@@ -2,7 +2,7 @@
 {
   imports = [
     ./hardware-configuration.nix
-    ../../modules/nixos/cinnamon.nix
+    ../../modules/nixos/desktop.nix
     ../../modules/nixos/docker.nix
   ];
 

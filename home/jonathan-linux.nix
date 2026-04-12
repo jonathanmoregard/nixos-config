@@ -2,7 +2,6 @@
 {
   imports = [
     ./jonathan.nix
-    ./cinnamon-dconf.nix
     ./desktop-apps.nix
     ./ghostty.nix
     ./autodoro.nix
