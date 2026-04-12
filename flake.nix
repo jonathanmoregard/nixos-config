@@ -27,7 +27,7 @@
         {
           home-manager.useGlobalPkgs = true;
           home-manager.useUserPackages = true;
-          home-manager.users.jonathan = import ./home/jonathan.nix;
+          home-manager.users.jonathan = import ./home/jonathan-linux.nix;
         }
       ];
     };

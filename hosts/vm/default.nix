@@ -2,6 +2,8 @@
 {
   imports = [
     ./hardware-configuration.nix
+    ../../modules/nixos/cinnamon.nix
+    ../../modules/nixos/docker.nix
   ];
 
   # systemd-boot works cleanly with the GPT+ESP partition scheme used during install
@@ -25,13 +27,6 @@
       PasswordAuthentication = false;
       PermitRootLogin = "no";
     };
-  };
-
-  # XFCE desktop — lightweight, swappable when RAM increases
-  services.xserver = {
-    enable = true;
-    desktopManager.xfce.enable = true;
-    displayManager.lightdm.enable = true;
   };
 
   # User account
