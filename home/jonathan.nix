@@ -9,7 +9,7 @@
   home.packages = with pkgs; [
     zsh-powerlevel10k
     nodejs_22
-    nodePackages.pnpm
+    pnpm
   ];
 
   programs.git = {
@@ -39,7 +39,7 @@
       update = "sudo nix flake update /etc/nixos && sudo nixos-rebuild switch --flake /etc/nixos#vm";
     };
 
-    initExtra = ''
+    initContent = ''
       # Powerlevel10k
       source ${pkgs.zsh-powerlevel10k}/share/zsh-powerlevel10k/powerlevel10k.zsh-theme
       [[ -f ~/.p10k.zsh ]] && source ~/.p10k.zsh
