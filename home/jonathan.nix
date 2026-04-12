@@ -12,9 +12,9 @@
   # Git identity
   programs.git = {
     enable = true;
-    userName = "jonathanmoregard";
-    userEmail = "jonathan.more@hotmail.com";
-    extraConfig = {
+    settings = {
+      user.name = "jonathanmoregard";
+      user.email = "jonathan.more@hotmail.com";
       init.defaultBranch = "main";
       pull.rebase = true;
     };

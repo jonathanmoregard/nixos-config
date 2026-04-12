@@ -18,7 +18,7 @@
   time.timeZone = "Europe/Stockholm";
   i18n.defaultLocale = "en_US.UTF-8";
 
-  # SSH server — only way to access this headless VM
+  # SSH server
   services.openssh = {
     enable = true;
     settings = {
@@ -27,9 +27,17 @@
     };
   };
 
+  # XFCE desktop — lightweight, swappable when RAM increases
+  services.xserver = {
+    enable = true;
+    desktopManager.xfce.enable = true;
+    displayManager.lightdm.enable = true;
+  };
+
   # User account
   users.users.jonathan = {
     isNormalUser = true;
+    initialPassword = "changeme";
     extraGroups = [ "wheel" "networkmanager" ];
     shell = pkgs.zsh;
     openssh.authorizedKeys.keys = [

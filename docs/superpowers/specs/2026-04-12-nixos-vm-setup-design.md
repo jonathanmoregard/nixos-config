@@ -18,6 +18,7 @@ Set up NixOS in a QEMU/KVM VM on the current Linux laptop, with Claude Code inst
 
 ```
 nixos-config/
+├── .gitignore                         # result, .direnv, *.qcow2
 ├── flake.nix                          # outputs: nixosConfigurations.vm + darwinConfigurations.mac-mini
 ├── flake.lock
 ├── hosts/
@@ -51,13 +52,19 @@ inputs = {
 };
 ```
 
+**Cross-platform note:** `darwinConfigurations` is always declared in flake outputs
+(it's just an attrset — no evaluation happens until accessed). `nix flake check`
+will skip darwin eval on Linux. Only `nix flake check --all-systems` would fail,
+which we simply don't run on the VM. No conditional logic needed.
+
 ## NixOS VM (`hosts/vm/`)
 
 - **NixOS channel:** nixos-unstable
-- **Boot:** GRUB, single partition (or simple GPT for virt)
+- **Boot:** systemd-boot, GPT with ESP
+- **Disk:** 20 GB qcow2 (thin provisioned)
 - **Networking:** NetworkManager, NAT via libvirt default bridge
 - **Users:** `jonathan` with sudo, SSH key auth
-- **Display:** headless or minimal — VM used via SSH from host
+- **Display:** headless (no display server). SSH only — `services.openssh.enable = true`. Host reaches VM via libvirt NAT (default `192.168.122.x`) or port forwarding.
 
 ### Low-RAM Tuning (`modules/nixos/vm-tweaks.nix`)
 
@@ -65,15 +72,17 @@ inputs = {
 nix.settings = {
   max-jobs = 1;
   cores = 1;
+  min-free = 128 * 1024 * 1024;  # trigger GC when <128MB free
 };
-# Enable zram swap to handle nix builds without OOM
 zramSwap.enable = true;
+swapDevices = [{ device = "/swapfile"; size = 2048; }];  # 2GB disk swap in addition to zram
+boot.tmp.useTmpfs = false;  # use disk for /tmp, not RAM
 ```
 
 ## Shared Modules (`modules/common.nix`)
 
 Packages applied to both VM and Mac Mini:
-- `pkgs.claude-code` (available in nixpkgs unstable)
+- `pkgs.claude-code` (confirmed in nixpkgs unstable, v2.1.92, **unfree** — requires `nixpkgs.config.allowUnfree = true`)
 - `pkgs.git`
 - `pkgs.gh` (GitHub CLI)
 - `pkgs.ripgrep`, `pkgs.fd`, `pkgs.jq`
