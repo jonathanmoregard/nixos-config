@@ -15,7 +15,7 @@
       local repo="$1"
       local dir="$2"
       if [ ! -d "$dir" ]; then
-        ${pkgs.git}/bin/git clone "https://github.com/jonathanmoregard/$repo.git" "$dir" || true
+        GIT_TERMINAL_PROMPT=0 ${pkgs.git}/bin/git clone "https://github.com/jonathanmoregard/$repo.git" "$dir" 2>/dev/null || true
       fi
     }
 

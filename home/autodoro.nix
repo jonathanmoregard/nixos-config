@@ -8,6 +8,7 @@
     };
     Service = {
       ExecStart = "%h/Repos/autodoro/autodoro.sh";
+      ExecCondition = "/bin/sh -c 'test -f %h/Repos/autodoro/autodoro.sh'";
       Restart = "on-failure";
       Environment = [
         "DISPLAY=:0"
