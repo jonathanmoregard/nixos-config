@@ -32,6 +32,7 @@
   # Wire desaturate toggle as Super+G keyboard shortcut in XFCE
   # Written as XML directly — xfconf-query requires a live session and fails during HM activation
   home.file.".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-keyboard-shortcuts.xml" = {
+    force = true;
     text = ''
       <?xml version="1.0" encoding="UTF-8"?>
       <channel name="xfce4-keyboard-shortcuts" version="1.0">
