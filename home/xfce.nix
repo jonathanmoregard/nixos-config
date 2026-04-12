@@ -30,7 +30,17 @@
   };
 
   # Wire desaturate toggle as Super+G keyboard shortcut in XFCE
-  xfconf.settings."xfce4-keyboard-shortcuts" = {
-    "/commands/custom/<Super>g" = "/home/jonathan/.local/bin/desaturate-toggle";
+  # Written as XML directly — xfconf-query requires a live session and fails during HM activation
+  home.file.".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-keyboard-shortcuts.xml" = {
+    text = ''
+      <?xml version="1.0" encoding="UTF-8"?>
+      <channel name="xfce4-keyboard-shortcuts" version="1.0">
+        <property name="commands" type="empty">
+          <property name="custom" type="empty">
+            <property name="&lt;Super&gt;g" type="string" value="/home/jonathan/.local/bin/desaturate-toggle"/>
+          </property>
+        </property>
+      </channel>
+    '';
   };
 }
