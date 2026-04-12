@@ -9,9 +9,13 @@
 
     nix-darwin.url = "github:LnL7/nix-darwin";
     nix-darwin.inputs.nixpkgs.follows = "nixpkgs";
+
+    agenix.url = "github:ryantm/agenix";
+    agenix.inputs.nixpkgs.follows = "nixpkgs";
+    agenix.inputs.darwin.follows = "nix-darwin";
   };
 
-  outputs = { self, nixpkgs, home-manager, nix-darwin, ... }:
+  outputs = { self, nixpkgs, home-manager, nix-darwin, agenix, ... }:
   let
     linuxSystem = "x86_64-linux";
     darwinSystem = "aarch64-darwin";
@@ -23,6 +27,8 @@
         ./hosts/vm/default.nix
         ./modules/common.nix
         ./modules/nixos/vm-tweaks.nix
+        agenix.nixosModules.default
+        { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
         home-manager.nixosModules.home-manager
         {
           home-manager.useGlobalPkgs = true;

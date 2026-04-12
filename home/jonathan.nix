@@ -10,6 +10,7 @@
     zsh-powerlevel10k
     nodejs_22
     pnpm
+    gitleaks
   ];
 
   programs.git = {
@@ -20,7 +21,23 @@
       init.defaultBranch = "main";
       pull.rebase = true;
       credential."https://github.com".helper = "!/run/current-system/sw/bin/gh auth git-credential";
+      core.hooksPath = "~/.config/git/hooks";
     };
+  };
+
+  # gitleaks pre-commit hook — blocks commits containing secrets
+  home.file.".config/git/hooks/pre-commit" = {
+    executable = true;
+    text = ''
+      #!/usr/bin/env bash
+      ${pkgs.gitleaks}/bin/gitleaks detect --staged --redact -q
+      if [ $? -ne 0 ]; then
+        echo ""
+        echo "gitleaks: potential secret detected — commit blocked."
+        echo "To bypass (only if you're sure): git commit --no-verify"
+        exit 1
+      fi
+    '';
   };
 
   programs.zsh = {
