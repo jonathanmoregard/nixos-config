@@ -1,19 +1,34 @@
 { pkgs, ... }:
 {
-  home.packages = [ pkgs.xcalib ];
+  home.packages = with pkgs; [ xcalib sxhkd redshift ];
 
-  # Redshift — night light equivalent for X11 (replaces Cinnamon night light)
-  services.redshift = {
-    enable = true;
-    latitude = "59.2";
-    longitude = "18.03";
-    temperature = {
-      day = 6500;
-      night = 2400;
-    };
+  # Redshift config (read by both redshift and redshift-gtk)
+  home.file.".config/redshift.conf" = {
+    force = true;
+    text = ''
+      [redshift]
+      temp-day=6500
+      temp-night=2400
+      location-provider=manual
+
+      [manual]
+      lat=59.2
+      lon=18.03
+    '';
   };
 
-  # Desaturate-all toggle script (equivalent of the Cinnamon applet)
+  # Autostart redshift-gtk so it appears in the system tray
+  # (XFCE doesn't activate systemd graphical-session.target, so services.redshift won't start)
+  home.file.".config/autostart/redshift.desktop".text = ''
+    [Desktop Entry]
+    Type=Application
+    Name=Redshift
+    Exec=${pkgs.redshift}/bin/redshift-gtk
+    Hidden=false
+    X-GNOME-Autostart-enabled=true
+  '';
+
+  # Desaturate-all toggle script
   home.file.".local/bin/desaturate-toggle" = {
     executable = true;
     text = ''
@@ -29,19 +44,20 @@
     '';
   };
 
-  # Wire desaturate toggle as Super+G keyboard shortcut in XFCE
-  # Written as XML directly — xfconf-query requires a live session and fails during HM activation
-  home.file.".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-keyboard-shortcuts.xml" = {
-    force = true;
-    text = ''
-      <?xml version="1.0" encoding="UTF-8"?>
-      <channel name="xfce4-keyboard-shortcuts" version="1.0">
-        <property name="commands" type="empty">
-          <property name="custom" type="empty">
-            <property name="&lt;Super&gt;g" type="string" value="/home/jonathan/.local/bin/desaturate-toggle"/>
-          </property>
-        </property>
-      </channel>
-    '';
-  };
+  # sxhkd for keyboard shortcuts — DE-agnostic, no XFCE session dependency
+  home.file.".config/sxhkd/sxhkdrc".text = ''
+    # Toggle desaturate-all (Super+G)
+    super + g
+      /home/jonathan/.local/bin/desaturate-toggle
+  '';
+
+  # Autostart sxhkd with the XFCE session
+  home.file.".config/autostart/sxhkd.desktop".text = ''
+    [Desktop Entry]
+    Type=Application
+    Name=sxhkd
+    Exec=${pkgs.sxhkd}/bin/sxhkd
+    Hidden=false
+    X-GNOME-Autostart-enabled=true
+  '';
 }
