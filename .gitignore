@@ -1,0 +1,13 @@
+# Nix build results
+result
+result-*
+
+# direnv
+.direnv/
+
+# VM disk images (don't commit these)
+*.qcow2
+*.vmdk
+
+# Editor
+.DS_Store
