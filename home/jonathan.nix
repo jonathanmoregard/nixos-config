@@ -11,6 +11,11 @@
     nodejs_22
     pnpm
     gitleaks
+    # Dev toolchains
+    rustc
+    cargo
+    python3
+    uv
   ];
 
   programs.git = {

@@ -23,5 +23,11 @@
     clone_if_missing intender "$HOME/Repos/intender"
     clone_if_missing weekend "$HOME/Repos/weekend"
     clone_if_missing nixos-config "$HOME/Repos/nixos-config"
+    clone_if_missing artcraft "$HOME/Repos/artcraft"
+    clone_if_missing claude-code "$HOME/Repos/claude-code"
+    clone_if_missing claude-exam "$HOME/Repos/claude-exam"
+    clone_if_missing jhana "$HOME/Repos/jhana"
+    clone_if_missing jonathan-claude-marketplace "$HOME/Repos/jonathan-claude-marketplace"
+    clone_if_missing survival-corpus "$HOME/Repos/survival-corpus"
   '';
 }
