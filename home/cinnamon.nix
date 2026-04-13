@@ -94,6 +94,12 @@ in
       natural-scroll = false;
     };
 
+    # Default terminal: Ghostty
+    "org/cinnamon/desktop/default-applications/terminal" = {
+      exec = "ghostty";
+      exec-arg = "-e";
+    };
+
     # Super+G keybinding for desaturate-all (matches Mint setup)
     "org/cinnamon/desktop/keybindings/custom-keybindings/custom0" = {
       name = "Desaturate All";
@@ -103,6 +109,24 @@ in
 
     "org/cinnamon/desktop/keybindings" = {
       custom-list = [ "custom0" ];
+    };
+  };
+
+  # XDG MIME defaults (matches Mint)
+  xdg.mimeApps = {
+    enable = true;
+    defaultApplications = {
+      "x-scheme-handler/http" = "google-chrome.desktop";
+      "x-scheme-handler/https" = "google-chrome.desktop";
+      "text/html" = "google-chrome.desktop";
+      "text/plain" = "org.x.editor.desktop";
+      "application/pdf" = "xreader.desktop";
+      "image/png" = "xviewer.desktop";
+      "image/jpeg" = "xviewer.desktop";
+      "image/gif" = "xviewer.desktop";
+      "image/bmp" = "xviewer.desktop";
+      "image/webp" = "xviewer.desktop";
+      "inode/directory" = "nemo.desktop";
     };
   };
 }
