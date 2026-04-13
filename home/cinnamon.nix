@@ -12,12 +12,28 @@ in
     mint-themes
     mint-y-icons
     bibata-cursors
+    xdotool
+    scrot
   ];
 
   # Install desaturate-all applet from nix store
   home.file.".local/share/cinnamon/applets/desaturate-all@hkoosha" = {
     source = "${desaturateApplet}/desaturate-all@hkoosha/files/desaturate-all@hkoosha";
     recursive = true;
+  };
+
+  # Applet config: saturation=9 (slight desaturation), Super+G keybind, resume on startup
+  home.file.".config/cinnamon/spices/desaturate-all@hkoosha/desaturate-all@hkoosha.json" = {
+    force = true;
+    text = builtins.toJSON {
+      saturation = { type = "scale"; default = 0; min = 0; max = 100; step = 1; value = 9; description = "Color saturation"; };
+      keybinding = { type = "keybinding"; default = ""; value = "<Super>g"; description = "Shortcut to toggle desaturation effect"; };
+      automatic = { type = "switch"; default = false; value = false; description = "Automatic"; tooltip = "Automatically enable and disable the desaturation effect based on the time of day"; };
+      start-timechooser = { type = "timechooser"; default = { h = 22; m = 0; s = 0; }; value = { h = 22; m = 0; s = 0; }; description = "Time of day to automatically enable"; dependency = "automatic"; };
+      end-timechooser = { type = "timechooser"; default = { h = 6; m = 0; s = 0; }; value = { h = 6; m = 0; s = 0; }; description = "Time of day to automatically disable"; dependency = "automatic"; };
+      resume-on-startup = { type = "switch"; default = false; value = true; description = "Restore desaturation effect state on startup"; tooltip = "Restore the previously set desaturation state when cinnamon starts"; dependency = "!automatic"; };
+      state = { type = "generic"; default = 0; value = false; };
+    };
   };
 
   dconf.settings = {
@@ -133,16 +149,7 @@ in
       numlock-state = "off";
     };
 
-    # --- Keybindings ---
-    "org/cinnamon/desktop/keybindings/custom-keybindings/custom0" = {
-      name = "Desaturate All";
-      command = "dbus-send --session --type=method_call --dest=org.Cinnamon /org/Cinnamon org.Cinnamon.ToggleDesaturate";
-      binding = [ "<Super>g" ];
-    };
-
-    "org/cinnamon/desktop/keybindings" = {
-      custom-list = [ "custom0" ];
-    };
+    # Keybinding for desaturate-all is in the applet config (Super+G)
 
     # --- GNOME / GTK settings ---
     "org/gnome/desktop/interface" = {
