@@ -1,0 +1,58 @@
+# nixos-config
+
+Jonathan's declarative system config — NixOS VM + Mac Mini, managed with Nix flakes + Home Manager.
+
+## What this is
+
+Mirroring a Linux Mint 22.2 / Cinnamon daily-driver setup into a reproducible NixOS VM (QEMU/KVM, 4 GB RAM). Goal: full repro — if the VM is wiped and rebuilt, it should come back exactly as left.
+
+Mac Mini config is a placeholder (nix-darwin), fleshed out on arrival.
+
+## Hosts
+
+| Host | Target | Rebuild command |
+|------|--------|-----------------|
+| `vm` | NixOS x86_64 VM | `sudo nixos-rebuild switch --flake /etc/nixos#vm` |
+| `mac-mini` | nix-darwin aarch64 | `darwin-rebuild switch --flake .#mac-mini` |
+
+Alias on VM: `rebuild` (defined in `home/jonathan.nix`).
+
+## Deploy workflow
+
+Changes live on the host, rsync'd to VM — no GitHub credentials on VM:
+
+```bash
+rsync -avz --delete --exclude='.git' -e ssh --rsync-path="sudo rsync" \
+  /home/jonathan/Repos/nixos-config/ jonathan@192.168.122.27:/etc/nixos/
+```
+
+VM IP may change on reboot — check with `virsh domifaddr nixos`.
+
+## Key files
+
+| File | Purpose |
+|------|---------|
+| `flake.nix` | Inputs + host definitions |
+| `home/jonathan.nix` | Shared HM config (shell, git, packages, p10k) |
+| `home/jonathan-linux.nix` | Linux HM entrypoint — imports, cloneRepos activation |
+| `home/cinnamon.nix` | Cinnamon DE — applets, dconf, MIME defaults, autostart |
+| `home/desktop-apps.nix` | GUI app packages (Chrome, Beeper, Discord, etc.) |
+| `home/ghostty.nix` | Ghostty terminal config |
+| `home/autodoro.nix` | Autodoro systemd user service |
+| `modules/nixos/desktop.nix` | Cinnamon/LightDM system config + Chrome policies |
+| `modules/nixos/vm-tweaks.nix` | VM-specific tweaks (QEMU guest, SPICE, etc.) |
+
+## Cinnamon applet notes
+
+- **desaturate-all@hkoosha** is fetched from GitHub via `pkgs.fetchgit` with `sparseCheckout`. Source pinned by rev + hash.
+- Applet config files must be **real files**, not symlinks — Cinnamon can't read through nix store symlinks. Use `home.activation` (not `home.file`) for anything in `~/.config/cinnamon/spices/`.
+
+## Secrets
+
+gitleaks pre-commit hook blocks secrets. fetchgit hashes/revs that trigger false positives get `# pragma: allowlist secret` inline.
+
+## Known gaps / manual steps
+
+- **Dropbox**: daemon autostarts but `~/Dropbox` folder requires GUI login to Dropbox on first run.
+- **Private repos**: `cloneRepos` activation clones public repos automatically. Private repos need `gh auth login` on the VM first (interactive — run manually).
+- **Beeper**: installed via nixpkgs (unfree, allowed). Requires account login on first run.
