@@ -13,9 +13,9 @@ All phases are deployed on the VM (192.168.122.27).
 ## What's Deployed
 
 ### Architecture decisions made
-- **XFCE kept** (not Cinnamon) — user wants lightweight DE. Do NOT migrate to Cinnamon without explicit confirmation.
+- **Cinnamon DE** — matches Linux Mint daily driver; enables native desaturate-all applet
 - **Split HM entrypoints:** VM uses `home/jonathan-linux.nix`, Darwin keeps `home/jonathan.nix`
-- `modules/nixos/cinnamon.nix` was renamed to `modules/nixos/desktop.nix` (now contains XFCE)
+- `modules/nixos/desktop.nix` enables Cinnamon + LightDM
 
 ### File structure (actual)
 ```
@@ -34,7 +34,7 @@ nixos-config/
 ├── home/
 │   ├── jonathan.nix                   # OMZ + P10k + gh credential + gitleaks + nodejs/pnpm
 │   ├── jonathan-linux.nix             # imports all desktop modules + cloneRepos activation
-│   ├── xfce.nix                       # redshift-gtk autostart + desaturate-toggle + sxhkd
+│   ├── cinnamon.nix                    # Cinnamon dconf, themes, desaturate-all applet, night-light
 │   ├── desktop-apps.nix               # Chrome, Discord, GIMP, Calibre, LibreOffice, qbittorrent, KeePassXC, zoom, zenity, dropbox
 │   ├── ghostty.nix                    # Ghostty + gtk-single-instance=false + split keybinds
 │   └── autodoro.nix                   # systemd user service with ExecCondition guard
@@ -54,8 +54,8 @@ nixos-config/
 - Aliases: `ll`, `rebuild`, `update`
 
 ### Desktop features
-- **Redshift:** `redshift-gtk` XDG autostart, config at `~/.config/redshift.conf` (6500K→2400K, Stockholm 59.2/18.03)
-- **Desaturate-all:** `~/.local/bin/desaturate-toggle` (xcalib), triggered via sxhkd on Super+G. Both autostart on login.
+- **Night-light:** Cinnamon built-in via dconf (2400K, Stockholm 59.2/18.03) — replaces redshift
+- **Desaturate-all:** `desaturate-all@hkoosha` Cinnamon applet, installed from nix store via fetchFromGitHub. Super+G keybinding via dconf custom keybinding.
 - **Ghostty:** `gtk-single-instance = false` so it launches from Run Apps and menu
 - **autodoro:** systemd user service; skips start if `~/Repos/autodoro/autodoro.sh` missing (ExecCondition)
 

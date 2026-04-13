@@ -2,7 +2,7 @@
 {
   services.xserver = {
     enable = true;
-    desktopManager.xfce.enable = true;
+    desktopManager.cinnamon.enable = true;
     displayManager.lightdm.enable = true;
   };
 }

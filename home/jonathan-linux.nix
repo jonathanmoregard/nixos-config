@@ -2,7 +2,7 @@
 {
   imports = [
     ./jonathan.nix
-    ./xfce.nix
+    ./cinnamon.nix
     ./desktop-apps.nix
     ./ghostty.nix
     ./autodoro.nix
