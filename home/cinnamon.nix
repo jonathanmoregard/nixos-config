@@ -22,10 +22,24 @@ in
     recursive = true;
   };
 
-  # Applet config: saturation=9 (slight desaturation), Super+G keybind, resume on startup
-  home.file.".config/cinnamon/spices/desaturate-all@hkoosha/desaturate-all@hkoosha.json" = {
-    force = true;
-    text = builtins.toJSON {
+  # Dropbox autostart
+  home.file.".config/autostart/dropbox.desktop".text = ''
+    [Desktop Entry]
+    Type=Application
+    Name=Dropbox
+    Exec=${pkgs.dropbox}/bin/dropbox start -i
+    Hidden=false
+    X-GNOME-Autostart-enabled=true
+  '';
+
+  # Cinnamon applet configs — written as real files (not symlinks) so applets can read/write them
+  home.activation.cinnamonAppletConfigs = lib.hm.dag.entryAfter ["writeBoundary"] ''
+    # Desaturate-all applet config
+    mkdir -p "$HOME/.config/cinnamon/spices/desaturate-all@hkoosha"
+    DESAT_CFG="$HOME/.config/cinnamon/spices/desaturate-all@hkoosha/desaturate-all@hkoosha.json"
+    rm -f "$DESAT_CFG"
+    cat > "$DESAT_CFG" << 'DESAT_EOF'
+    ${builtins.toJSON {
       saturation = { type = "scale"; default = 0; min = 0; max = 100; step = 1; value = 9; description = "Color saturation"; };
       keybinding = { type = "keybinding"; default = ""; value = "<Super>g"; description = "Shortcut to toggle desaturation effect"; };
       automatic = { type = "switch"; default = false; value = false; description = "Automatic"; tooltip = "Automatically enable and disable the desaturation effect based on the time of day"; };
@@ -33,8 +47,28 @@ in
       end-timechooser = { type = "timechooser"; default = { h = 6; m = 0; s = 0; }; value = { h = 6; m = 0; s = 0; }; description = "Time of day to automatically disable"; dependency = "automatic"; };
       resume-on-startup = { type = "switch"; default = false; value = true; description = "Restore desaturation effect state on startup"; tooltip = "Restore the previously set desaturation state when cinnamon starts"; dependency = "!automatic"; };
       state = { type = "generic"; default = 0; value = false; };
-    };
-  };
+    }}
+    DESAT_EOF
+
+    # Grouped-window-list pinned apps
+    mkdir -p "$HOME/.config/cinnamon/spices/grouped-window-list@cinnamon.org"
+    GWL_CFG="$HOME/.config/cinnamon/spices/grouped-window-list@cinnamon.org/2.json"
+    rm -f "$GWL_CFG"
+    cat > "$GWL_CFG" << 'GWL_EOF'
+    ${builtins.toJSON {
+      pinned-apps = {
+        type = "generic";
+        default = [ "nemo.desktop" "firefox.desktop" "org.gnome.Terminal.desktop" ];
+        value = [
+          "nemo.desktop"
+          "com.mitchellh.ghostty.desktop"
+          "org.keepassxc.KeePassXC.desktop"
+          "google-chrome.desktop"
+        ];
+      };
+    }}
+    GWL_EOF
+  '';
 
   dconf.settings = {
     # --- Cinnamon shell ---
