@@ -59,7 +59,44 @@
       ll = "ls -la";
       rebuild = "sudo nixos-rebuild switch --flake /etc/nixos#vm";
       update = "sudo nix flake update /etc/nixos && sudo nixos-rebuild switch --flake /etc/nixos#vm";
+      drift = "cat ~/.local/share/nixos-drift-analyzer/latest.md 2>/dev/null || echo 'No drift report yet.'";
     };
+
+    loginExtra = ''
+      # NixOS drift check — runs once on login
+      _nixos_drift_check() {
+        local warnings=()
+
+        # Imperatively installed packages (nix-env) — outside the flake, lost on rebuild
+        local imperative
+        imperative=$(nix-env --query 2>/dev/null | grep -v '^$')
+        if [[ -n "$imperative" ]]; then
+          warnings+=("Imperative nix-env installs (not in flake, lost on rebuild):\n$(echo "$imperative" | sed 's/^/    /')")
+        fi
+
+        # Packages in PATH not traceable to /nix/store (rough heuristic)
+        if [[ -d "$HOME/.local/bin" ]] && [[ -n "$(ls -A "$HOME/.local/bin" 2>/dev/null)" ]]; then
+          warnings+=("~/.local/bin has files — check if these should be in home.packages")
+        fi
+
+        # Surface latest drift report if it exists
+        local report="$HOME/.local/share/nixos-drift-analyzer/latest.md"
+        if [[ -f "$report" ]]; then
+          warnings+=("Drift report available: $report")
+        fi
+
+        if [[ ''${#warnings[@]} -gt 0 ]]; then
+          echo ""
+          echo "  NixOS drift warning — the following may be lost on rebuild:"
+          for w in "''${warnings[@]}"; do
+            echo "  * $w"
+          done
+          echo "  Encode these in your flake: /home/jonathan/Repos/nixos-config"
+          echo ""
+        fi
+      }
+      _nixos_drift_check
+    '';
 
     initContent = ''
       # Powerlevel10k

@@ -6,6 +6,7 @@
     ./desktop-apps.nix
     ./ghostty.nix
     ./autodoro.nix
+    ./drift-analyzer.nix
   ];
 
   home.activation.cloneRepos = lib.hm.dag.entryAfter ["writeBoundary"] ''
