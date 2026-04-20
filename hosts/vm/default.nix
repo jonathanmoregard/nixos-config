@@ -3,7 +3,7 @@
   imports = [
     ./hardware-configuration.nix
     ../../modules/nixos/desktop.nix
-    ../../modules/nixos/docker.nix
+    ../../modules/nixos/docker.nix  # TODO(nixos-migration): swap for microvm.nix (Firecracker)
   ];
 
   # systemd-boot works cleanly with the GPT+ESP partition scheme used during install
@@ -32,7 +32,7 @@
   # User account
   users.users.jonathan = {
     isNormalUser = true;
-    initialPassword = "changeme";
+    initialPassword = "changeme"; # pragma: allowlist secret
     extraGroups = [ "wheel" "networkmanager" ];
     shell = pkgs.zsh;
     openssh.authorizedKeys.keys = [
