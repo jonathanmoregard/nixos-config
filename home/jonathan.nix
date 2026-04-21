@@ -12,11 +12,17 @@
     pnpm
     gitleaks
     gh
+    direnv
+    jq
     # Dev toolchains
     rustc
     cargo
     python3
     uv
+    # Intentionally NOT included (drift-scan 2026-04-19):
+    # - terraform: not used for now
+    # - yt-dlp: not wanted
+    # - virt-manager / libvirtd stack: not needed on this host
   ];
 
   programs.git = {

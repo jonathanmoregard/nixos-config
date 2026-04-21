@@ -1,6 +1,7 @@
 { pkgs, ... }:
-# Router personal-assistant services ported from ~/.config/systemd/user/.
-# Originals live on Mint under ~/.local/share/router-agent with uv-managed venv.
+# User services ported from ~/.config/systemd/user/ + migrated from autostart.
+# - Router services: originals under ~/.local/share/router-agent (uv-managed venv).
+# - Voquill: migrated from ~/.config/autostart/ to a proper systemd user service.
 {
   systemd.user.services.router-ingestor = {
     Unit = {
@@ -53,5 +54,24 @@
       Unit = "router-ingestor-scan.service";
     };
     Install.WantedBy = [ "timers.target" ];
+  };
+
+  # Voquill voice-typing app. Live binary at
+  # ~/Repos/voquill/apps/desktop/src-tauri/target/debug/Voquill (debug build).
+  # The prior autostart .desktop entry pointed at a stale Voice-typing/ path;
+  # this service uses the current path.
+  systemd.user.services.voquill = {
+    Unit = {
+      Description = "Voquill voice-typing";
+      After = [ "graphical-session.target" ];
+      PartOf = [ "graphical-session.target" ];
+    };
+    Service = {
+      Type = "simple";
+      ExecStart = "/home/jonathan/Repos/voquill/apps/desktop/src-tauri/target/debug/Voquill --voquill-autostart-hidden";
+      Restart = "on-failure";
+      RestartSec = 5;
+    };
+    Install.WantedBy = [ "graphical-session.target" ];
   };
 }

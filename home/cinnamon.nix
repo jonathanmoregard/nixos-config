@@ -185,10 +185,11 @@ in
     };
 
     "org/cinnamon/desktop/peripherals/touchpad" = {
-      two-finger-scroll-enabled = true;
+      two-finger-scrolling-enabled = true; # key name fix — "scroll-enabled" was silently ignored
       natural-scroll = true;
       tap-to-click = true;
       tap-and-drag = true;
+      disable-while-typing = true;
     };
 
     # --- Touchpad gestures ---
@@ -211,7 +212,7 @@ in
     # --- Default apps ---
     "org/cinnamon/desktop/default-applications/terminal" = {
       exec = "ghostty";
-      exec-arg = "-e";
+      exec-arg = "--"; # Ghostty uses "--" separator; "-e" is xterm-only and breaks Nemo "Open in Terminal"
     };
 
     # --- Night-light ---
@@ -231,6 +232,8 @@ in
       sleep-display-battery = 1800;
       sleep-inactive-ac-timeout = 0;
       sleep-inactive-battery-timeout = 0;
+      lock-on-suspend = true;
+      critical-battery-action = "hibernate";
     };
 
     "org/cinnamon/settings-daemon/peripherals/keyboard" = {
@@ -249,6 +252,10 @@ in
       font-name = "Ubuntu 10";
       enable-animations = true;
       toolkit-accessibility = false;
+      font-antialiasing = "grayscale";
+      font-hinting = "slight";
+      monospace-font-name = "DejaVu Sans Mono 10";
+      document-font-name = "Sans 10";
     };
 
     "org/gnome/desktop/sound" = {
@@ -277,6 +284,8 @@ in
       confirm-move-to-trash = false;
       sort-directories-first = true;
       sort-favorites-first = true;
+      always-use-browser = true;
+      thumbnail-limit = lib.gvariant.mkUint64 34359738368; # 32 GB
     };
   };
 

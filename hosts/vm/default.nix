@@ -4,6 +4,7 @@
     ./hardware-configuration.nix
     ../../modules/nixos/desktop.nix
     ../../modules/nixos/docker.nix  # TODO(nixos-migration): swap for microvm.nix (Firecracker)
+    ../../modules/nixos/tailscale.nix
   ];
 
   # systemd-boot works cleanly with the GPT+ESP partition scheme used during install
