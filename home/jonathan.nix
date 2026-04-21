@@ -11,6 +11,7 @@
     nodejs_22
     pnpm
     gitleaks
+    gh
     # Dev toolchains
     rustc
     cargo
@@ -27,8 +28,14 @@
       pull.rebase = true;
       credential."https://github.com".helper = "!/run/current-system/sw/bin/gh auth git-credential";
       core.hooksPath = "~/.config/git/hooks";
+      core.excludesfile = "~/.config/git/ignore";
     };
   };
+
+  # Global gitignore
+  home.file.".config/git/ignore".text = ''
+    **/.claude/settings.local.json
+  '';
 
   # gitleaks pre-commit hook — blocks commits containing secrets
   home.file.".config/git/hooks/pre-commit" = {

@@ -14,13 +14,47 @@ in
     bibata-cursors
     xdotool
     scrot
+    xbindkeys
   ];
+
+  # Notification sound
+  home.file.".local/share/sounds/tink.oga".source = ../assets/sounds/tink.oga;
 
   # Install desaturate-all applet from nix store
   home.file.".local/share/cinnamon/applets/desaturate-all@hkoosha" = {
     source = "${desaturateApplet}/desaturate-all@hkoosha/files/desaturate-all@hkoosha";
     recursive = true;
   };
+
+  # KeePassXC autostart
+  home.file.".config/autostart/org.keepassxc.KeePassXC.desktop".text = ''
+    [Desktop Entry]
+    Type=Application
+    Name=KeePassXC
+    Exec=${pkgs.keepassxc}/bin/keepassxc
+    Hidden=false
+    X-GNOME-Autostart-enabled=true
+  '';
+
+  # Beeper autostart
+  home.file.".config/autostart/beeper.desktop".text = ''
+    [Desktop Entry]
+    Type=Application
+    Name=Beeper
+    Exec=beeper
+    Hidden=false
+    X-GNOME-Autostart-enabled=true
+  '';
+
+  # xbindkeys autostart — binds defined in ~/.xbindkeysrc (managed via dotfiles repo)
+  home.file.".config/autostart/xbindkeys.desktop".text = ''
+    [Desktop Entry]
+    Type=Application
+    Name=xbindkeys
+    Exec=${pkgs.xbindkeys}/bin/xbindkeys
+    Hidden=false
+    X-GNOME-Autostart-enabled=true
+  '';
 
   # Dropbox autostart
   home.file.".config/autostart/dropbox.desktop".text = ''
@@ -97,6 +131,7 @@ in
       panel-zone-icon-sizes = ''[{"panelId": 1, "left": 32, "center": 0, "right": 24}]'';
       panel-zone-symbolic-icon-sizes = ''[{"panelId": 1, "left": 32, "center": 32, "right": 20}]'';
       panel-zone-text-sizes = ''[{"panelId": 1, "left": 10.0, "center": 0.0, "right": 0.0}]'';
+      date-format = "YYYY-MM-DD";
     };
 
     "org/cinnamon/theme" = {
@@ -111,6 +146,13 @@ in
       cursor-blink-time = 1200;
       first-day-of-week = 1;
       toolkit-accessibility = false;
+      clock-use-24h = true;
+      font-name = "Ubuntu 10";
+    };
+
+    "org/cinnamon/sounds" = {
+      notification-enabled = true;
+      notification-file = "/home/jonathan/.local/share/sounds/tink.oga";
     };
 
     "org/cinnamon/desktop/sound" = {
@@ -119,6 +161,16 @@ in
 
     "org/cinnamon/desktop/wm/preferences" = {
       min-window-opacity = 30;
+      button-layout = ":minimize,maximize,close";
+      titlebar-font = "Ubuntu Medium 10";
+      titlebar-uses-system-font = false;
+      num-workspaces = 4;
+      theme = "Mint-Y";
+      audible-bell = false;
+      resize-with-right-button = true;
+      focus-mode = "click";
+      action-double-click-titlebar = "toggle-maximize";
+      action-middle-click-titlebar = "lower";
     };
 
     "org/cinnamon/muffin" = {
@@ -134,7 +186,9 @@ in
 
     "org/cinnamon/desktop/peripherals/touchpad" = {
       two-finger-scroll-enabled = true;
-      natural-scroll = false;
+      natural-scroll = true;
+      tap-to-click = true;
+      tap-and-drag = true;
     };
 
     # --- Touchpad gestures ---
@@ -219,6 +273,10 @@ in
     # --- Nemo ---
     "org/nemo/preferences" = {
       show-hidden-files = true;
+      enable-delete = true;
+      confirm-move-to-trash = false;
+      sort-directories-first = true;
+      sort-favorites-first = true;
     };
   };
 
