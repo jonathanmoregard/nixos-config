@@ -43,6 +43,14 @@
     **/.claude/settings.local.json
   '';
 
+  # Husky pre-commit hook helper — loads nvm so node-based hooks find the
+  # right binary regardless of which shell the commit was made from.
+  home.file.".huskyrc".text = ''
+    # Load nvm for husky hooks
+    export NVM_DIR="$HOME/.nvm"
+    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+  '';
+
   # gitleaks pre-commit hook — blocks commits containing secrets
   home.file.".config/git/hooks/pre-commit" = {
     executable = true;

@@ -8,6 +8,7 @@
     ./autodoro.nix
     ./drift-analyzer.nix
     ./router-services.nix
+    ./claude-services.nix
   ];
 
   # User crontab — declarative source of truth. Re-applied on every rebuild
@@ -21,7 +22,10 @@
     0 10 * * * /home/jonathan/Repos/nixos-config/scripts/mint-drift-agent.sh >> /home/jonathan/.local/share/mint-drift-analyzer/run.log 2>&1
     0 10 * * 1 git -C /home/jonathan/Repos/everything-claude-code pull --ff-only >> /home/jonathan/.claude/logs/ecc-pull.log 2>&1
     0 9 * * 1 touch /home/jonathan/.claude/homunculus/.evolve-reminder
-    0 */6 * * * /home/jonathan/.claude/workers/token-optimizer-updater/run.sh
+    0 */6 * * * /home/jonathan/.claude/repo-autosync-data/token-optimizer/wrapper.sh
+    */30 6-22 * * * /usr/bin/python3 /home/jonathan/.claude/wellbeing/habit-tracker.py >> /home/jonathan/.claude/logs/habit-tracker.log 2>&1
+    */30 * * * * /usr/bin/python3 /home/jonathan/.claude/wellbeing/sunset-walk-tracker.py >> /home/jonathan/.claude/logs/sunset-walk-tracker.log 2>&1
+    37 15 * * * /home/jonathan/Repos/superpowers/sync-agent.sh >> /home/jonathan/Repos/superpowers/sync.log 2>&1
   '';
 
   home.activation.installCrontab = lib.hm.dag.entryAfter ["writeBoundary"] ''

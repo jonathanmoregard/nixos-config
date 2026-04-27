@@ -17,6 +17,8 @@
     dropbox
     thunderbird
     android-studio # nixpkgs, NOT flatpak — RAM-hungry, avoid in 4GB VM
+    wineWowPackages.stable  # 32+64-bit Wine for Windows app compatibility
+    winetricks
     # cursor: package name in nixpkgs is `code-cursor`. Re-add as
     #   code-cursor # rarely used but kept (drift-scan 2026-04-19)
     # if Cursor IDE actually wanted on this host.

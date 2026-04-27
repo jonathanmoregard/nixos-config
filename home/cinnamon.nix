@@ -66,6 +66,20 @@ in
     X-GNOME-Autostart-enabled=true
   '';
 
+  # Voquill (local) autostart — locally built voice typing app
+  home.file.".config/autostart/voquill.desktop".text = ''
+    [Desktop Entry]
+    Type=Application
+    Version=1.0
+    Name=Voquill (local)
+    Comment=Voquill (local) startup script
+    Exec=/home/jonathan/Repos/Voice-typing/voquill/apps/desktop/src-tauri/target/debug/Voquill --voquill-autostart-hidden
+    StartupNotify=false
+    Terminal=false
+    Hidden=false
+    X-GNOME-Autostart-enabled=true
+  '';
+
   # Cinnamon applet configs — written as real files (not symlinks) so applets can read/write them
   home.activation.cinnamonAppletConfigs = lib.hm.dag.entryAfter ["writeBoundary"] ''
     # Desaturate-all applet config
