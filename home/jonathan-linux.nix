@@ -34,6 +34,23 @@
     fi
   '';
 
+  # Clone user repos into ~/Repos on first activation.
+  #
+  # Strategy: try SSH first (works for both public + private once the host's
+  # SSH key is added at https://github.com/settings/keys), fall back to
+  # HTTPS (works for public repos only). All clones are best-effort —
+  # failures are silent so a missing key/network doesn't block rebuild.
+  #
+  # Re-running activation (every nixos-rebuild switch) is a no-op for any
+  # repo that already exists. Update existing repos via the cron-driven
+  # repo-autosync agent or `git pull` manually.
+  #
+  # ~/.claude is intentionally NOT auto-cloned: claude-code populates
+  # ~/.claude with runtime state (backups/, projects/, sessions/, cache/)
+  # on first run, and the .claude *repo* needs to coexist with that state.
+  # On a fresh host: move runtime dirs aside, `git clone
+  # git@github.com:jonathanmoregard/.claude.git ~/.claude`, restore
+  # runtime dirs, `git submodule update --init --recursive`.
   home.activation.cloneRepos = lib.hm.dag.entryAfter ["writeBoundary"] ''
     mkdir -p "$HOME/Repos"
 
@@ -41,7 +58,11 @@
       local repo="$1"
       local dir="$2"
       if [ ! -d "$dir" ]; then
-        GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" SSH_ASKPASS="" ${pkgs.git}/bin/git clone "https://github.com/jonathanmoregard/$repo.git" "$dir" 2>/dev/null || true
+        GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" SSH_ASKPASS="" \
+          ${pkgs.git}/bin/git clone "git@github.com:jonathanmoregard/$repo.git" "$dir" 2>/dev/null \
+        || GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" SSH_ASKPASS="" \
+             ${pkgs.git}/bin/git clone "https://github.com/jonathanmoregard/$repo.git" "$dir" 2>/dev/null \
+        || true
       fi
     }
 
@@ -55,5 +76,9 @@
     clone_if_missing jhana "$HOME/Repos/jhana"
     clone_if_missing jonathan-claude-marketplace "$HOME/Repos/jonathan-claude-marketplace"
     clone_if_missing survival-corpus "$HOME/Repos/survival-corpus"
+    clone_if_missing superpowers "$HOME/Repos/superpowers"
+    clone_if_missing voquill "$HOME/Repos/voquill"
+    clone_if_missing dotfiles "$HOME/Repos/dotfiles"
+    clone_if_missing everything-claude-code "$HOME/Repos/everything-claude-code"
   '';
 }

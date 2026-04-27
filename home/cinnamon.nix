@@ -73,7 +73,7 @@ in
     Version=1.0
     Name=Voquill (local)
     Comment=Voquill (local) startup script
-    Exec=/home/jonathan/Repos/Voice-typing/voquill/apps/desktop/src-tauri/target/debug/Voquill --voquill-autostart-hidden
+    Exec=/home/jonathan/Repos/voquill/apps/desktop/src-tauri/target/debug/Voquill --voquill-autostart-hidden
     StartupNotify=false
     Terminal=false
     Hidden=false

@@ -54,5 +54,7 @@ gitleaks pre-commit hook blocks secrets. fetchgit hashes/revs that trigger false
 ## Known gaps / manual steps
 
 - **Dropbox**: daemon autostarts but `~/Dropbox` folder requires GUI login to Dropbox on first run.
-- **Private repos**: `cloneRepos` activation clones public repos automatically. Private repos need `gh auth login` on the VM first (interactive — run manually).
-- **Beeper**: installed via nixpkgs (unfree, allowed). Requires account login on first run.
+- **Private repos**: `cloneRepos` activation tries SSH first (`git@github.com:...`), falls back to HTTPS. To clone private repos, add the host's SSH pubkey to https://github.com/settings/keys before next rebuild. Failures are silent — re-run `home-manager switch` after adding the key.
+- **`~/.claude` repo**: NOT auto-cloned. Claude Code populates `~/.claude` with runtime state (backups, projects, sessions, cache) on first run, and the [.claude repo](https://github.com/jonathanmoregard/.claude.git) needs to coexist with that. Bootstrap: move runtime dirs aside, `git clone git@github.com:jonathanmoregard/.claude.git ~/.claude`, move dirs back in, then `cd ~/.claude && git submodule update --init --recursive`.
+- **Beeper**: installed via nixpkgs (unfree, allowed). Requires account login on first run. nixpkgs version lags upstream — see `overlays/beeper.nix` for version bump.
+- **`~/.huskyrc`**: declared in `home/jonathan.nix` (loads nvm for husky pre-commit hooks). NVM itself is not declared in this flake — install via `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash` if needed.
