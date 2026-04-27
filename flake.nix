@@ -38,6 +38,23 @@
       ];
     };
 
+    # Dell Latitude 7440 laptop — daily driver
+    nixosConfigurations.dellan = nixpkgs.lib.nixosSystem {
+      system = linuxSystem;
+      modules = [
+        ./hosts/dellan/default.nix
+        ./modules/common.nix
+        agenix.nixosModules.default
+        { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
+        home-manager.nixosModules.home-manager
+        {
+          home-manager.useGlobalPkgs = true;
+          home-manager.useUserPackages = true;
+          home-manager.users.jonathan = import ./home/jonathan-linux.nix;
+        }
+      ];
+    };
+
     # Mac Mini (nix-darwin, placeholder — flesh out on arrival)
     darwinConfigurations.mac-mini = nix-darwin.lib.darwinSystem {
       system = darwinSystem;
