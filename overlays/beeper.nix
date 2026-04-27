@@ -19,7 +19,11 @@ let
       echo "export function registerLinuxConfig() {}" > $linuxConfigFilename
       sed -i 's/auto_update_disabled:[^,}]*/auto_update_disabled:true/g' $out/resources/app/build/main/main-entry-*.mjs
       sed -i -E 's/executeDownload\([^)]+\)\{/executeDownload(){return;/g' $out/resources/app/build/main/main-entry-*.mjs
-      sed -i '$ a\.subview-prefs-about > div:nth-child(2) {display: none;}' $out/resources/app/build/renderer/PrefsPanes-*.css
+      # NOTE: nixpkgs 4.2.630 patched PrefsPanes-*.css to hide the "outdated"
+      # warning on the about page. Beeper 4.2.742 ships PrefsPanes as .js
+      # (no matching .css), and on a current build the warning shouldn't
+      # appear at all. If a future bump needs to hide a UI warning again,
+      # target the renderer CSS bundle that contains `.subview-prefs-about`.
     '';
   };
 in
