@@ -7,6 +7,9 @@
     ../../modules/nixos/tailscale.nix
   ];
 
+  # Overlays — bump beeper above nixpkgs (server-enforced min version).
+  nixpkgs.overlays = [ (import ../../overlays/beeper.nix) ];
+
   # systemd-boot on UEFI
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
@@ -43,10 +46,8 @@
     initialPassword = "changeme"; # pragma: allowlist secret
     extraGroups = [ "wheel" "networkmanager" "video" ];
     shell = pkgs.zsh;
-    # TODO: replace bootstrap vm key with dellan-specific key after first boot
-    # (ssh-keygen -t ed25519 -C jonathan@dellan, then commit the new pubkey here)
     openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPf3ZLrzmf0pNSTJS603CaNb6in/ctXc0hZSJ9BflOVl jonathan@nixos-vm"
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINT9HeHhu82OoNsAHe/QAh116pSEANuZUr1h5m8R8kpp jonathan@dellan"
     ];
   };
 
