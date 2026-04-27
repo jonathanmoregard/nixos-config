@@ -17,7 +17,9 @@
     dropbox
     thunderbird
     android-studio # nixpkgs, NOT flatpak — RAM-hungry, avoid in 4GB VM
-    cursor         # rarely used but kept (drift-scan 2026-04-19)
+    # cursor: package name in nixpkgs is `code-cursor`. Re-add as
+    #   code-cursor # rarely used but kept (drift-scan 2026-04-19)
+    # if Cursor IDE actually wanted on this host.
     # NOTE: OBS Studio is installed via apt on Mint but is intentionally NOT
     # tracked here. Do not add obs-studio — user decision (drift-scan 2026-04-17).
   ];

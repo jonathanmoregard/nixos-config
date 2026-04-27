@@ -76,7 +76,7 @@
   # Fonts — sane defaults for desktop use
   fonts.packages = with pkgs; [
     noto-fonts
-    noto-fonts-emoji
+    noto-fonts-color-emoji
     noto-fonts-cjk-sans
     liberation_ttf
     dejavu_fonts
