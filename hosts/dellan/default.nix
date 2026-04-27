@@ -46,8 +46,10 @@
     initialPassword = "changeme"; # pragma: allowlist secret
     extraGroups = [ "wheel" "networkmanager" "video" ];
     shell = pkgs.zsh;
+    # Incoming SSH: keys whose PRIVATE half lives on the OTHER machine.
+    # jonathan@nixos-vm = host's key (used to drive dellan from host repo).
     openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINT9HeHhu82OoNsAHe/QAh116pSEANuZUr1h5m8R8kpp jonathan@dellan"
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPf3ZLrzmf0pNSTJS603CaNb6in/ctXc0hZSJ9BflOVl jonathan@nixos-vm"
     ];
   };
 
