@@ -32,6 +32,12 @@ let
                 wtitle = win.get("title", "")
                 fg = win.get("foreground_processes") or []
                 cmdline = fg[0].get("cmdline", []) if fg else []
+                # Skip transient kitty internals (e.g. the `kitten ask`
+                # confirmation dialog tab that kitty spawns when the user
+                # clicks X with running processes — restoring it
+                # re-shows the prompt on next launch).
+                if any("kitten" in a for a in cmdline) and "ask" in cmdline:
+                    continue
                 parts = ["launch"]
                 if cwd:
                     parts.append("--cwd")
@@ -133,17 +139,21 @@ let
         def run(*xs):
             subprocess.run(["kitty", "@", "--to", sock, *xs], check=True)
 
+        # Use insertion order via window ID (kitty auto-increments).
+        # Smallest id = original full-height "left" pane; second-smallest
+        # = result of vsplit, i.e. full-height "right" pane.
+        # `kitty @ ls` JSON doesn't expose at_x/at_y so we can't infer
+        # geometry directly.
+        sorted_ids = sorted(w["id"] for w in windows)
         if count == 0:
             run("launch", *common, *cmd)
         elif count == 1:
             run("launch", "--location=vsplit", *common, *cmd)
         elif count == 2:
-            left = min(windows, key=lambda w: w.get("at_x", 0))
-            run("focus-window", f"--match=id:{left['id']}")
+            run("focus-window", f"--match=id:{sorted_ids[0]}")
             run("launch", "--location=hsplit", *common, *cmd)
         elif count == 3:
-            right = max(windows, key=lambda w: w.get("at_x", 0))
-            run("focus-window", f"--match=id:{right['id']}")
+            run("focus-window", f"--match=id:{sorted_ids[1]}")
             run("launch", "--location=hsplit", *common, *cmd)
         else:
             run("launch", "--type=tab", *common, *cmd)
@@ -162,6 +172,7 @@ let
     import json
     import os
     import re
+    import shlex
     import subprocess
     import sys
     import time
@@ -204,41 +215,30 @@ let
         return [cmd[0], "--resume", latest]
 
 
-    def main():
+    STUB_PATH = "/tmp/kitty-stub-session"
+
+
+    def load_panes():
         cache = os.environ.get(
             "XDG_CACHE_HOME",
             os.path.join(os.path.expanduser("~"), ".cache"),
         )
         snap_path = os.path.join(cache, "kitty-session", "snapshot.json")
         if not os.path.exists(snap_path) or os.path.getsize(snap_path) == 0:
-            return
-
-        sock = find_socket()
-        if not sock:
-            print("kitty socket never appeared", file=sys.stderr)
-            sys.exit(1)
-
-        # IDs of the default windows kitty opened on startup; close them
-        # after we've added all our panes.
-        ls_out = subprocess.check_output(
-            ["kitty", "@", "--to", sock, "ls"], text=True,
-        )
-        default_ids = [
-            w["id"]
-            for osw in json.loads(ls_out)
-            for tab in osw.get("tabs", [])
-            for w in tab.get("windows", [])
-        ]
-
+            return []
         with open(snap_path) as fh:
             snap = json.load(fh)
-
         panes = []
         for osw in snap:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
                     fg = win.get("foreground_processes") or []
                     cmd = fg[0].get("cmdline", []) if fg else []
+                    # Skip kitty's transient `kitten ask` confirmation
+                    # dialogs (saved if a snapshot fires while the
+                    # close-confirmation tab is open).
+                    if any("kitten" in a for a in cmd) and "ask" in cmd:
+                        continue
                     cwd = win.get("cwd")
                     cmd = maybe_resume_claude(cmd, cwd)
                     panes.append({
@@ -246,33 +246,45 @@ let
                         "title": win.get("title", ""),
                         "cmd": cmd,
                     })
+        return panes
 
+
+    def emit_stub():
+        """Write a kitty session file with only pane 0's launch directive.
+        Kitty starts directly into this single window (no default extra),
+        avoiding a close-window prompt on the spurious startup shell."""
+        panes = load_panes()
         if not panes:
             return
+        p = panes[0]
+        parts = ["launch"]
+        if p["cwd"]:
+            parts += ["--cwd", shlex.quote(p["cwd"])]
+        if p["title"]:
+            parts += ["--title", shlex.quote(p["title"])]
+        if p["cmd"]:
+            parts += [shlex.quote(a) for a in p["cmd"]]
+        with open(STUB_PATH, "w") as fh:
+            fh.write(" ".join(parts) + "\n")
 
-        # Pane 0: launch directly into current (default-window) tab.
-        # We then close the default windows so only this pane remains —
-        # giving kitty-pane-add a clean count=1 starting point for the
-        # rest, which keeps the 2x2 grid pattern aligned.
-        first = panes[0]
-        first_argv = ["launch"]
-        if first["cwd"]:
-            first_argv += ["--cwd", first["cwd"]]
-        if first["title"]:
-            first_argv += ["--title", first["title"]]
-        if first["cmd"]:
-            first_argv += first["cmd"]
-        subprocess.run(
-            ["kitty", "@", "--to", sock, *first_argv], check=False,
-        )
 
-        for did in default_ids:
-            subprocess.run(
-                ["kitty", "@", "--to", sock,
-                 "close-window", f"--match=id:{did}"],
-                check=False,
-            )
+    def main():
+        if "--emit-stub" in sys.argv:
+            emit_stub()
+            return
 
+        panes = load_panes()
+        if len(panes) <= 1:
+            # Pane 0 is already created via kitty's --session stub; if
+            # that's all there is, we're done.
+            return
+
+        sock = find_socket()
+        if not sock:
+            print("kitty socket never appeared", file=sys.stderr)
+            sys.exit(1)
+
+        # Skip pane[0] — kitty already created it from the --session stub.
         for p in panes[1:]:
             argv = ["kitty-pane-add"]
             if p["cwd"]:
@@ -282,42 +294,6 @@ let
             if p["cmd"]:
                 argv += ["--", *p["cmd"]]
             subprocess.run(argv, check=False)
-
-        # Final cleanup: kitty sometimes spawns a stray OS window during
-        # restore (race between launch + close-window). Close any OS
-        # window that ended up with fewer panes than the largest one —
-        # that's our restored topology; the rest are leftovers.
-        ls_final = subprocess.check_output(
-            ["kitty", "@", "--to", sock, "ls"], text=True,
-        )
-        os_windows = json.loads(ls_final)
-        print(f"[restore] final cleanup; {len(os_windows)} OS window(s)",
-              flush=True)
-        if len(os_windows) > 1:
-            entries = []
-            for osw in os_windows:
-                total = sum(len(t["windows"]) for t in osw.get("tabs", []))
-                sample_wid = None
-                for t in osw.get("tabs", []):
-                    for w in t.get("windows", []):
-                        sample_wid = w["id"]
-                        break
-                    if sample_wid is not None:
-                        break
-                entries.append((osw["id"], total, sample_wid))
-            max_count = max(c for _, c, _ in entries)
-            for osw_id, count, sample_wid in entries:
-                if count < max_count and sample_wid is not None:
-                    print(
-                        f"[restore] closing stray OS#{osw_id} "
-                        f"({count} windows)",
-                        flush=True,
-                    )
-                    subprocess.run(
-                        ["kitty", "@", "--to", sock,
-                         "close-window", f"--match=id:{sample_wid}"],
-                        check=False,
-                    )
 
 
     if __name__ == "__main__":
@@ -409,8 +385,14 @@ let
       # waits for kitty's socket to appear before issuing its commands.
       snap="\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/snapshot.json"
       if [ -s "\$snap" ] && [ "\$live" -eq 0 ]; then
+        # Write a stub session file containing just pane 0; this makes
+        # kitty start directly into our restored topology with no extra
+        # default-startup window to clean up. Restore-session, running
+        # in the background, fills in panes 1..N once kitty's socket is up.
+        ${kittyRestoreSession}/bin/kitty-restore-session --emit-stub
         ( ${kittyRestoreSession}/bin/kitty-restore-session \
             >/tmp/kitty-restore.log 2>&1 & )
+        exec ${pkgs.kitty}/bin/kitty --session /tmp/kitty-stub-session "\$@"
       fi
       exec ${pkgs.kitty}/bin/kitty -1 "\$@"
       EOF
@@ -445,6 +427,10 @@ in
 
     # Splits layout enables hsplit/vsplit launch locations
     enabled_layouts splits,stack
+
+    # Suppress "are you sure you want to close this OS window?"
+    # confirmation when closing windows via UI/shortcut.
+    confirm_os_window_close 0
 
     # Keybinds — mirror Ghostty config (home/ghostty.nix). These override
     # kitty defaults like ctrl+minus = decrease_font_size.
