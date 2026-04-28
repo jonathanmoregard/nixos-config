@@ -141,7 +141,10 @@
     envExtra = ''
       export ANDROID_HOME="$HOME/Android/Sdk"
       export PATH="$PATH:$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools"
-      export PATH="$PATH:$HOME/.local/bin"
+      # Prepend so user-installed binaries (e.g. claude-code native
+      # installer at ~/.local/share/claude/versions/) win over nix-pkg
+      # fallbacks. Required for picking up self-updating tools.
+      export PATH="$HOME/.local/bin:$PATH"
     '';
   };
 

@@ -55,6 +55,11 @@
     powerOnBoot = true;
   };
 
+  # nix-ld — runs pre-built dynamically-linked Linux binaries (e.g. the
+  # Claude Code native installer at ~/.local/share/claude/versions/<v>)
+  # that expect /lib64/ld-linux-x86-64.so.2 + standard glibc layout.
+  programs.nix-ld.enable = true;
+
   # Lid close behavior — suspend on battery, ignore on AC (laptop docked)
   services.logind.lidSwitch = "suspend";
   services.logind.lidSwitchExternalPower = "ignore";
