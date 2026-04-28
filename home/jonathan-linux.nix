@@ -5,6 +5,7 @@
     ./cinnamon.nix
     ./desktop-apps.nix
     ./ghostty.nix
+    ./kitty.nix
     ./autodoro.nix
     ./drift-analyzer.nix
     ./router-services.nix
