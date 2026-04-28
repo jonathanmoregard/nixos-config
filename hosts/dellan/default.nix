@@ -5,6 +5,7 @@
     ../../modules/nixos/desktop.nix
     ../../modules/nixos/laptop.nix
     ../../modules/nixos/tailscale.nix
+    ../../modules/nixos/claude-rebuild
   ];
 
   # systemd-boot on UEFI

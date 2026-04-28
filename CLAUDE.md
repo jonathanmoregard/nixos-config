@@ -46,7 +46,7 @@ AI infra (MCP servers, classifiers, helper binaries) lives in nixos-config — o
 
 ```nix
 # home/claude-symlinks.nix
-home.file."claude/symlinks".source = pkgs.runCommand "claude-symlinks" {} ''
+home.file.".claude/symlinks".source = pkgs.runCommand "claude-symlinks" {} ''
   mkdir -p $out && ln -s /etc/nixos/<path> $out/<name>
 '';
 ```

@@ -14,6 +14,50 @@
 
 let
   lib = pkgs.lib;
+
+  # Test-only MCP driver — drives the claude-rebuild-mcp server over stdio
+  # from inside the VM. Defined here (rather than inline as a heredoc) so
+  # Nix's `''` indented-string stripping doesn't get confused by Python
+  # code at column 0.
+  mcpDriverScript = pkgs.writeText "mcp-drive.py" ''
+    import json
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+
+    reqs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "vm-e2e", "version": "0"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "classify_dellan", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "rebuild_dellan", "arguments": {}}},
+    ]
+    inp = "\n".join(json.dumps(r) for r in reqs) + "\n"
+
+    proc = subprocess.run(
+        ["claude-rebuild-mcp"],
+        input=inp, capture_output=True, text=True, timeout=30, env=env,
+    )
+
+    results = {}
+    for line in proc.stdout.splitlines():
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(msg, dict) and "id" in msg:
+            results[msg["id"]] = msg
+
+    sys.stderr.write("MCP STDERR:\n" + proc.stderr[-1500:] + "\n")
+    print(json.dumps(results))
+    sys.exit(0 if 2 in results and 3 in results else 1)
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "dellan-vm";
@@ -44,6 +88,17 @@ pkgs.testers.runNixOSTest {
       linger = true;
       initialPassword = lib.mkForce "test";
     };
+
+    # Test-only — preserve claude-rebuild env overrides through sudo so the
+    # e2e MCP→sudo→apply path can stub nixos-rebuild and redirect repo/state
+    # to a fixture. Production sudoers does NOT include this; defaults take
+    # over and apply hits real /etc/nixos + real nixos-rebuild.
+    security.sudo.extraConfig = ''
+      Defaults env_keep += "CLAUDE_REBUILD_REPO CLAUDE_REBUILD_STATE_DIR CLAUDE_REBUILD_AUDIT_LOG CLAUDE_REBUILD_NIXOS_REBUILD_BIN"
+    '';
+
+    # Test-only MCP driver script.
+    environment.etc."mcp-drive.py".source = mcpDriverScript;
 
     # Auto-login into a real X session so kitty has a DISPLAY to attach to
     # and we can drive it via remote control — the e2e signal the no-op
@@ -211,5 +266,245 @@ pkgs.testers.runNixOSTest {
             f"join(\" \")] | any(. | endswith(\"sleep {magic}\"))' "
             "/tmp/ls-after.json"
         )
+
+    # === claude-rebuild — module from modules/nixos/claude-rebuild ===
+    # Binaries on system PATH (environment.systemPackages → current-system/sw/bin)
+    dellan.succeed("test -x /run/current-system/sw/bin/claude-rebuild-classify")
+    dellan.succeed("test -x /run/current-system/sw/bin/claude-rebuild-apply")
+    dellan.succeed("test -x /run/current-system/sw/bin/claude-rebuild-mcp")
+
+    # Help output proves the entry-point + python deps resolved
+    dellan.succeed("claude-rebuild-classify --help >/dev/null")
+    dellan.succeed("claude-rebuild-apply --help >/dev/null")
+
+    # State + audit-log paths declared via systemd.tmpfiles
+    dellan.succeed("test -d /var/lib/claude-rebuild")
+    dellan.succeed("test -f /var/log/claude-rebuild.log")
+
+    # Sudoers rule: NOPASSWD only for `claude-rebuild-apply low` — high tier
+    # MUST flow through pkexec so polkit can prompt the user. The rule is
+    # rendered at /etc/sudoers.d/<n>-claude-rebuild_extraRules-cmd-0 (or
+    # similar) — grep the merged sudoers for the contract.
+    dellan.succeed(
+        "sudo -l -U jonathan 2>&1 | "
+        "grep -E 'NOPASSWD: .*/claude-rebuild-apply low'"
+    )
+    # Negative — high must NOT be NOPASSWD-able via sudo
+    dellan.fail(
+        "sudo -l -U jonathan 2>&1 | "
+        "grep -E 'NOPASSWD: .*/claude-rebuild-apply high'"
+    )
+
+    # MCP stdio server — initialize handshake should round-trip
+    init_req = (
+        '{"jsonrpc":"2.0","id":1,"method":"initialize",'
+        '"params":{"protocolVersion":"2025-06-18",'
+        '"capabilities":{},"clientInfo":{"name":"vm-test","version":"0"}}}'
+    )
+    dellan.succeed(
+        f"echo '{init_req}' | timeout 10 claude-rebuild-mcp 2>/dev/null | "
+        "grep -q '\"serverInfo\":{\"name\":\"claude-rebuild\"'"
+    )
+
+    # ~/.claude/symlinks — declarative HM derivation, contents fixed
+    dellan.succeed(
+        "test -L /home/jonathan/.claude/symlinks/claude-rebuild-nix"
+    )
+    dellan.succeed(
+        "test -L /home/jonathan/.claude/symlinks/claude-rebuild-mcp"
+    )
+    # Targets resolve into /etc/nixos
+    dellan.succeed(
+        "readlink /home/jonathan/.claude/symlinks/claude-rebuild-nix | "
+        "grep -q '^/etc/nixos/modules/nixos/claude-rebuild$'"
+    )
+
+    # === claude-rebuild full e2e: classifier → apply → MCP roundtrip ===
+    # Stubs nixos-rebuild via env override (CLAUDE_REBUILD_NIXOS_REBUILD_BIN)
+    # and redirects repo/state via env so we don't fight the real /etc/nixos
+    # or write to live /var/lib. Sudoers env_keep (test-only) lets these
+    # vars survive `sudo -n claude-rebuild-apply low` from the MCP server.
+
+    # Allow git to read repos owned by other users — needed because MCP
+    # server runs as jonathan but apply runs as root via sudo.
+    dellan.succeed("git config --system --add safe.directory '*'")
+
+    # Fixture repo with one low-blast change committed against base.
+    dellan.succeed("""
+      set -eux
+      mkdir -p /tmp/cr-repo
+      cd /tmp/cr-repo
+      git init -q
+      git config user.email a@b
+      git config user.name t
+      mkdir -p home modules/nixos overlays
+      echo '{ }' > home/foo.nix
+      git add -A
+      git commit -q -m base
+      echo '{ environment.systemPackages = [ ]; }' > home/foo.nix
+      git add -A
+      git commit -q -m low-change
+      chmod -R a+rX /tmp/cr-repo
+    """)
+
+    cr_env = (
+        "CLAUDE_REBUILD_REPO=/tmp/cr-repo "
+        "CLAUDE_REBUILD_STATE_DIR=/tmp/cr-state "
+        "CLAUDE_REBUILD_AUDIT_LOG=/tmp/cr-audit.log "
+        "CLAUDE_REBUILD_NIXOS_REBUILD_BIN=/run/current-system/sw/bin/true "
+    )
+
+    # --- Classifier on low-blast diff ---
+    out = dellan.succeed(f"{cr_env} claude-rebuild-classify --from HEAD~1 --to HEAD")
+    import json as _json
+    parsed = _json.loads(out)
+    assert parsed["tier"] == "low", f"expected low, got {parsed!r}"
+
+    # --- Direct apply low (root invocation) — stubbed nixos-rebuild ---
+    dellan.succeed(f"{cr_env} claude-rebuild-apply low")
+    dellan.succeed("test -s /tmp/cr-state/last-applied-rev")
+    dellan.succeed("grep -q rebuild_finish /tmp/cr-audit.log")
+    dellan.succeed("grep -q '\"exit_code\": 0' /tmp/cr-audit.log")
+
+    # --- Stage a HIGH-blast diff: touch flake.nix ---
+    dellan.succeed("""
+      set -eux
+      cd /tmp/cr-repo
+      echo '{ description = "x"; }' > flake.nix
+      git add -A
+      git -c user.email=a@b -c user.name=t commit -q -m high-change
+    """)
+
+    out = dellan.succeed(f"{cr_env} claude-rebuild-classify")
+    parsed = _json.loads(out)
+    assert parsed["tier"] == "high", f"expected high, got {parsed!r}"
+
+    # --- Defense in depth: apply low when classifier says high → reject ---
+    dellan.fail(f"{cr_env} claude-rebuild-apply low")
+
+    # --- High tier without PKEXEC_UID → reject ---
+    dellan.fail(f"{cr_env} claude-rebuild-apply high")
+
+    # --- High tier with PKEXEC_UID set (simulating a successful pkexec
+    # elevation; in production polkit's prompt is the actual HITL gate) ---
+    dellan.succeed(f"PKEXEC_UID=1000 {cr_env} claude-rebuild-apply high")
+
+    # --- B1 fix: --to <sha> pins the apply to the user-approved diff. ---
+    # Reset to a clean state, commit C1 (low), capture sha, commit C2 (high).
+    # apply with --to=C1 must apply C1 even though HEAD points at C2.
+    dellan.succeed("""
+      set -eux
+      cd /tmp/cr-repo
+      git reset --hard HEAD~2  # back to base
+      rm -rf /tmp/cr-state /tmp/cr-audit.log
+      echo '{ environment.systemPackages = [ ]; }' > home/foo.nix
+      git add -A
+      git -c user.email=a@b -c user.name=t commit -q -m C1-low
+    """)
+    c1_sha = dellan.succeed("cd /tmp/cr-repo && git rev-parse HEAD").strip()
+    dellan.succeed("""
+      set -eux
+      cd /tmp/cr-repo
+      echo '{ description = "x"; }' > flake.nix
+      git add -A
+      git -c user.email=a@b -c user.name=t commit -q -m C2-high
+    """)
+    # apply --to=C1 (low) should classify C1 alone (low) and apply, even
+    # though HEAD is C2 (high). If apply silently picked HEAD it would
+    # reject as tier mismatch.
+    dellan.succeed(
+        f"{cr_env} claude-rebuild-apply low --to {c1_sha}"
+    )
+    applied_rev = dellan.succeed("cat /tmp/cr-state/last-applied-rev").strip()
+    assert applied_rev == c1_sha, f"expected --to to pin to {c1_sha}, got {applied_rev}"
+
+    # --- H2 fix: audit records include caller identity (ppid, cmdline,
+    # SUDO_*/PKEXEC_* if present). ---
+    last_audit = dellan.succeed("tail -1 /tmp/cr-audit.log")
+    last = _json.loads(last_audit)
+    assert "caller" in last, f"audit missing caller: {last!r}"
+    assert last["caller"]["ppid"], f"audit caller missing ppid: {last['caller']!r}"
+
+    # --- H3 fix: secrets/*.age rotation now classified high. ---
+    dellan.succeed("""
+      set -eux
+      cd /tmp/cr-repo
+      git reset --hard HEAD~2  # base
+      mkdir -p secrets
+      echo 'fakeciphertext-v1' > secrets/foo.age
+      git add -A
+      git -c user.email=a@b -c user.name=t commit -q -m secrets-add
+      echo 'fakeciphertext-v2' > secrets/foo.age  # rotation
+      git add -A
+      git -c user.email=a@b -c user.name=t commit -q -m secrets-rotate
+    """)
+    out = dellan.succeed(f"{cr_env} claude-rebuild-classify --from HEAD~1 --to HEAD")
+    parsed = _json.loads(out)
+    assert parsed["tier"] == "high", f"secret rotation should be high, got {parsed!r}"
+
+    # --- M1 fix: deny-key for services.openssh inside an ALWAYS_LOW file ---
+    # Even though modules/nixos/desktop.nix is in ALWAYS_LOW_FILES, an
+    # added line containing services.openssh must trip the deny-key check.
+    dellan.succeed("""
+      set -eux
+      cd /tmp/cr-repo
+      git reset --hard HEAD~2  # base
+      mkdir -p modules/nixos
+      echo '{ }' > modules/nixos/desktop.nix
+      git add -A
+      git -c user.email=a@b -c user.name=t commit -q -m desktop-base
+      printf '%s\\n' '{ ... }: {' '  services.openssh.passwordAuthentication = true;' '}' > modules/nixos/desktop.nix
+      git add -A
+      git -c user.email=a@b -c user.name=t commit -q -m sshd-flip
+    """)
+    out = dellan.succeed(f"{cr_env} claude-rebuild-classify --from HEAD~1 --to HEAD")
+    parsed = _json.loads(out)
+    assert parsed["tier"] == "high", f"services.openssh in desktop.nix must be high, got {parsed!r}"
+
+    # --- M2 fix: git stderr surfaced on failure. ---
+    # Pass a bogus rev — classifier uses check=True, so we expect non-zero
+    # exit AND stderr to mention git's complaint.
+    rc, output = dellan.execute(
+        f"{cr_env} claude-rebuild-classify --from nonexistent-rev --to HEAD 2>&1"
+    )
+    assert rc != 0, "classifier should fail on bogus rev"
+    assert any(s in output for s in ("fatal:", "unknown revision", "bad revision")), (
+        f"git stderr should be surfaced; got: {output[-500:]}"
+    )
+
+    # === MCP server stdio: full request/response cycle ===
+    # Reset state to base + one low-blast change (collapse the high-blast
+    # commits into a fresh rev range so MCP's no-arg call sees low-blast).
+    dellan.succeed("""
+      set -eux
+      cd /tmp/cr-repo
+      git reset --hard HEAD~1
+      rm -rf /tmp/cr-state /tmp/cr-audit.log
+    """)
+
+    # MCP driver lives at /etc/mcp-drive.py (installed via environment.etc).
+    # Run as jonathan so the MCP→sudo path is exercised exactly as production.
+    raw = dellan.succeed(
+        f"su - jonathan -c '{cr_env} python3 /etc/mcp-drive.py'"
+    )
+    mcp_results = _json.loads(raw.strip().splitlines()[-1])
+
+    # tools/call classify_dellan
+    classify_msg = mcp_results["2"]
+    classify_text = classify_msg["result"]["structuredContent"]
+    assert classify_text["tier"] == "low", f"MCP classify wrong tier: {classify_text!r}"
+
+    # tools/call rebuild_dellan — should apply via sudo NOPASSWD path
+    rebuild_msg = mcp_results["3"]
+    rebuild_struct = rebuild_msg["result"]["structuredContent"]
+    assert rebuild_struct["tier"] == "low", f"MCP rebuild wrong tier: {rebuild_struct!r}"
+    assert rebuild_struct["applied"] is True, (
+        f"MCP rebuild not applied: {rebuild_struct!r}"
+    )
+
+    # Audit log written by the apply binary post-sudo elevation.
+    dellan.succeed("test -s /tmp/cr-audit.log")
+    dellan.succeed("grep -q rebuild_finish /tmp/cr-audit.log")
+    dellan.succeed("test -s /tmp/cr-state/last-applied-rev")
   '';
 }

@@ -10,6 +10,7 @@
     ./drift-analyzer.nix
     ./router-services.nix
     ./claude-services.nix
+    ./claude-symlinks.nix
   ];
 
   # User crontab — declarative source of truth. Re-applied on every rebuild

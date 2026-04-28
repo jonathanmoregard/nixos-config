@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude_rebuild"
+version = "0.1.0"
+description = "Blast-radius-gated nixos-rebuild for autonomous agents"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.0,<2"]
+
+[project.scripts]
+claude-rebuild-classify = "claude_rebuild.classifier:main"
+claude-rebuild-apply = "claude_rebuild.apply:main"
+claude-rebuild-mcp = "claude_rebuild.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["claude_rebuild*"]
