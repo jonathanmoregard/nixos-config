@@ -16,6 +16,7 @@
     zenity
     dropbox
     thunderbird
+    gnome-text-editor # GTK4 — used for scroll-behavior comparison vs Mint (drift-debug 2026-04-28)
     android-studio # nixpkgs, NOT flatpak — RAM-hungry, avoid in 4GB VM
     # cursor: package name in nixpkgs is `code-cursor`. Re-add as
     #   code-cursor # rarely used but kept (drift-scan 2026-04-19)
