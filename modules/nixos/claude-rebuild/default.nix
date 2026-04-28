@@ -29,7 +29,10 @@ in {
   # by root; world-readable so user-side classifier can use last-applied-rev.
   systemd.tmpfiles.rules = [
     "d /var/lib/claude-rebuild 0755 root root -"
-    "f /var/log/claude-rebuild.log 0644 root root -"
+    # Audit log includes caller PIDs + parent-process cmdlines, which can
+    # include credentials passed via argv by upstream wrappers. Restrict
+    # to wheel so non-admin users can't trawl forensic identity data.
+    "f /var/log/claude-rebuild.log 0640 root wheel -"
   ];
 
   # /etc/nixos is root-owned; classifier runs as jonathan via the MCP server.

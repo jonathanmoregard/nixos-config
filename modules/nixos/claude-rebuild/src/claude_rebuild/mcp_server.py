@@ -39,6 +39,7 @@ class ApprovalSchema(BaseModel):
 
 
 _MAX_PATHS_IN_SUMMARY = 100
+_MAX_REASONS_IN_SUMMARY = 50
 
 
 def _summarize(c: common.Classification) -> str:
@@ -49,20 +50,28 @@ def _summarize(c: common.Classification) -> str:
         "",
         "changed paths:",
     ]
-    shown = c.changed_paths[:_MAX_PATHS_IN_SUMMARY]
-    for p in shown:
+    shown_paths = c.changed_paths[:_MAX_PATHS_IN_SUMMARY]
+    for p in shown_paths:
         lines.append(f"  - {p}")
-    if len(c.changed_paths) > len(shown):
-        lines.append(f"  ... and {len(c.changed_paths) - len(shown)} more")
+    if len(c.changed_paths) > len(shown_paths):
+        lines.append(f"  ... and {len(c.changed_paths) - len(shown_paths)} more")
     if c.reasons:
         lines.append("")
         lines.append("reasons:")
-        for r in c.reasons:
+        shown_reasons = c.reasons[:_MAX_REASONS_IN_SUMMARY]
+        for r in shown_reasons:
             lines.append(f"  - {r}")
+        if len(c.reasons) > len(shown_reasons):
+            lines.append(f"  ... and {len(c.reasons) - len(shown_reasons)} more")
     return "\n".join(lines)
 
 
 _APPLY_TIMEOUT_SECONDS = 1800  # 30 min — generous upper bound for nixos-rebuild
+
+# Hardcode NixOS setuid wrapper paths — bare names rely on PATH which a
+# compromised MCP server (or a stripped systemd unit env) could subvert.
+_SUDO = "/run/wrappers/bin/sudo"
+_PKEXEC = "/run/wrappers/bin/pkexec"
 
 
 def _run_apply(tier: str, from_rev: str, to_rev: str) -> dict[str, Any]:
@@ -70,10 +79,17 @@ def _run_apply(tier: str, from_rev: str, to_rev: str) -> dict[str, Any]:
     classified for the user. Without --to, apply would re-resolve HEAD and
     could silently apply a diff that differs from the one shown to the user."""
     base = ["claude-rebuild-apply", tier, "--from", from_rev, "--to", to_rev]
-    cmd = ["sudo", "-n", *base] if tier == "low" else ["pkexec", *base]
+    cmd = [_SUDO, "-n", *base] if tier == "low" else [_PKEXEC, *base]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=_APPLY_TIMEOUT_SECONDS,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_APPLY_TIMEOUT_SECONDS,
+            # pkexec falls back to reading password on stdin when no polkit
+            # auth agent is reachable. With capture_output it would block
+            # for the full timeout. DEVNULL forces fast-fail.
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired as e:
         return {

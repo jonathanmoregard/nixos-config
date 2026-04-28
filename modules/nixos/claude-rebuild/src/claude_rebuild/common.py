@@ -34,6 +34,9 @@ ALWAYS_LOW_FILES = {
     "modules/nixos/vm-tweaks.nix",
 }
 ALWAYS_HIGH_PREFIXES = (
+    # Intentionally no `.nix` suffix — matches both
+    # `hardware-configuration.nix` (current layout) and a future
+    # `hardware-configuration/` subdir if the file ever splits.
     "hardware-configuration",
     "hosts/",
 )

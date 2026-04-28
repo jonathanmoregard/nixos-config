@@ -59,7 +59,13 @@ def write_last_applied_rev(rev: str) -> None:
     common.LAST_REV_FILE.write_text(rev + "\n")
 
 
-def acquire_lock():
+# Module-level retention so a future refactor that moves acquire_lock()
+# into a helper can't silently let Python GC close the fd and release
+# the flock mid-rebuild.
+_LOCK_FDS: set[int] = set()
+
+
+def acquire_lock() -> int:
     common.STATE_DIR.mkdir(parents=True, exist_ok=True)
     fd = os.open(common.LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
     try:
@@ -67,6 +73,7 @@ def acquire_lock():
     except BlockingIOError:
         sys.stderr.write("another claude-rebuild-apply is already running\n")
         sys.exit(4)
+    _LOCK_FDS.add(fd)
     return fd
 
 
@@ -104,11 +111,12 @@ def main(argv: list[str] | None = None) -> int:
         help="override classifier from-rev (default: last-applied-rev)",
     )
     parser.add_argument(
-        "--to", dest="to_rev", default="HEAD",
+        "--to", dest="to_rev", required=True,
         help=(
-            "git rev to apply (default: HEAD). MCP-driven flows MUST pass the "
-            "sha that was classified + presented to the user, so the apply "
-            "doesn't silently drift if HEAD moves between elicit and pkexec."
+            "git rev to apply. MUST be a sha (or rev-parseable name resolved "
+            "to a sha by the caller). Required to prevent HEAD drift between "
+            "the user's elicit-time classification and apply-time invocation. "
+            "MCP passes classification.to_rev; CLI users must specify."
         ),
     )
     args = parser.parse_args(argv)

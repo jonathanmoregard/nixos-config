@@ -361,10 +361,16 @@ pkgs.testers.runNixOSTest {
     assert parsed["tier"] == "low", f"expected low, got {parsed!r}"
 
     # --- Direct apply low (root invocation) — stubbed nixos-rebuild ---
-    dellan.succeed(f"{cr_env} claude-rebuild-apply low")
+    # `--to HEAD` is required (no default) since round 2 — prevents HEAD
+    # drift between an agent's classification and apply.
+    dellan.succeed(f"{cr_env} claude-rebuild-apply low --to HEAD")
     dellan.succeed("test -s /tmp/cr-state/last-applied-rev")
     dellan.succeed("grep -q rebuild_finish /tmp/cr-audit.log")
     dellan.succeed("grep -q '\"exit_code\": 0' /tmp/cr-audit.log")
+
+    # apply with no --to must fail fast (required arg) — defense against
+    # CLI invocations that re-resolve HEAD silently.
+    dellan.fail(f"{cr_env} claude-rebuild-apply low")
 
     # --- Stage a HIGH-blast diff: touch flake.nix ---
     dellan.succeed("""
@@ -380,14 +386,14 @@ pkgs.testers.runNixOSTest {
     assert parsed["tier"] == "high", f"expected high, got {parsed!r}"
 
     # --- Defense in depth: apply low when classifier says high → reject ---
-    dellan.fail(f"{cr_env} claude-rebuild-apply low")
+    dellan.fail(f"{cr_env} claude-rebuild-apply low --to HEAD")
 
     # --- High tier without PKEXEC_UID → reject ---
-    dellan.fail(f"{cr_env} claude-rebuild-apply high")
+    dellan.fail(f"{cr_env} claude-rebuild-apply high --to HEAD")
 
     # --- High tier with PKEXEC_UID set (simulating a successful pkexec
     # elevation; in production polkit's prompt is the actual HITL gate) ---
-    dellan.succeed(f"PKEXEC_UID=1000 {cr_env} claude-rebuild-apply high")
+    dellan.succeed(f"PKEXEC_UID=1000 {cr_env} claude-rebuild-apply high --to HEAD")
 
     # --- B1 fix: --to <sha> pins the apply to the user-approved diff. ---
     # Reset to a clean state, commit C1 (low), capture sha, commit C2 (high).
@@ -461,15 +467,52 @@ pkgs.testers.runNixOSTest {
     parsed = _json.loads(out)
     assert parsed["tier"] == "high", f"services.openssh in desktop.nix must be high, got {parsed!r}"
 
-    # --- M2 fix: git stderr surfaced on failure. ---
-    # Pass a bogus rev — classifier uses check=True, so we expect non-zero
-    # exit AND stderr to mention git's complaint.
+    # --- M2 fix: classifier surfaces a useful error on a bogus rev. ---
+    # H5's ancestor check now fast-fails on unknown-rev with "not an
+    # ancestor"; deeper M2-style git-stderr surfacing is exercised when
+    # the rev exists but the repo state is broken (covered indirectly).
     rc, output = dellan.execute(
         f"{cr_env} claude-rebuild-classify --from nonexistent-rev --to HEAD 2>&1"
     )
     assert rc != 0, "classifier should fail on bogus rev"
-    assert any(s in output for s in ("fatal:", "unknown revision", "bad revision")), (
-        f"git stderr should be surfaced; got: {output[-500:]}"
+    assert any(s in output for s in ("ancestor", "fatal:", "unknown revision", "bad revision")), (
+        f"classifier should surface a useful error; got: {output[-500:]}"
+    )
+
+    # --- H5 fix: classifier refuses if <from> is not an ancestor of <to>. ---
+    # Use the existing 3-commit linear history (base → desktop-base →
+    # sshd-flip) and reverse the rev range. HEAD is sshd-flip, HEAD~1 is
+    # desktop-base. `--from HEAD --to HEAD~1` → from is NOT an ancestor
+    # of to (it's a descendant). Refusal expected. No branch state to
+    # clean up; subsequent tests still see a 3-commit history.
+    rc, output = dellan.execute(
+        f"{cr_env} claude-rebuild-classify --from HEAD --to HEAD~1 2>&1"
+    )
+    assert rc != 0, f"classifier should refuse non-ancestor; got rc={rc}, out={output!r}"
+    assert "ancestor" in output, f"expected ancestor refusal message; got: {output[-500:]}"
+
+    # --- L12: production safe.directory works on real /etc/nixos. ---
+    # Unlike the test-only `safe.directory '*'` we set above, the module
+    # declares a pinned safe.directory = /etc/nixos in NixOS config. This
+    # asserts that pin works for `jonathan` reading the root-owned repo.
+    # /etc/nixos in the test VM is whatever NixOS materialized — empty by
+    # default, so we initialize it as a real git repo first to exercise
+    # the safe.directory contract.
+    dellan.succeed("""
+      set -eux
+      mkdir -p /etc/nixos
+      cd /etc/nixos
+      git init -q 2>/dev/null || true
+      git config user.email a@b
+      git config user.name t
+      [ -f marker ] || ( echo m > marker && git add -A && git -c user.email=a@b -c user.name=t commit -q -m init )
+      chown -R root:root /etc/nixos
+    """)
+    # As jonathan, run git status on root-owned /etc/nixos. With pinned
+    # safe.directory in NixOS config (programs.git.config.safe.directory),
+    # this must succeed without "dubious ownership" error.
+    dellan.succeed(
+        "su - jonathan -c 'git -C /etc/nixos status' >/dev/null"
     )
 
     # === MCP server stdio: full request/response cycle ===

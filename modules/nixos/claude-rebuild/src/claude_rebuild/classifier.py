@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 
 from . import common
@@ -58,6 +59,20 @@ def check_deny_keys(from_rev: str, to_rev: str) -> list[str]:
 
 
 def classify(from_rev: str, to_rev: str) -> common.Classification:
+    # Refuse if <from> is not an ancestor of <to>. After a rebase / force-push
+    # the diff `<from>..<to>` could include unrelated commits and flip tier
+    # in either direction. Fail closed rather than classify nonsense.
+    rc = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", from_rev, to_rev],
+        cwd=common.REPO,
+        capture_output=True,
+    ).returncode
+    if rc != 0:
+        raise SystemExit(
+            f"classify: <from> {from_rev} is not an ancestor of <to> {to_rev}. "
+            "Refusing — repo likely rebased between classify and apply."
+        )
+
     paths = common.changed_paths(from_rev, to_rev)
     tier = "low"
     reasons: list[str] = []
