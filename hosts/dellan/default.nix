@@ -5,6 +5,7 @@
     ../../modules/nixos/desktop.nix
     ../../modules/nixos/laptop.nix
     ../../modules/nixos/tailscale.nix
+    ../../modules/nixos/research-agent.nix
   ];
 
   # Overlays — bump beeper above nixpkgs (server-enforced min version).

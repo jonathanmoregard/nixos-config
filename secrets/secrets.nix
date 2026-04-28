@@ -10,6 +10,14 @@ let
 
   allKeys = [ jonathan vm dellan ];
 in {
-  # Add secrets here as needed, e.g.:
-  # "my-api-key.age".publicKeys = allKeys;
+  # API keys, split by trust/risk profile. Each should map to its own provider
+  # workspace with its own spend cap.
+  #   scanner  — research-agent injection scanner (untrusted-content honeypot,
+  #              ensemble across Anthropic + OpenAI; both keys required)
+  #   dev      — interactive Claude Code use (reserved)
+  #   headless — RSI / cron / sandbox autonomous agents (reserved)
+  "anthropic-api-key-scanner.age".publicKeys = allKeys;
+  "openai-api-key-scanner.age".publicKeys = allKeys;
+  # "anthropic-api-key-dev.age".publicKeys = allKeys;
+  # "anthropic-api-key-headless.age".publicKeys = allKeys;
 }
