@@ -19,10 +19,25 @@
   let
     linuxSystem = "x86_64-linux";
     darwinSystem = "aarch64-darwin";
+
+    # Pre-built pkgs — overlays + allowUnfree applied here rather than in
+    # modules. Required so tests/dellan-vm.nix can reuse the same pkgs:
+    # the nixosTest framework injects pkgs externally and that makes
+    # `nixpkgs.config` / `nixpkgs.overlays` read-only inside modules.
+    pkgsLinux = import nixpkgs {
+      system = linuxSystem;
+      config.allowUnfree = true;
+      overlays = [ (import ./overlays/beeper.nix) ];
+    };
+    pkgsDarwin = import nixpkgs {
+      system = darwinSystem;
+      config.allowUnfree = true;
+    };
   in {
     # NixOS VM (headless, QEMU/KVM)
     nixosConfigurations.vm = nixpkgs.lib.nixosSystem {
       system = linuxSystem;
+      pkgs = pkgsLinux;
       modules = [
         ./hosts/vm/default.nix
         ./modules/common.nix
@@ -41,6 +56,7 @@
     # Dell Latitude 7440 laptop — daily driver
     nixosConfigurations.dellan = nixpkgs.lib.nixosSystem {
       system = linuxSystem;
+      pkgs = pkgsLinux;
       modules = [
         ./hosts/dellan/default.nix
         ./modules/common.nix
@@ -55,9 +71,16 @@
       ];
     };
 
+    # VM-based e2e tests. Run: `nix build .#checks.x86_64-linux.dellan-vm -L`
+    checks.${linuxSystem}.dellan-vm = import ./tests/dellan-vm.nix {
+      pkgs = pkgsLinux;
+      inputs = { inherit home-manager agenix; };
+    };
+
     # Mac Mini (nix-darwin, placeholder — flesh out on arrival)
     darwinConfigurations.mac-mini = nix-darwin.lib.darwinSystem {
       system = darwinSystem;
+      pkgs = pkgsDarwin;
       modules = [
         ./hosts/mac-mini/default.nix
         ./modules/common.nix

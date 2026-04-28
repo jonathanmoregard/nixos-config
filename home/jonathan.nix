@@ -56,7 +56,7 @@
     executable = true;
     text = ''
       #!/usr/bin/env bash
-      ${pkgs.gitleaks}/bin/gitleaks detect --staged --redact -q
+      ${pkgs.gitleaks}/bin/gitleaks git --staged --redact -q
       if [ $? -ne 0 ]; then
         echo ""
         echo "gitleaks: potential secret detected — commit blocked."

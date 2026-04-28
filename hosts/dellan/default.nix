@@ -7,9 +7,6 @@
     ../../modules/nixos/tailscale.nix
   ];
 
-  # Overlays — bump beeper above nixpkgs (server-enforced min version).
-  nixpkgs.overlays = [ (import ../../overlays/beeper.nix) ];
-
   # systemd-boot on UEFI
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
