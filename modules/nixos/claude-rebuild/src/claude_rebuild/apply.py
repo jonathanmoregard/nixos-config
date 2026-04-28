@@ -48,7 +48,12 @@ def require_root() -> None:
 
 
 def require_pkexec_for_high(tier: str) -> None:
-    if tier == "high" and "PKEXEC_UID" not in os.environ:
+    if tier != "high":
+        return
+    # Empty-string env var would pass `in os.environ` — tighten to require
+    # a digit string. pkexec sets PKEXEC_UID to the invoking user's real UID.
+    val = os.environ.get("PKEXEC_UID", "")
+    if not val.isdigit():
         sys.stderr.write(
             "tier=high must be invoked via pkexec (desktop password prompt).\n"
             "  pkexec claude-rebuild-apply high\n"
@@ -60,8 +65,15 @@ def require_pkexec_for_high(tier: str) -> None:
 def audit(record: dict) -> None:
     common.AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
     record = {"ts": dt.datetime.now(dt.UTC).isoformat(), **record}
-    with common.AUDIT_LOG.open("a") as f:
-        f.write(json.dumps(record) + "\n")
+    # tmpfiles creates the audit log at boot with 0640 root:wheel. If it
+    # was deleted at runtime, Python's `open("a")` recreates it with
+    # default umask (typically 0644). Force 0640 explicitly so caller
+    # cmdlines never become world-readable post-recreate.
+    fd = os.open(common.AUDIT_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+    try:
+        os.write(fd, (json.dumps(record) + "\n").encode())
+    finally:
+        os.close(fd)
 
 
 def write_last_applied_rev(rev: str) -> None:

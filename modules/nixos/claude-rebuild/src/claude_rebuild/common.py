@@ -112,7 +112,11 @@ def resolve_rev(rev: str) -> str:
     return git("rev-parse", rev).strip()
 
 
-_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+# Tightened to full 40-hex shas only. We always WRITE full shas
+# (resolve_rev → git rev-parse → 40 chars lowercase). Abbreviated values
+# can become ambiguous as the repo grows; reject and fall back rather
+# than risk a silent rev resolution drift.
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def read_last_applied_rev() -> str | None:
