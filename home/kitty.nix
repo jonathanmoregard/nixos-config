@@ -161,6 +161,7 @@ let
     import glob
     import json
     import os
+    import re
     import subprocess
     import sys
     import time
@@ -178,6 +179,29 @@ let
                     return f"unix:{f}"
             time.sleep(0.3)
         return None
+
+
+    def maybe_resume_claude(cmd, cwd):
+        """If cmd is the claude-code CLI, rewrite to resume the latest
+        session for this cwd. Returns the (possibly modified) cmd list."""
+        if not cmd or not cwd:
+            return cmd
+        if os.path.basename(cmd[0]) != "claude":
+            return cmd
+        encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+        proj_dir = os.path.expanduser(f"~/.claude/projects/{encoded}")
+        if not os.path.isdir(proj_dir):
+            return cmd
+        sessions = [
+            (f, os.path.getmtime(os.path.join(proj_dir, f)))
+            for f in os.listdir(proj_dir)
+            if f.endswith(".jsonl")
+        ]
+        if not sessions:
+            return cmd
+        sessions.sort(key=lambda t: t[1], reverse=True)
+        latest = sessions[0][0].removesuffix(".jsonl")
+        return [cmd[0], "--resume", latest]
 
 
     def main():
@@ -215,8 +239,10 @@ let
                 for win in tab.get("windows", []):
                     fg = win.get("foreground_processes") or []
                     cmd = fg[0].get("cmdline", []) if fg else []
+                    cwd = win.get("cwd")
+                    cmd = maybe_resume_claude(cmd, cwd)
                     panes.append({
-                        "cwd": win.get("cwd"),
+                        "cwd": cwd,
                         "title": win.get("title", ""),
                         "cmd": cmd,
                     })
@@ -256,6 +282,42 @@ let
             if p["cmd"]:
                 argv += ["--", *p["cmd"]]
             subprocess.run(argv, check=False)
+
+        # Final cleanup: kitty sometimes spawns a stray OS window during
+        # restore (race between launch + close-window). Close any OS
+        # window that ended up with fewer panes than the largest one —
+        # that's our restored topology; the rest are leftovers.
+        ls_final = subprocess.check_output(
+            ["kitty", "@", "--to", sock, "ls"], text=True,
+        )
+        os_windows = json.loads(ls_final)
+        print(f"[restore] final cleanup; {len(os_windows)} OS window(s)",
+              flush=True)
+        if len(os_windows) > 1:
+            entries = []
+            for osw in os_windows:
+                total = sum(len(t["windows"]) for t in osw.get("tabs", []))
+                sample_wid = None
+                for t in osw.get("tabs", []):
+                    for w in t.get("windows", []):
+                        sample_wid = w["id"]
+                        break
+                    if sample_wid is not None:
+                        break
+                entries.append((osw["id"], total, sample_wid))
+            max_count = max(c for _, c, _ in entries)
+            for osw_id, count, sample_wid in entries:
+                if count < max_count and sample_wid is not None:
+                    print(
+                        f"[restore] closing stray OS#{osw_id} "
+                        f"({count} windows)",
+                        flush=True,
+                    )
+                    subprocess.run(
+                        ["kitty", "@", "--to", sock,
+                         "close-window", f"--match=id:{sample_wid}"],
+                        check=False,
+                    )
 
 
     if __name__ == "__main__":
@@ -341,15 +403,14 @@ let
         # Stale socket from a crashed instance — clean it up.
         rm -f "\$f"
       done
-      # First-launch restore: drop -1 so kitty doesn't think it's
-      # forwarding to an existing instance (single-instance + --session
-      # interact poorly). NOTE: layout-preservation via the 2x2 grid
-      # pattern is WIP — kitty-pane-add and kitty-restore-session
-      # derivations exist in this file but are not yet wired in. For
-      # now we use kitty's native --session, which restores
-      # cwds/titles/commands but rearranges splits.
-      if [ -s "\$session" ] && [ "\$live" -eq 0 ]; then
-        exec ${pkgs.kitty}/bin/kitty --session "\$session" "\$@"
+      # First-launch restore: spawn kitty-restore-session in the
+      # background to inject panes via kitty-pane-add (preserving the
+      # 2x2 grid pattern), then exec plain kitty. The restore script
+      # waits for kitty's socket to appear before issuing its commands.
+      snap="\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/snapshot.json"
+      if [ -s "\$snap" ] && [ "\$live" -eq 0 ]; then
+        ( ${kittyRestoreSession}/bin/kitty-restore-session \
+            >/tmp/kitty-restore.log 2>&1 & )
       fi
       exec ${pkgs.kitty}/bin/kitty -1 "\$@"
       EOF

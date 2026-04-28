@@ -97,8 +97,9 @@ pkgs.testers.runNixOSTest {
 
     # Helper: glob discovers the live socket regardless of kitty's PID.
     sock_cmd = (
-        "sock=$(ls /tmp/kitty.sock-* 2>/dev/null | head -1); "
-        "[ -n \"$sock\" ] && kitty @ --to unix:$sock"
+        'sock=$(find /tmp -maxdepth 1 -name "kitty.sock-*" -type s '
+        '2>/dev/null | head -1); '
+        '[ -n "$sock" ] && kitty @ --to unix:$sock'
     )
 
     # --- Phase 1: bring up kitty + 3 extra windows, each with a distinct
@@ -117,15 +118,19 @@ pkgs.testers.runNixOSTest {
         ("/var", "22222"),
         ("/etc", "33333"),
     ]
-    # Set up 4 panes via kitty's native remote control. The 2x2 grid
-    # ordering (vsplit, hsplit-left, hsplit-right, new-tab pattern) is
-    # WIP — see kittyPaneAdd / kittyRestoreSession in home/kitty.nix.
-    # For now we just verify that the 4 panes' cwds + cmdlines round-trip.
+    # Set up 4 panes via kitty-pane-add — drives the 2x2 grid pattern
+    # (vsplit, hsplit-left, hsplit-right, new-tab). Default first window
+    # acts as pane 1; 3 additional pane-adds give us 4 total in 2x2.
     for cwd, magic in panes:
         dellan.succeed(
-            f"su jonathan -c '{sock_cmd} launch --type=window --cwd {cwd} "
-            f"{sleep_bin} {magic}'"
+            "su jonathan -c "
+            f"'kitty-pane-add --cwd {cwd} -- {sleep_bin} {magic}'"
         )
+    dellan.wait_until_succeeds(
+        f"su jonathan -c '{sock_cmd} ls' | "
+        "jq -e '[.[].tabs[].windows[]] | length == 4'",
+        timeout=15,
+    )
     # Wait for all 4 windows to register.
     dellan.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls' | "
@@ -166,21 +171,48 @@ pkgs.testers.runNixOSTest {
             "/home/jonathan/.cache/kitty-session/last.session"
         )
 
-    # --- Phase 3: kill kitty, confirm process gone. (Stale socket files
-    # may persist briefly; the wrapper probes them on next launch and
-    # cleans dead ones — see home/kitty.nix.) ---
-    dellan.succeed("su jonathan -c 'pkill -x kitty || true'")
-    dellan.wait_until_succeeds(
-        "! pgrep -x -u jonathan kitty >/dev/null", timeout=15
+    # --- Phase 3: kill kitty. Try graceful close first; many kitty
+    # processes ignore SIGKILL when started via --detach, but respond
+    # to its own remote-control close-os-window protocol. ---
+    print("[diag] ps before kill:\n" + dellan.succeed(
+        "ps -u jonathan -o pid,comm,args --no-headers || true"
+    ))
+    dellan.succeed(
+        f"su jonathan -c '{sock_cmd} close-os-window --match=all || true'"
     )
+    dellan.sleep(2)
+    # Then SIGKILL any stragglers. Comm pattern matches `.kitty-wrapped`
+    # (nixpkgs wrap-program prefixes the binary with `.`) and `kitten`.
+    dellan.succeed(
+        "for _ in 1 2 3 4 5; do "
+        "  pids=$(ps -u jonathan -o pid,comm --no-headers | "
+        "    awk '$2 ~ /kit/ {print $1}'); "
+        "  [ -z \"$pids\" ] && break; "
+        "  echo $pids | xargs kill -KILL 2>/dev/null || true; "
+        "  sleep 1; "
+        "done; true"
+    )
+    print("[diag] ps after kill:\n" + dellan.succeed(
+        "ps -u jonathan -o pid,comm,args --no-headers || true"
+    ))
+    dellan.succeed("rm -f /tmp/kitty.sock-*")
 
     # --- Phase 4: relaunch via wrapper — must auto-inject --session.
     # Use shell backgrounding (& + setsid) instead of kitty's --detach,
     # which can spawn an extra default OS window alongside the session. ---
     dellan.succeed(
         "su jonathan -c 'DISPLAY=:0 setsid kitty </dev/null "
-        ">/tmp/kitty-restore.log 2>&1 &'"
+        ">/tmp/kitty-relaunch.log 2>&1 &'"
     )
+    # Diagnostic dump before the wait — failures at the wait give us
+    # nothing to inspect otherwise.
+    dellan.sleep(3)
+    print("[diag pre-wait] restore.log:\n" + dellan.succeed(
+        "cat /tmp/kitty-restore.log 2>&1 || true"
+    ))
+    print("[diag pre-wait] sockets:\n" + dellan.succeed(
+        "find /tmp -maxdepth 1 -name 'kitty.sock-*' 2>&1 || true"
+    ))
     dellan.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls >/dev/null'", timeout=30
     )
@@ -194,13 +226,26 @@ pkgs.testers.runNixOSTest {
     # Give kitty a moment to finish spawning all session-restored windows.
     dellan.sleep(3)
     dellan.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/ls-after.json'")
+    print("[diag] kitty-wrapper.log:\n" + dellan.succeed(
+        "cat /tmp/kitty-wrapper.log 2>&1 || true"
+    ))
     print("[diag] kitty-restore.log:\n" + dellan.succeed(
         "cat /tmp/kitty-restore.log 2>&1 || true"
     ))
+    print("[diag] kitty-relaunch.log:\n" + dellan.succeed(
+        "cat /tmp/kitty-relaunch.log 2>&1 || true"
+    ))
     print("[diag] ls-after.json:\n" + dellan.succeed("cat /tmp/ls-after.json"))
 
-    # All 3 magic sleep cmds must be back, with their cwds. (Layout / 2x2
-    # grid restoration is WIP — see kittyPaneAdd in home/kitty.nix.)
+    # Wait for restore-session to finish injecting all panes (async).
+    dellan.wait_until_succeeds(
+        f"su jonathan -c '{sock_cmd} ls > /tmp/ls-after.json' && "
+        "jq -e '[.[].tabs[].windows[]] | length == 4' /tmp/ls-after.json",
+        timeout=30,
+    )
+    print("[diag] ls-after final:\n" + dellan.succeed("cat /tmp/ls-after.json"))
+
+    # All 3 magic sleep cmds must be back, with their cwds.
     for cwd, magic in panes:
         dellan.succeed(
             f"jq -e '[.[].tabs[].windows[].cwd] | any(. == \"{cwd}\")' "
@@ -211,5 +256,15 @@ pkgs.testers.runNixOSTest {
             f"join(\" \")] | any(. | endswith(\"sleep {magic}\"))' "
             "/tmp/ls-after.json"
         )
+
+    # 2x2 grid: tab uses splits layout with 4 distinct window groups.
+    # (kitty's `ls` JSON doesn't expose at_x/at_y; the layout pattern is
+    # encoded in `tabs[].groups[]` — 4 groups means 4 separate splits.)
+    dellan.succeed(
+        "jq -e '.[0].tabs[0].layout == \"splits\"' /tmp/ls-after.json"
+    )
+    dellan.succeed(
+        "jq -e '.[0].tabs[0].groups | length == 4' /tmp/ls-after.json"
+    )
   '';
 }
