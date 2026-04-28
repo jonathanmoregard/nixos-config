@@ -22,10 +22,12 @@
   services.tlp = {
     enable = true;
     settings = {
-      # `performance` pinned cores to 5.2 GHz on AC and pushed pkg temp to
-      # 95°C with fans full-tilt at idle. `schedutil` is the modern kernel
-      # default and ramps cores on demand.
-      CPU_SCALING_GOVERNOR_ON_AC = "schedutil";
+      # i7-1365U uses intel_pstate, which only exposes "performance" and
+      # "powersave" governors — `performance` pins cores at 5.2 GHz at idle
+      # (95°C, fans full). On modern Intel, "powersave" governor + EPP
+      # ("balance_performance" on AC, "power" on battery) is the correct
+      # idiom — clocks ramp on demand via EPP hints, not the governor.
+      CPU_SCALING_GOVERNOR_ON_AC = "powersave";
       CPU_SCALING_GOVERNOR_ON_BAT = "powersave";
       CPU_ENERGY_PERF_POLICY_ON_AC = "balance_performance";
       CPU_ENERGY_PERF_POLICY_ON_BAT = "power";
