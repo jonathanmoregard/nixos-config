@@ -22,7 +22,10 @@
   services.tlp = {
     enable = true;
     settings = {
-      CPU_SCALING_GOVERNOR_ON_AC = "performance";
+      # `performance` pinned cores to 5.2 GHz on AC and pushed pkg temp to
+      # 95°C with fans full-tilt at idle. `schedutil` is the modern kernel
+      # default and ramps cores on demand.
+      CPU_SCALING_GOVERNOR_ON_AC = "schedutil";
       CPU_SCALING_GOVERNOR_ON_BAT = "powersave";
       CPU_ENERGY_PERF_POLICY_ON_AC = "balance_performance";
       CPU_ENERGY_PERF_POLICY_ON_BAT = "power";
