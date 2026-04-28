@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -111,10 +112,28 @@ def resolve_rev(rev: str) -> str:
     return git("rev-parse", rev).strip()
 
 
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
 def read_last_applied_rev() -> str | None:
-    if LAST_REV_FILE.is_file():
-        return LAST_REV_FILE.read_text().strip() or None
-    return None
+    """Read /var/lib/claude-rebuild/last-applied-rev, validate it's a real
+    sha that still exists in the repo. A poisoned or stale file (rebased-
+    away sha) returned blindly would propagate into git diff and crash
+    every classify call until ops manually intervened."""
+    if not LAST_REV_FILE.is_file():
+        return None
+    raw = LAST_REV_FILE.read_text().strip()
+    if not raw or not _SHA_RE.match(raw):
+        return None
+    # Confirm the sha resolves in the current repo.
+    rc = subprocess.run(
+        ["git", "cat-file", "-e", raw],
+        cwd=REPO,
+        capture_output=True,
+    ).returncode
+    if rc != 0:
+        return None
+    return raw
 
 
 def changed_paths(from_rev: str, to_rev: str) -> list[str]:

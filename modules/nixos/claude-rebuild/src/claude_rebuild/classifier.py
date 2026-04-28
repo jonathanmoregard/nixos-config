@@ -68,7 +68,11 @@ def classify(from_rev: str, to_rev: str) -> common.Classification:
         capture_output=True,
     ).returncode
     if rc != 0:
-        raise SystemExit(
+        # ValueError (not SystemExit) — SystemExit inherits BaseException
+        # and would propagate through FastMCP's `except Exception` tool
+        # wrapping, killing the long-running MCP server. ValueError is
+        # caught and surfaces to the MCP client as a tool error.
+        raise ValueError(
             f"classify: <from> {from_rev} is not an ancestor of <to> {to_rev}. "
             "Refusing — repo likely rebased between classify and apply."
         )
@@ -122,7 +126,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from_rev = resolve_from(args.from_rev)
-    result = classify(from_rev, args.to_rev)
+    try:
+        result = classify(from_rev, args.to_rev)
+    except ValueError as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
     json.dump(result.to_dict(), sys.stdout, indent=2)
     sys.stdout.write("\n")
 

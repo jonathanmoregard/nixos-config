@@ -46,6 +46,14 @@ in {
   # Sudoers — NOPASSWD only for the LOW tier. HIGH must go through pkexec.
   # The apply binary re-runs the classifier and rejects if its own classification
   # disagrees with the requested tier (defense in depth).
+  #
+  # IMPORTANT: sudo command-match is positional and matches as a PREFIX —
+  # `claude-rebuild-apply low` allows any args after `low` (e.g. `--from`,
+  # `--to`). Defense in depth (re-classification + tier check) is what keeps
+  # this safe. If you ever add a new flag to apply that bypasses or weakens
+  # classification (e.g. `--skip-classify`), you MUST also tighten this rule
+  # or that flag becomes silently NOPASSWD-callable from any context that
+  # can sudo. Audit `apply.py` flags before changing this.
   security.sudo.extraRules = [{
     users = [ "jonathan" ];
     commands = [{

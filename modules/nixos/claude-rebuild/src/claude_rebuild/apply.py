@@ -16,6 +16,16 @@ Defense in depth:
 
 Writes /var/lib/claude-rebuild/last-applied-rev (HEAD sha) on success.
 Appends one JSON line per attempt to /var/log/claude-rebuild.log.
+
+Exit codes (for ops debugging):
+  0 — rebuild succeeded
+  1 — argparse / unknown flag
+  2 — not invoked as root (sudo or pkexec required)
+  3 — tier=high requested but PKEXEC_UID not set (sudo cannot apply high)
+  4 — another claude-rebuild-apply already holds the flock
+  5 — classifier disagrees with requested tier (defense in depth)
+  6 — classifier raised ValueError (e.g., non-ancestor rev range)
+  >0 from nixos-rebuild — propagated as-is
 """
 
 from __future__ import annotations
@@ -126,7 +136,11 @@ def main(argv: list[str] | None = None) -> int:
     lock = acquire_lock()  # noqa: F841 — held until process exit
 
     from_rev = classifier.resolve_from(args.from_rev)
-    result = classifier.classify(from_rev, args.to_rev)
+    try:
+        result = classifier.classify(from_rev, args.to_rev)
+    except ValueError as e:
+        sys.stderr.write(f"{e}\n")
+        return 6
     caller = caller_identity()
 
     if result.tier != args.tier:

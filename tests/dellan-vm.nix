@@ -491,6 +491,39 @@ pkgs.testers.runNixOSTest {
     assert rc != 0, f"classifier should refuse non-ancestor; got rc={rc}, out={output!r}"
     assert "ancestor" in output, f"expected ancestor refusal message; got: {output[-500:]}"
 
+    # --- B3 fix: classifier raises ValueError (not SystemExit) on
+    # non-ancestor, so MCP server doesn't crash on bad state. CLI exits
+    # cleanly with code 1, no Python traceback dumped. ---
+    assert "Traceback" not in output, (
+        f"non-ancestor refusal should be clean stderr, no Python traceback: {output[-500:]}"
+    )
+
+    # --- H6 fix: poisoned last-applied-rev falls back instead of crashing. ---
+    dellan.succeed("""
+      set -eux
+      mkdir -p /tmp/cr-state
+      echo 'this-is-not-a-sha-garbage-from-prior-version' > /tmp/cr-state/last-applied-rev
+    """)
+    # No --from supplied → resolve_from reads last-applied-rev → garbage →
+    # validation discards → falls back to HEAD~1.
+    out = dellan.succeed(f"{cr_env} claude-rebuild-classify --to HEAD")
+    parsed = _json.loads(out)
+    assert "tier" in parsed, f"poisoned last-applied-rev should fall back, not crash: {parsed!r}"
+
+    # Same with a stale-but-syntactically-valid sha (rebased away).
+    dellan.succeed("""
+      set -eux
+      echo '0000000000000000000000000000000000000000' > /tmp/cr-state/last-applied-rev
+    """)
+    out = dellan.succeed(f"{cr_env} claude-rebuild-classify --to HEAD")
+    parsed = _json.loads(out)
+    assert "tier" in parsed, f"stale-sha last-applied-rev should fall back: {parsed!r}"
+
+    # Restore a valid last-applied-rev for subsequent tests (point at HEAD~1).
+    dellan.succeed(
+        "cd /tmp/cr-repo && git rev-parse HEAD~1 > /tmp/cr-state/last-applied-rev"
+    )
+
     # --- L12: production safe.directory works on real /etc/nixos. ---
     # Unlike the test-only `safe.directory '*'` we set above, the module
     # declares a pinned safe.directory = /etc/nixos in NixOS config. This
