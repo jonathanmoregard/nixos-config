@@ -17,6 +17,10 @@ Mac Mini config is a placeholder (nix-darwin), fleshed out on arrival.
 
 Alias on VM: `rebuild` (defined in `home/jonathan.nix`).
 
+## Repo layout
+
+`/home/jonathan/Repos/nixos-config` is a symlink to `/etc/nixos`. Same git repo — edits, status, and pulls in either path hit the same tree.
+
 ## Deploy workflow
 
 Changes live on the host, rsync'd to VM — no GitHub credentials on VM:
