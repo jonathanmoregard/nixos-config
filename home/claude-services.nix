@@ -1,4 +1,4 @@
-{ ... }:
+{ pkgs, ... }:
 # Claude-related user services. Captured from live host on 2026-04-27 — these
 # units were installed imperatively (~/.config/systemd/user/) and would be
 # lost on a fresh rebuild without this declarative copy.
@@ -17,7 +17,7 @@
     };
     Service = {
       Type = "oneshot";
-      ExecStartPre = "%h/.local/bin/uv pip install --python %h/.claude/dev-container/.venv/bin/python3 --no-cache --quiet --upgrade --force-reinstall injection-scanner@git+https://github.com/jonathanmoregard/injection-scanner@main";
+      ExecStartPre = "${pkgs.uv}/bin/uv pip install --python %h/.claude/dev-container/.venv/bin/python3 --no-cache --quiet --upgrade --force-reinstall injection-scanner@git+https://github.com/jonathanmoregard/injection-scanner@main";
       ExecStart = "%h/.claude/dev-container/.venv/bin/python3 %h/.claude/dev-container/bin/claude-cl-sync";
       Nice = 10;
       Environment = "PYTHONDONTWRITEBYTECODE=1";
