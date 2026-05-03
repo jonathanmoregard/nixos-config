@@ -14,6 +14,8 @@
     gh
     direnv
     jq
+    # Fonts
+    nerd-fonts.jetbrains-mono
     # Dev toolchains
     rustc
     cargo

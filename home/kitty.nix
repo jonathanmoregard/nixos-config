@@ -114,10 +114,15 @@ let
         )
         data = json.loads(ls_out)
         active_tab = None
+        focused_win = None
         for osw in data:
             for tab in osw.get("tabs", []):
                 if tab.get("is_focused"):
                     active_tab = tab
+                    for w in tab.get("windows", []):
+                        if w.get("is_focused"):
+                            focused_win = w
+                            break
                     break
             if active_tab:
                 break
@@ -126,6 +131,10 @@ let
         if not active_tab:
             print("no tab", file=sys.stderr)
             sys.exit(1)
+
+        # Inherit cwd from the focused window if --cwd wasn't given.
+        if cwd is None and focused_win is not None:
+            cwd = focused_win.get("cwd")
 
         windows = active_tab.get("windows", [])
         count = len(windows)
@@ -433,12 +442,91 @@ in
     # confirmation when closing windows via UI/shortcut.
     confirm_os_window_close 0
 
+    # === Ghostty-default-dark theme port + matching aesthetics ===
+    # Source: ghostty-org/ghostty discussions #5390
+    # foreground is slightly off-white (#ebebeb) — pure #ffffff renders harsher
+    # in kitty than ghostty's freetype pipeline; this reduces glare without
+    # losing contrast.
+    foreground            #ebebeb
+    background            #292c33
+    selection_foreground  #ffffff
+    selection_background  #ffffff
+    cursor                #ffffff
+    cursor_text_color     #363a43
+
+    # Window split dividers (kitty default = neon green, replaced)
+    active_border_color   #5c6370
+    inactive_border_color #3a3d44
+
+    # Normal colors (palette 0-7)
+    color0  #1d1f21
+    color1  #bf6b69
+    color2  #b7bd73
+    color3  #e9c880
+    color4  #88a1bb
+    color5  #ad95b8
+    color6  #95bdb7
+    color7  #c5c8c6
+
+    # Bright colors (palette 8-15)
+    color8  #666666
+    color9  #c55757
+    color10 #bcc95f
+    color11 #e1c65e
+    color12 #83a5d6
+    color13 #bc99d4
+    color14 #83beb1
+    color15 #eaeaea
+
+    # Font (JetBrains Mono Nerd Font installed via home/jonathan.nix).
+    # ghostty Linux default = 12pt freetype.
+    font_family      JetBrainsMono Nerd Font Mono
+    font_size        12.0
+    modify_font     underline_position 1
+    modify_font     underline_thickness 200%
+
+    # Thicker glyph rendering — kitty default 1.7 renders thinner than
+    # ghostty's freetype output. Bump to 2.0 to bring weight closer; pairs
+    # with off-white foreground above for the "thicker but slightly duller"
+    # ghostty look (esp. visible on claude-code's renamed-session label).
+    text_composition_strategy 2.0 0
+
+    # Ghostty Linux default = 2px each side.
+    window_padding_width 2
+
+    # Fade non-focused panes — ghostty overlays whole surface (fg+bg) at
+    # 0.7 opacity. kitty only fades text, so go lower (0.55) to land at
+    # roughly the same perceived dim.
+    inactive_text_alpha 0.55
+
+    # Cursor
+    cursor_shape block
+    cursor_blink_interval 0.5
+
+    enable_audio_bell no
+    scrollback_lines 10000
+
+    # Tab bar — separator style, minimal chrome.
+    tab_bar_min_tabs 2
+    tab_bar_style separator
+    tab_separator "  ┃  "
+    tab_bar_margin_width 0
+    tab_bar_margin_height 0 0
+    tab_title_template "{title}"
+    # Match ghostty's GTK Adwaita tab-label weight (bolder than kitty's default).
+    active_tab_font_style   bold
+    inactive_tab_font_style bold
+
     # Keybinds — mirror Ghostty config (home/ghostty.nix). These override
     # kitty defaults like ctrl+minus = decrease_font_size.
     map ctrl+minus launch --location=hsplit --cwd=current
     map ctrl+w close_window
     map ctrl+up neighboring_window up
     map ctrl+down neighboring_window down
+    # Add new pane via the 2x2-grid pattern (kitty-pane-add).
+    map ctrl+less launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
+    # New tab inheriting cwd of current window.
+    map ctrl+t new_tab_with_cwd
   '';
 
   # Periodic snapshot — survives crashes, kernel panics, power loss.
