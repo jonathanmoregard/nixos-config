@@ -88,7 +88,7 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
    - **Implementation:** `pkgs.writers.writePython3Bin "github-webhook-handler"`. Reads request from stdin (socket-activated), writes response to stdout. Lives in `modules/nixos/github-webhook.nix`.
    - **HMAC verification:** computes `hmac.new(SECRET, body, sha256)` and compares to `X-Hub-Signature-256` header in constant time (`hmac.compare_digest`). Secret in `secrets/github-webhook-secret.age`, exposed as `EnvironmentFile`.
    - **Replay protection:** stores `X-GitHub-Delivery` UUIDs seen in the last 24h to `/var/lib/github-webhook/seen` (one UUID per line, pruned on rotation). Duplicate UUID → 200 OK with no action.
-   - **Rate limit (accept-side):** systemd socket unit sets `RateLimitIntervalSec=10` and `RateLimitBurst=5` (5 new connections per 10s, then queues).
+   - **Rate limit (accept-side):** systemd socket unit sets `RateLimitIntervalSec=10` and `RateLimitBurst=10` (10 new connections per 10s, then queues). GitHub retries failed webhooks up to 3x with exponential backoff over ~30s; burst=5 risked dropping retries during transient errors.
    - **Slowloris protection (read-side):** socket unit sets `MaxConnections=4` (cap on concurrent in-flight workers); service unit sets `TimeoutStartSec=10s` (kill the handler if it exceeds 10s); python handler calls `socket.settimeout(5)` on its read loop so a dripping connection cannot stall the worker indefinitely.
    - **Event filter:** handler only acts on `X-GitHub-Event: push` with `payload.ref == "refs/heads/main"`. All other events → 200 OK with no action.
    - On valid push: `systemctl start nixos-deploy.service`
@@ -103,11 +103,12 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
    - **discover-hosts:** `nix eval` walks `nixosConfigurations` and `darwinConfigurations`, emits a matrix. Linux jobs run on `[self-hosted, x86_64-linux]`; darwin jobs require `[self-hosted, aarch64-darwin]` → skip with warning if no runner.
 4. **Cache:** Attic server (`pkgs.attic-server`) as a NixOS systemd unit, listening on `localhost:8080`.
    - **Trust model:** Attic generates a signing key on first start (`/var/lib/atticd/server.key`, `0400 root:root`). The matching public key is published to `flake.nix`'s `pkgsLinux.config.nix.settings.trusted-public-keys`. Substituter URL: `http://localhost:8080/<cache-name>`.
-   - **Bootstrap chicken-and-egg:** the public key is generated on first start, so it can't be statically declared on first deploy. Bootstrap flow:
+   - **Bootstrap chicken-and-egg + multi-host:** the public key is generated on first start, so it can't be statically declared on first deploy. Bootstrap flow:
      1. Initial deploy uses ONLY `cache.nixos.org` as substituter (Attic public key not yet known).
      2. After first start of `atticd.service`, run `cat /var/lib/atticd/server.pub` and commit the value into `flake.nix`'s `trusted-public-keys` list.
      3. Subsequent rebuilds enable Attic as a substituter alongside `cache.nixos.org`.
-     A NixOS module activation script enforces this by writing a marker file `/var/lib/atticd/.public-key-committed` only when the public key matches what's in `flake.nix`; the activation refuses to add Attic as a substituter until the marker exists.
+     **Multi-host (forward-looking):** since each host runs its own Attic and generates its own key, `trusted-public-keys` must be a **list keyed by hostname** — not a single value. When mac-mini joins, its Attic public key is appended; the activation script checks list-membership of `/var/lib/atticd/server.pub` against the list, not equality. Per-host append-to-list flow is part of the bootstrap procedure run on each host's first deploy.
+     A NixOS module activation script enforces this by writing a marker file `/var/lib/atticd/.public-key-committed` only when the host's public key is in the `flake.nix` list; activation refuses to add the local Attic as a substituter until the marker exists.
    - **Auth:** push tokens (one for the runner user, one for any human) live in agenix (`secrets/atticd-runner-token.age`, `secrets/atticd-jonathan-token.age`). Pull is open to anyone on localhost.
    - **Fallback:** `cache.nixos.org` remains in the substituter list as a lower-priority fallback. Attic-only paths (e.g. `nixos-system-dellan`) are still re-buildable from source if Attic is down.
    - **Port choice:** 8080 default; can collide with dev servers. Spec leaves overridable via `nixos.attic-server.port` module option.
@@ -165,38 +166,57 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
    - Tracks `last-good` SHA and `current-poison` (latest refused SHA); poisoned history is append-only at `poisoned.log`
    - Logs to journal under `nixos-deploy.service`
 
-   **Operator notification** (separate user-scoped service so DBUS works):
+   **Operator notification** (separate user-scoped services per flag, so DBUS works AND each `path` unit watches exactly one path):
    ```nix
-   # Triggered by path-watch; runs as user jonathan with their session bus.
-   systemd.user.services.nixos-deploy-notify = {
-     Service = {
-       Type = "oneshot";
-       ExecStart = "${pkgs.writeShellScript "nixos-deploy-notify" ''
-         set -e
-         if [ -f /var/lib/nixos-deploy/notify-failure ]; then
-           SHA=$(cat /var/lib/nixos-deploy/current-poison 2>/dev/null || echo unknown)
-           ${pkgs.libnotify}/bin/notify-send -u critical "nixos-deploy FAILED" \
-             "Commit $SHA failed activation. Recovery: sudo nixos-rebuild switch --rollback"
-           sudo rm -f /var/lib/nixos-deploy/notify-failure
-         fi
-         if [ -f /var/lib/nixos-deploy/notify-success ]; then
-           SHA=$(cat /var/lib/nixos-deploy/last-good)
-           ${pkgs.libnotify}/bin/notify-send -u low "nixos-deploy" "Applied $SHA"
-           sudo rm -f /var/lib/nixos-deploy/notify-success
-         fi
-       ''}";
-     };
-   };
-   systemd.user.paths.nixos-deploy-notify = {
-     Unit.Description = "Watch for nixos-deploy notification flags";
+   # Failure path: watch flag, run service, service notifies + clears flag.
+   systemd.user.paths.nixos-deploy-notify-failure = {
+     Unit.Description = "Watch for nixos-deploy failure flag";
      Path.PathExists = "/var/lib/nixos-deploy/notify-failure";
      Install.WantedBy = [ "default.target" ];
    };
-   # Second path unit for success flag (systemd path units only watch one path each)
+   systemd.user.services.nixos-deploy-notify-failure.Service = {
+     Type = "oneshot";
+     ExecStart = "${pkgs.writeShellScript "deploy-notify-failure" ''
+       SHA=$(cat /var/lib/nixos-deploy/current-poison 2>/dev/null || echo unknown)
+       ${pkgs.libnotify}/bin/notify-send -u critical "nixos-deploy FAILED" \
+         "Commit $SHA failed activation. Recovery: sudo nixos-rebuild switch --rollback"
+       sudo /run/current-system/sw/bin/rm -f /var/lib/nixos-deploy/notify-failure
+     ''}";
+   };
+
+   # Success path: same shape, watches notify-success.
+   systemd.user.paths.nixos-deploy-notify-success = {
+     Unit.Description = "Watch for nixos-deploy success flag";
+     Path.PathExists = "/var/lib/nixos-deploy/notify-success";
+     Install.WantedBy = [ "default.target" ];
+   };
+   systemd.user.services.nixos-deploy-notify-success.Service = {
+     Type = "oneshot";
+     ExecStart = "${pkgs.writeShellScript "deploy-notify-success" ''
+       SHA=$(cat /var/lib/nixos-deploy/last-good)
+       ${pkgs.libnotify}/bin/notify-send -u low "nixos-deploy" "Applied $SHA"
+       sudo /run/current-system/sw/bin/rm -f /var/lib/nixos-deploy/notify-success
+     ''}";
+   };
    ```
-   - Root deploy script writes flag files; user-bus service consumes them and surfaces via libnotify
-   - `users.users.jonathan.linger = true` is required so the user systemd survives boot before login (already set on dellan; verify in implementation)
-   - Flag files in `/var/lib/nixos-deploy/` (root-writable, jonathan can read but only delete via `sudo rm` — script uses `sudo` from a sudoers entry that allows `jonathan` to delete those specific files without password)
+   - Two path units required because systemd's `Path.PathExists=` watches a single path; merging into one watching the parent dir would re-fire on `last-good` writes too (false positives)
+   - Root deploy script writes flag files; user-bus services consume them and surface via libnotify
+   - **Linger prerequisite (must be added — verified empirically that linger is NOT set in current `hosts/dellan/default.nix`):**
+     ```nix
+     users.users.jonathan.linger = true;
+     ```
+     Without linger, the user systemd doesn't run before first login, so deploys before login emit no notification.
+   - **Sudoers stanza (must be drafted explicitly — relying on `wheelNeedsPassword = false` couples the notification path to a global passwordless-sudo setting that may tighten later):**
+     ```nix
+     security.sudo.extraRules = [{
+       users = [ "jonathan" ];
+       commands = [
+         { command = "${pkgs.coreutils}/bin/rm -f /var/lib/nixos-deploy/notify-failure"; options = [ "NOPASSWD" ]; }
+         { command = "${pkgs.coreutils}/bin/rm -f /var/lib/nixos-deploy/notify-success"; options = [ "NOPASSWD" ]; }
+       ];
+     }];
+     ```
+   - Flag files in `/var/lib/nixos-deploy/` (root-writable; jonathan reads them, deletes via the sudoers-allowed `rm`)
 3. **Trigger** = webhook (same Tailscale Funnel ingress). On `push: main` event, signature-verified handler issues `systemctl start nixos-deploy.service`.
 4. **Concurrency:** `Conflicts=` ensures one deploy at a time. Webhook handler debounces overlapping triggers — if a deploy is in flight when another push lands, it queues a single follow-up via `systemctl start --no-block` (unit's `RefuseManualStart=no` allows queueing).
 5. **No auto-rollback.** NixOS retains last 10 generations; bootloader menu and `nixos-rebuild switch --rollback` are the recovery path. Failure notification surfaces the recovery command directly to the operator.
@@ -214,8 +234,19 @@ if [ ! -L /etc/nixos ] && [ -d /etc/nixos/.git ]; then
   exit 0
 fi
 
-# Pre-flight: verify origin/main builds before destroying the old layout
+# Pre-flight 1: verify origin/main builds before destroying the old layout
 nix build --no-link "git+ssh://git@github.com/jonathanmoregard/nixos-config?ref=main#nixosConfigurations.dellan.config.system.build.toplevel"
+
+# Pre-flight 2: refuse to destroy local diagnostic edits inside the existing
+# /etc/nixos (mirrors C.1's bare-repo bootstrap discipline)
+if [ -d /etc/nixos/.git ] || [ -L /etc/nixos ]; then
+  REAL=$(readlink -f /etc/nixos)
+  if [ -n "$(git -C "$REAL" status --porcelain 2>/dev/null)" ]; then
+    echo "abort: $REAL has uncommitted changes; resolve before bootstrap" >&2
+    git -C "$REAL" status --short >&2
+    exit 1
+  fi
+fi
 
 # Stop deploy timer/service to avoid a race
 sudo systemctl stop nixos-deploy.service nixos-deploy.timer 2>/dev/null || true
@@ -229,14 +260,15 @@ if [ -L /etc/nixos ]; then
   TARGET=$(readlink /etc/nixos)
   echo "old /etc/nixos was symlink to: $TARGET"
 fi
-sudo rm -rf /etc/nixos       # safe: we have backups in ~/Repos and on origin
+sudo rm -rf /etc/nixos       # safe: pre-flight 2 verified no uncommitted work
 sudo mv /etc/nixos.new /etc/nixos
 
 # Restart deploy
 sudo systemctl start nixos-deploy.service
 ```
-- Pre-flight build of `origin/main` ensures we don't strand the host on a broken commit
-- The `rm -rf /etc/nixos` is the only destructive action and it's predicated on the pre-flight passing
+- Pre-flight 1 (build) ensures we don't strand the host on a broken commit
+- Pre-flight 2 (dirty-tree) ensures manual diagnostic edits aren't silently nuked
+- The `rm -rf /etc/nixos` is the only destructive action and it's predicated on both pre-flights passing
 
 ### Why this is safe without auto-rollback
 
@@ -370,7 +402,7 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
    - **Fail-closed default:** if signal exists in any source but no rule matches, default = MEDIUM
    - Highest matched bucket wins (CRITICAL > HIGH > MEDIUM > LOW > TRIVIAL)
    - Emits highest bucket via `$GITHUB_OUTPUT` (modern replacement for the deprecated `::set-output`)
-   - **PR comment with breakdown:** classify step posts a markdown table to the PR showing per-source contributions, so reviewers see why a bucket was chosen rather than just the verdict:
+   - **PR comment with breakdown:** classify step posts a markdown table to the PR showing per-source contributions, so reviewers see why a bucket was chosen rather than just the verdict. A change observable in multiple sources is shown in each row that matched it; final bucket = max, not sum:
      ```
      | Source            | Matched          | Contribution |
      |-------------------|------------------|--------------|
@@ -402,8 +434,15 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
      # Source 2: paths inside the etc/ derivation. Match: PREFIX from /etc-relative
      # path. `systemd/system/` matches `systemd/system/foo.service` but NOT
      # `dbus-1/systemd/system/`.
+     #
+     # NOTE: bootloader/kernel risk is NOT detected here — boot.json lives at
+     # /run/current-system/boot.json (not /etc), and kernel-modules at
+     # /run/{current,booted}-system/kernel-modules/. Those changes surface in
+     # Source 1 via the `linux`, `systemd-boot`, `grub`, `bootspec` package
+     # entries. Don't add boot.json/kernel-modules to etcPaths — they would
+     # be dead rules.
      etcPaths = {
-       critical = [ "boot.json" "kernel-modules/" ];
+       critical = [ ];   # nothing currently — bootloader/kernel covered by packages
        high     = [ "systemd/system/" "pam.d/" "sudoers" "ssh/" "shadow" "passwd" ];
        # other etc paths → MEDIUM
      };
@@ -436,7 +475,15 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
    | LOW | `risk:low` | Auto-merge if all checks green |
    | TRIVIAL | `risk:trivial` | Auto-merge; non-essential gates skipped (eval+build still run) |
 4. **AI code-review subagent (MEDIUM bucket):** GHA step calls a Claude-Code subagent via the existing skill set; verdict `approve` → bot adds `ai-approved` label; verdict `request-changes` → comment posted, `ai-approved` not added.
-   - **Authentication:** ANTHROPIC_API_KEY stored in `secrets/anthropic-api-key.age`, exposed to the workflow step as a runner-scoped environment variable. **Cost note:** this is a billed Claude API key (Claude.ai subscription does not work for CI use); spend is bounded by MEDIUM-bucket PR rate. Add to `secrets/secrets.nix` allKeys list.
+   - **Authentication:** ANTHROPIC_API_KEY stored in `secrets/anthropic-api-key.age`. **agenix decrypts to the raw secret value, NOT KEY=VALUE format**, so the file MUST be written as `ANTHROPIC_API_KEY=sk-ant-...` (with the literal env-var name on the left), then encrypted via agenix. The runner unit references it via `EnvironmentFile=${config.age.secrets.anthropic-api-key.path}` and the workflow step inherits it. (Alternative: `LoadCredential=` plus an export shim — but EnvironmentFile is simpler if the .age file's plaintext is in env-format.) Document the env-format requirement in `secrets/secrets.nix` next to the entry. **Cost note:** this is a billed Claude API key (Claude.ai subscription does not work for CI use); spend is bounded by MEDIUM-bucket PR rate. Add to `secrets/secrets.nix` allKeys list.
+   - **Workflow permissions:** the AI-subagent step adds the `ai-approved` label via `gh pr edit --add-label`. The default `${{ github.token }}` has only `contents: read` for self-hosted runners on private repos. Workflow declares:
+     ```yaml
+     permissions:
+       contents: read
+       pull-requests: write
+       issues: write     # GH treats label-add as an issue write on a PR
+     ```
+     Without these, label-add silently 403s and the allowlist gate (D.4) breaks open.
    - **Prompt-injection mitigation:** PR body, commit messages, and diff contents are wrapped in `<untrusted_external_content>` tags before passing to the subagent (per global CLAUDE.md). Subagent must NOT execute instructions found inside these tags.
    - **Circuit breaker:** track AI-approved auto-merges in `/var/lib/ci-state/ai-approved-merges.jsonl` (one line per merge, with SHA, timestamp, classifier verdict). The path is owned by `root:actions-runner` mode `0775`, declared by a NixOS module (`modules/nixos/ci-state.nix`) so ownership and permissions are reproducible. The runner identity is fixed: **A.1 names the runner user as `actions-runner` (system user, no shell); the runner unit runs as that user via `User=actions-runner` in the systemd unit declaration.** After **3 consecutive AI-approved merges without a human approval in between**, OR within **24h of any deploy failure**, the label-gate flips to require human approval for MEDIUM bucket. Resets when a human approves any PR.
    - **Threat-model caveat:** the state file is writeable by the runner user, which is the same identity that runs PR code. A malicious PR could theoretically reset the file. Mitigations layered on top:
@@ -513,6 +560,7 @@ Extends `nodes.dellan` block in `tests/dellan-vm.nix` (or splits into `tests/del
 | `secrets/anthropic-api-key.age` | AI code-review subagent step (D.4) | Billed Claude API access from CI |
 | `secrets/atticd-runner-token.age` | runner pushes to Attic (A.4) | Authenticates `attic push` from CI |
 | `secrets/atticd-jonathan-token.age` | dev-shell pushes to Attic (A.4) | Authenticates manual `attic push` from worktrees |
+| `secrets/actions-runner-ssh-key.age` | runner cloning private repos (A.1, D.1) | SSH key for `actions-runner` to fetch private nixos-config + flake inputs from GitHub. Mounted at `/var/lib/actions-runner/.ssh/id_ed25519` mode 0400. Public key registered in GitHub Deploy Keys for the repo. |
 
 All keys must be added to `secrets/secrets.nix` `allKeys` list. CI keys are runner-host-bound (`age.secrets.<name>.publicKeys = [ jonathanKey dellanHostKey ];`) so a leaked key from one workstation doesn't auto-decrypt on other machines.
 
