@@ -415,6 +415,7 @@ in
     # Reason for switching from Ghostty: Ghostty 1.3.1 doesn't fire kinetic
     # scroll for GDK_SOURCE_TOUCHPAD on X11 (GTK4 limitation, tracked at
     # ghostty#11460). Kitty 0.46+ shipped first-class momentum_scroll.
+    # momentum_scroll = decay factor (0=stop instantly, 1=never stops). Default 0.96.
     momentum_scroll 0.96
     pixel_scroll yes
 

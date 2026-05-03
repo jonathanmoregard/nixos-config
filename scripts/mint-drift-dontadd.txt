@@ -1,0 +1,59 @@
+# Skip-list for mint-drift-agent.sh.
+#
+# One regex per line. Matched against:
+#   - the proposed slug (kebab-case)
+#   - the proposed title (lowercased)
+#
+# The detector silently skips any candidate whose slug OR title
+# matches any pattern here. Comment lines (#) and blanks ignored.
+#
+# Edit when a drift category turns out to be a non-issue or an
+# explicit user "don't add" decision. Pair every entry with a
+# one-line reason so future-you knows why it's here.
+
+# --- Apps explicitly declined ---
+^obs(-studio)?$               # OBS — drift-scan 2026-04-17, intentionally NOT tracked
+^cursor$                      # Cursor IDE — nixpkgs name is `code-cursor`; user declined re-adding 2026-04-27
+^wine                         # Wine — declined 2026-04-27 (no Windows app needs on dellan)
+winehq                        # apt name variant
+winetricks                    # apt name variant
+^distrobox$                   # declined 2026-04-27
+^podman$                      # declined 2026-04-27
+^docker$                      # docker being migrated to microvm.nix per CLAUDE.md, not a drift miss
+^touchegg                     # declined 2026-04-27 (libinput + cinnamon gestures already cover)
+
+# --- Tooling intentionally excluded (drift-scan 2026-04-19) ---
+^terraform$
+^yt-dlp$
+^virt-manager$
+^libvirtd?$
+
+# --- Already declared / resolved (avoid re-flagging) ---
+^tailscale                    # declared in modules/nixos/tailscale.nix + imported by dellan
+^gh-cli                       # declared in modules/common.nix systemPackages
+^xbindkeys-autostart          # declared in home/cinnamon.nix
+^huskyrc                      # declared in home/jonathan.nix as ~/.huskyrc
+^voquill-autostart            # declared in home/cinnamon.nix
+^claude-cl-sync               # declared in home/claude-services.nix
+^claude-sandbox-proxy         # declared in home/claude-services.nix
+^gh-token                     # declared in home/claude-services.nix
+^cron-superpowers-sync        # declared in home/jonathan-linux.nix crontab
+^cron-wellbeing               # declared (habit-tracker, sunset-walk-tracker)
+^cron-token-optimizer         # path corrected 2026-04-27
+^inhibit-lid-switch           # declared in modules/nixos/laptop.nix logind
+^touchpad-tap-to-click        # declared in home/cinnamon.nix dconf + laptop.nix libinput
+^night-light                  # declared in home/cinnamon.nix dconf
+^cinnamon-interface-clock     # declared in home/cinnamon.nix dconf
+^cinnamon-wm-preferences      # declared in home/cinnamon.nix dconf
+^cinnamon-sounds              # tink.oga in assets/sounds/, declared in home/cinnamon.nix
+^git-ignore                   # declared in home/jonathan.nix
+^custom-systemd-services      # umbrella; specific services declared in claude-services.nix
+^cron-jobs-not?-captured      # umbrella resolved by 2026-04-27 cron additions
+^cron-nightly-rsi             # RSI proposal cron entries declared in jonathan-linux.nix
+
+# --- Out-of-scope categories ---
+^browser-extension            # Chrome ext sync handled by Chrome itself
+^chrome-bookmark              # synced by Chrome account
+^firefox-                     # not used as primary; not tracking
+^thunderbird-account          # imap/smtp creds out of band
+^dropbox-content              # synced by Dropbox itself
