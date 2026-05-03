@@ -109,7 +109,7 @@ in
         default = [ "nemo.desktop" "firefox.desktop" "org.gnome.Terminal.desktop" ];
         value = [
           "nemo.desktop"
-          "com.mitchellh.ghostty.desktop"
+          "kitty.desktop"
           "org.keepassxc.KeePassXC.desktop"
           "google-chrome.desktop"
         ];
@@ -225,8 +225,8 @@ in
 
     # --- Default apps ---
     "org/cinnamon/desktop/default-applications/terminal" = {
-      exec = "ghostty";
-      exec-arg = "--"; # Ghostty uses "--" separator; "-e" is xterm-only and breaks Nemo "Open in Terminal"
+      exec = "kitty";
+      exec-arg = "-e"; # kitty supports "-e CMD ARGS..." for Nemo "Open in Terminal"
     };
 
     # --- Night-light ---
