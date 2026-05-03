@@ -66,6 +66,67 @@ pkgs.testers.runNixOSTest {
     # systemd --user for jonathan comes up via linger
     dellan.wait_for_unit("default.target", "jonathan")
 
+    # === autodoro launcher + GTK/GdkPixbuf runtime env ===
+    # On NixOS the autodoro pomodoro service must launch via a wrapper
+    # that injects a deterministic PATH (bash, pactl, paplay, xprintidle,
+    # cinnamon-screensaver-command, python3-with-gi) plus GI_TYPELIB_PATH
+    # and GDK_PIXBUF_MODULE_FILE so the GTK popup + webp blocker image
+    # render. Without the wrapper, the service exits 203/EXEC (the
+    # repo's `#!/bin/bash` shebang has no /bin/bash on NixOS) or
+    # crashes inside python with "Namespace Gtk not available" /
+    # "Couldn't recognize the image file format for file ...webp".
+
+    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/autodoro")
+    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/autodoro-env")
+
+    # Wrapper is a real shell script (writeShellApplication output).
+    dellan.succeed(
+        "head -1 /etc/profiles/per-user/jonathan/bin/autodoro | "
+        "grep -Eq '^#!.*/(ba)?sh'"
+    )
+
+    # All runtime CLI deps reachable from the launcher's PATH.
+    for binname in [
+        "bash", "pactl", "paplay", "xprintidle",
+        "cinnamon-screensaver-command", "python3",
+    ]:
+        dellan.succeed(
+            f"su jonathan -c 'autodoro-env command -v {binname}'"
+        )
+
+    # systemd unit definition resolves and is loaded. ExecCondition
+    # exits non-zero in the test VM because ~/Repos/autodoro is not
+    # cloned, so the unit stays inactive — but it must not be
+    # not-found / failed at the unit-file layer.
+    state = dellan.succeed(
+        "su jonathan -c 'systemctl --user show -p LoadState "
+        "autodoro.service'"
+    ).strip()
+    assert state.endswith("=loaded"), f"autodoro.service LoadState: {state}"
+
+    # GTK 3 + GdkPixbuf importable AND webp pixbuf loader registered.
+    # Catches GI_TYPELIB_PATH gaps (Gtk import) and missing
+    # GDK_PIXBUF_MODULE_FILE / webp-pixbuf-loader (blocker.py loads
+    # /home/jonathan/Repos/intender/.../misty-1280.webp at runtime).
+    py_check = "\n".join([
+        "import gi",
+        "gi.require_version('Gtk', '3.0')",
+        "from gi.repository import Gtk, Gdk, GdkPixbuf, GLib  # noqa: F401",
+        "fmts = sorted(f.get_name() for f in GdkPixbuf.Pixbuf.get_formats())",
+        "assert 'webp' in fmts, f'webp loader missing; have: {fmts}'",
+        "print('ok ' + ','.join(fmts))",
+        "",
+    ])
+    dellan.succeed(
+        "cat > /tmp/autodoro-check.py <<'PYEOF'\n"
+        + py_check + "PYEOF"
+    )
+    pixbuf_out = dellan.succeed(
+        "su jonathan -c 'autodoro-env python3 /tmp/autodoro-check.py'"
+    )
+    print("[diag autodoro] gi/pixbuf check:\n" + pixbuf_out)
+    assert pixbuf_out.startswith("ok "), pixbuf_out
+
     # HM-installed binaries on user PATH
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty")
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty-session-save")
