@@ -1,0 +1,195 @@
+# .github/workflows/gate.yml
+#
+# Trusted merge-gate workflow. Runs on `pull_request_target` so it executes
+# the BASE branch's workflow + script, not the PR's. PR diff is fetched
+# explicitly and treated as untrusted data.
+#
+# Steps:
+#   classify  → posts risk label (risk:critical/high/medium/low/trivial)
+#   ai-review → only if MEDIUM; subagent reviews diff, may add ai-approved
+#   label-gate → status check that encodes merge-gating logic, consumed
+#                by the GitHub Ruleset on `main`
+#
+# Permissions: pull-requests:write + issues:write are required for the
+# label-add step. The PR-branch ci.yml workflow does NOT have these.
+name: gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  classify:
+    runs-on: [self-hosted, x86_64-linux]
+    if: github.event.action != 'labeled' && github.event.action != 'unlabeled'
+    outputs:
+      risk: ${{ steps.classify.outputs.risk }}
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Check out base branch (trusted code path)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+
+      - name: Fetch PR head
+        run: |
+          git fetch origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
+
+      - name: Run classifier (script loaded from base checkout)
+        id: classify
+        run: |
+          set -euo pipefail
+          # Classifier script is loaded from base — PR-modified versions
+          # are NOT executed.
+          ./scripts/classify-pr.sh > /tmp/classify-output.md
+          cat /tmp/classify-output.md
+
+      - name: Apply risk label
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          risk="${{ steps.classify.outputs.risk }}"
+          # Strip any existing risk:* label, add the new one
+          gh pr edit "${PR_NUMBER}" \
+            --remove-label risk:critical \
+            --remove-label risk:high \
+            --remove-label risk:medium \
+            --remove-label risk:low \
+            --remove-label risk:trivial 2>/dev/null || true
+          gh pr edit "${PR_NUMBER}" \
+            --add-label "risk:$(echo "$risk" | tr '[:upper:]' '[:lower:]')"
+
+      - name: Post classifier breakdown as PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${PR_NUMBER}" --body-file /tmp/classify-output.md
+
+  ai-review:
+    runs-on: [self-hosted, x86_64-linux]
+    needs: classify
+    if: needs.classify.outputs.risk == 'MEDIUM'
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Capture PR diff (untrusted data)
+        run: |
+          gh pr diff "${PR_NUMBER}" > /tmp/pr-diff.txt
+          gh pr view "${PR_NUMBER}" --json body,title \
+            > /tmp/pr-meta.json
+
+      - name: Run AI review subagent
+        run: |
+          # The AI subagent receives PR diff + body as
+          # <untrusted_external_content> per global CLAUDE.md security
+          # rules. Output: a verdict file with `approve` or `request-changes`.
+          # Implementation: ./scripts/ai-review.sh (out-of-scope for the
+          # initial spec implementation; placeholder).
+          if [ -x ./scripts/ai-review.sh ]; then
+            ./scripts/ai-review.sh /tmp/pr-diff.txt /tmp/pr-meta.json \
+              > /tmp/ai-verdict.txt
+          else
+            echo "request-changes" > /tmp/ai-verdict.txt
+            echo "(ai-review.sh not yet implemented)" >> /tmp/ai-verdict.txt
+          fi
+
+      - name: Apply ai-approved label on approve verdict
+        run: |
+          if grep -q "^approve$" /tmp/ai-verdict.txt; then
+            gh pr edit "${PR_NUMBER}" --add-label "ai-approved"
+          fi
+
+  label-gate:
+    runs-on: [self-hosted, x86_64-linux]
+    # Always runs (including label change events)
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Validate label-add sender against allowlist
+        run: |
+          # If this is a label event, check the sender. Allowlist:
+          #   ai-approved        → github-actions[bot] only
+          #   baseline:approved  → jonathan only
+          #   risk:*             → github-actions[bot] only
+          if [ "${{ github.event.action }}" = "labeled" ] || [ "${{ github.event.action }}" = "unlabeled" ]; then
+            label_name="${{ github.event.label.name }}"
+            sender="${{ github.event.sender.login }}"
+            case "$label_name" in
+              ai-approved)
+                if [ "$sender" != "github-actions[bot]" ]; then
+                  echo "❌ label $label_name added by disallowed sender $sender"; exit 1
+                fi ;;
+              baseline:approved)
+                if [ "$sender" != "jonathan" ]; then
+                  echo "❌ label $label_name added by disallowed sender $sender"; exit 1
+                fi ;;
+              risk:*)
+                if [ "$sender" != "github-actions[bot]" ]; then
+                  echo "❌ label $label_name added by disallowed sender $sender"; exit 1
+                fi ;;
+            esac
+          fi
+
+      - name: Compute label-gate status
+        run: |
+          set -euo pipefail
+          labels=$(gh pr view "${PR_NUMBER}" --json labels --jq '[.labels[].name]')
+          has() { echo "$labels" | jq -e --arg l "$1" 'index($l) != null' >/dev/null; }
+
+          # human approval = any review with state APPROVED
+          approved_by_human=$(gh pr view "${PR_NUMBER}" \
+            --json reviews \
+            --jq '[.reviews[] | select(.state == "APPROVED")] | length > 0')
+
+          # CRITICAL / HIGH risk → human approval required
+          if has "risk:critical" || has "risk:high"; then
+            if [ "$approved_by_human" != "true" ]; then
+              echo "❌ risk:critical/high requires human approval"; exit 1
+            fi
+          fi
+
+          # MEDIUM → ai-approved OR human
+          if has "risk:medium"; then
+            if ! has "ai-approved" && [ "$approved_by_human" != "true" ]; then
+              echo "❌ risk:medium requires ai-approved label or human approval"
+              exit 1
+            fi
+          fi
+
+          # baseline drift gate — any change under tests/baselines/
+          # requires baseline:approved label
+          touched_baseline=$(gh pr diff "${PR_NUMBER}" --name-only \
+            | grep -c '^tests/baselines/' || true)
+          if [ "$touched_baseline" -gt 0 ]; then
+            if ! has "baseline:approved"; then
+              echo "❌ tests/baselines/ changed but baseline:approved label missing"
+              exit 1
+            fi
+          fi
+
+          echo "✓ label-gate passes"
