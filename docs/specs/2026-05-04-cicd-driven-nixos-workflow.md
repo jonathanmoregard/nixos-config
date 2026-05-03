@@ -111,7 +111,25 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
      classify ─► label-pr ─► (if MEDIUM) ai-review ─► label-pr (ai-approved)
                           └► label-gate (status check)
      ```
-   - The `pull_request_target` trigger runs with full repo permissions but checks out the base branch by default. PR-modified `scripts/classify-pr.sh` is NEVER executed here. Either (a) the script is loaded from the base checkout (read base-tree path explicitly), or (b) the classifier is invoked via `nix run github:jonathanmoregard/nixos-config/main#classify-pr -- "$BASE_SHA" "$HEAD_SHA"` so the script identity is pinned by SHA.
+   - **Step skeleton (resolves how SHAs and PR diff arrive):**
+     ```yaml
+     env:
+       BASE_SHA: ${{ github.event.pull_request.base.sha }}
+       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+       PR_NUMBER: ${{ github.event.pull_request.number }}
+     steps:
+       - uses: actions/checkout@v4
+         with:
+           ref: ${{ github.event.pull_request.base.sha }}   # base branch — trusted code
+           fetch-depth: 0
+       - name: Fetch PR head into refs/remotes/pr/head
+         run: |
+           git fetch origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
+       - name: Run classifier (script loaded from base checkout)
+         run: ./scripts/classify-pr.sh
+       # gh pr diff is used by the AI-review step to read PR contents as untrusted data
+     ```
+   - The `pull_request_target` trigger runs with full repo permissions but checks out the base branch by default. PR-modified `scripts/classify-pr.sh` is NEVER executed here. The script identity is pinned by base checkout (option a above). Option b — `nix run github:jonathanmoregard/nixos-config/main#classify-pr -- "$BASE_SHA" "$HEAD_SHA"` — is documented as an alternative if pinning to a specific SHA is wanted later.
    - PR diff and PR body/comments are wrapped in `<untrusted_external_content>` before passing to the AI subagent (per global CLAUDE.md security rules).
    - This split is the standard GitHub Actions pattern for "validate untrusted PR contents from a trusted context"; documented in [GitHub Security Lab "Keeping your GitHub Actions and workflows secure" guidance](https://securitylab.github.com/research/github-actions-untrusted-input/).
 4. **Cache:** Attic server (`pkgs.attic-server`) as a NixOS systemd unit, listening on `localhost:8080`.
@@ -498,7 +516,7 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
      ```
      The PR-controlled `ci.yml` workflow uses `permissions: { contents: read, pull-requests: read }` — no label-add capability.
    - **Prompt-injection mitigation:** PR body, commit messages, and diff contents are wrapped in `<untrusted_external_content>` tags before passing to the subagent (per global CLAUDE.md). Subagent must NOT execute instructions found inside these tags.
-   - **Circuit breaker:** track AI-approved auto-merges in `/var/lib/ci-state/ai-approved-merges.jsonl` (one line per merge, with SHA, timestamp, classifier verdict). The path is owned by `root:actions-runner` mode `0775`, declared by a NixOS module (`modules/nixos/ci-state.nix`) so ownership and permissions are reproducible. The runner identity is fixed: **A.1 names the runner user as `actions-runner` (system user, no shell); the runner unit runs as that user via `User=actions-runner` in the systemd unit declaration.** After **3 consecutive AI-approved merges without a human approval in between**, OR within **24h of any deploy failure**, the label-gate flips to require human approval for MEDIUM bucket. Resets when a human approves any PR.
+   - **Circuit breaker:** track AI-approved auto-merges in `/var/lib/ci-state/ai-approved-merges.jsonl` (one line per merge, with SHA, timestamp, classifier verdict). The path is owned by `root:actions-runner` mode `0775`, declared by a NixOS module (`modules/nixos/ci-state.nix`) so ownership and permissions are reproducible. The runner identity is fixed: **A.1 names the runner user as `actions-runner` (system user, no shell); the runner unit runs as that user via `User=actions-runner` in the systemd unit declaration.** After **3 consecutive AI-approved merges without a human approval in between**, OR within **24h of any deploy failure**, the label-gate flips to require human approval for MEDIUM bucket. The counter resets only when a human approves the SAME PR being gated (per-PR scope, not global) — preventing an unrelated human approval from accidentally clearing a queued malicious PR's path.
    - **Threat-model caveat:** the state file is writeable by the runner user, which is the same identity that runs PR code. A malicious PR could theoretically reset the file. Mitigations layered on top:
      1. The runner mounts the state directory append-only via a systemd `BindReadOnlyPaths` exception covering only `/var/lib/ci-state/ai-approved-merges.jsonl` (read-write), and read-only on the parent dir (no path manipulation).
      2. A separate root-owned `state-snapshot.timer` runs hourly, copies the JSONL to `/var/lib/ci-state/snapshots/<timestamp>.jsonl`. Tamper detection: classifier hashes the live file against the latest snapshot's tail; mismatch → engages circuit-breaker on suspicion.
@@ -591,6 +609,11 @@ All keys must be added to `secrets/secrets.nix` `allKeys` list. CI keys are runn
 
 - **Repo is private; single-developer.** Fork PRs are NOT supported; `pull_request` events from forks are out of scope. If forks are accepted later, the trust split (A.3 `ci.yml` vs `gate.yml`) already handles it correctly — the merge-gating logic is in `pull_request_target` which doesn't run fork-controlled code.
 - **Trusted actors:** `jonathan` (admin), `github-actions[bot]` (only when running base-branch workflow code via `pull_request_target`). AI agents working on PRs run AS PR contributors — their workflow code is untrusted and runs only in `ci.yml`.
+- **Critical: AI agents must NOT have GitHub credentials authenticated as `jonathan`.** The current `gh` wrapper in `home/jonathan.nix` auto-runs `gh auth login` for the user; an AI agent with shell access in a worktree could otherwise call `gh pr review --approve <its-own-PR>` and bypass the entire human-review gate (since admin is in the bypass list for status checks). Mitigation, **declared as part of this spec's required changes**:
+  1. AI agents run under a **dedicated unprivileged user `claude-agent`** (or per-agent users `claude-agent-{1,2,3}`), with no `gh` token in their HOME, no membership in `wheel`, no sudo access.
+  2. The shared bare repo `~/Repos/nixos-config` and worktree directory `~/Repos/nixos-config-worktrees/` are group-readable (`jonathan:claude-agents` 0775), so agents can read/clone/edit their own worktree but cannot push as `jonathan`. Agents push using their own SSH key with `repo:write` scope only (no admin, no PR-merge approval).
+  3. The `gh` wrapper at `home/jonathan.nix:130-135` is moved out of the per-user shell init into a dedicated wrapper that's only on `jonathan`'s PATH, never on `claude-agent`'s PATH.
+  4. As an additional belt: the `ai-approved` label-add allowlist (D.4) restricts to `github-actions[bot]` only — `jonathan` cannot add the label manually. So even if a Claude agent somehow gets `jonathan` credentials, it cannot use them to short-circuit AI-review.
 - **Out-of-scope threats:** physical access to dellan, kernel-level compromise, supply-chain attacks on nixpkgs/flake inputs (mitigated by `nix.settings.trusted-public-keys` but not by anything in this spec).
 
 ## Out of scope for this spec
@@ -603,23 +626,24 @@ All keys must be added to `secrets/secrets.nix` `allKeys` list. CI keys are runn
 
 ## Implementation order (for the implementation plan)
 
-Each step is annotated `[auto]` (Claude can do start-to-finish in one autonomous session) or `[human]` (needs a token registration, GitHub UI step, or one-time interactive bootstrap). Reordered to put Rulesets activation AFTER the workflow has produced its first green run on `main`, preventing lockout.
+Each step is annotated `[auto]` (Claude can do start-to-finish in one autonomous session), `[human]` (needs a token registration, GitHub UI step, or one-time interactive bootstrap), or `[human-checkpoint]` (an autonomous run must STOP here and wait for explicit user confirmation before proceeding). Reordered to put Rulesets activation AFTER the workflow has produced its first green run on `main`, preventing lockout.
 
 1. **A.1** Self-hosted runner registered + resource-scoped — `[human]` (GitHub registration token must be retrieved interactively from `Settings → Actions → Runners → New self-hosted runner`; secret then committed via agenix)
 2. **A.2** Attic cache running locally — `[auto]` (NixOS module + first activation; pub-key bootstrap noted)
 3. **A.3 (`ci.yml` only first)** Skeleton workflow with `eval` + `build` + existing VM-minimal — `[auto]`
-4. **C.1** Bare-repo conversion + worktree directory — `[human]` (destructive on `~/Repos/nixos-config`; pre-flight asserts no unpushed work, but operator should review before running)
-5. **B (deploy target only, no activation yet)** `bootstrap-deploy-target.sh` clones `/etc/nixos` from main (without enabling the auto-deploy service) — `[human]`
-6. **B** Production auto-deploy service + flag-file notification chain — `[auto]` after step 5
-7. **A.6** Webhook ingress over Tailscale Funnel — `[human]` (Funnel hostname + GitHub webhook URL must be configured via `tailscale funnel` and GitHub `Settings → Webhooks`)
-8. **D.1** Classifier script + rule table + classifier unit tests — `[auto]`
-9. **A.3 (`gate.yml`)** Add gate workflow (`pull_request_target`, classifier, label-pr) — `[auto]`
-10. **A.5** `ci.yml` extends to discover-hosts matrix + lanes — `[auto]`
-11. **Wait for at least one green run of all named checks on `main`** — preserve as a manual checkpoint
-12. **D.2** Bootstrap script for Rulesets, in `enforcement: "evaluate"` mode first — `[human]` (PAT with `repo:admin` for ruleset CRUD)
-13. **D.2 (active)** Flip Rulesets to `enforcement: "active"` once verified — `[human]` checkpoint
-14. **E.1** VM-graphical tier + screenshot baseline scaffolding — `[auto]`
-15. **D.3** AI code-review subagent wiring (MEDIUM bucket) — `[auto]` after `secrets/anthropic-api-key.age` is created `[human]`
-16. **E.2** VM-realapp tier (opt-in) — `[auto]`
+4. **(Bootstrap snapshot before destructive steps)** `sudo cp -a /etc/nixos /etc/nixos.bak.$(date +%s)` — `[auto]`. Documented recovery: `sudo rm -rf /etc/nixos && sudo mv /etc/nixos.bak.<timestamp> /etc/nixos`.
+5. **C.1** Bare-repo conversion + worktree directory — `[human]` (destructive on `~/Repos/nixos-config`; pre-flight asserts no unpushed work, but operator should review before running). On failure: pre-flight refuses; on partial success without B-bootstrap, recover via step 4's snapshot.
+6. **B (deploy target only, no activation yet)** `bootstrap-deploy-target.sh` clones `/etc/nixos` from main (without enabling the auto-deploy service) — `[human]`. On failure: recover via step 4's snapshot.
+7. **B** Production auto-deploy service + flag-file notification chain (linger, sudoers, two path units) — `[auto]` after step 6
+8. **A.6** Webhook ingress over Tailscale Funnel — `[human]` (Funnel hostname + GitHub webhook URL must be configured via `tailscale funnel` and GitHub `Settings → Webhooks`)
+9. **D.1** Classifier script + rule table + classifier unit tests — `[auto]`
+10. **A.3 (`gate.yml`)** Add gate workflow (`pull_request_target`, classifier, label-pr) — `[auto]`
+11. **A.5** `ci.yml` extends to discover-hosts matrix + lanes — `[auto]`
+12. **`[human-checkpoint]`** STOP. Wait for at least one green run of all named status checks on `main` (eval, build, vm-minimal, classify, label-gate). An autonomous implementer MUST NOT proceed past this checkpoint without explicit user confirmation; doing so risks locking out merges if the next step's Rulesets reference a status check that hasn't produced a check-run yet.
+13. **D.2** Bootstrap script for Rulesets, in `enforcement: "evaluate"` mode first — `[human]` (PAT with `repo:admin` for ruleset CRUD)
+14. **D.2 (active)** Flip Rulesets to `enforcement: "active"` once verified — `[human-checkpoint]` (verifies dry-run results match expectations before activation)
+15. **E.1** VM-graphical tier + screenshot baseline scaffolding — `[auto]`
+16. **D.3** AI code-review subagent wiring (MEDIUM bucket) — `[auto]` after `secrets/anthropic-api-key.age` is created `[human]`. Includes the `claude-agent` user / `gh`-wrapper-scoping changes from the threat model section.
+17. **E.2** VM-realapp tier (opt-in) — `[auto]`
 
-Each `[auto]` step has a VM-gateable check. `[human]` steps are tokens / interactive bootstrap; the implementation plan documents the exact UI clicks. Spec'd steps map 1:1 to plan items.
+Each `[auto]` step has a VM-gateable check. `[human]` steps are tokens / interactive bootstrap; the implementation plan documents the exact UI clicks. `[human-checkpoint]` steps are mandatory stops where autonomous implementation must pause for user confirmation. Spec'd steps map 1:1 to plan items.
