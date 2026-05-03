@@ -76,9 +76,11 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
 
 ### Components
 
-1. **Self-hosted GHA runner** on dellan, registered to repo as `dellan-runner`. systemd user unit:
+1. **Self-hosted GHA runner** on dellan, registered to repo as `dellan-runner`. Declared as a system service (NOT a user unit) running as a dedicated NixOS-managed system user `actions-runner` (no shell, home `/var/lib/actions-runner`). System unit because GHA's runner needs predictable PATH, root-owned state directory, and survives without `linger`:
+   - `User=actions-runner`
+   - `Group=actions-runner`
    - `CPUWeight=50` (yields to interactive work under contention)
-   - `MemoryHigh=20G` (caps RAM)
+   - `MemoryHigh=20G` (caps RAM under pressure; CPUWeight only kicks in when the kernel detects contention — under low load the runner gets all available cores)
    - `Slice=actions-runner.slice`
    - Token stored in `secrets/github-runner-token.age`
 2. **Webhook ingress** via Tailscale Funnel — used **only** for production deploy. PR-triggered jobs do not need it (GHA self-hosted runners long-poll GitHub directly for queued work).
@@ -86,7 +88,8 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
    - **Implementation:** `pkgs.writers.writePython3Bin "github-webhook-handler"`. Reads request from stdin (socket-activated), writes response to stdout. Lives in `modules/nixos/github-webhook.nix`.
    - **HMAC verification:** computes `hmac.new(SECRET, body, sha256)` and compares to `X-Hub-Signature-256` header in constant time (`hmac.compare_digest`). Secret in `secrets/github-webhook-secret.age`, exposed as `EnvironmentFile`.
    - **Replay protection:** stores `X-GitHub-Delivery` UUIDs seen in the last 24h to `/var/lib/github-webhook/seen` (one UUID per line, pruned on rotation). Duplicate UUID → 200 OK with no action.
-   - **Rate limit:** systemd socket unit sets `RateLimitIntervalSec=10` and `RateLimitBurst=5` (5 connections per 10s, then queues).
+   - **Rate limit (accept-side):** systemd socket unit sets `RateLimitIntervalSec=10` and `RateLimitBurst=5` (5 new connections per 10s, then queues).
+   - **Slowloris protection (read-side):** socket unit sets `MaxConnections=4` (cap on concurrent in-flight workers); service unit sets `TimeoutStartSec=10s` (kill the handler if it exceeds 10s); python handler calls `socket.settimeout(5)` on its read loop so a dripping connection cannot stall the worker indefinitely.
    - **Event filter:** handler only acts on `X-GitHub-Event: push` with `payload.ref == "refs/heads/main"`. All other events → 200 OK with no action.
    - On valid push: `systemctl start nixos-deploy.service`
 3. **Workflow** `.github/workflows/ci.yml`:
@@ -100,6 +103,11 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
    - **discover-hosts:** `nix eval` walks `nixosConfigurations` and `darwinConfigurations`, emits a matrix. Linux jobs run on `[self-hosted, x86_64-linux]`; darwin jobs require `[self-hosted, aarch64-darwin]` → skip with warning if no runner.
 4. **Cache:** Attic server (`pkgs.attic-server`) as a NixOS systemd unit, listening on `localhost:8080`.
    - **Trust model:** Attic generates a signing key on first start (`/var/lib/atticd/server.key`, `0400 root:root`). The matching public key is published to `flake.nix`'s `pkgsLinux.config.nix.settings.trusted-public-keys`. Substituter URL: `http://localhost:8080/<cache-name>`.
+   - **Bootstrap chicken-and-egg:** the public key is generated on first start, so it can't be statically declared on first deploy. Bootstrap flow:
+     1. Initial deploy uses ONLY `cache.nixos.org` as substituter (Attic public key not yet known).
+     2. After first start of `atticd.service`, run `cat /var/lib/atticd/server.pub` and commit the value into `flake.nix`'s `trusted-public-keys` list.
+     3. Subsequent rebuilds enable Attic as a substituter alongside `cache.nixos.org`.
+     A NixOS module activation script enforces this by writing a marker file `/var/lib/atticd/.public-key-committed` only when the public key matches what's in `flake.nix`; the activation refuses to add Attic as a substituter until the marker exists.
    - **Auth:** push tokens (one for the runner user, one for any human) live in agenix (`secrets/atticd-runner-token.age`, `secrets/atticd-jonathan-token.age`). Pull is open to anyone on localhost.
    - **Fallback:** `cache.nixos.org` remains in the substituter list as a lower-priority fallback. Attic-only paths (e.g. `nixos-system-dellan`) are still re-buildable from source if Attic is down.
    - **Port choice:** 8080 default; can collide with dev servers. Spec leaves overridable via `nixos.attic-server.port` module option.
@@ -114,7 +122,7 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
 ### Components
 
 1. **`/etc/nixos`** = read-only clone of `origin/main`, root-owned. Symlink `~/Repos/nixos-config → /etc/nixos` is removed; the dev tree only lives at `~/Repos/nixos-config-worktrees/`.
-2. **`nixos-deploy.service`** (oneshot, declared as a NixOS module):
+2. **`nixos-deploy.service`** (oneshot, root, declared as a NixOS module):
    ```bash
    ExecStart = ${pkgs.writeShellScript "nixos-deploy" ''
      set -euo pipefail
@@ -122,7 +130,8 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
      STATE=/var/lib/nixos-deploy
      mkdir -p "$STATE"
      LAST_GOOD="$STATE/last-good"
-     POISONED="$STATE/poisoned"
+     POISONED_LOG="$STATE/poisoned.log"      # append-only history
+     CURRENT_POISON="$STATE/current-poison"  # latest SHA refused
 
      git -C /etc/nixos fetch origin main
      TARGET=$(git -C /etc/nixos rev-parse origin/main)
@@ -131,33 +140,103 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
      # Skip if already at target
      [ "$CURRENT" = "$TARGET" ] && exit 0
 
-     # Refuse to re-attempt a poisoned commit unless manually cleared
-     if [ -f "$POISONED" ] && [ "$(cat "$POISONED")" = "$TARGET" ]; then
+     # Refuse to re-attempt the last poisoned commit unless cleared
+     if [ -f "$CURRENT_POISON" ] && [ "$(cat "$CURRENT_POISON")" = "$TARGET" ]; then
        echo "deploy: target $TARGET is poisoned; manual reset required"
-       echo "  to clear: rm $POISONED && systemctl reset-failed nixos-deploy"
+       echo "  log:    $POISONED_LOG"
+       echo "  clear:  sudo rm $CURRENT_POISON && sudo systemctl reset-failed nixos-deploy"
        exit 1
      fi
 
      git -C /etc/nixos reset --hard "$TARGET"
      if nixos-rebuild switch --flake /etc/nixos#dellan; then
        echo "$TARGET" > "$LAST_GOOD"
-       rm -f "$POISONED"
-       ${pkgs.libnotify}/bin/notify-send -u low "nixos-deploy" "Applied $TARGET"
+       rm -f "$CURRENT_POISON"
+       # Operator signal — see "Operator notification" subsection below
+       touch "$STATE/notify-success"
      else
-       echo "$TARGET" > "$POISONED"
-       ${pkgs.libnotify}/bin/notify-send -u critical "nixos-deploy FAILED" \
-         "Commit $TARGET failed activation. Manual recovery: nixos-rebuild switch --rollback"
+       echo "$TARGET" > "$CURRENT_POISON"
+       printf '%s\t%s\t%s\n' "$(date -Iseconds)" "$TARGET" "FAILED" >> "$POISONED_LOG"
+       touch "$STATE/notify-failure"
        exit 1
      fi
    ''}";
    ```
-   - Tracks `last-good` and `poisoned` SHAs in `/var/lib/nixos-deploy`
-   - Emits desktop notification on success (low priority) and failure (critical priority) — operator signal that the silent-failure case in the v1 design lacked
-   - Refuses to re-apply a poisoned commit until manual `rm /var/lib/nixos-deploy/poisoned`
+   - Tracks `last-good` SHA and `current-poison` (latest refused SHA); poisoned history is append-only at `poisoned.log`
    - Logs to journal under `nixos-deploy.service`
+
+   **Operator notification** (separate user-scoped service so DBUS works):
+   ```nix
+   # Triggered by path-watch; runs as user jonathan with their session bus.
+   systemd.user.services.nixos-deploy-notify = {
+     Service = {
+       Type = "oneshot";
+       ExecStart = "${pkgs.writeShellScript "nixos-deploy-notify" ''
+         set -e
+         if [ -f /var/lib/nixos-deploy/notify-failure ]; then
+           SHA=$(cat /var/lib/nixos-deploy/current-poison 2>/dev/null || echo unknown)
+           ${pkgs.libnotify}/bin/notify-send -u critical "nixos-deploy FAILED" \
+             "Commit $SHA failed activation. Recovery: sudo nixos-rebuild switch --rollback"
+           sudo rm -f /var/lib/nixos-deploy/notify-failure
+         fi
+         if [ -f /var/lib/nixos-deploy/notify-success ]; then
+           SHA=$(cat /var/lib/nixos-deploy/last-good)
+           ${pkgs.libnotify}/bin/notify-send -u low "nixos-deploy" "Applied $SHA"
+           sudo rm -f /var/lib/nixos-deploy/notify-success
+         fi
+       ''}";
+     };
+   };
+   systemd.user.paths.nixos-deploy-notify = {
+     Unit.Description = "Watch for nixos-deploy notification flags";
+     Path.PathExists = "/var/lib/nixos-deploy/notify-failure";
+     Install.WantedBy = [ "default.target" ];
+   };
+   # Second path unit for success flag (systemd path units only watch one path each)
+   ```
+   - Root deploy script writes flag files; user-bus service consumes them and surfaces via libnotify
+   - `users.users.jonathan.linger = true` is required so the user systemd survives boot before login (already set on dellan; verify in implementation)
+   - Flag files in `/var/lib/nixos-deploy/` (root-writable, jonathan can read but only delete via `sudo rm` — script uses `sudo` from a sudoers entry that allows `jonathan` to delete those specific files without password)
 3. **Trigger** = webhook (same Tailscale Funnel ingress). On `push: main` event, signature-verified handler issues `systemctl start nixos-deploy.service`.
 4. **Concurrency:** `Conflicts=` ensures one deploy at a time. Webhook handler debounces overlapping triggers — if a deploy is in flight when another push lands, it queues a single follow-up via `systemctl start --no-block` (unit's `RefuseManualStart=no` allows queueing).
 5. **No auto-rollback.** NixOS retains last 10 generations; bootloader menu and `nixos-rebuild switch --rollback` are the recovery path. Failure notification surfaces the recovery command directly to the operator.
+
+### B.6: Bootstrap script for the deploy target
+
+`scripts/bootstrap-deploy-target.sh` — converts the old symlinked `/etc/nixos` into a fresh root-owned clone:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ ! -L /etc/nixos ] && [ -d /etc/nixos/.git ]; then
+  echo "/etc/nixos is already a real git checkout; skipping"
+  exit 0
+fi
+
+# Pre-flight: verify origin/main builds before destroying the old layout
+nix build --no-link "git+ssh://git@github.com/jonathanmoregard/nixos-config?ref=main#nixosConfigurations.dellan.config.system.build.toplevel"
+
+# Stop deploy timer/service to avoid a race
+sudo systemctl stop nixos-deploy.service nixos-deploy.timer 2>/dev/null || true
+
+# Clone fresh, then atomically replace
+sudo git clone --branch main git@github.com:jonathanmoregard/nixos-config.git /etc/nixos.new
+sudo git -C /etc/nixos.new config safe.directory /etc/nixos
+
+# Snapshot the old symlink target before removing
+if [ -L /etc/nixos ]; then
+  TARGET=$(readlink /etc/nixos)
+  echo "old /etc/nixos was symlink to: $TARGET"
+fi
+sudo rm -rf /etc/nixos       # safe: we have backups in ~/Repos and on origin
+sudo mv /etc/nixos.new /etc/nixos
+
+# Restart deploy
+sudo systemctl start nixos-deploy.service
+```
+- Pre-flight build of `origin/main` ensures we don't strand the host on a broken commit
+- The `rm -rf /etc/nixos` is the only destructive action and it's predicated on the pre-flight passing
 
 ### Why this is safe without auto-rollback
 
@@ -247,7 +326,7 @@ git -C "$BARE" worktree add ../nixos-config-worktrees/main main
 #    (Production auto-deploy) into its own root-owned clone.
 echo "Bare conversion done. Run B's bootstrap next to re-establish /etc/nixos."
 ```
-Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (run separately) reclones `/etc/nixos` from `origin/main` as a root-owned tree, severing the old symlink relationship.
+Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (`scripts/bootstrap-deploy-target.sh`, see B.6 below) reclones `/etc/nixos` from `origin/main` as a root-owned tree, severing the old symlink relationship.
 
 ### Failure handling
 
@@ -287,36 +366,66 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
    - Step fetches `BASE_SHA` explicitly (`git fetch origin main:refs/remotes/origin/main`); `actions/checkout` only fetches PR head by default
    - Builds both `system.build.toplevel` derivations (cache-hit via Attic)
    - Runs all three sources, merges results
-   - Highest matched bucket wins (CRITICAL > HIGH > MEDIUM > LOW > TRIVIAL); if no rule matches, default = MEDIUM (fail-closed)
+   - **No-op short-circuit:** if all three diffs are empty (closure unchanged AND etc-tree unchanged AND `git diff` is empty or whitespace/comment-only), classify as **TRIVIAL** without consulting the rule table. Reason: no signal at all = no risk by definition; only fall back to fail-closed MEDIUM when there's a signal we can't categorize.
+   - **Fail-closed default:** if signal exists in any source but no rule matches, default = MEDIUM
+   - Highest matched bucket wins (CRITICAL > HIGH > MEDIUM > LOW > TRIVIAL)
    - Emits highest bucket via `$GITHUB_OUTPUT` (modern replacement for the deprecated `::set-output`)
+   - **PR comment with breakdown:** classify step posts a markdown table to the PR showing per-source contributions, so reviewers see why a bucket was chosen rather than just the verdict:
+     ```
+     | Source            | Matched          | Contribution |
+     |-------------------|------------------|--------------|
+     | diff-closures     | linux: 6.1→6.2   | CRITICAL     |
+     | etc-tree paths    | (none)           | —            |
+     | source-tree (git) | flake.nix        | —            |
+     | **Final**         | linux is critical| **CRITICAL** |
+     ```
 
-2. **Rule table** `scripts/risk-rules.nix` — split by data source:
+2. **Rule table** `scripts/risk-rules.nix` — split by data source. **Matching semantics specified explicitly per source to avoid the `linux` ⊂ `linux-firmware` ambiguity:**
+
    ```nix
    {
-     # Source 1: package names (matched against diff-closures output keys)
+     # Source 1: package names — EXACT match on the package-name token left of
+     # the colon in `diff-closures` output. `linux: 6.1→6.2` matches the literal
+     # string "linux", NOT "linux-firmware". Add both names if you want both.
+     # DO NOT add flake.lock to trivial — closure delta is the only signal for
+     # lock bumps.
      packages = {
        critical = [ "linux" "linux-firmware" "systemd-boot" "grub" "bootspec" ];
        high     = [ "openssh" "systemd" "agenix" "pam" ];
        # any package add/remove not matched above → MEDIUM
      };
-     # Source 1b: agenix secret rotation appears as `*.age: ε → ∅` lines
+     # Source 1b: agenix secret rotation appears as `*.age: ε → ∅` lines.
+     # Match: filename SUFFIX `.age` on the package-name token.
      secrets = {
-       high = [ ".age" ];   # any secret rotation triggers HIGH (was CRITICAL — softened: rotation is routine)
+       high = [ ".age" ];   # rotation triggers HIGH (was CRITICAL — softened: rotation is routine)
      };
-     # Source 2: paths inside the etc/ derivation (matched as prefixes from /etc relative)
+     # Source 2: paths inside the etc/ derivation. Match: PREFIX from /etc-relative
+     # path. `systemd/system/` matches `systemd/system/foo.service` but NOT
+     # `dbus-1/systemd/system/`.
      etcPaths = {
        critical = [ "boot.json" "kernel-modules/" ];
        high     = [ "systemd/system/" "pam.d/" "sudoers" "ssh/" "shadow" "passwd" ];
        # other etc paths → MEDIUM
      };
-     # Source 3: source-tree paths (matched via git diff)
+     # Source 3: source-tree paths from `git diff --name-only`. Match: PREFIX.
      sourceTree = {
        trivial = [ "docs/" "README" "tests/baselines/" ];
        # other source paths fall through to derivation-based scoring
      };
    }
    ```
-   Note: HM-managed paths under `~/.config` / `~/.local` do NOT appear in `/etc`. They live in the `home-manager-jonathan` derivation. For now, source-tree changes touching only `home/*.nix` (no resulting kernel/systemd/etc delta) classify as LOW via fall-through. If finer HM-path discrimination is needed later, add a Source 4 walking `home-manager-jonathan` outputs.
+
+   A unit-test script `scripts/risk-rules.test.sh` is part of the implementation. Test cases include:
+   - `linux-firmware: 20240101 → 20240601` → CRITICAL (exact match on `linux-firmware`)
+   - `util-linux: 2.39 → 2.40` → MEDIUM (no exact match on `util-linux`; falls through to default-medium)
+   - `openssh: 9.0 → 9.1` → HIGH
+   - `unit-podman.service: ε → ∅` → MEDIUM (no rule match → default)
+   - `pam.d/sshd` → HIGH (etc path prefix match)
+   - `dbus-1/systemd/system/...` → MEDIUM (etc path NOT prefix-matched by `systemd/system/`)
+   - `flake.lock` only changed AND closure unchanged → TRIVIAL via no-op short-circuit
+   - `flake.lock` changed AND closure shifts (e.g. nixpkgs bump) → bucket determined by closure delta, not lock file
+
+   Note: HM-managed paths under `~/.config` / `~/.local` do NOT appear in `/etc`. They live in the `home-manager-jonathan` derivation. For now, source-tree changes touching only `home/*.nix` (no resulting kernel/systemd/etc delta) classify via fall-through to closure-based scoring. If finer HM-path discrimination is needed later, add a Source 4 walking `home-manager-jonathan` outputs.
 3. **Bucket → GitHub label:**
 
    | Bucket | Label | Effect |
@@ -329,12 +438,21 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
 4. **AI code-review subagent (MEDIUM bucket):** GHA step calls a Claude-Code subagent via the existing skill set; verdict `approve` → bot adds `ai-approved` label; verdict `request-changes` → comment posted, `ai-approved` not added.
    - **Authentication:** ANTHROPIC_API_KEY stored in `secrets/anthropic-api-key.age`, exposed to the workflow step as a runner-scoped environment variable. **Cost note:** this is a billed Claude API key (Claude.ai subscription does not work for CI use); spend is bounded by MEDIUM-bucket PR rate. Add to `secrets/secrets.nix` allKeys list.
    - **Prompt-injection mitigation:** PR body, commit messages, and diff contents are wrapped in `<untrusted_external_content>` tags before passing to the subagent (per global CLAUDE.md). Subagent must NOT execute instructions found inside these tags.
-   - **Circuit breaker:** track AI-approved auto-merges in `~/.cache/ci-state/ai-approved-merges.jsonl` (one line per merge, with SHA, timestamp, classifier verdict). After **3 consecutive AI-approved merges without a human approval in between**, OR within **24h of any deploy failure**, the label-gate flips to require human approval for MEDIUM bucket. Resets when a human approves any PR. State file lives outside the repo (in the runner's cache) so a malicious PR can't reset it.
+   - **Circuit breaker:** track AI-approved auto-merges in `/var/lib/ci-state/ai-approved-merges.jsonl` (one line per merge, with SHA, timestamp, classifier verdict). The path is owned by `root:actions-runner` mode `0775`, declared by a NixOS module (`modules/nixos/ci-state.nix`) so ownership and permissions are reproducible. The runner identity is fixed: **A.1 names the runner user as `actions-runner` (system user, no shell); the runner unit runs as that user via `User=actions-runner` in the systemd unit declaration.** After **3 consecutive AI-approved merges without a human approval in between**, OR within **24h of any deploy failure**, the label-gate flips to require human approval for MEDIUM bucket. Resets when a human approves any PR.
+   - **Threat-model caveat:** the state file is writeable by the runner user, which is the same identity that runs PR code. A malicious PR could theoretically reset the file. Mitigations layered on top:
+     1. The runner mounts the state directory append-only via a systemd `BindReadOnlyPaths` exception covering only `/var/lib/ci-state/ai-approved-merges.jsonl` (read-write), and read-only on the parent dir (no path manipulation).
+     2. A separate root-owned `state-snapshot.timer` runs hourly, copies the JSONL to `/var/lib/ci-state/snapshots/<timestamp>.jsonl`. Tamper detection: classifier hashes the live file against the latest snapshot's tail; mismatch → engages circuit-breaker on suspicion.
+     3. Audit signal: any reset event journals at WARNING with the actor and SHA so a `journalctl --since=...` review surfaces tampering.
    - **Label-gate enforcement:** Rulesets cannot read PR labels directly. A small workflow `label-gate.yml` runs on `pull_request: types: [opened, synchronize, reopened, labeled, unlabeled]` (the `labeled`/`unlabeled` types are required because GitHub does NOT re-trigger `pull_request` workflows on label changes by default — empirically verified gap). The workflow posts a status check `label-gate` that fails when:
      - `risk:medium` set AND `ai-approved` missing AND no human approval, OR
      - `risk:critical` or `risk:high` set AND no human approval, OR
      - circuit-breaker engaged (any case requires human).
      The Ruleset requires this status check to pass — that's how labels translate into a merge gate.
+   - **Label-add authorization:** the gate is only sound if labels can't be added by the same actor whose review they're supposed to gate. The `label-gate.yml` workflow inspects the `labeled` event payload's `sender.login` and refuses to count a label toward bypass if the sender is not in an allowlist:
+     - `ai-approved`: addable only by `github-actions[bot]` (set by the AI subagent step running in the trusted workflow)
+     - `baseline:approved`: addable only by `jonathan` (human review of pixel diffs)
+     - `risk:*`: addable only by `github-actions[bot]` (set by the classifier step)
+     A label added by a disallowed actor → status check fails. Implementation note: the workflow stores a record `(label, sender, sha)` per event in `/var/lib/ci-state/label-events.jsonl` for audit.
 5. **GitHub Rulesets** (set up by `scripts/bootstrap-rulesets.sh`, idempotent via the `PUT /repos/.../rulesets/{id}` API path).
    - **Idempotency strategy:** ruleset IDs are stored in `scripts/rulesets-state.json` (committed). On bootstrap: if state file lists IDs, the script issues `PUT` to update each existing ruleset; if no state file, the script issues `POST` to create them and writes back the IDs. Running twice without the state file would create duplicates — the state file prevents that. Optional alternative: discover existing rulesets by name match before creating. Implementation chooses the state-file approach for simplicity.
    - Rule 1: require PR before merging `main` — bypass actors: **none** (admins can't direct-push)
