@@ -81,10 +81,10 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
    - `MemoryHigh=20G` (caps RAM)
    - `Slice=actions-runner.slice`
    - Token stored in `secrets/github-runner-token.age`
-2. **Webhook ingress** via Tailscale Funnel:
+2. **Webhook ingress** via Tailscale Funnel — used **only** for production deploy. PR-triggered jobs do not need it (GHA self-hosted runners long-poll GitHub directly for queued work).
    - GitHub → `https://<machine>.<tailnet>.ts.net/webhook` → systemd socket-activated handler
    - HMAC signature verified using secret in `secrets/github-webhook-secret.age`
-   - Handler dispatches: `pull_request.{opened,synchronize}` → no-op (GHA listens directly), `push: main` → `systemctl start nixos-deploy.service`
+   - Handler subscribes to `push: main` events only; on receipt → `systemctl start nixos-deploy.service`
 3. **Workflow** `.github/workflows/ci.yml`:
    - Triggers: `pull_request: {types: [opened, synchronize, reopened]}`, `push: {branches: [main]}`
    - Concurrency group: `vm-lane-${{ matrix.lane }}` with `lane: [1, 2, 3]`
@@ -132,7 +132,14 @@ Every commit on `main` already passed: eval + build + VM-minimal + VM-graphical 
    - GHA matrix `lane: [1, 2, 3]` → at most 3 VM tests in flight
    - Per lane: 2 cores × 4 GB (matches existing `tests/dellan-vm.nix`)
    - Total: 6 cores / 12 GB → 6c / 20 GB headroom for daily-driver
-4. **Build coordination:** all worktrees share `/nix/store`. Nix daemon: `max-jobs = 3`, `cores = 4` per build → 12-thread cap. Attic deduplicates store paths across worktrees.
+4. **Build coordination:** all worktrees share `/nix/store`. Set in NixOS config (`hosts/dellan/default.nix` or a new `modules/nixos/build-coordination.nix`):
+   ```nix
+   nix.settings = {
+     max-jobs = 3;
+     cores = 4;          # 3 × 4 = 12-thread cap
+   };
+   ```
+   Attic deduplicates store paths across worktrees.
 5. **Agent isolation primitive:** each AI agent gets one worktree. `git worktree add ... <branch>` → work inside → push. The `using-git-worktrees` skill is the standard wrapper.
 6. **Test harness for the harness:** `advice-refine-test-loop` skill runs as a per-job step on PRs touching shared infra (`flake.nix`, `modules/`, `home/cinnamon.nix`).
 
@@ -171,10 +178,12 @@ git -C ~/Repos/nixos-config worktree add ../nixos-config-worktrees/main main
 
 1. **Classifier script** `scripts/classify-pr.sh` (GHA step):
    - Inputs: `BASE_REF` (default `main`), `HEAD_REF` (PR head)
+   - Step explicitly fetches `BASE_REF` first (`git fetch origin main:refs/remotes/origin/main`); GHA `actions/checkout` only fetches the PR head by default
+   - Checks out `BASE_REF` into a sibling worktree (`git worktree add /tmp/base $BASE_REF`)
    - Builds both `system.build.toplevel` derivations (cache-hit via Attic)
    - Runs `nix store diff-closures $base $head`
    - Maps changed paths → bucket via declarative rule table
-   - Emits highest bucket as `::set-output name=risk::<bucket>`
+   - Emits highest bucket via `$GITHUB_OUTPUT` (modern replacement for the deprecated `::set-output`)
 2. **Rule table** `scripts/risk-rules.nix`:
    ```nix
    {
@@ -199,14 +208,14 @@ git -C ~/Repos/nixos-config worktree add ../nixos-config-worktrees/main main
    | MEDIUM | `risk:medium` | AI code-review subagent posts review; `risk:medium` blocks auto-merge until either `ai-approved` label OR human approval |
    | LOW | `risk:low` | Auto-merge if all checks green |
    | TRIVIAL | `risk:trivial` | Auto-merge; non-essential gates skipped (eval+build still run) |
-4. **AI code-review subagent (MEDIUM bucket):** GHA step calls a Claude-Code subagent via the existing skill set; verdict `approve` → bot adds `ai-approved` label; verdict `request-changes` → comment posted, `ai-approved` not added. Branch protection consumes the label.
+4. **AI code-review subagent (MEDIUM bucket):** GHA step calls a Claude-Code subagent via the existing skill set; verdict `approve` → bot adds `ai-approved` label; verdict `request-changes` → comment posted, `ai-approved` not added.
+   - **Label-gate enforcement:** Rulesets cannot read PR labels directly. A small workflow `label-gate.yml` runs on `pull_request` and posts a status check `label-gate` that fails when (`risk:medium` is set AND `ai-approved` is missing) OR (`risk:critical|high` is set AND no human approval). The Ruleset requires this status check to pass — that's how labels translate into a merge gate.
 5. **GitHub Rulesets** (set up by `scripts/bootstrap-rulesets.sh`, idempotent):
    - Rule 1: require PR before merging `main` — bypass actors: **none** (admins can't direct-push)
    - Rule 2: require status checks (`eval`, `build`, `vm-minimal`, `classify`) — bypass actors: **[admin]** (admin can merge a failing PR via UI)
    - Rule 3: block force pushes — bypass actors: **none**
    - Rule 4: block branch deletion — bypass actors: **none**
-   - Rule 5: require reviewers when label `risk:critical|high` is present — bypass actors: **none**
-   - Rule 6: require label `ai-approved` OR human reviewer when `risk:medium` — bypass actors: **none**
+   - Rule 5: require status check `label-gate` to pass — bypass actors: **none**. (`label-gate` encodes both the "human required for risk:high|critical" and "ai-approved or human required for risk:medium" rules; see D.4.)
 
 ### Why Rulesets, not legacy branch protection
 
@@ -224,7 +233,7 @@ Legacy branch protection's `enforce_admins` is all-or-nothing. Rulesets allow pe
 | **build** | every PR + `push: main` | ~30s warm | Derivation compile, generated-script lint (shellcheck, flake8) |
 | **VM-minimal** | every PR | ~90s warm | HM activation, systemd user units, binary presence, X session up, kitty save/restore (= existing `tests/dellan-vm.nix`) |
 | **VM-graphical** | path-filter (`home/cinnamon.nix`, `modules/nixos/desktop.nix`, `home/kitty.nix`, theme files) | ~3-5min | Cinnamon panel renders, applets load, taskbar pins resolve, kitty renders glyphs (screenshot diff vs baseline) |
-| **VM-realapp** | opt-in label `test:realapp`; auto on `risk:high`+ | ~5-10min | Chrome/Beeper/Dropbox/KeePassXC launch, autostart fires, desktop notifications work, MIME defaults route correctly |
+| **VM-realapp** | opt-in label `test:realapp`; auto-applied when classifier label is `risk:critical` or `risk:high` | ~5-10min | Chrome/Beeper/Dropbox/KeePassXC launch, autostart fires, desktop notifications work, MIME defaults route correctly |
 
 ### Documented gaps (cannot be VM-tested)
 
