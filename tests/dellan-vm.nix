@@ -102,7 +102,7 @@ pkgs.testers.runNixOSTest {
     # cloned, so the unit stays inactive — but it must not be
     # not-found / failed at the unit-file layer.
     state = dellan.succeed(
-        "su jonathan -c 'systemctl --user show -p LoadState "
+        "su - jonathan -c 'systemctl --user show -p LoadState "
         "autodoro.service'"
     ).strip()
     assert state.endswith("=loaded"), f"autodoro.service LoadState: {state}"
