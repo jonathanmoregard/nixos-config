@@ -13,9 +13,15 @@
     agenix.url = "github:ryantm/agenix";
     agenix.inputs.nixpkgs.follows = "nixpkgs";
     agenix.inputs.darwin.follows = "nix-darwin";
+
+    # Autodoro pomodoro timer — vendored as a non-flake source so the
+    # NixOS wrapper can ship the bash + python scripts straight out of
+    # /nix/store. Update with `nix flake update autodoro`.
+    autodoro.url = "github:jonathanmoregard/autodoro";
+    autodoro.flake = false;
   };
 
-  outputs = { self, nixpkgs, home-manager, nix-darwin, agenix, ... }:
+  outputs = { self, nixpkgs, home-manager, nix-darwin, agenix, autodoro, ... }:
   let
     linuxSystem = "x86_64-linux";
     darwinSystem = "aarch64-darwin";
@@ -49,6 +55,7 @@
           home-manager.useGlobalPkgs = true;
           home-manager.useUserPackages = true;
           home-manager.users.jonathan = import ./home/jonathan-linux.nix;
+          home-manager.extraSpecialArgs = { autodoroSrc = autodoro; };
         }
       ];
     };
@@ -67,6 +74,7 @@
           home-manager.useGlobalPkgs = true;
           home-manager.useUserPackages = true;
           home-manager.users.jonathan = import ./home/jonathan-linux.nix;
+          home-manager.extraSpecialArgs = { autodoroSrc = autodoro; };
         }
       ];
     };
@@ -74,7 +82,7 @@
     # VM-based e2e tests. Run: `nix build .#checks.x86_64-linux.dellan-vm -L`
     checks.${linuxSystem}.dellan-vm = import ./tests/dellan-vm.nix {
       pkgs = pkgsLinux;
-      inputs = { inherit home-manager agenix; };
+      inputs = { inherit home-manager agenix autodoro; };
     };
 
     # Mac Mini (nix-darwin, placeholder — flesh out on arrival)

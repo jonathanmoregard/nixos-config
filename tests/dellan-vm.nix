@@ -77,14 +77,15 @@ pkgs.testers.runNixOSTest {
     dellan.wait_for_unit("default.target", "jonathan")
 
     # === autodoro launcher + GTK/GdkPixbuf runtime env ===
-    # On NixOS the autodoro pomodoro service must launch via a wrapper
-    # that injects a deterministic PATH (bash, pactl, paplay, xprintidle,
-    # cinnamon-screensaver-command, python3-with-gi) plus GI_TYPELIB_PATH
-    # and GDK_PIXBUF_MODULE_FILE so the GTK popup + webp blocker image
-    # render. Without the wrapper, the service exits 203/EXEC (the
-    # repo's `#!/bin/bash` shebang has no /bin/bash on NixOS) or
-    # crashes inside python with "Namespace Gtk not available" /
-    # "Couldn't recognize the image file format for file ...webp".
+    # Autodoro is fully declarative now: scripts ship from /nix/store
+    # via the `autodoro` flake input. Wrapper exec's `bash <store>/
+    # autodoro.sh`, so the script's shebang is irrelevant. The wrapper
+    # supplies PATH (bash/pactl/paplay/xprintidle/cinnamon-screensaver-
+    # command/python3-with-gi), GI_TYPELIB_PATH, and
+    # GDK_PIXBUF_MODULE_FILE so the GTK popup + webp blocker image
+    # render. Missing any of those would crash inside python with
+    # "Namespace Gtk not available" / "Couldn't recognize the image
+    # file format for file ...webp".
 
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/autodoro")
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/autodoro-env")
@@ -93,6 +94,28 @@ pkgs.testers.runNixOSTest {
     dellan.succeed(
         "head -1 /etc/profiles/per-user/jonathan/bin/autodoro | "
         "grep -Eq '^#!.*/(ba)?sh'"
+    )
+
+    # Wrapper sources autodoro.sh from /nix/store, not from $HOME —
+    # proves the declarative flake-input wiring took effect (regression
+    # would silently fall back to a missing $HOME path).
+    dellan.succeed(
+        "grep -Eq 'exec bash /nix/store/[^ ]+/autodoro\\.sh' "
+        "/etc/profiles/per-user/jonathan/bin/autodoro"
+    )
+    dellan.succeed(
+        "ref=$(grep -oE '/nix/store/[^ ]+/autodoro\\.sh' "
+        "/etc/profiles/per-user/jonathan/bin/autodoro); test -f \"$ref\""
+    )
+    # Sibling python scripts must be present alongside the bash entry.
+    dellan.succeed(
+        "ref=$(grep -oE '/nix/store/[^ ]+/autodoro\\.sh' "
+        "/etc/profiles/per-user/jonathan/bin/autodoro); "
+        "dir=$(dirname \"$ref\"); "
+        "test -f \"$dir/autodoro_popup.py\" && "
+        "test -f \"$dir/autodoro_blocker.py\" && "
+        "test -f \"$dir/config.defaults\" && "
+        "test -f \"$dir/gong.mp3\""
     )
 
     # All runtime CLI deps reachable from the launcher's PATH.
@@ -107,10 +130,7 @@ pkgs.testers.runNixOSTest {
             f"su jonathan -c \"autodoro-env bash -c 'command -v {binname}'\""
         )
 
-    # systemd unit definition resolves and is loaded. ExecCondition
-    # exits non-zero in the test VM because ~/Repos/autodoro is not
-    # cloned, so the unit stays inactive — but it must not be
-    # not-found / failed at the unit-file layer.
+    # systemd unit definition resolves and is loaded.
     state = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/1000 "
         "systemctl --user show -p LoadState autodoro.service'"

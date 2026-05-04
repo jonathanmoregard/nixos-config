@@ -1,14 +1,16 @@
-{ pkgs, lib, ... }:
+{ pkgs, lib, autodoroSrc, ... }:
 # Autodoro pomodoro timer.
 #
-# The script lives in ~/Repos/autodoro and is iterated on outside this
-# flake (post-push hook auto-restarts the service). The Nix side here
-# only owns the launch *environment*: a wrapper that injects every
-# binary and GI/pixbuf path the script's bash + python3+gi code needs
-# at runtime. NixOS has no /bin/bash and no global GI typelib, so
-# without this wrapper the service either exits 203/EXEC or crashes
-# inside python with "Namespace Gtk not available" / "Couldn't
-# recognize the image file format".
+# Fully declarative: scripts ship from /nix/store via the `autodoro`
+# flake input (github:jonathanmoregard/autodoro). The wrapper sets up
+# PATH + GI_TYPELIB_PATH + GDK_PIXBUF_MODULE_FILE for the bash +
+# python3+gi code, then exec's bash on the script (bypassing its
+# shebang so /bin/bash absence on NixOS does not matter).
+#
+# Iteration loop: edit autodoro repo → push → `nix flake update
+# autodoro` in /etc/nixos → `nixos-rebuild switch --flake
+# /etc/nixos#dellan`. The VM gate runs against the same source so
+# regressions surface before switch.
 let
   pythonEnv = pkgs.python3.withPackages (ps: with ps; [ pygobject3 ]);
 
@@ -28,10 +30,9 @@ let
   ];
 
   # Re-query gdk-pixbuf loaders against the base set + the webp
-  # loader, then point GDK_PIXBUF_MODULE_FILE at the regenerated
-  # cache. blocker.py loads a .webp screen image; without this the
-  # base loader cache (built without webp) would crash with
-  # "Couldn't recognize the image file format".
+  # loader. blocker.py loads a .webp screen image; the base loader
+  # cache (built without webp) would crash with "Couldn't recognize
+  # the image file format".
   # gdk-pixbuf-query-loaders takes loader .so paths as args — its
   # GDK_PIXBUF_MODULEDIR env honors only a single directory, so
   # passing two dirs separated by `:` quietly drops one.
@@ -59,15 +60,15 @@ let
     export GDK_PIXBUF_MODULE_FILE="${pixbufModuleFile}"
   '';
 
-  # The actual systemd ExecStart. Sources the env, then execs the
-  # repo script so the post-push reload path keeps working without a
-  # rebuild.
+  # systemd ExecStart. exec's bash on the store path so the script's
+  # shebang is irrelevant — wrapper PATH always points at our pinned
+  # bash, regardless of what shebang upstream changes the script to.
   launcher = pkgs.writeShellApplication {
     name = "autodoro";
     inherit runtimeInputs;
     text = ''
       ${envExports}
-      exec "$HOME/Repos/autodoro/autodoro.sh" "$@"
+      exec bash ${autodoroSrc}/autodoro.sh "$@"
     '';
   };
 
@@ -95,7 +96,6 @@ in
     };
     Service = {
       ExecStart = "${launcher}/bin/autodoro";
-      ExecCondition = "/bin/sh -c 'test -f %h/Repos/autodoro/autodoro.sh'";
       Restart = "on-failure";
       Environment = [
         "DISPLAY=:0"

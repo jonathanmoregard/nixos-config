@@ -25,6 +25,22 @@
         "type": "github"
       }
     },
+    "autodoro": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1777889795,
+        "narHash": "sha256-s2lY1wYhlgdf/65JGZ8YZtr6Q7zSRSl0ViLHHqmZ4T4=",
+        "owner": "jonathanmoregard",
+        "repo": "autodoro",
+        "rev": "146fa6eb39eff4f84a28f9c3079f9932703bc1a7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jonathanmoregard",
+        "repo": "autodoro",
+        "type": "github"
+      }
+    },
     "home-manager": {
       "inputs": {
         "nixpkgs": [
@@ -105,6 +121,7 @@
     "root": {
       "inputs": {
         "agenix": "agenix",
+        "autodoro": "autodoro",
         "home-manager": "home-manager_2",
         "nix-darwin": "nix-darwin",
         "nixpkgs": "nixpkgs"
