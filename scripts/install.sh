@@ -279,7 +279,15 @@ else
   sudo git -C "$CONFIG_PATH" -c user.name=jonathanmoregard \
     -c user.email=jonathan.more@hotmail.com \
     commit -m "feat(install): encrypt CI/CD secrets + enable services"
-  sudo git -C "$CONFIG_PATH" push origin main
+  # Push uses jonathan's SSH key (root has no GH credentials).
+  # GIT_SSH_COMMAND points at jonathan's id_ed25519 explicitly so the
+  # sudo'd push authenticates as jonathan to GitHub.
+  if [ -f "$HOME/.ssh/id_ed25519" ]; then
+    sudo GIT_SSH_COMMAND="ssh -i $HOME/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes" \
+      git -C "$CONFIG_PATH" push origin main
+  else
+    fail "No SSH key at \$HOME/.ssh/id_ed25519. Cannot push to GitHub. Generate one and register as a Deploy Key, then re-run."
+  fi
   ok "Committed + pushed config edits to origin/main"
 fi
 
