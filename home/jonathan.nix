@@ -80,8 +80,10 @@
 
     shellAliases = {
       ll = "ls -la";
-      rebuild = "sudo nixos-rebuild switch --flake /etc/nixos#vm";
-      update = "sudo nix flake update /etc/nixos && sudo nixos-rebuild switch --flake /etc/nixos#vm";
+      # `rebuild` and `update` aliases removed — auto-deploy on push:main
+      # handles rebuilds. Manual rebuild = emergency only:
+      #   sudo nixos-rebuild switch --flake /etc/nixos#dellan
+      #   sudo nixos-rebuild switch --rollback
       drift = "cat ~/.local/share/nixos-drift-analyzer/latest.md 2>/dev/null || echo 'No drift report yet.'";
     };
 
