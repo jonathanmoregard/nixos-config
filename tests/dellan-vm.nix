@@ -46,6 +46,7 @@ pkgs.testers.runNixOSTest {
       useGlobalPkgs = true;
       useUserPackages = true;
       users.jonathan = import ../home/jonathan-linux.nix;
+      extraSpecialArgs = { autodoroSrc = inputs.autodoro; };
     };
 
     users.users.jonathan = {
