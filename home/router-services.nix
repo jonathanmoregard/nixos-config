@@ -2,6 +2,57 @@
 # User services ported from ~/.config/systemd/user/ + migrated from autostart.
 # - Router services: originals under ~/.local/share/router-agent (uv-managed venv).
 # - Voquill: migrated from ~/.config/autostart/ to a proper systemd user service.
+let
+  # Voquill is built outside Nix (in ~/Repos/voquill via its devShell flake),
+  # so the resulting binary links against unqualified SONAMEs (libwebkit2gtk,
+  # libxdo, libpulse, etc.). On NixOS those libs aren't in /usr/lib, so we
+  # have to inject the Nix-store paths via LD_LIBRARY_PATH at launch time.
+  # Keep this list in sync with apps/desktop/flake.nix `runtimeLibs`.
+  voquillRuntimeLibs = with pkgs; [
+    webkitgtk_4_1
+    gtk3
+    gtk-layer-shell
+    libayatana-appindicator  # tray-icon dlopens libayatana-appindicator3.so.1
+    glib
+    libsoup_3
+    librsvg
+    gdk-pixbuf
+    cairo
+    pango
+    atk
+    harfbuzz
+    openssl
+    alsa-lib
+    libpulseaudio
+    xdotool
+    libx11
+    libxtst
+    libxi
+    libxrandr
+    libxcursor
+    libxcb
+    libxkbcommon
+    wayland
+    vulkan-loader
+    libGL
+  ];
+
+  # Built with tauri.local.conf.json overlay so the binary uses the
+  # `com.voquill.desktop.local` identifier and reads the user's existing
+  # data directory at ~/.config/com.voquill.desktop.local.
+  voquillBinary = "/home/jonathan/Repos/voquill/apps/desktop/src-tauri/target/release/Voquill (local)";
+  voquillWrapper = pkgs.writeShellApplication {
+    name = "voquill-launch";
+    runtimeInputs = [ pkgs.xdotool ];
+    text = ''
+      export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath voquillRuntimeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      # webkit2gtk DMA-BUF renderer can crash on some drivers; force the
+      # legacy compositing renderer for stability inside Tauri.
+      export WEBKIT_DISABLE_DMABUF_RENDERER=1
+      exec "${voquillBinary}" "$@"
+    '';
+  };
+in
 {
   systemd.user.services.router-ingestor = {
     Unit = {
@@ -56,10 +107,22 @@
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # Voquill voice-typing app. Live binary at
-  # ~/Repos/voquill/apps/desktop/src-tauri/target/debug/Voquill (debug build).
-  # The prior autostart .desktop entry pointed at a stale Voice-typing/ path;
-  # this service uses the current path.
+  # Voquill voice-typing app. Locally-built release binary at
+  # ~/Repos/voquill/apps/desktop/src-tauri/target/release/Voquill, launched
+  # through `voquillWrapper` so it gets the Nix-store LD_LIBRARY_PATH it
+  # cannot resolve on its own (no /usr/lib on NixOS).
+  # Start-menu entry for Voquill. Placed at ~/.local/share/applications by
+  # home-manager so Cinnamon's menu picks it up without imperative edits.
+  xdg.desktopEntries.voquill = {
+    name = "Voquill";
+    comment = "AI voice dictation";
+    exec = "${voquillWrapper}/bin/voquill-launch";
+    icon = "/home/jonathan/Repos/voquill/apps/desktop/src-tauri/icons/128x128.png";
+    terminal = false;
+    type = "Application";
+    categories = [ "Utility" "AudioVideo" ];
+  };
+
   systemd.user.services.voquill = {
     Unit = {
       Description = "Voquill voice-typing";
@@ -68,7 +131,7 @@
     };
     Service = {
       Type = "simple";
-      ExecStart = "/home/jonathan/Repos/voquill/apps/desktop/src-tauri/target/debug/Voquill --voquill-autostart-hidden";
+      ExecStart = "${voquillWrapper}/bin/voquill-launch --voquill-autostart-hidden";
       Restart = "on-failure";
       RestartSec = 5;
     };
