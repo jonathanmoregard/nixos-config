@@ -78,19 +78,17 @@ require_cmd() {
 }
 
 agenix_encrypt() {
-  # Encrypts content from stdin → secrets/$1.age. Uses the agenix
-  # flake app; runs in $CONFIG_PATH so secrets/secrets.nix is picked up.
+  # Encrypts content from stdin → secrets/$1.age. agenix expects
+  # secrets.nix to live next to the .age files, so we cd into
+  # $CONFIG_PATH/secrets and pass a bare filename.
   local name="$1" tmp
   tmp=$(mktemp)
   cat > "$tmp"
-  # agenix's -e mode opens an editor; we use EDITOR=cp to drop content
-  # from a file, but cleaner is the rage CLI directly through agenix's
-  # internals. Workaround: write plaintext to a temp file then pipe.
   (
-    cd "$CONFIG_PATH"
+    cd "$CONFIG_PATH/secrets"
     EDITOR="cp -f $tmp" sudo -E nix run \
       --extra-experimental-features 'nix-command flakes' \
-      github:ryantm/agenix -- -e "secrets/${name}.age"
+      github:ryantm/agenix -- -e "${name}.age"
   )
   rm -f "$tmp"
 }
