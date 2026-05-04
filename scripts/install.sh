@@ -8,7 +8,7 @@
 #   5. VM gate + nixos-rebuild switch
 #   6. Bare-repo + deploy-target bootstraps
 #   7. Tailscale Funnel + GitHub Webhook UI
-#   8. Rulesets bootstrap (evaluate then active)
+#   8. Branch protection bootstrap (evaluate then active)
 #   9. Smoke test (no-op PR)
 #
 # Run as your normal user; the script will sudo for the privileged steps.
@@ -412,13 +412,13 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Phase 8: Rulesets bootstrap
+# Phase 8: Branch protection bootstrap
 # -------------------------------------------------------------------------
 
-heading "Phase 8: Rulesets bootstrap"
+heading "Phase 8: Branch protection bootstrap"
 
 if [ "$DRY_RUN" = "1" ]; then
-  note "DRY_RUN: skipping Rulesets bootstrap"
+  note "DRY_RUN: skipping Branch protection bootstrap"
 else
   if [ -z "${RULESETS_PAT:-}" ]; then
     if [ -n "${TEST_PAT:-}" ]; then
@@ -429,15 +429,15 @@ else
     fi
   fi
 
-  note "Running bootstrap-rulesets.sh in evaluate (dry-run) mode..."
-  GH_TOKEN="$RULESETS_PAT" "$REPO_ROOT/scripts/bootstrap-rulesets.sh" evaluate
+  note "Running bootstrap-branch-protection.sh in evaluate (dry-run) mode..."
+  GH_TOKEN="$RULESETS_PAT" "$REPO_ROOT/scripts/bootstrap-branch-protection.sh" evaluate
   ok "Dry-run rulesets created"
 
-  prompt "Open $GH_URL/rulesets — verify the dry-run rulesets look right."
+  prompt "Review the proposed config above. Branch protection has no native dry-run; activate when ready."
   pause "Ready to activate?"
 
   note "Activating rulesets..."
-  GH_TOKEN="$RULESETS_PAT" "$REPO_ROOT/scripts/bootstrap-rulesets.sh" active
+  GH_TOKEN="$RULESETS_PAT" "$REPO_ROOT/scripts/bootstrap-branch-protection.sh" active
   ok "Rulesets active"
 
   unset RULESETS_PAT
