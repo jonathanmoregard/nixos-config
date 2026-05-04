@@ -62,16 +62,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          risk="${{ steps.classify.outputs.risk }}"
-          # Strip any existing risk:* label, add the new one
-          gh pr edit "${PR_NUMBER}" \
-            --remove-label risk:critical \
-            --remove-label risk:high \
-            --remove-label risk:medium \
-            --remove-label risk:low \
-            --remove-label risk:trivial 2>/dev/null || true
-          gh pr edit "${PR_NUMBER}" \
-            --add-label "risk:$(echo "$risk" | tr '[:upper:]' '[:lower:]')"
+          risk_lower=$(echo "${{ steps.classify.outputs.risk }}" | tr '[:upper:]' '[:lower:]')
+
+          # Ensure all risk:* labels exist in the repo (idempotent;
+          # gh label create --force overwrites color/desc, doesn't error
+          # on existing).
+          gh label create risk:critical --color B60205 --description "Classifier: CRITICAL" --force
+          gh label create risk:high     --color D93F0B --description "Classifier: HIGH"     --force
+          gh label create risk:medium   --color FBCA04 --description "Classifier: MEDIUM"   --force
+          gh label create risk:low      --color 0E8A16 --description "Classifier: LOW"      --force
+          gh label create risk:trivial  --color 1D76DB --description "Classifier: TRIVIAL"  --force
+          gh label create ai-approved   --color 5319E7 --description "AI reviewer approved" --force
+          gh label create baseline:approved --color 5319E7 --description "Pixel baseline drift approved" --force
+
+          # Strip any existing risk:* label, add the new one. Removes
+          # one at a time so a missing label doesn't abort the rest.
+          for old in risk:critical risk:high risk:medium risk:low risk:trivial; do
+            gh pr edit "${PR_NUMBER}" --remove-label "$old" 2>/dev/null || true
+          done
+          gh pr edit "${PR_NUMBER}" --add-label "risk:${risk_lower}"
 
       - name: Post classifier breakdown as PR comment
         env:
