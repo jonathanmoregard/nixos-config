@@ -130,61 +130,73 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
 
-      - name: Validate label-add sender against allowlist
+      - name: Validate every current label against add-time allowlist
+        env:
+          REPO: ${{ github.repository }}
         run: |
-          # If this is a label event, check the sender. Allowlist:
-          #   ai-approved        → github-actions[bot] only
-          #   baseline:approved  → jonathan only
-          #   risk:*             → github-actions[bot] only
-          if [ "${{ github.event.action }}" = "labeled" ] || [ "${{ github.event.action }}" = "unlabeled" ]; then
-            label_name="${{ github.event.label.name }}"
-            sender="${{ github.event.sender.login }}"
+          # Walk the PR's timeline to find each label's actor; refuse if
+          # any current label was added by a disallowed actor. Runs on
+          # EVERY workflow invocation (open/sync/labeled/unlabeled) so a
+          # pre-existing label added between events is still audited.
+          set -euo pipefail
+          labels=$(gh pr view "${PR_NUMBER}" --json labels --jq '.labels[].name')
+          while IFS= read -r label_name; do
+            [ -z "$label_name" ] && continue
+            # Get the actor of the most recent labeled event for this label
+            actor=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/timeline" \
+              --jq "[.[] | select(.event == \"labeled\" and .label.name == \"$label_name\")] | last | .actor.login")
             case "$label_name" in
-              ai-approved)
-                if [ "$sender" != "github-actions[bot]" ]; then
-                  echo "❌ label $label_name added by disallowed sender $sender"; exit 1
-                fi ;;
+              ai-approved|risk:*)
+                if [ "$actor" != "github-actions[bot]" ]; then
+                  echo "❌ label '$label_name' added by disallowed actor: $actor"
+                  exit 1
+                fi
+                ;;
               baseline:approved)
-                if [ "$sender" != "jonathan" ]; then
-                  echo "❌ label $label_name added by disallowed sender $sender"; exit 1
-                fi ;;
-              risk:*)
-                if [ "$sender" != "github-actions[bot]" ]; then
-                  echo "❌ label $label_name added by disallowed sender $sender"; exit 1
-                fi ;;
+                if [ "$actor" != "jonathan" ]; then
+                  echo "❌ label '$label_name' added by disallowed actor: $actor"
+                  exit 1
+                fi
+                ;;
             esac
-          fi
+          done <<< "$labels"
 
       - name: Compute label-gate status
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           labels=$(gh pr view "${PR_NUMBER}" --json labels --jq '[.labels[].name]')
           has() { echo "$labels" | jq -e --arg l "$1" 'index($l) != null' >/dev/null; }
 
-          # human approval = any review with state APPROVED
-          approved_by_human=$(gh pr view "${PR_NUMBER}" \
-            --json reviews \
-            --jq '[.reviews[] | select(.state == "APPROVED")] | length > 0')
+          # Human approval = APPROVED review on the CURRENT head SHA.
+          # A force-push past a stale approval would otherwise bypass the
+          # gate; filter by commit_id == HEAD_SHA so reviews must be fresh.
+          approved_by_human=$(gh api \
+            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+            --jq "[.[] | select(.state == \"APPROVED\" and .commit_id == \"${HEAD_SHA}\")] | length")
 
-          # CRITICAL / HIGH risk → human approval required
+          # CRITICAL / HIGH risk → fresh human approval required
           if has "risk:critical" || has "risk:high"; then
-            if [ "$approved_by_human" != "true" ]; then
-              echo "❌ risk:critical/high requires human approval"; exit 1
-            fi
-          fi
-
-          # MEDIUM → ai-approved OR human
-          if has "risk:medium"; then
-            if ! has "ai-approved" && [ "$approved_by_human" != "true" ]; then
-              echo "❌ risk:medium requires ai-approved label or human approval"
+            if [ "$approved_by_human" -lt 1 ]; then
+              echo "❌ risk:critical/high requires fresh human approval (on $HEAD_SHA)"
               exit 1
             fi
           fi
 
-          # baseline drift gate — any change under tests/baselines/
-          # requires baseline:approved label
-          touched_baseline=$(gh pr diff "${PR_NUMBER}" --name-only \
-            | grep -c '^tests/baselines/' || true)
+          # MEDIUM → ai-approved OR fresh human
+          if has "risk:medium"; then
+            if ! has "ai-approved" && [ "$approved_by_human" -lt 1 ]; then
+              echo "❌ risk:medium requires ai-approved label or fresh human approval"
+              exit 1
+            fi
+          fi
+
+          # Baseline drift gate — any change under tests/baselines/
+          # requires baseline:approved label.
+          # Using `gh pr view --json files` (gh pr diff has no --name-only).
+          touched_baseline=$(gh pr view "${PR_NUMBER}" --json files \
+            --jq '[.files[].path | select(startswith("tests/baselines/"))] | length')
           if [ "$touched_baseline" -gt 0 ]; then
             if ! has "baseline:approved"; then
               echo "❌ tests/baselines/ changed but baseline:approved label missing"

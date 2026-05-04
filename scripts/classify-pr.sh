@@ -75,8 +75,9 @@ SRC_LINES=$(wc -l < "$WORK/source-paths.txt")
 if [ "$PKG_LINES" -eq 0 ] && [ "$ETC_LINES" -eq 0 ] && [ "$SRC_LINES" -eq 0 ]; then
   RISK=TRIVIAL
   echo "## Classifier: TRIVIAL (no-op — all three diffs empty)"
-  emit_risk() { echo "risk=$1" >> "${GITHUB_OUTPUT:-/dev/stdout}"; }
-  emit_risk "$RISK"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    echo "risk=$RISK" >> "$GITHUB_OUTPUT"
+  fi
   exit 0
 fi
 

@@ -116,11 +116,11 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${deployScript}";
-        # Conflicts ensures only one deploy at a time. A second invocation
-        # while one is running queues via systemctl start --no-block.
       };
-      conflicts = [ "nixos-deploy.service" ];
-      path = with pkgs; [ git nixos-rebuild ];
+      # systemd oneshots already serialize naturally — a second `start`
+      # while one is running is a no-op. Earlier draft used Conflicts=self
+      # which has the opposite effect (stops the running one).
+      path = with pkgs; [ git nixos-rebuild openssh ];
     };
 
     # User-bus notification chain. systemd Path.PathExists watches one path

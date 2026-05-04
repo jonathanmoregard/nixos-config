@@ -56,14 +56,16 @@ in
   config = lib.mkIf cfg.enable {
     users.groups.claude-agents = { };
 
-    users.users = (lib.listToAttrs (map (n: {
-      name = "claude-agent-${toString n}";
-      value = agentUser "claude-agent-${toString n}";
-    }) (lib.range 1 cfg.count))) // {
-      # jonathan is in claude-agents so they share the worktree-readable
-      # group. (Group, not setuid.)
-      jonathan.extraGroups = [ "claude-agents" ];
-    };
+    # mkMerge so we can both define agent users via listToAttrs AND
+    # extend jonathan's extraGroups in the same module without a
+    # path-vs-attrset collision at parse time.
+    users.users = lib.mkMerge [
+      (lib.listToAttrs (map (n: {
+        name = "claude-agent-${toString n}";
+        value = agentUser "claude-agent-${toString n}";
+      }) (lib.range 1 cfg.count)))
+      { jonathan.extraGroups = [ "claude-agents" ]; }
+    ];
 
     # Loosen worktree-root permissions so agents can create/edit their
     # subdirectories. The bare repo at ~/Repos/nixos-config (NOT under

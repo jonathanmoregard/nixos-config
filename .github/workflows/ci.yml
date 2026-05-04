@@ -74,9 +74,9 @@ jobs:
       max-parallel: 3
       matrix:
         lane: [1, 2, 3]
-    concurrency:
-      group: vm-lane-${{ matrix.lane }}
-      cancel-in-progress: false
+    # Per-job concurrency removed — GHA concurrency is a mutex, not a
+    # pool. Lane parallelism is enforced by strategy.max-parallel: 3
+    # combined with workflow-level pr-cancel concurrency at the top.
     steps:
       - uses: actions/checkout@v4
       - run: |

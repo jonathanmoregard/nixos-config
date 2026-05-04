@@ -145,8 +145,10 @@ let
             return 0
 
         unit = os.environ.get("DEPLOY_UNIT", "nixos-deploy.service")
+        # sudo invocation matches the sudoers rule exactly: command path
+        # + start --no-block <unit>, which is the only allowed form.
         subprocess.run(
-            ["/run/current-system/sw/bin/systemctl", "start", "--no-block", unit],
+            ["sudo", "/run/current-system/sw/bin/systemctl", "start", "--no-block", unit],
             check=False,
         )
         respond("200 OK", f"queued: systemctl start {unit}")
@@ -191,7 +193,9 @@ in
 
     systemd.sockets.github-webhook = {
       description = "Listen for GitHub webhooks";
-      listenStreams = [ (toString cfg.port) ];
+      # Bind localhost only — Tailscale Funnel terminates TLS upstream
+      # and forwards to localhost. Don't expose to other interfaces.
+      listenStreams = [ "127.0.0.1:${toString cfg.port}" ];
       socketConfig = {
         Accept = true;
         MaxConnections = 4;
@@ -219,21 +223,20 @@ in
         TimeoutStartSec = "10s";
         User = "github-webhook";
         Group = "github-webhook";
-        # systemctl start requires polkit/sudo. Either grant the user
-        # passwordless start of the deploy unit, or run the handler under
-        # a user with that grant. Polkit rule lives below.
       };
     };
 
-    # Allow github-webhook to start the deploy unit without a password.
-    security.polkit.extraConfig = ''
-      polkit.addRule(function(action, subject) {
-        if (action.id == "org.freedesktop.systemd1.manage-units" &&
-            action.lookup("unit") == "${cfg.deployUnit}" &&
-            subject.user == "github-webhook") {
-          return polkit.Result.YES;
-        }
-      });
-    '';
+    # Allow github-webhook user to start the deploy unit without a password.
+    # Earlier draft used a polkit rule, but socket-activated handlers run
+    # without a D-Bus session — polkit's manage-units lookup falls back to
+    # PID 1 socket and returns EACCES. A scoped sudoers rule works in the
+    # no-D-Bus context.
+    security.sudo.extraRules = [{
+      users = [ "github-webhook" ];
+      commands = [{
+        command = "/run/current-system/sw/bin/systemctl start --no-block ${cfg.deployUnit}";
+        options = [ "NOPASSWD" ];
+      }];
+    }];
   };
 }

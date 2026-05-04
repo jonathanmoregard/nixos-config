@@ -62,7 +62,7 @@ in
       group = "actions-runner";
       home = "/var/lib/actions-runner";
       createHome = true;
-      shell = "${pkgs.shadow}/bin/nologin";
+      shell = "/run/current-system/sw/bin/nologin";
     };
     users.groups.actions-runner = { };
 
@@ -93,10 +93,11 @@ in
         ExecStart = pkgs.writeShellScript "actions-runner-ssh-setup" ''
           install -d -m 0700 -o actions-runner -g actions-runner /var/lib/actions-runner/.ssh
           install -m 0400 -o actions-runner -g actions-runner ${cfg.sshKeyFile} /var/lib/actions-runner/.ssh/id_ed25519
-          # known_hosts for github.com — pinned to avoid prompts
-          cat > /var/lib/actions-runner/.ssh/known_hosts <<'EOF'
-          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
-          EOF
+          # known_hosts for github.com — pinned to avoid prompts.
+          # printf used (not heredoc) so Nix indentation doesn't get baked in.
+          printf '%s\n' \
+            'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+            > /var/lib/actions-runner/.ssh/known_hosts
           chmod 0644 /var/lib/actions-runner/.ssh/known_hosts
           chown actions-runner:actions-runner /var/lib/actions-runner/.ssh/known_hosts
         '';
