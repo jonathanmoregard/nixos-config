@@ -19,23 +19,23 @@
   ];
 
   # ---------------------------------------------------------------------
-  # CI/CD workflow — agenix secret declarations. .age files don't exist
-  # until you encrypt them (see pending_for_human.md). Uncomment AFTER
-  # the corresponding .age file is created and committed.
+  # CI/CD workflow — agenix secret declarations.
   # ---------------------------------------------------------------------
 
   age.secrets.github-runner-token.file    = ../../secrets/github-runner-token.age;
   age.secrets.actions-runner-ssh-key.file = ../../secrets/actions-runner-ssh-key.age;
   age.secrets.github-webhook-secret.file  = ../../secrets/github-webhook-secret.age;
   age.secrets.gh-janitor-token.file       = ../../secrets/gh-janitor-token.age;
+  age.secrets.atticd-rs256-secret.file    = ../../secrets/atticd-rs256-secret.age;
 
   # ---------------------------------------------------------------------
-  # CI/CD workflow — service options. Each block depends on its
-  # corresponding age.secret being declared above. Uncomment one at a
-  # time per the install order in pending_for_human.md.
+  # CI/CD workflow — service options.
   # ---------------------------------------------------------------------
 
-  services.atticCache.enable = true;          # Step 2: Attic binary cache
+  services.atticCache = {                     # Step 2: Attic binary cache
+    enable = true;
+    rs256SecretFile = config.age.secrets.atticd-rs256-secret.path;
+  };
   services.buildCoordination.enable = true;   # Step 2b: nix max-jobs/cores caps
 
   services.actionsRunner = {                  # Step 1: self-hosted GHA runner

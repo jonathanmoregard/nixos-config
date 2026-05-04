@@ -27,18 +27,24 @@ in
       default = "dellan";
       description = "Cache name component of the substituter URL (http://localhost:PORT/<name>).";
     };
+
+    rs256SecretFile = lib.mkOption {
+      type = lib.types.path;
+      description = ''
+        Path to a file containing ATTIC_SERVER_TOKEN_RS256_SECRET=<base64>.
+        Required by atticd to sign cache API tokens. Generate via:
+          openssl genrsa -traditional 4096 | base64 -w0
+        and wrap as KEY=VALUE for systemd EnvironmentFile.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
     services.atticd = {
       enable = true;
-      # Settings minimal — bootstrap flow expects atticd to generate the
-      # signing key on first start. The public key is then committed into
-      # flake.nix's trusted-public-keys (see B.6).
+      environmentFile = cfg.rs256SecretFile;
       settings = {
         listen = "127.0.0.1:${toString cfg.port}";
-        # Use file-backed storage for the chunk store. NixOS module
-        # supplies sensible defaults; override here only if needed.
       };
     };
 
