@@ -80,12 +80,14 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
-# Treats a .age file as missing if it's smaller than 200 bytes.
-# 322-byte ciphertexts from earlier broken install.sh runs are
-# encrypted-empty; we want those re-encrypted with real content.
+# Treats a .age file as invalid if its ciphertext exactly matches the
+# "encrypted-empty + 2-recipient" baseline (322 bytes), which is what
+# the earlier broken cat>tmp+EDITOR=cp dance produced. Real plaintext
+# inflates ciphertext past 322. Threshold set to 350 — covers any
+# real plaintext of >= ~5 bytes.
 age_file_valid() {
   local f="$1"
-  [ -f "$f" ] && [ "$(wc -c < "$f")" -ge 200 ]
+  [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 350 ]
 }
 
 agenix_encrypt() {
@@ -107,8 +109,8 @@ agenix_encrypt() {
   )
   local cipher_size
   cipher_size=$(wc -c < "$CONFIG_PATH/secrets/${name}.age")
-  if [ "$cipher_size" -lt 200 ]; then
-    fail "agenix_encrypt $name: ciphertext only $cipher_size bytes (expected >= 200 with header). Encryption likely failed."
+  if [ "$cipher_size" -le 350 ]; then
+    fail "agenix_encrypt $name: ciphertext only $cipher_size bytes (<= 350; the empty-plaintext baseline is 322 bytes for 2 recipients). Encryption produced no plaintext."
   fi
 }
 
