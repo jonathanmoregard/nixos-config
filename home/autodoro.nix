@@ -32,11 +32,16 @@ let
   # cache. blocker.py loads a .webp screen image; without this the
   # base loader cache (built without webp) would crash with
   # "Couldn't recognize the image file format".
+  # gdk-pixbuf-query-loaders takes loader .so paths as args — its
+  # GDK_PIXBUF_MODULEDIR env honors only a single directory, so
+  # passing two dirs separated by `:` quietly drops one.
   pixbufModuleFile = pkgs.runCommand "autodoro-gdk-pixbuf-loaders.cache" {
     nativeBuildInputs = [ pkgs.gdk-pixbuf ];
   } ''
-    GDK_PIXBUF_MODULEDIR="${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders:${pkgs.webp-pixbuf-loader}/lib/gdk-pixbuf-2.0/2.10.0/loaders" \
-      gdk-pixbuf-query-loaders > $out
+    gdk-pixbuf-query-loaders \
+      ${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so \
+      ${pkgs.webp-pixbuf-loader}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so \
+      > $out
   '';
 
   runtimeInputs = [
