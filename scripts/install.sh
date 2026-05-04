@@ -67,9 +67,12 @@ pause() {
 
 read_secret() {
   # Reads a secret from stdin without echo. $1 = prompt text.
-  prompt "$1"
+  # Prompt + final newline go to STDERR so $(read_secret ...) doesn't
+  # capture them into the value.
+  local val
+  prompt "$1" >&2
   IFS= read -rs val
-  echo
+  echo >&2
   printf '%s' "$val"
 }
 
@@ -78,15 +81,17 @@ require_cmd() {
 }
 
 agenix_encrypt() {
-  # Encrypts content from stdin → secrets/$1.age. agenix expects
-  # secrets.nix to live next to the .age files, so we cd into
-  # $CONFIG_PATH/secrets and pass a bare filename.
+  # Encrypts content from stdin → $CONFIG_PATH/secrets/$1.age. Pre-flight
+  # asserts feat/cicd-workflow is merged to main, so /etc/nixos has the
+  # round-7 secrets.nix entries already. agenix's secrets.nix discovery
+  # walks up from the .age file, so we cd into $CONFIG_PATH/secrets and
+  # pass a bare filename.
   local name="$1" tmp
   tmp=$(mktemp)
   cat > "$tmp"
   (
     cd "$CONFIG_PATH/secrets"
-    EDITOR="cp -f $tmp" sudo -E nix run \
+    EDITOR="cp -f $tmp" nix run \
       --extra-experimental-features 'nix-command flakes' \
       github:ryantm/agenix -- -e "${name}.age"
   )
@@ -110,27 +115,35 @@ if [ ! -L "$CONFIG_PATH" ] && [ ! -d "$CONFIG_PATH" ]; then
   fail "$CONFIG_PATH does not exist"
 fi
 
-# Determine: are we ALREADY running from /etc/nixos (post bare-repo bootstrap),
-# or from a worktree under $HOME/Repos/nixos-config-worktrees?
+# Note where we're running from (informational only — install operates
+# on $CONFIG_PATH regardless).
 if [ "$REPO_ROOT" = "$CONFIG_PATH" ] || [ "$(readlink -f "$REPO_ROOT")" = "$(readlink -f "$CONFIG_PATH")" ]; then
-  CONFIG_FROM_WORKTREE=0
   ok "Running from $CONFIG_PATH directly"
 else
-  CONFIG_FROM_WORKTREE=1
   ok "Running from worktree $REPO_ROOT"
-  note "Will edit config files in $CONFIG_PATH (sudo)"
+  note "All edits target $CONFIG_PATH (sudo)"
 fi
 
-# Branch sanity
-BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)
-note "Current branch: $BRANCH"
-if [ "$BRANCH" != "feat/cicd-workflow" ] && [ "$BRANCH" != "main" ]; then
-  prompt "Branch is '$BRANCH', expected feat/cicd-workflow or main. Continue anyway? (y/N)"
-  read -r ans
-  [ "$ans" = "y" ] || exit 1
+# Pre-flight: feat must already be merged to main, AND /etc/nixos must
+# point at that merged main. Otherwise the secrets.nix lookup, the sed
+# config-edits, and the rebuild all fail in cascading ways.
+ETC_NIXOS_REAL=$(readlink -f "$CONFIG_PATH")
+ETC_BRANCH=$(git -C "$ETC_NIXOS_REAL" rev-parse --abbrev-ref HEAD)
+note "/etc/nixos resolves to $ETC_NIXOS_REAL (branch: $ETC_BRANCH)"
+
+if [ "$ETC_BRANCH" != "main" ]; then
+  fail "/etc/nixos is on branch '$ETC_BRANCH', not main. Merge feat/cicd-workflow → main first."
 fi
 
-ok "Pre-flight passed"
+# Confirm the merged main contains round-7 content.
+if ! grep -q '"actions-runner-ssh-key.age"' "$CONFIG_PATH/secrets/secrets.nix" 2>/dev/null; then
+  fail "/etc/nixos/secrets/secrets.nix doesn't have round-7 entries. Merge feat/cicd-workflow → main first."
+fi
+if ! grep -q 'services.atticCache.enable' "$CONFIG_PATH/hosts/dellan/default.nix" 2>/dev/null; then
+  fail "/etc/nixos/hosts/dellan/default.nix doesn't have round-7 service blocks. Merge feat/cicd-workflow → main first."
+fi
+
+ok "Pre-flight passed (main has round-7 content)"
 
 # -------------------------------------------------------------------------
 # Phase 1: SSH key for the runner (also reused by nixos-deploy.service)
@@ -138,7 +151,7 @@ ok "Pre-flight passed"
 
 heading "Phase 1: Generate runner SSH key"
 
-KEYFILE_AGE="$REPO_ROOT/secrets/actions-runner-ssh-key.age"
+KEYFILE_AGE="$CONFIG_PATH/secrets/actions-runner-ssh-key.age"
 if [ -f "$KEYFILE_AGE" ]; then
   ok "$KEYFILE_AGE already exists; skipping keygen"
 else
@@ -169,7 +182,7 @@ fi
 
 heading "Phase 2: Runner registration token"
 
-TOKEN_AGE="$REPO_ROOT/secrets/github-runner-token.age"
+TOKEN_AGE="$CONFIG_PATH/secrets/github-runner-token.age"
 if [ -f "$TOKEN_AGE" ]; then
   ok "$TOKEN_AGE already exists; skipping"
   note "If token is expired, delete the .age and re-run."
@@ -191,7 +204,7 @@ fi
 
 heading "Phase 3: Webhook secret + Rulesets PAT"
 
-WEBHOOK_AGE="$REPO_ROOT/secrets/github-webhook-secret.age"
+WEBHOOK_AGE="$CONFIG_PATH/secrets/github-webhook-secret.age"
 if [ -f "$WEBHOOK_AGE" ]; then
   ok "$WEBHOOK_AGE already exists; skipping"
   WEBHOOK_SECRET_DISPLAY="(already encrypted; cat manually if you need to re-paste in GH UI)"
@@ -202,7 +215,7 @@ else
   WEBHOOK_SECRET_DISPLAY="$WEBHOOK_SECRET"
 fi
 
-PAT_AGE="$REPO_ROOT/secrets/gh-janitor-token.age"
+PAT_AGE="$CONFIG_PATH/secrets/gh-janitor-token.age"
 if [ -f "$PAT_AGE" ]; then
   ok "$PAT_AGE already exists; skipping"
 else
@@ -221,31 +234,17 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Phase 4: Stage encrypted .age files in /etc/nixos + uncomment config
+# Phase 4: Uncomment service blocks in /etc/nixos/hosts/dellan/default.nix
 # -------------------------------------------------------------------------
 
-heading "Phase 4: Wire secrets + uncomment service blocks in $CONFIG_PATH"
+heading "Phase 4: Uncomment service blocks in $CONFIG_PATH"
 
-# Copy newly-encrypted .age files into /etc/nixos if running from worktree
-if [ "$CONFIG_FROM_WORKTREE" = 1 ]; then
-  for f in actions-runner-ssh-key github-runner-token github-webhook-secret gh-janitor-token; do
-    src="$REPO_ROOT/secrets/${f}.age"
-    dst="$CONFIG_PATH/secrets/${f}.age"
-    if [ -f "$src" ] && [ ! -f "$dst" ]; then
-      sudo cp "$src" "$dst"
-      ok "Copied secrets/${f}.age into $CONFIG_PATH"
-    fi
-  done
-fi
-
-# Uncomment age.secrets + service blocks in hosts/dellan/default.nix.
-# Uses sed in place; idempotent because uncommenting a line that's already
-# uncommented is a no-op (sed pattern won't match).
+# Uncomment age.secrets + service blocks. Uses sed in place; idempotent
+# because uncommenting an already-uncommented line is a no-op.
 HOST_NIX="$CONFIG_PATH/hosts/dellan/default.nix"
 
 uncomment_block() {
-  # $1 = anchor regex (matched line marks where to start), $2 = number of
-  # lines to uncomment. Strips leading '# ' from each line.
+  # $1 = anchor regex, $2 = number of lines after anchor to uncomment.
   local anchor="$1" count="$2"
   sudo sed -i "/$anchor/,+$count s/^  # /  /" "$HOST_NIX"
 }
@@ -260,7 +259,7 @@ uncomment_line 'age.secrets.actions-runner-ssh-key.file'
 uncomment_line 'age.secrets.github-webhook-secret.file'
 uncomment_line 'age.secrets.gh-janitor-token.file'
 
-# Service blocks
+# Single-line service options
 uncomment_line 'services.atticCache.enable = true;'
 uncomment_line 'services.buildCoordination.enable = true;'
 uncomment_line 'services.claudeAgentUsers.enable = true;'
@@ -270,10 +269,19 @@ uncomment_block 'services.actionsRunner =' 5
 uncomment_block 'services.githubWebhook =' 3
 uncomment_block 'services.nixosDeploy =' 3
 
-# Stage in git so the flake sees them
+# Commit + push the .age files and config edits BEFORE bare-repo bootstrap
+# destroys ~/Repos/nixos-config. The bootstrap reclones from origin/main,
+# so anything not pushed is lost.
 sudo git -C "$CONFIG_PATH" add -A
-
-ok "Config edits staged in $CONFIG_PATH"
+if sudo git -C "$CONFIG_PATH" diff --cached --quiet; then
+  ok "No changes to commit (already done in a previous run)"
+else
+  sudo git -C "$CONFIG_PATH" -c user.name=jonathanmoregard \
+    -c user.email=jonathan.more@hotmail.com \
+    commit -m "feat(install): encrypt CI/CD secrets + enable services"
+  sudo git -C "$CONFIG_PATH" push origin main
+  ok "Committed + pushed config edits to origin/main"
+fi
 
 # -------------------------------------------------------------------------
 # Phase 5: VM gate + nixos-rebuild switch
@@ -319,14 +327,17 @@ heading "Phase 7: Tailscale Funnel + GitHub Webhook"
 
 if sudo tailscale funnel status 2>/dev/null | grep -q ':9091'; then
   ok "Tailscale Funnel already exposing :9091"
-  FUNNEL_URL=$(sudo tailscale funnel status --json 2>/dev/null | jq -r '.AllowedFunnel[]' | head -1 || echo "<your-funnel-url>")
 else
   note "Starting Tailscale Funnel on :9091..."
   sudo tailscale funnel --bg 9091
   sleep 2
-  FUNNEL_URL=$(sudo tailscale funnel status --json 2>/dev/null | jq -r '.AllowedFunnel[]' | head -1)
-  ok "Funnel up at $FUNNEL_URL"
+  ok "Funnel started"
 fi
+# Funnel hostname comes from this node's tailnet DNS name; trim trailing dot.
+FUNNEL_HOST=$(tailscale status --json 2>/dev/null \
+  | jq -r '.Self.DNSName' | sed 's/\.$//')
+FUNNEL_URL="https://${FUNNEL_HOST}/"
+note "Funnel URL: $FUNNEL_URL"
 
 echo
 prompt "Open $GH_URL/settings/hooks/new"
@@ -370,7 +381,7 @@ heading "Phase 9: Smoke test"
 
 prompt "Optional: open a no-op test PR (e.g. README typo) to verify the"
 prompt "full pipeline (CI runs → classify → label → label-gate → mergeable)."
-prompt "Done?"
+pause "Done (or press ENTER to skip)?"
 
 ok "Install complete!"
 echo
