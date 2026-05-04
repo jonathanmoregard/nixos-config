@@ -9,7 +9,27 @@ let
   dellan = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJNvaYqBU7k/iTKPHcfVGYz5WJNVWnf0t26SX6Y7SZ0e root@dellan";
 
   allKeys = [ jonathan vm dellan ];
+
+  # Subset of recipients for CI/CD secrets — restrict to dellan host
+  # key + jonathan's editing key. Excludes vm because the CI runner
+  # only runs on dellan; a leaked key on vm shouldn't auto-decrypt.
+  ciKeys = [ jonathan dellan ];
 in {
-  # Add secrets here as needed, e.g.:
-  # "my-api-key.age".publicKeys = allKeys;
+  # ---------------------------------------------------------------------
+  # CI/CD workflow secrets (round 7).
+  #
+  # File CONTENTS expected at decrypt time:
+  #   github-runner-token.age    — raw GitHub registration token
+  #                                (just the token string, no key=value)
+  #   actions-runner-ssh-key.age — raw OpenSSH private key (ed25519)
+  #   github-webhook-secret.age  — KEY=VALUE: WEBHOOK_SECRET=<hex>
+  #                                (env-format because consumed via
+  #                                 systemd EnvironmentFile)
+  #   gh-janitor-token.age       — KEY=VALUE: GH_TOKEN=<pat>
+  #                                (env-format; future janitor cron)
+  # ---------------------------------------------------------------------
+  "github-runner-token.age".publicKeys    = ciKeys;
+  "actions-runner-ssh-key.age".publicKeys = ciKeys;
+  "github-webhook-secret.age".publicKeys  = ciKeys;
+  "gh-janitor-token.age".publicKeys       = ciKeys;
 }

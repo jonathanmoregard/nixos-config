@@ -30,6 +30,9 @@ let
     CURRENT_POISON="$STATE/current-poison"
 
     cd /etc/nixos
+    ${lib.optionalString (cfg.sshKeyFile != null) ''
+      export GIT_SSH_COMMAND="${pkgs.openssh}/bin/ssh -i ${cfg.sshKeyFile} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+    ''}
     git fetch origin main
     TARGET=$(git rev-parse origin/main)
     CURRENT=$(git rev-parse HEAD)
@@ -85,6 +88,18 @@ in
       type = lib.types.str;
       default = "jonathan";
       description = "User whose session bus receives deploy notifications.";
+    };
+
+    sshKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Path to SSH private key for the `git fetch origin main` step.
+        Required because /etc/nixos's origin is git@github.com (private repo).
+        Typically reused from the actions-runner deploy key:
+          sshKeyFile = config.age.secrets.actions-runner-ssh-key.path;
+        If null, falls back to root's ~/.ssh/id_ed25519 (must exist).
+      '';
     };
   };
 
