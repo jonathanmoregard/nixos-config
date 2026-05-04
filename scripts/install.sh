@@ -18,6 +18,28 @@
 
 set -euo pipefail
 
+# ------------------------------------------------------------------------
+# Self-bootstrap: ensure all required tools are on PATH. If any is missing,
+# re-exec the script inside a `nix shell` that provides them. This makes
+# the install one-shot from a fresh dellan even if `openssl`, `jq`, or
+# `gh` aren't in the user's environment yet.
+# ------------------------------------------------------------------------
+if [ -z "${INSTALL_SH_BOOTSTRAPPED:-}" ]; then
+  REQUIRED=(openssl jq gh ssh-keygen shred)
+  MISSING=()
+  for cmd in "${REQUIRED[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
+  done
+  if [ ${#MISSING[@]} -gt 0 ]; then
+    echo "Missing tools: ${MISSING[*]}"
+    echo "Re-execing inside nix shell with: openssl, jq, gh, openssh, coreutils"
+    export INSTALL_SH_BOOTSTRAPPED=1
+    exec nix shell --extra-experimental-features 'nix-command flakes' \
+      nixpkgs#openssl nixpkgs#jq nixpkgs#gh nixpkgs#openssh nixpkgs#coreutils \
+      --command bash "$0" "$@"
+  fi
+fi
+
 REPO_ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
 CONFIG_PATH=/etc/nixos
 GH_OWNER=jonathanmoregard
