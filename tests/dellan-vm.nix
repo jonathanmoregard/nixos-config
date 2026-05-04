@@ -138,6 +138,31 @@ pkgs.testers.runNixOSTest {
     ).strip()
     assert state.endswith("=loaded"), f"autodoro.service LoadState: {state}"
 
+    # Positive path: service must actually run, complete >= 1 polling
+    # cycle, and not throw `command not found` for any binary autodoro.sh
+    # invokes. Catches missing runtimeInputs (the original failure mode
+    # was bash's `grep` resolving to nothing because coreutils on NixOS
+    # ships without it — silent on the unit-loaded check, fatal in real
+    # use). Wait long enough for the wrapper to start the script and
+    # for the script to enter its first sleep CHECK_INTERVAL (default 5s).
+    dellan.wait_until_succeeds(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/1000 "
+        "systemctl --user is-active autodoro.service' | grep -qx active",
+        timeout=15,
+    )
+    dellan.sleep(8)
+    log = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/1000 "
+        "journalctl --user -u autodoro.service --no-pager'"
+    )
+    print("[diag autodoro] service log:\n" + log)
+    assert "Monitoring mic" in log, (
+        f"autodoro.sh did not reach its initial log line:\n{log}"
+    )
+    assert "command not found" not in log, (
+        f"autodoro.sh hit a missing binary — extend runtimeInputs:\n{log}"
+    )
+
     # GTK 3 + GdkPixbuf importable AND webp pixbuf loader registered.
     # Catches GI_TYPELIB_PATH gaps (Gtk import) and missing
     # GDK_PIXBUF_MODULE_FILE / webp-pixbuf-loader (blocker.py loads

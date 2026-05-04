@@ -48,6 +48,7 @@ let
   runtimeInputs = [
     pkgs.bash
     pkgs.coreutils
+    pkgs.gnugrep                # autodoro.sh uses grep -q (NixOS coreutils does not include grep)
     pkgs.procps                 # ps
     pkgs.pulseaudio             # pactl, paplay
     pkgs.xprintidle
