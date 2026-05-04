@@ -139,7 +139,7 @@ fi
 if ! grep -q '"actions-runner-ssh-key.age"' "$CONFIG_PATH/secrets/secrets.nix" 2>/dev/null; then
   fail "/etc/nixos/secrets/secrets.nix doesn't have round-7 entries. Merge feat/cicd-workflow → main first."
 fi
-if ! grep -q 'services.atticCache.enable' "$CONFIG_PATH/hosts/dellan/default.nix" 2>/dev/null; then
+if ! grep -q 'services.atticCache' "$CONFIG_PATH/hosts/dellan/default.nix" 2>/dev/null; then
   fail "/etc/nixos/hosts/dellan/default.nix doesn't have round-7 service blocks. Merge feat/cicd-workflow → main first."
 fi
 
