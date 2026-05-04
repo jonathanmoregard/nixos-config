@@ -34,7 +34,15 @@ read -r -d '' BODY <<'JSON' || true
 {
   "required_status_checks": {
     "strict": false,
-    "contexts": ["eval", "build", "vm-minimal", "classify", "label-gate"]
+    "contexts": [
+      "eval (dellan)",
+      "build (dellan)",
+      "vm-minimal (1)",
+      "vm-minimal (2)",
+      "vm-minimal (3)",
+      "classify",
+      "label-gate"
+    ]
   },
   "enforce_admins": true,
   "required_pull_request_reviews": {
