@@ -13,10 +13,14 @@
 
 set -euo pipefail
 
-: "${WORK:?WORK directory must contain pkg-delta.txt, etc-paths.diff, source-paths.txt}"
+: "${WORK:?WORK directory must contain pkg-delta.txt, etc-paths.diff, source-paths.txt, churn.txt}"
 : "${REPO_ROOT:?REPO_ROOT must point to repo root}"
 
 RULES="$REPO_ROOT/scripts/risk-rules.nix"
+
+# churn.txt is optional for backwards compatibility with callers that
+# don't yet stage it. Default to empty.
+[ -f "$WORK/churn.txt" ] || : > "$WORK/churn.txt"
 
 read_rule() {
   nix eval --raw --impure --expr \
@@ -26,8 +30,10 @@ read_rule() {
 PKG_LINES=$(wc -l < "$WORK/pkg-delta.txt")
 ETC_LINES=$(wc -l < "$WORK/etc-paths.diff")
 SRC_LINES=$(wc -l < "$WORK/source-paths.txt")
+CHURN_LINES=$(wc -l < "$WORK/churn.txt")
 
-if [ "$PKG_LINES" -eq 0 ] && [ "$ETC_LINES" -eq 0 ] && [ "$SRC_LINES" -eq 0 ]; then
+if [ "$PKG_LINES" -eq 0 ] && [ "$ETC_LINES" -eq 0 ] \
+   && [ "$SRC_LINES" -eq 0 ] && [ "$CHURN_LINES" -eq 0 ]; then
   echo "TRIVIAL"
   exit 0
 fi
@@ -86,6 +92,30 @@ while IFS= read -r line; do
 
   upgrade_to MEDIUM
 done < "$WORK/pkg-delta.txt"
+
+# Source 1b: derivation churn — same name+version, different store hash.
+# Closes the 3 nix-diff blind spots (kernel config flip without version
+# bump, patches added to existing packages, build env var changes) at a
+# fraction of nix-diff's cost. Reuses the same package rule table as
+# Source 1; matching is EXACT on the package name token.
+while IFS= read -r pkg; do
+  [ -z "$pkg" ] && continue
+  matched=0
+
+  while IFS= read -r rule; do
+    [ -z "$rule" ] && continue
+    if [ "$pkg" = "$rule" ]; then upgrade_to CRITICAL; matched=1; break; fi
+  done <<< "$PKG_CRIT"
+  [ "$matched" = 1 ] && continue
+
+  while IFS= read -r rule; do
+    [ -z "$rule" ] && continue
+    if [ "$pkg" = "$rule" ]; then upgrade_to HIGH; matched=1; break; fi
+  done <<< "$PKG_HIGH"
+  [ "$matched" = 1 ] && continue
+
+  upgrade_to MEDIUM
+done < "$WORK/churn.txt"
 
 # Source 2: etc-tree paths
 while IFS= read -r line; do

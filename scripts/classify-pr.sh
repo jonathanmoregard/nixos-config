@@ -66,13 +66,45 @@ git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$WORK/source-paths.txt" || {
   : > "$WORK/source-paths.txt"
 }
 
+# --- Source 1b: derivation churn ---------------------------------------
+# Same package name+version present in both closures but with different
+# store hash = derivation differs (patches, build env vars, kernel config
+# flip without version bump). Cheap signal that closes the 3 nix-diff
+# blind spots without nix-diff's parse cost.
+nix-store -qR "$BASE_TOPLEVEL" | sort > "$WORK/base-paths.txt"
+nix-store -qR "$HEAD_TOPLEVEL" | sort > "$WORK/head-paths.txt"
+
+# Strip /nix/store/<32-char-hash>- prefix to get name-version key.
+# Find name-version values present in both, then check if their hashes differ.
+extract_nv() { sed -E 's,^/nix/store/[a-z0-9]{32}-,,' "$1" | sort -u; }
+extract_nv "$WORK/base-paths.txt" > "$WORK/base-nv.txt"
+extract_nv "$WORK/head-paths.txt" > "$WORK/head-nv.txt"
+comm -12 "$WORK/base-nv.txt" "$WORK/head-nv.txt" > "$WORK/shared-nv.txt"
+
+: > "$WORK/churn.txt"
+while IFS= read -r nv; do
+  [ -z "$nv" ] && continue
+  base_hash=$(grep -E "/[a-z0-9]{32}-${nv//./\\.}$" "$WORK/base-paths.txt" \
+    | head -1 | sed -E 's,^/nix/store/([a-z0-9]{32})-.*,\1,')
+  head_hash=$(grep -E "/[a-z0-9]{32}-${nv//./\\.}$" "$WORK/head-paths.txt" \
+    | head -1 | sed -E 's,^/nix/store/([a-z0-9]{32})-.*,\1,')
+  if [ -n "$base_hash" ] && [ -n "$head_hash" ] && [ "$base_hash" != "$head_hash" ]; then
+    # Strip trailing version (last -<digit-or-dot> chunk) to extract package name.
+    pkg_name=$(echo "$nv" | sed -E 's/-[0-9][0-9a-z.+-]*$//')
+    echo "$pkg_name" >> "$WORK/churn.txt"
+  fi
+done < "$WORK/shared-nv.txt"
+sort -u "$WORK/churn.txt" -o "$WORK/churn.txt"
+
 # --- No-op short-circuit ----------------------------------------------
 
 PKG_LINES=$(wc -l < "$WORK/pkg-delta.txt")
 ETC_LINES=$(wc -l < "$WORK/etc-paths.diff")
 SRC_LINES=$(wc -l < "$WORK/source-paths.txt")
+CHURN_LINES=$(wc -l < "$WORK/churn.txt")
 
-if [ "$PKG_LINES" -eq 0 ] && [ "$ETC_LINES" -eq 0 ] && [ "$SRC_LINES" -eq 0 ]; then
+if [ "$PKG_LINES" -eq 0 ] && [ "$ETC_LINES" -eq 0 ] \
+   && [ "$SRC_LINES" -eq 0 ] && [ "$CHURN_LINES" -eq 0 ]; then
   RISK=TRIVIAL
   echo "## Classifier: TRIVIAL (no-op — all three diffs empty)"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then

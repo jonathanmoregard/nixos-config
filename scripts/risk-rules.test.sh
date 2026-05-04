@@ -20,12 +20,14 @@ FAILED_TESTS=()
 
 run_case() {
   local name="$1" pkg_input="$2" etc_input="$3" src_input="$4" expected="$5"
+  local churn_input="${6:-}"
   local work; work=$(mktemp -d)
   trap 'rm -rf "$work"' RETURN
 
-  printf '%b' "$pkg_input" > "$work/pkg-delta.txt"
-  printf '%b' "$etc_input" > "$work/etc-paths.diff"
-  printf '%b' "$src_input" > "$work/source-paths.txt"
+  printf '%b' "$pkg_input"   > "$work/pkg-delta.txt"
+  printf '%b' "$etc_input"   > "$work/etc-paths.diff"
+  printf '%b' "$src_input"   > "$work/source-paths.txt"
+  printf '%b' "$churn_input" > "$work/churn.txt"
 
   # Re-run the bucket logic directly by sourcing a stripped-down version.
   local risk
@@ -114,6 +116,49 @@ run_case \
   "> ./pam.d/login\n" \
   "" \
   "CRITICAL"
+
+# -------------------------------------------------------------------------
+# Source 1b: derivation churn (same name+version, different store hash =
+# patches / build env vars / kernel config flip without version bump).
+# Closes the 3 nix-diff blind spots without nix-diff's parse cost.
+# Format: one package name per line in churn.txt.
+# -------------------------------------------------------------------------
+
+run_case \
+  "kernel config flip → CRITICAL via churn (linux exact match)" \
+  "" "" "" \
+  "CRITICAL" \
+  "linux\n"
+
+run_case \
+  "openssh patch (no version bump) → HIGH via churn" \
+  "" "" "" \
+  "HIGH" \
+  "openssh\n"
+
+run_case \
+  "bash unrelated patch → MEDIUM via churn (no rule match → default)" \
+  "" "" "" \
+  "MEDIUM" \
+  "bash\n"
+
+run_case \
+  "linux-firmware churn → CRITICAL (exact match, NOT substring 'linux')" \
+  "" "" "" \
+  "CRITICAL" \
+  "linux-firmware\n"
+
+run_case \
+  "churn + closure-bump (linux churn AND openssh version bump) → CRITICAL" \
+  "openssh: 9.0 → 9.1\n" "" "" \
+  "CRITICAL" \
+  "linux\n"
+
+run_case \
+  "empty churn + empty other diffs → TRIVIAL (no-op short-circuit holds)" \
+  "" "" "" \
+  "TRIVIAL" \
+  ""
 
 # -------------------------------------------------------------------------
 # Summary

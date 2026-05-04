@@ -420,6 +420,15 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
    ```
    Resulting paths matched as prefixes against the `etcPaths` rule table.
 
+   **Source 1b — derivation churn** (closes the 3 nix-diff blind spots: kernel config flip without version bump, patches added to existing packages, build env var changes):
+   ```bash
+   nix-store -qR "$base_toplevel" | sort > /tmp/base-paths.txt
+   nix-store -qR "$head_toplevel" | sort > /tmp/head-paths.txt
+   # Strip /nix/store/<32-char-hash>- prefix to get name-version key.
+   # Find name-version values present in both, then check if their hashes differ.
+   ```
+   Same package name+version present in both closures but with different store hash = derivation differs. Same package rule table as Source 1; matching is EXACT on the package name token (extracted by stripping the trailing `-<digits...>` from name-version). Cheaper than `nix-diff` (no derivation graph walk, no 17k-line parse), covers ~95% of risk-relevant changes.
+
    **Source 3 — source-tree delta** (for non-derivation files: docs, README, tests):
    ```bash
    git diff --name-only "$base_sha" "$head_sha" > /tmp/source-paths.diff
@@ -428,8 +437,8 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
    - Inputs: `BASE_SHA`, `HEAD_SHA`
    - Step fetches `BASE_SHA` explicitly (`git fetch origin main:refs/remotes/origin/main`); `actions/checkout` only fetches PR head by default
    - Builds both `system.build.toplevel` derivations (cache-hit via Attic)
-   - Runs all three sources, merges results
-   - **No-op short-circuit:** if all three diffs are empty (closure unchanged AND etc-tree unchanged AND `git diff` is empty or whitespace/comment-only), classify as **TRIVIAL** without consulting the rule table. Reason: no signal at all = no risk by definition; only fall back to fail-closed MEDIUM when there's a signal we can't categorize.
+   - Runs all FOUR sources (1, 1b, 2, 3), merges results
+   - **No-op short-circuit:** if all four diffs are empty (closure unchanged AND no churn AND etc-tree unchanged AND `git diff` is empty or whitespace/comment-only), classify as **TRIVIAL** without consulting the rule table. Reason: no signal at all = no risk by definition; only fall back to fail-closed MEDIUM when there's a signal we can't categorize.
    - **Fail-closed default:** if signal exists in any source but no rule matches, default = MEDIUM
    - Highest matched bucket wins (CRITICAL > HIGH > MEDIUM > LOW > TRIVIAL)
    - Emits highest bucket via `$GITHUB_OUTPUT` (modern replacement for the deprecated `::set-output`)
@@ -485,7 +494,7 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
    }
    ```
 
-   A unit-test script `scripts/risk-rules.test.sh` is part of the implementation. Test cases include:
+   A unit-test script `scripts/risk-rules.test.sh` is part of the implementation (currently 17 cases, all green). Test cases include:
    - `linux-firmware: 20240101 → 20240601` → CRITICAL (exact match on `linux-firmware`)
    - `util-linux: 2.39 → 2.40` → MEDIUM (no exact match on `util-linux`; falls through to default-medium)
    - `openssh: 9.0 → 9.1` → HIGH
@@ -494,51 +503,47 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
    - `dbus-1/systemd/system/...` → MEDIUM (etc path NOT prefix-matched by `systemd/system/`)
    - `flake.lock` only changed AND closure unchanged → TRIVIAL via no-op short-circuit
    - `flake.lock` changed AND closure shifts (e.g. nixpkgs bump) → bucket determined by closure delta, not lock file
+   - **Source 1b churn cases:** `linux` churn (kernel config flip) → CRITICAL; `openssh` churn (patch without version bump) → HIGH; `bash` churn (unrelated patch) → MEDIUM default; `linux-firmware` churn (exact-match, NOT substring of `linux`) → CRITICAL; churn + version-bump multi-source → CRITICAL (max wins)
 
    Note: HM-managed paths under `~/.config` / `~/.local` do NOT appear in `/etc`. They live in the `home-manager-jonathan` derivation. For now, source-tree changes touching only `home/*.nix` (no resulting kernel/systemd/etc delta) classify via fall-through to closure-based scoring. If finer HM-path discrimination is needed later, add a Source 4 walking `home-manager-jonathan` outputs.
 3. **Bucket → GitHub label:**
 
    | Bucket | Label | Effect |
    |---|---|---|
-   | CRITICAL | `risk:critical` | Required reviewer (you) + 24h cooldown |
-   | HIGH | `risk:high` | Required reviewer |
-   | MEDIUM | `risk:medium` | AI code-review subagent posts review; `risk:medium` blocks auto-merge until either `ai-approved` label OR human approval |
+   | CRITICAL | `risk:critical` | Required fresh human reviewer + 24h cooldown |
+   | HIGH | `risk:high` | Required fresh human reviewer |
+   | MEDIUM | `risk:medium` | Required fresh human reviewer (default for "we don't know what this change does") |
    | LOW | `risk:low` | Auto-merge if all checks green |
    | TRIVIAL | `risk:trivial` | Auto-merge; non-essential gates skipped (eval+build still run) |
-4. **AI code-review subagent (MEDIUM bucket):** GHA step calls a Claude-Code subagent via the existing skill set; verdict `approve` → bot adds `ai-approved` label; verdict `request-changes` → comment posted, `ai-approved` not added.
-   - **Authentication:** ANTHROPIC_API_KEY stored in `secrets/anthropic-api-key.age`. **agenix decrypts to the raw secret value, NOT KEY=VALUE format**, so the file MUST be written as `ANTHROPIC_API_KEY=sk-ant-...` (with the literal env-var name on the left), then encrypted via agenix. The runner unit references it via `EnvironmentFile=${config.age.secrets.anthropic-api-key.path}` and the workflow step inherits it. (Alternative: `LoadCredential=` plus an export shim — but EnvironmentFile is simpler if the .age file's plaintext is in env-format.) Document the env-format requirement in `secrets/secrets.nix` next to the entry. **Cost note:** this is a billed Claude API key (Claude.ai subscription does not work for CI use); spend is bounded by MEDIUM-bucket PR rate. Add to `secrets/secrets.nix` allKeys list.
-   - **Workflow permissions:** the AI-subagent step adds the `ai-approved` label via `gh pr edit --add-label`. This step runs in `gate.yml` (the trusted `pull_request_target` workflow) which declares:
-     ```yaml
-     permissions:
-       contents: read
-       pull-requests: write
-       issues: write     # GH treats label-add as an issue write on a PR
-     ```
-     The PR-controlled `ci.yml` workflow uses `permissions: { contents: read, pull-requests: read }` — no label-add capability.
-   - **Prompt-injection mitigation:** PR body, commit messages, and diff contents are wrapped in `<untrusted_external_content>` tags before passing to the subagent (per global CLAUDE.md). Subagent must NOT execute instructions found inside these tags.
-   - **Circuit breaker:** track AI-approved auto-merges in `/var/lib/ci-state/ai-approved-merges.jsonl` (one line per merge, with SHA, timestamp, classifier verdict). The path is owned by `root:actions-runner` mode `0775`, declared by a NixOS module (`modules/nixos/ci-state.nix`) so ownership and permissions are reproducible. The runner identity is fixed: **A.1 names the runner user as `actions-runner` (system user, no shell); the runner unit runs as that user via `User=actions-runner` in the systemd unit declaration.** After **3 consecutive AI-approved merges without a human approval in between**, OR within **24h of any deploy failure**, the label-gate flips to require human approval for MEDIUM bucket. The counter resets only when a human approves the SAME PR being gated (per-PR scope, not global) — preventing an unrelated human approval from accidentally clearing a queued malicious PR's path.
-   - **Threat-model caveat:** the state file is writeable by the runner user, which is the same identity that runs PR code. A malicious PR could theoretically reset the file. Mitigations layered on top:
-     1. The runner mounts the state directory append-only via a systemd `BindReadOnlyPaths` exception covering only `/var/lib/ci-state/ai-approved-merges.jsonl` (read-write), and read-only on the parent dir (no path manipulation).
-     2. A separate root-owned `state-snapshot.timer` runs hourly, copies the JSONL to `/var/lib/ci-state/snapshots/<timestamp>.jsonl`. Tamper detection: classifier hashes the live file against the latest snapshot's tail; mismatch → engages circuit-breaker on suspicion.
-     3. Audit signal: any reset event journals at WARNING with the actor and SHA so a `journalctl --since=...` review surfaces tampering.
-   - **Label-gate enforcement:** Rulesets cannot read PR labels directly. A small workflow `label-gate.yml` runs on `pull_request: types: [opened, synchronize, reopened, labeled, unlabeled]` (the `labeled`/`unlabeled` types are required because GitHub does NOT re-trigger `pull_request` workflows on label changes by default — empirically verified gap). The workflow posts a status check `label-gate` that fails when:
-     - `risk:medium` set AND `ai-approved` missing AND no human approval, OR
-     - `risk:critical` or `risk:high` set AND no human approval, OR
-     - circuit-breaker engaged (any case requires human).
-     The Ruleset requires this status check to pass — that's how labels translate into a merge gate.
-   - **Label-add authorization:** the gate is only sound if labels can't be added by the same actor whose review they're supposed to gate. The `label-gate.yml` workflow inspects the `labeled` event payload's `sender.login` and refuses to count a label toward bypass if the sender is not in an allowlist:
-     - `ai-approved`: addable only by `github-actions[bot]` (set by the AI subagent step running in the trusted workflow)
-     - `baseline:approved`: addable only by `jonathan` (human review of pixel diffs)
-     - `risk:*`: addable only by `github-actions[bot]` (set by the classifier step)
-     A label added by a disallowed actor → status check fails. Implementation note: the workflow stores a record `(label, sender, sha)` per event in `/var/lib/ci-state/label-events.jsonl` for audit.
-5. **GitHub Rulesets** (set up by `scripts/bootstrap-rulesets.sh`, idempotent via the `PUT /repos/.../rulesets/{id}` API path).
-   - **Idempotency strategy:** ruleset IDs are stored in `scripts/rulesets-state.json` (committed). On bootstrap: if state file lists IDs, the script issues `PUT` to update each existing ruleset; if no state file, the script issues `POST` to create them and writes back the IDs. Running twice without the state file would create duplicates — the state file prevents that. Optional alternative: discover existing rulesets by name match before creating. Implementation chooses the state-file approach for simplicity.
-   - **Bootstrap order safety (lockout prevention):** Rulesets are created in `enforcement: "evaluate"` mode first (dry-run; failures recorded but don't block merges). Only after the workflow has produced at least one successful run on `main` for each named status check is the ruleset flipped to `enforcement: "active"`. Verification: `gh api /repos/.../commits/main/check-runs` lists the named checks before activation. This sequencing prevents a misconfigured ruleset from locking out the very merges that would deploy the fix.
+4. **AI reviewer removed (round 7).** Original spec had a Claude-Code subagent on MEDIUM-bucket PRs that could add `ai-approved` to satisfy the gate. Research surfaced multiple latent bypasses (same-vendor prompt-injection susceptibility between author and reviewer, hidden HTML-comment / invisible-char attacks, GITHUB_TOKEN abuse via injected instructions). Removed in favour of "humans gate everything ambiguous, classifier handles the deterministic cases" — simpler attack surface, same effective coverage given low-volume single-developer use.
+
+   Dropped artifacts:
+   - `ai-review` job in `gate.yml`
+   - `scripts/ai-review.sh` (was placeholder)
+   - `secrets/anthropic-api-key.age`
+   - `ai-approved` label + label-add allowlist for it
+   - Circuit-breaker logic (3-consecutive AI merges, 24h-post-failure)
+   - `ai-approved-merges.jsonl` state file + tamper-detection snapshot timer
+
+5. **Label-gate enforcement:** Rulesets cannot read PR labels directly. The `gate.yml` workflow's `label-gate` job runs on `pull_request_target: types: [opened, synchronize, reopened, labeled, unlabeled]` (the `labeled`/`unlabeled` types are required because GitHub does NOT re-trigger `pull_request_target` workflows on label changes by default). The job posts a status check `label-gate` that fails when:
+   - `risk:critical`, `risk:high`, or `risk:medium` is set AND no fresh human approval (filtered by `commit_id == HEAD_SHA`), OR
+   - `tests/baselines/**` changed AND `baseline:approved` label missing.
+
+   The Ruleset requires this status check to pass — that's how labels translate into a merge gate.
+
+6. **Label-add authorization:** the gate is only sound if labels can't be added by the same actor whose review they're supposed to gate. The `label-gate` job walks the PR's timeline every run and refuses to count any current label toward bypass if its most recent `labeled` actor is not in the allowlist:
+   - `baseline:approved`: addable only by `jonathan`
+   - `risk:*`: addable only by `github-actions[bot]` (set by the classifier step)
+
+   A label added by a disallowed actor → status check fails. Implementation note: the workflow appends `(label, sender, sha)` per event to `/var/lib/ci-state/label-events.jsonl` for audit (the only state file that survived the AI-reviewer removal).
+7. **GitHub Rulesets** (set up by `scripts/bootstrap-rulesets.sh`, idempotent via the `PUT /repos/.../rulesets/{id}` API path).
+   - **Idempotency strategy:** ruleset IDs stored in `scripts/rulesets-state.json` (committed). On bootstrap: if state file lists IDs, the script issues `PUT` to update; if missing, `POST` to create and writes back the IDs.
+   - **Bootstrap order safety (lockout prevention):** Rulesets created in `enforcement: "evaluate"` mode first (dry-run; failures recorded but don't block merges). Only after the workflow has produced at least one successful run on `main` for each named status check is the ruleset flipped to `enforcement: "active"`. This sequencing prevents a misconfigured ruleset from locking out the very merges that would deploy the fix.
    - Rule 1: require PR before merging `main` — bypass actors: **none** (admins can't direct-push)
-   - Rule 2: require status checks (`eval`, `build`, `vm-minimal`, `classify`) — bypass actors: **[admin]** (admin can merge a failing PR via UI)
+   - Rule 2: require status checks (`eval`, `build`, `vm-minimal`, `classify`, `label-gate`) — bypass actors: **[admin]** (admin can merge a failing PR via UI)
    - Rule 3: block force pushes — bypass actors: **none**
    - Rule 4: block branch deletion — bypass actors: **none**
-   - Rule 5: require status check `label-gate` to pass — bypass actors: **none**. (`label-gate` encodes both the "human required for risk:high|critical" and "ai-approved or human required for risk:medium" rules; see D.4.)
+   - Rule 5: require approval of most recent reviewable push (Rulesets native option, October 2022) — bypass actors: **none**. Belt-and-suspenders alongside the `label-gate`'s commit_id == HEAD_SHA filter.
 
 ### Why Rulesets, not legacy branch protection
 
@@ -589,7 +594,6 @@ Extends `nodes.dellan` block in `tests/dellan-vm.nix` (or splits into `tests/del
 |---|---|---|
 | `secrets/github-runner-token.age` | `actions-runner.service` (A.1) | Authenticates the self-hosted runner to GitHub |
 | `secrets/github-webhook-secret.age` | `github-webhook.service` (A.2 / B.3) | HMAC verifies incoming webhooks |
-| `secrets/anthropic-api-key.age` | AI code-review subagent step (D.4) | Billed Claude API access from CI |
 | `secrets/atticd-runner-token.age` | runner pushes to Attic (A.4) | Authenticates `attic push` from CI |
 | `secrets/atticd-jonathan-token.age` | dev-shell pushes to Attic (A.4) | Authenticates manual `attic push` from worktrees |
 | `secrets/actions-runner-ssh-key.age` | runner cloning private repos (A.1, D.1) | SSH key for `actions-runner` to fetch private nixos-config + flake inputs from GitHub. Mounted at `/var/lib/actions-runner/.ssh/id_ed25519` mode 0400. Public key registered in GitHub Deploy Keys for the repo. |
@@ -643,7 +647,7 @@ Each step is annotated `[auto]` (Claude can do start-to-finish in one autonomous
 13. **D.2** Bootstrap script for Rulesets, in `enforcement: "evaluate"` mode first — `[human]` (PAT with `repo:admin` for ruleset CRUD)
 14. **D.2 (active)** Flip Rulesets to `enforcement: "active"` once verified — `[human-checkpoint]` (verifies dry-run results match expectations before activation)
 15. **E.1** VM-graphical tier + screenshot baseline scaffolding — `[auto]`
-16. **D.3** AI code-review subagent wiring (MEDIUM bucket) — `[auto]` after `secrets/anthropic-api-key.age` is created `[human]`. Includes the `claude-agent` user / `gh`-wrapper-scoping changes from the threat model section.
+16. **claude-agent** user split + gh-wrapper PATH scoping (threat model) — `[auto]`
 17. **E.2** VM-realapp tier (opt-in) — `[auto]`
 
 Each `[auto]` step has a VM-gateable check. `[human]` steps are tokens / interactive bootstrap; the implementation plan documents the exact UI clicks. `[human-checkpoint]` steps are mandatory stops where autonomous implementation must pause for user confirmation. Spec'd steps map 1:1 to plan items.

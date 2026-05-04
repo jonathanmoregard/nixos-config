@@ -79,46 +79,6 @@ jobs:
         run: |
           gh pr comment "${PR_NUMBER}" --body-file /tmp/classify-output.md
 
-  ai-review:
-    runs-on: [self-hosted, x86_64-linux]
-    needs: classify
-    if: needs.classify.outputs.risk == 'MEDIUM'
-    env:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-
-      - name: Capture PR diff (untrusted data)
-        run: |
-          gh pr diff "${PR_NUMBER}" > /tmp/pr-diff.txt
-          gh pr view "${PR_NUMBER}" --json body,title \
-            > /tmp/pr-meta.json
-
-      - name: Run AI review subagent
-        run: |
-          # The AI subagent receives PR diff + body as
-          # <untrusted_external_content> per global CLAUDE.md security
-          # rules. Output: a verdict file with `approve` or `request-changes`.
-          # Implementation: ./scripts/ai-review.sh (out-of-scope for the
-          # initial spec implementation; placeholder).
-          if [ -x ./scripts/ai-review.sh ]; then
-            ./scripts/ai-review.sh /tmp/pr-diff.txt /tmp/pr-meta.json \
-              > /tmp/ai-verdict.txt
-          else
-            echo "request-changes" > /tmp/ai-verdict.txt
-            echo "(ai-review.sh not yet implemented)" >> /tmp/ai-verdict.txt
-          fi
-
-      - name: Apply ai-approved label on approve verdict
-        run: |
-          if grep -q "^approve$" /tmp/ai-verdict.txt; then
-            gh pr edit "${PR_NUMBER}" --add-label "ai-approved"
-          fi
-
   label-gate:
     runs-on: [self-hosted, x86_64-linux]
     # Always runs (including label change events)
@@ -142,11 +102,10 @@ jobs:
           labels=$(gh pr view "${PR_NUMBER}" --json labels --jq '.labels[].name')
           while IFS= read -r label_name; do
             [ -z "$label_name" ] && continue
-            # Get the actor of the most recent labeled event for this label
             actor=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/timeline" \
               --jq "[.[] | select(.event == \"labeled\" and .label.name == \"$label_name\")] | last | .actor.login")
             case "$label_name" in
-              ai-approved|risk:*)
+              risk:*)
                 if [ "$actor" != "github-actions[bot]" ]; then
                   echo "❌ label '$label_name' added by disallowed actor: $actor"
                   exit 1
@@ -176,18 +135,12 @@ jobs:
             "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
             --jq "[.[] | select(.state == \"APPROVED\" and .commit_id == \"${HEAD_SHA}\")] | length")
 
-          # CRITICAL / HIGH risk → fresh human approval required
-          if has "risk:critical" || has "risk:high"; then
+          # CRITICAL / HIGH / MEDIUM risk → fresh human approval required.
+          # AI reviewer removed: closure-diff classifier is the only
+          # automated decision; humans gate everything ambiguous or risky.
+          if has "risk:critical" || has "risk:high" || has "risk:medium"; then
             if [ "$approved_by_human" -lt 1 ]; then
-              echo "❌ risk:critical/high requires fresh human approval (on $HEAD_SHA)"
-              exit 1
-            fi
-          fi
-
-          # MEDIUM → ai-approved OR fresh human
-          if has "risk:medium"; then
-            if ! has "ai-approved" && [ "$approved_by_human" -lt 1 ]; then
-              echo "❌ risk:medium requires ai-approved label or fresh human approval"
+              echo "❌ risk:critical/high/medium requires fresh human approval (on $HEAD_SHA)"
               exit 1
             fi
           fi
