@@ -55,6 +55,20 @@ in
       extraLabels = cfg.extraLabels;
       user = "actions-runner";
       group = "actions-runner";
+      # Tools the runner shell needs in PATH for ci.yml + gate.yml steps.
+      # Without these, classify gets "awk: command not found" and
+      # label-gate gets "gh: command not found".
+      extraPackages = with pkgs; [
+        gawk
+        gh
+        jq
+        coreutils
+        gnugrep
+        gnused
+        git
+        nix
+        openssh
+      ];
     };
 
     users.users.actions-runner = {
