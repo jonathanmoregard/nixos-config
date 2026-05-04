@@ -81,14 +81,20 @@ require_cmd() {
 }
 
 agenix_encrypt() {
-  # Encrypts content from stdin → $CONFIG_PATH/secrets/$1.age. Pre-flight
-  # asserts feat/cicd-workflow is merged to main, so /etc/nixos has the
-  # round-7 secrets.nix entries already. agenix's secrets.nix discovery
-  # walks up from the .age file, so we cd into $CONFIG_PATH/secrets and
-  # pass a bare filename.
-  local name="$1" tmp
+  # Encrypts content from stdin → $CONFIG_PATH/secrets/$1.age.
+  # Verifies non-empty plaintext + non-zero ciphertext + roundtrip
+  # decrypt to catch cases where the EDITOR=cp trick silently produces
+  # an empty file.
+  local name="$1"
+  local tmp
   tmp=$(mktemp)
   cat > "$tmp"
+  local plaintext_size
+  plaintext_size=$(wc -c < "$tmp")
+  if [ "$plaintext_size" -eq 0 ]; then
+    rm -f "$tmp"
+    fail "agenix_encrypt $name: stdin was empty (refusing to encrypt 0 bytes)"
+  fi
   (
     cd "$CONFIG_PATH/secrets"
     EDITOR="cp -f $tmp" nix run \
@@ -96,6 +102,16 @@ agenix_encrypt() {
       github:ryantm/agenix -- -e "${name}.age"
   )
   rm -f "$tmp"
+  # Roundtrip: decrypt and verify size matches the input.
+  local decrypted_size
+  decrypted_size=$(
+    cd "$CONFIG_PATH/secrets" && \
+    nix run --extra-experimental-features 'nix-command flakes' \
+      github:ryantm/agenix -- -d "${name}.age" 2>/dev/null | wc -c
+  )
+  if [ "$decrypted_size" -ne "$plaintext_size" ]; then
+    fail "agenix_encrypt $name: decrypted size $decrypted_size != input size $plaintext_size — encryption corrupted content"
+  fi
 }
 
 # -------------------------------------------------------------------------
@@ -239,7 +255,9 @@ if [ -f "$ATTIC_AGE" ]; then
 else
   note "Generating Attic RS256 token-signing secret (4096-bit RSA, base64)..."
   ATTIC_SECRET=$(openssl genrsa -traditional 4096 2>/dev/null | base64 -w0)
-  printf 'ATTIC_SERVER_TOKEN_RS256_SECRET="%s"\n' "$ATTIC_SECRET" \
+  # NOTE: atticd expects the env var name to end with _BASE64 (verified
+  # against actual panic message at server/src/config.rs:335).
+  printf 'ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64="%s"\n' "$ATTIC_SECRET" \
     | agenix_encrypt atticd-rs256-secret
   unset ATTIC_SECRET
   ok "Encrypted as secrets/atticd-rs256-secret.age"
