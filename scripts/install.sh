@@ -80,37 +80,31 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
+# Treats a .age file as missing if it's smaller than 200 bytes.
+# 322-byte ciphertexts from earlier broken install.sh runs are
+# encrypted-empty; we want those re-encrypted with real content.
+age_file_valid() {
+  local f="$1"
+  [ -f "$f" ] && [ "$(wc -c < "$f")" -ge 200 ]
+}
+
 agenix_encrypt() {
   # Encrypts content from stdin → $CONFIG_PATH/secrets/$1.age.
-  # Verifies non-empty plaintext (refuse to encrypt 0 bytes) and that
-  # the resulting ciphertext is at least 200 bytes (age header overhead
-  # alone is ~150 bytes for two recipients; larger means real plaintext
-  # was included).
+  # Pipes stdin DIRECTLY to agenix; agenix detects non-interactive
+  # stdin and internally sets EDITOR=cp /dev/stdin. Earlier draft used
+  # a cat>tmp + EDITOR=cp $tmp dance which CONSUMED stdin before agenix
+  # saw it → agenix read empty /dev/stdin → encrypted 0 bytes silently.
+  # Verified by inspecting agenix CLI --help.
   #
-  # We do NOT roundtrip-decrypt-verify because the script runs as the
-  # interactive user (jonathan), whose actual SSH private key on dellan
-  # may differ from the `jonathan` recipient pubkey listed in
-  # secrets.nix (which is jonathan's key on a different machine).
-  # Decryption verification belongs at activation time (NixOS rebuild
-  # uses dellan's host key, which IS a recipient).
+  # Verification: ciphertext must be >= 200 bytes (age header overhead
+  # for 2 recipients is ~150B; smaller means encryption produced no
+  # plaintext content).
   local name="$1"
-  local tmp
-  tmp=$(mktemp)
-  cat > "$tmp"
-  local plaintext_size
-  plaintext_size=$(wc -c < "$tmp")
-  if [ "$plaintext_size" -eq 0 ]; then
-    rm -f "$tmp"
-    fail "agenix_encrypt $name: stdin was empty (refusing to encrypt 0 bytes)"
-  fi
   (
     cd "$CONFIG_PATH/secrets"
-    EDITOR="cp -f $tmp" nix run \
-      --extra-experimental-features 'nix-command flakes' \
+    nix run --extra-experimental-features 'nix-command flakes' \
       github:ryantm/agenix -- -e "${name}.age"
   )
-  rm -f "$tmp"
-  # Sanity check on ciphertext size.
   local cipher_size
   cipher_size=$(wc -c < "$CONFIG_PATH/secrets/${name}.age")
   if [ "$cipher_size" -lt 200 ]; then
@@ -172,7 +166,7 @@ ok "Pre-flight passed (main has round-7 content)"
 heading "Phase 1: Generate runner SSH key"
 
 KEYFILE_AGE="$CONFIG_PATH/secrets/actions-runner-ssh-key.age"
-if [ -f "$KEYFILE_AGE" ]; then
+if age_file_valid "$KEYFILE_AGE"; then
   ok "$KEYFILE_AGE already exists; skipping keygen"
 else
   TMPKEY=$(mktemp -d)/runner-key
@@ -203,7 +197,7 @@ fi
 heading "Phase 2: Runner registration token"
 
 TOKEN_AGE="$CONFIG_PATH/secrets/github-runner-token.age"
-if [ -f "$TOKEN_AGE" ]; then
+if age_file_valid "$TOKEN_AGE"; then
   ok "$TOKEN_AGE already exists; skipping"
   note "If token is expired, delete the .age and re-run."
 else
@@ -225,7 +219,7 @@ fi
 heading "Phase 3: Webhook secret + Rulesets PAT"
 
 WEBHOOK_AGE="$CONFIG_PATH/secrets/github-webhook-secret.age"
-if [ -f "$WEBHOOK_AGE" ]; then
+if age_file_valid "$WEBHOOK_AGE"; then
   ok "$WEBHOOK_AGE already exists; skipping"
   WEBHOOK_SECRET_DISPLAY="(already encrypted; cat manually if you need to re-paste in GH UI)"
 else
@@ -236,7 +230,7 @@ else
 fi
 
 PAT_AGE="$CONFIG_PATH/secrets/gh-janitor-token.age"
-if [ -f "$PAT_AGE" ]; then
+if age_file_valid "$PAT_AGE"; then
   ok "$PAT_AGE already exists; skipping"
 else
   prompt "Open https://github.com/settings/tokens/new"
@@ -254,7 +248,7 @@ else
 fi
 
 ATTIC_AGE="$CONFIG_PATH/secrets/atticd-rs256-secret.age"
-if [ -f "$ATTIC_AGE" ]; then
+if age_file_valid "$ATTIC_AGE"; then
   ok "$ATTIC_AGE already exists; skipping"
 else
   note "Generating Attic RS256 token-signing secret (4096-bit RSA, base64)..."
