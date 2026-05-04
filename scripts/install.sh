@@ -310,9 +310,13 @@ fi
 
 heading "Phase 5: VM gate + nixos-rebuild switch"
 
-note "Running VM gate (~2-3 min)..."
-nix build "${CONFIG_PATH}#checks.x86_64-linux.dellan-vm" -L --no-link
-ok "VM gate green"
+if [ "${SKIP_VM_GATE:-0}" = "1" ]; then
+  note "SKIP_VM_GATE=1 — skipping VM gate, going straight to switch"
+else
+  note "Running VM gate (~2-3 min)..."
+  nix build "${CONFIG_PATH}#checks.x86_64-linux.dellan-vm" -L --no-link
+  ok "VM gate green"
+fi
 
 note "Running nixos-rebuild switch..."
 sudo nixos-rebuild switch --flake "${CONFIG_PATH}#dellan"
