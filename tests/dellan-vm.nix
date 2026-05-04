@@ -86,12 +86,15 @@ pkgs.testers.runNixOSTest {
     )
 
     # All runtime CLI deps reachable from the launcher's PATH.
+    # `command -v` is a shell builtin, so we have to invoke it through
+    # bash (the wrapper exec's its argv directly, and exec can't run
+    # builtins).
     for binname in [
         "bash", "pactl", "paplay", "xprintidle",
         "cinnamon-screensaver-command", "python3",
     ]:
         dellan.succeed(
-            f"su jonathan -c 'autodoro-env command -v {binname}'"
+            f"su jonathan -c \"autodoro-env bash -c 'command -v {binname}'\""
         )
 
     # systemd unit definition resolves and is loaded. ExecCondition
