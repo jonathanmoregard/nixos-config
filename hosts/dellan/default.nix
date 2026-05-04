@@ -24,10 +24,10 @@
   # the corresponding .age file is created and committed.
   # ---------------------------------------------------------------------
 
-  # age.secrets.github-runner-token.file    = ../../secrets/github-runner-token.age;
-  # age.secrets.actions-runner-ssh-key.file = ../../secrets/actions-runner-ssh-key.age;
-  # age.secrets.github-webhook-secret.file  = ../../secrets/github-webhook-secret.age;
-  # age.secrets.gh-janitor-token.file       = ../../secrets/gh-janitor-token.age;
+  age.secrets.github-runner-token.file    = ../../secrets/github-runner-token.age;
+  age.secrets.actions-runner-ssh-key.file = ../../secrets/actions-runner-ssh-key.age;
+  age.secrets.github-webhook-secret.file  = ../../secrets/github-webhook-secret.age;
+  age.secrets.gh-janitor-token.file       = ../../secrets/gh-janitor-token.age;
 
   # ---------------------------------------------------------------------
   # CI/CD workflow — service options. Each block depends on its
@@ -35,27 +35,27 @@
   # time per the install order in pending_for_human.md.
   # ---------------------------------------------------------------------
 
-  # services.atticCache.enable = true;          # Step 2: Attic binary cache
-  # services.buildCoordination.enable = true;   # Step 2b: nix max-jobs/cores caps
+  services.atticCache.enable = true;          # Step 2: Attic binary cache
+  services.buildCoordination.enable = true;   # Step 2b: nix max-jobs/cores caps
 
-  # services.actionsRunner = {                  # Step 1: self-hosted GHA runner
-  #   enable = true;
-  #   url = "https://github.com/jonathanmoregard/nixos-config";
-  #   tokenFile  = config.age.secrets.github-runner-token.path;
-  #   sshKeyFile = config.age.secrets.actions-runner-ssh-key.path;
-  # };
+  services.actionsRunner = {                  # Step 1: self-hosted GHA runner
+    enable = true;
+    url = "https://github.com/jonathanmoregard/nixos-config";
+    tokenFile  = config.age.secrets.github-runner-token.path;
+    sshKeyFile = config.age.secrets.actions-runner-ssh-key.path;
+  };
 
-  # services.githubWebhook = {                  # Step 5: webhook ingress
-  #   enable = true;
-  #   secretFile = config.age.secrets.github-webhook-secret.path;
-  # };
+  services.githubWebhook = {                  # Step 5: webhook ingress
+    enable = true;
+    secretFile = config.age.secrets.github-webhook-secret.path;
+  };
 
-  # services.nixosDeploy = {                    # Step 6: production auto-deploy
-  #   enable = true;
-  #   sshKeyFile = config.age.secrets.actions-runner-ssh-key.path;
-  # };
+  services.nixosDeploy = {                    # Step 6: production auto-deploy
+    enable = true;
+    sshKeyFile = config.age.secrets.actions-runner-ssh-key.path;
+  };
 
-  # services.claudeAgentUsers.enable = true;    # Step 7: claude-agent-N users
+  services.claudeAgentUsers.enable = true;    # Step 7: claude-agent-N users
 
 
   # systemd-boot on UEFI
