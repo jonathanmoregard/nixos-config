@@ -550,7 +550,8 @@ in
     # losing contrast.
     foreground            #ebebeb
     background            #292c33
-    selection_foreground  #ffffff
+    # Dark text on white bg — both #ffffff was invisible.
+    selection_foreground  #1d1f21
     selection_background  #ffffff
     cursor                #ffffff
     cursor_text_color     #363a43
