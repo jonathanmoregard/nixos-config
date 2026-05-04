@@ -1,19 +1,15 @@
 # modules/nixos/ci-state.nix
 #
-# /var/lib/ci-state — owned by root:actions-runner mode 0775. Stores:
+# Round 7 (post AI-reviewer removal) leaves this module with no state to
+# persist. The label-gate's `gh api .../timeline` walk is the live
+# source of truth for label-add audit; we don't need a separate
+# append-only log file.
 #
-#   - label-events.jsonl    audit trail of label-add events
-#
-# AI reviewer removed in spec round 7 (research-recommended): no
-# ai-approved-merges.jsonl, no circuit-breaker state, no snapshot timer.
-# Closure-diff classifier is the only automated decision; humans gate
-# all CRITICAL/HIGH/MEDIUM via Rulesets.
+# Kept as a stub so existing references in spec/impl ordering still
+# resolve, and future state needs (e.g. circuit-breaker if AI reviewer
+# is re-introduced) have a place to land. Currently a no-op.
 { ... }:
 {
-  systemd.tmpfiles.rules = [
-    "d /var/lib/ci-state 0775 root actions-runner - -"
-    # Append-only audit log for label-add events. Workflows append via
-    # runner identity; useful for post-incident review.
-    "f /var/lib/ci-state/label-events.jsonl 0664 root actions-runner - -"
-  ];
+  # Intentionally empty — the dir is no longer needed. Re-introduce
+  # systemd.tmpfiles.rules here if a future change adds state.
 }

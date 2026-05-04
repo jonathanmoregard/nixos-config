@@ -535,7 +535,7 @@ Note: this script does NOT touch `/etc/nixos` directly. Sub-spec B's bootstrap (
    - `baseline:approved`: addable only by `jonathan`
    - `risk:*`: addable only by `github-actions[bot]` (set by the classifier step)
 
-   A label added by a disallowed actor → status check fails. Implementation note: the workflow appends `(label, sender, sha)` per event to `/var/lib/ci-state/label-events.jsonl` for audit (the only state file that survived the AI-reviewer removal).
+   A label added by a disallowed actor → status check fails. The `gh api .../timeline` walk is the live source of truth for audit — no separate append-only log needed (the previous round's `label-events.jsonl` was dropped because the workflow can re-derive it on demand).
 7. **GitHub Rulesets** (set up by `scripts/bootstrap-rulesets.sh`, idempotent via the `PUT /repos/.../rulesets/{id}` API path).
    - **Idempotency strategy:** ruleset IDs stored in `scripts/rulesets-state.json` (committed). On bootstrap: if state file lists IDs, the script issues `PUT` to update; if missing, `POST` to create and writes back the IDs.
    - **Bootstrap order safety (lockout prevention):** Rulesets created in `enforcement: "evaluate"` mode first (dry-run; failures recorded but don't block merges). Only after the workflow has produced at least one successful run on `main` for each named status check is the ruleset flipped to `enforcement: "active"`. This sequencing prevents a misconfigured ruleset from locking out the very merges that would deploy the fix.

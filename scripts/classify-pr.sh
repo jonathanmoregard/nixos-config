@@ -74,27 +74,35 @@ git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$WORK/source-paths.txt" || {
 nix-store -qR "$BASE_TOPLEVEL" | sort > "$WORK/base-paths.txt"
 nix-store -qR "$HEAD_TOPLEVEL" | sort > "$WORK/head-paths.txt"
 
-# Strip /nix/store/<32-char-hash>- prefix to get name-version key.
-# Find name-version values present in both, then check if their hashes differ.
-extract_nv() { sed -E 's,^/nix/store/[a-z0-9]{32}-,,' "$1" | sort -u; }
-extract_nv "$WORK/base-paths.txt" > "$WORK/base-nv.txt"
-extract_nv "$WORK/head-paths.txt" > "$WORK/head-nv.txt"
-comm -12 "$WORK/base-nv.txt" "$WORK/head-nv.txt" > "$WORK/shared-nv.txt"
+# Build a (nv, hash) table from each closure via awk — pure string ops,
+# no regex over user-controlled package names. Avoids escaping pitfalls
+# with `+`, `[`, etc. in nixpkgs version strings.
+extract_nv_hash() {
+  # Input: /nix/store/<32-char-hash>-<nv>
+  # Output: <nv>\t<hash> (one per line)
+  awk -F/ '
+    {
+      bn = $NF
+      hash = substr(bn, 1, 32)
+      nv   = substr(bn, 34)        # skip 32-char hash + "-"
+      if (length(hash) == 32 && nv != "") print nv "\t" hash
+    }
+  ' "$1" | sort -u
+}
+extract_nv_hash "$WORK/base-paths.txt" > "$WORK/base-nv-hash.txt"
+extract_nv_hash "$WORK/head-paths.txt" > "$WORK/head-nv-hash.txt"
 
+# Join on nv. awk does the dedup + churn detection in one pass.
 : > "$WORK/churn.txt"
-while IFS= read -r nv; do
-  [ -z "$nv" ] && continue
-  base_hash=$(grep -E "/[a-z0-9]{32}-${nv//./\\.}$" "$WORK/base-paths.txt" \
-    | head -1 | sed -E 's,^/nix/store/([a-z0-9]{32})-.*,\1,')
-  head_hash=$(grep -E "/[a-z0-9]{32}-${nv//./\\.}$" "$WORK/head-paths.txt" \
-    | head -1 | sed -E 's,^/nix/store/([a-z0-9]{32})-.*,\1,')
-  if [ -n "$base_hash" ] && [ -n "$head_hash" ] && [ "$base_hash" != "$head_hash" ]; then
-    # Strip trailing version (last -<digit-or-dot> chunk) to extract package name.
-    pkg_name=$(echo "$nv" | sed -E 's/-[0-9][0-9a-z.+-]*$//')
-    echo "$pkg_name" >> "$WORK/churn.txt"
-  fi
-done < "$WORK/shared-nv.txt"
-sort -u "$WORK/churn.txt" -o "$WORK/churn.txt"
+awk -F'\t' '
+  NR == FNR { base[$1] = $2; next }
+  { if (($1 in base) && base[$1] != $2) print $1 }
+' "$WORK/base-nv-hash.txt" "$WORK/head-nv-hash.txt" \
+  | while IFS= read -r nv; do
+      # Strip trailing version (last -<digit><digit-letter-dot-+-chars>* chunk).
+      pkg_name=$(echo "$nv" | sed -E 's/-[0-9][0-9a-z.+-]*$//')
+      echo "$pkg_name"
+    done | sort -u > "$WORK/churn.txt"
 
 # --- No-op short-circuit ----------------------------------------------
 
