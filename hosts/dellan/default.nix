@@ -28,6 +28,7 @@
   # age.secrets.actions-runner-ssh-key.file = ../../secrets/actions-runner-ssh-key.age;
   # age.secrets.github-webhook-secret.file  = ../../secrets/github-webhook-secret.age;
   # age.secrets.gh-janitor-token.file       = ../../secrets/gh-janitor-token.age;
+  # age.secrets.atticd-rs256-secret.file    = ../../secrets/atticd-rs256-secret.age;
 
   # ---------------------------------------------------------------------
   # CI/CD workflow — service options. Each block depends on its
@@ -35,7 +36,10 @@
   # time per the install order in pending_for_human.md.
   # ---------------------------------------------------------------------
 
-  # services.atticCache.enable = true;          # Step 2: Attic binary cache
+  # services.atticCache = {                    # Step 2: Attic binary cache
+  #   enable = true;
+  #   rs256SecretFile = config.age.secrets.atticd-rs256-secret.path;
+  # };
   # services.buildCoordination.enable = true;   # Step 2b: nix max-jobs/cores caps
 
   # services.actionsRunner = {                  # Step 1: self-hosted GHA runner

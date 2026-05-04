@@ -221,7 +221,7 @@ if [ -f "$PAT_AGE" ]; then
 else
   prompt "Open https://github.com/settings/tokens/new"
   prompt "  Note: nixos-config-rulesets-bootstrap"
-  prompt "  Expiration: 7 days (rulesets one-shot) OR 90 days (also covers janitor cron)"
+  prompt "  Expiration: 7 days (rulesets one-shot) OR 1 year (also covers janitor cron)"
   prompt "  Scope: 'repo' (full)"
   prompt "  Generate token, copy."
   PAT=$(read_secret "Paste PAT (input hidden):")
@@ -231,6 +231,18 @@ else
   RULESETS_PAT="$PAT"   # keep for Phase 6
   unset PAT
   ok "Encrypted as secrets/gh-janitor-token.age"
+fi
+
+ATTIC_AGE="$CONFIG_PATH/secrets/atticd-rs256-secret.age"
+if [ -f "$ATTIC_AGE" ]; then
+  ok "$ATTIC_AGE already exists; skipping"
+else
+  note "Generating Attic RS256 token-signing secret (4096-bit RSA, base64)..."
+  ATTIC_SECRET=$(openssl genrsa -traditional 4096 2>/dev/null | base64 -w0)
+  printf 'ATTIC_SERVER_TOKEN_RS256_SECRET="%s"\n' "$ATTIC_SECRET" \
+    | agenix_encrypt atticd-rs256-secret
+  unset ATTIC_SECRET
+  ok "Encrypted as secrets/atticd-rs256-secret.age"
 fi
 
 # -------------------------------------------------------------------------
@@ -253,18 +265,19 @@ uncomment_line() {
   sudo sed -i "s|^  # \\($1\\)|  \\1|" "$HOST_NIX"
 }
 
-# age.secrets declarations (4 lines)
+# age.secrets declarations (5 lines)
 uncomment_line 'age.secrets.github-runner-token.file'
 uncomment_line 'age.secrets.actions-runner-ssh-key.file'
 uncomment_line 'age.secrets.github-webhook-secret.file'
 uncomment_line 'age.secrets.gh-janitor-token.file'
+uncomment_line 'age.secrets.atticd-rs256-secret.file'
 
 # Single-line service options
-uncomment_line 'services.atticCache.enable = true;'
 uncomment_line 'services.buildCoordination.enable = true;'
 uncomment_line 'services.claudeAgentUsers.enable = true;'
 
 # Multi-line service blocks
+uncomment_block 'services.atticCache =' 3
 uncomment_block 'services.actionsRunner =' 5
 uncomment_block 'services.githubWebhook =' 3
 uncomment_block 'services.nixosDeploy =' 3

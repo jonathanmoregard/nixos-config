@@ -32,4 +32,8 @@ in {
   "actions-runner-ssh-key.age".publicKeys = ciKeys;
   "github-webhook-secret.age".publicKeys  = ciKeys;
   "gh-janitor-token.age".publicKeys       = ciKeys;
+
+  # Attic RS256 token signing secret. Format expected:
+  #   ATTIC_SERVER_TOKEN_RS256_SECRET="<base64 of `openssl genrsa -traditional 4096`>"
+  "atticd-rs256-secret.age".publicKeys    = ciKeys;
 }
