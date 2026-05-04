@@ -45,12 +45,14 @@ let
     SEEN_TTL = 24 * 3600  # 24h
     READ_TIMEOUT_S = 5
 
+
     def respond(code, body=""):
         sys.stdout.write(f"HTTP/1.1 {code}\r\n")
         sys.stdout.write(f"Content-Length: {len(body)}\r\n")
         sys.stdout.write("Content-Type: text/plain\r\n\r\n")
         sys.stdout.write(body)
         sys.stdout.flush()
+
 
     def main():
         # Slowloris hardening: hard-cap stdin read time.
@@ -147,12 +149,14 @@ let
         unit = os.environ.get("DEPLOY_UNIT", "nixos-deploy.service")
         # sudo invocation matches the sudoers rule exactly: command path
         # + start --no-block <unit>, which is the only allowed form.
+        SYSTEMCTL = "/run/current-system/sw/bin/systemctl"
         subprocess.run(
-            ["sudo", "/run/current-system/sw/bin/systemctl", "start", "--no-block", unit],
+            ["sudo", SYSTEMCTL, "start", "--no-block", unit],
             check=False,
         )
         respond("200 OK", f"queued: systemctl start {unit}")
         return 0
+
 
     if __name__ == "__main__":
         sys.exit(main())
