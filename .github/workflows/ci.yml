@@ -1,0 +1,103 @@
+# .github/workflows/ci.yml
+#
+# PR-controlled CI workflow. Runs on `pull_request` (PR-branch code).
+# Allowed to do: builds, tests, lint, eval.
+# Forbidden: labelling, AI review, anything that gates merge.
+#
+# Trust boundary: this workflow's permissions are read-only for content;
+# merge-gating logic lives in gate.yml (pull_request_target).
+name: ci
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  discover-hosts:
+    runs-on: [self-hosted, x86_64-linux]
+    outputs:
+      linux-hosts: ${{ steps.discover.outputs.linux-hosts }}
+      darwin-hosts: ${{ steps.discover.outputs.darwin-hosts }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: discover
+        run: |
+          set -euo pipefail
+          linux=$(nix eval --json --no-warn-dirty .#nixosConfigurations \
+            --apply 'attrs: builtins.attrNames attrs' 2>/dev/null || echo "[]")
+          darwin=$(nix eval --json --no-warn-dirty .#darwinConfigurations \
+            --apply 'attrs: builtins.attrNames attrs' 2>/dev/null || echo "[]")
+          echo "linux-hosts=$linux" >> "$GITHUB_OUTPUT"
+          echo "darwin-hosts=$darwin" >> "$GITHUB_OUTPUT"
+
+  eval:
+    runs-on: [self-hosted, x86_64-linux]
+    needs: discover-hosts
+    strategy:
+      fail-fast: false
+      matrix:
+        host: ${{ fromJSON(needs.discover-hosts.outputs.linux-hosts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          nix eval --no-warn-dirty \
+            ".#nixosConfigurations.${{ matrix.host }}.config.system.build.toplevel.drvPath"
+
+  build:
+    runs-on: [self-hosted, x86_64-linux]
+    needs: [discover-hosts, eval]
+    strategy:
+      fail-fast: false
+      matrix:
+        host: ${{ fromJSON(needs.discover-hosts.outputs.linux-hosts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          nix build --no-link --print-build-logs \
+            ".#nixosConfigurations.${{ matrix.host }}.config.system.build.toplevel"
+
+  vm-minimal:
+    runs-on: [self-hosted, x86_64-linux, kvm]
+    needs: build
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        lane: [1, 2, 3]
+    # Per-job concurrency removed — GHA concurrency is a mutex, not a
+    # pool. Lane parallelism is enforced by strategy.max-parallel: 3
+    # combined with workflow-level pr-cancel concurrency at the top.
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          # Each lane runs the same VM-gate check; matrix is for parallelism
+          # bookkeeping and resource-budget enforcement (3 concurrent VMs).
+          # In practice we'd target different host check derivations here
+          # once more than one host exists.
+          nix build --no-link --print-build-logs \
+            .#checks.x86_64-linux.dellan-vm
+
+  vm-graphical:
+    runs-on: [self-hosted, x86_64-linux, kvm]
+    needs: build
+    if: |
+      contains(github.event.pull_request.changed_files, 'home/cinnamon.nix') ||
+      contains(github.event.pull_request.changed_files, 'modules/nixos/desktop.nix') ||
+      contains(github.event.pull_request.changed_files, 'home/kitty.nix')
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          # Placeholder: VM-graphical check derivation is added in spec E.1
+          # (path-prefix gated; runs only when desktop-affecting files
+          # change). For now, this job no-ops cleanly.
+          echo "vm-graphical: not yet implemented (spec E.1)"
