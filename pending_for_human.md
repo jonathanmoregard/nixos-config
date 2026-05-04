@@ -133,21 +133,36 @@ Run each step in order. Each `[YOU]` block is the minimum interactive work; each
   - Events: only the `push` event
   - Active: yes
 
-## Step 6 — Workflows + classifier on main
+## Step 6 — Merge `feat/cicd-workflow` to main
 
-- [YOU]
-  ```bash
-  cd /etc/nixos
-  git checkout main
-  git checkout feat/cicd-workflow -- .github/ scripts/
-  git add -A
-  git commit -m 'feat(ci): bring CI workflows + classifier to main'
-  git push origin main
-  ```
-- [YOU] Open a no-op test PR (e.g. add a comment to `flake.nix`). Watch:
+The whole branch goes to main. No cherry-picking — spec, modules, scripts, workflows, host wiring all land together (the host-wiring is inert by default; uncommenting was already done in earlier steps).
+
+- [YOU] Branch is 17 commits ahead of origin/main and 7 commits behind on `tests/dellan-vm.nix` (autodoro/keyring/kitty test work landed during round-7 dev). They touch different files; no real conflicts expected.
+- [YOU] Choose merge style:
+  - **Merge commit** (recommended; preserves the 6-round refinement history):
+    ```bash
+    cd /etc/nixos
+    git fetch origin
+    git checkout main
+    git merge origin/main         # ensure local main matches origin
+    git merge feat/cicd-workflow --no-ff
+    nix build .#checks.x86_64-linux.dellan-vm -L
+    git push origin main
+    ```
+  - **Rebase** (linear history, replays 17 commits):
+    ```bash
+    cd /etc/nixos
+    git checkout feat/cicd-workflow
+    git rebase origin/main
+    git checkout main
+    git merge feat/cicd-workflow --ff-only
+    nix build .#checks.x86_64-linux.dellan-vm -L
+    git push origin main
+    ```
+- [YOU] Open a no-op test PR (e.g. comment in `flake.nix`). Watch:
   - `https://github.com/jonathanmoregard/nixos-config/actions` — runner picks it up
   - PR labels — should get `risk:trivial`
-  - PR checks — `eval`, `build`, `vm-minimal`, `classify`, `label-gate` should all show green
+  - PR checks — `eval`, `build`, `vm-minimal`, `classify`, `label-gate` all green
 
 ## Step 7 — `[HUMAN-CHECKPOINT]` Wait for first green run on main
 
