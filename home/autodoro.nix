@@ -15,14 +15,16 @@ let
   # Typelibs the script's gi imports actually touch (Gtk 3, Gdk,
   # GdkPixbuf, GLib via blocker.py + popup.py). Pango/Atk/HarfBuzz
   # come along because Gtk's typelib references them.
+  # NOTE: must reference `.out` explicitly — several of these pkgs
+  # default to `.bin` and ship typelibs in `.out`.
   giTypelibPath = lib.makeSearchPath "lib/girepository-1.0" [
-    pkgs.gtk3
-    pkgs.gdk-pixbuf
-    pkgs.pango
-    pkgs.atk
-    pkgs.harfbuzz
-    pkgs.glib
-    pkgs.gobject-introspection
+    pkgs.gtk3.out
+    pkgs.gdk-pixbuf.out
+    pkgs.pango.out
+    pkgs.atk.out
+    pkgs.harfbuzz.out
+    pkgs.glib.out
+    pkgs.gobject-introspection.out
   ];
 
   # Re-query gdk-pixbuf loaders against the base set + the webp
