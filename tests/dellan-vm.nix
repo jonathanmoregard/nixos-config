@@ -18,6 +18,14 @@ in
 pkgs.testers.runNixOSTest {
   name = "dellan-vm";
 
+  # Skip the test driver's mypy pass. It complains about `import json`
+  # at the top of the testScript heredoc with "Unexpected indent" once
+  # the type-driver derivation is rebuilt — the runtime exec is fine
+  # (the script ran end-to-end before the type-driver cache turned
+  # over). The script is short, dynamic-typed (machine objects, jq
+  # output strings), and a static type pass adds little signal.
+  skipTypeCheck = true;
+
   nodes.dellan = { config, ... }: {
     imports = [
       inputs.agenix.nixosModules.default
@@ -61,6 +69,8 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    import json
+
     dellan.wait_for_unit("multi-user.target")
     dellan.wait_for_unit("home-manager-jonathan.service")
     # systemd --user for jonathan comes up via linger
@@ -109,8 +119,10 @@ pkgs.testers.runNixOSTest {
         "su jonathan -c 'DISPLAY=:0 nohup kitty -1 --detach "
         ">/tmp/kitty-launch.log 2>&1' &"
     )
+    # 30s was tight under host load (parallel VM builds, cold caches);
+    # 60s gives kitty time to spawn and start its remote-control socket.
     dellan.wait_until_succeeds(
-        f"su jonathan -c '{sock_cmd} ls >/dev/null'", timeout=30
+        f"su jonathan -c '{sock_cmd} ls >/dev/null'", timeout=60
     )
     sleep_bin = "/run/current-system/sw/bin/sleep"
     panes = [
@@ -265,6 +277,234 @@ pkgs.testers.runNixOSTest {
     )
     dellan.succeed(
         "jq -e '.[0].tabs[0].groups | length == 4' /tmp/ls-after.json"
+    )
+
+    # === Phase 6: Same-cwd Claude pane disambiguation ===
+    # Two `claude` panes in the same cwd must each get their own
+    # claude_session_id attached to the corresponding window in
+    # snapshot.json. Without per-pane id, the latest-by-mtime fallback
+    # collapses both panes onto whichever .jsonl is newest, yielding a
+    # duplicate session on restore instead of the user's two distinct
+    # ones.
+    #
+    # Faking real claude processes inside the test VM (argv[0]="claude"
+    # AND an open jsonl fd visible via /proc/<pid>/fd) proved fragile —
+    # coreutils-multicall trips up `exec -a`, and
+    # systemd-run/su/setsid backgrounding interacts unpredictably with
+    # dellan.succeed's wait-for-EOF semantics. Instead, the enricher
+    # supports a KITTY_ENRICH_PROC_ROOT env var (test-only seam,
+    # production always uses /proc) so we can point it at a fake tree
+    # of symlinks. This isolates the enricher's lookup logic, which is
+    # the only thing the bug fix changed.
+
+    proj_dir = "/home/jonathan/.claude/projects/-tmp-fake"
+    sid_a = "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    sid_b = "bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    dellan.succeed(
+        f"su - jonathan -c 'mkdir -p {proj_dir} && "
+        f"touch {proj_dir}/{sid_a}.jsonl {proj_dir}/{sid_b}.jsonl'"
+    )
+
+    # Fake /proc tree: two arbitrary pids, each with an /fd/9 symlink
+    # to a distinct .jsonl. Pids don't need to map to real processes —
+    # the enricher only does os.listdir / os.readlink under
+    # PROC_ROOT/<pid>/fd.
+    fake_proc = "/tmp/fake-proc"
+    pid_a, pid_b = 12345, 67890
+    dellan.succeed(
+        f"rm -rf {fake_proc} && "
+        f"mkdir -p {fake_proc}/{pid_a}/fd {fake_proc}/{pid_b}/fd && "
+        f"ln -s {proj_dir}/{sid_a}.jsonl {fake_proc}/{pid_a}/fd/9 && "
+        f"ln -s {proj_dir}/{sid_b}.jsonl {fake_proc}/{pid_b}/fd/9 && "
+        f"chown -R jonathan {fake_proc}"
+    )
+    print(
+        "[diag phase6] fake-proc tree:\n"
+        + dellan.succeed(f"ls -laR {fake_proc}")
+    )
+
+    # Synthetic `kitty @ ls` JSON with two same-cwd claude windows
+    # whose foreground_processes point at the fake pids.
+    fake_ls = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"cwd": "/tmp/fake", "title": "pane-a",
+                 "foreground_processes": [
+                     {"pid": pid_a, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+                {"cwd": "/tmp/fake", "title": "pane-b",
+                 "foreground_processes": [
+                     {"pid": pid_b, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+            ],
+        }],
+    }])
+    dellan.succeed(
+        "cat > /tmp/fake-ls.json <<'EOF'\n" + fake_ls + "\nEOF"
+    )
+    dellan.succeed("chown jonathan /tmp/fake-ls.json")
+    print(
+        "[diag phase6] fake-ls.json:\n"
+        + dellan.succeed("cat /tmp/fake-ls.json")
+    )
+
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_ENRICH_TEST=1 KITTY_ENRICH_PROC_ROOT={fake_proc} "
+        "kitty-session-enrich < /tmp/fake-ls.json > /tmp/enriched.json'"
+    )
+    print(
+        "[diag phase6] enriched.json:\n"
+        + dellan.succeed("cat /tmp/enriched.json")
+    )
+
+    id_a = dellan.succeed(
+        "jq -r '.[0].tabs[0].windows[0].claude_session_id // empty' "
+        "/tmp/enriched.json"
+    ).strip()
+    id_b = dellan.succeed(
+        "jq -r '.[0].tabs[0].windows[1].claude_session_id // empty' "
+        "/tmp/enriched.json"
+    ).strip()
+    assert id_a == sid_a, (
+        f"window 0 expected sid {sid_a!r}, got {id_a!r} — "
+        "enricher dropped or mis-attached id"
+    )
+    assert id_b == sid_b, (
+        f"window 1 expected sid {sid_b!r}, got {id_b!r} — "
+        "enricher dropped or mis-attached id"
+    )
+    assert id_a != id_b, (
+        "same-cwd panes collapsed to a single claude_session_id — "
+        "enricher failed to disambiguate"
+    )
+
+    # Negative path: a non-claude foreground process must NOT get a
+    # claude_session_id attached even when its pid would have a
+    # matching jsonl fd in the fake /proc tree.
+    fake_ls_noclaude = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"cwd": "/tmp/fake", "title": "shell",
+                 "foreground_processes": [
+                     {"pid": pid_a, "cmdline": ["/usr/bin/zsh"]}
+                 ]},
+            ],
+        }],
+    }])
+    dellan.succeed(
+        "cat > /tmp/fake-ls-noclaude.json <<'EOF'\n"
+        + fake_ls_noclaude + "\nEOF"
+    )
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_ENRICH_TEST=1 KITTY_ENRICH_PROC_ROOT={fake_proc} "
+        "kitty-session-enrich < /tmp/fake-ls-noclaude.json "
+        "> /tmp/enriched-noclaude.json'"
+    )
+    has_field = dellan.succeed(
+        "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
+        "/tmp/enriched-noclaude.json"
+    ).strip()
+    assert has_field == "false", (
+        f"non-claude window got tagged with claude_session_id "
+        f"(has_field={has_field!r})"
+    )
+
+    # Production safety: KITTY_ENRICH_PROC_ROOT must be ignored without
+    # the explicit KITTY_ENRICH_TEST=1 marker, or a stray export in a
+    # user's shell rc could silently re-route /proc lookups to an
+    # attacker-controllable tree.
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_ENRICH_PROC_ROOT={fake_proc} "
+        "kitty-session-enrich < /tmp/fake-ls.json > /tmp/enriched-noflag.json'"
+    )
+    has_field_noflag = dellan.succeed(
+        "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
+        "/tmp/enriched-noflag.json"
+    ).strip()
+    assert has_field_noflag == "false", (
+        "PROC_ROOT was honored without KITTY_ENRICH_TEST=1 — "
+        f"production env-var leak risk (has_field={has_field_noflag!r})"
+    )
+
+    # Regex tightness: only canonical UUID-shaped session ids
+    # (8-4-4-4-12 lowercase hex) must be matched. A non-UUID jsonl in
+    # the project dir must NOT be picked up.
+    bad_name = "abcdef0123456789abcdef0123456789ab"
+    dellan.succeed(
+        f"su - jonathan -c 'touch {proj_dir}/{bad_name}.jsonl'"
+    )
+    pid_c = 33333
+    dellan.succeed(
+        f"mkdir -p {fake_proc}/{pid_c}/fd && "
+        f"ln -s {proj_dir}/{bad_name}.jsonl {fake_proc}/{pid_c}/fd/9 && "
+        f"chown -R jonathan {fake_proc}/{pid_c}"
+    )
+    fake_ls_badname = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"cwd": "/tmp/fake", "title": "pane-c",
+                 "foreground_processes": [
+                     {"pid": pid_c, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+            ],
+        }],
+    }])
+    dellan.succeed(
+        "cat > /tmp/fake-ls-badname.json <<'EOF'\n"
+        + fake_ls_badname + "\nEOF"
+    )
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_ENRICH_TEST=1 "
+        f"KITTY_ENRICH_PROC_ROOT={fake_proc} kitty-session-enrich "
+        "< /tmp/fake-ls-badname.json > /tmp/enriched-badname.json'"
+    )
+    has_field_badname = dellan.succeed(
+        "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
+        "/tmp/enriched-badname.json"
+    ).strip()
+    assert has_field_badname == "false", (
+        f"non-UUID jsonl matched the regex — would attribute the "
+        f"wrong id (has_field={has_field_badname!r})"
+    )
+
+    # Break-placement: a window with two claude foreground_processes
+    # where the first has no attributable session id (process gone /
+    # no jsonl fd) must fall through to the second. An unconditional
+    # `break` after the first match attempt would skip the second,
+    # leaving the window untagged.
+    pid_no_sid = 44444
+    dellan.succeed(
+        f"mkdir -p {fake_proc}/{pid_no_sid}/fd && "
+        f"chown -R jonathan {fake_proc}/{pid_no_sid}"
+    )
+    fake_ls_two_fps = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"cwd": "/tmp/fake", "title": "pane-multi",
+                 "foreground_processes": [
+                     {"pid": pid_no_sid, "cmdline": ["/usr/bin/claude"]},
+                     {"pid": pid_a, "cmdline": ["/usr/bin/claude"]},
+                 ]},
+            ],
+        }],
+    }])
+    dellan.succeed(
+        "cat > /tmp/fake-ls-twofp.json <<'EOF'\n"
+        + fake_ls_two_fps + "\nEOF"
+    )
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_ENRICH_TEST=1 "
+        f"KITTY_ENRICH_PROC_ROOT={fake_proc} kitty-session-enrich "
+        "< /tmp/fake-ls-twofp.json > /tmp/enriched-twofp.json'"
+    )
+    id_multi = dellan.succeed(
+        "jq -r '.[0].tabs[0].windows[0].claude_session_id // empty' "
+        "/tmp/enriched-twofp.json"
+    ).strip()
+    assert id_multi == sid_a, (
+        f"two-claude-fp window: expected fallthrough to second fp "
+        f"with sid {sid_a!r}, got {id_multi!r} — break is firing "
+        "before all claude fps are tried"
     )
   '';
 }

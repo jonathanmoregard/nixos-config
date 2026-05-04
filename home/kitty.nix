@@ -201,16 +201,26 @@ let
         return None
 
 
-    def maybe_resume_claude(cmd, cwd):
-        """If cmd is the claude-code CLI, rewrite to resume the latest
-        session for this cwd. Returns the (possibly modified) cmd list."""
-        if not cmd or not cwd:
+    def maybe_resume_claude(cmd, cwd, session_id=None):
+        """If cmd is the claude-code CLI, rewrite to resume the correct
+        session. Prefers the per-pane session_id captured at snapshot time
+        (via /proc/<pid>/fd/ → open .jsonl); falls back to latest-by-mtime
+        for the cwd when no per-pane id is available, OR when the named
+        session's jsonl no longer exists (user pruned it between snapshot
+        and restore)."""
+        if not cmd:
             return cmd
         if os.path.basename(cmd[0]) != "claude":
             return cmd
-        encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
-        proj_dir = os.path.expanduser(f"~/.claude/projects/{encoded}")
-        if not os.path.isdir(proj_dir):
+        proj_dir = None
+        if cwd:
+            encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+            proj_dir = os.path.expanduser(f"~/.claude/projects/{encoded}")
+        if session_id and proj_dir and os.path.isfile(
+            os.path.join(proj_dir, f"{session_id}.jsonl")
+        ):
+            return [cmd[0], "--resume", session_id]
+        if not proj_dir or not os.path.isdir(proj_dir):
             return cmd
         sessions = [
             (f, os.path.getmtime(os.path.join(proj_dir, f)))
@@ -249,7 +259,8 @@ let
                     if any("kitten" in a for a in cmd) and "ask" in cmd:
                         continue
                     cwd = win.get("cwd")
-                    cmd = maybe_resume_claude(cmd, cwd)
+                    sid = win.get("claude_session_id")
+                    cmd = maybe_resume_claude(cmd, cwd, sid)
                     panes.append({
                         "cwd": cwd,
                         "title": win.get("title", ""),
@@ -309,10 +320,93 @@ let
         main()
   '';
 
+  # Enrich `kitty @ ls` JSON with per-pane Claude Code session IDs.
+  # Multiple `claude` panes in the same cwd are indistinguishable from
+  # cmdline+cwd alone (cmdline is just `claude`, cwd matches), so on
+  # restore the latest-by-mtime fallback would collapse them all onto
+  # the same session. To disambiguate, walk /proc/<pid>/fd/ for each
+  # claude foreground process and grab the open `.jsonl` under
+  # ~/.claude/projects/<encoded-cwd>/ — the filename stem is the
+  # session id. Captured at snapshot time because the claude processes
+  # are dead by the time restore runs.
+  kittySessionEnrich = pkgs.writers.writePython3Bin "kitty-session-enrich" {} ''
+    import json
+    import os
+    import re
+    import sys
+
+    # Tight UUID match — Claude session ids are canonical UUID4
+    # (8-4-4-4-12 lowercase hex). A looser pattern would over-match if
+    # claude (or another tool) ever writes adjacent jsonl logs whose
+    # filenames happen to be 8+ hex/dash chars.
+    SESSION_RE = re.compile(
+        r"/\.claude/projects/[^/]+/"
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
+    )
+
+    # Test-only seam: KITTY_ENRICH_PROC_ROOT is honored only when
+    # KITTY_ENRICH_TEST=1 is also set. This way a stray export of
+    # PROC_ROOT in a user's shell rc can't silently re-route /proc
+    # lookups in production.
+    if os.environ.get("KITTY_ENRICH_TEST") == "1":
+        PROC_ROOT = os.environ.get("KITTY_ENRICH_PROC_ROOT", "/proc")
+    else:
+        PROC_ROOT = "/proc"
+
+
+    def claude_session_for_pid(pid):
+        if not pid:
+            return None
+        fd_dir = f"{PROC_ROOT}/{pid}/fd"
+        try:
+            entries = os.listdir(fd_dir)
+        except OSError:
+            return None
+        for fd in entries:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            m = SESSION_RE.search(target)
+            if m:
+                return m.group(1)
+        return None
+
+
+    def enrich(data):
+        for osw in data:
+            for tab in osw.get("tabs", []):
+                for win in tab.get("windows", []):
+                    for fp in win.get("foreground_processes") or []:
+                        cmd = fp.get("cmdline") or []
+                        if not cmd:
+                            continue
+                        if os.path.basename(cmd[0]) != "claude":
+                            continue
+                        sid = claude_session_for_pid(fp.get("pid"))
+                        if sid:
+                            win["claude_session_id"] = sid
+                            break
+        return data
+
+
+    def main():
+        try:
+            data = json.load(sys.stdin)
+        except json.JSONDecodeError:
+            sys.exit(0)
+        json.dump(enrich(data), sys.stdout)
+
+
+    if __name__ == "__main__":
+        main()
+  '';
+
   # Snapshot current kitty state. No-op if no kitty is listening.
   kittySessionSave = pkgs.writeShellApplication {
     name = "kitty-session-save";
-    runtimeInputs = [ pkgs.kitty kittySessionConvert pkgs.coreutils ];
+    runtimeInputs = [ pkgs.kitty kittySessionConvert kittySessionEnrich pkgs.coreutils ];
     text = ''
       set -euo pipefail
 
@@ -340,7 +434,13 @@ let
       fi
       [ -z "$json" ] && exit 0
 
-      printf '%s\n' "$json" > "$dir/snapshot.json.tmp"
+      # Enrich with per-pane Claude session IDs before persisting.
+      # Failure (e.g. enricher crash) falls back to raw json — better
+      # to lose the per-pane id and use latest-by-mtime than to skip
+      # the snapshot entirely.
+      if ! printf '%s\n' "$json" | kitty-session-enrich > "$dir/snapshot.json.tmp"; then
+        printf '%s\n' "$json" > "$dir/snapshot.json.tmp"
+      fi
       mv "$dir/snapshot.json.tmp" "$dir/snapshot.json"
 
       kitty-session-convert < "$dir/snapshot.json" > "$dir/last.session.tmp"
@@ -413,6 +513,7 @@ in
   home.packages = [
     kittyWithSession
     kittySessionConvert
+    kittySessionEnrich
     kittySessionSave
     # WIP, not yet wired in (see wrapper above):
     kittyPaneAdd
