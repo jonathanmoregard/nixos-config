@@ -6,6 +6,10 @@
     displayManager.lightdm.enable = true;
   };
 
+  services.gnome.gnome-keyring.enable = true;
+  security.pam.services.lightdm.enableGnomeKeyring = true;
+  security.pam.services.login.enableGnomeKeyring = true;
+
   # cron daemon — required for the home-manager-installed user crontab
   # in home/jonathan-linux.nix. Without this, `crontab` is missing from
   # PATH and the installCrontab activation silently skips.

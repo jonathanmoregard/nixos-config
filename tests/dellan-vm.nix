@@ -140,6 +140,17 @@ pkgs.testers.runNixOSTest {
     print("[diag autodoro] gi/pixbuf check:\n" + pixbuf_out)
     assert pixbuf_out.startswith("ok "), pixbuf_out
 
+    # gnome-keyring PAM wiring — guarantees `passwd` re-keys the login
+    # keyring instead of leaving Chrome stuck on the old encryption pw.
+    # lightdm substacks login, so login is the load-bearing file.
+    # use_authtok on the password line is what propagates the new pw
+    # into the keyring at passwd time.
+    dellan.succeed(
+        "grep -q 'password.*pam_gnome_keyring.*use_authtok' /etc/pam.d/login"
+    )
+    dellan.succeed("grep -q 'auth.*pam_gnome_keyring' /etc/pam.d/login")
+    dellan.succeed("grep -q 'session.*pam_gnome_keyring' /etc/pam.d/login")
+
     # HM-installed binaries on user PATH
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty")
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty-session-save")
