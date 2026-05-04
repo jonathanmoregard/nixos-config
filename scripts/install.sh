@@ -82,9 +82,17 @@ require_cmd() {
 
 agenix_encrypt() {
   # Encrypts content from stdin → $CONFIG_PATH/secrets/$1.age.
-  # Verifies non-empty plaintext + non-zero ciphertext + roundtrip
-  # decrypt to catch cases where the EDITOR=cp trick silently produces
-  # an empty file.
+  # Verifies non-empty plaintext (refuse to encrypt 0 bytes) and that
+  # the resulting ciphertext is at least 200 bytes (age header overhead
+  # alone is ~150 bytes for two recipients; larger means real plaintext
+  # was included).
+  #
+  # We do NOT roundtrip-decrypt-verify because the script runs as the
+  # interactive user (jonathan), whose actual SSH private key on dellan
+  # may differ from the `jonathan` recipient pubkey listed in
+  # secrets.nix (which is jonathan's key on a different machine).
+  # Decryption verification belongs at activation time (NixOS rebuild
+  # uses dellan's host key, which IS a recipient).
   local name="$1"
   local tmp
   tmp=$(mktemp)
@@ -102,15 +110,11 @@ agenix_encrypt() {
       github:ryantm/agenix -- -e "${name}.age"
   )
   rm -f "$tmp"
-  # Roundtrip: decrypt and verify size matches the input.
-  local decrypted_size
-  decrypted_size=$(
-    cd "$CONFIG_PATH/secrets" && \
-    nix run --extra-experimental-features 'nix-command flakes' \
-      github:ryantm/agenix -- -d "${name}.age" 2>/dev/null | wc -c
-  )
-  if [ "$decrypted_size" -ne "$plaintext_size" ]; then
-    fail "agenix_encrypt $name: decrypted size $decrypted_size != input size $plaintext_size — encryption corrupted content"
+  # Sanity check on ciphertext size.
+  local cipher_size
+  cipher_size=$(wc -c < "$CONFIG_PATH/secrets/${name}.age")
+  if [ "$cipher_size" -lt 200 ]; then
+    fail "agenix_encrypt $name: ciphertext only $cipher_size bytes (expected >= 200 with header). Encryption likely failed."
   fi
 }
 
