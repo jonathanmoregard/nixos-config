@@ -39,7 +39,7 @@ let
     nativeBuildInputs = [ pkgs.gdk-pixbuf ];
   } ''
     gdk-pixbuf-query-loaders \
-      ${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so \
+      ${pkgs.gdk-pixbuf.out}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so \
       ${pkgs.webp-pixbuf-loader}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so \
       > $out
   '';
