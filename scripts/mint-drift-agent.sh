@@ -71,8 +71,26 @@ $(gsettings list-recursively "$schema" 2>/dev/null || echo '(not available)')
 "
 done
 
-# --- apt user-installed packages ---
-APT_MANUAL=$(apt-mark showmanual 2>/dev/null | sort || echo '(unavailable)')
+# --- apt user-installed packages, with Mint-default heuristic filter.
+#     Raw apt-mark showmanual on Mint 22.2 returns ~2000 entries — almost
+#     all are distro defaults that ship with the ISO. Stripping the
+#     obvious ones cuts prompt size by ~95% and removes most false-
+#     positive "package missing from config" flags. Patterns biased
+#     toward false-negative (keep something distro-default in the list)
+#     since the LLM still has the explicit skip-list as a second filter.
+APT_MANUAL=$(apt-mark showmanual 2>/dev/null \
+  | grep -vE '^(cinnamon|mint|xapp|mate|nemo|xed|xreader|xviewer|xplayer|pix|warpinator|hypnotix|webapp-manager)(-|$)' \
+  | grep -vE '^(libreoffice|firefox|thunderbird|gnome|gtk|gir1\.2|python3|libpython|libgtk|libglib|libgnome|libcairo|libpango|libfontconfig|libfreetype|libice|libsm|libxt|libxcb|libx11|libxext|libxrender|libxrandr|libxfixes|libxinerama|libxcursor|libxi|libxtst|libxkbcommon|libxss|libxcomposite|libxdamage|libgl|libegl|libdrm|libgbm)(-|$)' \
+  | grep -vE '^(linux-image|linux-headers|linux-modules|linux-libc|linux-firmware|linux-tools|grub|systemd|udev|dbus|policykit|polkitd|cups|sane|networkmanager|wpasupplicant|bluez|alsa|pulseaudio|pipewire|wireplumber)(-|$)' \
+  | grep -vE '^(dpkg|apt|aptitude|debconf|init|initscripts|libdebconf|libapt|libdpkg|sudo|adduser|apparmor|base-files|base-passwd|bsdmainutils|bsdutils|coreutils|dash|debianutils|diffutils|e2fsprogs|findutils|grep|gzip|hostname|libc-bin|libc6|libpam|locales|login|lsb-release|mawk|mount|ncurses|net-tools|netbase|openssl|passwd|perl|procps|sed|tar|util-linux|xz-utils|zlib1g)(-|$)' \
+  | grep -vE '^(fonts-|ttf-|x11-|xserver-|xfonts-|console-|ucf|tzdata|locales-all|info|man-db|manpages)' \
+  | grep -vE '^lib[a-z0-9]+[0-9]?(-|$)' \
+  | sort -u || echo '(unavailable)')
+
+# --- pip --user, top-level only (skip transitive dependencies) ---
+PIP_USER=$(pip list --user --not-required --format=freeze 2>/dev/null | head -50 \
+  || pip list --user --format=freeze 2>/dev/null | head -50 \
+  || echo '(unavailable)')
 
 # --- flatpak apps + runtimes (apps + runtime versions both signal install state) ---
 FLATPAK_APPS=$(flatpak list --app --columns=name,application 2>/dev/null || echo '(none or not installed)')
@@ -89,8 +107,7 @@ $(ls "$prefix/lib/node_modules" 2>/dev/null | grep -v '^\.' || true)
 done
 [ -z "$NPM_GLOBALS" ] && NPM_GLOBALS="(none)"
 
-# --- pip --user installs ---
-PIP_USER=$(pip list --user --format=freeze 2>/dev/null | head -100 || echo '(unavailable)')
+# --- pipx ---
 PIPX_LIST=$(pipx list --short 2>/dev/null || echo '(unavailable)')
 
 # --- cargo bin (rust binaries installed via cargo install) ---
@@ -365,7 +382,10 @@ if [ "$OUTPUT" = "NO_DRIFT" ]; then
 fi
 
 TMPJSON=$(mktemp)
-printf '%s' "$OUTPUT" > "$TMPJSON"
+# Strip optional markdown JSON fence — Sonnet sometimes wraps array in ```json ... ```.
+printf '%s' "$OUTPUT" \
+  | sed -E '/^[[:space:]]*```json[[:space:]]*$/d; /^[[:space:]]*```[[:space:]]*$/d' \
+  > "$TMPJSON"
 
 if ! jq -e '.' "$TMPJSON" > /dev/null 2>&1; then
   log "JSON parse error — raw output: $(head -5 "$TMPJSON")"
