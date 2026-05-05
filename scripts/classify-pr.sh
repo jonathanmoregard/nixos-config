@@ -136,6 +136,7 @@ SECRET_HIGH=$(read_rule secrets high)
 ETC_HIGH=$(read_rule etcPaths high)
 ETC_CRIT=$(read_rule etcPaths critical)
 SRC_TRIVIAL=$(read_rule sourceTree trivial)
+SRC_HIGH=$(read_rule sourceTree high)
 
 bucket_rank() {
   case "$1" in
@@ -234,26 +235,32 @@ while IFS= read -r line; do
 done < "$WORK/etc-paths.diff"
 
 # Source 3: source-tree paths — PREFIX
-SRC_NONTRIVIAL=0
+# Order: high (upgrade) → trivial (annotate-only) → fall-through to closure-based scoring.
 while IFS= read -r p; do
   [ -z "$p" ] && continue
-  trivial_match=0
+  matched=0
+
+  while IFS= read -r rule; do
+    [ -z "$rule" ] && continue
+    if [[ "$p" == "$rule"* ]]; then
+      SOURCE3_HITS+=("$p → HIGH")
+      upgrade_to HIGH; matched=1; break
+    fi
+  done <<< "$SRC_HIGH"
+  [ "$matched" = 1 ] && continue
+
   while IFS= read -r rule; do
     [ -z "$rule" ] && continue
     if [[ "$p" == "$rule"* ]]; then
       SOURCE3_HITS+=("$p → trivial")
-      trivial_match=1; break
+      matched=1; break
     fi
   done <<< "$SRC_TRIVIAL"
-  if [ "$trivial_match" = 0 ]; then
-    SRC_NONTRIVIAL=1
-  fi
-done < "$WORK/source-paths.txt"
+  [ "$matched" = 1 ] && continue
 
-# If only TRIVIAL paths changed AND no closure delta → TRIVIAL
-if [ "$RISK" = "TRIVIAL" ] && [ "$SRC_NONTRIVIAL" = 0 ]; then
-  : # stay TRIVIAL
-fi
+  # Path doesn't match any source-tree rule. No upgrade — closure/etc
+  # signals (Sources 1/2/1b) still drive the verdict if they fire.
+done < "$WORK/source-paths.txt"
 
 # --- Emit summary ------------------------------------------------------
 

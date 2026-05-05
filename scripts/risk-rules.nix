@@ -57,6 +57,13 @@
 
   # ======================================================================
   # Source 3: source-tree paths from `git diff --name-only`. Match: PREFIX.
+  #
+  # `high` upgrades cover CI/policy files that have ZERO closure impact
+  # (so Sources 1+2 can't see them) but that materially control the trust
+  # boundary of the merge gate itself. A PR touching them must surface in
+  # the PR body even when nothing else changes.
+  # `trivial` paths suppress source-tree contribution entirely; other
+  # paths fall through to derivation-based scoring.
   # ======================================================================
   sourceTree = {
     trivial = [
@@ -64,6 +71,17 @@
       "README"
       "tests/baselines/"
     ];
-    # other source paths fall through to derivation-based scoring
+    high = [
+      ".github/workflows/"
+      "scripts/classify-pr.sh"
+      "scripts/risk-rules.nix"
+      "scripts/risk-rules-classify-only.sh"
+      "scripts/risk-rules.test.sh"
+      "scripts/bootstrap-branch-protection.sh"
+      "scripts/bootstrap-rulesets.sh"
+      "scripts/bootstrap-bare-repo.sh"
+      "scripts/bootstrap-deploy-target.sh"
+      "scripts/install.sh"
+    ];
   };
 }

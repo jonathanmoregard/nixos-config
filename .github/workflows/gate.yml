@@ -130,33 +130,22 @@ jobs:
           done <<< "$labels"
 
       - name: Compute label-gate status
-        env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           labels=$(gh pr view "${PR_NUMBER}" --json labels --jq '[.labels[].name]')
           has() { echo "$labels" | jq -e --arg l "$1" 'index($l) != null' >/dev/null; }
 
-          # Human approval = APPROVED review on the CURRENT head SHA.
-          # A force-push past a stale approval would otherwise bypass the
-          # gate; filter by commit_id == HEAD_SHA so reviews must be fresh.
-          approved_by_human=$(gh api \
-            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
-            --jq "[.[] | select(.state == \"APPROVED\" and .commit_id == \"${HEAD_SHA}\")] | length")
-
-          # CRITICAL / HIGH / MEDIUM risk → fresh human approval required.
-          # AI reviewer removed: closure-diff classifier is the only
-          # automated decision; humans gate everything ambiguous or risky.
-          if has "risk:critical" || has "risk:high" || has "risk:medium"; then
-            if [ "$approved_by_human" -lt 1 ]; then
-              echo "❌ risk:critical/high/medium requires fresh human approval (on $HEAD_SHA)"
-              exit 1
-            fi
-          fi
-
-          # Baseline drift gate — any change under tests/baselines/
-          # requires baseline:approved label.
-          # Using `gh pr view --json files` (gh pr diff has no --name-only).
+          # label-gate fails ONLY on real errors:
+          # - label added by disallowed actor (handled in earlier step)
+          # - tests/baselines/ touched without baseline:approved label
+          #
+          # Risk-based merge gating moved to branch protection:
+          # required_approving_review_count=1 blocks merge until a fresh
+          # APPROVED review lands. enforce_admins=false lets the admin
+          # bypass via the UI's "Merge without waiting" button. Solo-author
+          # case (PR author == reviewer) is handled by admin override,
+          # not by failing this check. gh pr merge --admin is denied at
+          # the safe-bash MCP layer to keep override a deliberate UI act.
           touched_baseline=$(gh pr view "${PR_NUMBER}" --json files \
             --jq '[.files[].path | select(startswith("tests/baselines/"))] | length')
           if [ "$touched_baseline" -gt 0 ]; then

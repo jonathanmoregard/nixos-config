@@ -2,10 +2,20 @@
 # scripts/bootstrap-branch-protection.sh — set up legacy Branch Protection
 # on origin/main. Free on private repos (Rulesets are paid-only).
 #
-# Tradeoff vs Rulesets: enforce_admins is all-or-nothing — if true,
-# admin (jonathanmoregard) cannot direct-push to main AND cannot
-# override required status checks via PR merge UI. We accept the
-# tradeoff; emergencies → toggle this off via UI.
+# Design (solo-author + agents):
+# - enforce_admins=false: jonathan (admin) opens most PRs himself, so
+#   the merge-block must come from a missing review (overridable in UI
+#   via "Merge without waiting") and NOT from a failing required check.
+#   "Failed checks" should always mean "something is broken", never
+#   "happy path waiting on review".
+# - required_approving_review_count=1: one APPROVED review is needed
+#   to merge. PR authors cannot self-approve. Solo PRs ship via admin
+#   UI override; agent-authored PRs ship via human review.
+# - require_last_push_approval=true + dismiss_stale_reviews=true:
+#   force-pushes invalidate prior approvals.
+# - gh pr merge --admin is denied at the safe-bash MCP layer to keep
+#   admin override a deliberate UI gesture (audit-friendly, friction
+#   on autopilot CLI).
 #
 # Required env: GH_TOKEN (classic PAT with `repo` scope)
 # Required arg: enforcement mode = "evaluate" or "active"
@@ -44,10 +54,10 @@ read -r -d '' BODY <<'JSON' || true
       "label-gate"
     ]
   },
-  "enforce_admins": true,
+  "enforce_admins": false,
   "required_pull_request_reviews": {
-    "required_approving_review_count": 0,
-    "dismiss_stale_reviews": false,
+    "required_approving_review_count": 1,
+    "dismiss_stale_reviews": true,
     "require_code_owner_reviews": false,
     "require_last_push_approval": true
   },
