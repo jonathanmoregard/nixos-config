@@ -30,10 +30,7 @@
       "https://jonathanmoregard.cachix.org"
     ];
     trusted-public-keys = [
-      # PUBLIC KEY of the cachix cache. Replace with the value shown on
-      # https://app.cachix.org/cache/jonathanmoregard under
-      # "Public Signing Keys" before merging this PR.
-      "jonathanmoregard.cachix.org-1:REPLACE_ME_AT_MERGE_TIME="
+      "jonathanmoregard.cachix.org-1:Qzksr/c2ciAaV4j/U2mGFd1HTgOAicks8gJNs1Ztxo8="
     ];
   };
 }
