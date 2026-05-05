@@ -152,6 +152,11 @@ in
       name = "Mint-Y-Dark-Red";
     };
 
+    "org/cinnamon/desktop/background" = {
+      picture-uri = "file://${../wallpapers/misty-landscape.jpg}";
+      picture-options = "zoom";
+    };
+
     # --- Cinnamon desktop ---
     "org/cinnamon/desktop/interface" = {
       gtk-theme = "Mint-Y-Dark-Red";
