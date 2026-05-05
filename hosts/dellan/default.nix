@@ -6,11 +6,10 @@
     ../../modules/nixos/laptop.nix
     ../../modules/nixos/tailscale.nix
 
-    # CI/CD workflow modules — all enable=false by default so importing
-    # is inert. Flip enables one at a time per the install order in
-    # pending_for_human.md.
-    ../../modules/nixos/atticd.nix
-    ../../modules/nixos/actions-runner.nix
+    # CI/CD workflow modules. CI itself runs on GitHub-hosted runners
+    # (ubuntu-latest); see .github/workflows/. The modules below cover
+    # only the pieces that MUST live on dellan: webhook ingress and the
+    # deploy-on-push systemd unit.
     ../../modules/nixos/github-webhook.nix
     ../../modules/nixos/nixos-deploy.nix
     ../../modules/nixos/build-coordination.nix
@@ -22,40 +21,27 @@
   # CI/CD workflow — agenix secret declarations.
   # ---------------------------------------------------------------------
 
-  age.secrets.github-runner-token.file    = ../../secrets/github-runner-token.age;
-  age.secrets.actions-runner-ssh-key.file = ../../secrets/actions-runner-ssh-key.age;
-  age.secrets.github-webhook-secret.file  = ../../secrets/github-webhook-secret.age;
-  age.secrets.gh-janitor-token.file       = ../../secrets/gh-janitor-token.age;
-  age.secrets.atticd-rs256-secret.file    = ../../secrets/atticd-rs256-secret.age;
+  age.secrets.deploy-ssh-key.file        = ../../secrets/deploy-ssh-key.age;
+  age.secrets.github-webhook-secret.file = ../../secrets/github-webhook-secret.age;
+  age.secrets.gh-janitor-token.file      = ../../secrets/gh-janitor-token.age;
 
   # ---------------------------------------------------------------------
   # CI/CD workflow — service options.
   # ---------------------------------------------------------------------
 
-  services.atticCache = {                     # Step 2: Attic binary cache
-    enable = true;
-    rs256SecretFile = config.age.secrets.atticd-rs256-secret.path;
-  };
-  services.buildCoordination.enable = true;   # Step 2b: nix max-jobs/cores caps
+  services.buildCoordination.enable = true;   # nix max-jobs/cores caps
 
-  services.actionsRunner = {                  # Step 1: self-hosted GHA runner
-    enable = true;
-    url = "https://github.com/jonathanmoregard/nixos-config";
-    tokenFile  = config.age.secrets.github-runner-token.path;
-    sshKeyFile = config.age.secrets.actions-runner-ssh-key.path;
-  };
-
-  services.githubWebhook = {                  # Step 5: webhook ingress
+  services.githubWebhook = {                  # Webhook ingress
     enable = true;
     secretFile = config.age.secrets.github-webhook-secret.path;
   };
 
-  services.nixosDeploy = {                    # Step 6: production auto-deploy
+  services.nixosDeploy = {                    # Auto-deploy on push:main
     enable = true;
-    sshKeyFile = config.age.secrets.actions-runner-ssh-key.path;
+    sshKeyFile = config.age.secrets.deploy-ssh-key.path;
   };
 
-  services.claudeAgentUsers.enable = true;    # Step 7: claude-agent-N users
+  services.claudeAgentUsers.enable = true;    # claude-agent-N users
 
 
   # systemd-boot on UEFI

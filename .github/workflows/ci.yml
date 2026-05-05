@@ -1,8 +1,9 @@
 # .github/workflows/ci.yml
 #
-# PR-controlled CI workflow. Runs on `pull_request` (PR-branch code).
-# Allowed to do: builds, tests, lint, eval.
-# Forbidden: labelling, AI review, anything that gates merge.
+# CI workflow. Runs on `pull_request` (PR-branch code).
+# Allowed: builds, tests, lint, eval.
+# Forbidden: labelling, AI review, anything that gates merge — those
+# live in gate.yml on `pull_request_target`.
 #
 # Trust boundary: this workflow's permissions are read-only for content;
 # merge-gating logic lives in gate.yml (pull_request_target).
@@ -10,9 +11,12 @@
 # Fork policy: this repo does NOT accept external contributions. Every
 # job below is gated on either a push event OR a PR whose head lives in
 # this same repository. Fork PRs cause every job to skip — no PR code
-# from outside this repo ever runs on the self-hosted runner. The
-# .github/workflows/close-fork-prs.yml workflow handles the comment+
-# close so fork PRs don't sit open silently.
+# from outside this repo runs in CI. close-fork-prs.yml handles the
+# auto-close so fork PRs don't sit open silently.
+#
+# Runner: GitHub-hosted (ubuntu-latest). Public repo = unlimited free
+# minutes. KVM nested-virt available since Feb 2023; verified via the
+# DETERMINATE_NIX_KVM env exported by determinate-nix-action.
 name: ci
 
 on:
@@ -30,86 +34,102 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  discover-hosts:
-    runs-on: [self-hosted, x86_64-linux]
+  verify-fork-guards:
+    name: verify fork-guards
+    runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    outputs:
-      linux-hosts: ${{ steps.discover.outputs.linux-hosts }}
-      darwin-hosts: ${{ steps.discover.outputs.darwin-hosts }}
     steps:
-      - uses: actions/checkout@v4
-      - id: discover
-        run: |
-          set -euo pipefail
-          linux=$(nix eval --json --no-warn-dirty .#nixosConfigurations \
-            --apply 'attrs: builtins.attrNames attrs' 2>/dev/null || echo "[]")
-          darwin=$(nix eval --json --no-warn-dirty .#darwinConfigurations \
-            --apply 'attrs: builtins.attrNames attrs' 2>/dev/null || echo "[]")
-          echo "linux-hosts=$linux" >> "$GITHUB_OUTPUT"
-          echo "darwin-hosts=$darwin" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/check-fork-guards.sh
 
-  eval:
-    runs-on: [self-hosted, x86_64-linux]
-    needs: discover-hosts
+  flake-check:
+    name: flake check (eval)
+    runs-on: ubuntu-latest
+    needs: verify-fork-guards
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    strategy:
-      fail-fast: false
-      matrix:
-        host: ${{ fromJSON(needs.discover-hosts.outputs.linux-hosts) }}
     steps:
-      - uses: actions/checkout@v4
-      - run: |
-          nix eval --no-warn-dirty \
-            ".#nixosConfigurations.${{ matrix.host }}.config.system.build.toplevel.drvPath"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
+        with:
+          primary-key: nix-${{ runner.os }}-eval-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-eval-
+          gc-max-store-size-linux: 5G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-eval-
+          purge-last-accessed: 86400
+          purge-primary-key: never
+      - run: nix flake check --no-build --all-systems
 
-  build:
-    runs-on: [self-hosted, x86_64-linux]
-    needs: [discover-hosts, eval]
+  build-dellan:
+    name: build dellan toplevel
+    runs-on: ubuntu-latest
+    needs: flake-check
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    strategy:
-      fail-fast: false
-      matrix:
-        host: ${{ fromJSON(needs.discover-hosts.outputs.linux-hosts) }}
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # main
+      - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
+        with:
+          primary-key: nix-${{ runner.os }}-dellan-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-dellan-
+          gc-max-store-size-linux: 5G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-dellan-
+          purge-last-accessed: 86400
+          purge-primary-key: never
       - run: |
-          nix build --no-link --print-build-logs \
-            ".#nixosConfigurations.${{ matrix.host }}.config.system.build.toplevel"
+          nix build .#nixosConfigurations.dellan.config.system.build.toplevel \
+            --no-link --print-build-logs --keep-going
 
   vm-minimal:
-    runs-on: [self-hosted, x86_64-linux, kvm]
-    needs: build
+    name: vm-minimal
+    runs-on: ubuntu-latest
+    needs: build-dellan
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       max-parallel: 3
       matrix:
         lane: [1, 2, 3]
-    # Per-job concurrency removed — GHA concurrency is a mutex, not a
-    # pool. Lane parallelism is enforced by strategy.max-parallel: 3
-    # combined with workflow-level pr-cancel concurrency at the top.
     steps:
-      - uses: actions/checkout@v4
-      - run: |
-          # Each lane runs the same VM-gate check; matrix is for parallelism
-          # bookkeeping and resource-budget enforcement (3 concurrent VMs).
-          # In practice we'd target different host check derivations here
-          # once more than one host exists.
-          nix build --no-link --print-build-logs \
-            .#checks.x86_64-linux.dellan-vm
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # main
+      - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
+        with:
+          primary-key: nix-${{ runner.os }}-vm-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-vm-
+          gc-max-store-size-linux: 5G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-vm-
+          purge-last-accessed: 86400
+          purge-primary-key: never
+      - name: Verify KVM
+        run: |
+          test "${DETERMINATE_NIX_KVM:-}" = "1" || { echo "KVM not available"; exit 1; }
+          ls -la /dev/kvm
+      - run: nix build .#checks.x86_64-linux.dellan-vm -L
 
   vm-graphical:
-    runs-on: [self-hosted, x86_64-linux, kvm]
-    needs: build
+    name: vm-graphical
+    runs-on: ubuntu-latest
+    needs: build-dellan
+    permissions:
+      contents: read
     if: |
       (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) &&
       (contains(github.event.pull_request.changed_files, 'home/cinnamon.nix') ||
        contains(github.event.pull_request.changed_files, 'modules/nixos/desktop.nix') ||
        contains(github.event.pull_request.changed_files, 'home/kitty.nix'))
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: |
-          # Placeholder: VM-graphical check derivation is added in spec E.1
-          # (path-prefix gated; runs only when desktop-affecting files
-          # change). For now, this job no-ops cleanly.
+          # Placeholder: VM-graphical check derivation TBD (spec E.1).
+          # Path-conditional; runs only when desktop-affecting files change.
           echo "vm-graphical: not yet implemented (spec E.1)"

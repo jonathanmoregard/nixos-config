@@ -95,9 +95,9 @@ in
       default = null;
       description = ''
         Path to SSH private key for the `git fetch origin main` step.
-        Required because /etc/nixos's origin is git@github.com (private repo).
-        Typically reused from the actions-runner deploy key:
-          sshKeyFile = config.age.secrets.actions-runner-ssh-key.path;
+        Required because /etc/nixos's origin is git@github.com.
+        Typical wiring (see hosts/dellan/default.nix):
+          sshKeyFile = config.age.secrets.deploy-ssh-key.path;
         If null, falls back to root's ~/.ssh/id_ed25519 (must exist).
       '';
     };

@@ -5,13 +5,20 @@
 # explicitly and treated as untrusted data.
 #
 # Steps:
-#   classify  → posts risk label (risk:critical/high/medium/low/trivial)
-#   ai-review → only if MEDIUM; subagent reviews diff, may add ai-approved
-#   label-gate → status check that encodes merge-gating logic, consumed
-#                by the GitHub Ruleset on `main`
+#   classify   → posts risk label (risk:critical/high/medium/low/trivial)
+#   label-gate → status check that encodes merge-gating logic
 #
 # Permissions: pull-requests:write + issues:write are required for the
 # label-add step. The PR-branch ci.yml workflow does NOT have these.
+#
+# Fork policy: this repo does NOT accept external contributions. Every
+# job below is gated on `head.repo == base.repo`. Fork PRs cause every
+# job to skip — no PR code from outside this repo is evaluated by the
+# classifier. close-fork-prs.yml handles drive-by PR auto-close.
+#
+# Runner: GitHub-hosted (ubuntu-latest). The classifier needs `nix
+# build` of both base and head toplevels to compute the closure delta;
+# cache-nix-action restores between runs to keep it fast.
 name: gate
 
 on:
@@ -29,11 +36,7 @@ concurrency:
 
 jobs:
   classify:
-    runs-on: [self-hosted, x86_64-linux]
-    # Skip fork PRs: classify-pr.sh runs `nix build` against the PR sha,
-    # and Nix flake evaluation is unsandboxed → arbitrary code execution
-    # on the self-hosted runner. close-fork-prs.yml handles drive-by PRs
-    # via metadata-only auto-close. Same-repo PRs only.
+    runs-on: ubuntu-latest
     if: github.event.pull_request.head.repo.full_name == github.repository && github.event.action != 'labeled' && github.event.action != 'unlabeled'
     outputs:
       risk: ${{ steps.classify.outputs.risk }}
@@ -43,10 +46,22 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
       - name: Check out base branch (trusted code path)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
+
+      - uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # main
+      - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
+        with:
+          primary-key: nix-${{ runner.os }}-classify-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-classify-
+          gc-max-store-size-linux: 5G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-classify-
+          purge-last-accessed: 86400
+          purge-primary-key: never
 
       - name: Fetch PR head
         run: |
@@ -56,8 +71,8 @@ jobs:
         id: classify
         run: |
           set -euo pipefail
-          # Classifier script is loaded from base — PR-modified versions
-          # are NOT executed.
+          # Classifier script + risk-rules.nix are loaded from BASE — PR-
+          # modified versions are NOT executed.
           ./scripts/classify-pr.sh > /tmp/classify-output.md
           cat /tmp/classify-output.md
 
@@ -79,8 +94,7 @@ jobs:
           gh label create ai-approved   --color 5319E7 --description "AI reviewer approved" --force
           gh label create baseline:approved --color 5319E7 --description "Pixel baseline drift approved" --force
 
-          # Strip any existing risk:* label, add the new one. Removes
-          # one at a time so a missing label doesn't abort the rest.
+          # Strip any existing risk:* label, add the new one.
           for old in risk:critical risk:high risk:medium risk:low risk:trivial; do
             gh pr edit "${PR_NUMBER}" --remove-label "$old" 2>/dev/null || true
           done
@@ -93,15 +107,13 @@ jobs:
           gh pr comment "${PR_NUMBER}" --body-file /tmp/classify-output.md
 
   label-gate:
-    runs-on: [self-hosted, x86_64-linux]
-    # Always runs (including label change events). Fork-PR guard: skip
-    # entirely so a fork PR can't even add labels via this workflow.
+    runs-on: ubuntu-latest
     if: github.event.pull_request.head.repo.full_name == github.repository
     env:
       GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.pull_request.base.sha }}
 

@@ -1,42 +1,120 @@
 # nixos-config
 
-Jonathan's declarative system config — NixOS VM + Mac Mini, managed with Nix flakes + Home Manager.
+Jonathan's declarative system config — NixOS Dell Latitude (`dellan`) + Mac Mini (placeholder), managed with Nix flakes + Home Manager.
 
 ## What this is
 
-Mirroring a Linux Mint 22.2 / Cinnamon daily-driver setup into a reproducible NixOS VM (QEMU/KVM, 4 GB RAM). Goal: full repro — if the VM is wiped and rebuilt, it should come back exactly as left.
+Linux Mint 22.2 / Cinnamon migration to NixOS, declarative end to end. PRs are CI-tested on GitHub-hosted runners; merges to `main` auto-deploy to dellan via webhook.
 
 Mac Mini config is a placeholder (nix-darwin), fleshed out on arrival.
 
 ## Hosts
 
-| Host | Target | Rebuild command |
-|------|--------|-----------------|
-| `vm` | NixOS x86_64 VM | `sudo nixos-rebuild switch --flake /etc/nixos#vm` |
-| `dellan` | Dell Latitude 7440 (daily driver) | `sudo nixos-rebuild switch --flake /etc/nixos#dellan` |
-| `mac-mini` | nix-darwin aarch64 | `darwin-rebuild switch --flake .#mac-mini` |
+| Host | Target |
+|------|--------|
+| `dellan` | Dell Latitude 7440 (daily driver, auto-deploy target) |
+| `mac-mini` | nix-darwin aarch64 (placeholder) |
 
-Alias on VM: `rebuild` (defined in `home/jonathan.nix`).
+**Manual `nixos-rebuild switch` is no longer the default workflow.** Auto-deploy on push to `main` handles it (see "Deploy workflow" below). Manual rebuilds are reserved for: bootstrap install, hardware-config edits the VM gate can't model, emergency rollback. Use `sudo nixos-rebuild switch --rollback` for emergency rollback.
 
-## VM e2e tests — DEFAULT before rebuilding `dellan`
+## Dev workflow (worktree → branch → PR → auto-deploy)
 
-Before `sudo nixos-rebuild switch --flake .#dellan`, run the ephemeral VM test:
+**Repo layout:**
+
+```
+~/Repos/nixos-config/                    ← bare repo (no working tree)
+~/Repos/nixos-config-worktrees/
+    main/                                ← read-only browse worktree
+    <branch-slug>/                       ← dev worktrees, one per branch
+/etc/nixos/                              ← root-owned clone of origin/main
+                                           (auto-pulled + rebuilt by
+                                            nixos-deploy.service)
+```
+
+You CANNOT edit `~/Repos/nixos-config/` (no working tree). You CANNOT edit `/etc/nixos/` (root-owned, deploy target). Both fail by construction. **Always work in a worktree.**
+
+**Standard flow for any change:**
 
 ```bash
+# 1. Open a worktree
+cd ~/Repos/nixos-config
+git worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
+cd ~/Repos/nixos-config-worktrees/<slug>
+
+# 2. Edit, commit
+$EDITOR home/whatever.nix
+git add -A
+git commit -m "feat(scope): summary"
+
+# 3. Push branch + open PR
+git push -u origin feat/<slug>
+gh pr create --title "feat(scope): summary" --body "..."
+
+# 4. Wait for CI on GitHub-hosted runners
+gh pr checks <PR_NUMBER>
+
+# 5. Read the PR comment from the classifier — assigns risk:trivial/low/
+#    medium/high/critical based on derivation-graph blast radius
+#    (see scripts/risk-rules.nix). Branch protection requires 1 fresh
+#    APPROVED review to merge; admin (you) can override via the UI's
+#    "Merge without waiting for requirements" button.
+
+# 6. Merge. Auto-deploy webhook fires on push:main → nixos-deploy.service
+#    runs `git fetch + reset --hard + nixos-rebuild switch` on dellan.
+#    Desktop notification fires on success/failure.
+
+# 7. Clean up
+git -C ~/Repos/nixos-config worktree remove ~/Repos/nixos-config-worktrees/<slug>
+gh pr view <PR_NUMBER>   # confirm merged
+```
+
+**Don't:**
+- `git push origin main` directly — branch protection rejects (no direct push).
+- `sudo nixos-rebuild switch` casually — bypasses the gate stack.
+- Edit `/etc/nixos` directly — root-owned + auto-deploy will overwrite.
+
+## CI on GitHub-hosted runners
+
+CI runs on `ubuntu-latest`, NOT on dellan. The `.github/workflows/` files use:
+- `wimpysworld/nothing-but-nix` — mounts `/mnt` as `/nix` for ~70+ GB free disk
+- `DeterminateSystems/determinate-nix-action` — Nix install + KVM nested-virt enabled
+- `nix-community/cache-nix-action` — caches `/nix/store` between runs (10 GB GHA cache cap)
+
+Public repo = unlimited free minutes. KVM nested-virt is ~30-50% slower than bare metal but works for `nixosTest`.
+
+**Fork-PR policy:** this repo does NOT accept external contributions. `ci.yml` and `gate.yml` jobs skip on fork PRs (`if: head.repo == base.repo`); `close-fork-prs.yml` auto-closes any fork PR with a polite note. `scripts/check-fork-guards.sh` runs as a CI job to assert future workflows keep the guard.
+
+**Self-hosted runner is gone** — `modules/nixos/actions-runner.nix` and `modules/nixos/atticd.nix` deleted; the only CI-related code on dellan is the webhook handler (`modules/nixos/github-webhook.nix`) and the auto-deploy unit (`modules/nixos/nixos-deploy.nix`).
+
+## VM e2e tests
+
+CI runs `nix build .#checks.x86_64-linux.dellan-vm` automatically on every PR via `vm-minimal` (3 lanes). Required status check: `vm-minimal (1..3)`.
+
+To run locally for debugging:
+```bash
+cd ~/Repos/nixos-config-worktrees/<your-branch>
 nix build .#checks.x86_64-linux.dellan-vm -L
 ```
 
-It boots a QEMU VM with the same modules as production (minus hardware-configuration), waits for `multi-user.target`, asserts HM activation, asserts user-level systemd timers/services, and runs sanity checks against HM-installed binaries. ~2-3 min; uses `/dev/kvm`.
+`tests/dellan-vm.nix` is the test source. When adding HM units / scripts / systemd timers, add an assertion there. Skip only for hardware-specific config the VM can't model (touchpad, GPU, LUKS, real disks).
 
-Test source: `tests/dellan-vm.nix`. Add new assertions there when adding HM units, scripts, or systemd timers — keep this gate exercising real production paths.
+**Architecture note:** `nixpkgs.config.allowUnfree` and `nixpkgs.overlays` live in `flake.nix` (built into `pkgsLinux` / `pkgsDarwin`). Setting them inside modules conflicts with `runNixOSTest`'s read-only nixpkgs injection.
 
-**Why this is the gate, not `nixos-rebuild build-vm`:** `runNixOSTest` is sandboxed and returns a deterministic pass/fail derivation; `build-vm` is for interactive poking. Use `build-vm` only when debugging a failed test.
+## What you'll see on a PR
 
-**Architecture note:** `nixpkgs.config.allowUnfree` and `nixpkgs.overlays` live in `flake.nix` (built into `pkgsLinux` / `pkgsDarwin` and passed to `nixosSystem`/`darwinSystem` via the `pkgs` argument). Setting them inside modules conflicts with `runNixOSTest`'s read-only nixpkgs injection. Keep new overlays in `flake.nix`'s `pkgsLinux` definition.
+| Status check | What it does |
+|---|---|
+| `verify-fork-guards` | Asserts every PR-triggered workflow has a fork-guard predicate |
+| `flake check (eval)` | `nix flake check --no-build --all-systems` |
+| `build dellan toplevel` | Builds `nixosConfigurations.dellan.config.system.build.toplevel` |
+| `vm-minimal (1..3)` | Three parallel ephemeral VM e2e tests; same as `nix build .#checks.x86_64-linux.dellan-vm` |
+| `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |
+| `classify` | Posts `risk:trivial/low/medium/high/critical` label + per-source breakdown comment |
+| `label-gate` | Asserts label-actor allowlist + baseline-drift gate. Risk-tier merge gating is enforced by branch protection's review requirement, not by this check. |
 
-## Repo layout
+Branch protection requires 1 fresh APPROVED review to merge. Solo-author PRs ship via admin UI override (`enforce_admins: false`). `gh pr merge --admin` is denied at the safe-bash MCP layer to keep override a deliberate UI gesture.
 
-`/home/jonathan/Repos/nixos-config` is a symlink to `/etc/nixos`. Same git repo — edits, status, and pulls in either path hit the same tree.
+Spec: `docs/specs/2026-05-04-cicd-driven-nixos-workflow.md` (sections marked `[OBSOLETE-2026-05-05]` describe the original self-hosted runner + Attic architecture; replaced by GHA-hosted runners as of 2026-05-05).
 
 ### Cross-repo bridge: `~/.claude/symlinks/`
 
@@ -55,14 +133,17 @@ Edits *through* symlinks write to nixos-config (intended). Adding a link = edit 
 
 ## Deploy workflow
 
-Changes live on the host, rsync'd to VM — no GitHub credentials on VM:
+`nixos-deploy.service` (systemd, root) on dellan:
+1. GitHub `push: main` event → webhook over Tailscale Funnel
+2. Handler validates HMAC + replay-protects via `X-GitHub-Delivery` UUID
+3. `git fetch origin main` + `git reset --hard origin/main` in `/etc/nixos`
+4. `nixos-rebuild switch --flake /etc/nixos#dellan`
+5. On success: writes `last-good` SHA, libnotify low-priority desktop notification
+6. On failure: writes `current-poison` SHA + appends to `poisoned.log`,
+   libnotify CRITICAL notification with rollback command, refuses to
+   re-attempt the same SHA without manual `rm /var/lib/nixos-deploy/current-poison`
 
-```bash
-rsync -avz --delete --exclude='.git' -e ssh --rsync-path="sudo rsync" \
-  /home/jonathan/Repos/nixos-config/ jonathan@192.168.122.27:/etc/nixos/
-```
-
-VM IP may change on reboot — check with `virsh domifaddr nixos`.
+Manual recovery: `sudo nixos-rebuild switch --rollback`.
 
 ## Key files
 
@@ -76,7 +157,8 @@ VM IP may change on reboot — check with `virsh domifaddr nixos`.
 | `home/ghostty.nix` | Ghostty terminal config |
 | `home/autodoro.nix` | Autodoro systemd user service |
 | `modules/nixos/desktop.nix` | Cinnamon/LightDM system config + Chrome policies |
-| `modules/nixos/vm-tweaks.nix` | VM-specific tweaks (QEMU guest, SPICE, etc.) |
+| `modules/nixos/github-webhook.nix` | Webhook ingress for `push: main` events |
+| `modules/nixos/nixos-deploy.nix` | Auto-deploy systemd unit |
 
 ## Cinnamon applet notes
 
@@ -90,7 +172,6 @@ gitleaks pre-commit hook blocks secrets. fetchgit hashes/revs that trigger false
 ## Known gaps / manual steps
 
 - **Dropbox**: daemon autostarts but `~/Dropbox` folder requires GUI login to Dropbox on first run.
-- **Private repos**: `cloneRepos` activation tries SSH first (`git@github.com:...`), falls back to HTTPS. To clone private repos, add the host's SSH pubkey to https://github.com/settings/keys before next rebuild. Failures are silent — re-run `home-manager switch` after adding the key.
 - **`~/.claude` repo**: NOT auto-cloned. Claude Code populates `~/.claude` with runtime state (backups, projects, sessions, cache) on first run, and the [.claude repo](https://github.com/jonathanmoregard/.claude.git) needs to coexist with that. Bootstrap: move runtime dirs aside, `git clone git@github.com:jonathanmoregard/.claude.git ~/.claude`, move dirs back in, then `cd ~/.claude && git submodule update --init --recursive`.
 - **Beeper**: installed via nixpkgs (unfree, allowed). Requires account login on first run. nixpkgs version lags upstream — see `overlays/beeper.nix` for version bump.
 - **`~/.huskyrc`**: declared in `home/jonathan.nix` (loads nvm for husky pre-commit hooks). NVM itself is not declared in this flake — install via `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash` if needed.

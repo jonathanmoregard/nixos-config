@@ -1,6 +1,6 @@
 # .github/workflows/close-fork-prs.yml
 #
-# This repo does NOT accept external contributions. Forks PRs are
+# This repo does NOT accept external contributions. Fork PRs are
 # auto-closed with a comment pointing the would-be contributor at
 # the issue tracker.
 #
@@ -9,6 +9,9 @@
 # invoke nix/build/anything that could evaluate PR-controlled code.
 # It only inspects PR metadata + calls the gh API. Safe even on
 # fork-authored PRs.
+#
+# Runner: ubuntu-latest. Metadata-only job, no Nix needed; running on
+# a GitHub-hosted runner is correct (no privilege, no persistent state).
 name: close-fork-prs
 
 on:
@@ -16,12 +19,13 @@ on:
     types: [opened, reopened]
 
 permissions:
+  contents: read
   pull-requests: write
   issues: write
 
 jobs:
   close-fork:
-    runs-on: [self-hosted, x86_64-linux]
+    runs-on: ubuntu-latest
     if: github.event.pull_request.head.repo.full_name != github.repository
     env:
       GH_TOKEN: ${{ github.token }}

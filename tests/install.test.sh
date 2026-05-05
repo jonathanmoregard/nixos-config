@@ -3,14 +3,14 @@
 #
 # Runs install.sh against a fake CONFIG_PATH with throwaway SSH keys
 # we own (so we can decrypt + verify content). Stubs sudo via DRY_RUN,
-# injects token values via TEST_* env vars (no prompts).
+# injects token values via TEST_PAT (no prompts).
 #
 # Asserts:
-#   - All 5 .age files materialize at $FAKE/secrets/
+#   - All 3 .age files materialize at $FAKE/secrets/
 #   - Each ciphertext is > 350 bytes (above empty-plaintext baseline)
 #   - Each decrypts to the expected plaintext
-#   - hosts/dellan/default.nix has expected uncomments applied
-#   - Phase 4 git commit lands in the fake repo
+#   - Phase 3 git commit lands in the fake repo
+#   - Idempotent: second run skips everything
 #
 # Run via:
 #   nix shell nixpkgs#rage nixpkgs#openssl nixpkgs#jq nixpkgs#gh \
@@ -50,50 +50,32 @@ let
   k1 = "$PUB1";
   k2 = "$PUB2";
 in {
-  "github-runner-token.age".publicKeys    = [ k1 k2 ];
-  "actions-runner-ssh-key.age".publicKeys = [ k1 k2 ];
-  "github-webhook-secret.age".publicKeys  = [ k1 k2 ];
-  "gh-janitor-token.age".publicKeys       = [ k1 k2 ];
-  "atticd-rs256-secret.age".publicKeys    = [ k1 k2 ];
+  "deploy-ssh-key.age".publicKeys        = [ k1 k2 ];
+  "github-webhook-secret.age".publicKeys = [ k1 k2 ];
+  "gh-janitor-token.age".publicKeys      = [ k1 k2 ];
 }
 EOF
 
-# Minimal hosts/dellan/default.nix containing the comment markers
-# install.sh's sed expects.
+# Minimal hosts/dellan/default.nix that satisfies install.sh's pre-flight
+# (services.nixosDeploy reference must be present).
 cat > "$FAKE/hosts/dellan/default.nix" <<'EOF'
 { config, ... }:
 {
   imports = [];
 
-  # age.secrets.github-runner-token.file    = ../../secrets/github-runner-token.age;
-  # age.secrets.actions-runner-ssh-key.file = ../../secrets/actions-runner-ssh-key.age;
-  # age.secrets.github-webhook-secret.file  = ../../secrets/github-webhook-secret.age;
-  # age.secrets.gh-janitor-token.file       = ../../secrets/gh-janitor-token.age;
-  # age.secrets.atticd-rs256-secret.file    = ../../secrets/atticd-rs256-secret.age;
+  age.secrets.deploy-ssh-key.file        = ../../secrets/deploy-ssh-key.age;
+  age.secrets.github-webhook-secret.file = ../../secrets/github-webhook-secret.age;
+  age.secrets.gh-janitor-token.file      = ../../secrets/gh-janitor-token.age;
 
-  # services.atticCache = {
-  #   enable = true;
-  #   rs256SecretFile = "/dummy";
-  # };
-  # services.buildCoordination.enable = true;
-  # services.claudeAgentUsers.enable = true;
+  services.githubWebhook = {
+    enable = true;
+    secretFile = config.age.secrets.github-webhook-secret.path;
+  };
 
-  # services.actionsRunner = {
-  #   enable = true;
-  #   url = "https://example";
-  #   tokenFile = "/dummy";
-  #   sshKeyFile = "/dummy";
-  # };
-
-  # services.githubWebhook = {
-  #   enable = true;
-  #   secretFile = "/dummy";
-  # };
-
-  # services.nixosDeploy = {
-  #   enable = true;
-  #   sshKeyFile = "/dummy";
-  # };
+  services.nixosDeploy = {
+    enable = true;
+    sshKeyFile = config.age.secrets.deploy-ssh-key.path;
+  };
 }
 EOF
 
@@ -104,18 +86,16 @@ git -C "$FAKE" -c user.name=test -c user.email=test@test commit -qm "init"
 ok "Fake CONFIG_PATH at $FAKE (branch: main)"
 
 # -------------------------------------------------------------------------
-# Run install.sh with DRY_RUN + injected tokens
+# Run install.sh with DRY_RUN + injected PAT
 # -------------------------------------------------------------------------
 
 heading "Run install.sh with DRY_RUN=1"
 
-EXPECTED_RUNNER_TOKEN="DUMMY_RUNNER_TOKEN_29_ABCDE_X"
 EXPECTED_PAT="ghp_DUMMY_TEST_PAT_VALUE_FOR_TESTING"
 
 if CONFIG_PATH="$FAKE" \
    DRY_RUN=1 \
    INSTALL_SH_BOOTSTRAPPED=1 \
-   TEST_RUNNER_TOKEN="$EXPECTED_RUNNER_TOKEN" \
    TEST_PAT="$EXPECTED_PAT" \
    "$REPO_ROOT/scripts/install.sh" >"$TESTDIR/install.log" 2>&1; then
   ok "install.sh exited 0"
@@ -126,12 +106,12 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Assertion: all 5 .age files exist
+# Assertion: all 3 .age files exist
 # -------------------------------------------------------------------------
 
-heading "All 5 .age files present"
+heading "All 3 .age files present"
 
-for name in github-runner-token actions-runner-ssh-key github-webhook-secret gh-janitor-token atticd-rs256-secret; do
+for name in deploy-ssh-key github-webhook-secret gh-janitor-token; do
   f="$FAKE/secrets/${name}.age"
   if [ -f "$f" ]; then
     ok "$name.age exists"
@@ -141,12 +121,12 @@ for name in github-runner-token actions-runner-ssh-key github-webhook-secret gh-
 done
 
 # -------------------------------------------------------------------------
-# Assertion: each ciphertext > 350 bytes (above empty baseline)
+# Assertion: each ciphertext > 350 bytes
 # -------------------------------------------------------------------------
 
 heading "Ciphertext sizes above empty-baseline (>350)"
 
-for name in github-runner-token actions-runner-ssh-key github-webhook-secret gh-janitor-token atticd-rs256-secret; do
+for name in deploy-ssh-key github-webhook-secret gh-janitor-token; do
   f="$FAKE/secrets/${name}.age"
   size=$(wc -c < "$f")
   if [ "$size" -gt 350 ]; then
@@ -166,13 +146,6 @@ decrypt() {
   rage -d -i "$TESTDIR/k1" "$1"
 }
 
-actual_runner_token=$(decrypt "$FAKE/secrets/github-runner-token.age")
-if [ "$actual_runner_token" = "$EXPECTED_RUNNER_TOKEN" ]; then
-  ok "github-runner-token decrypts to expected value"
-else
-  nope "github-runner-token mismatch. Expected: $EXPECTED_RUNNER_TOKEN  Got: $actual_runner_token"
-fi
-
 actual_pat=$(decrypt "$FAKE/secrets/gh-janitor-token.age")
 expected_pat_line="GH_TOKEN=$EXPECTED_PAT"
 if [ "$actual_pat" = "$expected_pat_line" ]; then
@@ -188,57 +161,18 @@ else
   nope "webhook-secret format wrong: $actual_webhook"
 fi
 
-actual_attic=$(decrypt "$FAKE/secrets/atticd-rs256-secret.age")
-if [[ "$actual_attic" =~ ^ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64=\".+\"$ ]]; then
-  attic_inner_size=${#actual_attic}
-  if [ "$attic_inner_size" -gt 4000 ]; then
-    ok "atticd-rs256-secret has correct env var name + sane base64 size ($attic_inner_size bytes)"
-  else
-    nope "atticd-rs256-secret too small: $attic_inner_size bytes (expected >4000 for 4096-bit RSA)"
-  fi
-else
-  nope "atticd-rs256-secret format wrong: ${actual_attic:0:80}..."
-fi
-
-actual_sshkey=$(decrypt "$FAKE/secrets/actions-runner-ssh-key.age")
+actual_sshkey=$(decrypt "$FAKE/secrets/deploy-ssh-key.age")
 if [[ "$actual_sshkey" =~ "OPENSSH PRIVATE KEY" ]]; then
-  ok "actions-runner-ssh-key contains an OpenSSH private key"
+  ok "deploy-ssh-key contains an OpenSSH private key"
 else
-  nope "actions-runner-ssh-key isn't a recognizable SSH key: ${actual_sshkey:0:60}..."
+  nope "deploy-ssh-key isn't a recognizable SSH key: ${actual_sshkey:0:60}..."
 fi
 
 # -------------------------------------------------------------------------
-# Assertion: hosts/dellan/default.nix has uncomments applied
+# Assertion: Phase 3 commit landed
 # -------------------------------------------------------------------------
 
-heading "Phase 4 sed uncomments applied"
-
-uncomment_check() {
-  local pattern="$1" desc="$2"
-  if grep -q "^  $pattern" "$FAKE/hosts/dellan/default.nix"; then
-    ok "$desc uncommented"
-  else
-    nope "$desc still commented"
-  fi
-}
-
-uncomment_check 'age.secrets.github-runner-token.file' 'age.secrets.github-runner-token'
-uncomment_check 'age.secrets.actions-runner-ssh-key.file' 'age.secrets.actions-runner-ssh-key'
-uncomment_check 'age.secrets.github-webhook-secret.file' 'age.secrets.github-webhook-secret'
-uncomment_check 'age.secrets.gh-janitor-token.file' 'age.secrets.gh-janitor-token'
-uncomment_check 'age.secrets.atticd-rs256-secret.file' 'age.secrets.atticd-rs256-secret'
-uncomment_check 'services.buildCoordination.enable = true;' 'services.buildCoordination'
-uncomment_check 'services.claudeAgentUsers.enable = true;' 'services.claudeAgentUsers'
-uncomment_check 'services.atticCache =' 'services.atticCache block'
-uncomment_check 'services.actionsRunner =' 'services.actionsRunner block'
-uncomment_check 'services.githubWebhook =' 'services.githubWebhook block'
-uncomment_check 'services.nixosDeploy =' 'services.nixosDeploy block'
-
-# -------------------------------------------------------------------------
-# Assertion: Phase 4 commit landed
-# -------------------------------------------------------------------------
-
-heading "Phase 4 git commit"
+heading "Phase 3 git commit"
 
 last_commit_msg=$(git -C "$FAKE" log -1 --format=%s)
 if [[ "$last_commit_msg" =~ "encrypt CI/CD secrets" ]]; then
@@ -248,7 +182,7 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Idempotence: re-run should be a no-op (skip all phases)
+# Idempotence: re-run should be a no-op (skip all secret phases)
 # -------------------------------------------------------------------------
 
 heading "Idempotence: second run is a no-op"
@@ -263,12 +197,12 @@ else
   tail -20 "$TESTDIR/install2.log" | sed 's/^/    /'
 fi
 
-# All five "already exists; skipping" should appear
+# All three "already exists; skipping" should appear
 skip_count=$(grep -c "already exists; skipping" "$TESTDIR/install2.log")
-if [ "$skip_count" -ge 5 ]; then
-  ok "All 5 secret phases skipped as expected (skip count: $skip_count)"
+if [ "$skip_count" -ge 3 ]; then
+  ok "All 3 secret phases skipped as expected (skip count: $skip_count)"
 else
-  nope "Expected >=5 skip messages, got $skip_count"
+  nope "Expected >=3 skip messages, got $skip_count"
 fi
 
 # -------------------------------------------------------------------------
