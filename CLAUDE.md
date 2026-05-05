@@ -86,7 +86,7 @@ Public repo = unlimited free minutes. KVM nested-virt is ~30-50% slower than bar
 
 ## VM e2e tests
 
-CI runs `nix build .#checks.x86_64-linux.dellan-vm` automatically on every PR via `vm-minimal` (3 lanes). Required status check: `vm-minimal (1..3)`.
+CI runs `nix build .#checks.x86_64-linux.dellan-vm` automatically on every PR via the `vm-minimal` job. Required status check: `vm-minimal`.
 
 To run locally for debugging:
 ```bash
@@ -105,7 +105,7 @@ nix build .#checks.x86_64-linux.dellan-vm -L
 | `verify-fork-guards` | Asserts every PR-triggered workflow has a fork-guard predicate |
 | `flake check (eval)` | `nix flake check --no-build --all-systems` |
 | `build dellan toplevel` | Builds `nixosConfigurations.dellan.config.system.build.toplevel` |
-| `vm-minimal (1..3)` | Three parallel ephemeral VM e2e tests; same as `nix build .#checks.x86_64-linux.dellan-vm` |
+| `vm-minimal` | Ephemeral VM e2e test; same as `nix build .#checks.x86_64-linux.dellan-vm` |
 | `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |
 | `classify` | Posts `risk:trivial/low/medium/high/critical` label + per-source breakdown comment |
 | `label-gate` | Asserts label-actor allowlist + baseline-drift gate. Risk-tier merge gating is enforced by branch protection's review requirement, not by this check. |
