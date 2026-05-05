@@ -45,8 +45,9 @@ read -r -d '' BODY <<'JSON' || true
   "required_status_checks": {
     "strict": false,
     "contexts": [
-      "eval (dellan)",
-      "build (dellan)",
+      "verify fork-guards",
+      "flake check (eval)",
+      "build dellan toplevel",
       "vm-minimal (1)",
       "vm-minimal (2)",
       "vm-minimal (3)",
