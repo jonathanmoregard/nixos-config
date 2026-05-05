@@ -52,8 +52,10 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
         with:
-          primary-key: nix-${{ runner.os }}-eval-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-eval-
+          # Scope writes by ref so PR caches don't bleed across branches;
+          # restore falls back to main-only to avoid cross-PR cache reuse.
+          primary-key: nix-${{ runner.os }}-eval-${{ github.ref }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-eval-refs/heads/main-
           gc-max-store-size-linux: 5G
           purge: true
           purge-prefixes: nix-${{ runner.os }}-eval-
@@ -70,12 +72,12 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # main
+      - uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
       - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
         with:
-          primary-key: nix-${{ runner.os }}-dellan-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-dellan-
+          primary-key: nix-${{ runner.os }}-dellan-${{ github.ref }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-dellan-refs/heads/main-
           gc-max-store-size-linux: 5G
           purge: true
           purge-prefixes: nix-${{ runner.os }}-dellan-
@@ -99,12 +101,12 @@ jobs:
         lane: [1, 2, 3]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # main
+      - uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
       - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
         with:
-          primary-key: nix-${{ runner.os }}-vm-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-vm-
+          primary-key: nix-${{ runner.os }}-vm-${{ github.ref }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-vm-refs/heads/main-
           gc-max-store-size-linux: 5G
           purge: true
           purge-prefixes: nix-${{ runner.os }}-vm-
