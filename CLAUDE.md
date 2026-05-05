@@ -1,19 +1,17 @@
 # nixos-config
 
-Jonathan's declarative system config — NixOS Dell Latitude (`dellan`) + Mac Mini (placeholder), managed with Nix flakes + Home Manager.
+Jonathan's declarative system config — NixOS Dell Latitude (`dellan`) managed with Nix flakes + Home Manager.
 
 ## What this is
 
 Linux Mint 22.2 / Cinnamon migration to NixOS, declarative end to end. PRs are CI-tested on GitHub-hosted runners; merges to `main` auto-deploy to dellan via webhook.
-
-Mac Mini config is a placeholder (nix-darwin), fleshed out on arrival.
 
 ## Hosts
 
 | Host | Target |
 |------|--------|
 | `dellan` | Dell Latitude 7440 (daily driver, auto-deploy target) |
-| `mac-mini` | nix-darwin aarch64 (placeholder) |
+| `vm` | NixOS x86_64 VM (legacy; being phased out) |
 
 **Manual `nixos-rebuild switch` is no longer the default workflow.** Auto-deploy on push to `main` handles it (see "Deploy workflow" below). Manual rebuilds are reserved for: bootstrap install, hardware-config edits the VM gate can't model, emergency rollback. Use `sudo nixos-rebuild switch --rollback` for emergency rollback.
 

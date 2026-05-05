@@ -1,5 +1,5 @@
 {
-  description = "jonathanmoregard's NixOS + nix-darwin config";
+  description = "jonathanmoregard's NixOS config";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -7,18 +7,13 @@
     home-manager.url = "github:nix-community/home-manager";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
 
-    nix-darwin.url = "github:LnL7/nix-darwin";
-    nix-darwin.inputs.nixpkgs.follows = "nixpkgs";
-
     agenix.url = "github:ryantm/agenix";
     agenix.inputs.nixpkgs.follows = "nixpkgs";
-    agenix.inputs.darwin.follows = "nix-darwin";
   };
 
-  outputs = { self, nixpkgs, home-manager, nix-darwin, agenix, ... }:
+  outputs = { self, nixpkgs, home-manager, agenix, ... }:
   let
     linuxSystem = "x86_64-linux";
-    darwinSystem = "aarch64-darwin";
 
     # Pre-built pkgs — overlays + allowUnfree applied here rather than in
     # modules. Required so tests/dellan-vm.nix can reuse the same pkgs:
@@ -28,10 +23,6 @@
       system = linuxSystem;
       config.allowUnfree = true;
       overlays = [ (import ./overlays/beeper.nix) ];
-    };
-    pkgsDarwin = import nixpkgs {
-      system = darwinSystem;
-      config.allowUnfree = true;
     };
   in {
     # NixOS VM (headless, QEMU/KVM)
@@ -75,23 +66,6 @@
     checks.${linuxSystem}.dellan-vm = import ./tests/dellan-vm.nix {
       pkgs = pkgsLinux;
       inputs = { inherit home-manager agenix; };
-    };
-
-    # Mac Mini (nix-darwin, placeholder — flesh out on arrival)
-    darwinConfigurations.mac-mini = nix-darwin.lib.darwinSystem {
-      system = darwinSystem;
-      pkgs = pkgsDarwin;
-      modules = [
-        ./hosts/mac-mini/default.nix
-        ./modules/common.nix
-        ./modules/darwin/inference.nix
-        home-manager.darwinModules.home-manager
-        {
-          home-manager.useGlobalPkgs = true;
-          home-manager.useUserPackages = true;
-          home-manager.users.jonathan = import ./home/jonathan.nix;
-        }
-      ];
     };
   };
 }
