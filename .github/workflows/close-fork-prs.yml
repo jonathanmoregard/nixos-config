@@ -1,0 +1,35 @@
+# .github/workflows/close-fork-prs.yml
+#
+# This repo does NOT accept external contributions. Forks PRs are
+# auto-closed with a comment pointing the would-be contributor at
+# the issue tracker.
+#
+# Trigger: pull_request_target (runs base-branch code only). The job
+# below intentionally does NOT check out the PR head and does NOT
+# invoke nix/build/anything that could evaluate PR-controlled code.
+# It only inspects PR metadata + calls the gh API. Safe even on
+# fork-authored PRs.
+name: close-fork-prs
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  close-fork:
+    runs-on: [self-hosted, x86_64-linux]
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Comment + close
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Thanks for the interest, but this repository does not accept external contributions. If you've found a bug or have a suggestion, please open an issue instead. Closing this PR automatically."
+          gh pr close "$PR_NUMBER" --repo "$REPO"

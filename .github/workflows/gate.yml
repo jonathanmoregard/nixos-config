@@ -30,7 +30,11 @@ concurrency:
 jobs:
   classify:
     runs-on: [self-hosted, x86_64-linux]
-    if: github.event.action != 'labeled' && github.event.action != 'unlabeled'
+    # Skip fork PRs: classify-pr.sh runs `nix build` against the PR sha,
+    # and Nix flake evaluation is unsandboxed → arbitrary code execution
+    # on the self-hosted runner. close-fork-prs.yml handles drive-by PRs
+    # via metadata-only auto-close. Same-repo PRs only.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.action != 'labeled' && github.event.action != 'unlabeled'
     outputs:
       risk: ${{ steps.classify.outputs.risk }}
     env:
@@ -90,7 +94,9 @@ jobs:
 
   label-gate:
     runs-on: [self-hosted, x86_64-linux]
-    # Always runs (including label change events)
+    # Always runs (including label change events). Fork-PR guard: skip
+    # entirely so a fork PR can't even add labels via this workflow.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     env:
       GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ github.event.pull_request.number }}

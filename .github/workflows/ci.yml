@@ -6,6 +6,13 @@
 #
 # Trust boundary: this workflow's permissions are read-only for content;
 # merge-gating logic lives in gate.yml (pull_request_target).
+#
+# Fork policy: this repo does NOT accept external contributions. Every
+# job below is gated on either a push event OR a PR whose head lives in
+# this same repository. Fork PRs cause every job to skip — no PR code
+# from outside this repo ever runs on the self-hosted runner. The
+# .github/workflows/close-fork-prs.yml workflow handles the comment+
+# close so fork PRs don't sit open silently.
 name: ci
 
 on:
@@ -25,6 +32,7 @@ concurrency:
 jobs:
   discover-hosts:
     runs-on: [self-hosted, x86_64-linux]
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     outputs:
       linux-hosts: ${{ steps.discover.outputs.linux-hosts }}
       darwin-hosts: ${{ steps.discover.outputs.darwin-hosts }}
@@ -43,6 +51,7 @@ jobs:
   eval:
     runs-on: [self-hosted, x86_64-linux]
     needs: discover-hosts
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +65,7 @@ jobs:
   build:
     runs-on: [self-hosted, x86_64-linux]
     needs: [discover-hosts, eval]
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -69,6 +79,7 @@ jobs:
   vm-minimal:
     runs-on: [self-hosted, x86_64-linux, kvm]
     needs: build
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       max-parallel: 3
@@ -91,9 +102,10 @@ jobs:
     runs-on: [self-hosted, x86_64-linux, kvm]
     needs: build
     if: |
-      contains(github.event.pull_request.changed_files, 'home/cinnamon.nix') ||
-      contains(github.event.pull_request.changed_files, 'modules/nixos/desktop.nix') ||
-      contains(github.event.pull_request.changed_files, 'home/kitty.nix')
+      (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (contains(github.event.pull_request.changed_files, 'home/cinnamon.nix') ||
+       contains(github.event.pull_request.changed_files, 'modules/nixos/desktop.nix') ||
+       contains(github.event.pull_request.changed_files, 'home/kitty.nix'))
     steps:
       - uses: actions/checkout@v4
       - run: |
