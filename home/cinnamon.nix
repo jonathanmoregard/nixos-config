@@ -153,7 +153,7 @@ in
     };
 
     "org/cinnamon/desktop/background" = {
-      picture-uri = "file://${../wallpapers/misty-landscape.jpg}";
+      picture-uri = "file://${pkgs.mint-artwork}/share/backgrounds/linuxmint/linuxmint.jpg";
       picture-options = "zoom";
     };
 
