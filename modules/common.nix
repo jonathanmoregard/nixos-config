@@ -27,13 +27,13 @@
     # cache.nixos.org stays in the default substituter list (nix prepends
     # it). Trusted-public-keys is additive.
     substituters = [
-      "https://jonathanmoregard-nixos-config.cachix.org"
+      "https://jonathanmoregard.cachix.org"
     ];
     trusted-public-keys = [
       # PUBLIC KEY of the cachix cache. Replace with the value shown on
-      # https://app.cachix.org/cache/jonathanmoregard-nixos-config under
+      # https://app.cachix.org/cache/jonathanmoregard under
       # "Public Signing Keys" before merging this PR.
-      "jonathanmoregard-nixos-config.cachix.org-1:REPLACE_ME_AT_MERGE_TIME="
+      "jonathanmoregard.cachix.org-1:REPLACE_ME_AT_MERGE_TIME="
     ];
   };
 }

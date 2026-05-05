@@ -55,7 +55,7 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
-          name: jonathanmoregard-nixos-config
+          name: jonathanmoregard
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Fetch PR head
