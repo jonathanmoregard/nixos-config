@@ -48,9 +48,17 @@ let
 
     git reset --hard "$TARGET"
     if ${pkgs.nixos-rebuild}/bin/nixos-rebuild switch --flake /etc/nixos#${cfg.hostName}; then
+      # Notify only when last-good actually changed. Concurrent webhook
+      # retries can queue multiple deploy runs against the same TARGET;
+      # without this guard, each one re-touches notify-success and the
+      # path-watcher fires another notify-send. Read prior last-good
+      # before overwriting and skip the touch if TARGET is unchanged.
+      PRIOR=$(cat "$LAST_GOOD" 2>/dev/null || echo "")
       echo "$TARGET" > "$LAST_GOOD"
       rm -f "$CURRENT_POISON"
-      touch "$STATE/notify-success"
+      if [ "$PRIOR" != "$TARGET" ]; then
+        touch "$STATE/notify-success"
+      fi
     else
       echo "$TARGET" > "$CURRENT_POISON"
       printf '%s\t%s\t%s\n' "$(date -Iseconds)" "$TARGET" "FAILED" >> "$POISONED_LOG"
