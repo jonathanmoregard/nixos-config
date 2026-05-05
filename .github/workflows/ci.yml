@@ -61,10 +61,17 @@ jobs:
           purge-prefixes: nix-${{ runner.os }}-eval-
           purge-last-accessed: 86400
           purge-primary-key: never
-      # No --all-systems: darwinConfigurations.mac-mini is a placeholder
-      # (no users.users.jonathan declared, home.homeDirectory hardcoded
-      # for Linux). Re-enable once mac-mini's actual config lands.
-      - run: nix flake check --no-build
+      # `nix flake check` evaluates darwinConfigurations.mac-mini even
+       # without --all-systems (Determinate Nix walks all named outputs).
+       # mac-mini is a placeholder (no users.users.jonathan declared,
+       # home.homeDirectory hardcoded for Linux), so it fails to eval
+       # on a Linux runner. Probe Linux outputs explicitly instead.
+       # Re-enable `nix flake check` once mac-mini's actual config lands.
+      - run: |
+          set -euo pipefail
+          nix eval --no-warn-dirty .#nixosConfigurations.dellan.config.system.build.toplevel.drvPath > /dev/null
+          nix eval --no-warn-dirty .#nixosConfigurations.vm.config.system.build.toplevel.drvPath > /dev/null
+          nix eval --no-warn-dirty .#checks.x86_64-linux.dellan-vm.drvPath > /dev/null
 
   build-dellan:
     name: build dellan toplevel
