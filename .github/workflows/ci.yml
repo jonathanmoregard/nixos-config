@@ -98,15 +98,12 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
       - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
-      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
-        with:
-          primary-key: nix-${{ runner.os }}-vm-${{ github.ref }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-vm-refs/heads/main-
-          gc-max-store-size-linux: 5G
-          purge: true
-          purge-prefixes: nix-${{ runner.os }}-vm-
-          purge-last-accessed: 86400
-          purge-primary-key: never
+      # No cache-nix-action: the dellan-vm test closure (~8-12 GB) is
+      # too large for GHA's 10 GB-per-repo cache cap. The post-step
+      # save fails silently and marks the job as failed even when the
+      # build succeeds. cache.nixos.org provides upstream substitution
+      # for the heavy lifting; the local rebuild on cold start is
+      # acceptable for the once-per-PR vm-minimal lane.
       - name: Verify KVM
         run: |
           test "${DETERMINATE_NIX_KVM:-}" = "1" || { echo "KVM not available"; exit 1; }
