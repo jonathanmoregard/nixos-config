@@ -167,6 +167,16 @@ Manual recovery: `sudo nixos-rebuild switch --rollback`.
 
 gitleaks pre-commit hook blocks secrets. fetchgit hashes/revs that trigger false positives get `# pragma: allowlist secret` inline.
 
+## Mint host backup on dellan
+
+The Linux Mint daily-driver from which dellan was derived is being returned 2026-05-05. A point-in-time copy of the Mint user home was rsync'd to dellan before return:
+
+| Path on dellan | What |
+|---|---|
+| `/home/jonathan/mint-backup-2026-05-05/` | `~/jonathan/` from Mint host as of 2026-05-05, excluding caches, Dropbox, snap, Trash, node_modules, target/, .next, dist, __pycache__, .venv, Chrome cache |
+
+Use it as a read-only reference when porting drift proposals — every "live Mint state" the proposals reference (autostart .desktop entries, dotfiles, custom systemd unit text, scripts, configs) lives under that backup path. Never reinstate state from the backup blindly into `$HOME`; the backup contains stale paths (e.g. ghostty-mcp tooling that's been replaced by kitty), legacy app caches, and host-specific machine IDs. Always read first, transcribe deliberately into the flake.
+
 ## Known gaps / manual steps
 
 - **Dropbox**: daemon autostarts but `~/Dropbox` folder requires GUI login to Dropbox on first run.
