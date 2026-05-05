@@ -17,7 +17,7 @@ tests/
   autodoro.nix                # autodoro launcher + GTK/GdkPixbuf runtime env
   kitty.nix                   # kitty session-save, 4-pane grid, restore cycle
   keyring.nix                 # gnome-keyring PAM wiring
-  cicd.nix                    # round-7 modules — atticd up, runner registration prep, webhook listening, deploy unit declared
+  cicd.nix                    # webhook listening + nixos-deploy unit declared (post-2026-05-05: atticd + actions-runner removed; runner moved to GHA-hosted)
 ```
 
 ## flake.nix change
@@ -53,7 +53,7 @@ Matrix fan-out so each lane runs one check independently:
 
 ```yaml
 vm-tests:
-  runs-on: [self-hosted, x86_64-linux, kvm]
+  runs-on: ubuntu-latest
   strategy:
     fail-fast: false
     max-parallel: 3
@@ -69,7 +69,7 @@ vm-tests:
 Run only relevant checks per PR:
 - `home/autodoro.nix` change → only `dellan-vm-autodoro`
 - `home/kitty.nix` → only `dellan-vm-kitty`
-- `modules/nixos/{atticd,actions-runner,github-webhook,nixos-deploy,…}.nix` → only `dellan-vm-cicd`
+- `modules/nixos/{github-webhook,nixos-deploy,…}.nix` → only `dellan-vm-cicd`
 - `home/cinnamon.nix` → only `dellan-vm-base` (or new `dellan-vm-graphical`)
 - Touch any module imported by host: run all (fall-through)
 

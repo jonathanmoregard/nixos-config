@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # scripts/install.sh — guided, single-command installer for the CI/CD
 # workflow on dellan. Walks through:
-#   1. Generate runner SSH keypair → pause for user to add to GH Deploy Keys
-#   2. Prompt for runner registration token
-#   3. Generate webhook secret + prompt for Rulesets PAT + generate Attic RS256
-#   4. Uncomment age.secrets + service blocks; commit + push
-#   5. VM gate + nixos-rebuild switch
-#   6. Bare-repo + deploy-target bootstraps
-#   7. Tailscale Funnel + GitHub Webhook UI
-#   8. Branch protection bootstrap (evaluate then active)
-#   9. Smoke test (no-op PR)
+#   1. Generate deploy SSH key → pause for user to add to GH Deploy Keys
+#   2. Generate webhook secret + prompt for Rulesets PAT
+#   3. Commit + push encrypted secrets
+#   4. VM gate + nixos-rebuild switch
+#   5. Bare-repo + deploy-target bootstraps
+#   6. Tailscale Funnel + GitHub Webhook UI
+#   7. Branch protection bootstrap (evaluate then active)
+#   8. Smoke test (no-op PR)
+#
+# CI itself runs on GitHub-hosted runners (ubuntu-latest); see
+# .github/workflows/. No self-hosted runner provisioning is needed.
 #
 # Run as your normal user; the script will sudo for the privileged steps.
 # Idempotent-ish: each phase checks if it's already done and skips.
@@ -18,8 +20,7 @@
 #   CONFIG_PATH=/path        Override /etc/nixos target (default: /etc/nixos)
 #   DRY_RUN=1                Skip sudo, push, rebuild, bootstraps, funnel, rulesets
 #   SKIP_VM_GATE=1           Skip the VM gate before nixos-rebuild switch
-#   TEST_RUNNER_TOKEN=...    Skip Phase 2 prompt; use this value
-#   TEST_PAT=...             Skip Phase 3 PAT prompt; use this value
+#   TEST_PAT=...             Skip Rulesets PAT prompt; use this value
 #   INSTALL_SH_BOOTSTRAPPED  Internal: prevents nix-shell re-exec loop
 
 set -euo pipefail
@@ -73,8 +74,6 @@ pause() {
   read -r
 }
 
-# Sudo wrapper: in DRY_RUN, just runs the command without sudo (assumes
-# tester has write perms on the fake CONFIG_PATH).
 _sudo() {
   if [ "$DRY_RUN" = "1" ]; then
     "$@"
@@ -84,8 +83,6 @@ _sudo() {
 }
 
 read_secret() {
-  # $1 = prompt text. Prompt + final newline go to STDERR so
-  # $(read_secret ...) captures only the value.
   local val
   prompt "$1" >&2
   IFS= read -rs val
@@ -106,9 +103,9 @@ age_file_valid() {
 }
 
 agenix_encrypt() {
-  # Pipes stdin DIRECTLY to agenix; agenix detects non-interactive
-  # stdin and internally uses cp /dev/stdin. Earlier draft used cat>tmp
-  # which CONSUMED stdin before agenix → encrypted empty.
+  # Pipes stdin DIRECTLY to agenix; agenix detects non-interactive stdin
+  # and internally uses cp /dev/stdin. Earlier draft used cat>tmp which
+  # CONSUMED stdin before agenix → encrypted empty.
   local name="$1"
   (
     cd "$CONFIG_PATH/secrets"
@@ -118,7 +115,7 @@ agenix_encrypt() {
   local cipher_size
   cipher_size=$(wc -c < "$CONFIG_PATH/secrets/${name}.age")
   if [ "$cipher_size" -le 350 ]; then
-    fail "agenix_encrypt $name: ciphertext only $cipher_size bytes (<= 350; empty-plaintext baseline). Encryption produced no plaintext."
+    fail "agenix_encrypt $name: ciphertext only $cipher_size bytes (<= 350; empty-plaintext baseline)."
   fi
 }
 
@@ -151,34 +148,35 @@ ETC_BRANCH=$(git -C "$ETC_NIXOS_REAL" rev-parse --abbrev-ref HEAD)
 note "$CONFIG_PATH resolves to $ETC_NIXOS_REAL (branch: $ETC_BRANCH)"
 
 if [ "$ETC_BRANCH" != "main" ]; then
-  fail "$CONFIG_PATH is on branch '$ETC_BRANCH', not main. Merge feat/cicd-workflow → main first."
+  fail "$CONFIG_PATH is on branch '$ETC_BRANCH', not main."
 fi
 
-# Round-7 content checks — skipped in DRY_RUN since the test fixture
-# may not include the exact strings (only the markers we care about).
+# Sanity: post-migration secrets.nix must reference deploy-ssh-key + the
+# webhook + janitor secrets. Skipped in DRY_RUN since the test fixture
+# stubs these.
 if [ "$DRY_RUN" != "1" ]; then
-  if ! grep -q '"actions-runner-ssh-key.age"' "$CONFIG_PATH/secrets/secrets.nix" 2>/dev/null; then
-    fail "$CONFIG_PATH/secrets/secrets.nix doesn't have round-7 entries. Merge feat/cicd-workflow → main first."
+  if ! grep -q '"deploy-ssh-key.age"' "$CONFIG_PATH/secrets/secrets.nix" 2>/dev/null; then
+    fail "$CONFIG_PATH/secrets/secrets.nix missing deploy-ssh-key entry."
   fi
-  if ! grep -q 'services.atticCache' "$CONFIG_PATH/hosts/dellan/default.nix" 2>/dev/null; then
-    fail "$CONFIG_PATH/hosts/dellan/default.nix doesn't have round-7 service blocks. Merge feat/cicd-workflow → main first."
+  if ! grep -q 'services.nixosDeploy' "$CONFIG_PATH/hosts/dellan/default.nix" 2>/dev/null; then
+    fail "$CONFIG_PATH/hosts/dellan/default.nix missing services.nixosDeploy block."
   fi
 fi
 
 ok "Pre-flight passed"
 
 # -------------------------------------------------------------------------
-# Phase 1: SSH key for the runner (also reused by nixos-deploy.service)
+# Phase 1: Deploy SSH key
 # -------------------------------------------------------------------------
 
-heading "Phase 1: Generate runner SSH key"
+heading "Phase 1: Generate deploy SSH key"
 
-KEYFILE_AGE="$CONFIG_PATH/secrets/actions-runner-ssh-key.age"
+KEYFILE_AGE="$CONFIG_PATH/secrets/deploy-ssh-key.age"
 if age_file_valid "$KEYFILE_AGE"; then
   ok "$KEYFILE_AGE already exists; skipping keygen"
 else
-  TMPKEY=$(mktemp -d)/runner-key
-  ssh-keygen -t ed25519 -f "$TMPKEY" -N '' -C "actions-runner@dellan" >/dev/null
+  TMPKEY=$(mktemp -d)/deploy-key
+  ssh-keygen -t ed25519 -f "$TMPKEY" -N '' -C "deploy@dellan" >/dev/null
   ok "Generated keypair at $TMPKEY"
 
   echo
@@ -187,49 +185,22 @@ else
   echo "    --- end ---"
   echo
   prompt "Open $GH_URL/settings/keys/new"
-  prompt "  Title: actions-runner@dellan"
+  prompt "  Title: deploy@dellan"
   prompt "  Paste the public key above"
-  prompt "  CHECK 'Allow write access'"
+  prompt "  CHECK 'Allow write access' (deploy step uses it for the post-merge fetch)"
   prompt "  Click 'Add key'"
   pause "Done?"
 
-  agenix_encrypt actions-runner-ssh-key < "$TMPKEY"
+  agenix_encrypt deploy-ssh-key < "$TMPKEY"
   shred -u "$TMPKEY" "$TMPKEY.pub"
-  ok "Encrypted as secrets/actions-runner-ssh-key.age"
+  ok "Encrypted as secrets/deploy-ssh-key.age"
 fi
 
 # -------------------------------------------------------------------------
-# Phase 2: Runner registration token
+# Phase 2: Webhook secret + Rulesets PAT
 # -------------------------------------------------------------------------
 
-heading "Phase 2: Runner registration token"
-
-TOKEN_AGE="$CONFIG_PATH/secrets/github-runner-token.age"
-if age_file_valid "$TOKEN_AGE"; then
-  ok "$TOKEN_AGE already exists; skipping"
-  note "If token is expired, delete the .age and re-run."
-else
-  if [ -n "${TEST_RUNNER_TOKEN:-}" ]; then
-    TOKEN="$TEST_RUNNER_TOKEN"
-    note "Using TEST_RUNNER_TOKEN from env (no prompt)"
-  else
-    prompt "Open $GH_URL/settings/actions/runners/new"
-    prompt "  Select Linux x64"
-    prompt "  Copy the registration token"
-    TOKEN=$(read_secret "Paste token (input hidden):")
-  fi
-  [ -n "$TOKEN" ] || fail "empty token"
-
-  printf '%s' "$TOKEN" | agenix_encrypt github-runner-token
-  unset TOKEN
-  ok "Encrypted as secrets/github-runner-token.age"
-fi
-
-# -------------------------------------------------------------------------
-# Phase 3: Webhook secret + Rulesets PAT + Attic RS256 secret
-# -------------------------------------------------------------------------
-
-heading "Phase 3: Webhook secret + Rulesets PAT + Attic RS256"
+heading "Phase 2: Webhook secret + Rulesets PAT"
 
 WEBHOOK_AGE="$CONFIG_PATH/secrets/github-webhook-secret.age"
 if age_file_valid "$WEBHOOK_AGE"; then
@@ -259,66 +230,27 @@ else
   [ -n "$PAT" ] || fail "empty PAT"
 
   printf 'GH_TOKEN=%s\n' "$PAT" | agenix_encrypt gh-janitor-token
-  RULESETS_PAT="$PAT"   # keep for Phase 8
+  RULESETS_PAT="$PAT"   # keep for Phase 7
   unset PAT
   ok "Encrypted as secrets/gh-janitor-token.age"
 fi
 
-ATTIC_AGE="$CONFIG_PATH/secrets/atticd-rs256-secret.age"
-if age_file_valid "$ATTIC_AGE"; then
-  ok "$ATTIC_AGE already exists; skipping"
-else
-  note "Generating Attic RS256 token-signing secret (4096-bit RSA, base64)..."
-  ATTIC_SECRET=$(openssl genrsa -traditional 4096 2>/dev/null | base64 -w0)
-  # NOTE: atticd expects ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64 (with _BASE64).
-  printf 'ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64="%s"\n' "$ATTIC_SECRET" \
-    | agenix_encrypt atticd-rs256-secret
-  unset ATTIC_SECRET
-  ok "Encrypted as secrets/atticd-rs256-secret.age"
-fi
-
 # -------------------------------------------------------------------------
-# Phase 4: Uncomment service blocks; commit + push
+# Phase 3: Commit + push secrets
 # -------------------------------------------------------------------------
 
-heading "Phase 4: Uncomment service blocks in $CONFIG_PATH"
+heading "Phase 3: Commit + push secrets"
 
-HOST_NIX="$CONFIG_PATH/hosts/dellan/default.nix"
-
-uncomment_block() {
-  local anchor="$1" count="$2"
-  _sudo sed -i "/$anchor/,+$count s/^  # /  /" "$HOST_NIX"
-}
-
-uncomment_line() {
-  _sudo sed -i "s|^  # \\($1\\)|  \\1|" "$HOST_NIX"
-}
-
-# age.secrets declarations (5 lines)
-uncomment_line 'age.secrets.github-runner-token.file'
-uncomment_line 'age.secrets.actions-runner-ssh-key.file'
-uncomment_line 'age.secrets.github-webhook-secret.file'
-uncomment_line 'age.secrets.gh-janitor-token.file'
-uncomment_line 'age.secrets.atticd-rs256-secret.file'
-
-uncomment_line 'services.buildCoordination.enable = true;'
-uncomment_line 'services.claudeAgentUsers.enable = true;'
-
-uncomment_block 'services.atticCache =' 3
-uncomment_block 'services.actionsRunner =' 5
-uncomment_block 'services.githubWebhook =' 3
-uncomment_block 'services.nixosDeploy =' 3
-
-# Commit + push the .age files and config edits before bare-repo bootstrap
-# destroys ~/Repos/nixos-config. The bootstrap reclones from origin/main,
-# so anything not pushed is lost.
+# Commit + push the .age files before bare-repo bootstrap destroys
+# ~/Repos/nixos-config. The bootstrap reclones from origin/main, so
+# anything not pushed is lost.
 _sudo git -C "$CONFIG_PATH" add -A
 if _sudo git -C "$CONFIG_PATH" diff --cached --quiet; then
   ok "No changes to commit (already done in a previous run)"
 else
   _sudo git -C "$CONFIG_PATH" -c user.name=jonathanmoregard \
     -c user.email=jonathan.more@hotmail.com \
-    commit -m "feat(install): encrypt CI/CD secrets + enable services"
+    commit -m "feat(install): encrypt CI/CD secrets"
   if [ "$DRY_RUN" = "1" ]; then
     note "DRY_RUN: skipping push to origin"
   elif [ -f "$HOME/.ssh/id_ed25519" ]; then
@@ -327,14 +259,14 @@ else
   else
     fail "No SSH key at \$HOME/.ssh/id_ed25519. Cannot push to GitHub."
   fi
-  ok "Committed + pushed config edits to origin/main"
+  ok "Committed + pushed secrets to origin/main"
 fi
 
 # -------------------------------------------------------------------------
-# Phase 5: VM gate + nixos-rebuild switch
+# Phase 4: VM gate + nixos-rebuild switch
 # -------------------------------------------------------------------------
 
-heading "Phase 5: VM gate + nixos-rebuild switch"
+heading "Phase 4: VM gate + nixos-rebuild switch"
 
 if [ "$DRY_RUN" = "1" ]; then
   note "DRY_RUN: skipping VM gate + nixos-rebuild switch"
@@ -353,10 +285,10 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Phase 6: Bare-repo + deploy-target bootstraps
+# Phase 5: Bare-repo + deploy-target bootstraps
 # -------------------------------------------------------------------------
 
-heading "Phase 6: Bare-repo + deploy-target bootstraps"
+heading "Phase 5: Bare-repo + deploy-target bootstraps"
 
 if [ "$DRY_RUN" = "1" ]; then
   note "DRY_RUN: skipping bare-repo + deploy-target bootstraps"
@@ -379,10 +311,10 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Phase 7: Tailscale Funnel + GitHub Webhook UI
+# Phase 6: Tailscale Funnel + GitHub Webhook UI
 # -------------------------------------------------------------------------
 
-heading "Phase 7: Tailscale Funnel + GitHub Webhook"
+heading "Phase 6: Tailscale Funnel + GitHub Webhook"
 
 if [ "$DRY_RUN" = "1" ]; then
   note "DRY_RUN: skipping Tailscale Funnel + webhook UI"
@@ -412,10 +344,10 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Phase 8: Branch protection bootstrap
+# Phase 7: Branch protection bootstrap
 # -------------------------------------------------------------------------
 
-heading "Phase 8: Branch protection bootstrap"
+heading "Phase 7: Branch protection bootstrap"
 
 if [ "$DRY_RUN" = "1" ]; then
   note "DRY_RUN: skipping Branch protection bootstrap"
@@ -444,20 +376,20 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Phase 9: Smoke test
+# Phase 8: Smoke test
 # -------------------------------------------------------------------------
 
-heading "Phase 9: Smoke test"
+heading "Phase 8: Smoke test"
 
 if [ "$DRY_RUN" = "1" ]; then
   note "DRY_RUN: skipping smoke test"
 else
   prompt "Optional: open a no-op test PR (e.g. README typo) to verify the"
-  prompt "full pipeline (CI runs → classify → label → label-gate → mergeable)."
+  prompt "full pipeline (CI runs on GHA → classify → label → label-gate → mergeable)."
   pause "Done (or press ENTER to skip)?"
 fi
 
 ok "Install complete!"
 echo
-note "Next: open a real PR. Watch $GH_URL/actions for the runner picking it up."
-note "Verify via: gh api repos/$GH_OWNER/$GH_REPO/commits/main/check-runs"
+note "Next: open a real PR. Watch $GH_URL/actions for the GHA-hosted runner picking it up."
+note "Verify deploy via: gh api repos/$GH_OWNER/$GH_REPO/commits/main/check-runs"

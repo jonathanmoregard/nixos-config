@@ -11,29 +11,26 @@ let
   allKeys = [ jonathan vm dellan ];
 
   # Subset of recipients for CI/CD secrets — restrict to dellan host
-  # key + jonathan's editing key. Excludes vm because the CI runner
-  # only runs on dellan; a leaked key on vm shouldn't auto-decrypt.
+  # key + jonathan's editing key. CI itself runs on GitHub-hosted
+  # runners and never decrypts these; only dellan's webhook + deploy
+  # unit consumes them.
   ciKeys = [ jonathan dellan ];
 in {
   # ---------------------------------------------------------------------
-  # CI/CD workflow secrets (round 7).
+  # CI/CD workflow secrets.
   #
   # File CONTENTS expected at decrypt time:
-  #   github-runner-token.age    — raw GitHub registration token
-  #                                (just the token string, no key=value)
-  #   actions-runner-ssh-key.age — raw OpenSSH private key (ed25519)
+  #   deploy-ssh-key.age         — raw OpenSSH private key (ed25519).
+  #                                Used by nixos-deploy.service to fetch
+  #                                origin/main from github.com.
   #   github-webhook-secret.age  — KEY=VALUE: WEBHOOK_SECRET=<hex>
   #                                (env-format because consumed via
   #                                 systemd EnvironmentFile)
   #   gh-janitor-token.age       — KEY=VALUE: GH_TOKEN=<pat>
-  #                                (env-format; future janitor cron)
+  #                                (env-format; janitor cron for stale
+  #                                 PR / branch / label cleanup)
   # ---------------------------------------------------------------------
-  "github-runner-token.age".publicKeys    = ciKeys;
-  "actions-runner-ssh-key.age".publicKeys = ciKeys;
-  "github-webhook-secret.age".publicKeys  = ciKeys;
-  "gh-janitor-token.age".publicKeys       = ciKeys;
-
-  # Attic RS256 token signing secret. Format expected:
-  #   ATTIC_SERVER_TOKEN_RS256_SECRET="<base64 of `openssl genrsa -traditional 4096`>"
-  "atticd-rs256-secret.age".publicKeys    = ciKeys;
+  "deploy-ssh-key.age".publicKeys        = ciKeys;
+  "github-webhook-secret.age".publicKeys = ciKeys;
+  "gh-janitor-token.age".publicKeys      = ciKeys;
 }

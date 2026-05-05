@@ -1,9 +1,20 @@
 # CI/CD-driven nixos-config workflow
 
-**Status:** design
-**Date:** 2026-05-04
+**Status:** design (partially superseded — see migration note below)
+**Date:** 2026-05-04 (original); migration note 2026-05-05
 **Scope:** dellan host only (mac-mini and vm flake entries removed; auto-discovery picks up future hosts)
 **Spec format:** umbrella with five orthogonal sub-specs (A–E), each independently extractable.
+
+> **Migration note (2026-05-05):** the sections marked `[OBSOLETE-2026-05-05]`
+> in this spec describe the original self-hosted-runner-on-dellan + Attic
+> binary cache architecture. That architecture has been replaced with
+> GitHub-hosted runners on `ubuntu-latest` (public repo = unlimited free
+> minutes), `wimpysworld/nothing-but-nix` for disk pressure,
+> `DeterminateSystems/determinate-nix-action` for the Nix install, and
+> `nix-community/cache-nix-action` for /nix/store caching between runs.
+> Webhook-driven `nixos-deploy.service` on dellan (Sub-spec B) is unchanged —
+> only the CI runner location moved off-box. See `.github/workflows/`
+> + the project `CLAUDE.md` for the canonical current state.
 
 ---
 
@@ -18,14 +29,14 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
 | Production scope | dellan only (now) | Mac-mini is aarch64-darwin placeholder, vm host being deleted; future hosts auto-discovered |
 | Auto-apply cadence | Continuous on every merge to `main` | Highest velocity; NixOS boot generations + classifier gating make rollback rare |
 | Auto-rollback | None — rely on NixOS generations + manual `nixos-rebuild switch --rollback` | Gate stack catches issues pre-merge; auto-rollback adds complexity without clear win |
-| CI host | Self-hosted GHA runner on dellan | Free for private repos, warm `/nix/store`, resource-scoped via systemd |
-| Cache | Attic (self-hosted nix binary cache) on dellan | Free, local, deduplicates across worktrees |
+| CI host | GitHub-hosted `ubuntu-latest` (post-migration; was self-hosted on dellan) | Public repo = unlimited free minutes; ephemeral runner per job; no secrets persisted on dellan |
+| Cache | `nix-community/cache-nix-action` for /nix/store + cache.nixos.org as substituter | 10 GB GHA cache per repo, GC-bounded; replaces self-hosted Attic |
 | Webhook ingress | Tailscale Funnel (already wired on dellan) | TLS-terminated public endpoint without NAT punching; secret in agenix |
-| Concurrent VM lanes | 3 (each: 2 cores × 4 GB → 6c / 12 GB total) | Fits dellan's 12c/32 GB with 6c/20 GB headroom for daily-driver work |
+| Concurrent VM lanes | 3 (matrix on GHA-hosted; each lane its own ephemeral runner) | KVM nested-virt available on `ubuntu-latest` since Feb 2023 |
 | Repo layout | `~/Repos/nixos-config` is **bare**; all work in `~/Repos/nixos-config-worktrees/<branch>`; `/etc/nixos` is a separate root-owned clone of `origin/main` | Bare repo enforces worktree-only workflow by construction |
 | Triggers | `pull_request` (open/sync) + `push: main` (merge). Branch pushes do NOT trigger CI. | Saves cycles; agents push WIP freely |
 | Classification | Derivation-graph blast radius via `nix store diff-closures` → rule table → bucket → GitHub label | Nix-native; deterministic; sees outcome not source |
-| Branch protection | GitHub Rulesets (per-rule bypass) — admins cannot direct-push to `main`, can bypass status checks via PR merge UI | Rulesets API permits per-rule bypass; legacy branch protection's `enforce_admins` is too coarse |
+| Branch protection | Legacy Branch Protection (free on public repos) — `required_approving_review_count: 1`, `enforce_admins: false`, `require_last_push_approval: true` | Solo-author admin override via UI's "Merge without waiting"; CLI `gh pr merge --admin` denied at safe-bash MCP layer |
 
 ---
 
@@ -76,13 +87,7 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
 
 ### Components
 
-1. **Self-hosted GHA runner** on dellan, registered to repo as `dellan-runner`. Declared as a system service (NOT a user unit) running as a dedicated NixOS-managed system user `actions-runner` (no shell, home `/var/lib/actions-runner`). System unit because GHA's runner needs predictable PATH, root-owned state directory, and survives without `linger`:
-   - `User=actions-runner`
-   - `Group=actions-runner`
-   - `CPUWeight=50` (yields to interactive work under contention)
-   - `MemoryHigh=20G` (caps RAM under pressure; CPUWeight only kicks in when the kernel detects contention — under low load the runner gets all available cores)
-   - `Slice=actions-runner.slice`
-   - Token stored in `secrets/github-runner-token.age`
+1. **CI runner [OBSOLETE-2026-05-05 — replaced by GHA-hosted].** Originally a self-hosted GHA runner on dellan registered as `dellan-runner` (system service, dedicated `actions-runner` user, CPUWeight=50, MemoryHigh=20G, slice-scoped). Migrated to GitHub-hosted `ubuntu-latest` runners — public repo = unlimited free minutes, ephemeral runner per job, no agenix master key or attic signing key persisted on dellan. Module `modules/nixos/actions-runner.nix` and secrets `secrets/github-runner-token.age` deleted.
 2. **Webhook ingress** via Tailscale Funnel — used **only** for production deploy. PR-triggered jobs do not need it (GHA self-hosted runners long-poll GitHub directly for queued work).
    - GitHub → `https://<machine>.<tailnet>.ts.net/webhook` → systemd socket-activated handler
    - **Implementation:** `pkgs.writers.writePython3Bin "github-webhook-handler"`. Reads request from stdin (socket-activated), writes response to stdout. Lives in `modules/nixos/github-webhook.nix`.
@@ -132,19 +137,9 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
    - The `pull_request_target` trigger runs with full repo permissions but checks out the base branch by default. PR-modified `scripts/classify-pr.sh` is NEVER executed here. The script identity is pinned by base checkout (option a above). Option b — `nix run github:jonathanmoregard/nixos-config/main#classify-pr -- "$BASE_SHA" "$HEAD_SHA"` — is documented as an alternative if pinning to a specific SHA is wanted later.
    - PR diff and PR body/comments are wrapped in `<untrusted_external_content>` before passing to the AI subagent (per global CLAUDE.md security rules).
    - This split is the standard GitHub Actions pattern for "validate untrusted PR contents from a trusted context"; documented in [GitHub Security Lab "Keeping your GitHub Actions and workflows secure" guidance](https://securitylab.github.com/research/github-actions-untrusted-input/).
-4. **Cache:** Attic server (`pkgs.attic-server`) as a NixOS systemd unit, listening on `localhost:8080`.
-   - **Trust model:** Attic generates a signing key on first start (`/var/lib/atticd/server.key`, `0400 root:root`). The matching public key is published to `flake.nix`'s `pkgsLinux.config.nix.settings.trusted-public-keys`. Substituter URL: `http://localhost:8080/<cache-name>`.
-   - **Bootstrap chicken-and-egg + multi-host:** the public key is generated on first start, so it can't be statically declared on first deploy. Bootstrap flow:
-     1. Initial deploy uses ONLY `cache.nixos.org` as substituter (Attic public key not yet known).
-     2. After first start of `atticd.service`, run `cat /var/lib/atticd/server.pub` and commit the value into `flake.nix`'s `trusted-public-keys` list.
-     3. Subsequent rebuilds enable Attic as a substituter alongside `cache.nixos.org`.
-     **Multi-host (forward-looking):** since each host runs its own Attic and generates its own key, `trusted-public-keys` must be a **list keyed by hostname** — not a single value. When mac-mini joins, its Attic public key is appended; the activation script checks list-membership of `/var/lib/atticd/server.pub` against the list, not equality. Per-host append-to-list flow is part of the bootstrap procedure run on each host's first deploy.
-     A NixOS module activation script enforces this by writing a marker file `/var/lib/atticd/.public-key-committed` only when the host's public key is in the `flake.nix` list; activation refuses to add the local Attic as a substituter until the marker exists.
-   - **Auth:** push tokens (one for the runner user, one for any human) live in agenix (`secrets/atticd-runner-token.age`, `secrets/atticd-jonathan-token.age`). Pull is open to anyone on localhost.
-   - **Fallback:** `cache.nixos.org` remains in the substituter list as a lower-priority fallback. Attic-only paths (e.g. `nixos-system-dellan`) are still re-buildable from source if Attic is down.
-   - **Port choice:** 8080 default; can collide with dev servers. Spec leaves overridable via `nixos.attic-server.port` module option.
-5. **Discover-hosts runner placement:** the matrix-emitter step runs on `[self-hosted, x86_64-linux]` (NOT GitHub-hosted) so the eval has a warm `/nix/store`. Cold eval on GitHub-hosted runner would refetch nixpkgs and lose the eval-cost win.
-6. **Lane oversubscription policy:** GHA `concurrency: { group: vm-lane-${lane}, cancel-in-progress: false }` so a new push to the same PR does NOT cancel the running lane's job (we want test results to complete). A separate PR-level `concurrency: { group: pr-${pr_number}, cancel-in-progress: true }` outer block cancels superseded SHAs, so resyncing a PR doesn't pile up runs. Janitor cron (daily) cancels jobs older than 30min via `gh run cancel`.
+4. **Cache [OBSOLETE-2026-05-05 — replaced by cache-nix-action + cache.nixos.org].** Originally a self-hosted Attic server (`pkgs.attic-server`) on dellan localhost:8080 with multi-host signing-key bootstrap and per-host trusted-public-keys list. Migrated to `nix-community/cache-nix-action@v6` (GHA-side /nix/store cache, ~10 GB per repo, GC-bounded between runs) plus `cache.nixos.org` as the upstream substituter. Module `modules/nixos/atticd.nix` and secret `secrets/atticd-rs256-secret.age` deleted.
+5. **Discover-hosts runner placement [OBSOLETE-2026-05-05].** Original concern was warm `/nix/store` eval cost on a self-hosted runner. With GHA-hosted runners cold-starting per job, eval time is recovered via `cache-nix-action` keyed on `hashFiles('**/*.nix', '**/flake.lock')` — incremental between runs.
+6. **Lane oversubscription policy:** `strategy.max-parallel: 3` on the `vm-minimal` matrix; each lane is its own ephemeral GHA-hosted runner. PR-level `concurrency: { group: pr-${pr_number}, cancel-in-progress: true }` cancels superseded SHAs so resyncing doesn't pile runs. Janitor cron (daily) on dellan cancels jobs older than 30min via `gh run cancel` (uses `secrets/gh-janitor-token.age`).
 7. **Failure handling:** workflow failures post failed status to the PR via standard GHA. No special recovery; the user / agent fixes the branch and pushes again. Post-merge `push: main` workflow failures: deploy is gated on the workflow status check, so a broken `main` doesn't auto-deploy (separate from the deploy-loop poisoning protection in B).
 
 ---
@@ -592,12 +587,11 @@ Extends `nodes.dellan` block in `tests/dellan-vm.nix` (or splits into `tests/del
 
 | File | Used by | Purpose |
 |---|---|---|
-| `secrets/github-runner-token.age` | `actions-runner.service` (A.1) | Authenticates the self-hosted runner to GitHub |
 | `secrets/github-webhook-secret.age` | `github-webhook.service` (A.2 / B.3) | HMAC verifies incoming webhooks |
-| `secrets/atticd-runner-token.age` | runner pushes to Attic (A.4) | Authenticates `attic push` from CI |
-| `secrets/atticd-jonathan-token.age` | dev-shell pushes to Attic (A.4) | Authenticates manual `attic push` from worktrees |
-| `secrets/actions-runner-ssh-key.age` | runner cloning private repos (A.1, D.1) | SSH key for `actions-runner` to fetch private nixos-config + flake inputs from GitHub. Mounted at `/var/lib/actions-runner/.ssh/id_ed25519` mode 0400. Public key registered in GitHub Deploy Keys for the repo. |
+| `secrets/deploy-ssh-key.age` | `nixos-deploy.service` (B) | SSH key the deploy unit uses to `git fetch origin main`. Public key registered in GitHub Deploy Keys for the repo. |
 | `secrets/gh-janitor-token.age` | janitor cron `gh run cancel` (A.6) | Personal Access Token (or fine-grained app token) with `actions:write` scope to cancel stale jobs. Mounted as `EnvironmentFile=` (KEY=VALUE format: `GH_TOKEN=ghp_...`) on the timer-triggered cleanup unit. |
+
+[OBSOLETE-2026-05-05] removed entries: `github-runner-token.age` (no self-hosted runner), `actions-runner-ssh-key.age` (renamed to `deploy-ssh-key.age` after the runner moved to GHA-hosted), `atticd-runner-token.age` + `atticd-jonathan-token.age` + `atticd-rs256-secret.age` (no Attic).
 
 All keys must be added to `secrets/secrets.nix` `allKeys` list. CI keys are runner-host-bound (`age.secrets.<name>.publicKeys = [ jonathanKey dellanHostKey ];`) so a leaked key from one workstation doesn't auto-decrypt on other machines.
 
@@ -632,8 +626,8 @@ All keys must be added to `secrets/secrets.nix` `allKeys` list. CI keys are runn
 
 Each step is annotated `[auto]` (Claude can do start-to-finish in one autonomous session), `[human]` (needs a token registration, GitHub UI step, or one-time interactive bootstrap), or `[human-checkpoint]` (an autonomous run must STOP here and wait for explicit user confirmation before proceeding). Reordered to put Rulesets activation AFTER the workflow has produced its first green run on `main`, preventing lockout.
 
-1. **A.1** Self-hosted runner registered + resource-scoped — `[human]` (GitHub registration token must be retrieved interactively from `Settings → Actions → Runners → New self-hosted runner`; secret then committed via agenix)
-2. **A.2** Attic cache running locally — `[auto]` (NixOS module + first activation; pub-key bootstrap noted)
+1. **A.1 [OBSOLETE-2026-05-05]** Self-hosted runner. Replaced by GHA-hosted runners on `ubuntu-latest` declared directly in `.github/workflows/ci.yml` + `gate.yml`. No registration token, no agenix entry.
+2. **A.2 [OBSOLETE-2026-05-05]** Attic cache. Replaced by `nix-community/cache-nix-action@v6` per workflow + `cache.nixos.org` upstream. No NixOS module, no pub-key bootstrap.
 3. **A.3 (`ci.yml` only first)** Skeleton workflow with `eval` + `build` + existing VM-minimal — `[auto]`
 4. **(Bootstrap snapshot before destructive steps)** `sudo cp -a /etc/nixos /etc/nixos.bak.$(date +%s)` — `[auto]`. Documented recovery: `sudo rm -rf /etc/nixos && sudo mv /etc/nixos.bak.<timestamp> /etc/nixos`.
 5. **C.1** Bare-repo conversion + worktree directory — `[human]` (destructive on `~/Repos/nixos-config`; pre-flight asserts no unpushed work, but operator should review before running). On failure: pre-flight refuses; on partial success without B-bootstrap, recover via step 4's snapshot.
