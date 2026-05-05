@@ -43,7 +43,7 @@ PKG_HIGH=$(read_rule packages high)
 SECRET_HIGH=$(read_rule secrets high)
 ETC_HIGH=$(read_rule etcPaths high)
 ETC_CRIT=$(read_rule etcPaths critical)
-SRC_TRIVIAL=$(read_rule sourceTree trivial)
+SRC_HIGH=$(read_rule sourceTree high)
 
 bucket_rank() {
   case "$1" in
@@ -140,20 +140,18 @@ while IFS= read -r line; do
 done < "$WORK/etc-paths.diff"
 
 # Source 3: source-tree paths
-SRC_NONTRIVIAL=0
+# Order: high (upgrade) → trivial (suppress) → fall-through to closure-based scoring.
 while IFS= read -r p; do
   [ -z "$p" ] && continue
-  trivial_match=0
+  matched=0
+
   while IFS= read -r rule; do
     [ -z "$rule" ] && continue
-    if [[ "$p" == "$rule"* ]]; then trivial_match=1; break; fi
-  done <<< "$SRC_TRIVIAL"
-  [ "$trivial_match" = 0 ] && SRC_NONTRIVIAL=1
-done < "$WORK/source-paths.txt"
+    if [[ "$p" == "$rule"* ]]; then upgrade_to HIGH; matched=1; break; fi
+  done <<< "$SRC_HIGH"
+  [ "$matched" = 1 ] && continue
 
-# Source-only-trivial AND no closure delta = TRIVIAL (fallback)
-if [ "$RISK" = "TRIVIAL" ] && [ "$SRC_NONTRIVIAL" = 0 ]; then
-  : # stay TRIVIAL
-fi
+  # trivial paths just don't contribute (no upgrade)
+done < "$WORK/source-paths.txt"
 
 echo "$RISK"

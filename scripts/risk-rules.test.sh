@@ -161,6 +161,66 @@ run_case \
   ""
 
 # -------------------------------------------------------------------------
+# Source 3: source-tree HIGH upgrades (CI/policy files with no closure
+# impact). These are the blind-spot paths Sources 1+2 cannot see.
+# -------------------------------------------------------------------------
+
+run_case \
+  ".github/workflows/ci.yml change → HIGH (gate workflow)" \
+  "" "" ".github/workflows/ci.yml\n" \
+  "HIGH"
+
+run_case \
+  ".github/workflows/gate.yml change → HIGH (trusted gate)" \
+  "" "" ".github/workflows/gate.yml\n" \
+  "HIGH"
+
+run_case \
+  "scripts/bootstrap-branch-protection.sh change → HIGH (merge-gate policy)" \
+  "" "" "scripts/bootstrap-branch-protection.sh\n" \
+  "HIGH"
+
+run_case \
+  "scripts/classify-pr.sh change → HIGH (classifier itself)" \
+  "" "" "scripts/classify-pr.sh\n" \
+  "HIGH"
+
+run_case \
+  "scripts/risk-rules.nix change → HIGH (rule table)" \
+  "" "" "scripts/risk-rules.nix\n" \
+  "HIGH"
+
+run_case \
+  "scripts/install.sh change → HIGH (security-sensitive bootstrap)" \
+  "" "" "scripts/install.sh\n" \
+  "HIGH"
+
+run_case \
+  "scripts/mint-drift-agent.sh change → TRIVIAL (no rule, no closure delta)" \
+  "" "" "scripts/mint-drift-agent.sh\n" \
+  "TRIVIAL"
+
+run_case \
+  "home/foo.nix touched but no closure delta → TRIVIAL (fall-through)" \
+  "" "" "home/foo.nix\n" \
+  "TRIVIAL"
+
+run_case \
+  ".github/workflows/x.yml + openssh bump → HIGH (HIGH max wins, both are HIGH)" \
+  "openssh: 9.0 → 9.1\n" "" ".github/workflows/x.yml\n" \
+  "HIGH"
+
+run_case \
+  ".github/workflows/x.yml + linux bump → CRITICAL (linux outranks HIGH)" \
+  "linux: 6.1 → 6.2\n" "" ".github/workflows/x.yml\n" \
+  "CRITICAL"
+
+run_case \
+  "docs-only with sourceTree HIGH path absent → TRIVIAL" \
+  "" "" "docs/foo.md\n" \
+  "TRIVIAL"
+
+# -------------------------------------------------------------------------
 # Summary
 # -------------------------------------------------------------------------
 
