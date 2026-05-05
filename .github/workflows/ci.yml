@@ -74,15 +74,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
       - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
-      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
+      - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
-          primary-key: nix-${{ runner.os }}-dellan-${{ github.ref }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-dellan-refs/heads/main-
-          gc-max-store-size-linux: 5G
-          purge: true
-          purge-prefixes: nix-${{ runner.os }}-dellan-
-          purge-last-accessed: 86400
-          purge-primary-key: never
+          name: jonathanmoregard-nixos-config
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - run: |
           nix build .#nixosConfigurations.dellan.config.system.build.toplevel \
             --no-link --print-build-logs --keep-going
@@ -98,12 +93,15 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
       - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
-      # No cache-nix-action: the dellan-vm test closure (~8-12 GB) is
-      # too large for GHA's 10 GB-per-repo cache cap. The post-step
-      # save fails silently and marks the job as failed even when the
-      # build succeeds. cache.nixos.org provides upstream substitution
-      # for the heavy lifting; the local rebuild on cold start is
-      # acceptable for the once-per-PR vm-minimal lane.
+      # cachix substitutes the dellan toplevel + dependencies built by
+      # the build-dellan job above, so vm-minimal pulls binaries instead
+      # of rebuilding from source. This replaces cache-nix-action which
+      # we previously dropped due to GHA's 10 GB cache cap conflicting
+      # with the ~8-12 GB closure size.
+      - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+        with:
+          name: jonathanmoregard-nixos-config
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - name: Verify KVM
         run: |
           test "${DETERMINATE_NIX_KVM:-}" = "1" || { echo "KVM not available"; exit 1; }
