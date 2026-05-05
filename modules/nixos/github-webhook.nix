@@ -203,11 +203,15 @@ in
       socketConfig = {
         Accept = true;
         MaxConnections = 4;
-        # Rate limit: 10 new connections per 10s, then queue.
-        # GH retries failed webhooks 3x with exp backoff over ~30s — burst=10
-        # absorbs retry waves without dropping legitimate deliveries.
+        # Rate limit: 30 new connections per 10s, then queue.
+        # 10/10s was too tight in practice — GH retries failed webhooks 3x
+        # with exp backoff, plus test deliveries + multiple events per
+        # merge stack up and trip the limit, after which systemd refuses
+        # all further activations until the socket is manually restarted.
+        # 30/10s absorbs realistic retry storms without false-positive
+        # lockouts; MaxConnections=4 still caps in-flight workers.
         TriggerLimitIntervalSec = 10;
-        TriggerLimitBurst = 10;
+        TriggerLimitBurst = 30;
       };
       wantedBy = [ "sockets.target" ];
     };
