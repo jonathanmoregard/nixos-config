@@ -61,7 +61,10 @@ jobs:
           purge-prefixes: nix-${{ runner.os }}-eval-
           purge-last-accessed: 86400
           purge-primary-key: never
-      - run: nix flake check --no-build --all-systems
+      # No --all-systems: darwinConfigurations.mac-mini is a placeholder
+      # (no users.users.jonathan declared, home.homeDirectory hardcoded
+      # for Linux). Re-enable once mac-mini's actual config lands.
+      - run: nix flake check --no-build
 
   build-dellan:
     name: build dellan toplevel
