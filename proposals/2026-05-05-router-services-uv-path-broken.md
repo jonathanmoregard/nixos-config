@@ -62,6 +62,33 @@ journalctl --user -u router-ingestor.service --since '5 minutes ago' --no-pager 
 journalctl --user -u router-worker.service --since '5 minutes ago' --no-pager | tail
 ```
 
+### Prerequisite — runtime state directories
+
+The systemd units also reference these absolute paths (lines 64/80/93/95):
+
+```
+WorkingDirectory = "/home/jonathan/.local/share/router-agent";
+ExecStart = "... >> /home/jonathan/.local/state/router/audit/ingestor-cron.log ...";
+```
+
+If dellan's rsync from Mint didn't bring these across, fixing the `uv` path will only swap the EXEC failure for a `chdir` failure or a shell-redirect "no such file or directory". Verify both exist before committing the rebuild:
+
+```bash
+ssh dellan 'ls -d /home/jonathan/.local/share/router-agent /home/jonathan/.local/state/router/audit 2>&1'
+```
+
+If either is missing, either:
+- Re-rsync from the `mint-backup-2026-05-05/` snapshot:
+  `rsync -a /home/jonathan/mint-backup-2026-05-05/.local/share/router-agent/ ~/.local/share/router-agent/`
+  (and similar for state/router).
+- Or declaratively pre-create via a `home.activation` block:
+  ```nix
+  home.activation.routerStateDirs = lib.hm.dag.entryAfter ["writeBoundary"] ''
+    mkdir -p "$HOME/.local/share/router-agent" "$HOME/.local/state/router/audit"
+  '';
+  ```
+  Empty dirs let the services start; the project's own bootstrap then populates them.
+
 ### Notes
 - The router project lives at `~/.local/share/router-agent` per the
   comment at `home/router-services.nix:3`. `uv run` will pick up the
