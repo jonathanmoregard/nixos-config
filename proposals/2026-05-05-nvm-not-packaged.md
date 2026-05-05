@@ -18,66 +18,68 @@ home.file.".huskyrc".text = ''
 '';
 ```
 
-On Mint, `~/.nvm/nvm.sh` exists (installed via `curl ... | bash`). On dellan, it doesn't — the `[ -s ... ]` guard silently no-ops, and husky pre-commit hooks across every JS repo fall through to whatever `node` is on PATH (currently `nodejs_22` from `home.packages`).
+On Mint, `~/.nvm/nvm.sh` was installed via `curl ... | bash`. On dellan, it doesn't exist; the `[ -s ... ]` guard silently no-ops, and husky pre-commit hooks fall through to whatever `node` is on PATH (currently `nodejs_22` from `home.packages`).
 
-`CLAUDE.md` line 96 already documents this gap:
+CLAUDE.md line 96 documents the gap and recommends `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash`. **That recommendation conflicts with the project's own security policy** in CLAUDE.md "Web access" section (no curl/wget outside the research-agent). Pulling installers via curl-pipe-bash inside a `home.activation` block also breaks flake hygiene — every other web fetch in this flake (`cloneRepos`) uses `${pkgs.git}/bin/git clone`, never raw curl.
 
-> **`~/.huskyrc`**: declared in `home/jonathan.nix` (loads nvm for husky pre-commit hooks). NVM itself is not declared in this flake — install via `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash` if needed.
+### Recommendation: drop nvm entirely
 
-**The risk:** dellan currently silently runs husky hooks against `nodejs_22` even when a repo's `package.json#engines.node` (or `.nvmrc`) demands a different version. If any repo claude-code regularly opens has a strict node-version pin, hooks break in subtle ways.
+The .huskyrc fallback exists so husky can find a node version pinned in a repo's `.nvmrc`. But:
+- `nodejs_22` is in `home.packages` — `node` and `npm` are on PATH.
+- No repo claude-code regularly opens has a `.nvmrc` pinning a non-22 version (verified: `find ~/Repos -maxdepth 2 -name '.nvmrc' 2>/dev/null` returns 0 hits on Mint).
+- husky just needs **some** node binary; the version pinning was a Mint-era artifact.
 
-### Three approaches
+### Fix — Option A (recommended): delete the husky/nvm shim
 
-**A. Imperative install (CLAUDE.md status quo).** Run the curl install once on dellan post-bootstrap. Drift detector won't flag missing nvm because it's user-installed under `~/.nvm`. Pro: zero flake change. Con: imperative, lost on `rm -rf ~/.nvm`.
-
-**B. Declarative via `home.activation.installNvm`.** Add to `home/jonathan-linux.nix`:
+Edit `home/jonathan.nix`:
 
 ```nix
+# Delete this entire block:
+home.file.".huskyrc".text = ''
+  # Load nvm for husky hooks
+  export NVM_DIR="$HOME/.nvm"
+  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+'';
+```
+
+Edit `CLAUDE.md` "Known gaps" section: remove the `~/.huskyrc` bullet pointing at the nvm install command.
+
+### Fix — Option B (fallback if some repo *does* need a non-22 node)
+
+If a future repo pins a different node version, package nvm via `pkgs.fetchFromGitHub` instead of curl-pipe-bash:
+
+```nix
+# home/jonathan-linux.nix
+let
+  nvm = pkgs.fetchFromGitHub {
+    owner = "nvm-sh";
+    repo = "nvm";
+    rev = "v0.40.1";
+    hash = "sha256-...";  # nix-prefetch-url it once
+  };
+in
 home.activation.installNvm = lib.hm.dag.entryAfter ["writeBoundary"] ''
-  if [ ! -s "$HOME/.nvm/nvm.sh" ]; then
-    PROFILE=/dev/null ${pkgs.bash}/bin/bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash' || true
+  if [ ! -d "$HOME/.nvm" ]; then
+    mkdir -p "$HOME/.nvm"
+    cp -r ${nvm}/. "$HOME/.nvm/"
+    chmod -R u+w "$HOME/.nvm"
   fi
 '';
 ```
 
-Idempotent. Captures the install in the flake. Soft-fails offline. Caveat: each `home-manager switch` re-checks; an outdated `~/.nvm` won't auto-upgrade.
+No network during activation. Pinned hash. Reproducible.
 
-**C. Drop nvm, package node versions via flake overlays.** Replace nvm with a per-repo `direnv` + `flake.nix` declaring the node version. Pro: fully declarative, no nvm runtime. Con: requires per-repo flake.nix, breaks compatibility with non-nix users of those repos.
-
-### Recommendation
-
-**B.** Activation script is the smallest declarative win. C is overkill while you also use these repos from non-nix machines (Mac mini incoming).
-
-### Fix (Option B)
-
-```nix
-# home/jonathan-linux.nix — add to existing activation block, OR new entry:
-
-home.activation.installNvm = lib.hm.dag.entryAfter ["writeBoundary"] ''
-  # nvm is referenced by ~/.huskyrc for husky pre-commit hooks. Idempotent
-  # install — only runs the network-fetching shell when ~/.nvm/nvm.sh
-  # is missing. Soft-fails (|| true) so no network = no rebuild break.
-  if [ ! -s "$HOME/.nvm/nvm.sh" ]; then
-    PROFILE=/dev/null ${pkgs.bash}/bin/bash -c '${pkgs.curl}/bin/curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash' 2>/dev/null || true
-  fi
-'';
-```
-
-### Verify
+### Verify (Option A)
 
 ```bash
 sudo nixos-rebuild switch --flake /etc/nixos#dellan
-ls -la ~/.nvm/nvm.sh
-# Expect: a regular file ~150KB
-# Test husky hook indirectly:
-cd ~/Repos/voquill   # or any JS repo with husky
+ls ~/.huskyrc
+# expect: ENOENT (HM removed it)
+cd ~/Repos/voquill   # or any JS repo
 git commit --allow-empty -m "test husky" 2>&1 | head
-# Expect: no "nvm: command not found", no missing-node errors
+# expect: husky hooks run with nodejs_22 successfully, no errors
 ```
 
 ### Notes
-- nvm version pin `v0.40.1` matches what's on Mint and what CLAUDE.md
-  already documents. Bump together if upgrading.
-- `PROFILE=/dev/null` prevents the installer from appending to
-  `~/.bashrc` / `~/.zshrc` (those are HM-managed; appending breaks
-  reproducibility).
+- If Option B is chosen, run `nix-prefetch-github nvm-sh nvm v0.40.1`
+  on dellan to get the SHA256 hash before committing.

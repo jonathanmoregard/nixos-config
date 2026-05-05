@@ -1,13 +1,13 @@
 ---
-status: proposed
+status: done
 category: feature
 subcategory: build
 date: 2026-05-05
 source: advice-refine-loop
-depends_on: 2026-05-05-voquill-nix-ld-libs-needed.md
+done_evidence: ~/Repos/voquill/apps/desktop/src-tauri/target/release/Voquill (local) — 53 MB ELF, mtime 2026-05-04 13:30, dellan-built. Currently running via systemd.user.services.voquill (home/router-services.nix:126-138). Verified pgrep on dellan 2026-05-05.
 ---
 
-## Replace rsync'd Mint-built Voquill binary with dellan-built one
+## DONE — Voquill is already dellan-built and running
 
 Currently the Voquill executable at `~/Repos/voquill/apps/desktop/src-tauri/target/debug/Voquill` was rsync'd from Mint host on 2026-05-05 and is a 580 MB debug binary linked against Mint glibc + system libs. Even with the right nix-ld closure (sister proposal), this is a non-reproducible artifact: future `cargo build` runs can't reuse it (different host paths), `git clean -fdx` would delete it irrecoverably, and any Voquill code change requires the Mint-only-toolchain assumption to hold.
 

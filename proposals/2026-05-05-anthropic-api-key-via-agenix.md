@@ -16,7 +16,7 @@ honeypot probe returned ok=False (honeypot:honeypot_unavailable:
 conversation_history_leak:unavailable:no-anthropic-api-key)
 ```
 
-The MCP wrapper at `modules/nixos/research-agent.nix` *also* reads the key (line 15: `ANTHROPIC_API_KEY=$(cat ${secretPath})`), referencing `config.age.secrets.anthropic-api-key.path` — but the `.age` file isn't encrypted yet, so dellan rebuild fails with `error: Path 'secrets/anthropic-api-key.age' does not exist in Git repository "/etc/nixos"`.
+The key is currently set nowhere on dellan: `systemctl --user show-environment | grep ANTHROPIC` is empty, `~/.claude/.credentials.json` only has `claudeAiOauth` (the claude.ai web-OAuth bearer), and no `EnvironmentFile=` is wired into the systemd user unit.
 
 ### Status of agenix wiring
 
@@ -96,9 +96,12 @@ journalctl --user -u claude-cl-sync.service -n 5 --no-pager
 ```
 
 ### Notes
-- Same `.age` file works for `research-agent.nix` (already references
-  `config.age.secrets.anthropic-api-key.path`).
 - API key currently NOT in any captured rsync from Mint — must be
   obtained fresh from https://console.anthropic.com/settings/keys.
 - Once added, `claude-sandbox-proxy.service` is unaffected (doesn't
   need the key); `gh-token.service` already works.
+- Future `research-agent` MCP wrapper (if added under
+  `modules/nixos/research-agent.nix`) can reuse the same secret —
+  just declare another `EnvironmentFile=/run/agenix/anthropic-api-key`.
+  No such module exists today, so the .age file's only consumer is
+  cl-sync.
