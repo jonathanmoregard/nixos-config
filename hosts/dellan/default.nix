@@ -8,10 +8,9 @@
 
     # CI/CD workflow modules. CI itself runs on GitHub-hosted runners
     # (ubuntu-latest); see .github/workflows/. The modules below cover
-    # only the pieces that MUST live on dellan: webhook ingress and the
-    # deploy-on-push systemd unit.
-    ../../modules/nixos/github-webhook.nix
-    ../../modules/nixos/nixos-deploy.nix
+    # only the pieces that MUST live on dellan: pull-based deploy +
+    # webhook latency optimization.
+    ../../modules/nixos/nixos-auto-deploy.nix
     ../../modules/nixos/build-coordination.nix
     ../../modules/nixos/ci-state.nix
     ../../modules/nixos/claude-agent-users.nix
@@ -31,14 +30,13 @@
 
   services.buildCoordination.enable = true;   # nix max-jobs/cores caps
 
-  services.githubWebhook = {                  # Webhook ingress
-    enable = true;
-    secretFile = config.age.secrets.github-webhook-secret.path;
-  };
-
-  services.nixosDeploy = {                    # Auto-deploy on push:main
+  services.nixos-auto-deploy = {              # Pull-based deploy + webhook
     enable = true;
     sshKeyFile = config.age.secrets.deploy-ssh-key.path;
+    webhook = {
+      enable = true;
+      secretFile = config.age.secrets.github-webhook-secret.path;
+    };
   };
 
   services.claudeAgentUsers.enable = true;    # claude-agent-N users
