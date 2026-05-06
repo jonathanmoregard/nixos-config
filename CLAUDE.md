@@ -183,3 +183,5 @@ Use it as a read-only reference when porting drift proposals — every "live Min
 - **`~/.claude` repo**: NOT auto-cloned. Claude Code populates `~/.claude` with runtime state (backups, projects, sessions, cache) on first run, and the [.claude repo](https://github.com/jonathanmoregard/.claude.git) needs to coexist with that. Bootstrap: move runtime dirs aside, `git clone git@github.com:jonathanmoregard/.claude.git ~/.claude`, move dirs back in, then `cd ~/.claude && git submodule update --init --recursive`.
 - **Beeper**: installed via nixpkgs (unfree, allowed). Requires account login on first run. nixpkgs version lags upstream — see `overlays/beeper.nix` for version bump.
 - **`~/.huskyrc`**: declared in `home/jonathan.nix` (loads nvm for husky pre-commit hooks). NVM itself is not declared in this flake — install via `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash` if needed.
+
+<!-- e2e smoke test 2026-05-05 -->
