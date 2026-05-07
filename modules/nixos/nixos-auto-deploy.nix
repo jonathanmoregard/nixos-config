@@ -41,16 +41,29 @@ let
         exit 1
       fi
 
-      # Read the current generation's automated-deploy tag.
-      # /run/current-system/nixos-version is "version (codename) tag1 tag2...".
-      current_tag=$(grep -oE 'automated-deploy-[0-9a-f]+' \
-        /run/current-system/nixos-version | head -1 || true)
+      # Halt-on-human-touch via sidecar provenance file.
+      # `nixos-rebuild` doesn't accept a --tag flag (research-Claude
+      # extrapolated incorrectly), and templating system.nixos.tags into
+      # the flake per-build is gnarly. Sidecar file is the pragmatic path.
+      #
+      # Invariant: after a successful auto-deploy, last-deployed-sha
+      # records the SHA we switched to AND the resulting toplevel store
+      # path. On each run, if /run/current-system's toplevel doesn't
+      # match the recorded one, a human switched the system between runs
+      # (manual rebuild or rollback). Halt until cleared.
+      current_toplevel=$(readlink -f /run/current-system)
+      recorded_toplevel=$(awk 'NR==2 {print}' "$STATE/last-deployed-sha" 2>/dev/null || true)
 
-      if [ -z "$current_tag" ] && [ -e "$STATE/has-deployed" ]; then
-        echo "current generation lacks automated-deploy tag; halting"
+      if [ -e "$STATE/has-deployed" ] && [ "$current_toplevel" != "$recorded_toplevel" ]; then
+        echo "current generation does not match last auto-deploy; halting"
+        echo "  current  : $current_toplevel"
+        echo "  recorded : $recorded_toplevel"
         echo "  (manual rebuild or rollback detected; refusing to fight a human)"
-        echo "  to override: run a manual deploy with --tag automated-deploy-<sha>"
-        echo "  or: sudo touch $STATE/manual-hold && sudo rm $STATE/manual-hold"
+        echo "  to override: run a manual deploy via this service"
+        echo "    sudo systemctl start nixos-deploy.service  (no — reads stale state)"
+        echo "  or: clear by hand:"
+        echo "    sudo rm $STATE/last-deployed-sha $STATE/has-deployed"
+        echo "    then sudo systemctl start nixos-deploy.service"
         exit 1
       fi
 
@@ -82,8 +95,8 @@ let
       fi
 
       # Step 6: idempotency.
-      current_sha="''${current_tag#automated-deploy-}"
-      if [ -n "$current_sha" ] && [ "$target_sha" = "$current_sha" ]; then
+      recorded_sha=$(awk 'NR==1 {print}' "$STATE/last-deployed-sha" 2>/dev/null || true)
+      if [ -n "$recorded_sha" ] && [ "$target_sha" = "$recorded_sha" ]; then
         echo "already at $target_sha; no-op"
         exit 0
       fi
@@ -91,10 +104,14 @@ let
       # Step 7: deploy.
       echo "deploying $target_sha"
       git reset --hard "$target_sha"
-      if nixos-rebuild switch --flake ".#${cfg.flakeAttr}" \
-                              --tag "automated-deploy-$target_sha"; then
+      if nixos-rebuild switch --flake ".#${cfg.flakeAttr}"; then
+        # Record both the SHA and the resulting toplevel store path.
+        # On the next run, if /run/current-system's toplevel doesn't
+        # match this recorded path, we know a human touched it.
+        new_toplevel=$(readlink -f /run/current-system)
+        printf '%s\n%s\n' "$target_sha" "$new_toplevel" > "$STATE/last-deployed-sha"
         touch "$STATE/has-deployed"
-        echo "deploy success: $target_sha"
+        echo "deploy success: $target_sha ($new_toplevel)"
         exit 0
       else
         echo "$target_sha" >> "$STATE/poison-latch"
