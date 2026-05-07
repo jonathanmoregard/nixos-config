@@ -21,6 +21,13 @@
       ExecStart = "%h/.claude/dev-container/.venv/bin/python3 %h/.claude/dev-container/bin/claude-cl-sync";
       Nice = 10;
       Environment = "PYTHONDONTWRITEBYTECODE=1";
+      # ANTHROPIC_API_KEY + OPENAI_API_KEY env-format files, decrypted
+      # at activation. The injection-scanner honeypot probes Anthropic
+      # + OpenAI on every cl-sync tick; smoke fails-closed without these.
+      EnvironmentFile = [
+        "/run/agenix/anthropic-api-key"
+        "/run/agenix/openai-api-key"
+      ];
 
       # Hardening
       NoNewPrivileges = "yes";

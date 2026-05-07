@@ -11,6 +11,7 @@
     ./router-services.nix
     ./claude-services.nix
     ./claude-skills.nix
+    ./research-agent-mcp.nix
   ];
 
   # User crontab — declarative source of truth. Re-applied on every rebuild

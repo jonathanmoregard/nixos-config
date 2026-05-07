@@ -25,6 +25,23 @@
   age.secrets.github-webhook-secret.file = ../../secrets/github-webhook-secret.age;
   age.secrets.gh-janitor-token.file      = ../../secrets/gh-janitor-token.age;
 
+  # LLM provider API keys consumed by claude-cl-sync.service and the
+  # research-agent-mcp wrapper. Both load via env-format file (KEY=value
+  # per line). owner=jonathan + mode=0400 because the consumers run as
+  # the user, not root.
+  age.secrets.anthropic-api-key = {
+    file = ../../secrets/anthropic-api-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.openai-api-key = {
+    file = ../../secrets/openai-api-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   # ---------------------------------------------------------------------
   # CI/CD workflow — service options.
   # ---------------------------------------------------------------------
