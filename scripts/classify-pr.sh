@@ -5,8 +5,21 @@
 # script loaded from the BASE checkout, never from the PR branch.
 #
 # Inputs (env):
-#   BASE_SHA  - SHA of the merge base on origin/main
+#   BASE_SHA  - SHA of base branch tip when the workflow fired
 #   HEAD_SHA  - SHA of the PR head
+#
+# We compare HEAD against the merge-base (`git merge-base BASE HEAD`),
+# NOT against BASE_SHA directly. Reason: when a PR is branched from an
+# older main and main advances before classification runs, BASE_SHA is
+# the *current* main tip and `BASE_SHA..HEAD_SHA` includes the inverse
+# of every intermediate merge — the classifier then sees the PR as
+# "reverting" everything that landed in between. Merge-base is the
+# actual fork point, so the diff reflects only what THIS PR introduces.
+#
+# Caveat: this misses post-merge regressions caused by interaction
+# between the PR's diff and intermediate merges. Acceptable for the
+# linear-history solo-dev workflow; revisit if multi-author parallel
+# branches become common.
 #
 # Outputs:
 #   stdout: a markdown summary of per-source contributions
@@ -27,6 +40,15 @@ WORK="${WORK:-/tmp/classify-pr-$$}"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
 
+# Compare against the actual fork point, not the current base tip.
+# Falls back to BASE_SHA if merge-base lookup fails (shouldn't happen
+# in normal PR flow, but be defensive — fail-closed by treating BASE
+# as the comparison point preserves prior behavior).
+MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
+if [ "$MERGE_BASE" != "$BASE_SHA" ]; then
+  echo "note: comparing against merge-base $MERGE_BASE (PR branched from older main than current $BASE_SHA)" >&2
+fi
+
 # --- Build both system.build.toplevel derivations ----------------------
 
 build_toplevel() {
@@ -37,7 +59,7 @@ build_toplevel() {
   echo "$out"
 }
 
-BASE_TOPLEVEL=$(build_toplevel "$BASE_SHA")
+BASE_TOPLEVEL=$(build_toplevel "$MERGE_BASE")
 HEAD_TOPLEVEL=$(build_toplevel "$HEAD_SHA")
 
 # --- Source 1: package-set delta ---------------------------------------
@@ -62,7 +84,7 @@ fi
 
 # --- Source 3: source-tree delta ---------------------------------------
 
-git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$WORK/source-paths.txt" || {
+git diff --name-only "$MERGE_BASE" "$HEAD_SHA" > "$WORK/source-paths.txt" || {
   : > "$WORK/source-paths.txt"
 }
 
