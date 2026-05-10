@@ -7,6 +7,23 @@
 # GitHub App private key, homunculus, container-staging). On a fresh install
 # the units will fail at first tick until that scaffolding is set up
 # separately.
+let
+  # claude-cl-sync's injection-scanner honeypot probes Anthropic + OpenAI
+  # on every tick. systemd's `EnvironmentFile=` expects KEY=VALUE format,
+  # but our agenix `.age` files contain the raw key value only (no
+  # `ANTHROPIC_API_KEY=` prefix). Read the raw bytes with `$(< file)`
+  # (strips trailing newline) and export before execing the real entry.
+  claude-cl-sync-wrap = pkgs.writeShellApplication {
+    name = "claude-cl-sync-wrap";
+    text = ''
+      ANTHROPIC_API_KEY=$(< /run/agenix/anthropic-api-key)
+      OPENAI_API_KEY=$(< /run/agenix/openai-api-key)
+      export ANTHROPIC_API_KEY OPENAI_API_KEY
+      exec "$HOME/.claude/dev-container/.venv/bin/python3" \
+           "$HOME/.claude/dev-container/bin/claude-cl-sync"
+    '';
+  };
+in
 {
   # claude-cl-sync — vet container-captured CL-v2 observations and merge to
   # host homunculus. Pulls latest scanner from origin/main on every tick.
@@ -18,16 +35,13 @@
     Service = {
       Type = "oneshot";
       ExecStartPre = "${pkgs.uv}/bin/uv pip install --python %h/.claude/dev-container/.venv/bin/python3 --no-cache --quiet --upgrade --force-reinstall injection-scanner@git+https://github.com/jonathanmoregard/injection-scanner@main";
-      ExecStart = "%h/.claude/dev-container/.venv/bin/python3 %h/.claude/dev-container/bin/claude-cl-sync";
+      # Wrapper reads agenix raw-key files and exports ANTHROPIC_API_KEY
+      # + OPENAI_API_KEY before execing the real cl-sync entry. Needed
+      # because `.age` files contain raw key values (no `KEY=` prefix),
+      # so systemd's `EnvironmentFile=` can't parse them.
+      ExecStart = "${claude-cl-sync-wrap}/bin/claude-cl-sync-wrap";
       Nice = 10;
       Environment = "PYTHONDONTWRITEBYTECODE=1";
-      # ANTHROPIC_API_KEY + OPENAI_API_KEY env-format files, decrypted
-      # at activation. The injection-scanner honeypot probes Anthropic
-      # + OpenAI on every cl-sync tick; smoke fails-closed without these.
-      EnvironmentFile = [
-        "/run/agenix/anthropic-api-key"
-        "/run/agenix/openai-api-key"
-      ];
 
       # Hardening
       NoNewPrivileges = "yes";
