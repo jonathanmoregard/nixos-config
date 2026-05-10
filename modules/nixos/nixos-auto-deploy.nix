@@ -111,10 +111,14 @@ let
         new_toplevel=$(readlink -f /run/current-system)
         printf '%s\n%s\n' "$target_sha" "$new_toplevel" > "$STATE/last-deployed-sha"
         touch "$STATE/has-deployed"
+        # Trigger desktop notification (path-watcher in user systemd
+        # picks this up; notify-send + rm in the user service).
+        touch "$STATE/notify-success"
         echo "deploy success: $target_sha ($new_toplevel)"
         exit 0
       else
         echo "$target_sha" >> "$STATE/poison-latch"
+        touch "$STATE/notify-failure"
         echo "deploy FAILED: $target_sha latched as poisoned"
         exit 1
       fi
@@ -163,6 +167,18 @@ in
         dir's origin is git@github.com.
         Typical wiring: `config.age.secrets.deploy-ssh-key.path`.
         If null, falls back to root's ~/.ssh/id_ed25519.
+      '';
+    };
+
+    notifyUser = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "jonathan";
+      description = ''
+        Username whose session bus receives `notify-send` calls on
+        deploy success/failure. The user gets `linger` enabled so the
+        notification path-watcher works even when the desktop session
+        hasn't been opened yet (e.g. immediately after boot, before
+        first login). Set null to disable notifications entirely.
       '';
     };
 
@@ -260,12 +276,68 @@ in
     # Sudoers grant: the `webhook` system user (created by services.webhook)
     # can start nixos-deploy.service NOPASSWD. Pinned to exact argv so the
     # grant doesn't widen.
-    security.sudo.extraRules = lib.mkIf cfg.webhook.enable [{
-      users = [ "webhook" ];
-      commands = [{
-        command = "/run/current-system/sw/bin/systemctl start --no-block nixos-deploy.service";
-        options = [ "NOPASSWD" ];
-      }];
-    }];
+    security.sudo.extraRules =
+      (lib.optional cfg.webhook.enable {
+        users = [ "webhook" ];
+        commands = [{
+          command = "/run/current-system/sw/bin/systemctl start --no-block nixos-deploy.service";
+          options = [ "NOPASSWD" ];
+        }];
+      })
+      # The notify user removes its own flag files post-notify. Pinned to
+      # exact paths.
+      ++ (lib.optional (cfg.notifyUser != null) {
+        users = [ cfg.notifyUser ];
+        commands = [
+          { command = "/run/current-system/sw/bin/rm -f /var/lib/nixos-deploy/notify-success"; options = [ "NOPASSWD" ]; }
+          { command = "/run/current-system/sw/bin/rm -f /var/lib/nixos-deploy/notify-failure"; options = [ "NOPASSWD" ]; }
+        ];
+      });
+
+    # Linger so the notification user-bus is alive at boot, before any
+    # graphical login — otherwise the very first deploy after a reboot
+    # has no D-Bus session to send to.
+    users.users.${cfg.notifyUser}.linger = lib.mkIf (cfg.notifyUser != null) true;
+
+    # User-bus notification chain. Two (path + service) pairs because
+    # systemd Path.PathExists watches one path per unit.
+    systemd.user.paths = lib.mkIf (cfg.notifyUser != null) {
+      nixos-deploy-notify-success = {
+        wantedBy = [ "default.target" ];
+        pathConfig.PathExists = "/var/lib/nixos-deploy/notify-success";
+      };
+      nixos-deploy-notify-failure = {
+        wantedBy = [ "default.target" ];
+        pathConfig.PathExists = "/var/lib/nixos-deploy/notify-failure";
+      };
+    };
+
+    systemd.user.services = lib.mkIf (cfg.notifyUser != null) {
+      nixos-deploy-notify-success = {
+        description = "Desktop notification: nixos-deploy success";
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = pkgs.writeShellScript "deploy-notify-success" ''
+            set -e
+            SHA=$(${pkgs.coreutils}/bin/head -1 /var/lib/nixos-deploy/last-deployed-sha 2>/dev/null || echo unknown)
+            ${pkgs.libnotify}/bin/notify-send -u low "nixos-deploy" "Applied $SHA"
+            sudo /run/current-system/sw/bin/rm -f /var/lib/nixos-deploy/notify-success
+          '';
+        };
+      };
+      nixos-deploy-notify-failure = {
+        description = "Desktop notification: nixos-deploy failure";
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = pkgs.writeShellScript "deploy-notify-failure" ''
+            set -e
+            SHA=$(${pkgs.coreutils}/bin/tail -1 /var/lib/nixos-deploy/poison-latch 2>/dev/null || echo unknown)
+            ${pkgs.libnotify}/bin/notify-send -u critical "nixos-deploy FAILED" \
+              "Commit $SHA failed activation. Recovery: sudo nixos-rebuild switch --rollback"
+            sudo /run/current-system/sw/bin/rm -f /var/lib/nixos-deploy/notify-failure
+          '';
+        };
+      };
+    };
   };
 }
