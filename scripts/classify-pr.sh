@@ -51,24 +51,34 @@ fi
 
 # --- Build both system.build.toplevel derivations ----------------------
 
-# Fast path: skip both toplevel builds when no Nix-relevant file changed.
+# Fast path: skip both toplevel builds when every file in the diff is
+# proven NOT to feed `system.build.toplevel`.
 #
-# `system.build.toplevel` only depends on flake-tracked files. A diff
-# touching only docs / GH workflows / .gitignore cannot change the
-# closure, so the two `nix build`s and the closure-diff would all be
-# empty work — 3-5 min of cold-runner time wasted per such PR.
+# Using a denylist (not an allowlist) is the safer shape:
+#  - An earlier draft listed Nix-bearing dirs (`^home/`, `^modules/`,
+#    `^hosts/`, ...). It MISSED `dotfiles/`, `assets/`, `wallpapers/`
+#    which are referenced from home-manager modules via
+#    `home.file.<x>.source = ../<dir>/...` — content changes in those
+#    dirs DO change the closure, but the diff would have shown
+#    "no Nix files" and the PR would have been mis-classified TRIVIAL.
+#  - With a denylist, new top-level dirs default to slow-path. Adding
+#    a docs-only dir requires an explicit denylist entry; forgetting
+#    that entry just makes the path slower, never less safe.
 #
-# Conservative path allowlist: any `.nix`, lockfiles, or anything under
-# directories that contribute to the system closure. Anything else
-# short-circuits to TRIVIAL.
-NIX_TOUCHED=$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA" \
-  | grep -E '\.nix$|^flake\.lock$|^flake\.nix$|^secrets/|^home/|^modules/|^hosts/|^overlays/|^tests/' \
+# Denylist: paths that cannot, by their own definition, feed any Nix
+# derivation. `.github/` is NOT in this list — workflow changes need
+# classification (risk-rules.nix flags them HIGH) even though they
+# don't change the dellan closure.
+SAFE_NON_CLOSURE_RE='(^|/)docs/|^proposals/|^README(\..*)?$|^CLAUDE\.md$|^pending_for_human\.md$|^\.gitignore$|^\.gitattributes$|^LICENSE([.\-].*)?$|^\.editorconfig$'
+
+UNSAFE_PATHS=$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA" \
+  | grep -Ev "$SAFE_NON_CLOSURE_RE" \
   || true)
 
-if [ -z "$NIX_TOUCHED" ]; then
+if [ -z "$UNSAFE_PATHS" ]; then
   echo "## Risk: TRIVIAL"
   echo
-  echo "Fast-path: no Nix-relevant files changed between \`$MERGE_BASE\` and \`$HEAD_SHA\`."
+  echo "Fast-path: every file in the diff matches the doc/non-closure denylist."
   echo "Skipped the two toplevel builds + closure diff."
   echo "risk=TRIVIAL" >> "${GITHUB_OUTPUT:-/dev/null}"
   exit 0
