@@ -33,4 +33,17 @@ in {
   "deploy-ssh-key.age".publicKeys        = ciKeys;
   "github-webhook-secret.age".publicKeys = ciKeys;
   "gh-janitor-token.age".publicKeys      = ciKeys;
+
+  # ---------------------------------------------------------------------
+  # LLM provider API keys.
+  #
+  # Consumed by:
+  #   - claude-cl-sync.service   (home/claude-services.nix EnvironmentFile)
+  #   - research-agent-mcp       (home/research-agent.nix wrapper, planned)
+  # File CONTENTS expected at decrypt time (env-format, one var per file):
+  #   anthropic-api-key.age   — ANTHROPIC_API_KEY=sk-ant-...
+  #   openai-api-key.age      — OPENAI_API_KEY=sk-...
+  # ---------------------------------------------------------------------
+  "anthropic-api-key.age".publicKeys = allKeys;
+  "openai-api-key.age".publicKeys    = allKeys;
 }
