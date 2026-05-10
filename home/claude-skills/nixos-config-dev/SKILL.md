@@ -94,9 +94,10 @@ can't model (touchpad, GPU, LUKS), emergency rollback
   Claude Code's permissions also deny Edit/Write on this path
 - `nixos-rebuild switch --flake /etc/nixos#vm` — `vm` host is legacy
   (being phased out); target is `dellan`
-- `gh pr merge --admin` to bypass status checks — defeats the gate
-- `git push --force` — branch protection rejects, and force-push past a
-  reviewed commit would invalidate the freshness gate anyway
+- `gh pr merge` (any flags) — denied at the safe-bash MCP layer; merges
+  happen via the GitHub UI's merge button so required checks stay the
+  deliberate gesture, not a CLI autopilot
+- `git push --force` — branch protection rejects force-pushes to `main`
 
 ## Cleanup after PR closes
 

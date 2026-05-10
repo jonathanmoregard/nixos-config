@@ -53,11 +53,11 @@ gh pr checks <PR_NUMBER>
 
 # 5. Read the PR comment from the classifier — assigns risk:trivial/low/
 #    medium/high/critical based on derivation-graph blast radius
-#    (see scripts/risk-rules.nix). Branch protection requires 1 fresh
-#    APPROVED review to merge; admin (you) can override via the UI's
-#    "Merge without waiting for requirements" button.
+#    (see scripts/risk-rules.nix). Use the label as a sanity check on
+#    how much eyeballing the diff deserves before clicking merge.
 
-# 6. Merge. Auto-deploy webhook fires on push:main → nixos-deploy.service
+# 6. Merge in the GitHub UI (the CLI `gh pr merge` is denied at the
+#    safe-bash MCP layer). Auto-deploy webhook fires on push:main → nixos-deploy.service
 #    runs `git fetch + reset --hard + nixos-rebuild switch` on dellan.
 #    Desktop notification fires on success/failure.
 
@@ -108,9 +108,9 @@ nix build .#checks.x86_64-linux.dellan-vm -L
 | `vm-minimal` | Ephemeral VM e2e test; same as `nix build .#checks.x86_64-linux.dellan-vm` |
 | `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |
 | `classify` | Posts `risk:trivial/low/medium/high/critical` label + per-source breakdown comment |
-| `label-gate` | Asserts label-actor allowlist + baseline-drift gate. Risk-tier merge gating is enforced by branch protection's review requirement, not by this check. |
+| `label-gate` | Asserts label-actor allowlist + baseline-drift gate. |
 
-Branch protection requires 1 fresh APPROVED review to merge. Solo-author PRs ship via admin UI override (`enforce_admins: false`). `gh pr merge --admin` is denied at the safe-bash MCP layer to keep override a deliberate UI gesture.
+Branch protection: required status checks (above) are the gate. No required review on this solo-author repo. All `gh pr merge` invocations (including no flags) are denied at the safe-bash MCP layer — merges happen via the GitHub UI's merge button so the click is a deliberate gesture, not a CLI autopilot path past the checks.
 
 Spec: `docs/specs/2026-05-04-cicd-driven-nixos-workflow.md` (sections marked `[OBSOLETE-2026-05-05]` describe the original self-hosted runner + Attic architecture; replaced by GHA-hosted runners as of 2026-05-05).
 

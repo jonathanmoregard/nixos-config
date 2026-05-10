@@ -152,13 +152,10 @@ jobs:
           # - label added by disallowed actor (handled in earlier step)
           # - tests/baselines/ touched without baseline:approved label
           #
-          # Risk-based merge gating moved to branch protection:
-          # required_approving_review_count=1 blocks merge until a fresh
-          # APPROVED review lands. enforce_admins=false lets the admin
-          # bypass via the UI's "Merge without waiting" button. Solo-author
-          # case (PR author == reviewer) is handled by admin override,
-          # not by failing this check. gh pr merge --admin is denied at
-          # the safe-bash MCP layer to keep override a deliberate UI act.
+          # Merge gating: required status checks (build/vm-minimal/etc.)
+          # are the gate. No required review on this solo-author repo.
+          # All `gh pr merge` invocations are denied at the safe-bash MCP
+          # layer so merges happen via the GitHub UI's merge button.
           touched_baseline=$(gh pr view "${PR_NUMBER}" --json files \
             --jq '[.files[].path | select(startswith("tests/baselines/"))] | length')
           if [ "$touched_baseline" -gt 0 ]; then
