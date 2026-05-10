@@ -51,16 +51,57 @@ fi
 
 # --- Build both system.build.toplevel derivations ----------------------
 
-build_toplevel() {
-  local sha="$1" out
-  out=$(nix build --no-link --print-out-paths \
+# Fast path: skip both toplevel builds when no Nix-relevant file changed.
+#
+# `system.build.toplevel` only depends on flake-tracked files. A diff
+# touching only docs / GH workflows / .gitignore cannot change the
+# closure, so the two `nix build`s and the closure-diff would all be
+# empty work — 3-5 min of cold-runner time wasted per such PR.
+#
+# Conservative path allowlist: any `.nix`, lockfiles, or anything under
+# directories that contribute to the system closure. Anything else
+# short-circuits to TRIVIAL.
+NIX_TOUCHED=$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA" \
+  | grep -E '\.nix$|^flake\.lock$|^flake\.nix$|^secrets/|^home/|^modules/|^hosts/|^overlays/|^tests/' \
+  || true)
+
+if [ -z "$NIX_TOUCHED" ]; then
+  echo "## Risk: TRIVIAL"
+  echo
+  echo "Fast-path: no Nix-relevant files changed between \`$MERGE_BASE\` and \`$HEAD_SHA\`."
+  echo "Skipped the two toplevel builds + closure diff."
+  echo "risk=TRIVIAL" >> "${GITHUB_OUTPUT:-/dev/null}"
+  exit 0
+fi
+
+# Run base + head toplevel builds in parallel. Cachix substitutes both
+# closures from the binary cache when available (every main-branch build
+# pushes there); concurrent runs overlap cachix downloads on cold misses.
+
+build_toplevel_to() {
+  local sha="$1" outfile="$2"
+  nix build --no-link --print-out-paths \
     "git+file://$REPO_ROOT?rev=$sha#nixosConfigurations.dellan.config.system.build.toplevel" \
-    2>/dev/null) || return 1
-  echo "$out"
+    > "$outfile" 2>"$outfile.err"
 }
 
-BASE_TOPLEVEL=$(build_toplevel "$MERGE_BASE")
-HEAD_TOPLEVEL=$(build_toplevel "$HEAD_SHA")
+build_toplevel_to "$MERGE_BASE" "$WORK/base.path" &
+base_pid=$!
+build_toplevel_to "$HEAD_SHA" "$WORK/head.path" &
+head_pid=$!
+
+base_rc=0; head_rc=0
+wait "$base_pid" || base_rc=$?
+wait "$head_pid" || head_rc=$?
+if [ "$base_rc" -ne 0 ] || [ "$head_rc" -ne 0 ]; then
+  echo "classify-pr: toplevel build failed (base rc=$base_rc head rc=$head_rc)" >&2
+  [ -s "$WORK/base.path.err" ] && cat "$WORK/base.path.err" >&2 || true
+  [ -s "$WORK/head.path.err" ] && cat "$WORK/head.path.err" >&2 || true
+  exit 1
+fi
+
+BASE_TOPLEVEL=$(cat "$WORK/base.path")
+HEAD_TOPLEVEL=$(cat "$WORK/head.path")
 
 # --- Source 1: package-set delta ---------------------------------------
 
