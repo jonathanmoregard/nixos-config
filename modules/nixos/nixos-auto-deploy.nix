@@ -289,39 +289,31 @@ in
     # Sudoers grant: the `webhook` system user (created by services.webhook)
     # can start nixos-deploy.service NOPASSWD. Pinned to exact argv so the
     # grant doesn't widen.
-    security.sudo.extraRules =
-      (lib.optional cfg.webhook.enable {
-        users = [ "webhook" ];
-        commands = [{
-          command = "/run/current-system/sw/bin/systemctl start --no-block nixos-deploy.service";
-          options = [ "NOPASSWD" ];
-        }];
-      })
-      # The notify user removes its own flag files post-notify. Pinned to
-      # exact paths.
-      ++ (lib.optional (cfg.notifyUser != null) {
-        users = [ cfg.notifyUser ];
-        commands = [
-          { command = "/run/current-system/sw/bin/rm -f /var/lib/nixos-deploy/notify-success"; options = [ "NOPASSWD" ]; }
-          { command = "/run/current-system/sw/bin/rm -f /var/lib/nixos-deploy/notify-failure"; options = [ "NOPASSWD" ]; }
-        ];
-      });
+    security.sudo.extraRules = lib.optional cfg.webhook.enable {
+      users = [ "webhook" ];
+      commands = [{
+        command = "/run/current-system/sw/bin/systemctl start --no-block nixos-deploy.service";
+        options = [ "NOPASSWD" ];
+      }];
+    };
 
     # Linger so the notification user-bus is alive at boot, before any
     # graphical login — otherwise the very first deploy after a reboot
     # has no D-Bus session to send to.
     users.users.${cfg.notifyUser}.linger = lib.mkIf (cfg.notifyUser != null) true;
 
-    # User-bus notification chain. Two (path + service) pairs because
-    # systemd Path.PathExists watches one path per unit.
+    # User-bus notification chain. PathChanged fires once per deploy on
+    # close-after-write (the deploy script's `touch`), so the flag file
+    # can persist between runs without retriggering. PathExists would
+    # busy-loop while the file exists.
     systemd.user.paths = lib.mkIf (cfg.notifyUser != null) {
       nixos-deploy-notify-success = {
         wantedBy = [ "default.target" ];
-        pathConfig.PathExists = "/var/lib/nixos-deploy/notify-success";
+        pathConfig.PathChanged = "/var/lib/nixos-deploy/notify-success";
       };
       nixos-deploy-notify-failure = {
         wantedBy = [ "default.target" ];
-        pathConfig.PathExists = "/var/lib/nixos-deploy/notify-failure";
+        pathConfig.PathChanged = "/var/lib/nixos-deploy/notify-failure";
       };
     };
 
@@ -334,7 +326,6 @@ in
             set -e
             SHA=$(${pkgs.coreutils}/bin/head -1 /var/lib/nixos-deploy/last-deployed-sha 2>/dev/null || echo unknown)
             ${pkgs.libnotify}/bin/notify-send -u low "nixos-deploy" "Applied $SHA"
-            sudo /run/current-system/sw/bin/rm -f /var/lib/nixos-deploy/notify-success
           '';
         };
       };
@@ -347,7 +338,6 @@ in
             SHA=$(${pkgs.coreutils}/bin/tail -1 /var/lib/nixos-deploy/poison-latch 2>/dev/null || echo unknown)
             ${pkgs.libnotify}/bin/notify-send -u critical "nixos-deploy FAILED" \
               "Commit $SHA failed activation. Recovery: sudo nixos-rebuild switch --rollback"
-            sudo /run/current-system/sw/bin/rm -f /var/lib/nixos-deploy/notify-failure
           '';
         };
       };
