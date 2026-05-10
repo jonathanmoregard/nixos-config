@@ -134,10 +134,10 @@
         command gh "$@"
       }
 
-      # claude wrapper: set up env if needed
-      claude() {
-        command claude "$@"
-      }
+      # claude wrapper: clear + resume most recent session by default.
+      # Use `claudee` to start a fresh session.
+      claude()  { clear; command claude --continue "$@"; }
+      claudee() { clear; command claude "$@"; }
     '';
 
     envExtra = ''
