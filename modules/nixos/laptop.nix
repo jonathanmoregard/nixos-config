@@ -55,6 +55,22 @@
     powerOnBoot = true;
   };
 
+  # Intel IPU6 MIPI webcam (Latitude 7440, 13th-gen Raptor Lake → `ipu6ep`).
+  # Without this, the OV02C10 sensor enumerates kernel-side (modules load,
+  # /dev/video* nodes appear) but no userspace pipeline produces frames, so
+  # apps see "no camera". The module pulls in:
+  #   - intel-ipu6 firmware + ivsc-firmware (unfree-redistributable)
+  #   - ipu6-drivers out-of-tree kernel modules
+  #   - v4l2-relayd → exposes a v4l2loopback device at /dev/video50 (the
+  #     fixed `videoDeviceNumber`) so apps using plain v4l2 (Cheese, OBS,
+  #     Chromium without PipeWire portal) still find the camera.
+  #   - WirePlumber rule that hides the raw IPU6 nodes so PipeWire-aware
+  #     apps don't try to open them directly.
+  hardware.ipu6 = {
+    enable = true;
+    platform = "ipu6ep";
+  };
+
   # nix-ld — runs pre-built dynamically-linked Linux binaries (e.g. the
   # Claude Code native installer at ~/.local/share/claude/versions/<v>)
   # that expect /lib64/ld-linux-x86-64.so.2 + standard glibc layout.
