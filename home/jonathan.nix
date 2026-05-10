@@ -134,9 +134,19 @@
         command gh "$@"
       }
 
-      # claude wrapper: set up env if needed
+      # claude wrapper: resume the most recent session by default.
+      # Pass --no-continue (consumed here, not forwarded) to start fresh.
       claude() {
-        command claude "$@"
+        local cont=(--continue)
+        local args=()
+        for a in "$@"; do
+          if [[ "$a" == "--no-continue" ]]; then
+            cont=()
+          else
+            args+=("$a")
+          fi
+        done
+        command claude "''${cont[@]}" "''${args[@]}"
       }
     '';
 
