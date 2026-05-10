@@ -52,7 +52,19 @@ let
       # match the recorded one, a human switched the system between runs
       # (manual rebuild or rollback). Halt until cleared.
       current_toplevel=$(readlink -f /run/current-system)
-      recorded_toplevel=$(awk 'NR==2 {print}' "$STATE/last-deployed-sha" 2>/dev/null || true)
+
+      # Read both lines of last-deployed-sha (line 1 = SHA, line 2 =
+      # toplevel store path) via bash builtin `read`. The earlier
+      # `awk 'NR==N {print}'` form silently emitted empty when `awk`
+      # was not on PATH — `writeShellApplication`'s `runtimeInputs`
+      # didn't list `gawk`, command-not-found exit 127 got swallowed
+      # by `2>/dev/null || true`, and the drift check then halted on a
+      # false positive. Builtin `read` has no PATH dependency.
+      recorded_sha=""
+      recorded_toplevel=""
+      { IFS= read -r recorded_sha || true
+        IFS= read -r recorded_toplevel || true
+      } < "$STATE/last-deployed-sha" 2>/dev/null || true
 
       if [ -e "$STATE/has-deployed" ] && [ "$current_toplevel" != "$recorded_toplevel" ]; then
         echo "current generation does not match last auto-deploy; halting"
@@ -94,8 +106,9 @@ let
         fi
       fi
 
-      # Step 6: idempotency.
-      recorded_sha=$(awk 'NR==1 {print}' "$STATE/last-deployed-sha" 2>/dev/null || true)
+      # Step 6: idempotency. recorded_sha was read at the top of the
+      # script alongside recorded_toplevel — same builtin-read avoids
+      # the awk-on-PATH bug fixed in this revision.
       if [ -n "$recorded_sha" ] && [ "$target_sha" = "$recorded_sha" ]; then
         echo "already at $target_sha; no-op"
         exit 0
