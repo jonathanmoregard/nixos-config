@@ -147,12 +147,19 @@ jobs:
     # block `keyring` reporting status. `fail-fast: false` keeps every
     # lane reporting even after one breaks.
     #
+    # `needs: [..., build-dellan]` serializes the toplevel-closure
+    # build before any lane starts. Without this, all 5 lanes race
+    # build-dellan to rebuild the same closure cold, then the slowest
+    # one wins the cachix push and the rest finish unnecessarily.
+    # With the dep, build-dellan populates cachix once, lanes pull
+    # binaries; per-lane wall drops from ~4min to ~90s.
+    #
     # Branch-protection required-check names are
     # `vm-minimal (<lane>)` — update protection rules in the GH UI
     # when adding/removing a lane.
     name: vm-minimal (${{ matrix.lane }})
     runs-on: ubuntu-latest
-    needs: [verify-fork-guards, preflight]
+    needs: [verify-fork-guards, preflight, build-dellan]
     permissions:
       contents: read
     strategy:
@@ -167,10 +174,9 @@ jobs:
         run: ./scripts/mount-nix-loop.sh
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
-      # cachix substitutes the dellan toplevel + dependencies; if
-      # build-dellan ran first and populated the cache, the lane pulls
-      # binaries instead of rebuilding. Lanes share the same node
-      # closure so the first one warms the cache for the rest.
+      # build-dellan ran in needs: and populated cachix with the
+      # toplevel closure. Each lane pulls binaries from cache instead
+      # of rebuilding the system from scratch.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
