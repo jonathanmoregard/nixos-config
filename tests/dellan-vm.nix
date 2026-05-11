@@ -94,6 +94,14 @@ pkgs.testers.runNixOSTest {
     dellan.succeed("grep -q 'auth.*pam_gnome_keyring' /etc/pam.d/login")
     dellan.succeed("grep -q 'session.*pam_gnome_keyring' /etc/pam.d/login")
 
+    # CopyQ clipboard manager — binary on PATH + autostart .desktop present.
+    # Required for gnome-screenshot --clipboard (Cinnamon Ctrl+Print) to
+    # persist screenshots in CLIPBOARD after gnome-screenshot exits.
+    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/copyq")
+    dellan.succeed(
+        "test -f /home/jonathan/.config/autostart/copyq.desktop"
+    )
+
     # HM-installed binaries on user PATH
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty")
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty-session-save")
