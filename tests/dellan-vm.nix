@@ -102,6 +102,16 @@ pkgs.testers.runNixOSTest {
         "test -f /home/jonathan/.config/autostart/copyq.desktop"
     )
 
+    # Nemo (GTK) sidebar bookmarks — declarative pins for ~/Downloads
+    # and ~/Dropbox in the file manager's left menu.
+    bookmarks = dellan.succeed(
+        "cat /home/jonathan/.config/gtk-3.0/bookmarks"
+    )
+    assert "file:///home/jonathan/Downloads" in bookmarks, \
+        f"Downloads bookmark missing:\n{bookmarks}"
+    assert "file:///home/jonathan/Dropbox" in bookmarks, \
+        f"Dropbox bookmark missing:\n{bookmarks}"
+
     # gnome-screenshot — the binary fired by the Print / Shift+Print
     # Cinnamon custom keybindings.
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/gnome-screenshot")
