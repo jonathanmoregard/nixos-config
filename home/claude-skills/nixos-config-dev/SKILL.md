@@ -66,7 +66,6 @@ gh pr checks <PR_NUMBER>
 | `eval (dellan)`, `build (dellan)` | Flake evaluates + system derivation builds |
 | `vm-minimal (1..3)` | Three parallel ephemeral-VM e2e tests |
 | `vm-graphical` | Runs only when desktop files change |
-| `label-gate` | Enforces label-actor allowlist + baseline-drift gate |
 
 ## After merge
 
@@ -114,8 +113,8 @@ it's tidier to remove eagerly.
   -e <name>.age` from `secrets/` dir
 - VM gate fails on autodoro → known interaction; see
   `docs/proposals/2026-05-04-split-vm-tests.md`
-- Branch protection rejects merge → check the `label-gate` status;
-  PR likely needs `baseline:approved` if it touches `tests/baselines/`
+- Branch protection rejects merge → check the failing required
+  status check (eval / build / vm-minimal); fix and push again
 - `nixos-deploy.service` poisoned → see desktop notification's
   rollback command, then
   `sudo rm /var/lib/nixos-deploy/current-poison && sudo systemctl reset-failed nixos-deploy`

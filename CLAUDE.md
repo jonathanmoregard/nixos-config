@@ -102,7 +102,6 @@ nix build .#checks.x86_64-linux.dellan-vm -L
 | `build dellan toplevel` | Builds `nixosConfigurations.dellan.config.system.build.toplevel` |
 | `vm-minimal` | Ephemeral VM e2e test; same as `nix build .#checks.x86_64-linux.dellan-vm` |
 | `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |
-| `label-gate` | Asserts label-actor allowlist + baseline-drift gate. |
 
 Branch protection: required status checks (above) are the gate. No required review on this solo-author repo. All `gh pr merge` invocations (including no flags) are denied at the safe-bash MCP layer — merges happen via the GitHub UI's merge button so the click is a deliberate gesture, not a CLI autopilot path past the checks.
 

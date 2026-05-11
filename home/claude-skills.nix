@@ -2,8 +2,8 @@
 #
 # Symlinks Claude Code skills from this repo into ~/.claude/skills/.
 # Lets agent-facing skills go through the nixos-config CI/CD gate
-# (PR → label-gate → auto-deploy) instead of being edited live
-# in ~/.claude/.
+# (PR → CI → auto-deploy) instead of being edited live in
+# ~/.claude/.
 #
 # Adding a new skill:
 #   1. Drop it under home/claude-skills/<name>/SKILL.md
