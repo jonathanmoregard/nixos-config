@@ -1,21 +1,11 @@
 ---
 name: nixos-agent-testing
 description: >
-  Interactive NixOS feature-VM smoke testing. Use ONLY in the
-  nixos-config repo (paths under /etc/nixos/,
-  ~/Repos/nixos-config-worktrees/, or ~/Repos/nixos-config/) when a
-  change introduces branching logic (`mkIf` / `optionals` /
-  conditional service enable), multistep scripts
-  (`writeShellApplication`, activation scripts, multi-cmd
-  `ExecStart`), GUI/desktop side effects, or a daemon that needs
-  poking to verify — anything the automated assertion gate cannot
-  prove on its own. Triggers on phrases like "spin up the VM",
-  "boot the feature VM", "feature vm", "test in feature VM",
-  "smoke test (the change)", "screencap the VM", "send keys to the
-  VM", "QMP", "serial console", and on edits within the
-  nixos-config repo that match the shapes above. Pair with
-  `nixos-automated-testing` (assertion gate) — this skill is the
-  interactive complement, not a replacement.
+  Interactive NixOS smoke testing in a sandbox VM. Use ONLY in the
+  nixos-config repo (~/Repos/nixos-config-worktrees/) for complex
+  changes — branching logic, multistep scripts, GUI/desktop side
+  effects, or a daemon that needs poking. Pair with
+  `nixos-automated-testing`.
 ---
 
 ## When to invoke this skill

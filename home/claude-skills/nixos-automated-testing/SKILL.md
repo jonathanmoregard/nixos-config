@@ -1,17 +1,10 @@
 ---
 name: nixos-automated-testing
 description: >
-  NixOS dellan-vm e2e assertion gate. Use in the nixos-config repo
-  (paths under /etc/nixos/, ~/Repos/nixos-config-worktrees/, or
-  ~/Repos/nixos-config/) whenever a change builds the system — to
-  run the same gate CI runs (`vm-minimal`) locally before pushing,
-  to extend `tests/dellan-vm.nix` with an assertion for new HM
-  units / scripts / timers / packages, or to debug a red gate.
-  Triggers on phrases like "run the VM gate", "test the flake",
-  "run dellan-vm test", "add a test for X". Pair with
-  `nixos-agent-testing` when the change is branching logic, a
-  multistep script, a GUI side effect, or anything else whose
-  behavior the assertion gate alone cannot prove.
+  NixOS automated testing. Use when writing, extending, or running
+  automated tests for the nixos-config repo
+  (~/Repos/nixos-config-worktrees/). Pair with `nixos-agent-testing`
+  for complex changes (branching, GUI, daemons).
 ---
 
 ## Scope
