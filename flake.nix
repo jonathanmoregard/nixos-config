@@ -16,9 +16,10 @@
     linuxSystem = "x86_64-linux";
 
     # Pre-built pkgs — overlays + allowUnfree applied here rather than in
-    # modules. Required so tests/dellan-vm.nix can reuse the same pkgs:
-    # the nixosTest framework injects pkgs externally and that makes
-    # `nixpkgs.config` / `nixpkgs.overlays` read-only inside modules.
+    # modules. Required so the per-feature VM checks (tests/*.nix) can
+    # reuse the same pkgs: the nixosTest framework injects pkgs
+    # externally and that makes `nixpkgs.config` / `nixpkgs.overlays`
+    # read-only inside modules.
     pkgsLinux = import nixpkgs {
       system = linuxSystem;
       config.allowUnfree = true;
@@ -62,11 +63,26 @@
       ];
     };
 
-    # VM-based e2e tests. Run: `nix build .#checks.x86_64-linux.dellan-vm -L`
-    checks.${linuxSystem}.dellan-vm = import ./tests/dellan-vm.nix {
-      pkgs = pkgsLinux;
-      inputs = { inherit home-manager agenix; };
-    };
+    # VM-based e2e tests, one per feature area. Run any single lane:
+    #   nix build .#checks.x86_64-linux.vm-base -L
+    # Or all five via `nix flake check`.
+    #
+    # Adding a lane: drop a new ./tests/<feature>.nix that imports
+    # ./lib/common.nix and wire it here. No aggregate — CI's matrix
+    # fan-out (.github/workflows/ci.yml) enumerates the lanes.
+    checks.${linuxSystem} =
+      let
+        mkLane = path: import path {
+          pkgs = pkgsLinux;
+          inputs = { inherit home-manager agenix; };
+        };
+      in {
+        vm-base        = mkLane ./tests/base.nix;
+        vm-desktop     = mkLane ./tests/desktop.nix;
+        vm-keyring     = mkLane ./tests/keyring.nix;
+        vm-kitty       = mkLane ./tests/kitty.nix;
+        vm-claude-pane = mkLane ./tests/claude-pane.nix;
+      };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.
     #

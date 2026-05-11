@@ -155,14 +155,14 @@
     # Disable production-only services that either need real secrets,
     # depend on the dellan host's identity, or just slow the VM boot.
     # The point of the feature VM is to smoke-test config changes, not
-    # to mirror prod end-to-end (`tests/dellan-vm.nix` is the
-    # prod-parity gate).
+    # to mirror prod end-to-end (the `tests/*.nix` lanes via
+    # `tests/lib/common.nix` are the prod-parity gate).
     services.nixos-auto-deploy.enable = lib.mkForce false;
     services.tailscale.enable = lib.mkForce false;
 
     # Autologin into Cinnamon so interactive smoke tests can drive the
     # desktop session via QMP send-key without typing credentials at the
-    # greeter every boot. Matches `tests/dellan-vm.nix`'s autologin
+    # greeter every boot. Matches `tests/lib/common.nix`'s autologin
     # override — both are test/smoke contexts and never reach prod.
     services.xserver.displayManager.autoLogin = {
       enable = lib.mkForce true;

@@ -275,7 +275,10 @@ else
     note "SKIP_VM_GATE=1 — skipping VM gate, going straight to switch"
   else
     note "Running VM gate (~2-3 min)..."
-    nix build "${CONFIG_PATH}#checks.x86_64-linux.dellan-vm" -L --no-link
+    # `nix flake check` builds every check derivation in the flake,
+    # so new lanes added under `tests/<feature>.nix` get gated here
+    # automatically without editing this script.
+    (cd "${CONFIG_PATH}" && nix flake check -L)
     ok "VM gate green"
   fi
 

@@ -79,7 +79,7 @@ VM via `nixos-agent-testing`).
 | Anything that builds — *required* | `nixos-automated-testing` (the assertion gate CI runs on every PR; runs locally before pushing) |
 | Branching logic (`mkIf`, `optionals`, `if`/`case`), multistep scripts (`writeShellApplication`, activation scripts), GUI changes, daemons that need poking — *required pre-PR* | `nixos-agent-testing` (boot the feature VM, drive via SSH/QMP/screencap, capture proof for the PR body) |
 | Pre-implementation planning for non-trivial work | `brainstorming` |
-| While writing the change | `test-driven-development` — extend `tests/dellan-vm.nix` before the code, watch it fail, then make it pass |
+| While writing the change | `test-driven-development` — extend the right `tests/<feature>.nix` lane (base / desktop / keyring / kitty / claude-pane) before the code, watch it fail, then make it pass |
 | Before clicking merge on a medium/high-risk PR | `advice-refine-test-loop` — multi-round Opus review with empirical re-verification |
 
 Do not ask the user whether to run these. The only changes that
