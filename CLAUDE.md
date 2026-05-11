@@ -51,17 +51,12 @@ gh pr create --title "feat(scope): summary" --body "..."
 # 4. Wait for CI on GitHub-hosted runners
 gh pr checks <PR_NUMBER>
 
-# 5. Read the PR comment from the classifier — assigns risk:trivial/low/
-#    medium/high/critical based on derivation-graph blast radius
-#    (see scripts/risk-rules.nix). Use the label as a sanity check on
-#    how much eyeballing the diff deserves before clicking merge.
-
-# 6. Merge in the GitHub UI (the CLI `gh pr merge` is denied at the
+# 5. Merge in the GitHub UI (the CLI `gh pr merge` is denied at the
 #    safe-bash MCP layer). Auto-deploy webhook fires on push:main → nixos-deploy.service
 #    runs `git fetch + reset --hard + nixos-rebuild switch` on dellan.
 #    Desktop notification fires on success/failure.
 
-# 7. Clean up
+# 6. Clean up
 git -C ~/Repos/nixos-config worktree remove ~/Repos/nixos-config-worktrees/<slug>
 gh pr view <PR_NUMBER>   # confirm merged
 ```
@@ -107,7 +102,6 @@ nix build .#checks.x86_64-linux.dellan-vm -L
 | `build dellan toplevel` | Builds `nixosConfigurations.dellan.config.system.build.toplevel` |
 | `vm-minimal` | Ephemeral VM e2e test; same as `nix build .#checks.x86_64-linux.dellan-vm` |
 | `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |
-| `classify` | Posts `risk:trivial/low/medium/high/critical` label + per-source breakdown comment |
 | `label-gate` | Asserts label-actor allowlist + baseline-drift gate. |
 
 Branch protection: required status checks (above) are the gate. No required review on this solo-author repo. All `gh pr merge` invocations (including no flags) are denied at the safe-bash MCP layer — merges happen via the GitHub UI's merge button so the click is a deliberate gesture, not a CLI autopilot path past the checks.

@@ -46,7 +46,6 @@ read -r -d '' BODY <<'JSON' || true
       "flake check (eval)",
       "build dellan toplevel",
       "vm-minimal",
-      "classify",
       "label-gate"
     ]
   },

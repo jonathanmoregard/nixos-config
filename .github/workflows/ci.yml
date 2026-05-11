@@ -73,13 +73,10 @@ jobs:
           fetch-depth: 0
       - name: Preflight TRIVIAL check (no nix, ~1s)
         id: preflight
-        # Inline the denylist regex from scripts/classify-pr.sh / gate.yml
-        # so the preflight runs without `nix`. If every changed file
-        # matches the safe denylist, emit risk=TRIVIAL and let heavy
-        # steps in downstream jobs skip via
+        # Doc-only fast-path: if every changed file matches the safe
+        # denylist below, emit risk=TRIVIAL and let heavy steps in
+        # downstream jobs skip via
         # `if: needs.preflight.outputs.risk != 'TRIVIAL'`.
-        # Source of truth for the regex is the classifier script; keep
-        # the three (gate.yml, ci.yml, classify-pr.sh) in sync.
         # Push:main events skip the diff (no base SHA) and leave risk
         # empty so heavy steps always run on main.
         run: |
