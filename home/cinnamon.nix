@@ -289,6 +289,7 @@ in
       font-hinting = "slight";
       monospace-font-name = "DejaVu Sans Mono 10";
       document-font-name = "Sans 10";
+      color-scheme = "prefer-dark";
     };
 
     "org/gnome/desktop/sound" = {

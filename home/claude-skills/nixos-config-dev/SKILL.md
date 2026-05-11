@@ -1,13 +1,11 @@
 ---
 name: nixos-config-dev
 description: >
-  Use when modifying jonathan's NixOS config (any file under
-  /etc/nixos/ or ~/Repos/nixos-config-worktrees/). Worktree-only
-  workflow — direct edits to /etc/nixos and ~/Repos/nixos-config
-  fail by construction. Triggers on edits to flake.nix, hosts/*.nix,
-  modules/*.nix, home/*.nix, on phrases like "rebuild dellan",
-  "switch nixos config", "update home-manager", and on creating PRs
-  in the nixos-config repo.
+  NixOS config edits via worktree + PR. Use whenever the agent
+  modifies anything in the nixos-config repo. Routes into the right
+  testing skills (`nixos-automated-testing`, `nixos-agent-testing`,
+  `test-driven-development`, `advice-refine-test-loop`) based on
+  the shape of the change.
 ---
 
 ## First action when triggered
@@ -42,14 +40,15 @@ cd ~/Repos/nixos-config
 git worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
 cd ~/Repos/nixos-config-worktrees/<slug>
 
-# 2. Edit
+# 2. Plan + edit
+#    For anything beyond trivial, lead with the `brainstorming` skill
+#    before code, then the `test-driven-development` skill while
+#    coding (write the assertion first, watch it fail, make it pass).
 $EDITOR home/whatever.nix
 git add -A
 git commit -m "feat(scope): summary"
 
-# 3. (Optional but recommended) Run VM gate locally for fast feedback
-nix build .#checks.x86_64-linux.dellan-vm -L
-# See nixos-vm-test-gate skill for cheaper pre-VM checks.
+# 3. Test before pushing — see "Testing skills" below.
 
 # 4. Push, open PR
 git push -u origin feat/<slug>
@@ -57,7 +56,41 @@ gh pr create --title "..." --body "..."
 
 # 5. Watch CI
 gh pr checks <PR_NUMBER>
+
+# 6. For non-trivial PRs about to be merged, lead with the
+#    `advice-refine-test-loop` skill — Opus advisor + empirical
+#    re-verification across rounds catches fail-open paths, schema
+#    mismatches, and silent regressions that single-pass review
+#    misses. Cheap insurance on changes that auto-deploy to your
+#    daily-driver.
 ```
+
+## Testing skills
+
+Two complementary VM testing layers, both important. Pick by what
+the change actually does, not by mood. **Rows below are additive,
+not either/or** — a single change can match several rows (e.g.
+branching logic with a TDD-amenable assertion → write the assertion
+first via `test-driven-development`, then smoke-test in the feature
+VM via `nixos-agent-testing`).
+
+| Change shape | Skill(s) to invoke |
+|--------------|--------------------|
+| Anything that builds — *required* | `nixos-automated-testing` (the assertion gate CI runs on every PR; runs locally before pushing) |
+| Branching logic (`mkIf`, `optionals`, `if`/`case`), multistep scripts (`writeShellApplication`, activation scripts), GUI changes, daemons that need poking — *required pre-PR* | `nixos-agent-testing` (boot the feature VM, drive via SSH/QMP/screencap, capture proof for the PR body) |
+| Pre-implementation planning for non-trivial work | `brainstorming` |
+| While writing the change | `test-driven-development` — extend `tests/dellan-vm.nix` before the code, watch it fail, then make it pass |
+| Before clicking merge on a medium/high-risk PR | `advice-refine-test-loop` — multi-round Opus review with empirical re-verification |
+
+Do not ask the user whether to run these. The only changes that
+legitimately skip `nixos-agent-testing` are those where **no
+downstream code branches on the changed value and no script reads
+it** — e.g. adding a package to `environment.systemPackages`, bumping
+a version pin, fixing a comment. If the change flips a boolean that
+gates an `mkIf`, alters a value an `optionals` reads, modifies a
+script that runs at boot, or changes the input to anything
+conditional anywhere downstream, treat it as branching → run the
+interactive VM. When in doubt, run it; the cost is cheap.
 
 ## What you'll see on the PR
 
