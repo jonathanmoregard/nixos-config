@@ -11,13 +11,16 @@
 #      crashes inside python with "Namespace Gtk not available" /
 #      "Couldn't recognize the image file format".
 #
-#   2. the *reload trigger* — a systemd path unit watching the repo
-#      directory. Any modification (git push from another box that
-#      gets pulled, manual edit, IDE save) restarts autodoro.service
-#      within ~1s. Replaces the older `.githooks/post-push` flow,
-#      which silently no-op'd whenever the user's global
-#      `core.hooksPath` overrode the per-repo hooks dir — see
-#      commit message for the bug history.
+#   2. the *reload trigger* — a `pre-push` git hook installed into
+#      the user's global `~/.config/git/hooks/` dir. Fires only on
+#      `git push` from the autodoro repo and restarts the service.
+#      Replaces the older `.githooks/post-push` flow, which silently
+#      no-op'd: (a) `post-push` is not a real git hook (git only
+#      defines `pre-push`), and (b) the user's global
+#      `core.hooksPath=~/.config/git/hooks` overrode the per-repo
+#      `.githooks/` dir anyway. The hook lives in the global dir
+#      (matching that override) and guards by repo toplevel so it's
+#      a cheap no-op for pushes from any other repo.
 let
   pythonEnv = pkgs.python3.withPackages (ps: with ps; [ pygobject3 ]);
 
@@ -69,8 +72,8 @@ let
   '';
 
   # The actual systemd ExecStart. Sources the env, then execs the
-  # repo script — the script body itself stays in ~/Repos/autodoro and
-  # is reloaded via the path unit below whenever it changes on disk.
+  # repo script — the script body itself stays in ~/Repos/autodoro
+  # and is reloaded via the pre-push git hook below on `git push`.
   launcher = pkgs.writeShellApplication {
     name = "autodoro";
     inherit runtimeInputs;
@@ -102,9 +105,8 @@ in
       After = [ "graphical-session.target" ];
       PartOf = [ "graphical-session.target" ];
       # Cap restarts so a script that segfaults right after a bad
-      # `git pull` doesn't wedge the user's session in a tight
-      # restart loop. autodoro-reload below will re-trigger
-      # whenever the source file is fixed.
+      # push doesn't wedge the user's session in a tight restart
+      # loop. Next push of a fixed script re-triggers the hook.
       StartLimitIntervalSec = 30;
       StartLimitBurst = 5;
     };
@@ -123,43 +125,26 @@ in
     };
   };
 
-  # Watch the autodoro repo for any change and restart the service.
+  # Global pre-push hook → restart autodoro.service after a push from
+  # ~/Repos/autodoro. Lives in the global hooks dir because that's
+  # where the user's `core.hooksPath` (set in home/jonathan.nix)
+  # points; any per-repo `.githooks/` would be silently shadowed.
+  # Guard by `git rev-parse --show-toplevel` so pushes from every
+  # other repo are a cheap no-op.
   #
-  # Uses PathModified= on the *directory* (not PathChanged= on a
-  # specific file): editors that do atomic write-and-rename (vim
-  # default, git checkout, cp -f) replace the file's inode, which
-  # silently kills a watch on the file path itself. Watching the
-  # parent dir survives that.
-  #
-  # TriggerLimitIntervalSec/Burst debounces git-pull, which touches
-  # many files in quick succession — we only want one restart per
-  # batch.
-  systemd.user.paths.autodoro-reload = {
-    Unit.Description = "Watch autodoro sources and reload service";
-    Path = {
-      PathModified = "%h/Repos/autodoro";
-      TriggerLimitIntervalSec = "2s";
-      TriggerLimitBurst = 1;
-      Unit = "autodoro-reload.service";
-    };
-    Install.WantedBy = [ "default.target" ];
-  };
-
-  systemd.user.services.autodoro-reload = {
-    Unit = {
-      Description = "Reload autodoro.service after a source change";
-      # Skip on a fresh machine that hasn't cloned the repo yet —
-      # the path unit can still be installed even if the source
-      # tree is missing.
-      ConditionPathExists = "%h/Repos/autodoro/autodoro.sh";
-    };
-    Service = {
-      Type = "oneshot";
-      # Small sleep so a `git pull` writing several files inside the
-      # debounce window finishes before we restart against
-      # half-rewritten state.
-      ExecStartPre = "${pkgs.coreutils}/bin/sleep 1";
-      ExecStart = "${pkgs.systemd}/bin/systemctl --user restart autodoro.service";
-    };
+  # Fires synchronously inside `git push` and exits 0 unconditionally
+  # so a systemd error does not block the push itself. The restart
+  # is fire-and-forget — by the time the network push completes the
+  # service is already on the new code.
+  home.file.".config/git/hooks/pre-push" = {
+    executable = true;
+    text = ''
+      #!/usr/bin/env bash
+      # Run from any git push; this dispatches on the current repo.
+      if [ "$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null)" = "$HOME/Repos/autodoro" ]; then
+        ${pkgs.systemd}/bin/systemctl --user restart autodoro.service || true
+      fi
+      exit 0
+    '';
   };
 }
