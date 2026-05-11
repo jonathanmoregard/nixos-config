@@ -37,9 +37,22 @@ in
     37 15 * * * /home/jonathan/Repos/superpowers/sync-agent.sh >> /home/jonathan/Repos/superpowers/sync.log 2>&1
   '';
 
+  # `crontab` is a setuid wrapper at /run/wrappers/bin/crontab (provided by
+  # services.cron.enable). Home-manager activation runs with a minimal PATH
+  # that doesn't include /run/wrappers/bin, so `command -v crontab` returned
+  # nothing here and the if-guard silently skipped the reinstall — leaving
+  # the active crontab stale after every `nixos-rebuild switch`. The
+  # backup-sync agent (~/Repos/dotfiles/sync-agent.sh, scheduled daily)
+  # didn't compensate either, because it bails out without gitleaks.
+  # Result: cron entries on disk drifted from the active crontab for days
+  # (caught when wellbeing trackers kept failing with /usr/bin/python3
+  # after the python-path fix had already deployed).
+  #
+  # Test the wrapper path directly. /run/wrappers is set up early in the
+  # boot sequence by setuid-wrapper.service, well before HM activation.
   home.activation.installCrontab = lib.hm.dag.entryAfter ["writeBoundary"] ''
-    if command -v crontab >/dev/null 2>&1; then
-      crontab "$HOME/.config/crontab" || true
+    if [ -x /run/wrappers/bin/crontab ]; then
+      /run/wrappers/bin/crontab "$HOME/.config/crontab" || true
     fi
   '';
 
