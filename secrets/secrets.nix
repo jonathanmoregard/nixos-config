@@ -1,6 +1,12 @@
 let
-  # jonathan's personal SSH key (used from Mint laptop to manage secrets)
-  jonathan = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPf3ZLrzmf0pNSTJS603CaNb6in/ctXc0hZSJ9BflOVl jonathan@nixos-vm";
+  # jonathan's personal SSH key from the Mint-era laptop. Kept as a
+  # recipient until confirmed dead — separate concern from this PR.
+  jonathanMint = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPf3ZLrzmf0pNSTJS603CaNb6in/ctXc0hZSJ9BflOVl jonathan@nixos-vm";
+
+  # jonathan's personal SSH key on dellan (~/.ssh/id_ed25519.pub).
+  # Lets the unprivileged user decrypt .age files locally without
+  # sudo against the root-owned host key.
+  jonathanDellan = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINT9HeHhu82OoNsAHe/QAh116pSEANuZUr1h5m8R8kpp jonathan@dellan";
 
   # VM SSH host key (used by agenix to decrypt secrets at activation time)
   vm = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJaYUR/n99axrFFFr/uv987jwaa6fYik7Ykf9iRSieZV root@nixos-vm";
@@ -8,13 +14,13 @@ let
   # Dellan laptop SSH host key (used by agenix to decrypt secrets at activation time)
   dellan = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJNvaYqBU7k/iTKPHcfVGYz5WJNVWnf0t26SX6Y7SZ0e root@dellan";
 
-  allKeys = [ jonathan vm dellan ];
+  allKeys = [ jonathanMint jonathanDellan vm dellan ];
 
   # Subset of recipients for CI/CD secrets — restrict to dellan host
-  # key + jonathan's editing key. CI itself runs on GitHub-hosted
+  # key + jonathan's editing keys. CI itself runs on GitHub-hosted
   # runners and never decrypts these; only dellan's webhook + deploy
   # unit consumes them.
-  ciKeys = [ jonathan dellan ];
+  ciKeys = [ jonathanMint jonathanDellan dellan ];
 in {
   # ---------------------------------------------------------------------
   # CI/CD workflow secrets.
