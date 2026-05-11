@@ -36,7 +36,7 @@ Enable multiple AI agents to develop NixOS config changes in parallel — each a
 | Repo layout | `~/Repos/nixos-config` is **bare**; all work in `~/Repos/nixos-config-worktrees/<branch>`; `/etc/nixos` is a separate root-owned clone of `origin/main` | Bare repo enforces worktree-only workflow by construction |
 | Triggers | `pull_request` (open/sync) + `push: main` (merge). Branch pushes do NOT trigger CI. | Saves cycles; agents push WIP freely |
 | Classification | Derivation-graph blast radius via `nix store diff-closures` → rule table → bucket → GitHub label | Nix-native; deterministic; sees outcome not source |
-| Branch protection | Legacy Branch Protection (free on public repos) — `required_approving_review_count: 1`, `enforce_admins: false`, `require_last_push_approval: true` | Solo-author admin override via UI's "Merge without waiting"; CLI `gh pr merge --admin` denied at safe-bash MCP layer |
+| Branch protection | Legacy Branch Protection (free on public repos) — required status checks only, `enforce_admins: false`, no required review | Solo-author repo; checks are the gate. CLI `gh pr merge` (any flags) denied at safe-bash MCP layer so merge stays a deliberate UI gesture |
 
 ---
 
