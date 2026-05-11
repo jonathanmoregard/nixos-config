@@ -132,6 +132,32 @@ can't model (touchpad, GPU, LUKS), emergency rollback
   deliberate gesture, not a CLI autopilot
 - `git push --force` — branch protection rejects force-pushes to `main`
 
+## Running long commands (safe-bash 2-min ceiling)
+
+`mcp__safe-bash__exec` defaults to a 120 s timeout (max 600 s) and
+kills the whole process tree on expiry — `nohup ... &` does NOT
+survive. For nix builds, gate runs, feature-VM launches, anything
+that can take longer than two minutes:
+
+```bash
+systemd-run --user --collect --unit=<name>.service \
+  --working-directory=/home/jonathan/Repos/nixos-config-worktrees/<slug> \
+  --property=StandardOutput=file:/tmp/<name>.log \
+  --property=StandardError=append:/tmp/<name>.log \
+  <command...>
+```
+
+Returns immediately; the command runs as a transient user unit.
+Poll later:
+
+```bash
+systemctl --user is-active <name>.service
+tail -25 /tmp/<name>.log
+```
+
+Reset between runs when iterating:
+`systemctl --user reset-failed <name>.service; rm -f /tmp/<name>.log`.
+
 ## Cleanup after PR closes
 
 ```bash

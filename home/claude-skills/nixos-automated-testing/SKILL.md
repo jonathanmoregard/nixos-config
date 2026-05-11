@@ -111,32 +111,6 @@ cheaper layers first:
 Always run the first three before queuing a VM. They catch ~80% of
 mistakes in seconds.
 
-## Avoiding the safe-bash 2-min ceiling
-
-`mcp__safe-bash__exec` defaults to a 120s timeout (max 600s) and kills
-the whole process tree on expiry — `nohup ... &` does NOT survive. To
-run a 2-3min build without losing the output:
-
-```bash
-systemd-run --user --collect --unit=gate-test.service \
-  --working-directory=/etc/nixos \
-  --property=StandardOutput=file:/tmp/gate.log \
-  --property=StandardError=append:/tmp/gate.log \
-  /run/current-system/sw/bin/nix build --no-link --print-build-logs \
-  .#checks.x86_64-linux.dellan-vm
-```
-
-Returns immediately; the build runs as a transient systemd unit. Poll
-later with:
-
-```bash
-systemctl --user is-active gate-test.service
-tail -25 /tmp/gate.log
-```
-
-Reset between runs:
-`systemctl --user reset-failed gate-test.service; rm -f /tmp/gate.log`.
-
 ## Diagnostic dumps in testScript
 
 `print(...)` in the Python `testScript` writes to the test driver's
@@ -185,14 +159,22 @@ phase tears down the VM and you've lost the chance to introspect.
 
 ## What the gate cannot catch
 
-The test exercises systemd activation + binary presence + script logic
-— NOT live UI. Out of scope:
+The test exercises systemd activation + binary presence + script
+logic — NOT live UI, not branching that the script-driven assertions
+don't traverse, not anything requiring real human interaction. Out
+of scope:
 
 - Cinnamon applet rendering bugs
 - HM `home.activation` scripts that write to live `~/.config` and
   clobber existing real files (test starts with a clean home)
 - Behavior that requires a real graphical session (kitty actually
   rendering, X clients connecting, GPU acceleration)
+- Logic branches the test doesn't construct inputs for
 
-For those: gate green → merge → auto-deploy → verify in live session.
-If broken: `sudo nixos-rebuild switch --rollback`.
+For those use the **`nixos-agent-testing`** skill — interactive
+feature VM with SSH/QMP/screencap/sendkey, exact same dellan
+configuration, lets you drive the real code paths and capture
+proof. The two skills are intentional complements: this one is the
+automated assertion gate every PR runs; agent-testing is the
+human-style verification you reach for when assertions alone can't
+prove the change.
