@@ -22,53 +22,85 @@ interactive VM is what you reach for when logic in a change needs
 human-style verification before merge (any branching code or
 multistep script).
 
+## Lanes
+
+One check derivation per feature area. Pick the lane your change
+touches. Adding a lane is cheap (~30 lines + flake.nix wire-up); a
+mixing-pot lane defeats the failure-isolation goal.
+
+| Lane | Source | Covers |
+|---|---|---|
+| `vm-base` | `tests/base.nix` | boot + HM activation + systemd-user default.target |
+| `vm-desktop` | `tests/desktop.nix` | CopyQ + gnome-screenshot + Cinnamon Print/Shift+Print dconf bindings |
+| `vm-keyring` | `tests/keyring.nix` | gnome-keyring PAM wiring on `/etc/pam.d/login` |
+| `vm-kitty` | `tests/kitty.nix` | kitty session save → kill → restore (4-pane 2x2 grid) |
+| `vm-claude-pane` | `tests/claude-pane.nix` | Claude SessionStart hook + enricher → unique `claude_session_id` per pane |
+
+Shared node config lives in `tests/lib/common.nix` — imports
+`hosts/dellan/default.nix`, sets autoLogin/linger/virtualisation,
+and exports `mkTest { name, testScript }`. Each lane is ~20 lines of
+boilerplate + its own testScript.
+
 ## Run the gate locally
 
 From a worktree:
 
 ```bash
 cd ~/Repos/nixos-config-worktrees/<your-branch>
-nix build .#checks.x86_64-linux.dellan-vm -L
+
+# Single lane (fastest feedback loop while iterating):
+nix build .#checks.x86_64-linux.vm-base -L
+nix build .#checks.x86_64-linux.vm-kitty -L
+
+# All lanes (= what CI runs across its matrix):
+nix flake check -L
 ```
 
-`-L` streams test-driver stdout. ~90 sec warm, ~3 min cold. Boots an
-ephemeral QEMU VM, asserts HM activation, X session, kitty topology,
-keyring PAM, etc. Pass → green. Fail → traceback in stdout.
+`-L` streams test-driver stdout. Per-lane boot ~30s; whole VM run
+~90s warm / ~3min cold. Lanes share the same node closure so the
+first lane warms the cache for the rest. Pass → green. Fail →
+traceback in stdout.
 
-CI runs the same gate on every PR (status check `vm-minimal (1..3)`),
-so local invocation is for fast iteration before pushing.
+CI runs each lane as its own matrix job (`vm-minimal (<lane>)`); a
+broken `kitty` lane doesn't block `keyring` reporting status.
+`fail-fast: false` keeps every lane reporting even after one breaks.
 
-## When to extend the test
+## When to extend a test (and which one)
 
-| Change | Add to `tests/dellan-vm.nix` |
-|--------|------------------------------|
-| HM-installed binary on PATH | `dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/<name>")` |
-| systemd user unit | `dellan.wait_for_unit("<name>", "jonathan")` |
-| systemd system unit | `dellan.wait_for_unit("<name>")` |
-| Script with deterministic behavior | `dellan.succeed("su jonathan -c '<cmd>'")` |
-| New file rendered by HM | `dellan.succeed("test -f /home/jonathan/<path>")` |
+Pick the lane closest to what you changed. If your change touches
+something new with no obvious home, add a new lane file rather than
+piling onto `vm-base`.
+
+| Change | Lane | Assertion shape |
+|--------|------|-----------------|
+| HM-installed binary on PATH | the matching feature lane | `dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/<name>")` |
+| systemd user unit | the matching feature lane | `dellan.wait_for_unit("<name>", "jonathan")` |
+| systemd system unit | the matching feature lane | `dellan.wait_for_unit("<name>")` |
+| Script with deterministic behavior | the matching feature lane | `dellan.succeed("su jonathan -c '<cmd>'")` |
+| New file rendered by HM | the matching feature lane | `dellan.succeed("test -f /home/jonathan/<path>")` |
+| Whole new feature area | new `tests/<feature>.nix` + wire into `flake.nix` `checks` block + add to `ci.yml` matrix | use one of the small lanes (keyring/base) as a template |
 
 ## When to skip the gate
 
 - Pure hardware-config edits (`hardware-configuration.nix`, real-disk
   LUKS, GPU drivers, touchpad firmware) — VM can't model them.
 - Comment-only / formatting changes — eval check is enough:
-  `nix eval .#checks.x86_64-linux.dellan-vm.drvPath`.
+  `nix eval .#checks.x86_64-linux.vm-base.drvPath`.
 
 For everything else (HM packages, modules, services, scripts, secrets
 wiring, overlays): run the gate.
 
 ## Iterating fast — cheap checks before the gate
 
-Each VM-gate run costs ~90-180s. Burn fewer cycles by pruning errors at
+Each lane costs ~90-180s. Burn fewer cycles by pruning errors at
 cheaper layers first:
 
 | Cost | Command | Catches |
 |------|---------|---------|
-| ~1s | `nix eval --no-warn-dirty .#checks.x86_64-linux.dellan-vm.drvPath` | Nix syntax + module type errors |
+| ~1s | `nix eval --no-warn-dirty .#checks.x86_64-linux.vm-base.drvPath` | Nix syntax + module type errors (any lane works; pick one that builds fast) |
 | ~5-30s | `nix build --no-link --print-out-paths .#nixosConfigurations.dellan.config.home-manager.users.jonathan.home.path` | Generated scripts compile (writeShellApplication shellcheck, writePython3Bin lint) |
 | ~5s | Read `<home-path-out>/bin/<wrapper>` | Heredoc escaping, shebang at byte 0, paths interpolated correctly |
-| ~90-180s | `nix build .#checks.x86_64-linux.dellan-vm -L` | Real boot, real X session, real systemd-user, real assertions |
+| ~90-180s | `nix build .#checks.x86_64-linux.vm-<feature> -L` | Real boot, real X session, real systemd-user, real assertions for that lane |
 
 Always run the first three before queuing a VM. They catch ~80% of
 mistakes in seconds.

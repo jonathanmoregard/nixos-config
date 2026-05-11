@@ -81,15 +81,28 @@ Public repo = unlimited free minutes. KVM nested-virt is ~30-50% slower than bar
 
 ## VM e2e tests
 
-CI runs `nix build .#checks.x86_64-linux.dellan-vm` automatically on every PR via the `vm-minimal` job. Required status check: `vm-minimal`.
+CI runs every check derivation on every PR via the `vm-minimal` matrix job. One lane per feature, one VM boot per lane — a failure in `kitty` doesn't block `keyring` reporting. Lanes:
+
+| Lane | Source | Covers |
+|---|---|---|
+| `vm-base` | `tests/base.nix` | boot + HM activation + systemd-user default.target |
+| `vm-desktop` | `tests/desktop.nix` | CopyQ + gnome-screenshot + Cinnamon Print/Shift+Print dconf bindings |
+| `vm-keyring` | `tests/keyring.nix` | gnome-keyring PAM wiring on `/etc/pam.d/login` |
+| `vm-kitty` | `tests/kitty.nix` | kitty session save → kill → restore (4-pane 2x2 grid) |
+| `vm-claude-pane` | `tests/claude-pane.nix` | Claude SessionStart hook + enricher → unique `claude_session_id` per pane |
+
+Shared scaffolding (node config, host import) lives in `tests/lib/common.nix`. Each lane file calls `mkTest { name; testScript; }` and writes only its assertions.
+
+Required status checks: `vm-minimal (base)`, `vm-minimal (desktop)`, `vm-minimal (keyring)`, `vm-minimal (kitty)`, `vm-minimal (claude-pane)`.
 
 To run locally for debugging:
 ```bash
 cd ~/Repos/nixos-config-worktrees/<your-branch>
-nix build .#checks.x86_64-linux.dellan-vm -L
+nix build .#checks.x86_64-linux.vm-base -L          # single lane
+nix flake check -L                                  # all lanes
 ```
 
-`tests/dellan-vm.nix` is the test source. When adding HM units / scripts / systemd timers, add an assertion there. Skip only for hardware-specific config the VM can't model (touchpad, GPU, LUKS, real disks).
+Adding a new test: drop `tests/<feature>.nix` (use existing files as templates), wire it into `flake.nix`'s `checks` block, and add the lane name to the matrix in `.github/workflows/ci.yml`. Skip only for hardware-specific config the VM can't model (touchpad, GPU, LUKS, real disks).
 
 **Architecture note:** `nixpkgs.config.allowUnfree` and `nixpkgs.overlays` live in `flake.nix` (built into `pkgsLinux` / `pkgsDarwin`). Setting them inside modules conflicts with `runNixOSTest`'s read-only nixpkgs injection.
 
@@ -100,7 +113,7 @@ nix build .#checks.x86_64-linux.dellan-vm -L
 | `verify-fork-guards` | Asserts every PR-triggered workflow has a fork-guard predicate |
 | `flake check (eval)` | `nix flake check --no-build --all-systems` |
 | `build dellan toplevel` | Builds `nixosConfigurations.dellan.config.system.build.toplevel` |
-| `vm-minimal` | Ephemeral VM e2e test; same as `nix build .#checks.x86_64-linux.dellan-vm` |
+| `vm-minimal (<lane>)` | Ephemeral VM e2e test; one matrix lane per `tests/<feature>.nix` (base / desktop / keyring / kitty / claude-pane) |
 | `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |
 
 Branch protection: required status checks (above) are the gate. No required review on this solo-author repo. All `gh pr merge` invocations (including no flags) are denied at the safe-bash MCP layer — merges happen via the GitHub UI's merge button so the click is a deliberate gesture, not a CLI autopilot path past the checks.
