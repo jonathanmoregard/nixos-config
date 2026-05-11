@@ -68,27 +68,29 @@
       # inside the VM reads the file via host-jonathan's credentials
       # — required because the privkey is mode 0600 jonathan-only and
       # `mapped-xattr` would enforce VM-side uid checks. The matching
-      # fileSystems entry below mounts the export at /mnt/host-ssh.
+      # mount entry below lives in `virtualisation.fileSystems`
+      # (qemu-vm.nix overrides the top-level `fileSystems` wholesale
+      # with `mkVMOverride`, but merges siblings of
+      # `virtualisation.fileSystems` at the same priority).
       qemu.options = [
         "-virtfs"
         "local,path=/home/jonathan/.ssh,security_model=none,mount_tag=host-ssh"
       ];
-    };
 
-    # Mount the host-ssh 9p export read-only at /mnt/host-ssh. The
-    # `neededForBoot = true` flag ensures the mount lands before
-    # `system.activationScripts.agenix` runs (activation needs to read
-    # the privkey from this mount).
-    fileSystems."/mnt/host-ssh" = {
-      device = "host-ssh";
-      fsType = "9p";
-      options = [
-        "trans=virtio"
-        "version=9p2000.L"
-        "msize=16384"
-        "ro"
-      ];
-      neededForBoot = true;
+      # Mount the host-ssh 9p export read-only at /mnt/host-ssh.
+      # `neededForBoot = true` ensures it lands in initrd before
+      # agenix activation (stage-1) reads the privkey.
+      fileSystems."/mnt/host-ssh" = {
+        device = "host-ssh";
+        fsType = "9p";
+        options = [
+          "trans=virtio"
+          "version=9p2000.L"
+          "msize=16384"
+          "ro"
+        ];
+        neededForBoot = true;
+      };
     };
 
     # Point agenix at the host privkey 9p-mounted above. jonathan@dellan
