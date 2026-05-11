@@ -316,6 +316,19 @@ pkgs.testers.runNixOSTest {
     # opens/appends/closes per write, so the scan returned None and
     # the snapshot fell through to latest-by-mtime — exactly the bug.
 
+    # Stop the periodic snapshotter — its enricher would race phase 6
+    # by pruning our synthetic window ids (101, 102) because they
+    # aren't in the real kitty's live-window set, and the resulting
+    # TSV would be missing rows by the time we assert on them.
+    # Production timer is OnBootSec=30s + OnUnitActiveSec=60s, well
+    # inside this test's ~100s wall time. `--machine=jonathan@.host`
+    # is what `wait_for_unit("...", "jonathan")` uses under the hood;
+    # `su -` alone doesn't set XDG_RUNTIME_DIR in this test VM.
+    dellan.succeed(
+        "systemctl --machine=jonathan@.host --user "
+        "stop kitty-session-save.timer"
+    )
+
     tsv = "/home/jonathan/.cache/kitty-session/pane-sessions.tsv"
     sid_a = "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     sid_b = "bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -412,6 +425,8 @@ pkgs.testers.runNixOSTest {
     )
 
     # --- 6b: enricher reads TSV and attaches id keyed by kitty window id.
+    print("[diag phase6b] TSV right before enricher call:\n"
+          + dellan.succeed(f"cat {tsv}"))
     fake_ls = json.dumps([{
         "tabs": [{
             "windows": [
