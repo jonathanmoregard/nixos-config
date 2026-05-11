@@ -3,7 +3,7 @@
   # NB: `nixpkgs.config.allowUnfree` and `nixpkgs.overlays` live in
   # flake.nix at the pkgs-construction level. Setting them here would
   # make the test framework's externally-injected pkgs read-only conflict
-  # with the modules. See tests/dellan-vm.nix.
+  # with the modules. See tests/lib/common.nix and tests/*.nix.
 
   # Packages available on all machines.
   #
