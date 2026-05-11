@@ -1,8 +1,29 @@
 # Proposal: split monolithic dellan-vm.nix into per-feature checks
 
-**Status:** proposed
+**Status:** implemented 2026-05-11 (different shape than proposed — see below)
 **Date:** 2026-05-04
 **Driven by:** autodoro test block fails after round-7 CI/CD modules land; one failing assertion blocks the entire VM gate, including unrelated CI/CD checks.
+
+## Shipped shape (2026-05-11)
+
+5 lanes, no aggregate, `vm-<feature>` naming (not `dellan-vm-*`):
+
+- `vm-base` (`tests/base.nix`) — boot + HM activation
+- `vm-desktop` (`tests/desktop.nix`) — Cinnamon screenshot/clipboard plumbing
+- `vm-keyring` (`tests/keyring.nix`) — PAM gnome-keyring
+- `vm-kitty` (`tests/kitty.nix`) — session save/restore
+- `vm-claude-pane` (`tests/claude-pane.nix`) — Phase 6 hook + enricher
+
+`tests/lib/common.nix` exports `mkTest { name; testScript }`. CI matrix in `.github/workflows/ci.yml` enumerates lanes; one job per lane (`vm-minimal (<lane>)`).
+
+Differences from original proposal:
+- No `dellan-vm` aggregate `symlinkJoin` — CI matrix supersedes it; one less indirection.
+- Dropped `dellan-` prefix from lane names — every check is x86_64-linux and dellan-derived; the prefix was redundant.
+- No `autodoro.nix` lane (test block was deleted from the monolith pre-split; restore in a follow-up PR).
+- No `cicd.nix` lane (webhook/auto-deploy logic has no e2e assertion; add when it does).
+- Path-filter (`dorny/paths-filter`) deferred — every lane runs every PR for now; filter when wall-clock becomes a problem.
+
+Original 2026-05-04 plan preserved below for context.
 
 ## Goal
 
