@@ -1,4 +1,4 @@
-{ config, lib, pkgs, microvm, ... }:
+{ config, lib, pkgs, ... }:
 # research-agent microvm — replaces the docker-based
 # research-agent-container.service.
 #
@@ -16,10 +16,13 @@
 # enforced by bwrap inside the VM, exactly as in the docker era.
 {
   microvm.vms.research-agent = {
-    flake = ../..;  # path to this nixos-config flake root
+    # Fully-declarative VM (`config` set inline below). The host's
+    # `microvm.nixosModules.host` already injects the guest microvm
+    # module for declarative VMs — importing it explicitly here would
+    # define `microvm.runner.qemu` twice. `flake = ...` is mutually
+    # exclusive with `config` and would fail assertion
+    # `Fully-declarative VMs cannot also set a flake!`.
     config = { config, pkgs, ... }: {
-
-      imports = [ microvm.nixosModules.microvm ];
 
       microvm = {
         hypervisor = "qemu";
@@ -64,13 +67,13 @@
       };
 
       # System packages — replaces Dockerfile apt + pip layer.
+      # Note: `exa-py` and `tavily-python` from the old Dockerfile are
+      # dropped — both shims at agent/shims/{exa,tavily}_shim.py use
+      # `curl_cffi` directly (bypasses the SDKs entirely).
       environment.systemPackages = with pkgs; [
         bubblewrap
         claude-code
-        python3
-        python3Packages.curl-cffi
-        python3Packages.exa-py
-        python3Packages.tavily-python
+        (python3.withPackages (ps: with ps; [ curl-cffi ]))
       ];
 
       # Pin agent uid to 1000 so virtiofs passthrough lines up with

@@ -10,13 +10,14 @@
     agenix.url = "github:ryantm/agenix";
     agenix.inputs.nixpkgs.follows = "nixpkgs";
 
-    # microvm.nix — qemu+KVM microvm host module. Pinned to a release
-    # tag because upstream `main` has historically renamed options
-    # (`microvm.shares` schema, hypervisor defaults). Bumping the pin
-    # is a deliberate PR with a re-run dellan-vm test; security fixes
-    # for qemu/kernel/virtiofsd flow through nixpkgs, not this input.
-    # .github/workflows/update-microvm-pin.yml watches for new tags.
-    microvm.url = "github:astro/microvm.nix/v0.5.0";
+    # microvm.nix — qemu+KVM microvm host module. Tracking `main`
+    # because the most recent tagged release (v0.5.0, 2024-04) calls
+    # `pkgs.writeReferencesToFile` which has been removed in current
+    # nixpkgs. flake.lock pins the exact SHA so the build remains
+    # reproducible; bumping via `nix flake update microvm` is a
+    # deliberate PR with a re-run dellan-vm test.
+    # .github/workflows/update-microvm-pin.yml watches for new commits.
+    microvm.url = "github:astro/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
 
