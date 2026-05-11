@@ -187,5 +187,9 @@
           program = "${screencap}/bin/feature-vm-screencap";
         };
       };
+
+    # `nix run .#update-beeper` — rewrites overlays/beeper.nix to the latest
+    # upstream Beeper release. Wired into .github/workflows/update-beeper.yml.
+    packages.${linuxSystem}.update-beeper = pkgsLinux.beeper-update;
   };
 }

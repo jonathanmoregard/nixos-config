@@ -15,6 +15,7 @@ in
     xdotool
     scrot
     xbindkeys
+    copyq
   ];
 
   # Notification sound
@@ -52,6 +53,19 @@ in
     Type=Application
     Name=xbindkeys
     Exec=${pkgs.xbindkeys}/bin/xbindkeys
+    Hidden=false
+    X-GNOME-Autostart-enabled=true
+  '';
+
+  # CopyQ clipboard manager autostart — without a clipboard manager,
+  # gnome-screenshot --clipboard (Cinnamon Ctrl+Print binding) writes
+  # to the X11 CLIPBOARD selection but the data dies when
+  # gnome-screenshot exits since no app holds the selection.
+  home.file.".config/autostart/copyq.desktop".text = ''
+    [Desktop Entry]
+    Type=Application
+    Name=CopyQ
+    Exec=${pkgs.copyq}/bin/copyq
     Hidden=false
     X-GNOME-Autostart-enabled=true
   '';
@@ -275,6 +289,7 @@ in
       font-hinting = "slight";
       monospace-font-name = "DejaVu Sans Mono 10";
       document-font-name = "Sans 10";
+      color-scheme = "prefer-dark";
     };
 
     "org/gnome/desktop/sound" = {

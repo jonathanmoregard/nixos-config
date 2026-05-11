@@ -204,10 +204,11 @@ let
     def maybe_resume_claude(cmd, cwd, session_id=None):
         """If cmd is the claude-code CLI, rewrite to resume the correct
         session. Prefers the per-pane session_id captured at snapshot time
-        (via /proc/<pid>/fd/ → open .jsonl); falls back to latest-by-mtime
-        for the cwd when no per-pane id is available, OR when the named
-        session's jsonl no longer exists (user pruned it between snapshot
-        and restore)."""
+        (TSV populated by the SessionStart hook claude-kitty-pane-record,
+        keyed by kitty window id and joined in by kitty-session-enrich);
+        falls back to latest-by-mtime for the cwd when no per-pane id is
+        available, OR when the named session's jsonl no longer exists
+        (user pruned it between snapshot and restore)."""
         if not cmd:
             return cmd
         if os.path.basename(cmd[0]) != "claude":
@@ -320,74 +321,205 @@ let
         main()
   '';
 
+  # Claude Code SessionStart hook: record (kitty_window_id, session_id, cwd)
+  # to pane-sessions.tsv. Consumed by kitty-session-enrich at snapshot time
+  # to attach a `claude_session_id` to each pane in `kitty @ ls` JSON, so
+  # restore can re-resume the *same* session per pane (not just the latest
+  # one in the cwd).
+  #
+  # Mechanism replaces the earlier /proc/<pid>/fd scan, which assumed
+  # `claude` keeps its session jsonl fd open — empirically it does not
+  # (open/append/close per write), so the scan returned None and same-cwd
+  # panes collapsed onto the latest-by-mtime fallback.
+  #
+  # Hook input: JSON on stdin from Claude Code with { session_id, cwd, ... }.
+  # Required env: KITTY_WINDOW_ID (kitty injects this for every launched
+  # window). Silent no-op outside kitty so the hook is safe to wire
+  # globally.
+  claudeKittyPaneRecord = pkgs.writeShellApplication {
+    name = "claude-kitty-pane-record";
+    runtimeInputs = with pkgs; [ jq coreutils util-linux gawk ];
+    text = ''
+      set -euo pipefail
+
+      # Outside kitty → nothing to record.
+      [ -n "''${KITTY_WINDOW_ID:-}" ] || exit 0
+
+      input=$(cat)
+      session_id=$(printf '%s' "$input" | jq -r '.session_id // empty')
+      cwd=$(printf '%s' "$input" | jq -r '.cwd // empty')
+
+      # Reject malformed input — TSV consumers rely on UUID-shaped sids.
+      case "$session_id" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+        *) exit 0 ;;
+      esac
+      [ -n "$cwd" ] || exit 0
+      # Reject window ids that would corrupt the TSV (tab is field sep).
+      case "$KITTY_WINDOW_ID" in
+        '''|*[!0-9]*) exit 0 ;;
+      esac
+
+      dir="''${XDG_CACHE_HOME:-$HOME/.cache}/kitty-session"
+      tsv="$dir/pane-sessions.tsv"
+      mkdir -p "$dir"
+
+      # flock guards concurrent SessionStart hooks (e.g. two new claude
+      # sessions starting in the same second) AND the enricher's
+      # prune_tsv (which takes the same lock from Python). Replace any
+      # existing entry for this window_id, then atomically rename into
+      # place. The trap cleans up the tmp file if any step between
+      # mktemp and the final mv fails — mv consumes the source path,
+      # so on success the trap's `rm -f` is a no-op.
+      (
+        flock -x 9
+        tmp=$(mktemp -p "$dir" ".pane-sessions.tsv.XXXX")
+        trap 'rm -f "$tmp"' EXIT
+        if [ -f "$tsv" ]; then
+          awk -F'\t' -v wid="$KITTY_WINDOW_ID" '$1 != wid' "$tsv" > "$tmp"
+        fi
+        printf '%s\t%s\t%s\t%s\n' \
+          "$KITTY_WINDOW_ID" "$session_id" "$cwd" "$(date +%s)" >> "$tmp"
+        mv "$tmp" "$tsv"
+      ) 9>"$dir/.pane-sessions.lock"
+    '';
+  };
+
   # Enrich `kitty @ ls` JSON with per-pane Claude Code session IDs.
   # Multiple `claude` panes in the same cwd are indistinguishable from
   # cmdline+cwd alone (cmdline is just `claude`, cwd matches), so on
   # restore the latest-by-mtime fallback would collapse them all onto
-  # the same session. To disambiguate, walk /proc/<pid>/fd/ for each
-  # claude foreground process and grab the open `.jsonl` under
-  # ~/.claude/projects/<encoded-cwd>/ — the filename stem is the
-  # session id. Captured at snapshot time because the claude processes
-  # are dead by the time restore runs.
+  # the same session. To disambiguate, look up each pane's
+  # claude_session_id in pane-sessions.tsv (populated by the Claude Code
+  # SessionStart hook, claude-kitty-pane-record). Keyed by kitty's
+  # `id` field — the same value claude sees as $KITTY_WINDOW_ID.
+  #
+  # Pruning: TSV entries whose window_id is not in the current live set
+  # are removed on every enrich run, keeping the TSV bounded by current
+  # pane count (≤ a few hundred lines in pathological cases).
   kittySessionEnrich = pkgs.writers.writePython3Bin "kitty-session-enrich" {} ''
+    import fcntl
     import json
     import os
     import re
     import sys
+    import tempfile
 
-    # Tight UUID match — Claude session ids are canonical UUID4
-    # (8-4-4-4-12 lowercase hex). A looser pattern would over-match if
-    # claude (or another tool) ever writes adjacent jsonl logs whose
-    # filenames happen to be 8+ hex/dash chars.
-    SESSION_RE = re.compile(
-        r"/\.claude/projects/[^/]+/"
-        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-        r"[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
+    # Test-only seam: KITTY_ENRICH_TSV is honored only when
+    # KITTY_ENRICH_TEST=1 is also set, so a stray export in a user's
+    # shell rc can't silently re-route lookups in production.
+    DEFAULT_TSV = os.path.join(
+        os.environ.get(
+            "XDG_CACHE_HOME",
+            os.path.join(os.path.expanduser("~"), ".cache"),
+        ),
+        "kitty-session",
+        "pane-sessions.tsv",
+    )
+    if os.environ.get("KITTY_ENRICH_TEST") == "1":
+        TSV_PATH = os.environ.get("KITTY_ENRICH_TSV", DEFAULT_TSV)
+    else:
+        TSV_PATH = DEFAULT_TSV
+
+    UUID_RE = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12}$"
     )
 
-    # Test-only seam: KITTY_ENRICH_PROC_ROOT is honored only when
-    # KITTY_ENRICH_TEST=1 is also set. This way a stray export of
-    # PROC_ROOT in a user's shell rc can't silently re-route /proc
-    # lookups in production.
-    if os.environ.get("KITTY_ENRICH_TEST") == "1":
-        PROC_ROOT = os.environ.get("KITTY_ENRICH_PROC_ROOT", "/proc")
-    else:
-        PROC_ROOT = "/proc"
 
-
-    def claude_session_for_pid(pid):
-        if not pid:
-            return None
-        fd_dir = f"{PROC_ROOT}/{pid}/fd"
+    def load_tsv():
+        """Return {window_id: session_id}. Malformed lines ignored."""
+        if not os.path.isfile(TSV_PATH):
+            return {}
+        out = {}
         try:
-            entries = os.listdir(fd_dir)
+            with open(TSV_PATH) as fh:
+                for line in fh:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 2:
+                        continue
+                    wid, sid = parts[0], parts[1]
+                    if not wid.isdigit() or not UUID_RE.match(sid):
+                        continue
+                    out[int(wid)] = sid
         except OSError:
-            return None
-        for fd in entries:
+            return {}
+        return out
+
+
+    def prune_tsv(live_window_ids):
+        """Drop TSV entries for windows no longer in `kitty @ ls`.
+
+        Holds the same flock the SessionStart hook
+        (claude-kitty-pane-record) takes, so a concurrent row append
+        can't slip in between our read and our atomic replace and get
+        silently dropped. Window without the lock was ~ms but real.
+        """
+        if not os.path.isfile(TSV_PATH):
+            return
+        d = os.path.dirname(TSV_PATH)
+        lock_path = os.path.join(d, ".pane-sessions.lock")
+        try:
+            lock_fh = open(lock_path, "w")
+        except OSError:
+            return
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
             try:
-                target = os.readlink(os.path.join(fd_dir, fd))
+                with open(TSV_PATH) as fh:
+                    lines = fh.readlines()
             except OSError:
-                continue
-            m = SESSION_RE.search(target)
-            if m:
-                return m.group(1)
-        return None
+                return
+            kept = []
+            for line in lines:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2:
+                    continue
+                wid = parts[0]
+                if wid.isdigit() and int(wid) in live_window_ids:
+                    kept.append(line)
+            if len(kept) == len(lines):
+                return
+            try:
+                fd, tmp = tempfile.mkstemp(
+                    dir=d, prefix=".pane-sessions.tsv."
+                )
+            except OSError:
+                return
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    fh.writelines(kept)
+                os.replace(tmp, TSV_PATH)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        finally:
+            lock_fh.close()
 
 
     def enrich(data):
+        tsv = load_tsv()
+        live = set()
         for osw in data:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
-                    for fp in win.get("foreground_processes") or []:
-                        cmd = fp.get("cmdline") or []
-                        if not cmd:
-                            continue
-                        if os.path.basename(cmd[0]) != "claude":
-                            continue
-                        sid = claude_session_for_pid(fp.get("pid"))
-                        if sid:
-                            win["claude_session_id"] = sid
-                            break
+                    wid = win.get("id")
+                    if isinstance(wid, int):
+                        live.add(wid)
+                    fg = win.get("foreground_processes") or []
+                    has_claude = any(
+                        os.path.basename((fp.get("cmdline") or [""])[0])
+                        == "claude"
+                        for fp in fg
+                    )
+                    if not has_claude:
+                        continue
+                    sid = tsv.get(wid) if isinstance(wid, int) else None
+                    if sid:
+                        win["claude_session_id"] = sid
+        prune_tsv(live)
         return data
 
 
@@ -515,6 +647,7 @@ in
     kittySessionConvert
     kittySessionEnrich
     kittySessionSave
+    claudeKittyPaneRecord
     # WIP, not yet wired in (see wrapper above):
     kittyPaneAdd
     kittyRestoreSession
