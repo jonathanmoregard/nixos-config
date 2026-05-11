@@ -86,8 +86,12 @@ jobs:
             printf '%s\n' "$unsafe" | head -20 | sed 's/^/  /'
           fi
 
-      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      - name: Mount /nix on /mnt loopback (replaces free-disk-space)
+        # See scripts/mount-nix-loop.sh — fallocate + mkfs.ext4 + loop
+        # mount /mnt/nix.img to /nix. ~5s vs free-disk-space's ~3min
+        # of /usr/share/dotnet etc scrubbing.
         if: steps.preflight.outputs.risk == ''
+        run: ./scripts/mount-nix-loop.sh
       - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
         if: steps.preflight.outputs.risk == ''
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
