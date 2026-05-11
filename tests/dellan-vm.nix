@@ -83,6 +83,26 @@ pkgs.testers.runNixOSTest {
     # before the test reaches autodoro's loadstate check. Investigate
     # separately; restore from git history (commit 9eb65ba) once fixed.
 
+    # === autodoro path-unit reload ===
+    # File-level assertions only — same `systemctl --user` timing
+    # issue noted above prevents probing the unit via the bus. We
+    # check that HM rendered both the path watcher and the reload
+    # service, and that the path unit watches the right directory.
+    autodoro_dir = "/home/jonathan/.config/systemd/user"
+    dellan.succeed(f"test -f {autodoro_dir}/autodoro.service")
+    dellan.succeed(f"test -f {autodoro_dir}/autodoro-reload.path")
+    dellan.succeed(f"test -f {autodoro_dir}/autodoro-reload.service")
+    # %h is the systemd specifier — systemd expands it to $HOME at
+    # unit-load time, so the file on disk literally contains "%h".
+    dellan.succeed(
+        f"grep -q 'PathModified=%h/Repos/autodoro' "
+        f"{autodoro_dir}/autodoro-reload.path"
+    )
+    dellan.succeed(
+        f"grep -q 'systemctl --user restart autodoro.service' "
+        f"{autodoro_dir}/autodoro-reload.service"
+    )
+
     # gnome-keyring PAM wiring — guarantees `passwd` re-keys the login
     # keyring instead of leaving Chrome stuck on the old encryption pw.
     # lightdm substacks login, so login is the load-bearing file.

@@ -2,13 +2,22 @@
 # Autodoro pomodoro timer.
 #
 # The script lives in ~/Repos/autodoro and is iterated on outside this
-# flake (post-push hook auto-restarts the service). The Nix side here
-# only owns the launch *environment*: a wrapper that injects every
-# binary and GI/pixbuf path the script's bash + python3+gi code needs
-# at runtime. NixOS has no /bin/bash and no global GI typelib, so
-# without this wrapper the service either exits 203/EXEC or crashes
-# inside python with "Namespace Gtk not available" / "Couldn't
-# recognize the image file format".
+# flake. The Nix side here owns:
+#
+#   1. the launch *environment* — a wrapper that injects every binary
+#      and GI/pixbuf path the script's bash + python3+gi code needs at
+#      runtime. NixOS has no /bin/bash and no global GI typelib, so
+#      without this wrapper the service either exits 203/EXEC or
+#      crashes inside python with "Namespace Gtk not available" /
+#      "Couldn't recognize the image file format".
+#
+#   2. the *reload trigger* — a systemd path unit watching the repo
+#      directory. Any modification (git push from another box that
+#      gets pulled, manual edit, IDE save) restarts autodoro.service
+#      within ~1s. Replaces the older `.githooks/post-push` flow,
+#      which silently no-op'd whenever the user's global
+#      `core.hooksPath` overrode the per-repo hooks dir — see
+#      commit message for the bug history.
 let
   pythonEnv = pkgs.python3.withPackages (ps: with ps; [ pygobject3 ]);
 
@@ -60,8 +69,8 @@ let
   '';
 
   # The actual systemd ExecStart. Sources the env, then execs the
-  # repo script so the post-push reload path keeps working without a
-  # rebuild.
+  # repo script — the script body itself stays in ~/Repos/autodoro and
+  # is reloaded via the path unit below whenever it changes on disk.
   launcher = pkgs.writeShellApplication {
     name = "autodoro";
     inherit runtimeInputs;
@@ -92,11 +101,18 @@ in
       Description = "Autodoro pomodoro timer";
       After = [ "graphical-session.target" ];
       PartOf = [ "graphical-session.target" ];
+      # Cap restarts so a script that segfaults right after a bad
+      # `git pull` doesn't wedge the user's session in a tight
+      # restart loop. autodoro-reload below will re-trigger
+      # whenever the source file is fixed.
+      StartLimitIntervalSec = 30;
+      StartLimitBurst = 5;
     };
     Service = {
       ExecStart = "${launcher}/bin/autodoro";
       ExecCondition = "/bin/sh -c 'test -f %h/Repos/autodoro/autodoro.sh'";
       Restart = "on-failure";
+      RestartSec = "2s";
       Environment = [
         "DISPLAY=:0"
         "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
@@ -104,6 +120,46 @@ in
     };
     Install = {
       WantedBy = [ "graphical-session.target" ];
+    };
+  };
+
+  # Watch the autodoro repo for any change and restart the service.
+  #
+  # Uses PathModified= on the *directory* (not PathChanged= on a
+  # specific file): editors that do atomic write-and-rename (vim
+  # default, git checkout, cp -f) replace the file's inode, which
+  # silently kills a watch on the file path itself. Watching the
+  # parent dir survives that.
+  #
+  # TriggerLimitIntervalSec/Burst debounces git-pull, which touches
+  # many files in quick succession — we only want one restart per
+  # batch.
+  systemd.user.paths.autodoro-reload = {
+    Unit.Description = "Watch autodoro sources and reload service";
+    Path = {
+      PathModified = "%h/Repos/autodoro";
+      TriggerLimitIntervalSec = "2s";
+      TriggerLimitBurst = 1;
+      Unit = "autodoro-reload.service";
+    };
+    Install.WantedBy = [ "default.target" ];
+  };
+
+  systemd.user.services.autodoro-reload = {
+    Unit = {
+      Description = "Reload autodoro.service after a source change";
+      # Skip on a fresh machine that hasn't cloned the repo yet —
+      # the path unit can still be installed even if the source
+      # tree is missing.
+      ConditionPathExists = "%h/Repos/autodoro/autodoro.sh";
+    };
+    Service = {
+      Type = "oneshot";
+      # Small sleep so a `git pull` writing several files inside the
+      # debounce window finishes before we restart against
+      # half-rewritten state.
+      ExecStartPre = "${pkgs.coreutils}/bin/sleep 1";
+      ExecStart = "${pkgs.systemd}/bin/systemctl --user restart autodoro.service";
     };
   };
 }
