@@ -94,6 +94,14 @@ pkgs.testers.runNixOSTest {
     dellan.succeed("grep -q 'auth.*pam_gnome_keyring' /etc/pam.d/login")
     dellan.succeed("grep -q 'session.*pam_gnome_keyring' /etc/pam.d/login")
 
+    # CopyQ clipboard manager — binary on PATH + autostart .desktop present.
+    # Required for gnome-screenshot --clipboard (Cinnamon Ctrl+Print) to
+    # persist screenshots in CLIPBOARD after gnome-screenshot exits.
+    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/copyq")
+    dellan.succeed(
+        "test -f /home/jonathan/.config/autostart/copyq.desktop"
+    )
+
     # HM-installed binaries on user PATH
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty")
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty-session-save")
@@ -301,79 +309,137 @@ pkgs.testers.runNixOSTest {
     # Two `claude` panes in the same cwd must each get their own
     # claude_session_id attached to the corresponding window in
     # snapshot.json. Without per-pane id, the latest-by-mtime fallback
-    # collapses both panes onto whichever .jsonl is newest, yielding a
-    # duplicate session on restore instead of the user's two distinct
-    # ones.
+    # in maybe_resume_claude collapses both onto whichever .jsonl is
+    # newest, yielding a duplicate session on restore instead of the
+    # user's two distinct ones.
     #
-    # Faking real claude processes inside the test VM (argv[0]="claude"
-    # AND an open jsonl fd visible via /proc/<pid>/fd) proved fragile —
-    # coreutils-multicall trips up `exec -a`, and
-    # systemd-run/su/setsid backgrounding interacts unpredictably with
-    # dellan.succeed's wait-for-EOF semantics. Instead, the enricher
-    # supports a KITTY_ENRICH_PROC_ROOT env var (test-only seam,
-    # production always uses /proc) so we can point it at a fake tree
-    # of symlinks. This isolates the enricher's lookup logic, which is
-    # the only thing the bug fix changed.
+    # Mechanism: a Claude Code SessionStart hook
+    # (`claude-kitty-pane-record`) writes (window_id, session_id, cwd,
+    # ts) rows into ~/.cache/kitty-session/pane-sessions.tsv keyed by
+    # $KITTY_WINDOW_ID — the same integer kitty puts in `kitty @ ls`'s
+    # window `id` field. The enricher joins the TSV into snapshot JSON.
+    #
+    # This replaces an earlier /proc/<pid>/fd scan, which assumed
+    # `claude` keeps its session jsonl fd open. Empirically claude
+    # opens/appends/closes per write, so the scan returned None and
+    # the snapshot fell through to latest-by-mtime — exactly the bug.
 
-    proj_dir = "/home/jonathan/.claude/projects/-tmp-fake"
+    tsv = "/home/jonathan/.cache/kitty-session/pane-sessions.tsv"
     sid_a = "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     sid_b = "bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    wid_a, wid_b = 101, 102
+
+    def stage_input(path, payload):
+        dellan.succeed(
+            f"cat > {path} <<'EOF'\n" + payload + "\nEOF"
+        )
+        dellan.succeed(f"chown jonathan {path}")
+
+    # --- 6a: hook writes TSV rows from JSON-on-stdin + KITTY_WINDOW_ID env.
+    dellan.succeed(f"su - jonathan -c 'rm -f {tsv}'")
+    stage_input(
+        "/tmp/hook-a.json",
+        f'{{"session_id":"{sid_a}","cwd":"/tmp/fake"}}',
+    )
+    stage_input(
+        "/tmp/hook-b.json",
+        f'{{"session_id":"{sid_b}","cwd":"/tmp/fake"}}',
+    )
     dellan.succeed(
-        f"su - jonathan -c 'mkdir -p {proj_dir} && "
-        f"touch {proj_dir}/{sid_a}.jsonl {proj_dir}/{sid_b}.jsonl'"
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
+    )
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
+        "claude-kitty-pane-record < /tmp/hook-b.json'"
+    )
+    print("[diag phase6] TSV after hooks:\n" + dellan.succeed(f"cat {tsv}"))
+    dellan.succeed(f"grep -qP '^{wid_a}\\t{sid_a}\\t' {tsv}")
+    dellan.succeed(f"grep -qP '^{wid_b}\\t{sid_b}\\t' {tsv}")
+
+    # Re-invoking the hook for an existing window_id REPLACES the row,
+    # doesn't append a duplicate — guards against unbounded TSV growth
+    # when claude sessions are resumed multiple times in the same pane.
+    sid_a2 = "cccc3333-cccc-cccc-cccc-cccccccccccc"
+    stage_input(
+        "/tmp/hook-a2.json",
+        f'{{"session_id":"{sid_a2}","cwd":"/tmp/fake"}}',
+    )
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "claude-kitty-pane-record < /tmp/hook-a2.json'"
+    )
+    row_count_a = int(dellan.succeed(
+        f"grep -cP '^{wid_a}\\t' {tsv} || true"
+    ).strip())
+    assert row_count_a == 1, (
+        f"expected exactly 1 row for window {wid_a} after re-invocation, "
+        f"got {row_count_a}"
+    )
+    dellan.succeed(f"grep -qP '^{wid_a}\\t{sid_a2}\\t' {tsv}")
+    # Reset to original sid for downstream assertions.
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
 
-    # Fake /proc tree: two arbitrary pids, each with an /fd/9 symlink
-    # to a distinct .jsonl. Pids don't need to map to real processes —
-    # the enricher only does os.listdir / os.readlink under
-    # PROC_ROOT/<pid>/fd.
-    fake_proc = "/tmp/fake-proc"
-    pid_a, pid_b = 12345, 67890
+    # No KITTY_WINDOW_ID env → silent no-op. Hook must be safe to wire
+    # globally even for claude invocations outside kitty.
     dellan.succeed(
-        f"rm -rf {fake_proc} && "
-        f"mkdir -p {fake_proc}/{pid_a}/fd {fake_proc}/{pid_b}/fd && "
-        f"ln -s {proj_dir}/{sid_a}.jsonl {fake_proc}/{pid_a}/fd/9 && "
-        f"ln -s {proj_dir}/{sid_b}.jsonl {fake_proc}/{pid_b}/fd/9 && "
-        f"chown -R jonathan {fake_proc}"
-    )
-    print(
-        "[diag phase6] fake-proc tree:\n"
-        + dellan.succeed(f"ls -laR {fake_proc}")
+        "su - jonathan -c 'env -u KITTY_WINDOW_ID "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
 
-    # Synthetic `kitty @ ls` JSON with two same-cwd claude windows
-    # whose foreground_processes point at the fake pids.
+    # Malformed session_id rejected (not a canonical UUID) → no row.
+    stage_input(
+        "/tmp/hook-bad.json",
+        '{"session_id":"not-a-uuid","cwd":"/tmp/fake"}',
+    )
+    dellan.succeed(
+        "su - jonathan -c 'KITTY_WINDOW_ID=998 "
+        "claude-kitty-pane-record < /tmp/hook-bad.json'"
+    )
+    row_count_bad = int(dellan.succeed(
+        f"grep -cP '^998\\t' {tsv} || true"
+    ).strip())
+    assert row_count_bad == 0, (
+        f"malformed session_id should be rejected; got {row_count_bad} row(s)"
+    )
+
+    # Non-numeric KITTY_WINDOW_ID rejected — defends against TSV
+    # corruption if some upstream sets the env var to a non-integer.
+    dellan.succeed(
+        "su - jonathan -c 'KITTY_WINDOW_ID=abc "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
+    )
+    row_count_abc = int(dellan.succeed(
+        f"grep -cP '^abc\\t' {tsv} || true"
+    ).strip())
+    assert row_count_abc == 0, (
+        f"non-numeric KITTY_WINDOW_ID should be rejected; got {row_count_abc} row(s)"
+    )
+
+    # --- 6b: enricher reads TSV and attaches id keyed by kitty window id.
     fake_ls = json.dumps([{
         "tabs": [{
             "windows": [
-                {"cwd": "/tmp/fake", "title": "pane-a",
+                {"id": wid_a, "cwd": "/tmp/fake", "title": "pane-a",
                  "foreground_processes": [
-                     {"pid": pid_a, "cmdline": ["/usr/bin/claude"]}
+                     {"pid": 11111, "cmdline": ["/usr/bin/claude"]}
                  ]},
-                {"cwd": "/tmp/fake", "title": "pane-b",
+                {"id": wid_b, "cwd": "/tmp/fake", "title": "pane-b",
                  "foreground_processes": [
-                     {"pid": pid_b, "cmdline": ["/usr/bin/claude"]}
+                     {"pid": 22222, "cmdline": ["/usr/bin/claude"]}
                  ]},
             ],
         }],
     }])
+    stage_input("/tmp/fake-ls.json", fake_ls)
     dellan.succeed(
-        "cat > /tmp/fake-ls.json <<'EOF'\n" + fake_ls + "\nEOF"
+        "su - jonathan -c 'kitty-session-enrich "
+        "< /tmp/fake-ls.json > /tmp/enriched.json'"
     )
-    dellan.succeed("chown jonathan /tmp/fake-ls.json")
-    print(
-        "[diag phase6] fake-ls.json:\n"
-        + dellan.succeed("cat /tmp/fake-ls.json")
-    )
-
-    dellan.succeed(
-        f"su - jonathan -c 'KITTY_ENRICH_TEST=1 KITTY_ENRICH_PROC_ROOT={fake_proc} "
-        "kitty-session-enrich < /tmp/fake-ls.json > /tmp/enriched.json'"
-    )
-    print(
-        "[diag phase6] enriched.json:\n"
-        + dellan.succeed("cat /tmp/enriched.json")
-    )
+    print("[diag phase6] enriched.json:\n" + dellan.succeed("cat /tmp/enriched.json"))
 
     id_a = dellan.succeed(
         "jq -r '.[0].tabs[0].windows[0].claude_session_id // empty' "
@@ -384,145 +450,122 @@ pkgs.testers.runNixOSTest {
         "/tmp/enriched.json"
     ).strip()
     assert id_a == sid_a, (
-        f"window 0 expected sid {sid_a!r}, got {id_a!r} — "
-        "enricher dropped or mis-attached id"
+        f"window {wid_a}: expected sid {sid_a!r}, got {id_a!r}"
     )
     assert id_b == sid_b, (
-        f"window 1 expected sid {sid_b!r}, got {id_b!r} — "
-        "enricher dropped or mis-attached id"
+        f"window {wid_b}: expected sid {sid_b!r}, got {id_b!r}"
     )
     assert id_a != id_b, (
-        "same-cwd panes collapsed to a single claude_session_id — "
-        "enricher failed to disambiguate"
+        "same-cwd panes collapsed to a single claude_session_id"
     )
 
     # Negative path: a non-claude foreground process must NOT get a
-    # claude_session_id attached even when its pid would have a
-    # matching jsonl fd in the fake /proc tree.
+    # claude_session_id attached even with a matching TSV row.
     fake_ls_noclaude = json.dumps([{
         "tabs": [{
             "windows": [
-                {"cwd": "/tmp/fake", "title": "shell",
+                {"id": wid_a, "cwd": "/tmp/fake", "title": "shell",
                  "foreground_processes": [
-                     {"pid": pid_a, "cmdline": ["/usr/bin/zsh"]}
+                     {"pid": 11111, "cmdline": ["/usr/bin/zsh"]}
                  ]},
             ],
         }],
     }])
+    stage_input("/tmp/fake-ls-noclaude.json", fake_ls_noclaude)
     dellan.succeed(
-        "cat > /tmp/fake-ls-noclaude.json <<'EOF'\n"
-        + fake_ls_noclaude + "\nEOF"
-    )
-    dellan.succeed(
-        f"su - jonathan -c 'KITTY_ENRICH_TEST=1 KITTY_ENRICH_PROC_ROOT={fake_proc} "
-        "kitty-session-enrich < /tmp/fake-ls-noclaude.json "
-        "> /tmp/enriched-noclaude.json'"
+        "su - jonathan -c 'kitty-session-enrich "
+        "< /tmp/fake-ls-noclaude.json > /tmp/enriched-noclaude.json'"
     )
     has_field = dellan.succeed(
         "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
         "/tmp/enriched-noclaude.json"
     ).strip()
     assert has_field == "false", (
-        f"non-claude window got tagged with claude_session_id "
-        f"(has_field={has_field!r})"
+        f"non-claude window got claude_session_id (has_field={has_field!r})"
     )
 
-    # Production safety: KITTY_ENRICH_PROC_ROOT must be ignored without
-    # the explicit KITTY_ENRICH_TEST=1 marker, or a stray export in a
-    # user's shell rc could silently re-route /proc lookups to an
-    # attacker-controllable tree.
+    # --- 6c: pruning — stale TSV entries for windows not in `ls` are
+    # removed on each enrich pass, keeping the TSV bounded.
+    sid_stale = "dddd4444-dddd-dddd-dddd-dddddddddddd"
     dellan.succeed(
-        f"su - jonathan -c 'KITTY_ENRICH_PROC_ROOT={fake_proc} "
-        "kitty-session-enrich < /tmp/fake-ls.json > /tmp/enriched-noflag.json'"
+        f"su - jonathan -c \"printf '999\\t{sid_stale}\\t/tmp/dead\\t0\\n' "
+        f">> {tsv}\""
     )
-    has_field_noflag = dellan.succeed(
-        "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
-        "/tmp/enriched-noflag.json"
-    ).strip()
-    assert has_field_noflag == "false", (
-        "PROC_ROOT was honored without KITTY_ENRICH_TEST=1 — "
-        f"production env-var leak risk (has_field={has_field_noflag!r})"
+    dellan.succeed(f"grep -qP '^999\\t' {tsv}")
+    dellan.succeed(
+        "su - jonathan -c 'kitty-session-enrich "
+        "< /tmp/fake-ls.json > /dev/null'"
     )
+    dellan.fail(f"grep -qP '^999\\t' {tsv}")
 
-    # Regex tightness: only canonical UUID-shaped session ids
-    # (8-4-4-4-12 lowercase hex) must be matched. A non-UUID jsonl in
-    # the project dir must NOT be picked up.
-    bad_name = "abcdef0123456789abcdef0123456789ab"
+    # --- 6d: production safety — KITTY_ENRICH_TSV must be ignored
+    # without KITTY_ENRICH_TEST=1, or a stray export in a user's shell
+    # rc could silently re-route lookups to an attacker-controllable TSV.
     dellan.succeed(
-        f"su - jonathan -c 'touch {proj_dir}/{bad_name}.jsonl'"
+        f"su - jonathan -c \"printf '1234\\t{sid_a}\\t/tmp/fake\\t0\\n' "
+        f"> /tmp/evil-tsv\""
     )
-    pid_c = 33333
-    dellan.succeed(
-        f"mkdir -p {fake_proc}/{pid_c}/fd && "
-        f"ln -s {proj_dir}/{bad_name}.jsonl {fake_proc}/{pid_c}/fd/9 && "
-        f"chown -R jonathan {fake_proc}/{pid_c}"
-    )
-    fake_ls_badname = json.dumps([{
+    fake_ls_evil = json.dumps([{
         "tabs": [{
             "windows": [
-                {"cwd": "/tmp/fake", "title": "pane-c",
+                {"id": 1234, "cwd": "/tmp/fake", "title": "evil",
                  "foreground_processes": [
-                     {"pid": pid_c, "cmdline": ["/usr/bin/claude"]}
+                     {"pid": 99, "cmdline": ["/usr/bin/claude"]}
                  ]},
             ],
         }],
     }])
+    stage_input("/tmp/fake-ls-evil.json", fake_ls_evil)
     dellan.succeed(
-        "cat > /tmp/fake-ls-badname.json <<'EOF'\n"
-        + fake_ls_badname + "\nEOF"
+        "su - jonathan -c 'KITTY_ENRICH_TSV=/tmp/evil-tsv "
+        "kitty-session-enrich < /tmp/fake-ls-evil.json "
+        "> /tmp/enriched-evil.json'"
     )
-    dellan.succeed(
-        f"su - jonathan -c 'KITTY_ENRICH_TEST=1 "
-        f"KITTY_ENRICH_PROC_ROOT={fake_proc} kitty-session-enrich "
-        "< /tmp/fake-ls-badname.json > /tmp/enriched-badname.json'"
-    )
-    has_field_badname = dellan.succeed(
+    has_field_evil = dellan.succeed(
         "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
-        "/tmp/enriched-badname.json"
+        "/tmp/enriched-evil.json"
     ).strip()
-    assert has_field_badname == "false", (
-        f"non-UUID jsonl matched the regex — would attribute the "
-        f"wrong id (has_field={has_field_badname!r})"
+    assert has_field_evil == "false", (
+        f"KITTY_ENRICH_TSV honored without KITTY_ENRICH_TEST=1 — "
+        f"production env-var leak risk (has_field={has_field_evil!r})"
+    )
+    # With the test flag set, the redirect IS honored.
+    dellan.succeed(
+        "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
+        "KITTY_ENRICH_TSV=/tmp/evil-tsv kitty-session-enrich "
+        "< /tmp/fake-ls-evil.json > /tmp/enriched-evil-on.json'"
+    )
+    has_field_evil_on = dellan.succeed(
+        "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
+        "/tmp/enriched-evil-on.json"
+    ).strip()
+    assert has_field_evil_on == "true", (
+        "test flag should enable TSV redirect"
     )
 
-    # Break-placement: a window with two claude foreground_processes
-    # where the first has no attributable session id (process gone /
-    # no jsonl fd) must fall through to the second. An unconditional
-    # `break` after the first match attempt would skip the second,
-    # leaving the window untagged.
-    pid_no_sid = 44444
+    # --- 6e: malformed TSV lines (non-uuid sid, non-numeric wid, too
+    # few fields) are ignored by enricher rather than crashing or
+    # mis-attributing. Mix junk around a valid row and assert only the
+    # valid one wins.
     dellan.succeed(
-        f"mkdir -p {fake_proc}/{pid_no_sid}/fd && "
-        f"chown -R jonathan {fake_proc}/{pid_no_sid}"
-    )
-    fake_ls_two_fps = json.dumps([{
-        "tabs": [{
-            "windows": [
-                {"cwd": "/tmp/fake", "title": "pane-multi",
-                 "foreground_processes": [
-                     {"pid": pid_no_sid, "cmdline": ["/usr/bin/claude"]},
-                     {"pid": pid_a, "cmdline": ["/usr/bin/claude"]},
-                 ]},
-            ],
-        }],
-    }])
-    dellan.succeed(
-        "cat > /tmp/fake-ls-twofp.json <<'EOF'\n"
-        + fake_ls_two_fps + "\nEOF"
+        f"su - jonathan -c \"printf '"
+        f"not-a-number\\tnot-a-uuid\\n"
+        f"\\n"
+        f"{wid_a}\\t{sid_a}\\t/tmp/fake\\t0\\n"
+        f"truncated\\n"
+        f"' > /tmp/junk-tsv\""
     )
     dellan.succeed(
-        f"su - jonathan -c 'KITTY_ENRICH_TEST=1 "
-        f"KITTY_ENRICH_PROC_ROOT={fake_proc} kitty-session-enrich "
-        "< /tmp/fake-ls-twofp.json > /tmp/enriched-twofp.json'"
+        "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
+        "KITTY_ENRICH_TSV=/tmp/junk-tsv kitty-session-enrich "
+        "< /tmp/fake-ls.json > /tmp/enriched-junk.json'"
     )
-    id_multi = dellan.succeed(
+    id_a_junk = dellan.succeed(
         "jq -r '.[0].tabs[0].windows[0].claude_session_id // empty' "
-        "/tmp/enriched-twofp.json"
+        "/tmp/enriched-junk.json"
     ).strip()
-    assert id_multi == sid_a, (
-        f"two-claude-fp window: expected fallthrough to second fp "
-        f"with sid {sid_a!r}, got {id_multi!r} — break is firing "
-        "before all claude fps are tried"
+    assert id_a_junk == sid_a, (
+        f"junk TSV: expected {sid_a!r} for window {wid_a}, got {id_a_junk!r}"
     )
   '';
 }
