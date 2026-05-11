@@ -1,9 +1,25 @@
-{ pkgs, lib, ... }:
+{ config, pkgs, lib, ... }:
 let
   # Wellbeing tracker cron jobs need python-dateutil (habit-tracker.py)
   # plus stdlib. Cron's PATH is `/usr/bin:/bin` which has no `python3`
   # on NixOS, so the .py invocations need an absolute store path.
   wellbeingPython = pkgs.python3.withPackages (ps: with ps; [ python-dateutil ]);
+
+  # PATH for cron jobs. Vixie-cron parses `NAME=value` lines at the top
+  # of the crontab as env assignments (no shell expansion — `$HOME` and
+  # `~` don't work, neither do systemd `%h` specifiers; only Nix
+  # interpolation works here, evaluated at activation time).
+  # nix-profile paths first so user-installed binaries win over the
+  # system; /run/wrappers/bin last so a cron job can't accidentally
+  # resolve to a setuid wrapper ahead of its nix-profile equivalent.
+  cronPath = lib.concatStringsSep ":" [
+    "${config.home.homeDirectory}/.nix-profile/bin"
+    "/etc/profiles/per-user/${config.home.username}/bin"
+    "/run/current-system/sw/bin"
+    "/run/wrappers/bin"
+    "/usr/bin"
+    "/bin"
+  ];
 in
 {
   imports = [
@@ -24,6 +40,7 @@ in
   # (overwrites any ad-hoc `crontab -e` edits).
   home.file.".config/crontab".text = ''
     CRON_TZ=Europe/Stockholm
+    PATH=${cronPath}
     0 9 * * 1 /home/jonathan/.claude/date-check.sh
     0 10 * * 1 /home/jonathan/.claude/scripts/update-submodules.sh >> /home/jonathan/.claude/logs/submodule-update.log 2>&1
     0 11 * * 1 /home/jonathan/Repos/dotfiles/backup-crontab.sh >> /home/jonathan/Repos/dotfiles/backup-crontab.log 2>&1
@@ -80,6 +97,7 @@ in
   # runtime dirs, `git submodule update --init --recursive`.
   home.activation.cloneRepos = lib.hm.dag.entryAfter ["writeBoundary"] ''
     mkdir -p "$HOME/Repos"
+    mkdir -p "$HOME/.local/share"
 
     clone_if_missing() {
       local repo="$1"
@@ -92,6 +110,14 @@ in
         || true
       fi
     }
+
+    # router-agent lives outside ~/Repos because router-services.nix
+    # configures the systemd units' WorkingDirectory to
+    # %h/.local/share/router-agent (uv-managed venv lands alongside).
+    # uv will bootstrap the venv on first `uv run`; if resolution fails
+    # the unit goes into Restart=on-failure (journal-visible, not
+    # silent).
+    clone_if_missing router-agent "$HOME/.local/share/router-agent"
 
     clone_if_missing autodoro "$HOME/Repos/autodoro"
     clone_if_missing intender "$HOME/Repos/intender"
