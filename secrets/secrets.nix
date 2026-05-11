@@ -77,4 +77,22 @@ in {
   #                              `jonathanmoregard` cache.
   # ---------------------------------------------------------------------
   "cachix-auth-token.age".publicKeys = allKeys;
+
+  # ---------------------------------------------------------------------
+  # research-agent host-to-VM SSH private key.
+  #
+  # The MCP server (running on dellan as `jonathan`) reaches the
+  # research-agent microvm via ssh on 127.0.0.1:2223. This .age file
+  # is the matching private key. Decrypted into the agenix runtime dir
+  # for the wrapper at home/research-agent-mcp.nix to consume.
+  #
+  # The matching PUBLIC key lives plaintext inside
+  # modules/nixos/research-agent-microvm.nix as
+  # users.users.agent.openssh.authorizedKeys.keys — public keys are
+  # not secrets, no value in encrypting them.
+  #
+  # File CONTENTS expected at decrypt time: raw OpenSSH ed25519 private
+  # key (BEGIN OPENSSH PRIVATE KEY ... END OPENSSH PRIVATE KEY).
+  # ---------------------------------------------------------------------
+  "research-agent-host-key.age".publicKeys = [ jonathanDellan dellan ];
 }
