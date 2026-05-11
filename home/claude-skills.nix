@@ -17,7 +17,8 @@
 let
   skills = [
     "nixos-config-dev"
-    "nixos-vm-test-gate"
+    "nixos-automated-testing"
+    "nixos-agent-testing"
   ];
 in
 {

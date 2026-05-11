@@ -1,15 +1,26 @@
 ---
-name: nixos-vm-test-gate
+name: nixos-automated-testing
 description: >
-  Use when modifying NixOS flake config in /etc/nixos or
-  ~/Repos/nixos-config-worktrees and the VM e2e test should run.
-  CI runs this automatically on PRs; this skill covers the LOCAL
-  invocation for debugging before pushing.
-  Triggers on phrases like "run the VM gate", "test the flake",
-  "run dellan-vm test", and on edits to home/*.nix, modules/*.nix,
-  hosts/*.nix, flake.nix that introduce HM units, systemd timers,
-  scripts, or new packages.
+  NixOS automated testing. Use when writing, extending, or running
+  automated tests for the nixos-config repo
+  (~/Repos/nixos-config-worktrees/). Pair with `nixos-agent-testing`
+  for complex changes (branching, GUI, daemons).
 ---
+
+## Scope
+
+This is the **assertion-driven** gate: `nixosTest`-based, headless,
+script-driven, the same derivation CI builds. It proves things like
+"the unit reaches active", "the binary is on PATH", "the script's
+output matches this jq pattern". Pass → green. Fail → traceback.
+
+For **interactive smoke-testing** (boot a real feature VM, drive it
+via SSH/QMP/screencap, click on the actual login screen, watch a
+service start in real time), use the `nixos-agent-testing` skill
+instead. The two are complementary — this skill runs every PR; the
+interactive VM is what you reach for when logic in a change needs
+human-style verification before merge (any branching code or
+multistep script).
 
 ## Run the gate locally
 
@@ -37,44 +48,6 @@ so local invocation is for fast iteration before pushing.
 | Script with deterministic behavior | `dellan.succeed("su jonathan -c '<cmd>'")` |
 | New file rendered by HM | `dellan.succeed("test -f /home/jonathan/<path>")` |
 
-## MANDATORY: positive-path assertion for any new behavior
-
-Asserting only the no-op path (script exits 0 when its precondition is
-missing) is a footgun. Both "broken socket / wrong path" and
-"precondition genuinely missing" produce exit 0 — the test goes green
-while the feature is silently dead.
-
-For every new script / service / integration, add at least one
-assertion that **forces the success path** and verifies the expected
-side effect:
-
-- Spawn the dependency (real X session via
-  `services.xserver.displayManager.autoLogin = { enable = true; user = "<u>"; }`
-  and `dellan.wait_for_x()`).
-- Run the thing for real, not a mock.
-- Assert the artifact materializes (`test -s <path>`) AND its content
-  is structured as expected (`jq ...`, `grep -q ...`).
-
-Example pattern:
-
-```python
-dellan.wait_for_x()
-dellan.succeed(
-    "su jonathan -c 'DISPLAY=:0 nohup kitty -1 --detach >/tmp/kitty-launch.log 2>&1' &"
-)
-dellan.wait_until_succeeds(
-    "su jonathan -c 'sock=$(ls /tmp/kitty.sock-* 2>/dev/null | head -1); "
-    "[ -n \"$sock\" ] && kitty @ --to unix:$sock ls >/dev/null'",
-    timeout=30,
-)
-dellan.succeed("su jonathan -c kitty-session-save")
-dellan.succeed("test -s /home/jonathan/.cache/kitty-session/snapshot.json")
-```
-
-If you cannot construct the success path in the VM (truly hardware-bound),
-say so explicitly in the test comment and gate-skip the assertion — but
-only after confirming the no-op path is not your only check.
-
 ## When to skip the gate
 
 - Pure hardware-config edits (`hardware-configuration.nix`, real-disk
@@ -99,32 +72,6 @@ cheaper layers first:
 
 Always run the first three before queuing a VM. They catch ~80% of
 mistakes in seconds.
-
-## Avoiding the safe-bash 2-min ceiling
-
-`mcp__safe-bash__exec` defaults to a 120s timeout (max 600s) and kills
-the whole process tree on expiry — `nohup ... &` does NOT survive. To
-run a 2-3min build without losing the output:
-
-```bash
-systemd-run --user --collect --unit=gate-test.service \
-  --working-directory=/etc/nixos \
-  --property=StandardOutput=file:/tmp/gate.log \
-  --property=StandardError=append:/tmp/gate.log \
-  /run/current-system/sw/bin/nix build --no-link --print-build-logs \
-  .#checks.x86_64-linux.dellan-vm
-```
-
-Returns immediately; the build runs as a transient systemd unit. Poll
-later with:
-
-```bash
-systemctl --user is-active gate-test.service
-tail -25 /tmp/gate.log
-```
-
-Reset between runs:
-`systemctl --user reset-failed gate-test.service; rm -f /tmp/gate.log`.
 
 ## Diagnostic dumps in testScript
 
@@ -174,14 +121,22 @@ phase tears down the VM and you've lost the chance to introspect.
 
 ## What the gate cannot catch
 
-The test exercises systemd activation + binary presence + script logic
-— NOT live UI. Out of scope:
+The test exercises systemd activation + binary presence + script
+logic — NOT live UI, not branching that the script-driven assertions
+don't traverse, not anything requiring real human interaction. Out
+of scope:
 
 - Cinnamon applet rendering bugs
 - HM `home.activation` scripts that write to live `~/.config` and
   clobber existing real files (test starts with a clean home)
 - Behavior that requires a real graphical session (kitty actually
   rendering, X clients connecting, GPU acceleration)
+- Logic branches the test doesn't construct inputs for
 
-For those: gate green → merge → auto-deploy → verify in live session.
-If broken: `sudo nixos-rebuild switch --rollback`.
+For those use the **`nixos-agent-testing`** skill — interactive
+feature VM with SSH/QMP/screencap/sendkey, exact same dellan
+configuration, lets you drive the real code paths and capture
+proof. The two skills are intentional complements: this one is the
+automated assertion gate every PR runs; agent-testing is the
+human-style verification you reach for when assertions alone can't
+prove the change.
