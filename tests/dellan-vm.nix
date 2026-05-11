@@ -419,6 +419,33 @@ pkgs.testers.runNixOSTest {
         f"malformed session_id should be rejected; got {row_count_bad} row(s)"
     )
 
+    # CLAUDE_CODE_ENTRYPOINT != "cli" silent no-op. Nested
+    # `claude -p` invocations inherit KITTY_WINDOW_ID from parent and
+    # would otherwise overwrite the row with the subprocess's session
+    # id, causing kitty restore to resume the subprocess on next
+    # restart (the watcher-prompt-on-resume bug). Verify the gate
+    # holds for sdk-cli AND any other non-cli entrypoint name.
+    sid_evil = "eeee5555-eeee-eeee-eeee-eeeeeeeeeeee"
+    stage_input(
+        "/tmp/hook-evil.json",
+        f'{{"session_id":"{sid_evil}","cwd":"/tmp/fake"}}',
+    )
+    for evil_entrypoint in ["sdk-cli", "claude_code_action", "unknown"]:
+        dellan.succeed(
+            f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+            f"CLAUDE_CODE_ENTRYPOINT={evil_entrypoint} "
+            "claude-kitty-pane-record < /tmp/hook-evil.json'"
+        )
+        row_count_evil = int(dellan.succeed(
+            f"grep -cP '\\t{sid_evil}\\t' {tsv} || true"
+        ).strip())
+        assert row_count_evil == 0, (
+            f"entrypoint={evil_entrypoint}: row written despite "
+            f"non-cli gate; got {row_count_evil} matching rows"
+        )
+        # Existing main row for wid_a must remain untouched.
+        dellan.succeed(f"grep -qP '^{wid_a}\\t{sid_a}\\t' {tsv}")
+
     # Non-numeric KITTY_WINDOW_ID rejected — defends against TSV
     # corruption if some upstream sets the env var to a non-integer.
     dellan.succeed(

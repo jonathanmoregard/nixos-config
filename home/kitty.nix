@@ -342,6 +342,20 @@ let
     text = ''
       set -euo pipefail
 
+      # Only the main interactive Claude Code session may write the
+      # TSV. Nested `claude -p` invocations (SDK, agents, the
+      # step-back classifier, etc.) inherit KITTY_WINDOW_ID from the
+      # parent terminal, so their SessionStart hook fires with the
+      # SAME window_id but a fresh subprocess session_id. Without this
+      # gate, the nested write overwrites the main session's row and
+      # kitty restore resumes the subprocess instead of the user's
+      # session (which is exactly the watcher-prompt-on-resume bug
+      # this fix was discovered through).
+      #
+      # CLAUDE_CODE_ENTRYPOINT="cli" = main interactive session.
+      # "sdk-cli" / future values = subprocess; skip.
+      [ "''${CLAUDE_CODE_ENTRYPOINT:-cli}" = "cli" ] || exit 0
+
       # Outside kitty → nothing to record.
       [ -n "''${KITTY_WINDOW_ID:-}" ] || exit 0
 
