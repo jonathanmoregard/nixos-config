@@ -15,6 +15,14 @@
     ../../modules/nixos/ci-state.nix
     ../../modules/nixos/claude-agent-users.nix
 
+    # Docker + research-agent dev container. The MCP server spawned by
+    # Claude Code (via home/research-agent-mcp.nix) `docker exec`s into
+    # the long-running `research-agent` container for every research()
+    # call. Without these, the MCP server fails with
+    # `docker not available: [Errno 2] No such file or directory: 'docker'`.
+    ../../modules/nixos/docker.nix
+    ../../modules/nixos/research-agent-container.nix
+
     # Feature VM overrides — no-op for prod toplevel, only activates
     # under `config.system.build.vm`. See module header for usage.
     ../../modules/nixos/feature-vm.nix

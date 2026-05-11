@@ -17,14 +17,20 @@
 #   4. The host worktrees dir is mounted at /mnt/worktrees inside the
 #      VM, so edits on the host show up live without rebooting the VM.
 #
-# Agenix caveat: the VM boots with a freshly-generated ssh host key,
-# which is NOT a recipient of any .age file in `secrets/`. Activation
-# attempts decryption, fails, and the dependent services fail to
-# start. Boot still reaches multi-user.target (same behavior as the
-# existing `tests/dellan-vm.nix` gate). If a change under test needs a
-# real secret, stage plaintext into /tmp from the host:
-#   scp -P 2222 /tmp/anthropic-key.env jonathan@localhost:/tmp/
-# rather than rekeying every .age against a long-lived VM identity.
+# Agenix: the host's `jonathan@dellan` SSH private key
+# (/home/jonathan/.ssh/id_ed25519) is 9p-mounted read-only into the VM
+# at /mnt/host-ssh/id_ed25519, and `age.identityPaths` is pointed at
+# it. jonathan@dellan is already a recipient of every `.age` file
+# (see secrets/secrets.nix), so agenix activation inside the VM
+# decrypts successfully and `/run/agenix/<name>` is populated.
+#
+# Trust model: the 9p mount uses `security_model=none`, so the 9p
+# server runs filesystem ops as the host user that launched QEMU
+# (jonathan, uid 1000). Root inside the VM thus reads the privkey via
+# the server's host-jonathan credentials. This adds no new attack
+# surface — anyone who can compromise the VM already has read access
+# to jonathan@dellan's home over the existing /mnt/worktrees share,
+# and jonathan@dellan is itself an age recipient.
 {
   virtualisation.vmVariant = {
     virtualisation = {
@@ -54,7 +60,41 @@
         source = "/home/jonathan/Repos/nixos-config-worktrees";
         target = "/mnt/worktrees";
       };
+
+      # Extra 9p export for jonathan@dellan's SSH private key, so the
+      # in-VM agenix activation can decrypt secrets without baking a
+      # long-lived feature-VM identity into the recipient set. Uses
+      # `security_model=none` (not the default `mapped-xattr`) so root
+      # inside the VM reads the file via host-jonathan's credentials
+      # — required because the privkey is mode 0600 jonathan-only and
+      # `mapped-xattr` would enforce VM-side uid checks. The matching
+      # fileSystems entry below mounts the export at /mnt/host-ssh.
+      qemu.options = [
+        "-virtfs"
+        "local,path=/home/jonathan/.ssh,security_model=none,mount_tag=host-ssh"
+      ];
     };
+
+    # Mount the host-ssh 9p export read-only at /mnt/host-ssh. The
+    # `neededForBoot = true` flag ensures the mount lands before
+    # `system.activationScripts.agenix` runs (activation needs to read
+    # the privkey from this mount).
+    fileSystems."/mnt/host-ssh" = {
+      device = "host-ssh";
+      fsType = "9p";
+      options = [
+        "trans=virtio"
+        "version=9p2000.L"
+        "msize=16384"
+        "ro"
+      ];
+      neededForBoot = true;
+    };
+
+    # Point agenix at the host privkey 9p-mounted above. jonathan@dellan
+    # is already a recipient of every `.age` in secrets/secrets.nix, so
+    # decryption succeeds without any rekey.
+    age.identityPaths = [ "/mnt/host-ssh/id_ed25519" ];
 
     # Add jonathan@dellan as an authorized SSH key inside the VM so
     # the user/CC on dellan can ssh in without copying keys around.
