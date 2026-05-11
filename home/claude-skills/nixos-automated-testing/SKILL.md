@@ -48,44 +48,6 @@ so local invocation is for fast iteration before pushing.
 | Script with deterministic behavior | `dellan.succeed("su jonathan -c '<cmd>'")` |
 | New file rendered by HM | `dellan.succeed("test -f /home/jonathan/<path>")` |
 
-## MANDATORY: positive-path assertion for any new behavior
-
-Asserting only the no-op path (script exits 0 when its precondition is
-missing) is a footgun. Both "broken socket / wrong path" and
-"precondition genuinely missing" produce exit 0 — the test goes green
-while the feature is silently dead.
-
-For every new script / service / integration, add at least one
-assertion that **forces the success path** and verifies the expected
-side effect:
-
-- Spawn the dependency (real X session via
-  `services.xserver.displayManager.autoLogin = { enable = true; user = "<u>"; }`
-  and `dellan.wait_for_x()`).
-- Run the thing for real, not a mock.
-- Assert the artifact materializes (`test -s <path>`) AND its content
-  is structured as expected (`jq ...`, `grep -q ...`).
-
-Example pattern:
-
-```python
-dellan.wait_for_x()
-dellan.succeed(
-    "su jonathan -c 'DISPLAY=:0 nohup kitty -1 --detach >/tmp/kitty-launch.log 2>&1' &"
-)
-dellan.wait_until_succeeds(
-    "su jonathan -c 'sock=$(ls /tmp/kitty.sock-* 2>/dev/null | head -1); "
-    "[ -n \"$sock\" ] && kitty @ --to unix:$sock ls >/dev/null'",
-    timeout=30,
-)
-dellan.succeed("su jonathan -c kitty-session-save")
-dellan.succeed("test -s /home/jonathan/.cache/kitty-session/snapshot.json")
-```
-
-If you cannot construct the success path in the VM (truly hardware-bound),
-say so explicitly in the test comment and gate-skip the assertion — but
-only after confirming the no-op path is not your only check.
-
 ## When to skip the gate
 
 - Pure hardware-config edits (`hardware-configuration.nix`, real-disk
