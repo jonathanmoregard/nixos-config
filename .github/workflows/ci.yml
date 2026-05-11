@@ -139,10 +139,26 @@ jobs:
         with:
           name: jonathanmoregard
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+      - name: Build dellan toplevel + capture store path
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: |
           nix build .#nixosConfigurations.dellan.config.system.build.toplevel \
-            --no-link --print-build-logs --keep-going
+            --no-link --print-out-paths --print-build-logs --keep-going \
+            > /tmp/dellan-toplevel.path
+          echo "Captured: $(cat /tmp/dellan-toplevel.path)"
+      # Cache the BASE toplevel store path on push:main only. gate.yml's
+      # classify job restores this by `pull_request.base.sha` so it can
+      # skip the redundant BASE `nix build` (eval + substitute) on each
+      # PR. Cache value is just a path string (~80 bytes); GHA cache
+      # cap (10GB shared across the repo) is irrelevant.
+      # Restore from a feature-branch PR works because GHA cache scope
+      # lets PR runs read caches written on the PR's base branch (main).
+      - name: Cache BASE toplevel store path (push:main only)
+        if: github.event_name == 'push' && needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: /tmp/dellan-toplevel.path
+          key: dellan-toplevel-${{ github.sha }}
 
   vm-minimal:
     name: vm-minimal

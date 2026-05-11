@@ -87,6 +87,14 @@ fi
 # Run base + head toplevel builds in parallel. Cachix substitutes both
 # closures from the binary cache when available (every main-branch build
 # pushes there); concurrent runs overlap cachix downloads on cold misses.
+#
+# Fast-path: if the caller passed BASE_TOPLEVEL_PATH (gate.yml restores
+# it from the cache that ci.yml's build-dellan job wrote on the latest
+# push:main run), skip the BASE build entirely and only build HEAD.
+# Saves ~45-75s wall time per non-TRIVIAL classify run. The path still
+# needs `nix store diff-closures` / `nix-store -qR` against it, which
+# requires the closure to be present in /nix/store — cachix substitutes
+# on demand, so this is fine.
 
 build_toplevel_to() {
   local sha="$1" outfile="$2"
@@ -95,14 +103,44 @@ build_toplevel_to() {
     > "$outfile" 2>"$outfile.err"
 }
 
-build_toplevel_to "$MERGE_BASE" "$WORK/base.path" &
-base_pid=$!
+base_rc=0; head_rc=0
+fast_path=0
+if [ -n "${BASE_TOPLEVEL_PATH:-}" ] && [[ "$BASE_TOPLEVEL_PATH" == /nix/store/* ]]; then
+  fast_path=1
+fi
+
+# Fast path: replace the BASE `nix build` (eval + substitute) with
+# `nix-store --realise` of the cached path. --realise both validates
+# the path is substitutable from cachix AND populates /nix/store
+# ahead of `nix store diff-closures` (which needs the closure
+# locally regardless). Saves the BASE eval (~30s); substitute time
+# is unchanged because the closure must be in /nix/store either way.
+# `nix store path-info` was rejected here — it only checks the local
+# store, so on a fresh runner with empty /nix/store it would always
+# fail and the fast-path would be a no-op.
+if [ "$fast_path" = 1 ]; then
+  echo "classify-pr: realising cached BASE $BASE_TOPLEVEL_PATH in parallel with HEAD build" >&2
+  echo "$BASE_TOPLEVEL_PATH" > "$WORK/base.path"
+  nix-store --realise "$BASE_TOPLEVEL_PATH" >/dev/null 2>"$WORK/base.path.err" &
+  base_pid=$!
+else
+  build_toplevel_to "$MERGE_BASE" "$WORK/base.path" &
+  base_pid=$!
+fi
 build_toplevel_to "$HEAD_SHA" "$WORK/head.path" &
 head_pid=$!
-
-base_rc=0; head_rc=0
 wait "$base_pid" || base_rc=$?
 wait "$head_pid" || head_rc=$?
+
+# Retry BASE via full build if the cached realise failed (cache stale,
+# path GC'd from cachix, etc). HEAD build is already done; only BASE
+# repeats. Falls back to the same cost as a no-cache run.
+if [ "$fast_path" = 1 ] && [ "$base_rc" -ne 0 ]; then
+  echo "classify-pr: cached BASE realise failed, retrying with full BASE build" >&2
+  cat "$WORK/base.path.err" >&2 2>/dev/null || true
+  base_rc=0
+  build_toplevel_to "$MERGE_BASE" "$WORK/base.path" || base_rc=$?
+fi
 if [ "$base_rc" -ne 0 ] || [ "$head_rc" -ne 0 ]; then
   echo "classify-pr: toplevel build failed (base rc=$base_rc head rc=$head_rc)" >&2
   [ -s "$WORK/base.path.err" ] && cat "$WORK/base.path.err" >&2 || true

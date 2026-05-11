@@ -70,6 +70,11 @@ jobs:
         run: |
           set -euo pipefail
           merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
+          # Expose merge-base for downstream cache-restore — keying by
+          # base.sha would mis-classify stale PRs (when main has
+          # advanced past the fork point), per
+          # `scripts/classify-pr.sh:11-22`.
+          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
           safe_re='(^|/)docs/|^proposals/|^README(\..*)?$|^CLAUDE\.md$|^pending_for_human\.md$|^\.gitignore$|^\.gitattributes$|^LICENSE([.\-].*)?$|^\.editorconfig$'
           unsafe=$(git diff --name-only "$merge_base" "$HEAD_SHA" | grep -Ev "$safe_re" || true)
           if [ -z "$unsafe" ]; then
@@ -100,11 +105,42 @@ jobs:
           name: jonathanmoregard
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
+      # Try to restore the BASE toplevel store path that ci.yml's
+      # build-dellan job cached on the latest push:main run for the
+      # PR's MERGE-BASE commit (the actual fork point — NOT base.sha,
+      # which is the current main tip and may have advanced past the
+      # fork point on stale PRs; see classify-pr.sh:11-22 for the
+      # closure-delta correctness reasoning). On hit, classify-pr.sh
+      # skips the BASE `nix build` (eval + substitute, ~45-75s) and
+      # only builds HEAD. On miss (cache evicted, no recent push:main,
+      # race, stale PR with no push:main on the fork point), the
+      # script falls back to building both — same cost as today.
+      - name: Restore cached BASE toplevel store path
+        id: restore-base
+        if: steps.preflight.outputs.risk == ''
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        continue-on-error: true
+        with:
+          path: /tmp/dellan-toplevel.path
+          key: dellan-toplevel-${{ steps.preflight.outputs.merge_base }}
+
       - name: Run classifier (script loaded from base checkout)
         id: classify
         if: steps.preflight.outputs.risk == ''
         run: |
           set -euo pipefail
+          # If the cache restore landed, read the BASE toplevel store
+          # path from the cached file and export it; classify-pr.sh
+          # honors $BASE_TOPLEVEL_PATH and skips the BASE build.
+          # Empty/unset = script builds BASE itself.
+          if [ "${{ steps.restore-base.outputs.cache-hit }}" = "true" ] \
+             && [ -f /tmp/dellan-toplevel.path ]; then
+            BASE_TOPLEVEL_PATH=$(cat /tmp/dellan-toplevel.path)
+            export BASE_TOPLEVEL_PATH
+            echo "Using cached BASE toplevel: $BASE_TOPLEVEL_PATH"
+          else
+            echo "No cached BASE toplevel; classify-pr.sh will build it"
+          fi
           # Classifier script + risk-rules.nix are loaded from BASE — PR-
           # modified versions are NOT executed.
           ./scripts/classify-pr.sh > /tmp/classify-output.md
