@@ -6,16 +6,20 @@
 # sub-config that the QEMU VM builder merges in, not the regular system.
 #
 # Usage:
-#   1. From a worktree:
-#        nix build .#nixosConfigurations.dellan.config.system.build.vm
-#   2. Run the VM (foreground, graphics window):
-#        ./result/bin/run-dellan-vm
-#   3. SSH in from the host (in another terminal):
+#   1. Boot the VM (headless, snapshot mode = clean state per launch):
+#        nix run .#feature-vm
+#      (defined in flake.nix; wraps the underlying QEMU launch script
+#      with `-snapshot -display none` and a fresh $TMPDIR.)
+#   2. SSH in from the host in another terminal:
 #        ssh -p 2222 -o StrictHostKeyChecking=no \
 #            -o UserKnownHostsFile=/dev/null \
 #            -i ~/.ssh/id_ed25519 jonathan@localhost
-#   4. The host worktrees dir is mounted at /mnt/worktrees inside the
+#   3. The host worktrees dir is mounted at /mnt/worktrees inside the
 #      VM, so edits on the host show up live without rebooting the VM.
+#
+# Persistent qcow2 + graphics window (rarely needed):
+#   nix build .#nixosConfigurations.dellan.config.system.build.vm
+#   ./result/bin/run-dellan-vm
 #
 # Agenix: the host's `jonathan@dellan` SSH private key
 # (/home/jonathan/.ssh/id_ed25519) is 9p-mounted read-only into the VM
@@ -111,6 +115,12 @@
       # on the /mnt/worktrees 9p share whose host-side files are owned
       # by host uid 1000.
       uid = lib.mkForce 1000;
+
+      # Let jonathan `ls /run/agenix/` inside the VM. The agenix
+      # generation dir is mode 0750 root:keys; individual secrets
+      # owned by jonathan are still mode 0400, so this only widens
+      # *directory listing*, not file reads.
+      extraGroups = [ "keys" ];
     };
 
     # Console login fallback — same password regardless of the prod

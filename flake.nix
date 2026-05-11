@@ -67,5 +67,33 @@
       pkgs = pkgsLinux;
       inputs = { inherit home-manager agenix; };
     };
+
+    # `nix run .#feature-vm` — boot dellan's config in an ephemeral
+    # QEMU VM with sane defaults:
+    #   * -snapshot   → all disk writes go to RAM, clean state every boot
+    #   * -display none → headless; sshd reachable on host:2222
+    #   * fresh $TMPDIR per launch → no stale xchg/shared dirs
+    # See modules/nixos/feature-vm.nix for the in-VM overrides
+    # (sshd, /mnt/worktrees, /mnt/host-ssh + agenix, jonathan uid).
+    apps.${linuxSystem}.feature-vm = {
+      type = "app";
+      program =
+        let
+          vm = self.nixosConfigurations.dellan.config.system.build.vm;
+          runner = pkgsLinux.writeShellApplication {
+            name = "feature-vm";
+            text = ''
+              export QEMU_OPTS="''${QEMU_OPTS:--snapshot -display none}"
+              TMPDIR="$(mktemp -d -t feature-vm.XXXXXX)"
+              export TMPDIR
+              echo "[feature-vm] tmpdir=$TMPDIR  qemu_opts=$QEMU_OPTS" >&2
+              echo "[feature-vm] ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/id_ed25519 jonathan@localhost" >&2
+              cd "$TMPDIR"
+              exec ${vm}/bin/run-dellan-vm "$@"
+            '';
+          };
+        in
+        "${runner}/bin/feature-vm";
+    };
   };
 }
