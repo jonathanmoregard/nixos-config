@@ -80,10 +80,15 @@ the change actually does, not by mood.
 | While writing the change | `test-driven-development` — extend `tests/dellan-vm.nix` before the code, watch it fail, then make it pass |
 | Before clicking merge on a medium/high-risk PR | `advice-refine-test-loop` — multi-round Opus review with empirical re-verification |
 
-Do not ask the user whether to run these. Pure-data changes (a
-package added, a config value flipped, a string updated) skip
-`nixos-agent-testing` — the automated gate alone suffices for those.
-Everything else goes through both VM layers.
+Do not ask the user whether to run these. The only changes that
+legitimately skip `nixos-agent-testing` are those where **no
+downstream code branches on the changed value and no script reads
+it** — e.g. adding a package to `environment.systemPackages`, bumping
+a version pin, fixing a comment. If the change flips a boolean that
+gates an `mkIf`, alters a value an `optionals` reads, modifies a
+script that runs at boot, or changes the input to anything
+conditional anywhere downstream, treat it as branching → run the
+interactive VM. When in doubt, run it; the cost is cheap.
 
 ## What you'll see on the PR
 

@@ -11,12 +11,16 @@ description: >
   needs eyes on real behavior — anything with branching logic, a
   multistep script, a graphical side effect, or a daemon you want to
   poke).
-  Triggers on phrases like "spin up the VM", "boot the feature VM",
-  "feature vm", "test in feature VM", "smoke test (the change)",
-  "screencap the VM", "send keys to the VM", "QMP", "serial console",
-  and any time the agent edits branching logic / `mkIf` / `optionals`
-  / `writeShellApplication` / activation scripts in the nixos-config
-  repo.
+  Scope: ONLY relevant when working in the nixos-config repo (paths
+  under /etc/nixos/, ~/Repos/nixos-config-worktrees/, or
+  ~/Repos/nixos-config/). Triggers on phrases like "spin up the VM",
+  "boot the feature VM", "feature vm", "test in feature VM",
+  "smoke test (the change)", "screencap the VM", "send keys to the
+  VM", "QMP", "serial console", and on edits to files under those
+  paths that introduce branching logic (`mkIf` / `optionals` /
+  conditional service enable) or multistep scripts
+  (`writeShellApplication`, activation scripts, multi-cmd
+  `ExecStart`).
 ---
 
 ## When to invoke this skill
@@ -34,9 +38,12 @@ description: >
 - A **PR is risk:medium or higher** per the classifier, and you want
   to convince yourself before clicking merge.
 
-Skip when the change is pure data — package added, config value
-flipped, string updated. The automated gate alone is the right level
-for that.
+Skip only when the change has **no** downstream branch and **no**
+script reading it — e.g. adding a package to
+`environment.systemPackages`, bumping a version pin, fixing a
+comment. A boolean flip that gates `mkIf` / `optionals` is NOT
+pure-data; nor is changing input to a `writeShellApplication`. When
+in doubt, run the interactive VM — the cost is cheap.
 
 ## Quick start
 
@@ -69,8 +76,10 @@ headful when the user has explicitly asked for a window.
 
 ## What you get inside the VM
 
-- `dellan` hostname, same modules as prod, agenix decrypted (5
-  jonathan-readable secrets in `/run/agenix/`).
+- `dellan` hostname, same modules as prod, agenix-decrypted secrets
+  populated under `/run/agenix/` (jonathan-readable LLM/research
+  keys + root-readable CI/CD secrets — listed in
+  `secrets/secrets.nix`).
 - `/mnt/worktrees` — host's `~/Repos/nixos-config-worktrees`
   9p-mounted R/W. Edits on the host appear inside the VM without a
   reboot.
@@ -82,8 +91,10 @@ headful when the user has explicitly asked for a window.
 
 ## Control channels (headless and headful both expose these)
 
-The launcher prints the exact paths on startup. They live under
-`$TMPDIR/feature-vm.XXXXXX/` so they auto-clean on exit.
+The launcher prints the exact paths on startup as
+`[feature-vm] tmpdir=…`. The per-launch dir is itself the launcher's
+`$TMPDIR` (`/tmp/feature-vm.XXXXXX/`), with `qmp.sock` and
+`serial.sock` directly inside it. Auto-cleaned on exit.
 
 ### SSH — shell exec, file transfer, sudo
 
