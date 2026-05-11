@@ -93,10 +93,16 @@
   # MCP server) survives VM reboots. The dir must exist before the
   # microvm boots, otherwise virtiofsd mounts an empty source and
   # services.openssh fails to write its hostKey path.
+  #
+  # /var/lib (not /home/jonathan/.local/) because systemd-tmpfiles
+  # refuses to canonicalize across an ownership boundary
+  # (jonathan → root → jonathan) — fails with "unsafe path transition".
+  # /var/lib has no such hop and is the conventional spot for daemon
+  # state anyway.
   # ---------------------------------------------------------------------
   systemd.tmpfiles.rules = [
-    "d /home/jonathan/.local/state/research-agent 0750 jonathan users -"
-    "d /home/jonathan/.local/state/research-agent/vm-ssh 0700 jonathan users -"
+    "d /var/lib/research-agent 0700 root root -"
+    "d /var/lib/research-agent/vm-ssh 0700 root root -"
   ];
 
   # ---------------------------------------------------------------------

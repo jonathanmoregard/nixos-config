@@ -46,7 +46,9 @@
             # Persisted VM SSH host keys across reboots — required for
             # the host-side known_hosts pin (StrictHostKeyChecking=yes
             # in the MCP server's ssh command) to survive a VM reboot.
-            source = "/home/jonathan/.local/state/research-agent/vm-ssh";
+            # Backed by /var/lib/research-agent/vm-ssh on the host
+            # (systemd.tmpfiles.rules in hosts/dellan/default.nix).
+            source = "/var/lib/research-agent/vm-ssh";
             mountPoint = "/etc/ssh/keys";
             tag = "ssh-keys";
             proto = "virtiofs";
