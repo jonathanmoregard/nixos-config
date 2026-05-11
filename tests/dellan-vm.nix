@@ -102,6 +102,16 @@ pkgs.testers.runNixOSTest {
         "test -f /home/jonathan/.config/autostart/copyq.desktop"
     )
 
+    # Nemo (GTK) sidebar bookmarks — declarative pins for ~/Downloads
+    # and ~/Dropbox in the file manager's left menu.
+    bookmarks = dellan.succeed(
+        "cat /home/jonathan/.config/gtk-3.0/bookmarks"
+    )
+    assert "file:///home/jonathan/Downloads" in bookmarks, \
+        f"Downloads bookmark missing:\n{bookmarks}"
+    assert "file:///home/jonathan/Dropbox" in bookmarks, \
+        f"Dropbox bookmark missing:\n{bookmarks}"
+
     # Crontab source includes the bare-repo main-fetch line so worktrees
     # branched off ~/Repos/nixos-config/main don't start behind origin/main.
     # Assert on the home.file source rather than `crontab -l`: the live

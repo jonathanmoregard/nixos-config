@@ -22,6 +22,14 @@ in
   # Notification sound
   home.file.".local/share/sounds/tink.oga".source = ../assets/sounds/tink.oga;
 
+  # Nemo (GTK) sidebar bookmarks. Format: one URI per line, optional
+  # display name after a space. Nemo reads ~/.config/gtk-3.0/bookmarks
+  # and renders each entry in the file-manager left pane.
+  home.file.".config/gtk-3.0/bookmarks".text = ''
+    file:///home/jonathan/Downloads
+    file:///home/jonathan/Dropbox
+  '';
+
   # Install desaturate-all applet from nix store
   home.file.".local/share/cinnamon/applets/desaturate-all@hkoosha" = {
     source = "${desaturateApplet}/desaturate-all@hkoosha/files/desaturate-all@hkoosha";
