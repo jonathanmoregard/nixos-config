@@ -54,16 +54,24 @@ let
   };
 in
 {
+  # Router services: ExecStart was hardcoded to /home/jonathan/.local/bin/uv,
+  # which existed on the prior Mint host (pip-installed) but not on NixOS.
+  # nixpkgs provides uv at ${pkgs.uv}/bin/uv (resolved at activation time).
+  # ConditionPathExists guards against the project dir not being present —
+  # the router-agent project (uv-managed venv at %h/.local/share/router-agent)
+  # is jonathan's personal repo, not part of the flake closure, so it may be
+  # absent on fresh installs or rollbacks. Without the guard, systemd
+  # auto-restart floods journal with CHDIR failures.
   systemd.user.services.router-ingestor = {
     Unit = {
       Description = "Router personal-assistant ingestor (inlet -> inbox)";
       After = [ "default.target" ];
+      ConditionPathExists = "%h/.local/share/router-agent";
     };
     Service = {
       Type = "simple";
-      WorkingDirectory = "/home/jonathan/.local/share/router-agent";
-      Environment = "PATH=/home/jonathan/.local/bin:/usr/local/bin:/usr/bin:/bin";
-      ExecStart = "/home/jonathan/.local/bin/uv run router-ingestor --paths /home/jonathan/.config/router/paths.yaml watch";
+      WorkingDirectory = "%h/.local/share/router-agent";
+      ExecStart = "${pkgs.uv}/bin/uv run router-ingestor --paths %h/.config/router/paths.yaml watch";
       Restart = "on-failure";
       RestartSec = 5;
     };
@@ -74,12 +82,12 @@ in
     Unit = {
       Description = "Router worker (inbox -> HITL queue)";
       After = [ "router-ingestor.service" ];
+      ConditionPathExists = "%h/.local/share/router-agent";
     };
     Service = {
       Type = "simple";
-      WorkingDirectory = "/home/jonathan/.local/share/router-agent";
-      Environment = "PATH=/home/jonathan/.local/bin:/usr/local/bin:/usr/bin:/bin";
-      ExecStart = "/home/jonathan/.local/bin/uv run router-worker --paths /home/jonathan/.config/router/paths.yaml watch";
+      WorkingDirectory = "%h/.local/share/router-agent";
+      ExecStart = "${pkgs.uv}/bin/uv run router-worker --paths %h/.config/router/paths.yaml watch";
       Restart = "on-failure";
       RestartSec = 10;
     };
@@ -87,12 +95,14 @@ in
   };
 
   systemd.user.services.router-ingestor-scan = {
-    Unit.Description = "Router ingestor hourly safety-net scan (scan-once)";
+    Unit = {
+      Description = "Router ingestor hourly safety-net scan (scan-once)";
+      ConditionPathExists = "%h/.local/share/router-agent";
+    };
     Service = {
       Type = "oneshot";
-      WorkingDirectory = "/home/jonathan/.local/share/router-agent";
-      Environment = "PATH=/home/jonathan/.local/bin:/usr/local/bin:/usr/bin:/bin";
-      ExecStart = "/bin/sh -c '/home/jonathan/.local/bin/uv run router-ingestor --paths /home/jonathan/.config/router/paths.yaml scan-once >> /home/jonathan/.local/state/router/audit/ingestor-cron.log 2>&1'";
+      WorkingDirectory = "%h/.local/share/router-agent";
+      ExecStart = "/bin/sh -c '${pkgs.uv}/bin/uv run router-ingestor --paths %h/.config/router/paths.yaml scan-once >> %h/.local/state/router/audit/ingestor-cron.log 2>&1'";
     };
   };
 
