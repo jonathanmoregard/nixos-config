@@ -2,16 +2,27 @@
 # research-agent-mcp wrapper.
 #
 # Claude Code spawns `research-agent-mcp` as a stdio MCP subprocess
-# (configured in ~/.claude.json). The MCP server runs an injection
-# scanner whose L3 honeypot calls Anthropic + OpenAI; without
-# ANTHROPIC_API_KEY / OPENAI_API_KEY in the spawn env, smoke fails
-# closed and the server exits before binding stdio.
+# (configured in ~/.claude.json). The MCP server has two key dependencies
+# at startup:
+#
+#  1. The injection-scanner L3 honeypot calls Anthropic + OpenAI on every
+#     scan. Without ANTHROPIC_API_KEY / OPENAI_API_KEY in the spawn env,
+#     smoke fails closed and the server exits before binding stdio.
+#  2. The research agent itself (inside the dev container) needs EXA +
+#     TAVILY for search providers and a Claude Code OAuth token to drive
+#     the headless `claude` CLI. Without these, `research()` calls fail
+#     at the first tool invocation with `<provider>-api-key not in keyring`.
+#
+# The MCP server's secret loader prefers env vars before falling back to
+# the GNOME keyring (see `_SECRET_ENV` in mcp_server/server.py). On NixOS
+# the keyring isn't the source of truth — agenix is — so we always
+# populate via env to keep behaviour fully declarative.
 #
 # Claude Code's `env` block in ~/.claude.json takes literal values, not
-# file paths. To keep the keys out of dotfiles we wrap with a shell
-# script that reads each agenix-decrypted file (raw value, no env
-# prefix) and exports the corresponding env var at exec time, then
-# execs the Python entry from the project venv.
+# file paths. We wrap with a shell script that reads each
+# agenix-decrypted file (raw value, no env prefix) and exports the
+# corresponding env var at exec time, then execs the Python entry from
+# the project venv.
 #
 # Wrapper name `research-agent-mcp` matches the ~/.claude.json command
 # string so the config doesn't need to change. The wrapped binary lives
@@ -30,7 +41,11 @@
         # as an env var value.
         ANTHROPIC_API_KEY=$(< /run/agenix/anthropic-api-key)
         OPENAI_API_KEY=$(< /run/agenix/openai-api-key)
-        export ANTHROPIC_API_KEY OPENAI_API_KEY
+        EXA_API_KEY=$(< /run/agenix/exa-api-key)
+        TAVILY_API_KEY=$(< /run/agenix/tavily-api-key)
+        CLAUDE_CODE_OAUTH_TOKEN=$(< /run/agenix/claude-token)
+        export ANTHROPIC_API_KEY OPENAI_API_KEY \
+               EXA_API_KEY TAVILY_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 
         exec uv run --project "$HOME/Repos/research-agent" \
             python3 -m mcp_server.server "$@"

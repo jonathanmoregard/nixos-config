@@ -17,6 +17,21 @@
 # Runner: GitHub-hosted (ubuntu-latest). Public repo = unlimited free
 # minutes. KVM nested-virt available since Feb 2023; verified via the
 # DETERMINATE_NIX_KVM env exported by determinate-nix-action.
+#
+# Fast-path: a `preflight` job runs the same denylist regex as gate.yml
+# and emits `risk=TRIVIAL` for docs-only PRs. Heavy STEPS inside the
+# downstream jobs (flake-check, build-dellan, vm-minimal, vm-graphical)
+# are gated `if: needs.preflight.outputs.risk != 'TRIVIAL'`, so the
+# job COMPLETES SUCCESS with no work — that keeps branch-protection
+# required checks satisfied. Skipping the job itself would mark the
+# required check as SKIPPED and block merge. Push:main events leave
+# risk empty, so heavy steps always run on main.
+#
+# Disk: /nix is mounted on a loopback file backed by /mnt (~70GB
+# free) instead of running jlumbroso/free-disk-space (which scrubs
+# /usr/share/dotnet etc and takes ~2.5min per job). Loop mount: ~5s.
+# Implementation lives in scripts/mount-nix-loop.sh (must run BEFORE
+# determinate-nix-action).
 name: ci
 
 on:
@@ -42,86 +57,150 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: scripts/check-fork-guards.sh
 
-  flake-check:
-    name: flake check (eval)
+  preflight:
+    name: preflight
     runs-on: ubuntu-latest
     needs: verify-fork-guards
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      risk: ${{ steps.preflight.outputs.risk }}
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
-      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
         with:
-          # Scope writes by ref so PR caches don't bleed across branches;
-          # restore falls back to main-only to avoid cross-PR cache reuse.
-          primary-key: nix-${{ runner.os }}-eval-${{ github.ref }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-eval-refs/heads/main-
-          gc-max-store-size-linux: 5G
-          purge: true
-          purge-prefixes: nix-${{ runner.os }}-eval-
-          purge-last-accessed: 86400
-          purge-primary-key: never
-      - run: nix flake check --no-build --all-systems
+          fetch-depth: 0
+      - name: Preflight TRIVIAL check (no nix, ~1s)
+        id: preflight
+        # Inline the denylist regex from scripts/classify-pr.sh / gate.yml
+        # so the preflight runs without `nix`. If every changed file
+        # matches the safe denylist, emit risk=TRIVIAL and let heavy
+        # steps in downstream jobs skip via
+        # `if: needs.preflight.outputs.risk != 'TRIVIAL'`.
+        # Source of truth for the regex is the classifier script; keep
+        # the three (gate.yml, ci.yml, classify-pr.sh) in sync.
+        # Push:main events skip the diff (no base SHA) and leave risk
+        # empty so heavy steps always run on main.
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "preflight: non-PR event, leaving risk empty (heavy steps run)"
+            exit 0
+          fi
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
+          # Fail-closed: if `git diff` itself errors (bad SHAs / shallow
+          # clone), exit non-zero so the heavy steps run rather than
+          # silently treating the empty result as TRIVIAL and skipping
+          # required checks for an unverified PR.
+          if ! git diff --name-only "$merge_base" "$HEAD_SHA" > /tmp/diff-files.txt; then
+            echo "preflight: git diff failed, leaving risk empty (heavy steps run)"
+            cat /tmp/diff-files.txt 2>/dev/null || true
+            exit 0
+          fi
+          safe_re='(^|/)docs/|^proposals/|^README(\..*)?$|^CLAUDE\.md$|^pending_for_human\.md$|^\.gitignore$|^\.gitattributes$|^LICENSE([.\-].*)?$|^\.editorconfig$'
+          unsafe=$(grep -Ev "$safe_re" /tmp/diff-files.txt || true)
+          if [ -z "$unsafe" ]; then
+            echo "preflight: every changed file is in the safe denylist — risk=TRIVIAL"
+            echo "risk=TRIVIAL" >> "$GITHUB_OUTPUT"
+          else
+            echo "preflight: unsafe paths present, heavy steps will run"
+            printf '%s\n' "$unsafe" | head -20 | sed 's/^/  /'
+          fi
+
+  flake-check:
+    name: flake check (eval)
+    runs-on: ubuntu-latest
+    needs: [verify-fork-guards, preflight]
+    steps:
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix flake check --no-build --all-systems
 
   build-dellan:
     name: build dellan toplevel
     runs-on: ubuntu-latest
-    needs: flake-check
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [verify-fork-guards, preflight]
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-      - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
-      - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Mount /nix on /mnt loopback (replaces free-disk-space)
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: ./scripts/mount-nix-loop.sh
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
           name: jonathanmoregard
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - run: |
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: |
           nix build .#nixosConfigurations.dellan.config.system.build.toplevel \
             --no-link --print-build-logs --keep-going
 
   vm-minimal:
     name: vm-minimal
     runs-on: ubuntu-latest
-    needs: build-dellan
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [verify-fork-guards, preflight]
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-      - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
-      # cachix substitutes the dellan toplevel + dependencies built by
-      # the build-dellan job above, so vm-minimal pulls binaries instead
-      # of rebuilding from source. This replaces cache-nix-action which
-      # we previously dropped due to GHA's 10 GB cache cap conflicting
-      # with the ~8-12 GB closure size.
-      - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Mount /nix on /mnt loopback (replaces free-disk-space)
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: ./scripts/mount-nix-loop.sh
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+      # cachix substitutes the dellan toplevel + dependencies; if
+      # build-dellan ran first and populated the cache, vm-minimal
+      # pulls binaries instead of rebuilding. With build-dellan and
+      # vm-minimal now in parallel, the first run on a cold cache
+      # rebuilds the closure twice (once per job); subsequent runs
+      # hit cache.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
           name: jonathanmoregard
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - name: Verify KVM
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: |
           test "${DETERMINATE_NIX_KVM:-}" = "1" || { echo "KVM not available"; exit 1; }
           ls -la /dev/kvm
-      - run: nix build .#checks.x86_64-linux.dellan-vm -L
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.dellan-vm -L
 
   vm-graphical:
     name: vm-graphical
     runs-on: ubuntu-latest
-    needs: build-dellan
+    needs: [verify-fork-guards, preflight]
     permissions:
       contents: read
-    if: |
-      (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) &&
-      (contains(github.event.pull_request.changed_files, 'home/cinnamon.nix') ||
-       contains(github.event.pull_request.changed_files, 'modules/nixos/desktop.nix') ||
-       contains(github.event.pull_request.changed_files, 'home/kitty.nix'))
+    # Path-conditional: only runs when desktop-affecting files change.
+    # Docs-only PRs naturally skip via this gate, so the job completes
+    # SUCCESS-with-no-work for branch protection. The TRIVIAL gate is
+    # also redundant here (path filter is stricter) but kept for
+    # uniformity with the other heavy jobs.
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: |
+      - if: |
+          needs.preflight.outputs.risk != 'TRIVIAL' &&
+          (contains(github.event.pull_request.changed_files, 'home/cinnamon.nix') ||
+           contains(github.event.pull_request.changed_files, 'modules/nixos/desktop.nix') ||
+           contains(github.event.pull_request.changed_files, 'home/kitty.nix'))
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - if: |
+          needs.preflight.outputs.risk != 'TRIVIAL' &&
+          (contains(github.event.pull_request.changed_files, 'home/cinnamon.nix') ||
+           contains(github.event.pull_request.changed_files, 'modules/nixos/desktop.nix') ||
+           contains(github.event.pull_request.changed_files, 'home/kitty.nix'))
+        run: |
           # Placeholder: VM-graphical check derivation TBD (spec E.1).
           # Path-conditional; runs only when desktop-affecting files change.
           echo "vm-graphical: not yet implemented (spec E.1)"

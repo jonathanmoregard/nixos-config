@@ -41,15 +41,25 @@ in {
   "gh-janitor-token.age".publicKeys      = ciKeys;
 
   # ---------------------------------------------------------------------
-  # LLM provider API keys.
+  # LLM provider + research-agent API keys / tokens.
   #
   # Consumed by:
-  #   - claude-cl-sync.service   (home/claude-services.nix EnvironmentFile)
-  #   - research-agent-mcp       (home/research-agent.nix wrapper, planned)
-  # File CONTENTS expected at decrypt time (env-format, one var per file):
-  #   anthropic-api-key.age   — ANTHROPIC_API_KEY=sk-ant-...
-  #   openai-api-key.age      — OPENAI_API_KEY=sk-...
+  #   - claude-cl-sync.service   (home/claude-services.nix wrapper)
+  #   - research-agent-mcp       (home/research-agent-mcp.nix wrapper)
+  # File CONTENTS expected at decrypt time (RAW value, no `KEY=` prefix —
+  # both wrappers read with `$(< file)` and export the appropriate env
+  # var themselves):
+  #   anthropic-api-key.age   — sk-ant-...
+  #   openai-api-key.age      — sk-... | sk-proj-...
+  #   exa-api-key.age         — Exa neural-search API key
+  #   tavily-api-key.age      — Tavily web-search API key
+  #   claude-token.age        — Claude Code OAuth token (research-agent
+  #                              calls headless `claude` inside the
+  #                              isolated dev container)
   # ---------------------------------------------------------------------
   "anthropic-api-key.age".publicKeys = allKeys;
   "openai-api-key.age".publicKeys    = allKeys;
+  "exa-api-key.age".publicKeys       = allKeys;
+  "tavily-api-key.age".publicKeys    = allKeys;
+  "claude-token.age".publicKeys      = allKeys;
 }
