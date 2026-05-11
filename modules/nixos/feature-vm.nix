@@ -159,5 +159,14 @@
     # prod-parity gate).
     services.nixos-auto-deploy.enable = lib.mkForce false;
     services.tailscale.enable = lib.mkForce false;
+
+    # Autologin into Cinnamon so interactive smoke tests can drive the
+    # desktop session via QMP send-key without typing credentials at the
+    # greeter every boot. Matches `tests/dellan-vm.nix`'s autologin
+    # override — both are test/smoke contexts and never reach prod.
+    services.xserver.displayManager.autoLogin = {
+      enable = lib.mkForce true;
+      user = "jonathan";
+    };
   };
 }

@@ -16,6 +16,7 @@ in
     scrot
     xbindkeys
     copyq
+    gnome-screenshot
   ];
 
   # Notification sound
@@ -58,8 +59,8 @@ in
   '';
 
   # CopyQ clipboard manager autostart — without a clipboard manager,
-  # gnome-screenshot --clipboard (Cinnamon Ctrl+Print binding) writes
-  # to the X11 CLIPBOARD selection but the data dies when
+  # gnome-screenshot --clipboard (Print / Shift+Print bindings below)
+  # writes to the X11 CLIPBOARD selection but the data dies when
   # gnome-screenshot exits since no app holds the selection.
   home.file.".config/autostart/copyq.desktop".text = ''
     [Desktop Entry]
@@ -274,6 +275,38 @@ in
     };
 
     # Keybinding for desaturate-all is in the applet config (Super+G)
+
+    # --- Screenshot keybindings ---
+    # Print          → fullscreen to clipboard (gnome-screenshot --clipboard)
+    # Shift+Print    → region select to clipboard (gnome-screenshot --area --clipboard)
+    # CopyQ holds CLIPBOARD after gnome-screenshot exits (see autostart above).
+    # The default media-keys screenshot bindings save to ~/Pictures by default
+    # (no clipboard) — clear them so they don't double-fire alongside the
+    # custom bindings below.
+    "org/cinnamon/desktop/keybindings/media-keys" = {
+      screenshot = [ ];
+      area-screenshot = [ ];
+      screenshot-clip = [ ];
+      area-screenshot-clip = [ ];
+      window-screenshot = [ ];
+      window-screenshot-clip = [ ];
+    };
+
+    "org/cinnamon/desktop/keybindings" = {
+      custom-list = [ "custom-screenshot-clipboard" "custom-screenshot-area-clipboard" ];
+    };
+
+    "org/cinnamon/desktop/keybindings/custom-keybindings/custom-screenshot-clipboard" = {
+      name = "Screenshot fullscreen to clipboard";
+      binding = [ "Print" ];
+      command = "${pkgs.gnome-screenshot}/bin/gnome-screenshot --clipboard";
+    };
+
+    "org/cinnamon/desktop/keybindings/custom-keybindings/custom-screenshot-area-clipboard" = {
+      name = "Screenshot region to clipboard";
+      binding = [ "<Shift>Print" ];
+      command = "${pkgs.gnome-screenshot}/bin/gnome-screenshot --area --clipboard";
+    };
 
     # --- GNOME / GTK settings ---
     "org/gnome/desktop/interface" = {
