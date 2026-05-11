@@ -39,7 +39,10 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.pull_request.head.repo.full_name == github.repository && github.event.action != 'labeled' && github.event.action != 'unlabeled'
     outputs:
-      risk: ${{ steps.classify.outputs.risk }}
+      # Preflight wins when it emits TRIVIAL; otherwise fall back to the
+      # full classifier output. Expression-level `||` is GH Actions'
+      # null-coalesce on empty strings.
+      risk: ${{ steps.preflight.outputs.risk || steps.classify.outputs.risk }}
     env:
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -51,19 +54,51 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
 
+      - name: Fetch PR head (cheap; needed for preflight diff)
+        run: |
+          git fetch origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
+
+      - name: Preflight TRIVIAL check (no nix, ~1s)
+        id: preflight
+        # Inline the denylist regex from scripts/classify-pr.sh so the
+        # preflight runs without `nix`, `cachix-action`, or
+        # `free-disk-space`. If every changed file matches the safe
+        # denylist, set risk=TRIVIAL and let the subsequent heavy steps
+        # skip via `if: steps.preflight.outputs.risk == ''`.
+        # Source of truth for the regex is the classifier script; keep
+        # the two in sync.
+        run: |
+          set -euo pipefail
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
+          safe_re='(^|/)docs/|^proposals/|^README(\..*)?$|^CLAUDE\.md$|^pending_for_human\.md$|^\.gitignore$|^\.gitattributes$|^LICENSE([.\-].*)?$|^\.editorconfig$'
+          unsafe=$(git diff --name-only "$merge_base" "$HEAD_SHA" | grep -Ev "$safe_re" || true)
+          if [ -z "$unsafe" ]; then
+            echo "preflight: every changed file is in the safe denylist — risk=TRIVIAL"
+            echo "risk=TRIVIAL" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Risk: TRIVIAL"
+              echo
+              echo "Preflight fast-path: every file in the diff matches the doc/non-closure denylist."
+              echo "Skipped \`nix\` install, cachix, and the two toplevel builds."
+            } > /tmp/classify-output.md
+          else
+            echo "preflight: unsafe paths present, falling through to full classifier"
+            printf '%s\n' "$unsafe" | head -20 | sed 's/^/  /'
+          fi
+
       - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        if: steps.preflight.outputs.risk == ''
       - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+        if: steps.preflight.outputs.risk == ''
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+        if: steps.preflight.outputs.risk == ''
         with:
           name: jonathanmoregard
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Fetch PR head
-        run: |
-          git fetch origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
-
       - name: Run classifier (script loaded from base checkout)
         id: classify
+        if: steps.preflight.outputs.risk == ''
         run: |
           set -euo pipefail
           # Classifier script + risk-rules.nix are loaded from BASE — PR-
@@ -76,7 +111,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          risk_lower=$(echo "${{ steps.classify.outputs.risk }}" | tr '[:upper:]' '[:lower:]')
+          risk="${{ steps.preflight.outputs.risk || steps.classify.outputs.risk }}"
+          risk_lower=$(echo "$risk" | tr '[:upper:]' '[:lower:]')
 
           # Ensure all risk:* labels exist in the repo (idempotent;
           # gh label create --force overwrites color/desc, doesn't error
