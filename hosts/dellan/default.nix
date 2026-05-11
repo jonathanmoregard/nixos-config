@@ -14,6 +14,10 @@
     ../../modules/nixos/build-coordination.nix
     ../../modules/nixos/ci-state.nix
     ../../modules/nixos/claude-agent-users.nix
+
+    # Feature VM overrides — no-op for prod toplevel, only activates
+    # under `config.system.build.vm`. See module header for usage.
+    ../../modules/nixos/feature-vm.nix
   ];
 
   # ---------------------------------------------------------------------
