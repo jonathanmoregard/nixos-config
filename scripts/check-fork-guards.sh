@@ -25,7 +25,10 @@ if [ ! -d "$WF_DIR" ]; then
 fi
 
 GUARD_PATTERN='head\.repo\.full_name *==.*base\.repo\.full_name|head\.repo\.full_name *==.*github\.repository|head\.repo\.full_name *!=.*github\.repository'
-PR_TRIGGER_PATTERN='^on:|pull_request:|pull_request_target:'
+# Match only actual PR-event triggers. The earlier `^on:|` alternation
+# matched every workflow's top-level `on:` key and incorrectly flagged
+# schedule / workflow_dispatch workflows that have no PR exposure.
+PR_TRIGGER_PATTERN='pull_request:|pull_request_target:'
 
 errors=0
 

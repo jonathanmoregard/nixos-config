@@ -66,13 +66,6 @@ gh pr checks <PR_NUMBER>
 | `eval (dellan)`, `build (dellan)` | Flake evaluates + system derivation builds |
 | `vm-minimal (1..3)` | Three parallel ephemeral-VM e2e tests |
 | `vm-graphical` | Runs only when desktop files change |
-| `classify` | Posts `risk:trivial/low/medium/high/critical` label + per-source breakdown comment |
-| `label-gate` | Enforces merge gate based on the label + reviews |
-
-`risk:trivial` / `risk:low` → auto-merge once green.
-`risk:medium` / `risk:high` / `risk:critical` → fresh human approval
-required (filtered by `commit_id == HEAD_SHA` so a force-push past a
-stale review doesn't pass).
 
 ## After merge
 
@@ -120,8 +113,8 @@ it's tidier to remove eagerly.
   -e <name>.age` from `secrets/` dir
 - VM gate fails on autodoro → known interaction; see
   `docs/proposals/2026-05-04-split-vm-tests.md`
-- Branch protection rejects merge → check the `label-gate` status; PR
-  likely needs human approval for its risk bucket
+- Branch protection rejects merge → check the failing required
+  status check (eval / build / vm-minimal); fix and push again
 - `nixos-deploy.service` poisoned → see desktop notification's
   rollback command, then
   `sudo rm /var/lib/nixos-deploy/current-poison && sudo systemctl reset-failed nixos-deploy`
