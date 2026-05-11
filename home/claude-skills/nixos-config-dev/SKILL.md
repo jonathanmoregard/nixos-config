@@ -1,13 +1,18 @@
 ---
 name: nixos-config-dev
 description: >
-  Use when modifying jonathan's NixOS config (any file under
-  /etc/nixos/ or ~/Repos/nixos-config-worktrees/). Worktree-only
-  workflow — direct edits to /etc/nixos and ~/Repos/nixos-config
-  fail by construction. Triggers on edits to flake.nix, hosts/*.nix,
-  modules/*.nix, home/*.nix, on phrases like "rebuild dellan",
-  "switch nixos config", "update home-manager", and on creating PRs
-  in the nixos-config repo.
+  NixOS config edits via worktree + PR. Use whenever the agent
+  modifies anything under /etc/nixos/, ~/Repos/nixos-config/, or
+  ~/Repos/nixos-config-worktrees/ — direct edits to the first two
+  fail by construction, so the worktree → PR → auto-deploy flow
+  this skill encodes is the only working path. Triggers on edits
+  to flake.nix, hosts/*.nix, modules/*.nix, home/*.nix, on phrases
+  like "rebuild dellan", "switch nixos config", "update
+  home-manager", and on creating PRs in the nixos-config repo.
+  Routes the agent into the right testing skills
+  (`nixos-automated-testing`, `nixos-agent-testing`,
+  `test-driven-development`, `advice-refine-test-loop`) based on
+  the shape of the change.
 ---
 
 ## First action when triggered

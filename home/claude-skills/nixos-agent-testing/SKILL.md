@@ -1,26 +1,21 @@
 ---
 name: nixos-agent-testing
 description: >
-  Use to interactively smoke-test NixOS config changes inside an
-  ephemeral QEMU "feature VM" before opening / merging a PR. Drives
-  the dellan host config in a sandbox with SSH on host:2222, 9p host
-  worktrees mounted, agenix secrets decrypted, and QMP/serial/sendkey/
-  screencap control channels exposed. Companion to
-  `nixos-automated-testing` (that one is the assertion gate CI runs;
-  this one is the interactive sandbox you reach for when a change
-  needs eyes on real behavior — anything with branching logic, a
-  multistep script, a graphical side effect, or a daemon you want to
-  poke).
-  Scope: ONLY relevant when working in the nixos-config repo (paths
-  under /etc/nixos/, ~/Repos/nixos-config-worktrees/, or
-  ~/Repos/nixos-config/). Triggers on phrases like "spin up the VM",
+  Interactive NixOS feature-VM smoke testing. Use ONLY in the
+  nixos-config repo (paths under /etc/nixos/,
+  ~/Repos/nixos-config-worktrees/, or ~/Repos/nixos-config/) when a
+  change introduces branching logic (`mkIf` / `optionals` /
+  conditional service enable), multistep scripts
+  (`writeShellApplication`, activation scripts, multi-cmd
+  `ExecStart`), GUI/desktop side effects, or a daemon that needs
+  poking to verify — anything the automated assertion gate cannot
+  prove on its own. Triggers on phrases like "spin up the VM",
   "boot the feature VM", "feature vm", "test in feature VM",
   "smoke test (the change)", "screencap the VM", "send keys to the
-  VM", "QMP", "serial console", and on edits to files under those
-  paths that introduce branching logic (`mkIf` / `optionals` /
-  conditional service enable) or multistep scripts
-  (`writeShellApplication`, activation scripts, multi-cmd
-  `ExecStart`).
+  VM", "QMP", "serial console", and on edits within the
+  nixos-config repo that match the shapes above. Pair with
+  `nixos-automated-testing` (assertion gate) — this skill is the
+  interactive complement, not a replacement.
 ---
 
 ## When to invoke this skill
