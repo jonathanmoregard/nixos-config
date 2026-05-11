@@ -72,9 +72,11 @@
     # QEMU VM with sane defaults:
     #   * -snapshot   → all disk writes go to RAM, clean state every boot
     #   * -display none → headless; sshd reachable on host:2222
-    #   * fresh $TMPDIR per launch → no stale xchg/shared dirs
-    # See modules/nixos/feature-vm.nix for the in-VM overrides
-    # (sshd, /mnt/worktrees, /mnt/host-ssh + agenix, jonathan uid).
+    #   * fresh $TMPDIR per launch, cleaned on exit → no leaks
+    #   * stages host's ~/.ssh/id_ed25519 into a single-file cache dir
+    #     that gets 9p-exported into the VM as /mnt/host-ssh, so the VM
+    #     only sees the one file agenix needs (no known_hosts, no
+    #     other keys). See modules/nixos/feature-vm.nix.
     apps.${linuxSystem}.feature-vm = {
       type = "app";
       program =
@@ -83,13 +85,32 @@
           runner = pkgsLinux.writeShellApplication {
             name = "feature-vm";
             text = ''
-              export QEMU_OPTS="''${QEMU_OPTS:--snapshot -display none}"
+              hostKey="$HOME/.ssh/id_ed25519"
+              if [ ! -r "$hostKey" ]; then
+                echo "[feature-vm] ERROR: host SSH private key not readable at $hostKey" >&2
+                echo "[feature-vm] agenix decryption inside the VM would silently produce empty secrets — refusing to boot." >&2
+                exit 1
+              fi
+
+              # Stage the privkey into a launcher-owned cache dir so
+              # the 9p export sees only the one file it needs.
+              # Matches the path baked into modules/nixos/feature-vm.nix.
+              stagingDir="$HOME/.cache/feature-vm/host-ssh"
+              mkdir -p "$stagingDir"
+              chmod 0700 "$stagingDir"
+              install -m 0400 "$hostKey" "$stagingDir/id_ed25519"
+
               TMPDIR="$(mktemp -d -t feature-vm.XXXXXX)"
               export TMPDIR
+              trap 'rm -rf "$TMPDIR"' EXIT INT TERM
+
+              export QEMU_OPTS="''${QEMU_OPTS:--snapshot -display none}"
               echo "[feature-vm] tmpdir=$TMPDIR  qemu_opts=$QEMU_OPTS" >&2
               echo "[feature-vm] ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/id_ed25519 jonathan@localhost" >&2
+              # Don't `exec` — we need bash to stay alive long enough
+              # to run the trap that cleans $TMPDIR on QEMU exit.
               cd "$TMPDIR"
-              exec ${vm}/bin/run-dellan-vm "$@"
+              ${vm}/bin/run-dellan-vm "$@"
             '';
           };
         in

@@ -21,20 +21,29 @@
 #   nix build .#nixosConfigurations.dellan.config.system.build.vm
 #   ./result/bin/run-dellan-vm
 #
-# Agenix: the host's `jonathan@dellan` SSH private key
-# (/home/jonathan/.ssh/id_ed25519) is 9p-mounted read-only into the VM
-# at /mnt/host-ssh/id_ed25519, and `age.identityPaths` is pointed at
-# it. jonathan@dellan is already a recipient of every `.age` file
-# (see secrets/secrets.nix), so agenix activation inside the VM
-# decrypts successfully and `/run/agenix/<name>` is populated.
+# Agenix: a copy of the host's `jonathan@dellan` SSH private key is
+# 9p-mounted read-only into the VM at /mnt/host-ssh/id_ed25519, and
+# `age.identityPaths` is pointed at it. jonathan@dellan is already a
+# recipient of every `.age` file (see secrets/secrets.nix), so agenix
+# activation inside the VM decrypts successfully and the runtime
+# secrets dir is populated.
+#
+# The host-side export points at `~/.cache/feature-vm/host-ssh/`
+# rather than `~/.ssh/` so the VM only sees the one file it needs —
+# not `known_hosts`, agent sockets, or other key material that might
+# live in `~/.ssh/`. The launcher (`apps.feature-vm` in flake.nix)
+# populates the cache dir from `~/.ssh/id_ed25519` before booting
+# the VM and refuses to start if the host key is missing.
 #
 # Trust model: the 9p mount uses `security_model=none`, so the 9p
 # server runs filesystem ops as the host user that launched QEMU
 # (jonathan, uid 1000). Root inside the VM thus reads the privkey via
-# the server's host-jonathan credentials. This adds no new attack
-# surface — anyone who can compromise the VM already has read access
-# to jonathan@dellan's home over the existing /mnt/worktrees share,
-# and jonathan@dellan is itself an age recipient.
+# the server's host-jonathan credentials. This adds no new
+# decryption capability — `jonathan@dellan`'s privkey is already an
+# age recipient of every `.age` file, so any process that can read
+# that key on the host can already decrypt every secret today. The
+# 9p export reproduces that same trust level inside the VM, no new
+# capability granted.
 {
   virtualisation.vmVariant = {
     virtualisation = {
@@ -67,23 +76,37 @@
 
       # Extra 9p export for jonathan@dellan's SSH private key, so the
       # in-VM agenix activation can decrypt secrets without baking a
-      # long-lived feature-VM identity into the recipient set. Uses
+      # long-lived feature-VM identity into the recipient set.
+      #
       # `security_model=none` (not the default `mapped-xattr`) so root
       # inside the VM reads the file via host-jonathan's credentials
       # — required because the privkey is mode 0600 jonathan-only and
-      # `mapped-xattr` would enforce VM-side uid checks. The matching
-      # mount entry below lives in `virtualisation.fileSystems`
-      # (qemu-vm.nix overrides the top-level `fileSystems` wholesale
-      # with `mkVMOverride`, but merges siblings of
-      # `virtualisation.fileSystems` at the same priority).
+      # `mapped-xattr` would enforce VM-side uid checks.
+      #
+      # The source path is a launcher-managed cache dir, not `~/.ssh/`,
+      # so the VM only sees the one file it needs. The launcher
+      # (`apps.feature-vm` in flake.nix) populates it before boot. If
+      # this module is used outside the launcher (`run-dellan-vm`
+      # directly), populate `~/.cache/feature-vm/host-ssh/id_ed25519`
+      # manually first or agenix decryption will silently produce
+      # empty secrets.
+      #
+      # The matching mount entry below lives in
+      # `virtualisation.fileSystems` (qemu-vm.nix overrides the
+      # top-level `fileSystems` wholesale with `mkVMOverride`, but
+      # merges siblings of `virtualisation.fileSystems` at the same
+      # priority).
       qemu.options = [
         "-virtfs"
-        "local,path=/home/jonathan/.ssh,security_model=none,mount_tag=host-ssh"
+        "local,path=/home/jonathan/.cache/feature-vm/host-ssh,security_model=none,mount_tag=host-ssh"
       ];
 
       # Mount the host-ssh 9p export read-only at /mnt/host-ssh.
       # `neededForBoot = true` ensures it lands in initrd before
-      # agenix activation (stage-1) reads the privkey.
+      # agenix activation (stage-1) reads the privkey. The
+      # `x-systemd.requires=modprobe@9pnet_virtio.service` option
+      # mirrors what qemu-vm.nix injects for its own 9p mounts, so
+      # the mount waits for the kernel module to load.
       fileSystems."/mnt/host-ssh" = {
         device = "host-ssh";
         fsType = "9p";
@@ -92,6 +115,7 @@
           "version=9p2000.L"
           "msize=16384"
           "ro"
+          "x-systemd.requires=modprobe@9pnet_virtio.service"
         ];
         neededForBoot = true;
       };
