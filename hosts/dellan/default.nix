@@ -24,10 +24,11 @@
   age.secrets.github-webhook-secret.file = ../../secrets/github-webhook-secret.age;
   age.secrets.gh-janitor-token.file      = ../../secrets/gh-janitor-token.age;
 
-  # LLM provider API keys consumed by claude-cl-sync.service and the
-  # research-agent-mcp wrapper. Both load via env-format file (KEY=value
-  # per line). owner=jonathan + mode=0400 because the consumers run as
-  # the user, not root.
+  # LLM provider + research-agent secrets consumed by claude-cl-sync.service
+  # and the research-agent-mcp wrapper. Both read raw key values with
+  # `$(< file)` and export the matching env var themselves — `.age` files
+  # contain the raw key only (no `KEY=` prefix). owner=jonathan + mode=0400
+  # because the consumers run as the user, not root.
   age.secrets.anthropic-api-key = {
     file = ../../secrets/anthropic-api-key.age;
     owner = "jonathan";
@@ -36,6 +37,24 @@
   };
   age.secrets.openai-api-key = {
     file = ../../secrets/openai-api-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.exa-api-key = {
+    file = ../../secrets/exa-api-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.tavily-api-key = {
+    file = ../../secrets/tavily-api-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.claude-token = {
+    file = ../../secrets/claude-token.age;
     owner = "jonathan";
     group = "users";
     mode = "0400";
