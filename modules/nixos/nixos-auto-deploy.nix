@@ -8,9 +8,10 @@
 # - Idempotent: re-running deploy is no-op if origin/main is unchanged.
 # - No re-attempt loop: failed SHAs latched until origin/main advances
 #   past them (verified via `git merge-base --is-ancestor`).
-# - No fight with human: if current generation lacks the
-#   automated-deploy-* tag (from a manual rebuild or rollback), service
-#   halts until manually cleared.
+# - Respects rollbacks: if the active system profile generation is older
+#   than the newest known generation, the service halts. Cleared by
+#   running `nixos-rebuild switch` forward (advances the profile to a
+#   new latest, drift gone, auto-deploy resumes on next tick).
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.nixos-auto-deploy;
@@ -19,12 +20,14 @@ let
     name = "nixos-deploy";
     runtimeInputs = with pkgs; [
       git
+      nix
       nixos-rebuild
       util-linux
       openssh
       coreutils
       gnugrep
       gnused
+      gawk
     ];
     text = ''
       set -euo pipefail
@@ -41,43 +44,41 @@ let
         exit 1
       fi
 
-      # Halt-on-human-touch via sidecar provenance file.
-      # `nixos-rebuild` doesn't accept a --tag flag (research-Claude
-      # extrapolated incorrectly), and templating system.nixos.tags into
-      # the flake per-build is gnarly. Sidecar file is the pragmatic path.
+      # Rollback guard: respect explicit user rollbacks.
       #
-      # Invariant: after a successful auto-deploy, last-deployed-sha
-      # records the SHA we switched to AND the resulting toplevel store
-      # path. On each run, if /run/current-system's toplevel doesn't
-      # match the recorded one, a human switched the system between runs
-      # (manual rebuild or rollback). Halt until cleared.
-      current_toplevel=$(readlink -f /run/current-system)
-
-      # Read both lines of last-deployed-sha (line 1 = SHA, line 2 =
-      # toplevel store path) via bash builtin `read`. The earlier
-      # `awk 'NR==N {print}'` form silently emitted empty when `awk`
-      # was not on PATH — `writeShellApplication`'s `runtimeInputs`
-      # didn't list `gawk`, command-not-found exit 127 got swallowed
-      # by `2>/dev/null || true`, and the drift check then halted on a
-      # false positive. Builtin `read` has no PATH dependency.
-      recorded_sha=""
-      recorded_toplevel=""
-      { IFS= read -r recorded_sha || true
-        IFS= read -r recorded_toplevel || true
-      } < "$STATE/last-deployed-sha" 2>/dev/null || true
-
-      if [ -e "$STATE/has-deployed" ] && [ "$current_toplevel" != "$recorded_toplevel" ]; then
-        echo "current generation does not match last auto-deploy; halting"
-        echo "  current  : $current_toplevel"
-        echo "  recorded : $recorded_toplevel"
-        echo "  (manual rebuild or rollback detected; refusing to fight a human)"
-        echo "  to override: run a manual deploy via this service"
-        echo "    sudo systemctl start nixos-deploy.service  (no — reads stale state)"
-        echo "  or: clear by hand:"
-        echo "    sudo rm $STATE/last-deployed-sha $STATE/has-deployed"
-        echo "    then sudo systemctl start nixos-deploy.service"
-        exit 1
+      # When the user runs `nixos-rebuild switch --rollback` (or
+      # `nix-env --switch-generation N`), the system profile symlink
+      # points at gen N-1 even though gen N still exists. That's the
+      # canonical "I want to stay on this older generation" signal.
+      # Auto-deploy must not clobber it by re-applying origin/main.
+      #
+      # nix-env --list-generations marks the active generation with
+      # "(current)"; the highest-numbered line is the newest. If active
+      # < latest, the user pinned an older gen — halt.
+      #
+      # The previous design compared /run/current-system store-hash to
+      # a recorded toplevel path; that fired on any local rebuild,
+      # including identical-source rebuilds that just happened to
+      # produce a different drv hash, and required manual state-file
+      # deletion to recover. Generation comparison is what Nix already
+      # uses to model rollback, so the check costs nothing extra.
+      #
+      # Resume path: `sudo nixos-rebuild switch` forward — that
+      # advances the profile to a new latest, active==latest again,
+      # auto-deploy proceeds on the next tick.
+      gens=$(nix-env --list-generations -p /nix/var/nix/profiles/system)
+      active_gen=$(echo "$gens" | awk '/\(current\)/ {print $1}')
+      latest_gen=$(echo "$gens" | awk 'END {print $1}')
+      if [ -n "$active_gen" ] && [ -n "$latest_gen" ] && [ "$active_gen" -lt "$latest_gen" ]; then
+        echo "active system generation $active_gen < latest $latest_gen; halting"
+        echo "  (rollback in effect; refusing to clobber)"
+        echo "  to resume: sudo nixos-rebuild switch"
+        exit 0
       fi
+
+      # Idempotency input: SHA of the last successfully-deployed commit.
+      recorded_sha=""
+      { IFS= read -r recorded_sha || true; } < "$STATE/last-deployed-sha" 2>/dev/null || true
 
       cd "${cfg.workingDir}"
       ${lib.optionalString (cfg.sshKeyFile != null) ''
@@ -106,9 +107,7 @@ let
         fi
       fi
 
-      # Step 6: idempotency. recorded_sha was read at the top of the
-      # script alongside recorded_toplevel — same builtin-read avoids
-      # the awk-on-PATH bug fixed in this revision.
+      # Step 6: idempotency. recorded_sha was read at the top of the script.
       if [ -n "$recorded_sha" ] && [ "$target_sha" = "$recorded_sha" ]; then
         echo "already at $target_sha; no-op"
         exit 0
@@ -118,16 +117,16 @@ let
       echo "deploying $target_sha"
       git reset --hard "$target_sha"
       if nixos-rebuild switch --flake ".#${cfg.flakeAttr}"; then
-        # Record both the SHA and the resulting toplevel store path.
-        # On the next run, if /run/current-system's toplevel doesn't
-        # match this recorded path, we know a human touched it.
-        new_toplevel=$(readlink -f /run/current-system)
-        printf '%s\n%s\n' "$target_sha" "$new_toplevel" > "$STATE/last-deployed-sha"
+        # Record the deployed SHA so the next tick can short-circuit when
+        # origin/main hasn't advanced. The generation comparison above is
+        # what catches a human-driven rollback — toplevel-hash tracking
+        # is no longer needed.
+        printf '%s\n' "$target_sha" > "$STATE/last-deployed-sha"
         touch "$STATE/has-deployed"
         # Trigger desktop notification (path-watcher in user systemd
-        # picks this up; notify-send + rm in the user service).
+        # picks this up; notify-send in the user service).
         touch "$STATE/notify-success"
-        echo "deploy success: $target_sha ($new_toplevel)"
+        echo "deploy success: $target_sha"
         exit 0
       else
         echo "$target_sha" >> "$STATE/poison-latch"
