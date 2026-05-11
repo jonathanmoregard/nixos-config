@@ -102,6 +102,20 @@ pkgs.testers.runNixOSTest {
         "test -f /home/jonathan/.config/autostart/copyq.desktop"
     )
 
+    # Crontab source includes the bare-repo main-fetch line so worktrees
+    # branched off ~/Repos/nixos-config/main don't start behind origin/main.
+    # Assert on the home.file source rather than `crontab -l`: the live
+    # crontab is installed by an activation hook whose timing relative to
+    # /run/wrappers/bin/crontab in this VM image isn't load-bearing for
+    # production (real hardware activates after setuid-wrappers).
+    crontab_src = dellan.succeed(
+        "cat /home/jonathan/.config/crontab"
+    )
+    assert (
+        "git -C /home/jonathan/Repos/nixos-config fetch origin main:main"
+        in crontab_src
+    ), f"nixos-config bare-repo fetch line missing from crontab source:\n{crontab_src}"
+
     # gnome-screenshot — the binary fired by the Print / Shift+Print
     # Cinnamon custom keybindings.
     dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/gnome-screenshot")

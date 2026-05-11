@@ -35,6 +35,11 @@ in
     */30 6-22 * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/habit-tracker.py >> /home/jonathan/.claude/logs/habit-tracker.log 2>&1
     */30 * * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/sunset-walk-tracker.py >> /home/jonathan/.claude/logs/sunset-walk-tracker.log 2>&1
     37 15 * * * /home/jonathan/Repos/superpowers/sync-agent.sh >> /home/jonathan/Repos/superpowers/sync.log 2>&1
+    # Keep the bare nixos-config repo's local `main` ref in sync with
+    # origin/main so new worktrees (`git worktree add ... main`) don't
+    # start behind. Bare repo = no working tree, no conflicts possible;
+    # `main:main` refspec advances the ref in-place.
+    */30 * * * * git -C /home/jonathan/Repos/nixos-config fetch origin main:main >> /home/jonathan/.claude/logs/nixos-config-fetch.log 2>&1
   '';
 
   # `crontab` is a setuid wrapper at /run/wrappers/bin/crontab (provided by
