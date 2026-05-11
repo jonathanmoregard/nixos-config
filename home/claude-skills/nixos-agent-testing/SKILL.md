@@ -41,9 +41,17 @@ description: >
 Skip only when the change has **no** downstream branch and **no**
 script reading it — e.g. adding a package to
 `environment.systemPackages`, bumping a version pin, fixing a
-comment. A boolean flip that gates `mkIf` / `optionals` is NOT
-pure-data; nor is changing input to a `writeShellApplication`. When
-in doubt, run the interactive VM — the cost is cheap.
+comment.
+
+To decide, **trace the value you changed**: grep for the option /
+variable / file path it lives at, follow each reference through
+`mkIf` / `optionals` / `if`/`case` and into every script that
+interpolates it. If the value influences any of those, it has a
+downstream branch and is NOT pure-data. A boolean flip that gates
+`mkIf` / `optionals` is the canonical example; so is changing the
+input to a `writeShellApplication` or the right-hand side of an
+`ExecStart`. When in doubt, run the interactive VM — the cost is
+cheap.
 
 ## Quick start
 

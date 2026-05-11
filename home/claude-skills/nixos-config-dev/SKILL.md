@@ -70,7 +70,11 @@ gh pr checks <PR_NUMBER>
 ## Testing skills
 
 Two complementary VM testing layers, both important. Pick by what
-the change actually does, not by mood.
+the change actually does, not by mood. **Rows below are additive,
+not either/or** — a single change can match several rows (e.g.
+branching logic with a TDD-amenable assertion → write the assertion
+first via `test-driven-development`, then smoke-test in the feature
+VM via `nixos-agent-testing`).
 
 | Change shape | Skill(s) to invoke |
 |--------------|--------------------|
