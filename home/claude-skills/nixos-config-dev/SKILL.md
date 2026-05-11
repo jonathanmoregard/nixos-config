@@ -42,14 +42,15 @@ cd ~/Repos/nixos-config
 git worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
 cd ~/Repos/nixos-config-worktrees/<slug>
 
-# 2. Edit
+# 2. Plan + edit
+#    For anything beyond trivial, lead with the `brainstorming` skill
+#    before code, then the `test-driven-development` skill while
+#    coding (write the assertion first, watch it fail, make it pass).
 $EDITOR home/whatever.nix
 git add -A
 git commit -m "feat(scope): summary"
 
-# 3. (Optional but recommended) Run VM gate locally for fast feedback
-nix build .#checks.x86_64-linux.dellan-vm -L
-# See nixos-vm-test-gate skill for cheaper pre-VM checks.
+# 3. Test before pushing — see "Testing skills" below.
 
 # 4. Push, open PR
 git push -u origin feat/<slug>
@@ -57,7 +58,32 @@ gh pr create --title "..." --body "..."
 
 # 5. Watch CI
 gh pr checks <PR_NUMBER>
+
+# 6. For non-trivial PRs about to be merged, lead with the
+#    `advice-refine-test-loop` skill — Opus advisor + empirical
+#    re-verification across rounds catches fail-open paths, schema
+#    mismatches, and silent regressions that single-pass review
+#    misses. Cheap insurance on changes that auto-deploy to your
+#    daily-driver.
 ```
+
+## Testing skills
+
+Two complementary VM testing layers, both important. Pick by what
+the change actually does, not by mood.
+
+| Change shape | Skill(s) to invoke |
+|--------------|--------------------|
+| Anything that builds — *required* | `nixos-automated-testing` (the assertion gate CI runs on every PR; runs locally before pushing) |
+| Branching logic (`mkIf`, `optionals`, `if`/`case`), multistep scripts (`writeShellApplication`, activation scripts), GUI changes, daemons that need poking — *required pre-PR* | `nixos-agent-testing` (boot the feature VM, drive via SSH/QMP/screencap, capture proof for the PR body) |
+| Pre-implementation planning for non-trivial work | `brainstorming` |
+| While writing the change | `test-driven-development` — extend `tests/dellan-vm.nix` before the code, watch it fail, then make it pass |
+| Before clicking merge on a medium/high-risk PR | `advice-refine-test-loop` — multi-round Opus review with empirical re-verification |
+
+Do not ask the user whether to run these. Pure-data changes (a
+package added, a config value flipped, a string updated) skip
+`nixos-agent-testing` — the automated gate alone suffices for those.
+Everything else goes through both VM layers.
 
 ## What you'll see on the PR
 

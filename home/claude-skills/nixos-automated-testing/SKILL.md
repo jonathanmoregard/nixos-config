@@ -1,15 +1,34 @@
 ---
-name: nixos-vm-test-gate
+name: nixos-automated-testing
 description: >
-  Use when modifying NixOS flake config in /etc/nixos or
-  ~/Repos/nixos-config-worktrees and the VM e2e test should run.
-  CI runs this automatically on PRs; this skill covers the LOCAL
-  invocation for debugging before pushing.
+  AUTOMATED dellan-vm e2e test gate — the same test CI runs on every
+  PR (status check `vm-minimal`). Covers the LOCAL invocation for fast
+  iteration before pushing, when to extend `tests/dellan-vm.nix`, and
+  the test-script gotchas.
+  Pair with the `nixos-agent-testing` skill (interactive feature VM)
+  for changes whose logic the automated gate can't assert on its own
+  — branching scripts, multistep activation, things that need a real
+  X session or human-visible side effect.
   Triggers on phrases like "run the VM gate", "test the flake",
-  "run dellan-vm test", and on edits to home/*.nix, modules/*.nix,
-  hosts/*.nix, flake.nix that introduce HM units, systemd timers,
-  scripts, or new packages.
+  "run dellan-vm test", "add a test for X", and on edits to home/*.nix,
+  modules/*.nix, hosts/*.nix, flake.nix that introduce HM units,
+  systemd timers, scripts, or new packages.
 ---
+
+## Scope
+
+This is the **assertion-driven** gate: `nixosTest`-based, headless,
+script-driven, the same derivation CI builds. It proves things like
+"the unit reaches active", "the binary is on PATH", "the script's
+output matches this jq pattern". Pass → green. Fail → traceback.
+
+For **interactive smoke-testing** (boot a real feature VM, drive it
+via SSH/QMP/screencap, click on the actual login screen, watch a
+service start in real time), use the `nixos-agent-testing` skill
+instead. The two are complementary — this skill runs every PR; the
+interactive VM is what you reach for when logic in a change needs
+human-style verification before merge (any branching code or
+multistep script).
 
 ## Run the gate locally
 
