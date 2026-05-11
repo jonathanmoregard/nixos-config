@@ -776,6 +776,22 @@ in
     map ctrl+less launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
     # New tab inheriting cwd of current window.
     map ctrl+t new_tab_with_cwd
+
+    # Copy: strip embedded newlines so multi-line commands pasted from
+    # Claude Code (or any terminal output) land as a single line. Kitty
+    # already joins soft-wrapped lines and omits the trailing newline of
+    # the last selected line; this binding additionally removes *hard*
+    # newlines within the selection. Selection is passed as argv[0] (the
+    # $0 of `sh -c`); `kitten clipboard` reads stdin and writes to the
+    # system clipboard (works over SSH too).
+    map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | tr -d "\n" | kitten clipboard'
+    # Escape hatch: preserve embedded newlines (logs, diffs, error output).
+    map ctrl+shift+alt+c copy_to_clipboard
+
+    # Paste: replace-newline rewrites stray \n in paste payloads so they
+    # don't auto-execute under shells without bracketed paste. confirm
+    # keeps kitty's safety prompt for paste payloads with control codes.
+    paste_actions quote-urls-at-prompt,replace-newline,confirm
   '';
 
   # Periodic snapshot — survives crashes, kernel panics, power loss.
