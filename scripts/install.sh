@@ -385,7 +385,7 @@ if [ "$DRY_RUN" = "1" ]; then
   note "DRY_RUN: skipping smoke test"
 else
   prompt "Optional: open a no-op test PR (e.g. README typo) to verify the"
-  prompt "full pipeline (CI runs on GHA → classify → label → label-gate → mergeable)."
+  prompt "full pipeline (CI runs on GHA → mergeable)."
   pause "Done (or press ENTER to skip)?"
 fi
 
