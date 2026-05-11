@@ -204,10 +204,11 @@ let
     def maybe_resume_claude(cmd, cwd, session_id=None):
         """If cmd is the claude-code CLI, rewrite to resume the correct
         session. Prefers the per-pane session_id captured at snapshot time
-        (via /proc/<pid>/fd/ → open .jsonl); falls back to latest-by-mtime
-        for the cwd when no per-pane id is available, OR when the named
-        session's jsonl no longer exists (user pruned it between snapshot
-        and restore)."""
+        (TSV populated by the SessionStart hook claude-kitty-pane-record,
+        keyed by kitty window id and joined in by kitty-session-enrich);
+        falls back to latest-by-mtime for the cwd when no per-pane id is
+        available, OR when the named session's jsonl no longer exists
+        (user pruned it between snapshot and restore)."""
         if not cmd:
             return cmd
         if os.path.basename(cmd[0]) != "claude":
@@ -364,11 +365,16 @@ let
       mkdir -p "$dir"
 
       # flock guards concurrent SessionStart hooks (e.g. two new claude
-      # sessions starting in the same second). Replace any existing entry
-      # for this window_id, then atomically rename into place.
+      # sessions starting in the same second) AND the enricher's
+      # prune_tsv (which takes the same lock from Python). Replace any
+      # existing entry for this window_id, then atomically rename into
+      # place. The trap cleans up the tmp file if any step between
+      # mktemp and the final mv fails — mv consumes the source path,
+      # so on success the trap's `rm -f` is a no-op.
       (
         flock -x 9
         tmp=$(mktemp -p "$dir" ".pane-sessions.tsv.XXXX")
+        trap 'rm -f "$tmp"' EXIT
         if [ -f "$tsv" ]; then
           awk -F'\t' -v wid="$KITTY_WINDOW_ID" '$1 != wid' "$tsv" > "$tmp"
         fi
@@ -392,6 +398,7 @@ let
   # are removed on every enrich run, keeping the TSV bounded by current
   # pane count (≤ a few hundred lines in pathological cases).
   kittySessionEnrich = pkgs.writers.writePython3Bin "kitty-session-enrich" {} ''
+    import fcntl
     import json
     import os
     import re
@@ -441,38 +448,55 @@ let
 
 
     def prune_tsv(live_window_ids):
-        """Drop TSV entries for windows no longer in `kitty @ ls`."""
+        """Drop TSV entries for windows no longer in `kitty @ ls`.
+
+        Holds the same flock the SessionStart hook
+        (claude-kitty-pane-record) takes, so a concurrent row append
+        can't slip in between our read and our atomic replace and get
+        silently dropped. Window without the lock was ~ms but real.
+        """
         if not os.path.isfile(TSV_PATH):
             return
-        try:
-            with open(TSV_PATH) as fh:
-                lines = fh.readlines()
-        except OSError:
-            return
-        kept = []
-        for line in lines:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) < 2:
-                continue
-            wid = parts[0]
-            if wid.isdigit() and int(wid) in live_window_ids:
-                kept.append(line)
-        if len(kept) == len(lines):
-            return
         d = os.path.dirname(TSV_PATH)
+        lock_path = os.path.join(d, ".pane-sessions.lock")
         try:
-            fd, tmp = tempfile.mkstemp(dir=d, prefix=".pane-sessions.tsv.")
+            lock_fh = open(lock_path, "w")
         except OSError:
             return
         try:
-            with os.fdopen(fd, "w") as fh:
-                fh.writelines(kept)
-            os.replace(tmp, TSV_PATH)
-        except OSError:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
             try:
-                os.unlink(tmp)
+                with open(TSV_PATH) as fh:
+                    lines = fh.readlines()
             except OSError:
-                pass
+                return
+            kept = []
+            for line in lines:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2:
+                    continue
+                wid = parts[0]
+                if wid.isdigit() and int(wid) in live_window_ids:
+                    kept.append(line)
+            if len(kept) == len(lines):
+                return
+            try:
+                fd, tmp = tempfile.mkstemp(
+                    dir=d, prefix=".pane-sessions.tsv."
+                )
+            except OSError:
+                return
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    fh.writelines(kept)
+                os.replace(tmp, TSV_PATH)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        finally:
+            lock_fh.close()
 
 
     def enrich(data):
