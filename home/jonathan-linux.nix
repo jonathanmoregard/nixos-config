@@ -70,12 +70,43 @@ in
   # (caught when wellbeing trackers kept failing with /usr/bin/python3
   # after the python-path fix had already deployed).
   #
-  # Test the wrapper path directly. /run/wrappers is set up early in the
-  # boot sequence by setuid-wrapper.service, well before HM activation.
-  home.activation.installCrontab = lib.hm.dag.entryAfter ["writeBoundary"] ''
+  # Ordering: entryAfter ["linkGeneration"], NOT ["writeBoundary"]. The
+  # writeBoundary marker fires before the new generation's symlinks
+  # under $HOME are swapped in; the symlink at $HOME/.config/crontab
+  # still points at the PREVIOUS generation's store path during any
+  # activation hook running between writeBoundary and linkGeneration.
+  # An earlier iteration of this hook reinstalled the OLD content on
+  # every rebuild, which is how PR #52's PATH= addition didn't reach
+  # the active crontab even after a successful deploy. linkGeneration
+  # is the step that updates the symlinks; running after it guarantees
+  # crontab reads the new generation.
+  home.activation.installCrontab = lib.hm.dag.entryAfter ["linkGeneration"] ''
     if [ -x /run/wrappers/bin/crontab ]; then
       /run/wrappers/bin/crontab "$HOME/.config/crontab" || true
     fi
+  '';
+
+  # router-agent expects ~/.config/router/paths.yaml. Project is cloned
+  # by cloneRepos activation but its config dir lives outside the repo.
+  # Content migrated 1:1 from the prior Mint install (mint-backup-2026-05-05).
+  # Contains no secrets — just Dropbox roots and local-state directory
+  # paths.
+  home.file.".config/router/paths.yaml".text = ''
+    version: 1
+
+    # Dropbox roots — sync target for ingestion and exocortex artifacts.
+    # Change ~/Dropbox to wherever your Dropbox folder lives.
+    dropbox_root: ~/Dropbox
+    inlet_transcripts: ''${dropbox_root}/1. Exocortex/_Inlet/Android/Transcripts
+    exocortex_root: ''${dropbox_root}/1. Exocortex
+
+    # Local-disk roots (per-machine, never in Dropbox).
+    state_root: ~/.local/state/router
+    inbox_root: ''${state_root}/inbox
+    processed_root: ''${state_root}/processed
+    queue_root: ''${state_root}/queue
+    audit_root: ''${state_root}/audit
+    ingestor_ledger: ''${state_root}/ingestor-ledger.db
   '';
 
   # Clone user repos into ~/Repos on first activation.
