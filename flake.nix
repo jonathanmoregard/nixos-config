@@ -82,6 +82,7 @@
         vm-keyring     = mkLane ./tests/keyring.nix;
         vm-kitty       = mkLane ./tests/kitty.nix;
         vm-claude-pane = mkLane ./tests/claude-pane.nix;
+        vm-autodoro    = mkLane ./tests/autodoro.nix;
       };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.
