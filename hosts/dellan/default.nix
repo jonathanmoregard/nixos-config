@@ -89,10 +89,11 @@
   # research-agent microvm — persisted state.
   #
   # The VM's SSH host keys live on this virtiofs RW share so the
-  # host-side `known_hosts` pin (StrictHostKeyChecking=yes from the
-  # MCP server) survives VM reboots. The dir must exist before the
-  # microvm boots, otherwise virtiofsd mounts an empty source and
-  # services.openssh fails to write its hostKey path.
+  # host-side `known_hosts` pin (StrictHostKeyChecking=accept-new in
+  # the MCP server's ssh command — pinned on first connect, then
+  # verified strictly) remains valid across VM reboots. The dir must
+  # exist before the microvm boots, otherwise virtiofsd mounts an
+  # empty source and services.openssh fails to write its hostKey path.
   #
   # /var/lib (not /home/jonathan/.local/) because systemd-tmpfiles
   # refuses to canonicalize across an ownership boundary

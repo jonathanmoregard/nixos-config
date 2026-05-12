@@ -44,8 +44,11 @@
           }
           {
             # Persisted VM SSH host keys across reboots — required for
-            # the host-side known_hosts pin (StrictHostKeyChecking=yes
-            # in the MCP server's ssh command) to survive a VM reboot.
+            # the host-side known_hosts pin (StrictHostKeyChecking=accept-new
+            # in the MCP server's ssh command, pinned on first connect)
+            # to remain valid across VM reboots. Without persistence
+            # every boot would regenerate keys and the host would hit
+            # REMOTE HOST IDENTIFICATION HAS CHANGED on the second call.
             # Backed by /var/lib/research-agent/vm-ssh on the host
             # (systemd.tmpfiles.rules in hosts/dellan/default.nix).
             source = "/var/lib/research-agent/vm-ssh";
@@ -200,6 +203,17 @@
       };
 
       networking.hostName = "research-agent";
+
+      # Disable IPv6 inside the guest. The egress allowlist set
+      # (research_allowed, type ipv4_addr) only covers v4, and
+      # egress-init resolves with `getent ahostsv4`. If SLIRP ever
+      # advertised a v6 resolver (some QEMU configs expose fec0::3),
+      # the agent's resolver would prefer AAAA per RFC 6724, wait for
+      # the v6 connect to time out against the chain's default drop,
+      # then fall back to A — adding 5-10 s to every first connect.
+      # Matches the docker-era behavior (containers were v4-only).
+      networking.enableIPv6 = false;
+
       system.stateVersion = "25.11";
     };
   };
