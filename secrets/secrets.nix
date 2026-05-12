@@ -93,6 +93,19 @@ in {
   #
   # File CONTENTS expected at decrypt time: raw OpenSSH ed25519 private
   # key (BEGIN OPENSSH PRIVATE KEY ... END OPENSSH PRIVATE KEY).
+  #
+  # Recipients deliberately scoped to [jonathanDellan dellan]:
+  #   - dellan host key: needed for /run/agenix/research-agent-host-key
+  #     activation on the laptop where the MCP server runs.
+  #   - jonathanDellan: lets jonathan edit + rekey from dellan.
+  #   - jonathanMint (legacy laptop) intentionally omitted: this is a
+  #     post-Mint-migration secret, and re-encrypting from a "kept until
+  #     confirmed dead" key would broaden the trust surface for no gain.
+  #   - vm (nixos-vm host key) intentionally omitted: the legacy nixos-vm
+  #     never runs the MCP server, never needs to decrypt this.
+  # If jonathan ever rotates jonathanDellan, this secret needs an explicit
+  # agenix -r from dellan; bulk-rekey scripts that filter on allKeys will
+  # not touch it. Deliberate.
   # ---------------------------------------------------------------------
   "research-agent-host-key.age".publicKeys = [ jonathanDellan dellan ];
 }
