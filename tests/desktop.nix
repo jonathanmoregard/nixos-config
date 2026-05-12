@@ -69,5 +69,23 @@
     # are also acceptable signals that the binding is unset.
     assert media_keys in ("@as []", "[]", "EMPTY", ""), \
         f"default screenshot media-key not cleared: {media_keys!r}"
+
+    # LightDM greeter-setup-script — silences the X11 bell so arrow keys
+    # at the password field don't "twoink". Greeter user is `lightdm`,
+    # separate from jonathan's user-session dconf, so the silencing has
+    # to happen at the X-server level before the greeter starts.
+    lightdm_conf = dellan.succeed("cat /etc/lightdm/lightdm.conf")
+    print("[diag] /etc/lightdm/lightdm.conf:\n" + lightdm_conf)
+    assert "greeter-setup-script=" in lightdm_conf, \
+        f"greeter-setup-script not wired into lightdm.conf:\n{lightdm_conf}"
+    # Resolve the script path the greeter-setup-script line points at,
+    # then assert the body calls xset to disable the bell.
+    setup_script = dellan.succeed(
+        "awk -F= '/^greeter-setup-script=/ {print $2; exit}' /etc/lightdm/lightdm.conf"
+    ).strip()
+    assert setup_script, "greeter-setup-script value empty"
+    setup_body = dellan.succeed(f"cat {setup_script}")
+    assert "xset b off" in setup_body, \
+        f"greeter-setup-script does not silence X11 bell:\n{setup_body}"
   '';
 }
