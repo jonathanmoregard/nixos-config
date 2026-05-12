@@ -12,6 +12,7 @@
     # webhook latency optimization.
     ../../modules/nixos/nixos-auto-deploy.nix
     ../../modules/nixos/build-coordination.nix
+    ../../modules/nixos/cachix-push.nix
     ../../modules/nixos/claude-agent-users.nix
 
     # Docker + research-agent dev container. The MCP server spawned by
