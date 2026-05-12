@@ -62,4 +62,19 @@ in {
   "exa-api-key.age".publicKeys       = allKeys;
   "tavily-api-key.age".publicKeys    = allKeys;
   "claude-token.age".publicKeys      = allKeys;
+
+  # ---------------------------------------------------------------------
+  # Cachix push token.
+  #
+  # Consumed by:
+  #   - nix.settings.post-build-hook on dellan (modules/nixos/cachix-push.nix)
+  #     — pushes every successful local build (dellan toplevel, VM test
+  #     derivations, anything in /nix/store with the right closure) to
+  #     the `jonathanmoregard` cachix cache so CI on GHA pulls them
+  #     from cache instead of rebuilding cold.
+  # File CONTENTS expected at decrypt time (RAW value, no `KEY=` prefix):
+  #   cachix-auth-token.age   — cachix.org write token for the
+  #                              `jonathanmoregard` cache.
+  # ---------------------------------------------------------------------
+  "cachix-auth-token.age".publicKeys = allKeys;
 }
