@@ -9,9 +9,17 @@
 
     agenix.url = "github:ryantm/agenix";
     agenix.inputs.nixpkgs.follows = "nixpkgs";
+
+    # Personal CLI tools — own uv2nix flakes, exposed system-wide via
+    # `modules/nixos/listen-tools.nix`. Pinned to a tag in production
+    # eventually; track main for now.
+    tts-tool.url = "github:jonathanmoregard/tts-tool";
+    tts-tool.inputs.nixpkgs.follows = "nixpkgs";
+    substack-url-tool.url = "github:jonathanmoregard/substack-url-tool";
+    substack-url-tool.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, home-manager, agenix, ... }:
+  outputs = { self, nixpkgs, home-manager, agenix, tts-tool, substack-url-tool, ... }:
   let
     linuxSystem = "x86_64-linux";
 
@@ -20,10 +28,20 @@
     # reuse the same pkgs: the nixosTest framework injects pkgs
     # externally and that makes `nixpkgs.config` / `nixpkgs.overlays`
     # read-only inside modules.
+    #
+    # The listen-tools overlay exposes the standalone CLI packages
+    # (substack-url-tool, tts-tool) as plain `pkgs.<name>` attributes
+    # so modules don't need flake-input specialArgs threading.
     pkgsLinux = import nixpkgs {
       system = linuxSystem;
       config.allowUnfree = true;
-      overlays = [ (import ./overlays/beeper.nix) ];
+      overlays = [
+        (import ./overlays/beeper.nix)
+        (final: prev: {
+          tts-tool = tts-tool.packages.${linuxSystem}.default;
+          substack-url-tool = substack-url-tool.packages.${linuxSystem}.default;
+        })
+      ];
     };
   in {
     # NixOS VM (headless, QEMU/KVM)
@@ -77,11 +95,12 @@
           inputs = { inherit home-manager agenix; };
         };
       in {
-        vm-base        = mkLane ./tests/base.nix;
-        vm-desktop     = mkLane ./tests/desktop.nix;
-        vm-keyring     = mkLane ./tests/keyring.nix;
-        vm-kitty       = mkLane ./tests/kitty.nix;
-        vm-claude-pane = mkLane ./tests/claude-pane.nix;
+        vm-base         = mkLane ./tests/base.nix;
+        vm-desktop      = mkLane ./tests/desktop.nix;
+        vm-keyring      = mkLane ./tests/keyring.nix;
+        vm-kitty        = mkLane ./tests/kitty.nix;
+        vm-claude-pane  = mkLane ./tests/claude-pane.nix;
+        vm-listen-tools = mkLane ./tests/listen-tools.nix;
       };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.
