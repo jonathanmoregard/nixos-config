@@ -154,7 +154,15 @@
           Type = "oneshot";
           RemainAfterExit = true;
         };
-        path = [ pkgs.nftables pkgs.glibc pkgs.coreutils pkgs.gawk ];
+        # pkgs.getent (a separate small derivation) provides the
+        # `getent` binary. `glibc.bin` on current nixpkgs does NOT
+        # ship getent — it has gencat/getconf/iconv/locale/etc. but
+        # the resolver tool lives in its own attr. Verified by
+        # `ls $(nix eval --raw .#pkgs.glibc.bin)/bin`.
+        # Without this, the script fails on every domain with
+        # `getent: command not found`, exhausts retries, exits 1, and
+        # cascades sshd into `failed` via the Requires= above.
+        path = [ pkgs.nftables pkgs.getent pkgs.coreutils pkgs.gawk ];
         script = ''
           set -euo pipefail
 

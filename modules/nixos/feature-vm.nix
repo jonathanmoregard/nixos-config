@@ -99,6 +99,13 @@
       qemu.options = [
         "-virtfs"
         "local,path=/home/jonathan/.cache/feature-vm/host-ssh,security_model=none,mount_tag=host-ssh"
+        # research-agent worktree → /home/jonathan/Repos/research-agent
+        # inside the feature-vm. Production dellan has the real repo at
+        # that path; in the feature-vm we 9p-mount the host worktree so
+        # the inner microvm's virtiofs share for /workspace has actual
+        # code to run for an E2E research() call.
+        "-virtfs"
+        "local,path=/home/jonathan/worktrees/research-agent-feat-microvm-migration,security_model=mapped-xattr,mount_tag=research-agent"
       ];
 
       # Mount the host-ssh 9p export read-only at /mnt/host-ssh.
@@ -118,6 +125,19 @@
           "x-systemd.requires=modprobe@9pnet_virtio.service"
         ];
         neededForBoot = true;
+      };
+
+      # research-agent worktree mount. RW so the inner microvm's
+      # virtiofs RW share for /out can write reports into reports/.
+      fileSystems."/home/jonathan/Repos/research-agent" = {
+        device = "research-agent";
+        fsType = "9p";
+        options = [
+          "trans=virtio"
+          "version=9p2000.L"
+          "msize=131072"
+          "x-systemd.requires=modprobe@9pnet_virtio.service"
+        ];
       };
     };
 
@@ -160,22 +180,9 @@
     services.nixos-auto-deploy.enable = lib.mkForce false;
     services.tailscale.enable = lib.mkForce false;
 
-    # research-agent microvm virtiofs source stubs. The production
-    # config in modules/nixos/research-agent-microvm.nix declares
-    # virtiofs shares from /home/jonathan/Repos/research-agent{,/reports},
-    # which only exist on real dellan (where jonathan cloned the agent
-    # repo). Inside the feature VM those paths don't exist, virtiofsd
-    # exits with ERROR and microvm@research-agent.service restart-loops.
-    # Stub the dirs as empty so virtiofsd starts and the inner microvm
-    # can boot for interactive smoke. Empty workspace means the agent
-    # CLAUDE.md and shims won't be there — a `research()` call inside
-    # the VM will fail at the agent layer, which is acceptable for the
-    # smoke (we're testing the host module / microvm boot path, not
-    # an end-to-end research call).
+    # /home/jonathan/Repos needs to exist before the 9p mount lands.
     systemd.tmpfiles.rules = [
       "d /home/jonathan/Repos 0755 jonathan users -"
-      "d /home/jonathan/Repos/research-agent 0755 jonathan users -"
-      "d /home/jonathan/Repos/research-agent/reports 0755 jonathan users -"
     ];
 
     # Autologin into Cinnamon so interactive smoke tests can drive the
