@@ -160,6 +160,24 @@
     services.nixos-auto-deploy.enable = lib.mkForce false;
     services.tailscale.enable = lib.mkForce false;
 
+    # research-agent microvm virtiofs source stubs. The production
+    # config in modules/nixos/research-agent-microvm.nix declares
+    # virtiofs shares from /home/jonathan/Repos/research-agent{,/reports},
+    # which only exist on real dellan (where jonathan cloned the agent
+    # repo). Inside the feature VM those paths don't exist, virtiofsd
+    # exits with ERROR and microvm@research-agent.service restart-loops.
+    # Stub the dirs as empty so virtiofsd starts and the inner microvm
+    # can boot for interactive smoke. Empty workspace means the agent
+    # CLAUDE.md and shims won't be there — a `research()` call inside
+    # the VM will fail at the agent layer, which is acceptable for the
+    # smoke (we're testing the host module / microvm boot path, not
+    # an end-to-end research call).
+    systemd.tmpfiles.rules = [
+      "d /home/jonathan/Repos 0755 jonathan users -"
+      "d /home/jonathan/Repos/research-agent 0755 jonathan users -"
+      "d /home/jonathan/Repos/research-agent/reports 0755 jonathan users -"
+    ];
+
     # Autologin into Cinnamon so interactive smoke tests can drive the
     # desktop session via QMP send-key without typing credentials at the
     # greeter every boot. Matches `tests/lib/common.nix`'s autologin
