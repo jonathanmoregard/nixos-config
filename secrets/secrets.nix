@@ -64,6 +64,18 @@ in {
   "claude-token.age".publicKeys      = allKeys;
 
   # ---------------------------------------------------------------------
+  # Fish Audio TTS API key.
+  #
+  # Consumed by:
+  #   - tts-tool wrapper (modules/nixos/listen-tools.nix), which exports
+  #     FISH_AUDIO_API_KEY_FILE = decrypt path so the Python CLI reads
+  #     the key at exec time instead of having it bake into argv/env of
+  #     unrelated processes.
+  # File CONTENTS expected at decrypt time (RAW value, no `KEY=` prefix).
+  # ---------------------------------------------------------------------
+  "fish-audio-api-key.age".publicKeys = allKeys;
+
+  # ---------------------------------------------------------------------
   # Cachix push token.
   #
   # Consumed by:
