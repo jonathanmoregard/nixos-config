@@ -146,10 +146,20 @@
 
       systemd.services.research-agent-egress-init = {
         description = "Resolve allowlist FQDNs and populate nftables set";
-        wantedBy = [ "multi-user.target" ];
+        wantedBy = [ "multi-user.target" "nftables.service" ];
         after = [ "network-online.target" "nftables.service" ];
         wants = [ "network-online.target" ];
         requires = [ "nftables.service" ];
+        # PartOf=nftables.service so when nftables reloads (every
+        # nixos-rebuild switch atomically re-applies the ruleset and
+        # recreates the `research_allowed` set empty), egress-init is
+        # restarted in the same transaction and repopulates the set
+        # before the new ruleset goes live. Without this, a switch
+        # mid-flight on the host wipes the allowlist; ESTABLISHED
+        # flows survive via conntrack, but new outbound connections
+        # hit policy=drop until the operator manually restarts
+        # egress-init.
+        partOf = [ "nftables.service" ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
