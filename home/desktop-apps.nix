@@ -16,6 +16,7 @@
     zenity
     dropbox
     thunderbird
+    mpv # CLI + GUI media player; default for MP3 output from tts-tool
     gnome-text-editor # GTK4 — used for scroll-behavior comparison vs Mint (drift-debug 2026-04-28)
     android-studio # nixpkgs, NOT flatpak — RAM-hungry, avoid in 4GB VM
     # cursor: package name in nixpkgs is `code-cursor`. Re-add as
