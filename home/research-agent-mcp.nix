@@ -24,6 +24,11 @@
 # corresponding env var at exec time, then execs the Python entry from
 # the project venv.
 #
+# Post-microvm migration: the SSH transport reads `RESEARCH_SSH_KEY`
+# (default: agenix-decrypted host-to-VM private key path). The MCP
+# server's `_ssh_settings()` reads it lazily at call time so we just
+# export it here.
+#
 # Wrapper name `research-agent-mcp` matches the ~/.claude.json command
 # string so the config doesn't need to change. The wrapped binary lives
 # inside the project venv at a different absolute path, so no PATH loop.
@@ -46,6 +51,12 @@
         CLAUDE_CODE_OAUTH_TOKEN=$(< /run/agenix/claude-token)
         export ANTHROPIC_API_KEY OPENAI_API_KEY \
                EXA_API_KEY TAVILY_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+
+        # Host-to-VM SSH private key. The mcp_server reads this lazily
+        # in _ssh_settings(); we only need to point it at the agenix
+        # decrypt path. Override-friendly: a caller exporting
+        # RESEARCH_SSH_KEY before us wins.
+        export RESEARCH_SSH_KEY="''${RESEARCH_SSH_KEY:-/run/agenix/research-agent-host-key}"
 
         exec uv run --project "$HOME/Repos/research-agent" \
             python3 -m mcp_server.server "$@"

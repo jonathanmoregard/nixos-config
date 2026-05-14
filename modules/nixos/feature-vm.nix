@@ -99,6 +99,13 @@
       qemu.options = [
         "-virtfs"
         "local,path=/home/jonathan/.cache/feature-vm/host-ssh,security_model=none,mount_tag=host-ssh"
+        # research-agent worktree → /home/jonathan/Repos/research-agent
+        # inside the feature-vm. Production dellan has the real repo at
+        # that path; in the feature-vm we 9p-mount the host worktree so
+        # the inner microvm's virtiofs share for /workspace has actual
+        # code to run for an E2E research() call.
+        "-virtfs"
+        "local,path=/home/jonathan/worktrees/research-agent-feat-microvm-migration,security_model=mapped-xattr,mount_tag=research-agent"
       ];
 
       # Mount the host-ssh 9p export read-only at /mnt/host-ssh.
@@ -118,6 +125,19 @@
           "x-systemd.requires=modprobe@9pnet_virtio.service"
         ];
         neededForBoot = true;
+      };
+
+      # research-agent worktree mount. RW so the inner microvm's
+      # virtiofs RW share for /out can write reports into reports/.
+      fileSystems."/home/jonathan/Repos/research-agent" = {
+        device = "research-agent";
+        fsType = "9p";
+        options = [
+          "trans=virtio"
+          "version=9p2000.L"
+          "msize=131072"
+          "x-systemd.requires=modprobe@9pnet_virtio.service"
+        ];
       };
     };
 
@@ -159,6 +179,11 @@
     # `tests/lib/common.nix` are the prod-parity gate).
     services.nixos-auto-deploy.enable = lib.mkForce false;
     services.tailscale.enable = lib.mkForce false;
+
+    # /home/jonathan/Repos needs to exist before the 9p mount lands.
+    systemd.tmpfiles.rules = [
+      "d /home/jonathan/Repos 0755 jonathan users -"
+    ];
 
     # Autologin into Cinnamon so interactive smoke tests can drive the
     # desktop session via QMP send-key without typing credentials at the
