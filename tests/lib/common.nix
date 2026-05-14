@@ -1,19 +1,24 @@
-# Shared dellan-VM scaffolding for the per-feature checks
+# Shared scaffolding for the per-feature checks
 # (tests/base.nix, tests/desktop.nix, tests/keyring.nix, tests/kitty.nix,
 # tests/claude-pane.nix).
 #
-# Lifts the node config out of every lane so the 5 test files don't
-# each redeclare imports / disabledModules / autoLogin / linger /
-# virtualisation. The testScript stays explicit per-lane so each lane
-# is self-contained when read top-to-bottom.
+# Two builders:
+#   mkTest         — full dellan host import (HM + autoLogin + everything).
+#                    Lanes that exercise HM-installed bits or graphical
+#                    state use this; closure tracks the prod system.
+#   mkMinimalTest  — base profile + caller-supplied extraModules. No HM,
+#                    no autoLogin. Use when the lane only touches a
+#                    specific profile (e.g. keyring → /etc/pam.d/login)
+#                    so its derivation hash is independent of unrelated
+#                    files; cachix can then serve it across PRs that
+#                    don't touch the relevant profile.
 { pkgs, inputs }:
 
 let
   lib = pkgs.lib;
 
-  # Same dellan-in-a-VM node every lane uses. Mirrors the production
-  # host config (hosts/dellan/default.nix) under the test framework's
-  # read-only nixpkgs injection.
+  # Full-host node — mirrors hosts/dellan/default.nix under the test
+  # framework's read-only nixpkgs injection.
   node = { config, ... }: {
     imports = [
       inputs.agenix.nixosModules.default
@@ -55,9 +60,28 @@ let
       diskSize = 8192;
     };
   };
+
+  # Minimal node — base profile + agenix scaffolding only. Lanes opt in
+  # to feature profiles via `extraModules`.
+  mkMinimalNode = extraModules: { config, ... }: {
+    imports = [
+      inputs.agenix.nixosModules.default
+      ../../profiles/base.nix
+    ] ++ extraModules;
+
+    boot.loader.systemd-boot.enable = lib.mkForce false;
+    boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
+
+    users.users.jonathan.initialPassword = lib.mkForce "test";
+
+    virtualisation = {
+      memorySize = 1024;
+      cores = 2;
+      diskSize = 2048;
+    };
+  };
 in
 {
-  # Each lane calls `mkTest { name = "vm-..."; testScript = ''...''; }`.
   # skipTypeCheck mirrors the original monolith — mypy mis-parses some
   # of the testScript heredocs (e.g. `import json` indent in claude-pane);
   # keeping it uniform across lanes avoids surprise when blocks move.
@@ -66,4 +90,11 @@ in
     skipTypeCheck = true;
     nodes.dellan = node;
   };
+
+  mkMinimalTest = { name, testScript, extraModules ? [] }:
+    pkgs.testers.runNixOSTest {
+      inherit name testScript;
+      skipTypeCheck = true;
+      nodes.dellan = mkMinimalNode extraModules;
+    };
 }
