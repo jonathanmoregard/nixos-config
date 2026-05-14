@@ -69,5 +69,36 @@
     # are also acceptable signals that the binding is unset.
     assert media_keys in ("@as []", "[]", "EMPTY", ""), \
         f"default screenshot media-key not cleared: {media_keys!r}"
+
+    # LightDM display-setup-script — silences the X11 bell so arrow
+    # keys at the password field don't "twoink". Greeter user is
+    # `lightdm`, separate from jonathan's user-session dconf, so the
+    # silencing has to happen at the X-server level. Hook is
+    # `display-setup-script` (runs on every X start) rather than
+    # `greeter-setup-script` (skipped on autologin path).
+    lightdm_conf = dellan.succeed("cat /etc/lightdm/lightdm.conf")
+    print("[diag] /etc/lightdm/lightdm.conf:\n" + lightdm_conf)
+    assert "display-setup-script=" in lightdm_conf, \
+        f"display-setup-script not wired into lightdm.conf:\n{lightdm_conf}"
+    setup_script = dellan.succeed(
+        "awk -F= '/^display-setup-script=/ {print $2; exit}' /etc/lightdm/lightdm.conf"
+    ).strip()
+    assert setup_script, "display-setup-script value empty"
+    setup_body = dellan.succeed(f"cat {setup_script}")
+    assert "xset b off" in setup_body, \
+        f"display-setup-script does not silence X11 bell:\n{setup_body}"
+
+    # Empirical: with autologin enabled (test scaffolding mirrors
+    # feature-vm), display-setup-script runs and the X server reports
+    # bell volume 0. Confirms the hook fires on the autologin path —
+    # the failure mode that greeter-setup-script had.
+    dellan.wait_for_x()
+    bell_q = dellan.succeed(
+        "env DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 "
+        "xset q | grep -i 'bell percent'"
+    )
+    print("[diag] xset bell state: " + bell_q)
+    assert "bell percent:  0" in bell_q, \
+        f"X server bell not silenced after display-setup-script:\n{bell_q}"
   '';
 }

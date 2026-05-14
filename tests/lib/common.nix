@@ -18,6 +18,7 @@ let
     imports = [
       inputs.agenix.nixosModules.default
       inputs.home-manager.nixosModules.home-manager
+      inputs.microvm.nixosModules.host
       ../../hosts/dellan/default.nix
       ../../modules/common.nix
     ];

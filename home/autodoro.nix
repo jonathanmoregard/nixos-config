@@ -2,13 +2,25 @@
 # Autodoro pomodoro timer.
 #
 # The script lives in ~/Repos/autodoro and is iterated on outside this
-# flake (post-push hook auto-restarts the service). The Nix side here
-# only owns the launch *environment*: a wrapper that injects every
-# binary and GI/pixbuf path the script's bash + python3+gi code needs
-# at runtime. NixOS has no /bin/bash and no global GI typelib, so
-# without this wrapper the service either exits 203/EXEC or crashes
-# inside python with "Namespace Gtk not available" / "Couldn't
-# recognize the image file format".
+# flake. The Nix side here owns:
+#
+#   1. the launch *environment* — a wrapper that injects every binary
+#      and GI/pixbuf path the script's bash + python3+gi code needs at
+#      runtime. NixOS has no /bin/bash and no global GI typelib, so
+#      without this wrapper the service either exits 203/EXEC or
+#      crashes inside python with "Namespace Gtk not available" /
+#      "Couldn't recognize the image file format".
+#
+#   2. the *reload trigger* — a `pre-push` git hook installed into
+#      the user's global `~/.config/git/hooks/` dir. Fires only on
+#      `git push` from the autodoro repo and restarts the service.
+#      Replaces the older `.githooks/post-push` flow, which silently
+#      no-op'd: (a) `post-push` is not a real git hook (git only
+#      defines `pre-push`), and (b) the user's global
+#      `core.hooksPath=~/.config/git/hooks` overrode the per-repo
+#      `.githooks/` dir anyway. The hook lives in the global dir
+#      (matching that override) and guards by repo toplevel so it's
+#      a cheap no-op for pushes from any other repo.
 let
   pythonEnv = pkgs.python3.withPackages (ps: with ps; [ pygobject3 ]);
 
@@ -60,8 +72,8 @@ let
   '';
 
   # The actual systemd ExecStart. Sources the env, then execs the
-  # repo script so the post-push reload path keeps working without a
-  # rebuild.
+  # repo script — the script body itself stays in ~/Repos/autodoro
+  # and is reloaded via the pre-push git hook below on `git push`.
   launcher = pkgs.writeShellApplication {
     name = "autodoro";
     inherit runtimeInputs;
@@ -92,11 +104,17 @@ in
       Description = "Autodoro pomodoro timer";
       After = [ "graphical-session.target" ];
       PartOf = [ "graphical-session.target" ];
+      # Cap restarts so a script that segfaults right after a bad
+      # push doesn't wedge the user's session in a tight restart
+      # loop. Next push of a fixed script re-triggers the hook.
+      StartLimitIntervalSec = 30;
+      StartLimitBurst = 5;
     };
     Service = {
       ExecStart = "${launcher}/bin/autodoro";
       ExecCondition = "/bin/sh -c 'test -f %h/Repos/autodoro/autodoro.sh'";
       Restart = "on-failure";
+      RestartSec = "2s";
       Environment = [
         "DISPLAY=:0"
         "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
@@ -105,5 +123,28 @@ in
     Install = {
       WantedBy = [ "graphical-session.target" ];
     };
+  };
+
+  # Global pre-push hook → restart autodoro.service after a push from
+  # ~/Repos/autodoro. Lives in the global hooks dir because that's
+  # where the user's `core.hooksPath` (set in home/jonathan.nix)
+  # points; any per-repo `.githooks/` would be silently shadowed.
+  # Guard by `git rev-parse --show-toplevel` so pushes from every
+  # other repo are a cheap no-op.
+  #
+  # Fires synchronously inside `git push` and exits 0 unconditionally
+  # so a systemd error does not block the push itself. The restart
+  # is fire-and-forget — by the time the network push completes the
+  # service is already on the new code.
+  home.file.".config/git/hooks/pre-push" = {
+    executable = true;
+    text = ''
+      #!/usr/bin/env bash
+      # Run from any git push; this dispatches on the current repo.
+      if [ "$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null)" = "$HOME/Repos/autodoro" ]; then
+        ${pkgs.systemd}/bin/systemctl --user restart autodoro.service || true
+      fi
+      exit 0
+    '';
   };
 }

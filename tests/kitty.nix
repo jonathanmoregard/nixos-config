@@ -29,6 +29,23 @@
         "head -1 /etc/profiles/per-user/jonathan/bin/kitty | grep -q bash"
     )
 
+    # Copy-strip keybinding rendered into kitty.conf: ctrl+shift+c pipes the
+    # selection through `tr -d \\n` so multi-line commands paste as a single
+    # line. ctrl+shift+alt+c is the escape hatch that preserves newlines.
+    kitty_conf = "/home/jonathan/.config/kitty/kitty.conf"
+    dellan.succeed(
+        f"grep -qE '^map ctrl\\+shift\\+c pass_selection_to_program' {kitty_conf}"
+    )
+    dellan.succeed(
+        f"grep -q 'tr -d' {kitty_conf}"
+    )
+    dellan.succeed(
+        f"grep -qE '^map ctrl\\+shift\\+alt\\+c copy_to_clipboard' {kitty_conf}"
+    )
+    dellan.succeed(
+        f"grep -qE '^paste_actions .*replace-newline' {kitty_conf}"
+    )
+
     # Persistence timer is active and scheduled
     dellan.wait_for_unit("kitty-session-save.timer", "jonathan")
 
