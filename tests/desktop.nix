@@ -92,7 +92,13 @@
     # feature-vm), display-setup-script runs and the X server reports
     # bell volume 0. Confirms the hook fires on the autologin path —
     # the failure mode that greeter-setup-script had.
+    #
+    # Sync barrier: `wait_for_x` only confirms the X socket is up; it
+    # does not wait for display-setup-script to finish. The script
+    # touches /run/x11-bell-silenced after xset, so this gives a
+    # deterministic post-condition to wait on (no retry loop, no race).
     dellan.wait_for_x()
+    dellan.wait_for_file("/run/x11-bell-silenced")
     bell_q = dellan.succeed(
         "env DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 "
         "xset q | grep -i 'bell percent'"
