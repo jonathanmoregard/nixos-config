@@ -8,10 +8,28 @@
 #     default media-keys screenshot binding cleared (so PrtSc doesn't
 #     double-fire into both "save to ~/Pictures" and "to clipboard").
 #
+# Uses mkFeatureTest with home/_test-desktop.nix — HM closure is
+# jonathan.nix + cinnamon.nix + desktop-apps.nix (no kitty / claude
+# /autodoro / router-services / etc). extraModules pull in the system
+# Cinnamon module + lightdm + autoLogin so dconf is populated when the
+# Cinnamon session comes up, plus jq for the testScript's grep paths.
+#
 # Run: nix build .#checks.x86_64-linux.vm-desktop -L
 { pkgs, inputs }:
-(import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
+(import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
   name = "vm-desktop";
+  hm = ../home/_test-desktop.nix;
+  extraModules = [
+    ../modules/nixos/desktop.nix
+    ({ pkgs, ... }: {
+      services.xserver.displayManager.autoLogin = {
+        enable = true;
+        user = "jonathan";
+      };
+      services.displayManager.defaultSession = "cinnamon";
+      environment.systemPackages = with pkgs; [ jq ];
+    })
+  ];
   testScript = ''
     dellan.wait_for_unit("multi-user.target")
     dellan.wait_for_unit("home-manager-jonathan.service")

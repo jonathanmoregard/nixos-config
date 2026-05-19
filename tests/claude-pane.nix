@@ -25,10 +25,24 @@
 #   6d  production safety — KITTY_ENRICH_TSV ignored without test flag
 #   6e  malformed TSV lines ignored, valid row still wins
 #
+# Uses mkFeatureTest with home/_test-claude-pane.nix — only kitty.nix
+# (which contains claude-kitty-pane-record + kitty-session-enrich) is
+# in the HM closure. Edits to home/cinnamon.nix, home/desktop-apps.nix,
+# home/jonathan.nix, home/claude-services.nix etc. leave this lane's
+# drvPath unchanged → cachix serves across PRs that don't touch the
+# kitty-side claude integration.
+#
 # Run: nix build .#checks.x86_64-linux.vm-claude-pane -L
 { pkgs, inputs }:
-(import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
+(import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
   name = "vm-claude-pane";
+  hm = ../home/_test-claude-pane.nix;
+  # `jq` on the test driver's PATH (testScript runs commands as root,
+  # not jonathan). The full-host node got jq transitively via
+  # modules/common.nix; the minimal feature node doesn't import it.
+  extraModules = [
+    ({ pkgs, ... }: { environment.systemPackages = [ pkgs.jq ]; })
+  ];
   testScript = ''
     import json
 

@@ -2,16 +2,19 @@
 # (tests/base.nix, tests/desktop.nix, tests/keyring.nix, tests/kitty.nix,
 # tests/claude-pane.nix).
 #
-# Two builders:
+# Three builders:
 #   mkTest         — full dellan host import (HM + autoLogin + everything).
-#                    Lanes that exercise HM-installed bits or graphical
-#                    state use this; closure tracks the prod system.
+#                    Lanes that exercise the integrated graphical stack
+#                    use this; closure tracks the prod system.
 #   mkMinimalTest  — base profile + caller-supplied extraModules. No HM,
 #                    no autoLogin. Use when the lane only touches a
-#                    specific profile (e.g. keyring → /etc/pam.d/login)
-#                    so its derivation hash is independent of unrelated
-#                    files; cachix can then serve it across PRs that
-#                    don't touch the relevant profile.
+#                    specific system profile (e.g. keyring → /etc/pam.d/login).
+#   mkFeatureTest  — base profile + extraModules + caller-supplied per-test
+#                    HM entrypoint (`hm` arg → home/_test-<lane>.nix). Use
+#                    when the lane exercises HM-installed bits but only a
+#                    subset of feature modules. Cache hash is invariant to
+#                    edits in HM modules NOT imported by the per-test
+#                    entrypoint.
 { pkgs, inputs }:
 
 let
@@ -80,6 +83,39 @@ let
       diskSize = 2048;
     };
   };
+
+  # Feature node — base + agenix + extraModules + a per-test HM
+  # entrypoint. The HM entrypoint (e.g. home/_test-claude-pane.nix)
+  # imports only the HM modules the lane exercises, so the resulting
+  # vm-* derivation hash is independent of HM modules NOT in that import
+  # graph.
+  mkFeatureNode = { extraModules, hm }: { config, ... }: {
+    imports = [
+      inputs.agenix.nixosModules.default
+      inputs.home-manager.nixosModules.home-manager
+      ../../profiles/base.nix
+    ] ++ extraModules;
+
+    boot.loader.systemd-boot.enable = lib.mkForce false;
+    boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
+
+    home-manager = {
+      useGlobalPkgs = true;
+      useUserPackages = true;
+      users.jonathan = import hm;
+    };
+
+    users.users.jonathan = {
+      linger = true;
+      initialPassword = lib.mkForce "test";
+    };
+
+    virtualisation = {
+      memorySize = 2048;
+      cores = 2;
+      diskSize = 4096;
+    };
+  };
 in
 {
   # skipTypeCheck mirrors the original monolith — mypy mis-parses some
@@ -96,5 +132,12 @@ in
       inherit name testScript;
       skipTypeCheck = true;
       nodes.dellan = mkMinimalNode extraModules;
+    };
+
+  mkFeatureTest = { name, testScript, hm, extraModules ? [] }:
+    pkgs.testers.runNixOSTest {
+      inherit name testScript;
+      skipTypeCheck = true;
+      nodes.dellan = mkFeatureNode { inherit extraModules hm; };
     };
 }
