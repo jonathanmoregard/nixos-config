@@ -1,18 +1,21 @@
 # listen-tools: CLI pipeline that turns Substack articles into MP3s.
 #
-#   substack-url-tool $URL | tts-tool -o out.mp3
+#   substack-url-tool --format markdown $URL \
+#     | prose-decorate \
+#     | tts-tool -o out.mp3
 #
-# Both binaries live in standalone flakes (github:jonathanmoregard/<name>)
+# All three binaries live in standalone flakes (github:jonathanmoregard/<name>)
 # and are exposed on the system via the inline overlay in `flake.nix`.
-# This module wraps `tts-tool` with a writeShellApplication that injects
-# FISH_AUDIO_API_KEY_FILE = the agenix decrypt path at runtime — the
-# Python CLI prefers _FILE over the bare env var so the key never
+# `tts-tool` and `prose-decorate` are wrapped here with writeShellApplication
+# wrappers that inject `<KEY>_FILE = agenix decrypt path` at runtime — the
+# Python CLIs prefer `_FILE` over the bare env var so the raw key never
 # transits any process argv/env outside the wrapper.
 #
-# Why agenix `owner = "jonathan"`: the binaries are user-launched at the
-# shell, NOT a systemd unit. No `LoadCredential` path; instead, agenix
-# decrypts to `/run/agenix/fish-audio-api-key` owned by jonathan so the
-# user shell can `cat` it via the wrapper without sudo.
+# Why agenix `owner = "jonathan"` (Fish key only — Anthropic key already
+# declared in hosts/dellan/default.nix with the same shape): the binaries
+# are user-launched at the shell, NOT systemd units. No `LoadCredential`
+# path; instead, agenix decrypts to `/run/agenix/<name>` owned by jonathan
+# so the user shell can `cat` it via the wrapper without sudo.
 { config, pkgs, lib, ... }:
 {
   age.secrets.fish-audio-api-key = {
@@ -31,6 +34,16 @@
           export FISH_AUDIO_API_KEY_FILE="${config.age.secrets.fish-audio-api-key.path}"
         fi
         exec tts-tool "$@"
+      '';
+    })
+    (pkgs.writeShellApplication {
+      name = "prose-decorate";
+      runtimeInputs = [ pkgs.prose-decorate ];
+      text = ''
+        if [ -r "${config.age.secrets.anthropic-api-key.path}" ]; then
+          export ANTHROPIC_API_KEY_FILE="${config.age.secrets.anthropic-api-key.path}"
+        fi
+        exec prose-decorate "$@"
       '';
     })
     pkgs.substack-url-tool

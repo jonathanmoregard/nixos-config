@@ -15,13 +15,16 @@
     ../../modules/nixos/cachix-push.nix
     ../../modules/nixos/claude-agent-users.nix
 
-    # Docker + research-agent dev container. The MCP server spawned by
-    # Claude Code (via home/research-agent-mcp.nix) `docker exec`s into
-    # the long-running `research-agent` container for every research()
-    # call. Without these, the MCP server fails with
-    # `docker not available: [Errno 2] No such file or directory: 'docker'`.
+    # research-agent microvm. The MCP server spawned by Claude Code
+    # (via home/research-agent-mcp.nix) ssh's into the long-running
+    # research-agent microvm for every research() call. The microvm is
+    # synthesized as microvm@research-agent.service by microvm.nix.
+    #
+    # docker.nix kept for now (no remaining Nix consumer after this PR,
+    # but interactive use is out of scope — removing it host-wide is a
+    # separate audit).
     ../../modules/nixos/docker.nix
-    ../../modules/nixos/research-agent-container.nix
+    ../../modules/nixos/research-agent-microvm.nix
 
     # Feature VM overrides — no-op for prod toplevel, only activates
     # under `config.system.build.vm`. See module header for usage.
@@ -77,6 +80,37 @@
     group = "users";
     mode = "0400";
   };
+
+  # Private half of the SSH keypair the MCP server uses to ssh into the
+  # research-agent microvm. Matching public key is plaintext inside
+  # modules/nixos/research-agent-microvm.nix as authorized_keys.
+  age.secrets.research-agent-host-key = {
+    file = ../../secrets/research-agent-host-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
+  # ---------------------------------------------------------------------
+  # research-agent microvm — persisted state.
+  #
+  # The VM's SSH host keys live on this virtiofs RW share so the
+  # host-side `known_hosts` pin (StrictHostKeyChecking=accept-new in
+  # the MCP server's ssh command — pinned on first connect, then
+  # verified strictly) remains valid across VM reboots. The dir must
+  # exist before the microvm boots, otherwise virtiofsd mounts an
+  # empty source and services.openssh fails to write its hostKey path.
+  #
+  # /var/lib (not /home/jonathan/.local/) because systemd-tmpfiles
+  # refuses to canonicalize across an ownership boundary
+  # (jonathan → root → jonathan) — fails with "unsafe path transition".
+  # /var/lib has no such hop and is the conventional spot for daemon
+  # state anyway.
+  # ---------------------------------------------------------------------
+  systemd.tmpfiles.rules = [
+    "d /var/lib/research-agent 0700 root root -"
+    "d /var/lib/research-agent/vm-ssh 0700 root root -"
+  ];
 
   # ---------------------------------------------------------------------
   # CI/CD workflow — service options.

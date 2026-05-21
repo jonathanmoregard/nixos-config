@@ -126,6 +126,9 @@ jobs:
     steps:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Free root disk (dotnet/ghc/android/codeql)
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: ./scripts/free-root-disk.sh
       - name: Mount /nix on /mnt loopback (replaces free-disk-space)
         if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/mount-nix-loop.sh
@@ -165,10 +168,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, listen-tools]
+        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools]
     steps:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Free root disk (dotnet/ghc/android/codeql)
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: ./scripts/free-root-disk.sh
       - name: Mount /nix on /mnt loopback (replaces free-disk-space)
         if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/mount-nix-loop.sh

@@ -19,9 +19,14 @@
   # latter is skipped on the autologin path (verified in feature-vm:
   # bell percent stayed 50 with greeter-setup-script). display-setup
   # runs at every X server start regardless of greeter vs autologin.
+  #
+  # Sentinel `/run/x11-bell-silenced` is touched after xset so the
+  # vm-desktop test can `wait_for_file` deterministically instead of
+  # racing `wait_for_x` against this hook's completion.
   services.xserver.displayManager.lightdm.extraSeatDefaults = ''
     display-setup-script=${pkgs.writeShellScript "lightdm-disable-bell" ''
       ${pkgs.xorg.xset}/bin/xset b off
+      touch /run/x11-bell-silenced
     ''}
   '';
 
