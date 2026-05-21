@@ -779,7 +779,11 @@ in
     map ctrl+up neighboring_window up
     map ctrl+down neighboring_window down
     # Add new pane via the 2x2-grid pattern (kitty-pane-add).
-    map ctrl+less launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
+    # Use literal `<` (ASCII 0x3C, matches X11 keysym at runtime) rather
+    # than `less`: kitty's `dlopen("libxkbcommon.so")` fails on this
+    # NixOS build, so named-keysym binds like `ctrl+less` parse-error
+    # ("unknown key, ignoring") at config-load and never fire.
+    map ctrl+< launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
     # New tab inheriting cwd of current window.
     map ctrl+t new_tab_with_cwd
 
