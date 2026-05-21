@@ -59,13 +59,18 @@ let
       exit 0
     fi
 
+    # Capture the exit code BEFORE any `if`-test or `!`-inversion —
+    # bash zeroes `$?` once a conditional has decided, so reading rc
+    # from inside an `if ! cmd; then` block always sees 0 and the
+    # 124/137 timeout-vs-failure discriminator below would be wrong.
+    rc=0
     # shellcheck disable=SC2086 # OUT_PATHS is intentionally word-split
-    if ! CACHIX_AUTH_TOKEN="$(< "$tokenFile")" \
-         ${pkgs.coreutils}/bin/timeout \
-           --signal=KILL --kill-after=5s ${toString pushTimeoutSeconds}s \
-         ${pkgs.cachix}/bin/cachix push ${cacheName} $OUT_PATHS \
-         >&2; then
-      rc=$?
+    CACHIX_AUTH_TOKEN="$(< "$tokenFile")" \
+      ${pkgs.coreutils}/bin/timeout \
+        --signal=KILL --kill-after=5s ${toString pushTimeoutSeconds}s \
+      ${pkgs.cachix}/bin/cachix push ${cacheName} $OUT_PATHS \
+      >&2 || rc=$?
+    if [ "$rc" -ne 0 ]; then
       if [ "$rc" = "137" ] || [ "$rc" = "124" ]; then
         echo "cachix-push-hook: timed out after ${toString pushTimeoutSeconds}s pushing $OUT_PATHS" >&2
       else
