@@ -665,6 +665,12 @@ in
     # WIP, not yet wired in (see wrapper above):
     kittyPaneAdd
     kittyRestoreSession
+    # Used by the ctrl+shift+c copy-strip bind below. `kitten clipboard`
+    # opens /dev/tty to push via OSC 52; `pass_selection_to_program`
+    # runs its child without a controlling terminal, so that path fails
+    # silently ("Error: open /dev/tty: no such device or address"). xclip
+    # writes to the X11 CLIPBOARD selection without needing a TTY.
+    pkgs.xclip
   ];
 
   home.file.".config/kitty/kitty.conf".text = ''
@@ -786,9 +792,13 @@ in
     # already joins soft-wrapped lines and omits the trailing newline of
     # the last selected line; this binding additionally removes *hard*
     # newlines within the selection. Selection is passed as argv[0] (the
-    # $0 of `sh -c`); `kitten clipboard` reads stdin and writes to the
-    # system clipboard (works over SSH too).
-    map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | tr -d "\n" | kitten clipboard'
+    # $0 of `sh -c`); pipe through tr then xclip to the X11 CLIPBOARD.
+    # NOTE: `kitten clipboard` was tried here first but fails silently
+    # under `pass_selection_to_program` — it opens /dev/tty to push via
+    # OSC 52, and kitty runs the child without a controlling terminal
+    # ("Error: open /dev/tty: no such device or address"). xclip writes
+    # directly to the X11 CLIPBOARD selection, no TTY needed.
+    map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | tr -d "\n" | xclip -selection clipboard -in'
     # Escape hatch: preserve embedded newlines (logs, diffs, error output).
     map ctrl+shift+alt+c copy_to_clipboard
 
