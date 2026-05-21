@@ -11,10 +11,37 @@
 #   4. Relaunch via wrapper — must auto-inject --session
 #   5. Assert restored topology matches (4 windows, cwds, foreground cmdlines)
 #
+# Uses mkFeatureTest with home/_test-kitty.nix — only home/jonathan.nix
+# + home/kitty.nix in the HM closure. Edits to home/cinnamon.nix,
+# home/desktop-apps.nix, home/claude-services.nix etc. leave this lane's
+# drvPath unchanged.
+#
+# extraModules: lightdm + autoLogin (need X for the kitty session
+# restore phase) and jq/findutils on the system PATH (the testScript
+# runs them as root).
+#
 # Run: nix build .#checks.x86_64-linux.vm-kitty -L
 { pkgs, inputs }:
-(import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
+(import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
   name = "vm-kitty";
+  hm = ../home/_test-kitty.nix;
+  extraModules = [
+    ({ pkgs, ... }: {
+      services.xserver = {
+        enable = true;
+        displayManager.lightdm.enable = true;
+        # Bare xterm session (no Cinnamon, no full WM) — kitty just needs
+        # a DISPLAY to attach to. Registers `none+xterm` as a session.
+        desktopManager.xterm.enable = true;
+      };
+      services.xserver.displayManager.autoLogin = {
+        enable = true;
+        user = "jonathan";
+      };
+      services.displayManager.defaultSession = "xterm";
+      environment.systemPackages = with pkgs; [ jq findutils ];
+    })
+  ];
   testScript = ''
     dellan.wait_for_unit("multi-user.target")
     dellan.wait_for_unit("home-manager-jonathan.service")
