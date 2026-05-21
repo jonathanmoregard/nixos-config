@@ -30,9 +30,11 @@
     ''}
   '';
 
-  services.gnome.gnome-keyring.enable = true;
+  # gnome-keyring service + login PAM moved to profiles/keyring.nix so
+  # vm-keyring can pull in the keyring slice without dragging the full
+  # Cinnamon/LightDM closure. lightdm-PAM extension stays here — it's
+  # display-manager-coupled.
   security.pam.services.lightdm.enableGnomeKeyring = true;
-  security.pam.services.login.enableGnomeKeyring = true;
 
   # cron daemon — required for the home-manager-installed user crontab
   # in home/jonathan-linux.nix. Without this, `crontab` is missing from
