@@ -9,9 +9,19 @@
 
     agenix.url = "github:ryantm/agenix";
     agenix.inputs.nixpkgs.follows = "nixpkgs";
+
+    # microvm.nix — qemu+KVM microvm host module. Tracking `main`
+    # because the most recent tagged release (v0.5.0, 2024-04) calls
+    # `pkgs.writeReferencesToFile` which has been removed in current
+    # nixpkgs. flake.lock pins the exact SHA so the build remains
+    # reproducible; bumping via `nix flake update microvm` is a
+    # deliberate PR with a re-run dellan-vm test.
+    # .github/workflows/update-microvm-pin.yml watches for new commits.
+    microvm.url = "github:astro/microvm.nix";
+    microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, home-manager, agenix, ... }:
+  outputs = { self, nixpkgs, home-manager, agenix, microvm, ... }:
   let
     linuxSystem = "x86_64-linux";
 
@@ -49,11 +59,13 @@
     nixosConfigurations.dellan = nixpkgs.lib.nixosSystem {
       system = linuxSystem;
       pkgs = pkgsLinux;
+      specialArgs = { inherit microvm; };
       modules = [
         ./hosts/dellan/default.nix
         ./modules/common.nix
         agenix.nixosModules.default
         { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
+        microvm.nixosModules.host
         home-manager.nixosModules.home-manager
         {
           home-manager.useGlobalPkgs = true;
@@ -74,7 +86,7 @@
       let
         mkLane = path: import path {
           pkgs = pkgsLinux;
-          inputs = { inherit home-manager agenix; };
+          inputs = { inherit home-manager agenix microvm; };
         };
       in {
         vm-base        = mkLane ./tests/base.nix;
@@ -82,6 +94,8 @@
         vm-keyring     = mkLane ./tests/keyring.nix;
         vm-kitty       = mkLane ./tests/kitty.nix;
         vm-claude-pane = mkLane ./tests/claude-pane.nix;
+        vm-autodoro    = mkLane ./tests/autodoro.nix;
+        vm-microvm     = mkLane ./tests/microvm.nix;
       };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.
