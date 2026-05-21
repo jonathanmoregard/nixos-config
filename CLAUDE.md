@@ -65,6 +65,13 @@ gh pr view <PR_NUMBER>   # confirm merged
 - `git push origin main` directly — branch protection rejects (no direct push).
 - `sudo nixos-rebuild switch` casually — bypasses the gate stack.
 - Edit `/etc/nixos` directly — root-owned + auto-deploy will overwrite.
+- **Split related work into stacked PRs.** One logical change = one PR,
+  even if the diff grows. Stacks couple merge order to the CI risk-
+  classifier: a "low risk" child PR can auto-merge into its parent
+  branch (not into main), leaving the parent PR dangling and forcing
+  manual reopen + base retarget. Only stack when review must happen in
+  stages (different reviewers, or the child genuinely depends on a
+  yet-unreviewed parent semantic).
 
 ## CI on GitHub-hosted runners
 
