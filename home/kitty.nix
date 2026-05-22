@@ -797,25 +797,39 @@ in
     # New tab inheriting cwd of current window.
     map ctrl+t new_tab_with_cwd
 
-    # Copy: strip embedded newlines so multi-line commands pasted from
-    # Claude Code (or any terminal output) land as a single line. Kitty
-    # already joins soft-wrapped lines and omits the trailing newline of
-    # the last selected line; this binding additionally removes *hard*
-    # newlines within the selection. Selection is passed as argv[0] (the
-    # $0 of `sh -c`); pipe through tr then xclip to the X11 CLIPBOARD.
-    # NOTE: `kitten clipboard` was tried here first but fails silently
-    # under `pass_selection_to_program` — it opens /dev/tty to push via
-    # OSC 52, and kitty runs the child without a controlling terminal
-    # ("Error: open /dev/tty: no such device or address"). xclip writes
-    # directly to the X11 CLIPBOARD selection, no TTY needed.
-    map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | tr -d "\n" | xclip -selection clipboard -in'
-    # Escape hatch: preserve embedded newlines (logs, diffs, error output).
+    # Copy: preserve embedded newlines so multi-line shell commands and
+    # multi-line code blocks copied out of the terminal round-trip
+    # intact. Prior design (PR #70, `tr -d "\n"`) was wrong: it stripped
+    # EVERY newline, so any selection that spanned > 1 line collapsed
+    # into one giant blob. Combined with the prior `paste_actions
+    # replace-newline` that also flattened newlines on the way in, this
+    # made the whole copy/paste pipeline a one-way trip to single-line
+    # mangling.
+    #
+    # Selection is passed as argv[0] (the $0 of `sh -c`). `printf %s`
+    # does NOT append a trailing newline, so what kitty handed us is
+    # what xclip stores byte-for-byte. xclip writes to the X11 CLIPBOARD
+    # selection without a controlling TTY (kitten clipboard / OSC 52
+    # fails under pass_selection_to_program — see comment near
+    # `pkgs.xclip` above).
+    map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | xclip -selection clipboard -in'
+    # Escape hatch: kitty's built-in copy_to_clipboard (no shell hop).
+    # Both bindings now preserve newlines — the alt variant exists for
+    # parity with the prior split-behavior config so muscle memory keeps
+    # working.
     map ctrl+shift+alt+c copy_to_clipboard
 
-    # Paste: replace-newline rewrites stray \n in paste payloads so they
-    # don't auto-execute under shells without bracketed paste. confirm
-    # keeps kitty's safety prompt for paste payloads with control codes.
-    paste_actions quote-urls-at-prompt,replace-newline,confirm
+    # Paste: preserve newlines in the paste payload byte-for-byte.
+    # `replace-newline` was a destructive hack that rewrote every \n in
+    # the paste into a space — broke pasting multi-line shell commands,
+    # diffs, code, anything the user expected to land as the bytes they
+    # copied. `confirm` keeps kitty's safety prompt for paste payloads
+    # carrying control codes (the actual injection risk); `quote-urls-
+    # at-prompt` keeps the URL-quoting nicety. Modern shells (zsh+bash
+    # with vi/emacs mode) handle bracketed paste correctly — they hold
+    # the payload in the buffer without auto-executing, so the
+    # safety story is already covered by the shell side.
+    paste_actions quote-urls-at-prompt,confirm
   '';
 
   # Periodic snapshot — survives crashes, kernel panics, power loss.
