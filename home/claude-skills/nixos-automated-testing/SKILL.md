@@ -147,6 +147,21 @@ phase tears down the VM and you've lost the chance to introspect.
 - **`nixpkgs.config` and `nixpkgs.overlays` become read-only** when the
   test framework injects pkgs externally. Keep them in `flake.nix`'s
   `pkgsLinux`/`pkgsDarwin` definitions, never in modules.
+- **`fprintf(stderr, …)` from C code in a patched binary is INVISIBLE
+  in VM test harness output**, even with `fflush(stderr)`. The test
+  driver captures `machine.succeed("cmd")`'s stdout, not stderr of every
+  library loaded inside `cmd`'s process. If `cmd` is wrapped (xvfb-run,
+  systemd-run) or backgrounds itself, fd 2 routes to journald or
+  `/dev/null` before the C lib prints. Use explicit file logging instead:
+  ```c
+  FILE *fd = fopen("/tmp/debug.log", "a");
+  fprintf(fd, "got here\n");
+  fclose(fd);
+  ```
+  Then read it from the testScript: `print(machine.succeed("cat /tmp/debug.log"))`.
+  Direct disk-write is launch-method-agnostic and can't disappear.
+  Past incident (kitty/glfw-x11 patch debug): hours burned adding more
+  `fprintf(stderr, ...)` blocks before switching to file logging.
 
 ## Failure modes
 
