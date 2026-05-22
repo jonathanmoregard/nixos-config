@@ -1,5 +1,5 @@
 { pkgs, lib, ... }:
-# Autodoro pomodoro timer.
+# Autodoro pomodoro timer. (key-churn comment to force fresh cache save on PR #75)
 #
 # The script lives in ~/Repos/autodoro and is iterated on outside this
 # flake. The Nix side here owns:
