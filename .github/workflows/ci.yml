@@ -137,32 +137,35 @@ jobs:
       - name: Mount /nix on /mnt loopback (replaces free-disk-space)
         if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/mount-nix-loop.sh
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       # build-dellan owns the shared cache. Restore on entry; the action
       # auto-saves /nix/store at job end under `primary-key` (post step is
       # gated `post-if: success()`, so cancelled/failed runs skip save and
       # don't poison the snapshot). Subsequent PR jobs (vm-minimal lanes)
       # restore from this snapshot.
       #
-      # Order: this step runs BEFORE determinate-nix-action. The restore
-      # phase is plain tar-into-/nix/store, no nix binary needed; running
-      # it after the installer would overlay our cached store on the
-      # installer's freshly-initialised /nix/var/nix/db, which leaves the
-      # daemon's sqlite out of sync with the on-disk paths (nix would
-      # then re-download everything). Save phase (post step) runs after
-      # the build, when nix IS installed and gc works.
+      # Order: this step runs AFTER determinate-nix-action. cache-nix-
+      # action's restore phase shells out to `sudo chown -R runner:runner
+      # /nix/var/nix/db && sqlite3 ... 'PRAGMA wal_checkpoint(TRUNCATE)'`
+      # (see src/utils/database.ts in the action source) — that dir only
+      # exists once nix is installed. The action then runs its own
+      # `mergeStoreDatabases` to fold the cached store-paths into the
+      # installer's fresh sqlite, so there's no on-disk vs db desync to
+      # worry about (handled in src/utils/restore.ts).
       #
       # Key strategy: hash flake.lock + every .nix file. Identical config
       # → exact hit. flake.lock-only changes (input bump) → restore the
       # closest lock-prefix and only fetch the delta. Total miss → fall
       # back to the runner-os prefix.
       #
-      # Cache budget: GHA caps repos at 10 GB compressed; tar+zstd hits
-      # roughly 2× compression, so an uncompressed 9 GB store fits in
-      # ~4.5 GB cache. gc-max-store-size-linux trims to 9 GB to give the
-      # dellan closure (~8 GB) headroom without evicting live paths.
-      # purge with purge-prefixes drops other matching caches older than
-      # 7 days; purge-primary-key:never protects the snapshot we just
-      # restored from.
+      # Cache budget: GHA caps repos at 10 GB compressed. NixOS store is
+      # mostly pre-compressed (elf, gz, xz), so tar+zstd only hits
+      # ~1.2-1.3×. gc-max-store-size-linux: 7 GB → ~5.5 GB compressed,
+      # leaving headroom against the cap. dellan closure (~8 GB) doesn't
+      # all fit but the toplevel itself stays gc-live; what gets evicted
+      # are intermediate build outputs the next run can re-download
+      # cheaply.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
@@ -170,14 +173,12 @@ jobs:
           restore-prefixes-first-match: |
             nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
             nix-store-${{ runner.os }}-
-          gc-max-store-size-linux: 9000000000
+          gc-max-store-size-linux: 7000000000
           purge: true
           purge-prefixes: nix-store-${{ runner.os }}-
           purge-created: true
           purge-created-max-age-seconds: 604800  # 7 days
           purge-primary-key: never
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
@@ -222,18 +223,19 @@ jobs:
       - name: Mount /nix on /mnt loopback (replaces free-disk-space)
         if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/mount-nix-loop.sh
-      # Restore the shared /nix/store snapshot that build-dellan saved
-      # earlier in this run. save: false — only build-dellan owns the
-      # snapshot. 7 lanes saving in parallel would race for the same
-      # cache key, and 7 × ~9 GB blows the GHA 10 GB cap. Worst case
-      # (build-dellan's save hasn't propagated yet) the restore-prefixes
-      # fall back to the previous run's snapshot — still faster than
-      # cold.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+      # Restore the shared /nix/store snapshot that build-dellan saved.
+      # save: false — only build-dellan owns the snapshot. 7 lanes saving
+      # in parallel would race for the same cache key, and 7 × ~7 GB
+      # blows the GHA 10 GB cap. Worst case (build-dellan's save hasn't
+      # propagated) the restore-prefixes fall back to the previous run's
+      # snapshot — still faster than cold.
       #
-      # Order matches build-dellan: cache restore BEFORE the installer
-      # so the cached /nix/store and the installer's fresh
-      # /nix/var/nix/db end up consistent (the installer ingests the
-      # restored paths during its setup).
+      # Order matches build-dellan: cache restore AFTER the installer
+      # because the action's restore phase needs /nix/var/nix/db to
+      # exist (it chowns + sqlite-checkpoints the daemon DB so it can
+      # merge cached store-paths into the freshly-installed DB).
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
@@ -242,8 +244,6 @@ jobs:
             nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
             nix-store-${{ runner.os }}-
           save: false
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       # cachix remains the secondary substituter: it covers paths the
       # GHA cache didn't have (e.g. brand-new VM-specific closure) and
       # paths from other developers' machines pushed via post-build hooks.
