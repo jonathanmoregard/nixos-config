@@ -116,9 +116,9 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       # No cache-nix-action here on purpose. flake-check is eval-only
       # (`--no-build`); its added /nix/store would be small relative to
-      # build-dellan's ~8 GB snapshot, and this job has no /mnt loopback
-      # so restoring the shared snapshot to the runner's root disk would
-      # likely ENOSPC.
+      # build-dellan's snapshot (≤8 GB uncompressed per gc-max), and
+      # this job has no /mnt loopback so restoring the shared snapshot
+      # to the runner's root disk would likely ENOSPC.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix flake check --no-build --all-systems
 
@@ -159,13 +159,17 @@ jobs:
       # closest lock-prefix and only fetch the delta. Total miss → fall
       # back to the runner-os prefix.
       #
-      # Cache budget: GHA caps repos at 10 GB compressed. NixOS store is
-      # mostly pre-compressed (elf, gz, xz), so tar+zstd only hits
+      # Cache budget: GHA caps repos at 10 GB compressed. NixOS store
+      # is mostly pre-compressed (elf, gz, xz), so tar+zstd only hits
       # ~1.2-1.3×. gc-max-store-size-linux: 8G (binary, 8.59 GB decimal)
-      # → ~6.5 GB compressed, comfortable under the 10 GB cap. dellan
-      # toplevel closure (~8 GB) is just barely able to fit AS LONG AS
-      # the toplevel is pinned as a gcroot — the action's post step
-      # unconditionally calls `nix store gc --max` on cold save, and
+      # → ~6.5 GB compressed, comfortable under the 10 GB cap. The cap
+      # is sized to hold the dellan toplevel + recent intermediates;
+      # actual closure size is whatever the build produces (re-tune by
+      # reading `nix path-info -sSh /run/current-system` after a fresh
+      # build if the cache starts thrashing).
+      #
+      # The cap matters because the action's post step unconditionally
+      # calls `nix store gc --max` on cold save (saveImpl.ts:102), and
       # without a gcroot the just-built --no-link toplevel is
       # unreachable and would be deleted before the tarball is written.
       # The `nix build --out-link` below registers an indirect gcroot
