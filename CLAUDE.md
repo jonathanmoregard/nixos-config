@@ -66,6 +66,13 @@ gh pr view <PR_NUMBER>   # confirm merged
 - `sudo nixos-rebuild switch` casually — bypasses the gate stack.
 - Edit `/etc/nixos` directly — root-owned + auto-deploy will overwrite.
 - **`git rebase` to sync a PR branch with `main`.** Use `git merge origin/main` instead. Rebase rewrites the published branch's history and then requires `git push --force-with-lease` to publish — `--force*` is denied at the safe-bash MCP layer, so the agent gets stuck mid-sync. Merge commits the conflict resolution as a normal merge commit; `git push` (no flags) advances the ref cleanly. The merge-commit noise in `git log` is a feature, not a bug — it records when the branch caught up.
+- **Split related work into stacked PRs.** One logical change = one PR,
+  even if the diff grows. Stacks couple merge order to the CI risk-
+  classifier: a "low risk" child PR can auto-merge into its parent
+  branch (not into main), leaving the parent PR dangling and forcing
+  manual reopen + base retarget. Only stack when review must happen in
+  stages (different reviewers, or the child genuinely depends on a
+  yet-unreviewed parent semantic).
 
 ## CI on GitHub-hosted runners
 
@@ -104,6 +111,8 @@ nix flake check -L                                  # all lanes
 ```
 
 Adding a new test: drop `tests/<feature>.nix` (use existing files as templates), wire it into `flake.nix`'s `checks` block, and add the lane name to the matrix in `.github/workflows/ci.yml`. Skip only for hardware-specific config the VM can't model (touchpad, GPU, LUKS, real disks).
+
+**Prefer behavioural assertions over presence ones.** A lane asserting `test -x <bin>` or `wait_for_unit <name>` proves the file/unit exists; it does not prove the feature behaves. Where feasible, exercise the actual user-facing job (run the CLI, press the binding, hit the endpoint) and assert the output. The `Behavioural evidence` trailer field demands the same posture at push time. See `nixos-automated-testing` for assertion patterns and `nixos-agent-testing` for the interactive smoke (`nix run .#feature-vm`) when the assertion gate can't reach a real user-facing code path.
 
 **Architecture note:** `nixpkgs.config.allowUnfree` and `nixpkgs.overlays` live in `flake.nix` (built into `pkgsLinux` / `pkgsDarwin`). Setting them inside modules conflicts with `runNixOSTest`'s read-only nixpkgs injection.
 

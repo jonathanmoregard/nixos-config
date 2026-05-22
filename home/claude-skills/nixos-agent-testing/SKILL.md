@@ -18,8 +18,10 @@ description: >
   activation script, systemd `ExecStart` chain of several commands).
 - Change touches **user-visible UI / desktop** (Cinnamon, kitty,
   LightDM theming, applet behavior).
-- A **daemon needs poking** to verify behavior (curl an endpoint,
-  trigger a unit and read its log, watch a timer fire).
+- A **daemon needs poking** to verify its actual job (curl the
+  endpoint, fire the timer, hit the URL, press the GUI binding, run
+  the CLI as the user) — `systemctl is-active` is NOT enough. The
+  test must reach the user's perspective, not the kernel's.
 - A **PR is risk:medium or higher** per the classifier, and you want
   to convince yourself before clicking merge.
 
@@ -159,8 +161,13 @@ The interactive VM's value vs. the automated gate is that you can
 1. Boot the VM (`nix run .#feature-vm`).
 2. SSH in and `systemctl --failed`, `systemctl is-active <unit>`,
    `journalctl -u <unit> -n 50`. Understand what's actually there.
-3. Trigger the new behavior end-to-end (curl the endpoint, fire the
-   timer, run the script that was added).
+3. Trigger the new behavior the way a user would. CLI command → run
+   it as the user. GUI binding → send the keystroke and observe the
+   side effect. HTTP endpoint → curl it. Daemon → exercise its actual
+   job. **Don't grep the config and call it tested. Don't
+   `systemctl is-active` and call it tested. Press the key. Make the
+   request.** (Patterns behind PR #57's render-grep-only and PR #61's
+   is-active-only broken merges.)
 4. Capture proof: `journalctl --since`, `systemctl status`, a
    screencap if it's UI, the actual artifact the script was supposed
    to produce.

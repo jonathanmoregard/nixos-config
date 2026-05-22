@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
 let
   # Convert `kitty @ ls` JSON snapshot → kitty session-file format
   # (https://sw.kovidgoyal.net/kitty/overview/#startup-sessions).
@@ -201,17 +201,28 @@ let
         return None
 
 
-    def maybe_resume_claude(cmd, cwd, session_id=None):
+    def maybe_resume_claude(cmd, cwd, session_id, claimed_sids):
         """If cmd is the claude-code CLI, rewrite to resume the correct
-        session. Prefers the per-pane session_id captured at snapshot time
-        (TSV populated by the SessionStart hook claude-kitty-pane-record,
-        keyed by kitty window id and joined in by kitty-session-enrich);
-        falls back to latest-by-mtime for the cwd when no per-pane id is
-        available, OR when the named session's jsonl no longer exists
-        (user pruned it between snapshot and restore)."""
-        if not cmd:
-            return cmd
-        if os.path.basename(cmd[0]) != "claude":
+        session. Prefers the per-pane session_id captured at snapshot
+        time (TSV populated by the SessionStart hook
+        claude-kitty-pane-record, keyed by kitty window id and joined in
+        by kitty-session-enrich).
+
+        Fallback is latest-by-mtime in the cwd's project dir, BUT skips
+        any sid already claimed by a sibling pane in this restore. Two
+        same-cwd panes both losing their per-pane sid (because their
+        SessionStart hook hadn't fired before the snapshot tick that
+        captured them) is the canonical wrong-collide scenario this
+        guard prevents — one pane took the snapshot sid, the other one
+        falling back to latest-by-mtime would otherwise pick that same
+        sid (latest === sibling's freshly-touched jsonl). When every
+        candidate is claimed, return cmd unchanged → claude launches
+        fresh rather than wrong-resume. Losing one pane's resume is
+        recoverable; merging two panes onto one session corrupts both.
+
+        Mutates `claimed_sids` with the sid this pane ends up using.
+        """
+        if not cmd or os.path.basename(cmd[0]) != "claude":
             return cmd
         proj_dir = None
         if cwd:
@@ -220,6 +231,7 @@ let
         if session_id and proj_dir and os.path.isfile(
             os.path.join(proj_dir, f"{session_id}.jsonl")
         ):
+            claimed_sids.add(session_id)
             return [cmd[0], "--resume", session_id]
         if not proj_dir or not os.path.isdir(proj_dir):
             return cmd
@@ -231,8 +243,13 @@ let
         if not sessions:
             return cmd
         sessions.sort(key=lambda t: t[1], reverse=True)
-        latest = sessions[0][0].removesuffix(".jsonl")
-        return [cmd[0], "--resume", latest]
+        for fname, _mtime in sessions:
+            candidate = fname.removesuffix(".jsonl")
+            if candidate in claimed_sids:
+                continue
+            claimed_sids.add(candidate)
+            return [cmd[0], "--resume", candidate]
+        return cmd
 
 
     STUB_PATH = "/tmp/kitty-stub-session"
@@ -248,6 +265,16 @@ let
             return []
         with open(snap_path) as fh:
             snap = json.load(fh)
+        # Seed claimed_sids with sids explicitly attached in the snapshot
+        # before resolving any fallback, so an un-enriched same-cwd pane
+        # can't grab a sibling's sid via latest-by-mtime.
+        claimed_sids = set()
+        for osw in snap:
+            for tab in osw.get("tabs", []):
+                for win in tab.get("windows", []):
+                    sid = win.get("claude_session_id")
+                    if sid:
+                        claimed_sids.add(sid)
         panes = []
         for osw in snap:
             for tab in osw.get("tabs", []):
@@ -261,7 +288,7 @@ let
                         continue
                     cwd = win.get("cwd")
                     sid = win.get("claude_session_id")
-                    cmd = maybe_resume_claude(cmd, cwd, sid)
+                    cmd = maybe_resume_claude(cmd, cwd, sid, claimed_sids)
                     panes.append({
                         "cwd": cwd,
                         "title": win.get("title", ""),
@@ -292,6 +319,14 @@ let
     def main():
         if "--emit-stub" in sys.argv:
             emit_stub()
+            return
+
+        if "--dump-panes" in sys.argv:
+            # Test-only: emit resolved panes JSON so assertions can
+            # inspect maybe_resume_claude's per-pane outcome (including
+            # the same-cwd-collision-avoidance fallback) without having
+            # to spin up a real kitty.
+            json.dump(load_panes(), sys.stdout)
             return
 
         panes = load_panes()
@@ -353,8 +388,13 @@ let
       # this fix was discovered through).
       #
       # CLAUDE_CODE_ENTRYPOINT="cli" = main interactive session.
-      # "sdk-cli" / future values = subprocess; skip.
-      [ "''${CLAUDE_CODE_ENTRYPOINT:-cli}" = "cli" ] || exit 0
+      # "sdk-cli" / future values = subprocess; skip. Use the bare-form
+      # default (''${VAR-cli} not ''${VAR:-cli}) so an explicitly empty
+      # value ("") fails the gate instead of falling through to "cli":
+      # empty string is what a misconfigured shell launcher injects,
+      # and we want that to be loud (no TSV write), not silently
+      # treated as the main interactive session.
+      [ "''${CLAUDE_CODE_ENTRYPOINT-cli}" = "cli" ] || exit 0
 
       # Outside kitty → nothing to record.
       [ -n "''${KITTY_WINDOW_ID:-}" ] || exit 0
@@ -411,6 +451,16 @@ let
   # Pruning: TSV entries whose window_id is not in the current live set
   # are removed on every enrich run, keeping the TSV bounded by current
   # pane count (≤ a few hundred lines in pathological cases).
+  #
+  # Exit codes:
+  #   0  — enriched JSON written, safe to commit as new snapshot.
+  #   2  — collision risk: at least one cwd has multiple claude panes
+  #         and at least one of them lacks a TSV row (SessionStart
+  #         hook hadn't fired yet when the snapshot tick captured it).
+  #         The save wrapper treats this as "preserve the prior good
+  #         snapshot.json"; persisting the partial would let the
+  #         un-enriched pane fall back to latest-by-mtime on restore
+  #         and collide with the sibling's freshly-touched jsonl.
   kittySessionEnrich = pkgs.writers.writePython3Bin "kitty-session-enrich" {} ''
     import fcntl
     import json
@@ -514,8 +564,17 @@ let
 
 
     def enrich(data):
+        """Annotate each claude pane with its session id. Returns
+        (data, collision_risk) where collision_risk is True when the
+        snapshot is partial in a way that would collapse same-cwd
+        sibling panes on restore — i.e. at least one cwd has multiple
+        claude panes and at least one of them lacks a TSV entry. The
+        caller uses this to decide whether to overwrite snapshot.json
+        or preserve the prior good one.
+        """
         tsv = load_tsv()
         live = set()
+        claude_panes_by_cwd = {}
         for osw in data:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
@@ -533,8 +592,14 @@ let
                     sid = tsv.get(wid) if isinstance(wid, int) else None
                     if sid:
                         win["claude_session_id"] = sid
+                    cwd = win.get("cwd") or ""
+                    claude_panes_by_cwd.setdefault(cwd, []).append(sid)
         prune_tsv(live)
-        return data
+        collision_risk = any(
+            len(sids) > 1 and any(s is None for s in sids)
+            for sids in claude_panes_by_cwd.values()
+        )
+        return data, collision_risk
 
 
     def main():
@@ -542,7 +607,12 @@ let
             data = json.load(sys.stdin)
         except json.JSONDecodeError:
             sys.exit(0)
-        json.dump(enrich(data), sys.stdout)
+        enriched, collision_risk = enrich(data)
+        json.dump(enriched, sys.stdout)
+        # Exit 2 (distinct from 1 = generic error) signals "snapshot
+        # would collide on restore; caller should preserve prior good".
+        if collision_risk:
+            sys.exit(2)
 
 
     if __name__ == "__main__":
@@ -581,16 +651,25 @@ let
       [ -z "$json" ] && exit 0
 
       # Enrich with per-pane Claude session IDs before persisting.
-      # Failure (e.g. enricher crash) falls back to raw json — better
-      # to lose the per-pane id and use latest-by-mtime than to skip
-      # the snapshot entirely.
-      if ! printf '%s\n' "$json" | kitty-session-enrich > "$dir/snapshot.json.tmp"; then
-        printf '%s\n' "$json" > "$dir/snapshot.json.tmp"
+      # Exit codes from kitty-session-enrich:
+      #   0  — fully enriched, snapshot safe to commit
+      #   2  — partial / collision-risk (multiple same-cwd claude panes
+      #        and at least one lacks a TSV row); the un-enriched pane
+      #        would fall back to latest-by-mtime on restore and collide
+      #        with a sibling. Preserve the prior good snapshot.json
+      #        instead of overwriting it with the dangerous partial.
+      #   any other non-zero — enricher crashed; preserve prior good.
+      set +e
+      printf '%s\n' "$json" | kitty-session-enrich > "$dir/snapshot.json.tmp"
+      enrich_rc=$?
+      set -e
+      if [ "$enrich_rc" -eq 0 ]; then
+        mv "$dir/snapshot.json.tmp" "$dir/snapshot.json"
+        kitty-session-convert < "$dir/snapshot.json" > "$dir/last.session.tmp"
+        mv "$dir/last.session.tmp" "$dir/last.session"
+      else
+        rm -f "$dir/snapshot.json.tmp"
       fi
-      mv "$dir/snapshot.json.tmp" "$dir/snapshot.json"
-
-      kitty-session-convert < "$dir/snapshot.json" > "$dir/last.session.tmp"
-      mv "$dir/last.session.tmp" "$dir/last.session"
     '';
   };
 
@@ -618,15 +697,16 @@ let
       if [ "\''${1:-}" = "@" ]; then
         exec ${pkgs.kitty}/bin/kitty "\$@"
       fi
-      session="\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/last.session"
       # Detect a running kitty by probing each socket — a kitty crash can
       # leave stale /tmp/kitty.sock-PID files behind that would otherwise
       # block restore on next launch. pgrep is unsafe here because the
       # kernel sets comm to argv[0] which is "kitty" for this wrapper too.
       shopt -s nullglob
       live=0
+      sockets_seen=0
       for f in /tmp/kitty.sock-*; do
         [ -S "\$f" ] || continue
+        sockets_seen=1
         if ${pkgs.kitty}/bin/kitty @ --to "unix:\$f" ls >/dev/null 2>&1; then
           live=1
           break
@@ -639,6 +719,20 @@ let
       # 2x2 grid pattern), then exec plain kitty. The restore script
       # waits for kitty's socket to appear before issuing its commands.
       snap="\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/snapshot.json"
+      # Drop the TSV before the new kitty starts: kitty assigns window
+      # ids starting at 1 per instance, so the old kitty's wid→sid
+      # rows would otherwise alias onto fresh panes in the window
+      # between pane creation and SessionStart hook firing, and the
+      # next snapshot tick would bake a stale sid into the new
+      # snapshot. Guarded on sockets_seen=0 (no socket files existed
+      # at all) — not on live=0 — so a transiently-unresponsive live
+      # kitty whose @ ls call failed doesn't make us nuke its TSV
+      # underfoot. SessionStart re-populates correct rows within
+      # seconds; meanwhile the partial-snapshot guard in
+      # kitty-session-enrich keeps the prior good snapshot in place.
+      if [ "\$sockets_seen" -eq 0 ]; then
+        rm -f "\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/pane-sessions.tsv"
+      fi
       if [ -s "\$snap" ] && [ "\$live" -eq 0 ]; then
         # Write a stub session file containing just pane 0; this makes
         # kitty start directly into our restored topology with no extra
@@ -665,6 +759,12 @@ in
     # WIP, not yet wired in (see wrapper above):
     kittyPaneAdd
     kittyRestoreSession
+    # Used by the ctrl+shift+c copy-strip bind below. `kitten clipboard`
+    # opens /dev/tty to push via OSC 52; `pass_selection_to_program`
+    # runs its child without a controlling terminal, so that path fails
+    # silently ("Error: open /dev/tty: no such device or address"). xclip
+    # writes to the X11 CLIPBOARD selection without needing a TTY.
+    pkgs.xclip
   ];
 
   home.file.".config/kitty/kitty.conf".text = ''
@@ -689,6 +789,16 @@ in
     # Suppress "are you sure you want to close this OS window?"
     # confirmation when closing windows via UI/shortcut.
     confirm_os_window_close 0
+
+    # Watch kitty.conf for direct in-place edits. Empirically (vm-kitty
+    # auto-reload behavioral test) this directive does NOT fire on
+    # home-manager's symlink-target swap — kitty resolves the symlink
+    # at startup and watches the resolved inode in /nix/store, which
+    # is immutable. The HM activation path is handled separately by
+    # the `kittyReloadConfig` activation hook below. Keeping the
+    # directive anyway covers the direct-edit case (e.g. user fiddling
+    # with kitty.conf out-of-band for prototyping).
+    auto_reload_config yes
 
     # === Ghostty-default-dark theme port + matching aesthetics ===
     # Source: ghostty-org/ghostty discussions #5390
@@ -773,25 +883,47 @@ in
     map ctrl+up neighboring_window up
     map ctrl+down neighboring_window down
     # Add new pane via the 2x2-grid pattern (kitty-pane-add).
-    map ctrl+less launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
+    # Use literal `<` (ASCII 0x3C, matches X11 keysym at runtime) rather
+    # than `less`: kitty's `dlopen("libxkbcommon.so")` fails on this
+    # NixOS build, so named-keysym binds like `ctrl+less` parse-error
+    # ("unknown key, ignoring") at config-load and never fire.
+    map ctrl+< launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
     # New tab inheriting cwd of current window.
     map ctrl+t new_tab_with_cwd
 
-    # Copy: strip embedded newlines so multi-line commands pasted from
-    # Claude Code (or any terminal output) land as a single line. Kitty
-    # already joins soft-wrapped lines and omits the trailing newline of
-    # the last selected line; this binding additionally removes *hard*
-    # newlines within the selection. Selection is passed as argv[0] (the
-    # $0 of `sh -c`); `kitten clipboard` reads stdin and writes to the
-    # system clipboard (works over SSH too).
-    map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | tr -d "\n" | kitten clipboard'
-    # Escape hatch: preserve embedded newlines (logs, diffs, error output).
+    # Copy: preserve embedded newlines so multi-line shell commands and
+    # multi-line code blocks copied out of the terminal round-trip
+    # intact. Prior design (PR #70, `tr -d "\n"`) was wrong: it stripped
+    # EVERY newline, so any selection that spanned > 1 line collapsed
+    # into one giant blob. Combined with the prior `paste_actions
+    # replace-newline` that also flattened newlines on the way in, this
+    # made the whole copy/paste pipeline a one-way trip to single-line
+    # mangling.
+    #
+    # Selection is passed as argv[0] (the $0 of `sh -c`). `printf %s`
+    # does NOT append a trailing newline, so what kitty handed us is
+    # what xclip stores byte-for-byte. xclip writes to the X11 CLIPBOARD
+    # selection without a controlling TTY (kitten clipboard / OSC 52
+    # fails under pass_selection_to_program — see comment near
+    # `pkgs.xclip` above).
+    map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | xclip -selection clipboard -in'
+    # Escape hatch: kitty's built-in copy_to_clipboard (no shell hop).
+    # Both bindings now preserve newlines — the alt variant exists for
+    # parity with the prior split-behavior config so muscle memory keeps
+    # working.
     map ctrl+shift+alt+c copy_to_clipboard
 
-    # Paste: replace-newline rewrites stray \n in paste payloads so they
-    # don't auto-execute under shells without bracketed paste. confirm
-    # keeps kitty's safety prompt for paste payloads with control codes.
-    paste_actions quote-urls-at-prompt,replace-newline,confirm
+    # Paste: preserve newlines in the paste payload byte-for-byte.
+    # `replace-newline` was a destructive hack that rewrote every \n in
+    # the paste into a space — broke pasting multi-line shell commands,
+    # diffs, code, anything the user expected to land as the bytes they
+    # copied. `confirm` keeps kitty's safety prompt for paste payloads
+    # carrying control codes (the actual injection risk); `quote-urls-
+    # at-prompt` keeps the URL-quoting nicety. Modern shells (zsh+bash
+    # with vi/emacs mode) handle bracketed paste correctly — they hold
+    # the payload in the buffer without auto-executing, so the
+    # safety story is already covered by the shell side.
+    paste_actions quote-urls-at-prompt,confirm
   '';
 
   # Periodic snapshot — survives crashes, kernel panics, power loss.
@@ -812,6 +944,28 @@ in
     };
     Install.WantedBy = [ "timers.target" ];
   };
+
+  # Send `kitty @ load-config` to every running kitty socket after
+  # home-manager finishes activation. Compensates for the fact that
+  # `auto_reload_config yes` (above) does NOT pick up HM's symlink-
+  # target swap — kitty's inotify watcher stays bound to the original
+  # /nix/store path, which never mutates. Without this hook, every
+  # config-change PR (PR #70 ctrl+shift+c xclip fix being the
+  # motivating case) lands on disk but doesn't take effect until the
+  # user manually restarts kitty.
+  #
+  # Best-effort: silent no-op when no kitty is running, and a single
+  # socket's reload failure does not abort activation. Runs in
+  # entryAfter ["linkGeneration"] so it fires after the new
+  # kitty.conf symlink target is in place.
+  home.activation.kittyReloadConfig =
+    lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+      for sock in /tmp/kitty.sock-*; do
+        [ -S "$sock" ] || continue
+        ${pkgs.kitty}/bin/kitty @ --to "unix:$sock" load-config \
+          2>/dev/null || true
+      done
+    '';
 
   # Final snapshot at logout. Bound to graphical-session.target so ExecStop
   # fires when the desktop session ends, capturing state newer than the

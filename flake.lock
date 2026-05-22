@@ -133,11 +133,11 @@
         "uv2nix": "uv2nix"
       },
       "locked": {
-        "lastModified": 1779393730,
-        "narHash": "sha256-NHYEpVe/ZvHwKc7+fvw7Jx2/nuHDOF6bUnCM+Y6jDjw=",
+        "lastModified": 1779465792,
+        "narHash": "sha256-CGYONp5wyQUPkFCPC5lY9QgWrbJ/09YozbeEQQIxDvo=",
         "owner": "jonathanmoregard",
         "repo": "prose-decorate",
-        "rev": "a49ca2ce5da946b96136ec24534bbc4bbe6ad659",
+        "rev": "d5adf16b31b84e146061ed95c400735ab35addbf",
         "type": "github"
       },
       "original": {
@@ -333,11 +333,11 @@
         "uv2nix": "uv2nix_2"
       },
       "locked": {
-        "lastModified": 1779392729,
-        "narHash": "sha256-9TcX9dE5VmLoGrAJ40xisKtP7pyNEFBsFqy2Box9LaQ=",
+        "lastModified": 1779400547,
+        "narHash": "sha256-sZL/VPnNfsZOjbOloGInXHdpWq/DGdAOb3z92MIyJjU=",
         "owner": "jonathanmoregard",
         "repo": "substack-url-tool",
-        "rev": "a79b50e8de65d29ed3cbbaa9483b4d13fe4870dc",
+        "rev": "fc1680a45ae03dc1385a3b5dac41b29745a1bd3b",
         "type": "github"
       },
       "original": {
@@ -371,11 +371,11 @@
         "uv2nix": "uv2nix_3"
       },
       "locked": {
-        "lastModified": 1778579432,
-        "narHash": "sha256-gG4nMZONbhFiVYo74TrVwiP2dIo+ym2oV7A/RVEN1wI=",
+        "lastModified": 1779462107,
+        "narHash": "sha256-RIhZhkv4MqdYgI+DBtXl5m8bSRbD/MO1f52RWfiZfDw=",
         "owner": "jonathanmoregard",
         "repo": "tts-tool",
-        "rev": "8468af512dde7709951bef3324bbe90689eca4b1",
+        "rev": "f936d5de5485f2d5c2e5f1471840bed3b701c099",
         "type": "github"
       },
       "original": {

@@ -46,24 +46,110 @@ cd ~/Repos/nixos-config-worktrees/<slug>
 #    coding (write the assertion first, watch it fail, make it pass).
 $EDITOR home/whatever.nix
 git add -A
-git commit -m "feat(scope): summary"
 
 # 3. Test before pushing — see "Testing skills" below.
 
-# 4. Push, open PR
+# 4. Commit with the pre-push checklist in the message body
+#    (safe-bash MCP refuses pushes whose HEAD commit lacks it; see
+#    "Pre-push checklist trailer" below).
+git commit -m "feat(scope): summary
+
+Body explaining the change.
+
+Pre-push checklist:
+- Type: risky                                # or 'pure-data'
+- Rebased on origin/main: yes
+- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0
+- Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>
+- Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>
+- feature-vm.nix modified: no                # MUST match diff
+- Risky markers in diff: <list, or 'none'>
+- Behavioural evidence: <cmd + observed output>
+"
+
+# 5. Push, open PR
 git push -u origin feat/<slug>
 gh pr create --title "..." --body "..."
 
-# 5. Watch CI
+# 6. Watch CI
 gh pr checks <PR_NUMBER>
 
-# 6. For non-trivial PRs about to be merged, lead with the
+# 7. For non-trivial PRs about to be merged, lead with the
 #    `advice-refine-test-loop` skill — Opus advisor + empirical
 #    re-verification across rounds catches fail-open paths, schema
 #    mismatches, and silent regressions that single-pass review
 #    misses. Cheap insurance on changes that auto-deploy to your
 #    daily-driver.
 ```
+
+## Pre-push checklist trailer
+
+The safe-bash MCP refuses `git push` from any clone of the nixos-config
+repo whose HEAD commit message lacks a `Pre-push checklist:` block (or
+carries internally inconsistent claims). This exists because two recent
+PRs (#57, #61) shipped broken changes despite the HARD RULE being in
+context the whole time — the skill prose alone wasn't enough; this gate
+enforces structurally.
+
+**Detection is by remote URL, not filesystem path.** Any candidate path
+(parsed from `cd <path>` in the command, `git -C <path>` flag, or the
+MCP server's cwd) is probed with `git rev-parse --show-toplevel`; if it
+resolves to a working tree whose configured remotes include a URL
+matching `jonathanmoregard/nixos-config` (any of: ssh `git@github.com:…`,
+https, with or without `.git` suffix), the gate fires. A scratch clone
+at `/tmp/foo/`, a worktree under `~/projects/`, or anywhere else outside
+`~/Repos/nixos-config-worktrees/` is gated identically. Conversely, a
+worktree that happens to live under the canonical worktrees dir but
+points its origin elsewhere is NOT gated.
+
+### Pure-data (package add, version bump, comment, doc edit)
+
+```
+Pre-push checklist:
+- Type: pure-data
+```
+
+Accepted iff the diff has **no** risky markers (mkIf / optionals / ExecStart /
+writeShellApplication / `sh -c` / microvm / virtiofsd / networking.useDHCP /
+activationScripts / systemd.services.\*) AND does not touch
+`modules/nixos/feature-vm.nix`. If either is true → promote to `Type: risky`.
+
+### Risky (anything else)
+
+```
+Pre-push checklist:
+- Type: risky
+- Rebased on origin/main: yes
+- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0
+- Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>
+- Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>
+- feature-vm.nix modified: no
+- Risky markers in diff: <list, or 'none'>
+- Behavioural evidence: <cmd + observed output>
+```
+
+| Field | Verified by gate | Notes |
+|---|---|---|
+| `Type` | yes (literal `pure-data` or `risky`) | Mismatch with diff = reject |
+| `Rebased on origin/main` | yes (`merge-base HEAD origin/main == origin/main`) | `yes` claim while behind main = reject |
+| `Local gate` | no — typed claim | Audited post-hoc via `git log` |
+| `Interactive smoke (nixos-agent-testing)` | no — typed claim | Required for branching / multistep / GUI / daemon-poke. `N/A` only when the VM can't model the change (hardware-only). |
+| `Advisor review (advice-refine-test-loop)` | no — typed claim | Required before merge on medium/high-risk PRs. `N/A` only for small / contained risky changes. |
+| `feature-vm.nix modified` | **yes — diff cross-checked** | `no` claim with feature-vm.nix in diff = reject |
+| `Risky markers in diff` | no — typed claim | Forces enumeration |
+| `Behavioural evidence` | no — typed claim | "Build green" / "verified locally" do NOT count |
+
+**The `Behavioural evidence` field is what historically went hollow.** Quote the actual command + observed output that proves the runtime path works. **User-realistic = what the user does** (run, press, hit), not what activates around it. `systemctl is-active` proves the unit is loaded; it does not prove the feature works. Valid examples:
+
+- `nix run .#feature-vm; ssh -p 2222 jonathan@localhost 'systemctl is-active research-agent'; curl localhost:8080/health → 200`
+- `xvfb-run kitty; xdotool key ctrl+shift+c; xclip -o -selection clipboard → "foo" (no trailing \n)`
+- "hardware-only change (touchpad palm rejection); cannot model in VM; will verify on real host after auto-deploy with `nixos-rebuild switch --rollback` ready"
+
+**`feature-vm.nix modified: yes (<reason>)`** is fine for legit reasons (wiring a new module into vmVariant, adding a fixture). It's only the **`no` claim while the diff DOES touch the file** that gets rejected — that combination is the PR #61 anti-pattern (agent stubbed virtiofsd shares to make boot succeed, smoke ran against the stub, prod path never exercised).
+
+### Override (audited)
+
+`Override: [skip-vm-gate] <reason>` line in the commit message bypasses the gate. Logged to stderr by the MCP; visible in `git log` forever. Reserve for true emergencies. Not a shortcut.
 
 ## Testing skills
 
@@ -78,6 +164,7 @@ VM via `nixos-agent-testing`).
 |--------------|--------------------|
 | Anything that builds — *required* | `nixos-automated-testing` (the assertion gate CI runs on every PR; runs locally before pushing) |
 | Branching logic (`mkIf`, `optionals`, `if`/`case`), multistep scripts (`writeShellApplication`, activation scripts), GUI changes, daemons that need poking — *required pre-PR* | `nixos-agent-testing` (boot the feature VM, drive via SSH/QMP/screencap, capture proof for the PR body) |
+| Modules emitting executable shell (`pkgs.writeShellScript`, `pkgs.writeShellApplication`, `serviceConfig.ExecStart =`, `nix.settings.post-build-hook`, `system.activationScripts.*`) — *required pre-PR* | **Runtime invocation test** of the generated script with adversarial inputs: empty/missing input, sub-command exits non-zero, sub-command hangs past timeout. Eval validates types; the VM gate validates integration but may not exercise the script (e.g. a post-build-hook whose agenix token is absent in the test VM). Pattern: `nix build` the derivation, run `/nix/store/.../<name>` directly with crafted env; OR write a parameterized analogue in `/tmp` swapping the real binary for `coreutils/false` / `coreutils/sleep`. Past incident (PR #67): a cachix post-build-hook's `if ! cmd; then rc=$?` looked correct on eval but bash zeroed `rc`, hiding timeout-vs-failure distinction from the journal and producing misleading diagnostics. |
 | Pre-implementation planning for non-trivial work | `brainstorming` |
 | While writing the change | `test-driven-development` — extend the right `tests/<feature>.nix` lane (base / desktop / keyring / kitty / claude-pane) before the code, watch it fail, then make it pass |
 | Before clicking merge on a medium/high-risk PR | `advice-refine-test-loop` — multi-round Opus review with empirical re-verification |
