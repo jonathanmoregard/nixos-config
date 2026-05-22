@@ -161,11 +161,15 @@ jobs:
       #
       # Cache budget: GHA caps repos at 10 GB compressed. NixOS store is
       # mostly pre-compressed (elf, gz, xz), so tar+zstd only hits
-      # ~1.2-1.3×. gc-max-store-size-linux: 7 GB → ~5.5 GB compressed,
-      # leaving headroom against the cap. dellan closure (~8 GB) doesn't
-      # all fit but the toplevel itself stays gc-live; what gets evicted
-      # are intermediate build outputs the next run can re-download
-      # cheaply.
+      # ~1.2-1.3×. gc-max-store-size-linux: 8G (binary, 8.59 GB decimal)
+      # → ~6.5 GB compressed, comfortable under the 10 GB cap. dellan
+      # toplevel closure (~8 GB) is just barely able to fit AS LONG AS
+      # the toplevel is pinned as a gcroot — the action's post step
+      # unconditionally calls `nix store gc --max` on cold save, and
+      # without a gcroot the just-built --no-link toplevel is
+      # unreachable and would be deleted before the tarball is written.
+      # The `nix build --out-link` below registers an indirect gcroot
+      # under /nix/var/nix/gcroots/auto/ so the toplevel survives gc.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
@@ -173,15 +177,19 @@ jobs:
           restore-prefixes-first-match: |
             nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
             nix-store-${{ runner.os }}-
-          gc-max-store-size-linux: 7000000000
+          # `8G` is parsed as binary (8 * 2^30 bytes ≈ 8.59 GB decimal)
+          # by the action's parseNixGcMax — see src/utils/inputs.ts.
+          gc-max-store-size-linux: 8G
           purge: true
+          # Purge other prefix-matched caches in the same ref (action
+          # scopes purge to the current branch / PR merge ref by
+          # default — see src/utils/purge.ts:84-87, anyRef=false). Keeps
+          # the per-ref cache count bounded; primary-key:never preserves
+          # the snapshot we just restored from.
           purge-prefixes: nix-store-${{ runner.os }}-
           # Purge prefix-matched caches not accessed in 7 days (P7D in
           # ISO 8601 duration — the action also accepts a bare integer
-          # but that's parsed as SECONDS, not hours/days). The original
-          # `purge-created-max-age-seconds: 604800` config was silently
-          # ignored ("Unexpected input(s)") — the v7 API is
-          # `purge-last-accessed` and `purge-created`.
+          # but that's parsed as SECONDS, not hours/days).
           purge-last-accessed: P7D
           purge-primary-key: never
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
@@ -189,10 +197,15 @@ jobs:
         with:
           name: jonathanmoregard
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      # `--out-link /tmp/dellan-result` pins the toplevel via an
+      # indirect gcroot, so cache-nix-action's post-step `nix store gc`
+      # can't delete it before tarring. `--no-link` (the previous flag)
+      # left it unreachable; gc trimmed it; cache snapshots held only
+      # intermediates; every PR re-fetched the toplevel from cachix.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: |
           nix build .#nixosConfigurations.dellan.config.system.build.toplevel \
-            --no-link --print-build-logs --keep-going
+            --out-link /tmp/dellan-result --print-build-logs --keep-going
 
   vm-minimal:
     # Matrix fan-out: one lane per feature check derivation. Each lane
