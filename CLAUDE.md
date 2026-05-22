@@ -111,6 +111,8 @@ nix flake check -L                                  # all lanes
 
 Adding a new test: drop `tests/<feature>.nix` (use existing files as templates), wire it into `flake.nix`'s `checks` block, and add the lane name to the matrix in `.github/workflows/ci.yml`. Skip only for hardware-specific config the VM can't model (touchpad, GPU, LUKS, real disks).
 
+**Prefer behavioural assertions over presence ones.** A lane asserting `test -x <bin>` or `wait_for_unit <name>` proves the file/unit exists; it does not prove the feature behaves. Where feasible, exercise the actual user-facing job (run the CLI, press the binding, hit the endpoint) and assert the output. The `Behavioural evidence` trailer field demands the same posture at push time. See `nixos-automated-testing` for assertion patterns and `nixos-agent-testing` for the interactive smoke (`nix run .#feature-vm`) when the assertion gate can't reach a real user-facing code path.
+
 **Architecture note:** `nixpkgs.config.allowUnfree` and `nixpkgs.overlays` live in `flake.nix` (built into `pkgsLinux` / `pkgsDarwin`). Setting them inside modules conflicts with `runNixOSTest`'s read-only nixpkgs injection.
 
 ## What you'll see on a PR
