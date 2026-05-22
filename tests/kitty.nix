@@ -72,6 +72,12 @@
     dellan.succeed(
         f"grep -qE '^paste_actions .*replace-newline' {kitty_conf}"
     )
+    # auto_reload_config yes so config bumps land on a running kitty
+    # without a restart (e.g. the ctrl+shift+c xclip fix that PR #70
+    # shipped but PR #70 deploy left invisible until kitty restarted).
+    dellan.succeed(
+        f"grep -qE '^auto_reload_config[[:space:]]+yes' {kitty_conf}"
+    )
 
     # Persistence timer is active and scheduled
     dellan.wait_for_unit("kitty-session-save.timer", "jonathan")
@@ -108,6 +114,84 @@
     dellan.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls >/dev/null'", timeout=60
     )
+
+    # === kitty config-reload BEHAVIORAL test ===
+    # The failure mode being defended: home-manager activation
+    # rewrites the kitty.conf SYMLINK target to a new /nix/store path.
+    # A running kitty does NOT notice that swap on its own — kitty's
+    # `auto_reload_config yes` inotify watcher binds to the resolved
+    # store-path inode at launch, and that inode never mutates.
+    # Verified empirically (this exact test, see git history): with
+    # only `auto_reload_config yes`, a symlink swap + 10s wait shows
+    # no foreground-color change in `kitty @ get-colors`.
+    #
+    # The actual fix is the `home.activation.kittyReloadConfig` hook
+    # in home/kitty.nix that runs `kitty @ load-config` on every live
+    # kitty socket after `linkGeneration`. This test reproduces that
+    # exact command sequence: swap the symlink, then invoke the same
+    # for-loop the hook uses, then assert the reload actually fired.
+    #
+    # Failure of this assertion = the fix is dead in production.
+    kitty_conf = "/home/jonathan/.config/kitty/kitty.conf"
+    orig_target = dellan.succeed(f"readlink {kitty_conf}").strip()
+    # Build a mutated config that mirrors the original plus one
+    # observable change. Sentinel color #ff00ff (magenta) is unique
+    # vs the deployed palette so stale colors can't masquerade.
+    dellan.succeed(
+        f"cp -L {kitty_conf} /tmp/kitty-mutated.conf && "
+        "chmod u+w /tmp/kitty-mutated.conf && "
+        "sed -i 's/^foreground.*$/foreground #ff00ff/' /tmp/kitty-mutated.conf"
+    )
+    # Atomic symlink swap — same operation home-manager activation performs.
+    dellan.succeed(
+        f"su jonathan -c 'ln -sfT /tmp/kitty-mutated.conf {kitty_conf}'"
+    )
+    # Sanity: kitty has not picked up the new color on its own
+    # (auto_reload_config does NOT fire on symlink-target swaps).
+    # Wait 3s to give any rogue watcher time to misbehave.
+    dellan.sleep(3)
+    dellan.fail(
+        f"su jonathan -c '{sock_cmd} get-colors' | "
+        "grep -qE '^foreground[[:space:]]+#?ff00ff'"
+    )
+    # Now run the activation-hook's exact command sequence. The hook
+    # body (see home/kitty.nix `home.activation.kittyReloadConfig`)
+    # iterates kitty sockets and runs `kitty @ load-config`. The
+    # reload must produce the magenta foreground.
+    dellan.succeed(
+        "su jonathan -c '"
+        "for sock in /tmp/kitty.sock-*; do "
+        "  [ -S \"$sock\" ] || continue; "
+        "  kitty @ --to \"unix:$sock\" load-config 2>/dev/null || true; "
+        "done'"
+    )
+    # Reload is synchronous to the @ call; a short wait is just paranoia
+    # for the test runner's scheduling jitter.
+    dellan.wait_until_succeeds(
+        f"su jonathan -c '{sock_cmd} get-colors' | "
+        "grep -qE '^foreground[[:space:]]+#?ff00ff'",
+        timeout=5,
+    )
+    # Restore original symlink + reload back to canonical colors so
+    # subsequent test phases (session save/restore) see the deployed
+    # palette. Bidirectional reload proof comes free.
+    dellan.succeed(
+        f"su jonathan -c 'ln -sfT {orig_target} {kitty_conf}'"
+    )
+    dellan.succeed(
+        "su jonathan -c '"
+        "for sock in /tmp/kitty.sock-*; do "
+        "  [ -S \"$sock\" ] || continue; "
+        "  kitty @ --to \"unix:$sock\" load-config 2>/dev/null || true; "
+        "done'"
+    )
+    dellan.wait_until_succeeds(
+        f"su jonathan -c '{sock_cmd} get-colors' | "
+        "grep -qE '^foreground[[:space:]]+#?ebebeb'",
+        timeout=5,
+    )
+    # === end kitty config-reload behavioral test ===
+
     sleep_bin = "/run/current-system/sw/bin/sleep"
     panes = [
         ("/tmp", "11111"),
