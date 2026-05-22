@@ -116,7 +116,7 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       # No cache-nix-action here on purpose. flake-check is eval-only
       # (`--no-build`); its added /nix/store would be small relative to
-      # build-dellan's ~7 GB snapshot, and this job has no /mnt loopback
+      # build-dellan's ~8 GB snapshot, and this job has no /mnt loopback
       # so restoring the shared snapshot to the runner's root disk would
       # likely ENOSPC.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
@@ -197,15 +197,26 @@ jobs:
         with:
           name: jonathanmoregard
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      # `--out-link /tmp/dellan-result` pins the toplevel via an
-      # indirect gcroot, so cache-nix-action's post-step `nix store gc`
-      # can't delete it before tarring. `--no-link` (the previous flag)
-      # left it unreachable; gc trimmed it; cache snapshots held only
-      # intermediates; every PR re-fetched the toplevel from cachix.
+      # Pin the toplevel as a gcroot so cache-nix-action's post-step
+      # `nix store gc --max` can't delete it before tarring. `--no-link`
+      # (the previous flag) left it unreachable; gc trimmed it; cache
+      # snapshots held only intermediates; every PR re-fetched the
+      # toplevel from cachix.
+      #
+      # `--out-link "$GITHUB_WORKSPACE/result-dellan"` registers an
+      # indirect gcroot under /nix/var/nix/gcroots/auto/ — the
+      # workspace dir is owned by the runner user, which is what nix's
+      # addPermRoot requires for the auto-gcroot registration to fire.
+      # Explicit `nix-store --add-root` is belt-and-braces in case the
+      # auto-registration path ever changes.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: |
+          set -euo pipefail
           nix build .#nixosConfigurations.dellan.config.system.build.toplevel \
-            --out-link /tmp/dellan-result --print-build-logs --keep-going
+            --out-link "$GITHUB_WORKSPACE/result-dellan" \
+            --print-build-logs --keep-going
+          nix-store --add-root "$GITHUB_WORKSPACE/result-dellan" -r \
+            "$(readlink -f "$GITHUB_WORKSPACE/result-dellan")" >/dev/null
 
   vm-minimal:
     # Matrix fan-out: one lane per feature check derivation. Each lane
@@ -245,7 +256,7 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       # Restore the shared /nix/store snapshot that build-dellan saved.
       # save: false — only build-dellan owns the snapshot. 7 lanes saving
-      # in parallel would race for the same cache key, and 7 × ~7 GB
+      # in parallel would race for the same cache key, and 7 × ~8 GB
       # blows the GHA 10 GB cap. Worst case (build-dellan's save hasn't
       # propagated) the restore-prefixes fall back to the previous run's
       # snapshot — still faster than cold.

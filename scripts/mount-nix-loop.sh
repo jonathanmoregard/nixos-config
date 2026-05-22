@@ -34,7 +34,9 @@ sudo mount -o loop,noatime /mnt/nix.img /nix
 # the step — the breakage is a perf bug, not a correctness one — but
 # the warning shows up in the GitHub UI annotation list.
 if ! sudo rmdir /nix/lost+found 2>/dev/null; then
-  echo "::warning::could not rmdir /nix/lost+found; cache-nix-action tar may fail" >&2
-  sudo ls -la /nix/lost+found 2>&1 || true
+  # GHA workflow-command parser only reads STDOUT for ::warning::
+  # annotations. Stderr would be logged but not annotate the run.
+  echo "::warning::could not rmdir /nix/lost+found; cache-nix-action tar may fail"
+  sudo ls -la /nix/lost+found >&2 || true
 fi
 df -h /nix
