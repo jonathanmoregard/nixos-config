@@ -176,8 +176,13 @@ jobs:
           gc-max-store-size-linux: 7000000000
           purge: true
           purge-prefixes: nix-store-${{ runner.os }}-
-          purge-created: true
-          purge-created-max-age-seconds: 604800  # 7 days
+          # Purge prefix-matched caches not accessed in 7 days (P7D in
+          # ISO 8601 duration — the action also accepts a bare integer
+          # but that's parsed as SECONDS, not hours/days). The original
+          # `purge-created-max-age-seconds: 604800` config was silently
+          # ignored ("Unexpected input(s)") — the v7 API is
+          # `purge-last-accessed` and `purge-created`.
+          purge-last-accessed: P7D
           purge-primary-key: never
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17

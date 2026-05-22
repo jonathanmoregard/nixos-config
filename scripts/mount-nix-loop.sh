@@ -21,4 +21,11 @@ sudo fallocate -l 60G /mnt/nix.img
 sudo mkfs.ext4 -F -E lazy_itable_init=1,lazy_journal_init=1 /mnt/nix.img
 sudo mkdir -p /nix
 sudo mount -o loop,noatime /mnt/nix.img /nix
+# Drop the ext4 lost+found that mke2fs auto-creates. It's root-owned
+# mode 700, useless on an ephemeral loopback, and breaks tar runs that
+# walk /nix as a non-root user — cache-nix-action's save step is the
+# canonical victim ('Cannot open: Permission denied' → tar exits 2 →
+# 'Could not save the new cache' → /nix/store never persists between
+# runs). Removing the dir is cleaner than chmod-ing it readable.
+sudo rmdir /nix/lost+found 2>/dev/null || true
 df -h /nix
