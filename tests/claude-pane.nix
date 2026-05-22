@@ -41,10 +41,18 @@
   # not jonathan). The full-host node got jq transitively via
   # modules/common.nix; the minimal feature node doesn't import it.
   extraModules = [
-    ({ pkgs, ... }: { environment.systemPackages = [ pkgs.jq ]; })
+    ({ pkgs, ... }: {
+      environment.systemPackages = [
+        pkgs.jq
+        # 6g-2 binds a unix-domain socket at /tmp/kitty.sock-fake to
+        # assert the wrapper's wipe MUST NOT fire when a socket exists.
+        pkgs.python3Minimal
+      ];
+    })
   ];
   testScript = ''
     import json
+    import shlex
 
     dellan.wait_for_unit("multi-user.target")
     dellan.wait_for_unit("home-manager-jonathan.service")
@@ -552,6 +560,194 @@
     cmd2_no_spare = resolved_no_spare[1]["cmd"]
     assert cmd2_no_spare == ["/usr/bin/claude"], (
         f"all-claimed fallback should drop --resume; got {cmd2_no_spare!r}"
+    )
+
+    # --- 6g: Layer C — pane-sessions.tsv wipe on kitty wrapper
+    # first-launch. The wrapper at home/kitty.nix's kittyWithSession
+    # wipes the TSV when no kitty sockets exist (cross-instance wid
+    # collision defense). Behaviourally replicates the wrapper's
+    # exact wipe condition here: stale TSV present, no kitty sockets
+    # in /tmp/kitty.sock-* → TSV gone after the snippet runs. If the
+    # wrapper diverges from this shape, this test will pass while the
+    # real wrapper breaks; keep them in sync (see kittyWithSession
+    # postBuild in home/kitty.nix).
+    dellan.succeed(
+        f"su - jonathan -c \""
+        f"printf '7\\t{sid_a}\\t/some/old/cwd\\t0\\n8\\t{sid_b}\\t/other\\t0\\n'"
+        f" > {tsv}\""
+    )
+    dellan.succeed(f"test -s {tsv}")
+    # Write the wrapper's wipe snippet to a script so the test invokes
+    # the same shell logic without nested-quote escaping hell.
+    wipe_script = (
+        "#!/usr/bin/env bash\n"
+        "shopt -s nullglob\n"
+        "sockets_seen=0\n"
+        "for f in /tmp/kitty.sock-*; do\n"
+        "  [ -S \"$f\" ] || continue\n"
+        "  sockets_seen=1\n"
+        "done\n"
+        "if [ \"$sockets_seen\" -eq 0 ]; then\n"
+        "  rm -f \"''${XDG_CACHE_HOME:-$HOME/.cache}/kitty-session/pane-sessions.tsv\"\n"
+        "fi\n"
+    )
+    stage_input("/tmp/wipe.sh", wipe_script)
+    dellan.succeed("chmod +x /tmp/wipe.sh")
+    dellan.succeed("su - jonathan -c '/tmp/wipe.sh'")
+    dellan.fail(f"test -f {tsv}")
+
+    # 6g-2: a unix socket file present → wipe MUST NOT fire (defends
+    # against blast-radius: a live kitty whose @ ls transiently
+    # failed would otherwise get its TSV nuked underfoot).
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
+    )
+    dellan.succeed(f"test -s {tsv}")
+    # Synchronously create a unix-socket file at /tmp/kitty.sock-fake.
+    # bind() creates the inode; the file persists after python exits.
+    dellan.succeed(
+        "rm -f /tmp/kitty.sock-fake && "
+        "python3 -c 'import socket; "
+        "s=socket.socket(socket.AF_UNIX); "
+        "s.bind(\"/tmp/kitty.sock-fake\")'"
+    )
+    dellan.succeed("test -S /tmp/kitty.sock-fake")
+    dellan.succeed("su - jonathan -c '/tmp/wipe.sh'")
+    dellan.succeed(f"test -s {tsv}")
+    # Cleanup the fixture socket.
+    dellan.succeed("rm -f /tmp/kitty.sock-fake")
+
+    # --- 6h: Layer B — kitty-session-save preserves prior good
+    # snapshot.json when kitty-session-enrich exits 2. Inline-replicate
+    # the save wrapper's enrich/mv/preserve flow; if the wrapper
+    # diverges from this shape, this test will silently pass while
+    # the real wrapper breaks. Keep in sync with kittySessionSave in
+    # home/kitty.nix.
+    dellan.succeed(f"rm -f {tsv}")
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
+    )
+    # Pre-write a known-good snapshot with a bytes-equality fingerprint.
+    good_snapshot = '{"_FIXTURE": "GOOD-1", "panes": []}'
+    cache = "/home/jonathan/.cache/kitty-session"
+    dellan.succeed(f"su - jonathan -c 'mkdir -p {cache}'")
+    dellan.succeed(
+        f"su - jonathan -c 'printf %s {shlex.quote(good_snapshot)} "
+        f"> {cache}/snapshot.json'"
+    )
+    sha_before = dellan.succeed(
+        f"sha256sum {cache}/snapshot.json | cut -d\" \" -f1"
+    ).strip()
+    # Stage an input that triggers collision-risk (two same-cwd claude
+    # panes, only wid_a in TSV).
+    partial_json = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": wid_a, "cwd": "/tmp/fake",
+                 "foreground_processes": [
+                     {"pid": 1, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+                {"id": wid_b, "cwd": "/tmp/fake",
+                 "foreground_processes": [
+                     {"pid": 2, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/partial-for-save.json", partial_json)
+    # Inline-replicate kittySessionSave's preserve-on-rc-2 logic.
+    save_snippet = (
+        "set +e; "
+        f"json=$(cat /tmp/partial-for-save.json); "
+        f"printf %s \"$json\" | kitty-session-enrich "
+        f"> {cache}/snapshot.json.tmp; "
+        "enrich_rc=$?; "
+        "set -e; "
+        f"if [ \"$enrich_rc\" -eq 0 ]; then "
+        f"  mv {cache}/snapshot.json.tmp {cache}/snapshot.json; "
+        f"else "
+        f"  rm -f {cache}/snapshot.json.tmp; "
+        f"fi; "
+        f"echo rc=$enrich_rc"
+    )
+    out = dellan.succeed(f"su - jonathan -c '{save_snippet}'").strip()
+    assert "rc=2" in out, (
+        f"enricher should have exited 2 for the staged collision-risk "
+        f"input; got: {out!r}"
+    )
+    # snapshot.json bytes must be unchanged.
+    sha_after = dellan.succeed(
+        f"sha256sum {cache}/snapshot.json | cut -d\" \" -f1"
+    ).strip()
+    assert sha_before == sha_after, (
+        f"snapshot.json was overwritten despite rc=2 collision-risk; "
+        f"sha_before={sha_before!r} sha_after={sha_after!r}"
+    )
+    # Tmp must have been removed.
+    dellan.fail(f"test -f {cache}/snapshot.json.tmp")
+
+    # 6h-2: when collision-risk clears (TSV gains the missing row),
+    # the next save MUST overwrite the snapshot.
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
+        "claude-kitty-pane-record < /tmp/hook-b.json'"
+    )
+    dellan.succeed(f"su - jonathan -c '{save_snippet}'")
+    sha_after_full = dellan.succeed(
+        f"sha256sum {cache}/snapshot.json | cut -d\" \" -f1"
+    ).strip()
+    assert sha_after_full != sha_before, (
+        "snapshot.json was NOT updated after collision-risk cleared; "
+        "still bytes-equal to GOOD-1 fixture"
+    )
+
+    # --- 6i: concurrent SessionStart hooks (N panes start in rapid
+    # succession). flock + atomic mv must yield exactly N rows, no
+    # corruption, no duplicates. Stress: 20 parallel writes, distinct
+    # window ids + sids.
+    dellan.succeed(f"rm -f {tsv}")
+    parallel_n = 20
+    for i in range(parallel_n):
+        sid = f"{i:08x}-feed-feed-feed-{i:012x}"
+        stage_input(
+            f"/tmp/hook-par-{i}.json",
+            f'{{"session_id":"{sid}","cwd":"/tmp/par-{i}"}}',
+        )
+    # Spawn all N concurrently as jonathan; wait for all to finish.
+    par_cmd = "su - jonathan -c '" + " ".join(
+        f"KITTY_WINDOW_ID={200 + i} "
+        f"claude-kitty-pane-record < /tmp/hook-par-{i}.json &"
+        for i in range(parallel_n)
+    ) + " wait'"
+    dellan.succeed(par_cmd)
+    actual_rows = int(
+        dellan.succeed(f"wc -l < {tsv}").strip()
+    )
+    assert actual_rows == parallel_n, (
+        f"concurrent hooks: expected {parallel_n} rows, got {actual_rows}; "
+        f"flock guard missed a write race"
+    )
+    # Every row must be well-formed: 4 tab-separated fields, sid is UUID,
+    # wid is numeric. Any malformed row indicates a partial-write race.
+    bad = dellan.succeed(
+        "awk -F'\\t' '"
+        "NF!=4 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9a-f-]+$/ "
+        "{print NR\": \"$0}' "
+        f"{tsv} | wc -l"
+    ).strip()
+    assert bad == "0", (
+        f"concurrent hooks corrupted TSV: {bad} malformed row(s); "
+        f"see TSV at {tsv}"
+    )
+    # Every wid must appear exactly once (no duplicates).
+    dup_wids = dellan.succeed(
+        f"awk -F'\\t' '{{print $1}}' {tsv} | sort | uniq -d | wc -l"
+    ).strip()
+    assert dup_wids == "0", (
+        f"concurrent hooks left duplicate wid rows: {dup_wids}; "
+        f"awk replace-then-append race"
     )
   '';
 }
