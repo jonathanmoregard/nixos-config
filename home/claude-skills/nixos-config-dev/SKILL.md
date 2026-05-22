@@ -60,6 +60,8 @@ Pre-push checklist:
 - Type: risky                                # or 'pure-data'
 - Rebased on origin/main: yes
 - Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0
+- Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>
+- Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>
 - feature-vm.nix modified: no                # MUST match diff
 - Risky markers in diff: <list, or 'none'>
 - Behavioural evidence: <cmd + observed output>
@@ -119,6 +121,8 @@ Pre-push checklist:
 - Type: risky
 - Rebased on origin/main: yes
 - Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0
+- Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>
+- Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>
 - feature-vm.nix modified: no
 - Risky markers in diff: <list, or 'none'>
 - Behavioural evidence: <cmd + observed output>
@@ -129,6 +133,8 @@ Pre-push checklist:
 | `Type` | yes (literal `pure-data` or `risky`) | Mismatch with diff = reject |
 | `Rebased on origin/main` | yes (`merge-base HEAD origin/main == origin/main`) | `yes` claim while behind main = reject |
 | `Local gate` | no — typed claim | Audited post-hoc via `git log` |
+| `Interactive smoke (nixos-agent-testing)` | no — typed claim | Required for branching / multistep / GUI / daemon-poke. `N/A` only when the VM can't model the change (hardware-only). |
+| `Advisor review (advice-refine-test-loop)` | no — typed claim | Required before merge on medium/high-risk PRs. `N/A` only for small / contained risky changes. |
 | `feature-vm.nix modified` | **yes — diff cross-checked** | `no` claim with feature-vm.nix in diff = reject |
 | `Risky markers in diff` | no — typed claim | Forces enumeration |
 | `Behavioural evidence` | no — typed claim | "Build green" / "verified locally" do NOT count |
