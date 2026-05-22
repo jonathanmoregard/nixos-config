@@ -133,7 +133,7 @@ Pre-push checklist:
 | `Risky markers in diff` | no — typed claim | Forces enumeration |
 | `Behavioural evidence` | no — typed claim | "Build green" / "verified locally" do NOT count |
 
-**The `Behavioural evidence` field is what historically went hollow.** Quote the actual command + observed output that proves the runtime path works. Valid examples:
+**The `Behavioural evidence` field is what historically went hollow.** Quote the actual command + observed output that proves the runtime path works. **User-realistic = what the user does** (run, press, hit), not what activates around it. `systemctl is-active` proves the unit is loaded; it does not prove the feature works. Valid examples:
 
 - `nix run .#feature-vm; ssh -p 2222 jonathan@localhost 'systemctl is-active research-agent'; curl localhost:8080/health → 200`
 - `xvfb-run kitty; xdotool key ctrl+shift+c; xclip -o -selection clipboard → "foo" (no trailing \n)`
