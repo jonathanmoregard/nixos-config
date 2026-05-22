@@ -82,11 +82,23 @@ gh pr checks <PR_NUMBER>
 
 ## Pre-push checklist trailer
 
-The safe-bash MCP refuses `git push` from a nixos-config worktree whose HEAD
-commit message lacks a `Pre-push checklist:` block (or carries internally
-inconsistent claims). This exists because two recent PRs (#57, #61) shipped
-broken changes despite the HARD RULE being in context the whole time — the
-skill prose alone wasn't enough; this gate enforces structurally.
+The safe-bash MCP refuses `git push` from any clone of the nixos-config
+repo whose HEAD commit message lacks a `Pre-push checklist:` block (or
+carries internally inconsistent claims). This exists because two recent
+PRs (#57, #61) shipped broken changes despite the HARD RULE being in
+context the whole time — the skill prose alone wasn't enough; this gate
+enforces structurally.
+
+**Detection is by remote URL, not filesystem path.** Any candidate path
+(parsed from `cd <path>` in the command, `git -C <path>` flag, or the
+MCP server's cwd) is probed with `git rev-parse --show-toplevel`; if it
+resolves to a working tree whose configured remotes include a URL
+matching `jonathanmoregard/nixos-config` (any of: ssh `git@github.com:…`,
+https, with or without `.git` suffix), the gate fires. A scratch clone
+at `/tmp/foo/`, a worktree under `~/projects/`, or anywhere else outside
+`~/Repos/nixos-config-worktrees/` is gated identically. Conversely, a
+worktree that happens to live under the canonical worktrees dir but
+points its origin elsewhere is NOT gated.
 
 ### Pure-data (package add, version bump, comment, doc edit)
 
