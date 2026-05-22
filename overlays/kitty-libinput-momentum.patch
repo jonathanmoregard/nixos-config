@@ -1,0 +1,80 @@
+# Patch generated from kitty 0.46.2 source. Adds libinput-touchpad HIGHRES classification
+--- a/glfw/x11_init.c	2026-05-14 09:01:04.780813816 +0200
++++ b/glfw/x11_init.c	2026-05-14 10:16:16.913029679 +0200
+@@ -174,6 +174,15 @@
+             XFree(data);
+         }
+ 
++        {
++            FILE *_dbg = fopen("/tmp/kitty-scrolldbg.log", "a");
++            if (_dbg) {
++                fprintf(_dbg, "[scrolldbg] enum dev id=%d use=%d name='%s' enabled=%d is_highres=%d\n",
++                        device->deviceid, device->use, device->name, device->enabled, (int)is_highres);
++                fclose(_dbg);
++            }
++        }
++
+         // Detect if this is a finger-based device (touchpad/touchscreen)
+         bool is_finger_based = false;
+ 
+@@ -204,6 +213,16 @@
+                 }
+             }
+         }
++
++        {
++            FILE *_dbg = fopen("/tmp/kitty-scrolldbg.log", "a");
++            if (_dbg) {
++                fprintf(_dbg, "[scrolldbg]   dev id=%d is_finger_based=%d\n",
++                        device->deviceid, (int)is_finger_based);
++                fclose(_dbg);
++            }
++        }
++
+         for (int j = 0; j < device->num_classes; j++) {
+             if (device->classes[j]->type != XIScrollClass) continue;
+             XIScrollClassInfo* scroll = (XIScrollClassInfo*)device->classes[j];
+--- a/glfw/x11_window.c	2026-05-14 09:01:04.781813805 +0200
++++ b/glfw/x11_window.c	2026-05-14 10:16:19.416257433 +0200
+@@ -1439,6 +1439,23 @@
+             d = t; break;
+         }
+     }
++    {
++        static int _motion_dbg_count = 0;
++        if (_motion_dbg_count < 80) {
++            _motion_dbg_count++;
++            FILE *_dbg = fopen("/tmp/kitty-scrolldbg.log", "a");
++            if (_dbg) {
++                fprintf(_dbg, "[scrolldbg] motion de->deviceid=%d sourceid=%d matched=%d",
++                        de->deviceid, de->sourceid, d != NULL);
++                if (d) fprintf(_dbg, " entry: dev=%d src=%d is_finger=%d "
++                               "offset_type=%d type_detected=%d num_events=%d",
++                               d->deviceid, d->sourceid, d->is_finger_based,
++                               d->offset_type, d->type_detected, d->num_events);
++                fprintf(_dbg, "\n");
++                fclose(_dbg);
++            }
++        }
++    }
+     if (d && de->valuators.mask_len){
+         double xOffset = 0, yOffset = 0;
+         // Process valuators to detect scroll events
+@@ -1466,7 +1483,16 @@
+             *off = delta;
+             d->num_events++;
+             if (!d->type_detected) {
+-                if (v->increment == 120.) {
++                // libinput-on-X11 fix: xf86-input-libinput advertises
++                // XIScrollClass.increment=120 for all scroll devices, including
++                // touchpads. The original upstream-classified V120 here, which
++                // never reaches the HIGHRES momentum path. For finger-based
++                // devices (touchpads, identified by libinput Tapping Enabled),
++                // classify as HIGHRES — pixel-fractional deltas, momentum desired.
++                if (d->is_finger_based) {
++                    d->type_detected = true;
++                    d->offset_type = GLFW_SCROLL_OFFEST_HIGHRES;
++                } else if (v->increment == 120.) {
+                     d->type_detected = true;
+                     d->offset_type = GLFW_SCROLL_OFFEST_V120;
+                 } else {

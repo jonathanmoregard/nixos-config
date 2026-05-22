@@ -33,7 +33,10 @@
     pkgsLinux = import nixpkgs {
       system = linuxSystem;
       config.allowUnfree = true;
-      overlays = [ (import ./overlays/beeper.nix) ];
+      overlays = [
+        (import ./overlays/beeper.nix)
+        (import ./overlays/kitty.nix)
+      ];
     };
   in {
     # NixOS VM (headless, QEMU/KVM)
@@ -89,13 +92,14 @@
           inputs = { inherit home-manager agenix microvm; };
         };
       in {
-        vm-base        = mkLane ./tests/base.nix;
-        vm-desktop     = mkLane ./tests/desktop.nix;
-        vm-keyring     = mkLane ./tests/keyring.nix;
-        vm-kitty       = mkLane ./tests/kitty.nix;
-        vm-claude-pane = mkLane ./tests/claude-pane.nix;
-        vm-autodoro    = mkLane ./tests/autodoro.nix;
-        vm-microvm     = mkLane ./tests/microvm.nix;
+        vm-base           = mkLane ./tests/base.nix;
+        vm-desktop        = mkLane ./tests/desktop.nix;
+        vm-keyring        = mkLane ./tests/keyring.nix;
+        vm-kitty          = mkLane ./tests/kitty.nix;
+        vm-kitty-momentum = mkLane ./tests/kitty-momentum.nix;
+        vm-claude-pane    = mkLane ./tests/claude-pane.nix;
+        vm-autodoro       = mkLane ./tests/autodoro.nix;
+        vm-microvm        = mkLane ./tests/microvm.nix;
       };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.
