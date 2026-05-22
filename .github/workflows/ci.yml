@@ -116,7 +116,7 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       # No cache-nix-action here on purpose. flake-check is eval-only
       # (`--no-build`); its added /nix/store would be small relative to
-      # build-dellan's ~9 GB snapshot, and this job has no /mnt loopback
+      # build-dellan's ~7 GB snapshot, and this job has no /mnt loopback
       # so restoring the shared snapshot to the runner's root disk would
       # likely ENOSPC.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
