@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
 let
   # Convert `kitty @ ls` JSON snapshot → kitty session-file format
   # (https://sw.kovidgoyal.net/kitty/overview/#startup-sessions).
@@ -696,6 +696,16 @@ in
     # confirmation when closing windows via UI/shortcut.
     confirm_os_window_close 0
 
+    # Watch kitty.conf for direct in-place edits. Empirically (vm-kitty
+    # auto-reload behavioral test) this directive does NOT fire on
+    # home-manager's symlink-target swap — kitty resolves the symlink
+    # at startup and watches the resolved inode in /nix/store, which
+    # is immutable. The HM activation path is handled separately by
+    # the `kittyReloadConfig` activation hook below. Keeping the
+    # directive anyway covers the direct-edit case (e.g. user fiddling
+    # with kitty.conf out-of-band for prototyping).
+    auto_reload_config yes
+
     # === Ghostty-default-dark theme port + matching aesthetics ===
     # Source: ghostty-org/ghostty discussions #5390
     # foreground is slightly off-white (#ebebeb) — pure #ffffff renders harsher
@@ -826,6 +836,28 @@ in
     };
     Install.WantedBy = [ "timers.target" ];
   };
+
+  # Send `kitty @ load-config` to every running kitty socket after
+  # home-manager finishes activation. Compensates for the fact that
+  # `auto_reload_config yes` (above) does NOT pick up HM's symlink-
+  # target swap — kitty's inotify watcher stays bound to the original
+  # /nix/store path, which never mutates. Without this hook, every
+  # config-change PR (PR #70 ctrl+shift+c xclip fix being the
+  # motivating case) lands on disk but doesn't take effect until the
+  # user manually restarts kitty.
+  #
+  # Best-effort: silent no-op when no kitty is running, and a single
+  # socket's reload failure does not abort activation. Runs in
+  # entryAfter ["linkGeneration"] so it fires after the new
+  # kitty.conf symlink target is in place.
+  home.activation.kittyReloadConfig =
+    lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+      for sock in /tmp/kitty.sock-*; do
+        [ -S "$sock" ] || continue
+        ${pkgs.kitty}/bin/kitty @ --to "unix:$sock" load-config \
+          2>/dev/null || true
+      done
+    '';
 
   # Final snapshot at logout. Bound to graphical-session.target so ExecStop
   # fires when the desktop session ends, capturing state newer than the
