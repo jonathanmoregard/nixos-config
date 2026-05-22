@@ -71,13 +71,21 @@ Pick the lane closest to what you changed. If your change touches
 something new with no obvious home, add a new lane file rather than
 piling onto `vm-base`.
 
-| Change | Lane | Assertion shape |
+**Prefer behavioural assertions over presence ones.** A presence check
+(`test -x <bin>`, `test -f <path>`, "config file contains string") proves
+nothing about runtime — render-grep / presence-only tests are how PR #57
+passed CI while the keybinding was broken at runtime (`pass_selection_to_program`
+runs the child without a controlling tty, so the bound `kitten clipboard`
+silently failed). The rows below show presence as the minimum bar; the
+right-hand column upgrades each to behavioural.
+
+| Change | Presence (minimum) | Behavioural (preferred) |
 |--------|------|-----------------|
-| HM-installed binary on PATH | the matching feature lane | `dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/<name>")` |
-| systemd user unit | the matching feature lane | `dellan.wait_for_unit("<name>", "jonathan")` |
-| systemd system unit | the matching feature lane | `dellan.wait_for_unit("<name>")` |
-| Script with deterministic behavior | the matching feature lane | `dellan.succeed("su jonathan -c '<cmd>'")` |
-| New file rendered by HM | the matching feature lane | `dellan.succeed("test -f /home/jonathan/<path>")` |
+| HM-installed binary on PATH | `test -x /etc/profiles/per-user/jonathan/bin/<name>` | `su jonathan -c '<name> --help' \| grep <expected-flag>` |
+| systemd user unit | `wait_for_unit("<name>", "jonathan")` | trigger the unit's job + assert the side effect (timer fires → check artifact; daemon listens → curl it) |
+| systemd system unit | `wait_for_unit("<name>")` | same — exercise the unit's actual job, not just liveness |
+| Script with deterministic behavior | `su jonathan -c '<cmd>'` | run with the inputs a user would, assert exit code AND stdout shape |
+| New file rendered by HM | `test -f /home/jonathan/<path>` | for a config file, prefer testing that the **app reading it does the right thing** — render-grep is the PR #57 anti-pattern |
 | Whole new feature area | new `tests/<feature>.nix` + wire into `flake.nix` `checks` block + add to `ci.yml` matrix | use one of the small lanes (keyring/base) as a template |
 
 ## When to skip the gate
