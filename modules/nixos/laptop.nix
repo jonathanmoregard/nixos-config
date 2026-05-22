@@ -71,6 +71,20 @@
     platform = "ipu6ep";
   };
 
+  # v4l2-relayd-ipu6 self-heal. Upstream `hardware.ipu6` ships
+  # StartLimitBurst=5 + default RestartSec=100ms; the gst pipeline
+  # tears down ~1s after preroll (v4l2loopback 0.15.3 buffer-queue
+  # regression, upstream PR #656 still open) and the sensor itself
+  # occasionally wedges on stop/start. The default settings burn
+  # through the burst in <1s and the unit lands in start-limit-hit
+  # → camera dead until manual `systemctl reset-failed`. Infinite
+  # retries + 5s backoff turns that into a brief blank that
+  # recovers on its own and gives the sensor time to settle.
+  systemd.services.v4l2-relayd-ipu6 = {
+    unitConfig.StartLimitBurst = 0;
+    serviceConfig.RestartSec = "5s";
+  };
+
   # nix-ld — runs pre-built dynamically-linked Linux binaries (e.g. the
   # Claude Code native installer at ~/.local/share/claude/versions/<v>)
   # that expect /lib64/ld-linux-x86-64.so.2 + standard glibc layout.
