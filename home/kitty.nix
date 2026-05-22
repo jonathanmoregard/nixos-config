@@ -696,6 +696,17 @@ in
     # confirmation when closing windows via UI/shortcut.
     confirm_os_window_close 0
 
+    # Reload kitty.conf whenever it changes on disk. Home-manager
+    # rewrites the symlink target on every activation; without this
+    # directive, a running kitty keeps the in-memory keybinding /
+    # color / font set from launch time and silently ignores config
+    # bumps until the user restarts kitty. That's how the
+    # ctrl+shift+c xclip fix (PR #70) appeared to be deployed but
+    # still broken on the running session — kitty kept calling
+    # `kitten clipboard` from its in-memory keymap. Reload is cheap
+    # (~ms) and only fires on inotify events for the actual config.
+    auto_reload_config yes
+
     # === Ghostty-default-dark theme port + matching aesthetics ===
     # Source: ghostty-org/ghostty discussions #5390
     # foreground is slightly off-white (#ebebeb) — pure #ffffff renders harsher

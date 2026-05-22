@@ -72,6 +72,12 @@
     dellan.succeed(
         f"grep -qE '^paste_actions .*replace-newline' {kitty_conf}"
     )
+    # auto_reload_config yes so config bumps land on a running kitty
+    # without a restart (e.g. the ctrl+shift+c xclip fix that PR #70
+    # shipped but PR #70 deploy left invisible until kitty restarted).
+    dellan.succeed(
+        f"grep -qE '^auto_reload_config[[:space:]]+yes' {kitty_conf}"
+    )
 
     # Persistence timer is active and scheduled
     dellan.wait_for_unit("kitty-session-save.timer", "jonathan")
