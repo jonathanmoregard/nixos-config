@@ -114,6 +114,11 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+      # No cache-nix-action here on purpose. flake-check is eval-only
+      # (`--no-build`); its added /nix/store would be small relative to
+      # build-dellan's ~9 GB snapshot, and this job has no /mnt loopback
+      # so restoring the shared snapshot to the runner's root disk would
+      # likely ENOSPC.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix flake check --no-build --all-systems
 
@@ -132,6 +137,45 @@ jobs:
       - name: Mount /nix on /mnt loopback (replaces free-disk-space)
         if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/mount-nix-loop.sh
+      # build-dellan owns the shared cache. Restore on entry; the action
+      # auto-saves /nix/store at job end under `primary-key` (post step is
+      # gated `post-if: success()`, so cancelled/failed runs skip save and
+      # don't poison the snapshot). Subsequent PR jobs (vm-minimal lanes)
+      # restore from this snapshot.
+      #
+      # Order: this step runs BEFORE determinate-nix-action. The restore
+      # phase is plain tar-into-/nix/store, no nix binary needed; running
+      # it after the installer would overlay our cached store on the
+      # installer's freshly-initialised /nix/var/nix/db, which leaves the
+      # daemon's sqlite out of sync with the on-disk paths (nix would
+      # then re-download everything). Save phase (post step) runs after
+      # the build, when nix IS installed and gc works.
+      #
+      # Key strategy: hash flake.lock + every .nix file. Identical config
+      # → exact hit. flake.lock-only changes (input bump) → restore the
+      # closest lock-prefix and only fetch the delta. Total miss → fall
+      # back to the runner-os prefix.
+      #
+      # Cache budget: GHA caps repos at 10 GB compressed; tar+zstd hits
+      # roughly 2× compression, so an uncompressed 9 GB store fits in
+      # ~4.5 GB cache. gc-max-store-size-linux trims to 9 GB to give the
+      # dellan closure (~8 GB) headroom without evicting live paths.
+      # purge with purge-prefixes drops other matching caches older than
+      # 7 days; purge-primary-key:never protects the snapshot we just
+      # restored from.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/*.nix') }}
+          restore-prefixes-first-match: |
+            nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
+            nix-store-${{ runner.os }}-
+          gc-max-store-size-linux: 9000000000
+          purge: true
+          purge-prefixes: nix-store-${{ runner.os }}-
+          purge-created: true
+          purge-created-max-age-seconds: 604800  # 7 days
+          purge-primary-key: never
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
@@ -151,11 +195,11 @@ jobs:
     # lane reporting even after one breaks.
     #
     # `needs: [..., build-dellan]` serializes the toplevel-closure
-    # build before any lane starts. Without this, all 5 lanes race
-    # build-dellan to rebuild the same closure cold, then the slowest
-    # one wins the cachix push and the rest finish unnecessarily.
-    # With the dep, build-dellan populates cachix once, lanes pull
-    # binaries; per-lane wall drops from ~4min to ~90s.
+    # build before any lane starts. Without this, all lanes race
+    # build-dellan to rebuild the same closure cold. With the dep,
+    # build-dellan saves the shared /nix/store snapshot to GHA cache
+    # (and pushes deltas to cachix); lanes restore from that snapshot
+    # so most paths land locally on disk before nix even runs.
     #
     # Branch-protection required-check names are
     # `vm-minimal (<lane>)` — update protection rules in the GH UI
@@ -178,11 +222,31 @@ jobs:
       - name: Mount /nix on /mnt loopback (replaces free-disk-space)
         if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/mount-nix-loop.sh
+      # Restore the shared /nix/store snapshot that build-dellan saved
+      # earlier in this run. save: false — only build-dellan owns the
+      # snapshot. 7 lanes saving in parallel would race for the same
+      # cache key, and 7 × ~9 GB blows the GHA 10 GB cap. Worst case
+      # (build-dellan's save hasn't propagated yet) the restore-prefixes
+      # fall back to the previous run's snapshot — still faster than
+      # cold.
+      #
+      # Order matches build-dellan: cache restore BEFORE the installer
+      # so the cached /nix/store and the installer's fresh
+      # /nix/var/nix/db end up consistent (the installer ingests the
+      # restored paths during its setup).
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/*.nix') }}
+          restore-prefixes-first-match: |
+            nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
+            nix-store-${{ runner.os }}-
+          save: false
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
-      # build-dellan ran in needs: and populated cachix with the
-      # toplevel closure. Each lane pulls binaries from cache instead
-      # of rebuilding the system from scratch.
+      # cachix remains the secondary substituter: it covers paths the
+      # GHA cache didn't have (e.g. brand-new VM-specific closure) and
+      # paths from other developers' machines pushed via post-build hooks.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
