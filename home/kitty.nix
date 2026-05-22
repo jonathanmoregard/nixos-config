@@ -619,6 +619,60 @@ let
         main()
   '';
 
+  # ctrl+shift+c copy filter: unwrap TUI hanging-indent line wraps so a
+  # single shell command that the source app (claude-code, less, man,
+  # any wide-text TUI) hard-wrapped for display copies back to its
+  # original single line.
+  #
+  # Algorithm: stdin → stdout. A "block" is one non-indented line
+  # followed by 1+ lines all starting with the SAME K>0 leading
+  # spaces. Continuation lines have their K spaces stripped, all lines
+  # rstrip'd, block joined with single spaces (matches the implicit
+  # word-boundary space at terminal wrap points). Lines outside any
+  # block pass through verbatim.
+  #
+  # Trade-off: a uniformly K-indented multi-line shell body (for/do/done,
+  # if/then/fi with consistent indent) ALSO collapses. The escape hatch
+  # is ctrl+shift+alt+c (`copy_to_clipboard`, kitty built-in, no
+  # transform). Heuristic-only by necessity: when the source TUI emits
+  # real `\n` for display wraps, kitty has no per-line "continued" flag
+  # to recover from.
+  kittyCopyUnwrap = pkgs.writers.writePython3Bin "kitty-copy-unwrap" {} ''
+    import sys
+
+
+    def unwrap(text):
+        lines = text.split("\n")
+        out = []
+        i = 0
+        while i < len(lines):
+            cur = lines[i]
+            if cur and cur[0] != " " and i + 1 < len(lines):
+                nxt = lines[i + 1]
+                stripped = nxt.lstrip(" ")
+                k = len(nxt) - len(stripped)
+                if k > 0 and stripped:
+                    block = [cur.rstrip()]
+                    j = i + 1
+                    while (
+                        j < len(lines)
+                        and len(lines[j]) > k
+                        and lines[j][:k] == " " * k
+                        and lines[j][k] != " "
+                    ):
+                        block.append(lines[j][k:].rstrip())
+                        j += 1
+                    out.append(" ".join(block))
+                    i = j
+                    continue
+            out.append(cur)
+            i += 1
+        return "\n".join(out)
+
+
+    sys.stdout.write(unwrap(sys.stdin.read()))
+  '';
+
   # Snapshot current kitty state. No-op if no kitty is listening.
   kittySessionSave = pkgs.writeShellApplication {
     name = "kitty-session-save";
@@ -755,6 +809,7 @@ in
     kittySessionConvert
     kittySessionEnrich
     kittySessionSave
+    kittyCopyUnwrap
     claudeKittyPaneRecord
     # WIP, not yet wired in (see wrapper above):
     kittyPaneAdd
@@ -891,26 +946,24 @@ in
     # New tab inheriting cwd of current window.
     map ctrl+t new_tab_with_cwd
 
-    # Copy: preserve embedded newlines so multi-line shell commands and
-    # multi-line code blocks copied out of the terminal round-trip
-    # intact. Prior design (PR #70, `tr -d "\n"`) was wrong: it stripped
-    # EVERY newline, so any selection that spanned > 1 line collapsed
-    # into one giant blob. Combined with the prior `paste_actions
-    # replace-newline` that also flattened newlines on the way in, this
-    # made the whole copy/paste pipeline a one-way trip to single-line
-    # mangling.
+    # Copy: pipe selection through kitty-copy-unwrap (see let-binding
+    # above) to undo TUI hanging-indent line wraps before xclip.
+    # Recovers single-line shell commands that the source TUI
+    # (claude-code, less, man, etc.) hard-wrapped for display — pasting
+    # the result back into a shell runs the original single command
+    # instead of choking on `\n  ` mid-pipeline.
     #
     # Selection is passed as argv[0] (the $0 of `sh -c`). `printf %s`
-    # does NOT append a trailing newline, so what kitty handed us is
-    # what xclip stores byte-for-byte. xclip writes to the X11 CLIPBOARD
-    # selection without a controlling TTY (kitten clipboard / OSC 52
-    # fails under pass_selection_to_program — see comment near
+    # does NOT append a trailing newline. xclip writes to the X11
+    # CLIPBOARD selection without a controlling TTY (kitten clipboard /
+    # OSC 52 fails under pass_selection_to_program — see comment near
     # `pkgs.xclip` above).
-    map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | xclip -selection clipboard -in'
-    # Escape hatch: kitty's built-in copy_to_clipboard (no shell hop).
-    # Both bindings now preserve newlines — the alt variant exists for
-    # parity with the prior split-behavior config so muscle memory keeps
-    # working.
+    map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | kitty-copy-unwrap | xclip -selection clipboard -in'
+    # Escape hatch: kitty's built-in copy_to_clipboard, no transform.
+    # Use for uniformly-indented multi-line shell bodies (for/do/done,
+    # if/then/fi) that the unwrap heuristic would collapse — kitty has
+    # no way to distinguish a soft-wrap continuation from a deliberate
+    # same-indent code line.
     map ctrl+shift+alt+c copy_to_clipboard
 
     # Paste: preserve newlines in the paste payload byte-for-byte.
