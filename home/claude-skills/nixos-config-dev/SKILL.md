@@ -46,24 +46,92 @@ cd ~/Repos/nixos-config-worktrees/<slug>
 #    coding (write the assertion first, watch it fail, make it pass).
 $EDITOR home/whatever.nix
 git add -A
-git commit -m "feat(scope): summary"
 
 # 3. Test before pushing — see "Testing skills" below.
 
-# 4. Push, open PR
+# 4. Commit with the pre-push checklist in the message body
+#    (safe-bash MCP refuses pushes whose HEAD commit lacks it; see
+#    "Pre-push checklist trailer" below).
+git commit -m "feat(scope): summary
+
+Body explaining the change.
+
+Pre-push checklist:
+- Type: risky                                # or 'pure-data'
+- Rebased on origin/main: yes
+- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0
+- feature-vm.nix modified: no                # MUST match diff
+- Risky markers in diff: <list, or 'none'>
+- Behavioural evidence: <cmd + observed output>
+"
+
+# 5. Push, open PR
 git push -u origin feat/<slug>
 gh pr create --title "..." --body "..."
 
-# 5. Watch CI
+# 6. Watch CI
 gh pr checks <PR_NUMBER>
 
-# 6. For non-trivial PRs about to be merged, lead with the
+# 7. For non-trivial PRs about to be merged, lead with the
 #    `advice-refine-test-loop` skill — Opus advisor + empirical
 #    re-verification across rounds catches fail-open paths, schema
 #    mismatches, and silent regressions that single-pass review
 #    misses. Cheap insurance on changes that auto-deploy to your
 #    daily-driver.
 ```
+
+## Pre-push checklist trailer
+
+The safe-bash MCP refuses `git push` from a nixos-config worktree whose HEAD
+commit message lacks a `Pre-push checklist:` block (or carries internally
+inconsistent claims). This exists because two recent PRs (#57, #61) shipped
+broken changes despite the HARD RULE being in context the whole time — the
+skill prose alone wasn't enough; this gate enforces structurally.
+
+### Pure-data (package add, version bump, comment, doc edit)
+
+```
+Pre-push checklist:
+- Type: pure-data
+```
+
+Accepted iff the diff has **no** risky markers (mkIf / optionals / ExecStart /
+writeShellApplication / `sh -c` / microvm / virtiofsd / networking.useDHCP /
+activationScripts / systemd.services.\*) AND does not touch
+`modules/nixos/feature-vm.nix`. If either is true → promote to `Type: risky`.
+
+### Risky (anything else)
+
+```
+Pre-push checklist:
+- Type: risky
+- Rebased on origin/main: yes
+- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0
+- feature-vm.nix modified: no
+- Risky markers in diff: <list, or 'none'>
+- Behavioural evidence: <cmd + observed output>
+```
+
+| Field | Verified by gate | Notes |
+|---|---|---|
+| `Type` | yes (literal `pure-data` or `risky`) | Mismatch with diff = reject |
+| `Rebased on origin/main` | yes (`merge-base HEAD origin/main == origin/main`) | `yes` claim while behind main = reject |
+| `Local gate` | no — typed claim | Audited post-hoc via `git log` |
+| `feature-vm.nix modified` | **yes — diff cross-checked** | `no` claim with feature-vm.nix in diff = reject |
+| `Risky markers in diff` | no — typed claim | Forces enumeration |
+| `Behavioural evidence` | no — typed claim | "Build green" / "verified locally" do NOT count |
+
+**The `Behavioural evidence` field is what historically went hollow.** Quote the actual command + observed output that proves the runtime path works. Valid examples:
+
+- `nix run .#feature-vm; ssh -p 2222 jonathan@localhost 'systemctl is-active research-agent'; curl localhost:8080/health → 200`
+- `xvfb-run kitty; xdotool key ctrl+shift+c; xclip -o -selection clipboard → "foo" (no trailing \n)`
+- "hardware-only change (touchpad palm rejection); cannot model in VM; will verify on real host after auto-deploy with `nixos-rebuild switch --rollback` ready"
+
+**`feature-vm.nix modified: yes (<reason>)`** is fine for legit reasons (wiring a new module into vmVariant, adding a fixture). It's only the **`no` claim while the diff DOES touch the file** that gets rejected — that combination is the PR #61 anti-pattern (agent stubbed virtiofsd shares to make boot succeed, smoke ran against the stub, prod path never exercised).
+
+### Override (audited)
+
+`Override: [skip-vm-gate] <reason>` line in the commit message bypasses the gate. Logged to stderr by the MCP; visible in `git log` forever. Reserve for true emergencies. Not a shortcut.
 
 ## Testing skills
 
