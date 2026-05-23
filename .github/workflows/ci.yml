@@ -44,6 +44,16 @@ permissions:
   contents: read
   pull-requests: read
 
+# NIX_CONFIG is parsed by Nix BEFORE any config file, so it survives
+# cachix-action's later NIX_USER_CONF_FILES override that otherwise
+# shadows /etc/nix/nix.conf for steps run after cachix loads.
+# Belt-and-braces alongside extra-conf in the determinate-nix-action
+# `with:` blocks: extra-conf covers steps before cachix; NIX_CONFIG
+# covers steps after. Both layers point at the same workflow token.
+env:
+  NIX_CONFIG: |
+    access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
 concurrency:
   group: pr-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -55,6 +65,9 @@ jobs:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - run: scripts/check-fork-guards.sh
 
   preflight:
@@ -71,6 +84,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Preflight TRIVIAL check (no nix, ~1s)
         id: preflight
         # Doc-only fast-path: if every changed file matches the safe
@@ -112,8 +127,21 @@ jobs:
     steps:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+        with:
+          # Belt-and-braces against intermittent HTTP 401 from
+          # api.github.com when Nix fetches flake input tarballs.
+          # Action auto-injects access-tokens from github-token, but
+          # cachix-action later sets NIX_USER_CONF_FILES, reshaping the
+          # conf chain Nix reads; the explicit extra-conf writes the
+          # token to the path Nix actually consults at build time.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
       # No cache-nix-action here on purpose. flake-check is eval-only
       # (`--no-build`); its added /nix/store would be small relative to
       # build-dellan's snapshot (≤8 GB uncompressed per gc-max), and
@@ -149,6 +177,9 @@ jobs:
       statuses: ${{ steps.probe.outputs.statuses }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       - id: probe
@@ -215,6 +246,16 @@ jobs:
     steps:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Pin to head SHA + explicit token. `gh run rerun` reuses the
+          # original event payload, but GitHub's `refs/pull/<N>/merge`
+          # virtual ref can lag-behind on rerun → actions/checkout
+          # falls through to its credential-prompt path and dies with
+          # "could not read Username for github.com: terminal prompts
+          # disabled". head.sha is always resolvable and bypasses the
+          # merge-ref propagation race.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Free root disk (dotnet/ghc/android/codeql)
         if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/free-root-disk.sh
@@ -223,6 +264,16 @@ jobs:
         run: ./scripts/mount-nix-loop.sh
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+        with:
+          # Belt-and-braces against intermittent HTTP 401 from
+          # api.github.com when Nix fetches flake input tarballs.
+          # Action auto-injects access-tokens from github-token, but
+          # cachix-action later sets NIX_USER_CONF_FILES, reshaping the
+          # conf chain Nix reads; the explicit extra-conf writes the
+          # token to the path Nix actually consults at build time.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
       # build-dellan owns the shared cache. Restore on entry; the action
       # auto-saves /nix/store at job end under `primary-key` (post step is
       # gated `post-if: success()`, so cancelled/failed runs skip save and
@@ -349,6 +400,9 @@ jobs:
           echo "status=$status" >> "$GITHUB_OUTPUT"
       - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Free root disk (dotnet/ghc/android/codeql)
         if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         run: ./scripts/free-root-disk.sh
@@ -357,6 +411,16 @@ jobs:
         run: ./scripts/mount-nix-loop.sh
       - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+        with:
+          # Belt-and-braces against intermittent HTTP 401 from
+          # api.github.com when Nix fetches flake input tarballs.
+          # Action auto-injects access-tokens from github-token, but
+          # cachix-action later sets NIX_USER_CONF_FILES, reshaping the
+          # conf chain Nix reads; the explicit extra-conf writes the
+          # token to the path Nix actually consults at build time.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
       # Restore the shared /nix/store snapshot that build-dellan saved.
       # save: false — only build-dellan owns the snapshot. 7 lanes saving
       # in parallel would race for the same cache key, and 7 × ~8 GB
@@ -410,6 +474,9 @@ jobs:
            contains(github.event.pull_request.changed_files, 'modules/nixos/desktop.nix') ||
            contains(github.event.pull_request.changed_files, 'home/kitty.nix'))
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - if: |
           needs.preflight.outputs.risk != 'TRIVIAL' &&
           (contains(github.event.pull_request.changed_files, 'home/cinnamon.nix') ||
