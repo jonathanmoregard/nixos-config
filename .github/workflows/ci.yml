@@ -44,6 +44,16 @@ permissions:
   contents: read
   pull-requests: read
 
+# NIX_CONFIG is parsed by Nix BEFORE any config file, so it survives
+# cachix-action's later NIX_USER_CONF_FILES override that otherwise
+# shadows /etc/nix/nix.conf for steps run after cachix loads.
+# Belt-and-braces alongside extra-conf in the determinate-nix-action
+# `with:` blocks: extra-conf covers steps before cachix; NIX_CONFIG
+# covers steps after. Both layers point at the same workflow token.
+env:
+  NIX_CONFIG: |
+    access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
 concurrency:
   group: pr-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

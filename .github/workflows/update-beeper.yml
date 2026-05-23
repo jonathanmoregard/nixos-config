@@ -27,6 +27,12 @@ permissions:
   contents: write
   pull-requests: write
 
+# Same NIX_CONFIG belt-and-braces as ci.yml — pre-empts any later
+# NIX_USER_CONF_FILES shadowing of /etc/nix/nix.conf.
+env:
+  NIX_CONFIG: |
+    access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
 concurrency:
   group: update-beeper
   cancel-in-progress: true
