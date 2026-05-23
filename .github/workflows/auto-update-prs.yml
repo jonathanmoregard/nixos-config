@@ -16,6 +16,17 @@
 # `gh pr update-branch` returns non-zero on merge conflict; logged as
 # non-fatal so the workflow still exits 0 (next merge to main will
 # pick a different PR if this one stays blocked).
+#
+# Behind detection: uses GitHub's compare API per-PR
+# (`repos/.../compare/main...<head>` → `.behind_by`) instead of
+# `mergeStateStatus`. Reason: a `push:main` event invalidates the
+# cached `mergeStateStatus` for every open PR; GitHub recomputes
+# asynchronously (seconds to minutes). Workflows triggered by the
+# same `push:main` fire within ~1-2s of the invalidation and read
+# `mergeStateStatus="UNKNOWN"` for every PR, so the BEHIND filter
+# matches nothing → "no behind PR to update" even when there are
+# 4+ behind PRs. The compare API is computed on demand and is not
+# subject to that lag.
 
 name: auto-update-prs
 
@@ -44,23 +55,52 @@ jobs:
         run: |
           set -euo pipefail
 
-          # mergeStateStatus == BEHIND is exactly the condition the
-          # "Update branch" button watches for. CLEAN / BLOCKED / DIRTY /
-          # UNSTABLE all mean don't bother — auto-merge handles CLEAN
-          # itself, DIRTY needs human conflict resolution, BLOCKED /
-          # UNSTABLE need CI to settle (or a force-rebase, out of scope).
-          target=$(gh pr list \
-            --base main \
-            --state open \
-            --json number,autoMergeRequest,mergeStateStatus \
-            --jq '[.[] | select(.autoMergeRequest != null and .mergeStateStatus == "BEHIND")] | sort_by(.number) | .[0].number // empty')
+          # 1. List open auto-merge PRs (number + head ref). headRefName
+          #    is the branch name within this repo — fork PRs would need
+          #    `owner:branch` form, but this repo doesn't accept forks.
+          prs=$(gh pr list \
+            --base main --state open --limit 100 \
+            --json number,headRefName,autoMergeRequest \
+            --jq '.[] | select(.autoMergeRequest != null) | "\(.number) \(.headRefName)"')
 
-          if [ -z "${target:-}" ]; then
+          if [ -z "$prs" ]; then
+            echo "no open auto-merge PRs"
+            exit 0
+          fi
+
+          echo "checking auto-merge PRs via compare API:"
+          # Indent each line for log readability (bash param expansion;
+          # avoids `sed` per SC2001).
+          printf '  %s\n' "${prs//$'\n'/$'\n  '}"
+
+          # 2. For each, ask GitHub's compare API how many commits the
+          #    PR head is behind main. `behind_by > 0` means main has
+          #    commits the PR doesn't have → "Update branch" candidate.
+          #    Computed on demand by GitHub; not subject to the
+          #    mergeStateStatus lazy-recompute lag.
+          behind_list=$(
+            while read -r num head; do
+              [ -z "$num" ] && continue
+              by=$(gh api "repos/$GH_REPO/compare/main...$head" --jq '.behind_by' 2>/dev/null || true)
+              # Skip non-numeric / empty / zero values without aborting
+              # the loop. case is the most portable numeric test.
+              case "$by" in
+                ''|*[!0-9]*) continue ;;
+                0) continue ;;
+              esac
+              echo "$num $by"
+            done <<< "$prs" | sort -n -k1,1
+          )
+
+          if [ -z "$behind_list" ]; then
             echo "no behind auto-merge PR to update"
             exit 0
           fi
 
-          echo "updating PR #$target (lowest behind auto-merge PR)"
+          target=$(echo "$behind_list" | head -1 | awk '{print $1}')
+          behind_by=$(echo "$behind_list" | head -1 | awk '{print $2}')
+
+          echo "updating PR #$target (behind main by $behind_by commits, lowest-numbered behind auto-merge PR)"
           if gh pr update-branch "$target" 2>&1; then
             echo "[ok] PR #$target: branch updated"
           else
