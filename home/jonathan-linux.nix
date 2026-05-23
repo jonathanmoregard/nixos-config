@@ -26,6 +26,7 @@ in
     ./jonathan.nix
     ./cinnamon.nix
     ./desktop-apps.nix
+    ./calibre-plugins.nix
     ./ghostty.nix
     ./kitty.nix
     ./autodoro.nix
