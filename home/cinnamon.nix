@@ -379,6 +379,8 @@ in
       "image/bmp" = "xviewer.desktop";
       "image/webp" = "xviewer.desktop";
       "inode/directory" = "nemo.desktop";
+      "x-scheme-handler/magnet" = "org.qbittorrent.qBittorrent.desktop";
+      "application/x-bittorrent" = "org.qbittorrent.qBittorrent.desktop";
     };
   };
 }
