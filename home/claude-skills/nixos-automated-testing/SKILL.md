@@ -71,13 +71,21 @@ Pick the lane closest to what you changed. If your change touches
 something new with no obvious home, add a new lane file rather than
 piling onto `vm-base`.
 
-| Change | Lane | Assertion shape |
+**Prefer behavioural assertions over presence ones.** A presence check
+(`test -x <bin>`, `test -f <path>`, "config file contains string") proves
+nothing about runtime — render-grep / presence-only tests are how PR #57
+passed CI while the keybinding was broken at runtime (`pass_selection_to_program`
+runs the child without a controlling tty, so the bound `kitten clipboard`
+silently failed). The rows below show presence as the minimum bar; the
+right-hand column upgrades each to behavioural.
+
+| Change | Presence (minimum) | Behavioural (preferred) |
 |--------|------|-----------------|
-| HM-installed binary on PATH | the matching feature lane | `dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/<name>")` |
-| systemd user unit | the matching feature lane | `dellan.wait_for_unit("<name>", "jonathan")` |
-| systemd system unit | the matching feature lane | `dellan.wait_for_unit("<name>")` |
-| Script with deterministic behavior | the matching feature lane | `dellan.succeed("su jonathan -c '<cmd>'")` |
-| New file rendered by HM | the matching feature lane | `dellan.succeed("test -f /home/jonathan/<path>")` |
+| HM-installed binary on PATH | `test -x /etc/profiles/per-user/jonathan/bin/<name>` | `su jonathan -c '<name> --help' \| grep <expected-flag>` |
+| systemd user unit | `wait_for_unit("<name>", "jonathan")` | trigger the unit's job + assert the side effect (timer fires → check artifact; daemon listens → curl it) |
+| systemd system unit | `wait_for_unit("<name>")` | same — exercise the unit's actual job, not just liveness |
+| Script with deterministic behavior | `su jonathan -c '<cmd>'` | run with the inputs a user would, assert exit code AND stdout shape |
+| New file rendered by HM | `test -f /home/jonathan/<path>` | for a config file, prefer testing that the **app reading it does the right thing** — render-grep is the PR #57 anti-pattern |
 | Whole new feature area | new `tests/<feature>.nix` + wire into `flake.nix` `checks` block + add to `ci.yml` matrix | use one of the small lanes (keyring/base) as a template |
 
 ## When to skip the gate
@@ -139,6 +147,22 @@ phase tears down the VM and you've lost the chance to introspect.
 - **`nixpkgs.config` and `nixpkgs.overlays` become read-only** when the
   test framework injects pkgs externally. Keep them in `flake.nix`'s
   `pkgsLinux`/`pkgsDarwin` definitions, never in modules.
+- **`fprintf(stderr, …)` from C code in a patched binary is INVISIBLE
+  in VM test harness output**, even with `fflush(stderr)`. The test
+  driver captures `machine.succeed("cmd")`'s stdout, not stderr of every
+  library loaded inside `cmd`'s process. If `cmd` is wrapped (xvfb-run,
+  systemd-run) or backgrounds itself, fd 2 routes to journald or
+  `/dev/null` before the C lib prints. Use explicit file logging instead:
+  ```c
+  FILE *fd = fopen("/tmp/debug.log", "a");
+  fprintf(fd, "got here\n");
+  fclose(fd);
+  ```
+  Then read it from the testScript: `print(machine.succeed("cat /tmp/debug.log"))`.
+  Direct disk-write is launch-method-agnostic and can't disappear.
+  Past incident (kitty/glfw-x11 patch debug): hours burned adding more
+  `fprintf(stderr, ...)` blocks before switching to file logging. See
+  `nixos-binary-debug` skill for the wider patched-binary debug flow.
 
 ## Failure modes
 

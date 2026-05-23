@@ -60,6 +60,8 @@ Pre-push checklist:
 - Type: risky                                # or 'pure-data'
 - Rebased on origin/main: yes
 - Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0
+- Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>
+- Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>
 - feature-vm.nix modified: no                # MUST match diff
 - Risky markers in diff: <list, or 'none'>
 - Behavioural evidence: <cmd + observed output>
@@ -82,11 +84,23 @@ gh pr checks <PR_NUMBER>
 
 ## Pre-push checklist trailer
 
-The safe-bash MCP refuses `git push` from a nixos-config worktree whose HEAD
-commit message lacks a `Pre-push checklist:` block (or carries internally
-inconsistent claims). This exists because two recent PRs (#57, #61) shipped
-broken changes despite the HARD RULE being in context the whole time — the
-skill prose alone wasn't enough; this gate enforces structurally.
+The safe-bash MCP refuses `git push` from any clone of the nixos-config
+repo whose HEAD commit message lacks a `Pre-push checklist:` block (or
+carries internally inconsistent claims). This exists because two recent
+PRs (#57, #61) shipped broken changes despite the HARD RULE being in
+context the whole time — the skill prose alone wasn't enough; this gate
+enforces structurally.
+
+**Detection is by remote URL, not filesystem path.** Any candidate path
+(parsed from `cd <path>` in the command, `git -C <path>` flag, or the
+MCP server's cwd) is probed with `git rev-parse --show-toplevel`; if it
+resolves to a working tree whose configured remotes include a URL
+matching `jonathanmoregard/nixos-config` (any of: ssh `git@github.com:…`,
+https, with or without `.git` suffix), the gate fires. A scratch clone
+at `/tmp/foo/`, a worktree under `~/projects/`, or anywhere else outside
+`~/Repos/nixos-config-worktrees/` is gated identically. Conversely, a
+worktree that happens to live under the canonical worktrees dir but
+points its origin elsewhere is NOT gated.
 
 ### Pure-data (package add, version bump, comment, doc edit)
 
@@ -107,6 +121,8 @@ Pre-push checklist:
 - Type: risky
 - Rebased on origin/main: yes
 - Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0
+- Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>
+- Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>
 - feature-vm.nix modified: no
 - Risky markers in diff: <list, or 'none'>
 - Behavioural evidence: <cmd + observed output>
@@ -117,11 +133,13 @@ Pre-push checklist:
 | `Type` | yes (literal `pure-data` or `risky`) | Mismatch with diff = reject |
 | `Rebased on origin/main` | yes (`merge-base HEAD origin/main == origin/main`) | `yes` claim while behind main = reject |
 | `Local gate` | no — typed claim | Audited post-hoc via `git log` |
+| `Interactive smoke (nixos-agent-testing)` | no — typed claim | Required for branching / multistep / GUI / daemon-poke. `N/A` only when the VM can't model the change (hardware-only). |
+| `Advisor review (advice-refine-test-loop)` | no — typed claim | Required before merge on medium/high-risk PRs. `N/A` only for small / contained risky changes. |
 | `feature-vm.nix modified` | **yes — diff cross-checked** | `no` claim with feature-vm.nix in diff = reject |
 | `Risky markers in diff` | no — typed claim | Forces enumeration |
 | `Behavioural evidence` | no — typed claim | "Build green" / "verified locally" do NOT count |
 
-**The `Behavioural evidence` field is what historically went hollow.** Quote the actual command + observed output that proves the runtime path works. Valid examples:
+**The `Behavioural evidence` field is what historically went hollow.** Quote the actual command + observed output that proves the runtime path works. **User-realistic = what the user does** (run, press, hit), not what activates around it. `systemctl is-active` proves the unit is loaded; it does not prove the feature works. Valid examples:
 
 - `nix run .#feature-vm; ssh -p 2222 jonathan@localhost 'systemctl is-active research-agent'; curl localhost:8080/health → 200`
 - `xvfb-run kitty; xdotool key ctrl+shift+c; xclip -o -selection clipboard → "foo" (no trailing \n)`

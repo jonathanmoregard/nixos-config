@@ -290,7 +290,30 @@ jobs:
         run: |
           test "${DETERMINATE_NIX_KVM:-}" = "1" || { echo "KVM not available"; exit 1; }
           ls -la /dev/kvm
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+      # Narinfo gate. `nix build` always materializes the output NAR
+      # even on a cachix hit (see NixOS/nix#3428 — no flag avoids this).
+      # For unchanged test drvs that means a multi-MB NAR download per
+      # lane on every PR. `nix path-info --store https://<cache>` queries
+      # narinfo only — no NAR pulled. On hit we skip the build step
+      # entirely: cachix only contains paths pushed by green CI runs, so
+      # existence is sufficient evidence the lane is green. On miss
+      # (cachix unreachable, narinfo absent, output never pushed) the
+      # gate emits hit=false and the build step runs as before.
+      - name: Cache gate (skip build on cachix hit)
+        id: gate
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: |
+          set -euo pipefail
+          out=$(nix eval --raw .#checks.x86_64-linux.vm-${{ matrix.lane }}.outPath)
+          echo "outPath=$out"
+          if nix path-info --store https://jonathanmoregard.cachix.org "$out" >/dev/null 2>&1; then
+            echo "cache hit — skipping build"
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache miss — build will run"
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.gate.outputs.hit != 'true'
         run: nix build .#checks.x86_64-linux.vm-${{ matrix.lane }} -L
 
   vm-graphical:
