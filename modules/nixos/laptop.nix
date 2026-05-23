@@ -71,18 +71,58 @@
     platform = "ipu6ep";
   };
 
-  # v4l2-relayd-ipu6 self-heal. Upstream `hardware.ipu6` ships
-  # StartLimitBurst=5 + default RestartSec=100ms; the gst pipeline
-  # tears down ~1s after preroll (v4l2loopback 0.15.3 buffer-queue
-  # regression, upstream PR #656 still open) and the sensor itself
-  # occasionally wedges on stop/start. The default settings burn
-  # through the burst in <1s and the unit lands in start-limit-hit
-  # → camera dead until manual `systemctl reset-failed`. Infinite
-  # retries + 5s backoff turns that into a brief blank that
-  # recovers on its own and gives the sensor time to settle.
+  # v4l2-relayd-ipu6 resilience + first-consumer warmup.
+  #
+  # Two failure modes are mitigated here, both rooted in the same
+  # upstream gap (`nixos/modules/hardware/video/webcam/ipu6.nix` does
+  # not wait for the IPU6 sensor stack — ivsc_csi / intel_ipu6_isys /
+  # sensor probe — to be ready before launching v4l2-relayd):
+  #
+  # 1. StartLimitBurst lockout. Upstream ships StartLimitBurst=5 +
+  #    default RestartSec=100ms; if the cold-boot race against the
+  #    sensor stack ever takes more than 5 restart attempts the unit
+  #    lands in start-limit-hit and the camera is dead until manual
+  #    `systemctl reset-failed`. Infinite retries + 5s backoff turns
+  #    that into a brief blank that recovers on its own and gives the
+  #    sensor time to settle.
+  #
+  # 2. First-consumer warmup. v4l2-relayd's gst pipeline (icamerasrc
+  #    → v4l2sink /dev/video50) defers full caps negotiation until
+  #    something opens the device. Chrome's V4L2 path opens "softly"
+  #    and gets an unnegotiated device → no frames → camera shows
+  #    blank in the page. Cheese / any GStreamer-backed client opens
+  #    "fully", triggers negotiation, and from that point everyone
+  #    (including Chrome) works. The ExecStartPost script below grabs
+  #    one frame from /dev/video50 so negotiation is forced before
+  #    any user app touches the device. It retries because the relay
+  #    may still be coming up when ExecStartPost first fires; it is
+  #    prefixed with `-` so a prolonged failure to prime never marks
+  #    the relay itself as failed (the relay is up regardless).
   systemd.services.v4l2-relayd-ipu6 = {
     unitConfig.StartLimitBurst = 0;
     serviceConfig.RestartSec = "5s";
+    serviceConfig.ExecStartPost = [
+      "-${pkgs.writeShellApplication {
+        name = "v4l2-relayd-ipu6-prime";
+        runtimeInputs = [ pkgs.v4l-utils pkgs.coreutils ];
+        text = ''
+          # Force gst caps negotiation by pulling one frame from
+          # /dev/video50. Retry up to ~15s in case the relay is still
+          # starting; exit 0 unconditionally so we never poison the
+          # main unit (prefix `-` in ExecStartPost already ignores
+          # exit codes, this is belt-and-braces).
+          for _ in $(seq 1 15); do
+            if timeout 1 v4l2-ctl -d /dev/video50 \
+                --stream-mmap --stream-count=1 \
+                --stream-to=/dev/null >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 0
+        '';
+      }}/bin/v4l2-relayd-ipu6-prime"
+    ];
   };
 
   # nix-ld — runs pre-built dynamically-linked Linux binaries (e.g. the
