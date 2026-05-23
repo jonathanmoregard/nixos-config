@@ -121,10 +121,16 @@ in {
   #                                      Includes DEEPGRAM_API_KEY,
   #                                      GOOGLE_API_KEY, SERVER_SECRET,
   #                                      and GOOGLE_APPLICATION_CREDENTIALS
-  #                                      pointing at /run/agenix/...
+  #                                      pointing at the runtime decrypt
+  #                                      path of the GCP credentials secret.
   #   jhanas-maxxing-gcp-credentials.age — raw Google Cloud service account
   #                                      JSON (consumed by Google TTS).
+  #
+  # Recipients scoped to [jonathanDellan dellan] (same pattern as
+  # research-agent-host-key) rather than allKeys: these contain billable
+  # GCP + Deepgram API keys, so no value in keeping the legacy nixos-vm
+  # host key or the pre-migration Mint laptop key in the trust set.
   # ---------------------------------------------------------------------
-  "jhanas-maxxing-env.age".publicKeys             = allKeys;
-  "jhanas-maxxing-gcp-credentials.age".publicKeys = allKeys;
+  "jhanas-maxxing-env.age".publicKeys             = [ jonathanDellan dellan ];
+  "jhanas-maxxing-gcp-credentials.age".publicKeys = [ jonathanDellan dellan ];
 }
