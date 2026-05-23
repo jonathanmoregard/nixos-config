@@ -1,0 +1,68 @@
+# .github/workflows/auto-update-prs.yml
+#
+# After every merge to main, update *at most one* open auto-merge PR
+# whose branch is behind main, so its CI re-runs against the now-
+# current base. If several PRs are behind, the lowest PR number wins
+# (rough FIFO); the next merge to main picks up the next one. Limiting
+# to one per run keeps the post-merge CI fan-out bounded — without it,
+# four behind auto-merge PRs would all re-run simultaneously and
+# quadruple the runner load.
+#
+# Triggers on push: main only — never on pull_request — so there's
+# no fork exposure to gate against. The `if: github.repository == ...`
+# predicate is belt-and-suspenders against the workflow running from
+# any clone of this code.
+#
+# `gh pr update-branch` returns non-zero on merge conflict; logged as
+# non-fatal so the workflow still exits 0 (next merge to main will
+# pick a different PR if this one stays blocked).
+
+name: auto-update-prs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: auto-update-prs
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.repository == 'jonathanmoregard/nixos-config'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update one behind auto-merge PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # mergeStateStatus == BEHIND is exactly the condition the
+          # "Update branch" button watches for. CLEAN / BLOCKED / DIRTY /
+          # UNSTABLE all mean don't bother — auto-merge handles CLEAN
+          # itself, DIRTY needs human conflict resolution, BLOCKED /
+          # UNSTABLE need CI to settle (or a force-rebase, out of scope).
+          target=$(gh pr list \
+            --base main \
+            --state open \
+            --json number,autoMergeRequest,mergeStateStatus \
+            --jq '[.[] | select(.autoMergeRequest != null and .mergeStateStatus == "BEHIND")] | sort_by(.number) | .[0].number // empty')
+
+          if [ -z "${target:-}" ]; then
+            echo "no behind auto-merge PR to update"
+            exit 0
+          fi
+
+          echo "updating PR #$target (lowest behind auto-merge PR)"
+          if gh pr update-branch "$target" 2>&1; then
+            echo "[ok] PR #$target: branch updated"
+          else
+            echo "[skip] PR #$target: merge conflict or transient gh error (non-fatal)"
+          fi
