@@ -108,4 +108,23 @@ in {
   # not touch it. Deliberate.
   # ---------------------------------------------------------------------
   "research-agent-host-key.age".publicKeys = [ jonathanDellan dellan ];
+
+  # ---------------------------------------------------------------------
+  # jhanas-maxxing — meditation app project secrets.
+  #
+  # Consumed by the Pipecat voice AI server at
+  # ~/Repos/jhana/jhanas-maxxing-server/, which runs as user `jonathan`
+  # (not a systemd unit). Server's config.py reads via python-dotenv,
+  # so file CONTENTS expected at decrypt time:
+  #
+  #   jhanas-maxxing-env.age          — multi-line KEY=VALUE (.env format).
+  #                                      Includes DEEPGRAM_API_KEY,
+  #                                      GOOGLE_API_KEY, SERVER_SECRET,
+  #                                      and GOOGLE_APPLICATION_CREDENTIALS
+  #                                      pointing at /run/agenix/...
+  #   jhanas-maxxing-gcp-credentials.age — raw Google Cloud service account
+  #                                      JSON (consumed by Google TTS).
+  # ---------------------------------------------------------------------
+  "jhanas-maxxing-env.age".publicKeys             = allKeys;
+  "jhanas-maxxing-gcp-credentials.age".publicKeys = allKeys;
 }

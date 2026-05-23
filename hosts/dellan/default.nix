@@ -92,6 +92,25 @@
     mode = "0400";
   };
 
+  # jhanas-maxxing voice AI server secrets. Consumed by the Pipecat server
+  # running as user `jonathan` (not a systemd unit). config.py reads
+  # /run/agenix/jhanas-maxxing-env via python-dotenv. The .env points
+  # GOOGLE_APPLICATION_CREDENTIALS at /run/agenix/jhanas-maxxing-gcp-credentials,
+  # so both secrets need to land in the same default agenix runtime dir
+  # for the relative path inside the .env to resolve.
+  age.secrets.jhanas-maxxing-env = {
+    file = ../../secrets/jhanas-maxxing-env.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.jhanas-maxxing-gcp-credentials = {
+    file = ../../secrets/jhanas-maxxing-gcp-credentials.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   # ---------------------------------------------------------------------
   # research-agent microvm — persisted state.
   #
