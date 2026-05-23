@@ -27,5 +27,16 @@ sudo mount -o loop,noatime /mnt/nix.img /nix
 # canonical victim ('Cannot open: Permission denied' → tar exits 2 →
 # 'Could not save the new cache' → /nix/store never persists between
 # runs). Removing the dir is cleaner than chmod-ing it readable.
-sudo rmdir /nix/lost+found 2>/dev/null || true
+#
+# If rmdir fails (a future runner image pre-populates the dir, or
+# mke2fs starts respecting -T no-lost+found), surface the failure
+# loudly so the cache regression is grep-able in CI logs. Don't fail
+# the step — the breakage is a perf bug, not a correctness one — but
+# the warning shows up in the GitHub UI annotation list.
+if ! sudo rmdir /nix/lost+found 2>/dev/null; then
+  # GHA workflow-command parser only reads STDOUT for ::warning::
+  # annotations. Stderr would be logged but not annotate the run.
+  echo "::warning::could not rmdir /nix/lost+found; cache-nix-action tar may fail"
+  sudo ls -la /nix/lost+found >&2 || true
+fi
 df -h /nix
