@@ -116,9 +116,9 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       # No cache-nix-action here on purpose. flake-check is eval-only
       # (`--no-build`); its added /nix/store would be small relative to
-      # build-dellan's ~7 GB snapshot, and this job has no /mnt loopback
-      # so restoring the shared snapshot to the runner's root disk would
-      # likely ENOSPC.
+      # build-dellan's snapshot (≤8 GB uncompressed per gc-max), and
+      # this job has no /mnt loopback so restoring the shared snapshot
+      # to the runner's root disk would likely ENOSPC.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix flake check --no-build --all-systems
 
@@ -159,13 +159,21 @@ jobs:
       # closest lock-prefix and only fetch the delta. Total miss → fall
       # back to the runner-os prefix.
       #
-      # Cache budget: GHA caps repos at 10 GB compressed. NixOS store is
-      # mostly pre-compressed (elf, gz, xz), so tar+zstd only hits
-      # ~1.2-1.3×. gc-max-store-size-linux: 7 GB → ~5.5 GB compressed,
-      # leaving headroom against the cap. dellan closure (~8 GB) doesn't
-      # all fit but the toplevel itself stays gc-live; what gets evicted
-      # are intermediate build outputs the next run can re-download
-      # cheaply.
+      # Cache budget: GHA caps repos at 10 GB compressed. NixOS store
+      # is mostly pre-compressed (elf, gz, xz), so tar+zstd only hits
+      # ~1.2-1.3×. gc-max-store-size-linux: 8G (binary, 8.59 GB decimal)
+      # → ~6.5 GB compressed, comfortable under the 10 GB cap. The cap
+      # is sized to hold the dellan toplevel + recent intermediates;
+      # actual closure size is whatever the build produces (re-tune by
+      # reading `nix path-info -sSh /run/current-system` after a fresh
+      # build if the cache starts thrashing).
+      #
+      # The cap matters because the action's post step unconditionally
+      # calls `nix store gc --max` on cold save (saveImpl.ts:102), and
+      # without a gcroot the just-built --no-link toplevel is
+      # unreachable and would be deleted before the tarball is written.
+      # The `nix build --out-link` below registers an indirect gcroot
+      # under /nix/var/nix/gcroots/auto/ so the toplevel survives gc.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
@@ -173,15 +181,19 @@ jobs:
           restore-prefixes-first-match: |
             nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
             nix-store-${{ runner.os }}-
-          gc-max-store-size-linux: 7000000000
+          # `8G` is parsed as binary (8 * 2^30 bytes ≈ 8.59 GB decimal)
+          # by the action's parseNixGcMax — see src/utils/inputs.ts.
+          gc-max-store-size-linux: 8G
           purge: true
+          # Purge other prefix-matched caches in the same ref (action
+          # scopes purge to the current branch / PR merge ref by
+          # default — see src/utils/purge.ts:84-87, anyRef=false). Keeps
+          # the per-ref cache count bounded; primary-key:never preserves
+          # the snapshot we just restored from.
           purge-prefixes: nix-store-${{ runner.os }}-
           # Purge prefix-matched caches not accessed in 7 days (P7D in
           # ISO 8601 duration — the action also accepts a bare integer
-          # but that's parsed as SECONDS, not hours/days). The original
-          # `purge-created-max-age-seconds: 604800` config was silently
-          # ignored ("Unexpected input(s)") — the v7 API is
-          # `purge-last-accessed` and `purge-created`.
+          # but that's parsed as SECONDS, not hours/days).
           purge-last-accessed: P7D
           purge-primary-key: never
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
@@ -189,10 +201,26 @@ jobs:
         with:
           name: jonathanmoregard
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      # Pin the toplevel as a gcroot so cache-nix-action's post-step
+      # `nix store gc --max` can't delete it before tarring. `--no-link`
+      # (the previous flag) left it unreachable; gc trimmed it; cache
+      # snapshots held only intermediates; every PR re-fetched the
+      # toplevel from cachix.
+      #
+      # `--out-link "$GITHUB_WORKSPACE/result-dellan"` registers an
+      # indirect gcroot under /nix/var/nix/gcroots/auto/ — the
+      # workspace dir is owned by the runner user, which is what nix's
+      # addPermRoot requires for the auto-gcroot registration to fire.
+      # Explicit `nix-store --add-root` is belt-and-braces in case the
+      # auto-registration path ever changes.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: |
+          set -euo pipefail
           nix build .#nixosConfigurations.dellan.config.system.build.toplevel \
-            --no-link --print-build-logs --keep-going
+            --out-link "$GITHUB_WORKSPACE/result-dellan" \
+            --print-build-logs --keep-going
+          nix-store --add-root "$GITHUB_WORKSPACE/result-dellan" -r \
+            "$(readlink -f "$GITHUB_WORKSPACE/result-dellan")" >/dev/null
 
   vm-minimal:
     # Matrix fan-out: one lane per feature check derivation. Each lane
@@ -232,7 +260,7 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
       # Restore the shared /nix/store snapshot that build-dellan saved.
       # save: false — only build-dellan owns the snapshot. 7 lanes saving
-      # in parallel would race for the same cache key, and 7 × ~7 GB
+      # in parallel would race for the same cache key, and 7 × ~8 GB
       # blows the GHA 10 GB cap. Worst case (build-dellan's save hasn't
       # propagated) the restore-prefixes fall back to the previous run's
       # snapshot — still faster than cold.
@@ -262,7 +290,30 @@ jobs:
         run: |
           test "${DETERMINATE_NIX_KVM:-}" = "1" || { echo "KVM not available"; exit 1; }
           ls -la /dev/kvm
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+      # Narinfo gate. `nix build` always materializes the output NAR
+      # even on a cachix hit (see NixOS/nix#3428 — no flag avoids this).
+      # For unchanged test drvs that means a multi-MB NAR download per
+      # lane on every PR. `nix path-info --store https://<cache>` queries
+      # narinfo only — no NAR pulled. On hit we skip the build step
+      # entirely: cachix only contains paths pushed by green CI runs, so
+      # existence is sufficient evidence the lane is green. On miss
+      # (cachix unreachable, narinfo absent, output never pushed) the
+      # gate emits hit=false and the build step runs as before.
+      - name: Cache gate (skip build on cachix hit)
+        id: gate
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: |
+          set -euo pipefail
+          out=$(nix eval --raw .#checks.x86_64-linux.vm-${{ matrix.lane }}.outPath)
+          echo "outPath=$out"
+          if nix path-info --store https://jonathanmoregard.cachix.org "$out" >/dev/null 2>&1; then
+            echo "cache hit — skipping build"
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache miss — build will run"
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.gate.outputs.hit != 'true'
         run: nix build .#checks.x86_64-linux.vm-${{ matrix.lane }} -L
 
   vm-graphical:

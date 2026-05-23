@@ -201,17 +201,28 @@ let
         return None
 
 
-    def maybe_resume_claude(cmd, cwd, session_id=None):
+    def maybe_resume_claude(cmd, cwd, session_id, claimed_sids):
         """If cmd is the claude-code CLI, rewrite to resume the correct
-        session. Prefers the per-pane session_id captured at snapshot time
-        (TSV populated by the SessionStart hook claude-kitty-pane-record,
-        keyed by kitty window id and joined in by kitty-session-enrich);
-        falls back to latest-by-mtime for the cwd when no per-pane id is
-        available, OR when the named session's jsonl no longer exists
-        (user pruned it between snapshot and restore)."""
-        if not cmd:
-            return cmd
-        if os.path.basename(cmd[0]) != "claude":
+        session. Prefers the per-pane session_id captured at snapshot
+        time (TSV populated by the SessionStart hook
+        claude-kitty-pane-record, keyed by kitty window id and joined in
+        by kitty-session-enrich).
+
+        Fallback is latest-by-mtime in the cwd's project dir, BUT skips
+        any sid already claimed by a sibling pane in this restore. Two
+        same-cwd panes both losing their per-pane sid (because their
+        SessionStart hook hadn't fired before the snapshot tick that
+        captured them) is the canonical wrong-collide scenario this
+        guard prevents — one pane took the snapshot sid, the other one
+        falling back to latest-by-mtime would otherwise pick that same
+        sid (latest === sibling's freshly-touched jsonl). When every
+        candidate is claimed, return cmd unchanged → claude launches
+        fresh rather than wrong-resume. Losing one pane's resume is
+        recoverable; merging two panes onto one session corrupts both.
+
+        Mutates `claimed_sids` with the sid this pane ends up using.
+        """
+        if not cmd or os.path.basename(cmd[0]) != "claude":
             return cmd
         proj_dir = None
         if cwd:
@@ -220,6 +231,7 @@ let
         if session_id and proj_dir and os.path.isfile(
             os.path.join(proj_dir, f"{session_id}.jsonl")
         ):
+            claimed_sids.add(session_id)
             return [cmd[0], "--resume", session_id]
         if not proj_dir or not os.path.isdir(proj_dir):
             return cmd
@@ -231,8 +243,13 @@ let
         if not sessions:
             return cmd
         sessions.sort(key=lambda t: t[1], reverse=True)
-        latest = sessions[0][0].removesuffix(".jsonl")
-        return [cmd[0], "--resume", latest]
+        for fname, _mtime in sessions:
+            candidate = fname.removesuffix(".jsonl")
+            if candidate in claimed_sids:
+                continue
+            claimed_sids.add(candidate)
+            return [cmd[0], "--resume", candidate]
+        return cmd
 
 
     STUB_PATH = "/tmp/kitty-stub-session"
@@ -248,6 +265,16 @@ let
             return []
         with open(snap_path) as fh:
             snap = json.load(fh)
+        # Seed claimed_sids with sids explicitly attached in the snapshot
+        # before resolving any fallback, so an un-enriched same-cwd pane
+        # can't grab a sibling's sid via latest-by-mtime.
+        claimed_sids = set()
+        for osw in snap:
+            for tab in osw.get("tabs", []):
+                for win in tab.get("windows", []):
+                    sid = win.get("claude_session_id")
+                    if sid:
+                        claimed_sids.add(sid)
         panes = []
         for osw in snap:
             for tab in osw.get("tabs", []):
@@ -261,7 +288,7 @@ let
                         continue
                     cwd = win.get("cwd")
                     sid = win.get("claude_session_id")
-                    cmd = maybe_resume_claude(cmd, cwd, sid)
+                    cmd = maybe_resume_claude(cmd, cwd, sid, claimed_sids)
                     panes.append({
                         "cwd": cwd,
                         "title": win.get("title", ""),
@@ -292,6 +319,14 @@ let
     def main():
         if "--emit-stub" in sys.argv:
             emit_stub()
+            return
+
+        if "--dump-panes" in sys.argv:
+            # Test-only: emit resolved panes JSON so assertions can
+            # inspect maybe_resume_claude's per-pane outcome (including
+            # the same-cwd-collision-avoidance fallback) without having
+            # to spin up a real kitty.
+            json.dump(load_panes(), sys.stdout)
             return
 
         panes = load_panes()
@@ -353,8 +388,13 @@ let
       # this fix was discovered through).
       #
       # CLAUDE_CODE_ENTRYPOINT="cli" = main interactive session.
-      # "sdk-cli" / future values = subprocess; skip.
-      [ "''${CLAUDE_CODE_ENTRYPOINT:-cli}" = "cli" ] || exit 0
+      # "sdk-cli" / future values = subprocess; skip. Use the bare-form
+      # default (''${VAR-cli} not ''${VAR:-cli}) so an explicitly empty
+      # value ("") fails the gate instead of falling through to "cli":
+      # empty string is what a misconfigured shell launcher injects,
+      # and we want that to be loud (no TSV write), not silently
+      # treated as the main interactive session.
+      [ "''${CLAUDE_CODE_ENTRYPOINT-cli}" = "cli" ] || exit 0
 
       # Outside kitty → nothing to record.
       [ -n "''${KITTY_WINDOW_ID:-}" ] || exit 0
@@ -411,6 +451,16 @@ let
   # Pruning: TSV entries whose window_id is not in the current live set
   # are removed on every enrich run, keeping the TSV bounded by current
   # pane count (≤ a few hundred lines in pathological cases).
+  #
+  # Exit codes:
+  #   0  — enriched JSON written, safe to commit as new snapshot.
+  #   2  — collision risk: at least one cwd has multiple claude panes
+  #         and at least one of them lacks a TSV row (SessionStart
+  #         hook hadn't fired yet when the snapshot tick captured it).
+  #         The save wrapper treats this as "preserve the prior good
+  #         snapshot.json"; persisting the partial would let the
+  #         un-enriched pane fall back to latest-by-mtime on restore
+  #         and collide with the sibling's freshly-touched jsonl.
   kittySessionEnrich = pkgs.writers.writePython3Bin "kitty-session-enrich" {} ''
     import fcntl
     import json
@@ -514,8 +564,17 @@ let
 
 
     def enrich(data):
+        """Annotate each claude pane with its session id. Returns
+        (data, collision_risk) where collision_risk is True when the
+        snapshot is partial in a way that would collapse same-cwd
+        sibling panes on restore — i.e. at least one cwd has multiple
+        claude panes and at least one of them lacks a TSV entry. The
+        caller uses this to decide whether to overwrite snapshot.json
+        or preserve the prior good one.
+        """
         tsv = load_tsv()
         live = set()
+        claude_panes_by_cwd = {}
         for osw in data:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
@@ -533,8 +592,14 @@ let
                     sid = tsv.get(wid) if isinstance(wid, int) else None
                     if sid:
                         win["claude_session_id"] = sid
+                    cwd = win.get("cwd") or ""
+                    claude_panes_by_cwd.setdefault(cwd, []).append(sid)
         prune_tsv(live)
-        return data
+        collision_risk = any(
+            len(sids) > 1 and any(s is None for s in sids)
+            for sids in claude_panes_by_cwd.values()
+        )
+        return data, collision_risk
 
 
     def main():
@@ -542,7 +607,12 @@ let
             data = json.load(sys.stdin)
         except json.JSONDecodeError:
             sys.exit(0)
-        json.dump(enrich(data), sys.stdout)
+        enriched, collision_risk = enrich(data)
+        json.dump(enriched, sys.stdout)
+        # Exit 2 (distinct from 1 = generic error) signals "snapshot
+        # would collide on restore; caller should preserve prior good".
+        if collision_risk:
+            sys.exit(2)
 
 
     if __name__ == "__main__":
@@ -581,16 +651,25 @@ let
       [ -z "$json" ] && exit 0
 
       # Enrich with per-pane Claude session IDs before persisting.
-      # Failure (e.g. enricher crash) falls back to raw json — better
-      # to lose the per-pane id and use latest-by-mtime than to skip
-      # the snapshot entirely.
-      if ! printf '%s\n' "$json" | kitty-session-enrich > "$dir/snapshot.json.tmp"; then
-        printf '%s\n' "$json" > "$dir/snapshot.json.tmp"
+      # Exit codes from kitty-session-enrich:
+      #   0  — fully enriched, snapshot safe to commit
+      #   2  — partial / collision-risk (multiple same-cwd claude panes
+      #        and at least one lacks a TSV row); the un-enriched pane
+      #        would fall back to latest-by-mtime on restore and collide
+      #        with a sibling. Preserve the prior good snapshot.json
+      #        instead of overwriting it with the dangerous partial.
+      #   any other non-zero — enricher crashed; preserve prior good.
+      set +e
+      printf '%s\n' "$json" | kitty-session-enrich > "$dir/snapshot.json.tmp"
+      enrich_rc=$?
+      set -e
+      if [ "$enrich_rc" -eq 0 ]; then
+        mv "$dir/snapshot.json.tmp" "$dir/snapshot.json"
+        kitty-session-convert < "$dir/snapshot.json" > "$dir/last.session.tmp"
+        mv "$dir/last.session.tmp" "$dir/last.session"
+      else
+        rm -f "$dir/snapshot.json.tmp"
       fi
-      mv "$dir/snapshot.json.tmp" "$dir/snapshot.json"
-
-      kitty-session-convert < "$dir/snapshot.json" > "$dir/last.session.tmp"
-      mv "$dir/last.session.tmp" "$dir/last.session"
     '';
   };
 
@@ -618,15 +697,16 @@ let
       if [ "\''${1:-}" = "@" ]; then
         exec ${pkgs.kitty}/bin/kitty "\$@"
       fi
-      session="\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/last.session"
       # Detect a running kitty by probing each socket — a kitty crash can
       # leave stale /tmp/kitty.sock-PID files behind that would otherwise
       # block restore on next launch. pgrep is unsafe here because the
       # kernel sets comm to argv[0] which is "kitty" for this wrapper too.
       shopt -s nullglob
       live=0
+      sockets_seen=0
       for f in /tmp/kitty.sock-*; do
         [ -S "\$f" ] || continue
+        sockets_seen=1
         if ${pkgs.kitty}/bin/kitty @ --to "unix:\$f" ls >/dev/null 2>&1; then
           live=1
           break
@@ -639,6 +719,20 @@ let
       # 2x2 grid pattern), then exec plain kitty. The restore script
       # waits for kitty's socket to appear before issuing its commands.
       snap="\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/snapshot.json"
+      # Drop the TSV before the new kitty starts: kitty assigns window
+      # ids starting at 1 per instance, so the old kitty's wid→sid
+      # rows would otherwise alias onto fresh panes in the window
+      # between pane creation and SessionStart hook firing, and the
+      # next snapshot tick would bake a stale sid into the new
+      # snapshot. Guarded on sockets_seen=0 (no socket files existed
+      # at all) — not on live=0 — so a transiently-unresponsive live
+      # kitty whose @ ls call failed doesn't make us nuke its TSV
+      # underfoot. SessionStart re-populates correct rows within
+      # seconds; meanwhile the partial-snapshot guard in
+      # kitty-session-enrich keeps the prior good snapshot in place.
+      if [ "\$sockets_seen" -eq 0 ]; then
+        rm -f "\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/pane-sessions.tsv"
+      fi
       if [ -s "\$snap" ] && [ "\$live" -eq 0 ]; then
         # Write a stub session file containing just pane 0; this makes
         # kitty start directly into our restored topology with no extra
