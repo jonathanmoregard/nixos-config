@@ -235,6 +235,16 @@ jobs:
     steps:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Pin to head SHA + explicit token. `gh run rerun` reuses the
+          # original event payload, but GitHub's `refs/pull/<N>/merge`
+          # virtual ref can lag-behind on rerun → actions/checkout
+          # falls through to its credential-prompt path and dies with
+          # "could not read Username for github.com: terminal prompts
+          # disabled". head.sha is always resolvable and bypasses the
+          # merge-ref propagation race.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Free root disk (dotnet/ghc/android/codeql)
         if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/free-root-disk.sh
