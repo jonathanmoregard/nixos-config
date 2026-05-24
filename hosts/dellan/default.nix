@@ -12,6 +12,7 @@
     ../../modules/nixos/desktop.nix
     ../../modules/nixos/laptop.nix
     ../../modules/nixos/tailscale.nix
+    ../../modules/nixos/kindle.nix
 
     # CI/CD workflow modules. CI itself runs on GitHub-hosted runners
     # (ubuntu-latest); see .github/workflows/. The modules below cover

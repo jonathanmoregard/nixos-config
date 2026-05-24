@@ -27,6 +27,12 @@ permissions:
   contents: write
   pull-requests: write
 
+# Same NIX_CONFIG belt-and-braces as ci.yml — pre-empts any later
+# NIX_USER_CONF_FILES shadowing of /etc/nix/nix.conf.
+env:
+  NIX_CONFIG: |
+    access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
 concurrency:
   group: update-beeper
   cancel-in-progress: true
@@ -42,6 +48,12 @@ jobs:
           fetch-depth: 0
 
       - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+        with:
+          # Same belt-and-braces as ci.yml — pin access-tokens explicitly
+          # so Nix's flake input fetcher always sees the workflow token.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
       - name: Bump beeper if upstream advanced
         run: nix run .#update-beeper
