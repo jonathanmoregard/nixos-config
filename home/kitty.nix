@@ -937,12 +937,14 @@ in
     map ctrl+w close_window
     map ctrl+up neighboring_window up
     map ctrl+down neighboring_window down
-    # Add new pane via the 2x2-grid pattern (kitty-pane-add).
+    # Plain vsplit of the focused pane — no grid logic, just side-by-side.
     # Use literal `<` (ASCII 0x3C, matches X11 keysym at runtime) rather
     # than `less`: kitty's `dlopen("libxkbcommon.so")` fails on this
     # NixOS build, so named-keysym binds like `ctrl+less` parse-error
     # ("unknown key, ignoring") at config-load and never fire.
-    map ctrl+< launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
+    map ctrl+< launch --location=vsplit --cwd=current
+    # Add new pane via the 2x2-grid pattern (kitty-pane-add).
+    map ctrl+n launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
     # New tab inheriting cwd of current window.
     map ctrl+t new_tab_with_cwd
 

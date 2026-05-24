@@ -37,6 +37,12 @@
     # Feature VM overrides — no-op for prod toplevel, only activates
     # under `config.system.build.vm`. See module header for usage.
     ../../modules/nixos/feature-vm.nix
+
+    # `substack-url-tool` + `tts-tool` — Substack-article-to-MP3 CLI
+    # pipeline. Both live in standalone flakes; this module installs
+    # them and wraps tts-tool to inject FISH_AUDIO_API_KEY_FILE from
+    # the agenix secret at runtime.
+    ../../modules/nixos/listen-tools.nix
   ];
 
   # ---------------------------------------------------------------------

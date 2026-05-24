@@ -65,6 +65,7 @@ gh pr view <PR_NUMBER>   # confirm merged
 - `git push origin main` directly — branch protection rejects (no direct push).
 - `sudo nixos-rebuild switch` casually — bypasses the gate stack.
 - Edit `/etc/nixos` directly — root-owned + auto-deploy will overwrite.
+- **`git rebase` to sync a PR branch with `main`.** Use `git merge origin/main` instead. Rebase rewrites the published branch's history and then requires `git push --force-with-lease` to publish — `--force*` is denied at the safe-bash MCP layer, so the agent gets stuck mid-sync. Merge commits the conflict resolution as a normal merge commit; `git push` (no flags) advances the ref cleanly. The merge-commit noise in `git log` is a feature, not a bug — it records when the branch caught up.
 - **Split related work into stacked PRs.** One logical change = one PR,
   even if the diff grows. Stacks couple merge order to the CI risk-
   classifier: a "low risk" child PR can auto-merge into its parent
