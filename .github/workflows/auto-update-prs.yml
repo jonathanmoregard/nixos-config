@@ -40,8 +40,8 @@
 #    triggers for events created by GITHUB_TOKEN — so update-branch
 #    via GITHUB_TOKEN moves the head SHA but never re-fires the
 #    PR's CI workflows, leaving the PR stuck. An App installation
-#    token is a separate actor; the `pull_request: synchronize`
-#    event it generates triggers CI normally.
+#    token is a separate actor; the synchronize event it generates
+#    triggers CI normally.
 #
 #    Required secrets (set at repo level):
 #      AUTO_UPDATE_APP_ID          — the GitHub App's numeric ID
