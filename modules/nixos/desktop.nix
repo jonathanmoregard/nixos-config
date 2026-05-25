@@ -36,6 +36,13 @@
   # display-manager-coupled.
   security.pam.services.lightdm.enableGnomeKeyring = true;
 
+  # gpg-agent: socket-activated PGP agent. pinentry-gtk2 matches Cinnamon's GTK
+  # stack so seahorse + CLI gpg share the same passphrase prompt UX.
+  programs.gnupg.agent = {
+    enable = true;
+    pinentryPackage = pkgs.pinentry-gtk2;
+  };
+
   # cron daemon — required for the home-manager-installed user crontab
   # in home/jonathan-linux.nix. Without this, `crontab` is missing from
   # PATH and the installCrontab activation silently skips.
