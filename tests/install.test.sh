@@ -63,9 +63,9 @@ cat > "$FAKE/hosts/dellan/default.nix" <<'EOF'
 {
   imports = [];
 
-  age.secrets.deploy-ssh-key.file        = ../../secrets/deploy-ssh-key.age;
-  age.secrets.github-webhook-secret.file = ../../secrets/github-webhook-secret.age;
-  age.secrets.gh-janitor-token.file      = ../../secrets/gh-janitor-token.age;
+  age.secrets.deploy-ssh-key.rekeyFile        = ../../secrets/deploy-ssh-key.age;
+  age.secrets.github-webhook-secret.rekeyFile = ../../secrets/github-webhook-secret.age;
+  age.secrets.gh-janitor-token.rekeyFile      = ../../secrets/gh-janitor-token.age;
 
   services.githubWebhook = {
     enable = true;

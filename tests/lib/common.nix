@@ -25,6 +25,7 @@ let
   node = { config, ... }: {
     imports = [
       inputs.agenix.nixosModules.default
+      inputs.agenix-rekey.nixosModules.default
       inputs.home-manager.nixosModules.home-manager
       inputs.microvm.nixosModules.host
       ../../hosts/dellan/default.nix
