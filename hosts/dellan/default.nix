@@ -8,6 +8,7 @@
     # only depends on what it actually exercises).
     ../../profiles/base.nix
     ../../profiles/keyring.nix
+    ../../modules/nixos/agenix-rekey-common.nix
 
     ../../modules/nixos/desktop.nix
     ../../modules/nixos/laptop.nix
@@ -46,12 +47,23 @@
   ];
 
   # ---------------------------------------------------------------------
-  # CI/CD workflow — agenix secret declarations.
+  # agenix-rekey per-host config.
+  # hostPubkey = dellan's SSH ed25519 host key. Each .age secret's source
+  # is encrypted to the master identity (see modules/nixos/agenix-rekey-common.nix);
+  # `nix run .#agenix -- rekey` produces a copy in secrets/rekeyed/dellan/
+  # encrypted to this hostPubkey, which is what the running system decrypts
+  # against /etc/ssh/ssh_host_ed25519_key.
+  # ---------------------------------------------------------------------
+  age.rekey.hostPubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJNvaYqBU7k/iTKPHcfVGYz5WJNVWnf0t26SX6Y7SZ0e root@dellan";
+  age.rekey.localStorageDir = ../../secrets/rekeyed/dellan;
+
+  # ---------------------------------------------------------------------
+  # CI/CD workflow — agenix secret declarations (now rekey-managed).
   # ---------------------------------------------------------------------
 
-  age.secrets.deploy-ssh-key.file        = ../../secrets/deploy-ssh-key.age;
-  age.secrets.github-webhook-secret.file = ../../secrets/github-webhook-secret.age;
-  age.secrets.gh-janitor-token.file      = ../../secrets/gh-janitor-token.age;
+  age.secrets.deploy-ssh-key.rekeyFile        = ../../secrets/deploy-ssh-key.age;
+  age.secrets.github-webhook-secret.rekeyFile = ../../secrets/github-webhook-secret.age;
+  age.secrets.gh-janitor-token.rekeyFile      = ../../secrets/gh-janitor-token.age;
 
   # LLM provider + research-agent secrets consumed by claude-cl-sync.service
   # and the research-agent-mcp wrapper. Both read raw key values with
@@ -59,31 +71,31 @@
   # contain the raw key only (no `KEY=` prefix). owner=jonathan + mode=0400
   # because the consumers run as the user, not root.
   age.secrets.anthropic-api-key = {
-    file = ../../secrets/anthropic-api-key.age;
+    rekeyFile = ../../secrets/anthropic-api-key.age;
     owner = "jonathan";
     group = "users";
     mode = "0400";
   };
   age.secrets.openai-api-key = {
-    file = ../../secrets/openai-api-key.age;
+    rekeyFile = ../../secrets/openai-api-key.age;
     owner = "jonathan";
     group = "users";
     mode = "0400";
   };
   age.secrets.exa-api-key = {
-    file = ../../secrets/exa-api-key.age;
+    rekeyFile = ../../secrets/exa-api-key.age;
     owner = "jonathan";
     group = "users";
     mode = "0400";
   };
   age.secrets.tavily-api-key = {
-    file = ../../secrets/tavily-api-key.age;
+    rekeyFile = ../../secrets/tavily-api-key.age;
     owner = "jonathan";
     group = "users";
     mode = "0400";
   };
   age.secrets.claude-token = {
-    file = ../../secrets/claude-token.age;
+    rekeyFile = ../../secrets/claude-token.age;
     owner = "jonathan";
     group = "users";
     mode = "0400";
@@ -93,7 +105,24 @@
   # research-agent microvm. Matching public key is plaintext inside
   # modules/nixos/research-agent-microvm.nix as authorized_keys.
   age.secrets.research-agent-host-key = {
-    file = ../../secrets/research-agent-host-key.age;
+    rekeyFile = ../../secrets/research-agent-host-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
+  # jhanas-maxxing voice AI server secrets (Pipecat). User-space server
+  # reads /run/agenix/jhanas-maxxing-env via python-dotenv; the env file's
+  # GOOGLE_APPLICATION_CREDENTIALS line points at the GCP credentials secret
+  # below in the same agenix runtime directory.
+  age.secrets.jhanas-maxxing-env = {
+    rekeyFile = ../../secrets/jhanas-maxxing-env.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.jhanas-maxxing-gcp-credentials = {
+    rekeyFile = ../../secrets/jhanas-maxxing-gcp-credentials.age;
     owner = "jonathan";
     group = "users";
     mode = "0400";

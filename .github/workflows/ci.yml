@@ -171,6 +171,24 @@ jobs:
       # build-dellan's snapshot (≤8 GB uncompressed per gc-max), and
       # this job has no /mnt loopback so restoring the shared snapshot
       # to the runner's root disk would likely ENOSPC.
+      # agenix-rekey's NixOS module references the per-host rekeyed dir
+      # via `builtins.path { path = ../../secrets/rekeyed/<host>; }`,
+      # producing a deterministic store path. Under `--no-build`,
+      # Determinate Nix doesn't materialise that input source on a
+      # fresh runner — the downstream nixos-system derivation eval then
+      # hits `error: path '<hash>-<host>' is not valid` when computing
+      # drvPath. Eagerly registering each rekeyed-dir produces the same
+      # store hash builtins.path will compute, so the assertion
+      # short-circuits to "path exists" and the check passes without
+      # building anything else.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: |
+          shopt -s nullglob
+          for dir in secrets/rekeyed/*/; do
+            # Strip trailing slash — `nix store add-path` derives the
+            # store-name from basename, and "dir/" yields an empty name.
+            nix store add-path "${dir%/}"
+          done
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix flake check --no-build --all-systems
 

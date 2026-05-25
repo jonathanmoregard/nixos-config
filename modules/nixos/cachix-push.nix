@@ -83,7 +83,7 @@ let
   '';
 in
 {
-  age.secrets.cachix-auth-token.file = ../../secrets/cachix-auth-token.age;
+  age.secrets.cachix-auth-token.rekeyFile = ../../secrets/cachix-auth-token.age;
 
   nix.settings.post-build-hook = "${pushHook}";
 }
