@@ -21,11 +21,27 @@ df -h /
 
 sudo rm -rf \
   /usr/share/dotnet \
+  /usr/share/swift \
   /opt/ghc \
   /usr/local/.ghcup \
   /usr/local/lib/android \
+  /usr/local/share/boost \
+  /usr/local/share/powershell \
   /opt/hostedtoolcache/CodeQL \
+  /opt/hostedtoolcache/PyPy \
+  /opt/hostedtoolcache/Ruby \
+  /opt/hostedtoolcache/go \
+  /opt/microsoft \
+  /opt/google \
+  /var/cache/apt/archives \
+  /var/lib/apt/lists \
   || true
+
+# Stop docker daemon + nuke its overlay store (~3-5 GB on hosted runners,
+# pre-pulled images we never use). `sudo` because the daemon socket and
+# /var/lib/docker are root-only.
+sudo systemctl stop docker.service docker.socket 2>/dev/null || true
+sudo rm -rf /var/lib/docker || true
 
 echo "after:"
 df -h /
