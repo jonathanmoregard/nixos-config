@@ -17,7 +17,19 @@ if mountpoint -q /nix 2>/dev/null; then
   exit 0
 fi
 
-sudo fallocate -l 60G /mnt/nix.img
+# Sparse file via truncate, not fallocate. `fallocate -l 60G` reserves
+# the full 60GB on /mnt's underlying filesystem upfront — fine on
+# ubuntu-latest images where /mnt = /dev/sdb1 with ~70GB free, but
+# some image rollouts have collapsed /mnt onto /dev/root, leaving
+# only ~47GB free after free-root-disk.sh. fallocate then ENOSPCs
+# and the job dies in step 6 (observed on runs 26387387551 attempt 3
+# and 26397985441 attempt 1 during the PR #101 stability loop).
+# truncate creates a sparse image: only filesystem metadata is
+# materialised, actual disk consumed grows as paths are written. The
+# 60G cap is enforced by underlying /mnt free space at runtime —
+# graceful ENOSPC mid-build instead of cold ENOSPC at job start.
+# Works identically on both image variants.
+sudo truncate -s 60G /mnt/nix.img
 sudo mkfs.ext4 -F -E lazy_itable_init=1,lazy_journal_init=1 /mnt/nix.img
 sudo mkdir -p /nix
 sudo mount -o loop,noatime /mnt/nix.img /nix
