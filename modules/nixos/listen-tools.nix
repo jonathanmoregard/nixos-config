@@ -19,7 +19,7 @@
 { config, pkgs, lib, ... }:
 {
   age.secrets.fish-audio-api-key = {
-    file = ../../secrets/fish-audio-api-key.age;
+    rekeyFile = ../../secrets/fish-audio-api-key.age;
     owner = "jonathan";
     group = "users";
     mode = "0400";
