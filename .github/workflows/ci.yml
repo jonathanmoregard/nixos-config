@@ -32,6 +32,15 @@
 # /usr/share/dotnet etc and takes ~2.5min per job). Loop mount: ~5s.
 # Implementation lives in scripts/mount-nix-loop.sh (must run BEFORE
 # determinate-nix-action).
+#
+# /tmp is bind-mounted onto /mnt via scripts/mount-tmp-loop.sh so the
+# nix build sandbox AND QEMU NixOS-test runtime artifacts (qcow2 disks,
+# screenshots, serial logs — several GB per lane) don't starve runner
+# root. Pair with `env: TMPDIR=/mnt/tmp` on the heavy steps. Ordering:
+# mount-tmp-loop → mount-nix-loop → free-root-disk → determinate-nix-
+# action. Root-disk ENOSPC during vm-minimal lanes (the autodoro
+# crash on run 26373588544 — worker died writing _diag log) is the
+# specific failure mode this guards.
 name: ci
 
 on:
@@ -283,9 +292,15 @@ jobs:
           # merge-ref propagation race.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Free root disk (dotnet/ghc/android/codeql)
+      - name: Disk before (baseline)
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: df -h / /mnt 2>/dev/null || df -h /
+      - name: Free root disk (dotnet/ghc/android/docker/codeql)
         if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/free-root-disk.sh
+      - name: Mount /tmp on /mnt bind
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: ./scripts/mount-tmp-loop.sh
       - name: Mount /nix on /mnt loopback (replaces free-disk-space)
         if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/mount-nix-loop.sh
@@ -379,6 +394,8 @@ jobs:
       # Explicit `nix-store --add-root` is belt-and-braces in case the
       # auto-registration path ever changes.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        env:
+          TMPDIR: /mnt/tmp
         run: |
           set -euo pipefail
           nix build .#nixosConfigurations.dellan.config.system.build.toplevel \
@@ -386,6 +403,9 @@ jobs:
             --print-build-logs --keep-going
           nix-store --add-root "$GITHUB_WORKSPACE/result-dellan" -r \
             "$(readlink -f "$GITHUB_WORKSPACE/result-dellan")" >/dev/null
+      - name: Disk after (post-build)
+        if: always() && needs.preflight.outputs.risk != 'TRIVIAL'
+        run: df -h / /mnt /tmp 2>/dev/null || df -h /
 
   vm-minimal:
     # Matrix fan-out: one lane per feature check derivation. Each lane
@@ -433,9 +453,15 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Free root disk (dotnet/ghc/android/codeql)
+      - name: Disk before (baseline)
+        if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        run: df -h / /mnt 2>/dev/null || df -h /
+      - name: Free root disk (dotnet/ghc/android/docker/codeql)
         if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         run: ./scripts/free-root-disk.sh
+      - name: Mount /tmp on /mnt bind
+        if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        run: ./scripts/mount-tmp-loop.sh
       - name: Mount /nix on /mnt loopback (replaces free-disk-space)
         if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         run: ./scripts/mount-nix-loop.sh
@@ -486,8 +512,40 @@ jobs:
         run: |
           test "${DETERMINATE_NIX_KVM:-}" = "1" || { echo "KVM not available"; exit 1; }
           ls -la /dev/kvm
-      - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
-        run: nix build .#checks.x86_64-linux.vm-${{ matrix.lane }} -L
+      - name: Build vm-${{ matrix.lane }} (3 retries)
+        if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        env:
+          TMPDIR: /mnt/tmp
+        # Retry loop catches transient infra flakes (ENOSPC blips,
+        # cachix 5xx, KVM hiccups) without needing a manual rerun.
+        # Backoff: 15 s after attempt 1, 30 s after attempt 2 — short
+        # enough to fit inside CI patience, long enough that a brief
+        # cache outage recovers before retry. Failures still bubble
+        # up on the third attempt, so genuine bugs aren't masked.
+        run: |
+          set -uo pipefail
+          attempts=3
+          for i in $(seq 1 $attempts); do
+            echo "::group::vm-${{ matrix.lane }} attempt $i/$attempts"
+            df -h / /mnt /tmp 2>/dev/null || df -h / || true
+            if nix build .#checks.x86_64-linux.vm-${{ matrix.lane }} -L; then
+              echo "::endgroup::"
+              echo "vm-${{ matrix.lane }} succeeded on attempt $i"
+              exit 0
+            fi
+            rc=$?
+            echo "::endgroup::"
+            echo "::warning::vm-${{ matrix.lane }} attempt $i failed (rc=$rc)"
+            df -h / /mnt /tmp 2>/dev/null || df -h / || true
+            if [ "$i" -lt "$attempts" ]; then
+              sleep $((i * 15))
+            fi
+          done
+          echo "::error::vm-${{ matrix.lane }} failed after $attempts attempts"
+          exit 1
+      - name: Disk after (post-build)
+        if: always() && needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        run: df -h / /mnt /tmp 2>/dev/null || df -h /
 
   vm-graphical:
     name: vm-graphical
