@@ -129,6 +129,7 @@
         vm-autodoro     = mkLane ./tests/autodoro.nix;
         vm-microvm      = mkLane ./tests/microvm.nix;
         vm-listen-tools = mkLane ./tests/listen-tools.nix;
+        vm-android-dev  = mkLane ./tests/android-dev.nix;
       };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.
