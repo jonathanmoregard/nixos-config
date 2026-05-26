@@ -59,9 +59,21 @@ permissions:
 # Belt-and-braces alongside extra-conf in the determinate-nix-action
 # `with:` blocks: extra-conf covers steps before cachix; NIX_CONFIG
 # covers steps after. Both layers point at the same workflow token.
+#
+# Substituter parallelism tuning: defaults (max-substitution-jobs=16,
+# http-connections=25) cap CloudFront throughput when restored
+# /nix/store snapshot misses hundreds of small paths the new closure
+# needs. Bumping to 64/64 saturates the connection on high-latency
+# CI links without hitting cachix throttling. narinfo-cache-positive-
+# ttl=600 keeps cachix narinfo hot across the job but invalidates
+# quickly enough to pick up new pushes (default is 30 days — fine for
+# laptops, harmful for an active CI cache).
 env:
   NIX_CONFIG: |
     access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+    max-substitution-jobs = 64
+    http-connections = 64
+    narinfo-cache-positive-ttl = 600
 
 concurrency:
   group: pr-${{ github.event.pull_request.number || github.run_id }}
@@ -151,6 +163,9 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           extra-conf: |
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            max-substitution-jobs = 64
+            http-connections = 64
+            narinfo-cache-positive-ttl = 600
       # No cache-nix-action here on purpose. flake-check is eval-only
       # (`--no-build`); its added /nix/store would be small relative to
       # build-dellan's snapshot (≤8 GB uncompressed per gc-max), and
@@ -209,6 +224,18 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+        with:
+          # Same NIX_CONFIG covers the probe step via env, but discover
+          # also runs `nix eval` + `nix path-info --store https://...`
+          # which both benefit from the bumped http-connections; setting
+          # extra-conf here too keeps the layering symmetric with the
+          # other heavy jobs.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            max-substitution-jobs = 64
+            http-connections = 64
+            narinfo-cache-positive-ttl = 600
       - id: probe
         env:
           RISK: ${{ needs.preflight.outputs.risk }}
@@ -307,6 +334,9 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           extra-conf: |
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            max-substitution-jobs = 64
+            http-connections = 64
+            narinfo-cache-positive-ttl = 600
       # build-dellan owns the shared cache. Restore on entry; the action
       # auto-saves /nix/store at job end under `primary-key` (post step is
       # gated `post-if: success()`, so cancelled/failed runs skip save and
@@ -465,6 +495,9 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           extra-conf: |
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            max-substitution-jobs = 64
+            http-connections = 64
+            narinfo-cache-positive-ttl = 600
       # Restore the shared /nix/store snapshot that build-dellan saved.
       # save: false — only build-dellan owns the snapshot. 7 lanes saving
       # in parallel would race for the same cache key, and 7 × ~8 GB
