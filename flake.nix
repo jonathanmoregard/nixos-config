@@ -56,6 +56,17 @@
     pkgsLinux = import nixpkgs {
       system = linuxSystem;
       config.allowUnfree = true;
+      # Required for pkgs.androidenv.composeAndroidPackages — the
+      # Android SDK terms of service must be accepted at evaluation
+      # time, otherwise the derivation fails with a redirect to
+      # `https://developer.android.com/studio/terms`. Consumed by
+      # modules/nixos/android-dev.nix. Note: the flag scopes to this
+      # whole `pkgsLinux` instance, so any future module that pulls in
+      # an androidenv derivation auto-accepts the license. Today only
+      # `android-dev.nix` does — if a build-farm host or anything
+      # contributor-facing imports androidenv, scope a separate pkgs
+      # import without this flag.
+      config.android_sdk.accept_license = true;
       overlays = [
         (import ./overlays/beeper.nix)
         (final: prev: {

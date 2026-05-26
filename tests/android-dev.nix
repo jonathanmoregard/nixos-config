@@ -40,5 +40,22 @@
         f"JAVA_HOME unset under a login shell — programs.java.enable did not export it:\n[{java_home!r}]"
     )
     dellan.succeed(f"test -x {java_home}/bin/java")
+
+    # ANDROID_HOME + ANDROID_SDK_ROOT exported by environment.sessionVariables.
+    android_home = dellan.succeed("bash -lc 'echo -n \"$ANDROID_HOME\"'")
+    assert android_home, (
+        f"ANDROID_HOME unset under a login shell:\n[{android_home!r}]"
+    )
+    android_sdk_root = dellan.succeed("bash -lc 'echo -n \"$ANDROID_SDK_ROOT\"'")
+    assert android_home == android_sdk_root, (
+        f"ANDROID_HOME / ANDROID_SDK_ROOT diverge: {android_home!r} vs {android_sdk_root!r}"
+    )
+
+    # platform-tools + platforms;android-34 + build-tools;34.0.0 land
+    # under the SDK root. Assert the three binaries / dirs AGP 8.x
+    # touches at build time exist and look sane.
+    dellan.succeed(f"test -x {android_home}/platform-tools/adb")
+    dellan.succeed(f"test -f {android_home}/platforms/android-34/android.jar")
+    dellan.succeed(f"test -x {android_home}/build-tools/34.0.0/aapt2")
   '';
 }
