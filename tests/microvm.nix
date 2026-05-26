@@ -106,6 +106,52 @@ pkgs.testers.runNixOSTest {
         f"vm-ssh dir perms expected '700 root', got {perms!r}"
     )
 
+    # Health-check watchdog: timer and oneshot service must be installed,
+    # the script must defer to operator-stopped state cleanly, and the
+    # systemctl-restart command name must appear in the script body (a
+    # rename of the microvm unit would silently break the watchdog).
+    dellan.succeed(
+        "systemctl cat research-agent-healthcheck.timer "
+        "| grep -q 'OnUnitActiveSec=1min'"
+    )
+    dellan.succeed(
+        "systemctl cat research-agent-healthcheck.service "
+        "| grep -q 'Description='"
+    )
+    script_path = dellan.succeed(
+        "systemctl cat research-agent-healthcheck.service "
+        "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
+    ).strip()
+    # Match the literal command issued on restart. --no-block keeps the
+    # oneshot bounded (the unit's TimeoutStartSec is 30s); a regression
+    # back to synchronous restart would let stuck activations stack
+    # behind the 1-min timer.
+    dellan.succeed(
+        f"grep -q 'systemctl restart --no-block microvm@research-agent.service' {script_path}"
+    )
+    # Probe should treat operator-stopped microvm as a no-op (exit 0
+    # silently) — otherwise an admin `systemctl stop microvm@...` would
+    # be fought by the watchdog. The microvm unit is stopped in this
+    # test (wantedBy mkForce []), so a fresh run must exit 0.
+    dellan.succeed("systemctl start research-agent-healthcheck.service")
+
+    # Count-file corruption MUST NOT brick the watchdog. Under `set -u`
+    # without sanitization, non-numeric input would crash the
+    # arithmetic and leave the script aborting forever each tick.
+    # read_int must clamp garbage back to 0.
+    dellan.succeed(
+        "mkdir -p /run/research-agent-healthcheck "
+        "&& printf 'abc\\n0\\n5garbage' > /run/research-agent-healthcheck/fail-count"
+    )
+    dellan.succeed("systemctl start research-agent-healthcheck.service")
+    # Service must reach 'inactive' (oneshot exited 0), not 'failed'.
+    rc = dellan.succeed(
+        "systemctl is-failed research-agent-healthcheck.service || true"
+    ).strip()
+    assert rc != "failed", (
+        f"watchdog must survive corrupted state file; got is-failed={rc!r}"
+    )
+
     # agenix entry for the host-to-VM SSH private key is wired.
     # agenix declares per-secret install snippets in the system's
     # activation script — `grep` finds the secret name there. The file

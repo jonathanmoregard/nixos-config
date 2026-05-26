@@ -34,6 +34,7 @@
     # separate audit).
     ../../modules/nixos/docker.nix
     ../../modules/nixos/research-agent-microvm.nix
+    ../../modules/nixos/research-agent-microvm-healthcheck.nix
 
     # Feature VM overrides — no-op for prod toplevel, only activates
     # under `config.system.build.vm`. See module header for usage.
