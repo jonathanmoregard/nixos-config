@@ -36,6 +36,12 @@
     ../../modules/nixos/research-agent-microvm.nix
     ../../modules/nixos/research-agent-microvm-healthcheck.nix
 
+    # Host-level Android dev tooling. Provides adb on PATH + JDK17 for
+    # the AGP 8.x gradle builds in ~/Repos/intender-app and pairs with
+    # the docker-android emulator the project ships in
+    # infra/emulator/docker-compose.yml.
+    ../../modules/nixos/android-dev.nix
+
     # Feature VM overrides — no-op for prod toplevel, only activates
     # under `config.system.build.vm`. See module header for usage.
     ../../modules/nixos/feature-vm.nix
