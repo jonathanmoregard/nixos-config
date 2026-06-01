@@ -6,6 +6,11 @@
 #   - systemd --user (via linger) reached default.target for jonathan
 #   - X server up (autoLogin path; catches LightDM regressions in
 #     the lightest lane before they trip the heavier ones)
+#   - kindle udev rule file present with the expected unset clauses
+#     (vm-base-only by design: this is the lane that imports the full
+#     dellan host config via mkTest, and we only need to verify the
+#     payload once per build — mkMinimalTest / mkFeatureTest lanes
+#     don't include kindle.nix)
 #
 # Run: nix build .#checks.x86_64-linux.vm-base -L
 { pkgs, inputs }:

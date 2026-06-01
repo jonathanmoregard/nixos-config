@@ -45,7 +45,10 @@
 # enumerates as a different PID, broaden this match.
 #
 # `ACTION!="remove"` keeps the rule from re-evaluating on unplug; the
-# unset-and-flag work is only meaningful on `add` / `bind`.
+# unset-and-flag work is only meaningful on `add` / `bind`. Per udev(7),
+# all assignments on a single rule line are gated by the preceding
+# match keys — if ACTION/SUBSYSTEM/ATTR don't match, none of the ENV
+# assignments fire.
 #
 # VM-untestable runtime behaviour: requires a real Kindle on USB.
 # Hardware-specific per the pipeline rule on lanes the VM can't model
