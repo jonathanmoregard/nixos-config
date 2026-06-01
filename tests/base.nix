@@ -6,6 +6,11 @@
 #   - systemd --user (via linger) reached default.target for jonathan
 #   - X server up (autoLogin path; catches LightDM regressions in
 #     the lightest lane before they trip the heavier ones)
+#   - kindle udev rule file present with the expected unset clauses
+#     (vm-base-only by design: this is the lane that imports the full
+#     dellan host config via mkTest, and we only need to verify the
+#     payload once per build — mkMinimalTest / mkFeatureTest lanes
+#     don't include kindle.nix)
 #
 # Run: nix build .#checks.x86_64-linux.vm-base -L
 { pkgs, inputs }:
@@ -34,5 +39,25 @@
         "git -C /home/jonathan/Repos/nixos-config fetch origin main:main"
         in crontab_src
     ), f"nixos-config bare-repo fetch line missing from crontab source:\n{crontab_src}"
+
+    # modules/nixos/kindle.nix installs a udev rule that stops
+    # gvfs-mtp-volume-monitor from claiming the kindle USB interface
+    # (calibre needs libusb). Two prior attempts failed because either
+    # the rule loaded too late or only blocked the libmtp probe path
+    # while leaving libmtp's hwdb-set ID_MTP_DEVICE=1 intact. The
+    # current rule unsets both ID_MTP_DEVICE and ID_MEDIA_PLAYER so
+    # 69-libmtp.rules' early-exit symlink branch can't fire. The VM
+    # can't model real USB so we only assert the rule file is on disk
+    # with the right unset clauses — runtime behaviour is verified on
+    # dellan by replugging the kindle.
+    kindle_rule = dellan.succeed("cat /etc/udev/rules.d/60-kindle.rules")
+    assert 'ATTR{idVendor}=="1949"' in kindle_rule, \
+        f"kindle rule missing vendor match:\n{kindle_rule}"
+    assert 'ATTR{idProduct}=="9981"' in kindle_rule, \
+        f"kindle rule missing product (paperwhite) match:\n{kindle_rule}"
+    assert 'ENV{ID_MTP_DEVICE}=""' in kindle_rule, \
+        f"kindle rule missing ID_MTP_DEVICE unset:\n{kindle_rule}"
+    assert 'ENV{ID_MEDIA_PLAYER}=""' in kindle_rule, \
+        f"kindle rule missing ID_MEDIA_PLAYER unset:\n{kindle_rule}"
   '';
 }
