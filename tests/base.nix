@@ -42,14 +42,13 @@
 
     # modules/nixos/kindle.nix installs a udev rule that stops
     # gvfs-mtp-volume-monitor from claiming the kindle USB interface
-    # (calibre needs libusb). Two prior attempts failed because either
-    # the rule loaded too late or only blocked the libmtp probe path
-    # while leaving libmtp's hwdb-set ID_MTP_DEVICE=1 intact. The
-    # current rule unsets both ID_MTP_DEVICE and ID_MEDIA_PLAYER so
-    # 69-libmtp.rules' early-exit symlink branch can't fire. The VM
-    # can't model real USB so we only assert the rule file is on disk
-    # with the right unset clauses — runtime behaviour is verified on
-    # dellan by replugging the kindle.
+    # (calibre needs libusb). Rule clears ID_MTP_DEVICE so
+    # 69-libmtp.rules:10's early-exit symlink branch can't fire, but
+    # leaves ID_MEDIA_PLAYER alone so 70-uaccess.rules:70 still grants
+    # the user ACL on the /dev/bus/usb/N/M node (cleared by PR #108,
+    # restored here). The VM can't model real USB so we only assert
+    # the rule file is on disk with the right clauses — runtime
+    # behaviour is verified on dellan by replugging the kindle.
     kindle_rule = dellan.succeed("cat /etc/udev/rules.d/60-kindle.rules")
     assert 'ATTR{idVendor}=="1949"' in kindle_rule, \
         f"kindle rule missing vendor match:\n{kindle_rule}"
@@ -57,7 +56,13 @@
         f"kindle rule missing product (paperwhite) match:\n{kindle_rule}"
     assert 'ENV{ID_MTP_DEVICE}=""' in kindle_rule, \
         f"kindle rule missing ID_MTP_DEVICE unset:\n{kindle_rule}"
-    assert 'ENV{ID_MEDIA_PLAYER}=""' in kindle_rule, \
-        f"kindle rule missing ID_MEDIA_PLAYER unset:\n{kindle_rule}"
+    # Regression guard for PR #108 → PR #109: must NOT clear
+    # ID_MEDIA_PLAYER (breaks 70-uaccess.rules:70 user-ACL grant).
+    # Substring match is safe here because writeTextFile only writes
+    # the `text` field — Nix-source comments don't leak into the
+    # deployed rule file. If a future edit adds rule-file comments via
+    # writeTextFile body, tighten this to a regex/word-boundary check.
+    assert 'ENV{ID_MEDIA_PLAYER}=""' not in kindle_rule, \
+        f"kindle rule clears ID_MEDIA_PLAYER — breaks uaccess; see PR #108 regression:\n{kindle_rule}"
   '';
 }

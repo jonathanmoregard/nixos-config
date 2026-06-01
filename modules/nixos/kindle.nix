@@ -5,7 +5,7 @@
 # and wins the interface race against calibre, which then reports
 # `libusb_claim_interface() ... device is busy`.
 #
-# History (two failed attempts before this one):
+# History (three failed attempts before this one):
 #
 # Attempt #1 — `services.udev.extraRules` setting `ID_MTP_DEVICE=0`. Lands
 # in /etc/udev/rules.d/99-local.rules — i.e. AFTER nixpkgs's
@@ -26,17 +26,30 @@
 #     the symlink before the probe (and our MTP_NO_PROBE guard on it)
 #     can do anything.
 #
-# Attempt #3 (this file) — also unset `ID_MTP_DEVICE` and `ID_MEDIA_PLAYER`
+# Attempt #3 (PR #108) — also unset `ID_MTP_DEVICE` AND `ID_MEDIA_PLAYER`
 # in 60-kindle.rules. 50-udev-default.rules (file order 50) imports hwdb
 # BEFORE 60-kindle.rules, so the unset wins by the time 69-libmtp.rules
 # (file order 69) evaluates its early-exit branch. With no ID_MTP_DEVICE,
-# no symlink, gvfs-mtp-volume-monitor has nothing to bind to, and calibre
-# wins the interface race. `MTP_NO_PROBE=1` is also still required: with
-# `ID_MTP_DEVICE` cleared, 69-libmtp.rules' fallback probe block becomes
-# eligible to re-tag the device (it runs `mtp-probe` which would respond
-# positively and reset `ID_MTP_DEVICE=1`, re-creating the symlink).
-# `UDISKS_IGNORE=1` keeps udisks2 from auto-mounting any partitions it
-# would still detect.
+# no symlink, gvfs-mtp-volume-monitor has nothing to bind to.
+#
+# But that also broke calibre, because `/lib/udev/rules.d/70-uaccess.rules`
+# line 70 hands the device's `uaccess` tag (which becomes a user ACL on
+# the /dev/bus/usb/N/M device node) ONLY when `ID_MEDIA_PLAYER` is set:
+#     SUBSYSTEM=="usb", ENV{ID_MEDIA_PLAYER}=="?*", TAG+="uaccess"
+# Clearing ID_MEDIA_PLAYER on the kindle stripped that path. The device
+# node ended up `crw-rw-r-- root:root` with no jonathan ACL, calibre got
+# permission-denied opening it.
+#
+# Attempt #4 (this file) — only unset `ID_MTP_DEVICE`. Leave
+# `ID_MEDIA_PLAYER` alone so 70-uaccess.rules:70 still grants the user
+# ACL. 69-libmtp.rules:10's early-exit symlink branch only keys on
+# `ID_MTP_DEVICE`, so clearing that alone is sufficient to suppress the
+# /dev/libmtp-* symlink and stop gvfs-mtp-volume-monitor from spawning
+# gvfsd-mtp. `MTP_NO_PROBE=1` is still required: clearing ID_MTP_DEVICE
+# makes 69-libmtp.rules' fallback probe block eligible to re-tag the
+# device (it runs `mtp-probe` which would respond positively and reset
+# `ID_MTP_DEVICE=1`, re-creating the symlink). `UDISKS_IGNORE=1` keeps
+# udisks2 from auto-mounting any partitions it would still detect.
 #
 # Scope: vendor 1949 = Amazon, product 9981 = Kindle Paperwhite (the
 # device this user owns). Narrow to product because Kindle Fire tablets
@@ -64,7 +77,7 @@
       name = "60-kindle";
       destination = "/lib/udev/rules.d/60-kindle.rules";
       text = ''
-        ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="1949", ATTR{idProduct}=="9981", ENV{MTP_NO_PROBE}="1", ENV{UDISKS_IGNORE}="1", ENV{ID_MTP_DEVICE}="", ENV{ID_MEDIA_PLAYER}=""
+        ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="1949", ATTR{idProduct}=="9981", ENV{MTP_NO_PROBE}="1", ENV{UDISKS_IGNORE}="1", ENV{ID_MTP_DEVICE}=""
       '';
     })
   ];
