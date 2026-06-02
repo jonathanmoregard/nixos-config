@@ -87,24 +87,37 @@
             # Workspace share — same pattern as research-agent. The
             # scraper HTTP server (scraper/server.py) lives in the
             # research-agent repo so both microvms get their code from
-            # one place. /workspace is RO so a chromium escape can't
-            # mutate the script tree on the host.
+            # one place. readOnly=true so a chromium sandbox escape
+            # inside the VM cannot rewrite scraper/server.py and
+            # persist an implant on the host. microvm.nix's `shares`
+            # default is readOnly=false — the flag MUST be set
+            # explicitly. (Verified via:
+            # `nix eval .#nixosConfigurations.dellan.config.microvm.vms.scraper.config.config.microvm.shares`.)
             source = "/home/jonathan/Repos/research-agent";
             mountPoint = "/workspace";
             tag = "workspace";
             proto = "virtiofs";
+            readOnly = true;
           }
           {
-            # Bearer token — read at startup by scraper-http.service.
-            # RO from the VM's point of view; the host owns the file.
+            # Bearer token. readOnly=true so a chromium escape inside
+            # the VM cannot rotate the operator's view-of-truth out
+            # from under the agent. The host owns the file and rotates
+            # it via scraper-bearer-init.service. scraper-http
+            # re-reads on every request (not cached at import).
             source = "/var/lib/scraper-bearer";
             mountPoint = "/etc/scraper";
             tag = "scraper-token";
             proto = "virtiofs";
+            readOnly = true;
           }
           {
             # Persisted SSH host keys (same rationale as the
             # research-agent module: known_hosts pin survives reboots).
+            # RW because sshd writes first-boot generated keys back
+            # here; a chromium-escape rotation of these would surface
+            # as REMOTE HOST IDENTIFICATION HAS CHANGED on the next
+            # operator ssh — fail-loud, not silent persistence.
             source = "/var/lib/scraper/vm-ssh";
             mountPoint = "/etc/ssh/keys";
             tag = "ssh-keys";

@@ -35,8 +35,17 @@
             mountPoint = "/workspace";
             tag = "workspace";
             proto = "virtiofs";
+            # RO so a prompt-injected agent cannot rewrite its own
+            # CLAUDE.md / shims / scripts on the host. microvm.nix's
+            # `shares` default is readOnly=false — the flag MUST be
+            # set explicitly. (Verified via:
+            # `nix eval .#nixosConfigurations.dellan.config.microvm.vms.research-agent.config.config.microvm.shares`.)
+            readOnly = true;
           }
           {
+            # /out is RW because the agent writes one report file per
+            # call here; the host MCP server reads the file from this
+            # virtiofs share after the agent exits.
             source = "/home/jonathan/Repos/research-agent/reports";
             mountPoint = "/out";
             tag = "out";
@@ -57,15 +66,18 @@
             proto = "virtiofs";
           }
           {
-            # Bearer token for the scraper microvm's HTTP API. RO from
-            # the agent's point of view; the file lives on the host at
-            # /var/lib/scraper-bearer/token (generated per-boot by
-            # scraper-bearer-init.service in modules/nixos/scraper-microvm.nix).
-            # render_shim.py reads from /etc/scraper/token at call time.
+            # Bearer token for the scraper microvm's HTTP API. The file
+            # lives on the host at /var/lib/scraper-bearer/token
+            # (generated per-boot by scraper-bearer-init.service in
+            # modules/nixos/scraper-microvm.nix). render_shim.py reads
+            # /etc/scraper/token at call time.
+            # readOnly=true: a prompt-injected agent inside the VM
+            # cannot rotate the bearer out from under the scraper.
             source = "/var/lib/scraper-bearer";
             mountPoint = "/etc/scraper";
             tag = "scraper-token";
             proto = "virtiofs";
+            readOnly = true;
           }
         ];
 
