@@ -25,6 +25,17 @@
     mode = "0400";
   };
 
+  # Auphonic API key. Used by `tts-tool clone --enhance auphonic` to send
+  # raw mic samples through Auphonic's breath/mouth-noise removal before
+  # the bytes hit Fish's `voices.create`. Same owner/mode shape as
+  # fish-audio-api-key — user-launched binary, decrypted to /run/agenix.
+  age.secrets.auphonic-api-key = {
+    rekeyFile = ../../secrets/auphonic-api-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   environment.systemPackages = [
     (pkgs.writeShellApplication {
       name = "tts-tool";
