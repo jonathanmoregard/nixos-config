@@ -55,11 +55,23 @@
         "prose-decorate", "ANTHROPIC_API_KEY_FILE", "anthropic-api-key"
     )
     # prose-decorate also handles the multimodal --audio path against
-    # Gemini 2.5 Pro; the wrapper must export GEMINI_API_KEY from the
-    # agenix-decrypted path so the Python CLI's read_gemini_api_key
-    # picks it up via env. Same wrapper, second secret reference.
+    # Gemini 2.5 Pro; the wrapper must EXPORT GEMINI_API_KEY (not just
+    # assign it locally) from the agenix-decrypted path so the Python
+    # CLI's read_gemini_api_key picks it up via env. Same wrapper,
+    # second secret reference. The bare assert_wrapper_references
+    # matches the substring `GEMINI_API_KEY=`, so we additionally
+    # anchor on the literal `export GEMINI_API_KEY` to reject a
+    # half-finished refactor that loses the export.
     assert_wrapper_references(
         "prose-decorate", "GEMINI_API_KEY", "gemini-api-key"
+    )
+    prose_wrapper_src = dellan.succeed(
+        "readlink -f $(command -v prose-decorate)"
+    ).strip()
+    prose_wrapper_text = dellan.succeed(f"cat {prose_wrapper_src}")
+    assert "export GEMINI_API_KEY" in prose_wrapper_text, (
+        "prose-decorate wrapper assigns GEMINI_API_KEY but never exports it:\n"
+        + prose_wrapper_text
     )
   '';
 }
