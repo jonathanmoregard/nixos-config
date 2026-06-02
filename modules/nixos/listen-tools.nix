@@ -57,6 +57,17 @@
         if [ -r "${config.age.secrets.anthropic-api-key.path}" ]; then
           export ANTHROPIC_API_KEY_FILE="${config.age.secrets.anthropic-api-key.path}"
         fi
+        # Gemini API key for the `--audio` multimodal path
+        # (`prose-decorate --audio FILE -i transcript.txt`). The Python
+        # tool reads GEMINI_API_KEY from env; we export it from the
+        # agenix decrypt path so the raw key never transits any process
+        # argv. Guarded by `[ -r ... ]` so the wrapper still launches
+        # on hosts where the secret hasn't been rekeyed yet — the
+        # text-only `prose-decorate` path keeps working in that case.
+        if [ -r "${config.age.secrets.gemini-api-key.path}" ]; then
+          GEMINI_API_KEY="$(< "${config.age.secrets.gemini-api-key.path}")"
+          export GEMINI_API_KEY
+        fi
         exec prose-decorate "$@"
       '';
     })
