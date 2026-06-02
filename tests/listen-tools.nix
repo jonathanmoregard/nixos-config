@@ -1,7 +1,10 @@
 # vm-listen-tools: substack-url-tool + prose-decorate + tts-tool reach
-# the system PATH, respond to --help, and the tts-tool / prose-decorate
-# wrappers point their respective `<KEY>_FILE` env vars at the agenix
-# decrypt path.
+# the system PATH, respond to --help, and the wrappers wire each tool to
+# its agenix-decrypted API key. Fish and Anthropic use `<KEY>_FILE`
+# indirection (Python CLIs reading the file at request time); Auphonic
+# CLI only honours bare `AUPHONIC_API_KEY`, so the tts-tool wrapper
+# reads the secret into env directly. The tts-tool wrapper also pins
+# `auphonic-cli` on PATH so `tts-tool clone --enhance` can shell out.
 #
 # Run: nix build .#checks.x86_64-linux.vm-listen-tools -L
 { pkgs, inputs }:
@@ -51,8 +54,29 @@
     assert_wrapper_references(
         "tts-tool", "FISH_AUDIO_API_KEY_FILE", "fish-audio-api-key"
     )
+    # Auphonic key is read into AUPHONIC_API_KEY (no _FILE indirection
+    # — the auphonic CLI only honours the bare env var). Same `if -r`
+    # guard so the binary still launches when the secret is missing
+    # (and tts-tool's `--enhance` falls back to raw bytes).
+    assert_wrapper_references(
+        "tts-tool", "AUPHONIC_API_KEY", "auphonic-api-key"
+    )
     assert_wrapper_references(
         "prose-decorate", "ANTHROPIC_API_KEY_FILE", "anthropic-api-key"
+    )
+
+    # auphonic-cli must be reachable from the tts-tool wrapper's PATH so
+    # `tts-tool clone --enhance` can shell out to it. writeShellApplication
+    # bakes `export PATH=<runtimeInputs-store-paths>:$PATH` into the wrapper
+    # text, so the auphonic-cli store path will appear there iff the
+    # overlay + runtimeInputs entry both landed.
+    tts_wrapper_src = dellan.succeed(
+        "readlink -f $(command -v tts-tool)"
+    ).strip()
+    tts_wrapper_text = dellan.succeed(f"cat {tts_wrapper_src}")
+    assert "auphonic-cli" in tts_wrapper_text, (
+        "tts-tool wrapper PATH does not include auphonic-cli store path:\n"
+        + tts_wrapper_text
     )
   '';
 }
