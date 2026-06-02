@@ -36,6 +36,10 @@
     ../../modules/nixos/research-agent-microvm.nix
     ../../modules/nixos/research-agent-microvm-healthcheck.nix
 
+    # scraper microvm — sibling to research-agent for JS-rendering
+    # crawls. See module header for the trust-boundary rationale.
+    ../../modules/nixos/scraper-microvm.nix
+
     # Host-level Android dev tooling. Provides adb on PATH + JDK17 for
     # the AGP 8.x gradle builds in ~/Repos/intender-app and pairs with
     # the docker-android emulator the project ships in

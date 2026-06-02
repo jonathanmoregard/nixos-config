@@ -56,6 +56,17 @@
             tag = "ssh-keys";
             proto = "virtiofs";
           }
+          {
+            # Bearer token for the scraper microvm's HTTP API. RO from
+            # the agent's point of view; the file lives on the host at
+            # /var/lib/scraper-bearer/token (generated per-boot by
+            # scraper-bearer-init.service in modules/nixos/scraper-microvm.nix).
+            # render_shim.py reads from /etc/scraper/token at call time.
+            source = "/var/lib/scraper-bearer";
+            mountPoint = "/etc/scraper";
+            tag = "scraper-token";
+            proto = "virtiofs";
+          }
         ];
 
         interfaces = [
@@ -139,6 +150,13 @@
               udp dport 53 accept
               tcp dport 53 accept
               ip daddr @research_allowed tcp dport 443 accept
+              # Scraper microvm HTTP API. 10.0.2.2 is the SLIRP host
+              # gateway from inside this VM (qemu user-mode default).
+              # The host's forwardPorts rule on the scraper VM exposes
+              # the scraper's guest port 8000 at host loopback :8123,
+              # so this rule lets the agent's render_shim reach the
+              # scraper without widening the broader egress allowlist.
+              ip daddr 10.0.2.2 tcp dport 8123 accept
             }
           }
         '';
