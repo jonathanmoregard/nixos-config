@@ -25,6 +25,20 @@
     mode = "0400";
   };
 
+  # Gemini API key. Will be consumed by an upcoming `prose-decorate
+  # --audio` path that uses Gemini 2.5 Pro as a multimodal LLM to
+  # annotate transcripts with Fish s2-pro prosody tags by listening to
+  # the actual podcast / interview audio. Wrapper plumbing (export
+  # GEMINI_API_KEY in the prose-decorate wrapper) ships in the follow-up
+  # PR that wires the new code path; this PR only declares the secret
+  # so the rekey loop can run independently.
+  age.secrets.gemini-api-key = {
+    rekeyFile = ../../secrets/gemini-api-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   environment.systemPackages = [
     (pkgs.writeShellApplication {
       name = "tts-tool";
