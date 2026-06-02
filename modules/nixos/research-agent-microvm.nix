@@ -114,6 +114,13 @@
         shell = pkgs.bashInteractive;
         openssh.authorizedKeys.keys = [
           "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJTpnxCppc/riWtTthEqc6FDX3tHoJvPkVjiKACOYZUl research-agent-host-key"
+          # jonathan@dellan operator key — debug ssh access only (the
+          # data path is host-MCP-over-ssh-stdin, not human ssh). Listed
+          # so feature-vm interactive smoke can reach the agent VM
+          # without needing the agenix-decrypted research-agent-host-key
+          # (which doesn't decrypt inside feature-vm because the
+          # host-ssh 9p mount's identity isn't a secrets.nix recipient).
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINT9HeHhu82OoNsAHe/QAh116pSEANuZUr1h5m8R8kpp jonathan@dellan"
         ];
       };
 
