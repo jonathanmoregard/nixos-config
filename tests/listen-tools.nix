@@ -68,14 +68,18 @@
     # auphonic-cli must be reachable from the tts-tool wrapper's PATH so
     # `tts-tool clone --enhance` can shell out to it. writeShellApplication
     # bakes `export PATH=<runtimeInputs-store-paths>:$PATH` into the wrapper
-    # text, so the auphonic-cli store path will appear there iff the
-    # overlay + runtimeInputs entry both landed.
+    # text. Match against the versioned store-path pattern so a comment or
+    # secret-name containing "auphonic" alone wouldn't false-pass — the
+    # actual binary derivation lives at /nix/store/<hash>-auphonic-cli-<ver>.
+    import re
     tts_wrapper_src = dellan.succeed(
         "readlink -f $(command -v tts-tool)"
     ).strip()
     tts_wrapper_text = dellan.succeed(f"cat {tts_wrapper_src}")
-    assert "auphonic-cli" in tts_wrapper_text, (
-        "tts-tool wrapper PATH does not include auphonic-cli store path:\n"
+    assert re.search(
+        r"/nix/store/[a-z0-9]+-auphonic-cli-[0-9][0-9.]*", tts_wrapper_text
+    ), (
+        "tts-tool wrapper PATH does not include an auphonic-cli store path:\n"
         + tts_wrapper_text
     )
   '';
