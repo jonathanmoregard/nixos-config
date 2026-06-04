@@ -230,5 +230,46 @@ pkgs.testers.runNixOSTest {
     # node. The interactive `nix run .#feature-vm` lane covers end-to-end
     # reachability (render_shim posting to the scraper); skip a brittle
     # grep here.
+
+    # ---------------------------------------------------------------
+    # scraper healthcheck — mirror of research-agent watchdog.
+    # ---------------------------------------------------------------
+    dellan.succeed(
+        "systemctl cat scraper-healthcheck.timer "
+        "| grep -q 'OnUnitActiveSec=1min'"
+    )
+    dellan.succeed(
+        "systemctl cat scraper-healthcheck.service | grep -q 'Description='"
+    )
+    scraper_script = dellan.succeed(
+        "systemctl cat scraper-healthcheck.service "
+        "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
+    ).strip()
+    # Must restart the scraper unit (not research-agent's) on persistent
+    # failure. A rename of the microvm unit would silently break this.
+    dellan.succeed(
+        f"grep -q 'systemctl restart --no-block microvm@scraper.service' {scraper_script}"
+    )
+    # Probe operator-stopped microvm as a no-op (the scraper unit is
+    # stopped in this test via wantedBy mkForce []), exit 0 silently.
+    dellan.succeed("systemctl start scraper-healthcheck.service")
+    rc = dellan.succeed(
+        "systemctl is-failed scraper-healthcheck.service || true"
+    ).strip()
+    assert rc != "failed", (
+        f"scraper watchdog must survive operator-stopped VM; got is-failed={rc!r}"
+    )
+    # Corrupted state file must NOT brick the watchdog (read_int clamp).
+    dellan.succeed(
+        "mkdir -p /run/scraper-healthcheck "
+        "&& printf 'abc\\n0\\n5garbage' > /run/scraper-healthcheck/fail-count"
+    )
+    dellan.succeed("systemctl start scraper-healthcheck.service")
+    rc = dellan.succeed(
+        "systemctl is-failed scraper-healthcheck.service || true"
+    ).strip()
+    assert rc != "failed", (
+        f"scraper watchdog must survive corrupted state; got is-failed={rc!r}"
+    )
   '';
 }
