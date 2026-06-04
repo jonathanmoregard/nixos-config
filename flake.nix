@@ -69,6 +69,7 @@
       config.android_sdk.accept_license = true;
       overlays = [
         (import ./overlays/beeper.nix)
+        (import ./overlays/auphonic-cli.nix)
         (final: prev: {
           tts-tool = tts-tool.packages.${linuxSystem}.default;
           substack-url-tool = substack-url-tool.packages.${linuxSystem}.default;
