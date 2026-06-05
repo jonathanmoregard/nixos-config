@@ -189,8 +189,13 @@ jobs:
             # store-name from basename, and "dir/" yields an empty name.
             nix store add-path "${dir%/}"
           done
+      # check-eval-warnings.sh wraps `nix flake check --no-build
+      # --all-systems` and FAILS on any unallowlisted lib.warn/warnIf
+      # output. Rationale + allowlist mechanics in the script header;
+      # born from the PR #117 incident (upstream warned about the exact
+      # bug on every eval, invisibly, while it took the VM down).
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        run: nix flake check --no-build --all-systems
+        run: ./scripts/check-eval-warnings.sh
 
   discover:
     # Upstream cache-status probe. For every vm-minimal lane, evaluate

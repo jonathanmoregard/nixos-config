@@ -25,7 +25,7 @@
   # racing `wait_for_x` against this hook's completion.
   services.xserver.displayManager.lightdm.extraSeatDefaults = ''
     display-setup-script=${pkgs.writeShellScript "lightdm-disable-bell" ''
-      ${pkgs.xorg.xset}/bin/xset b off
+      ${pkgs.xset}/bin/xset b off
       touch /run/x11-bell-silenced
     ''}
   '';
