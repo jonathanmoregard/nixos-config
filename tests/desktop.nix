@@ -22,7 +22,7 @@
   extraModules = [
     ../modules/nixos/desktop.nix
     ({ pkgs, ... }: {
-      services.xserver.displayManager.autoLogin = {
+      services.displayManager.autoLogin = {
         enable = true;
         user = "jonathan";
       };

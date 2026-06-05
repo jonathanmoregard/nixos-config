@@ -131,9 +131,11 @@
   programs.nix-ld.enable = true;
 
   # Lid close behavior — suspend on battery, ignore on AC (laptop docked)
-  services.logind.lidSwitch = "suspend";
-  services.logind.lidSwitchExternalPower = "ignore";
-  services.logind.lidSwitchDocked = "ignore";
+  services.logind.settings.Login = {
+    HandleLidSwitch = "suspend";
+    HandleLidSwitchExternalPower = "ignore";
+    HandleLidSwitchDocked = "ignore";
+  };
 
   # Audio — PipeWire (Cinnamon does not pull this in by default)
   services.pulseaudio.enable = false;
