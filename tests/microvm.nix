@@ -101,6 +101,20 @@ pkgs.testers.runNixOSTest {
         "| grep -q 'Description='"
     )
 
+    # The generated qemu runner must never pass exactly -m 2048: qemu's
+    # microvm machine serves a corrupt DSDT when guest RAM ends exactly
+    # at the 2 GiB boundary (microvm-nix/microvm.nix#171) and the guest
+    # wedges pre-init, pinning a host core. Assert on the materialized
+    # runner — the artifact qemu actually execs — not on the .nix source.
+    dellan.fail(
+        "grep -qE -- '-m 2048( |$)' "
+        "/var/lib/microvms/research-agent/current/bin/microvm-run"
+    )
+    dellan.succeed(
+        "grep -q -- '-m 3072' "
+        "/var/lib/microvms/research-agent/current/bin/microvm-run"
+    )
+
     # Persisted vm-ssh state dir must be in place before the VM boots.
     # The host module's systemd.tmpfiles.rules are the load-bearing piece.
     dellan.succeed("test -d /var/lib/research-agent/vm-ssh")
@@ -133,6 +147,30 @@ pkgs.testers.runNixOSTest {
     # behind the 1-min timer.
     dellan.succeed(
         f"grep -q 'systemctl restart --no-block microvm@research-agent.service' {script_path}"
+    )
+    # Give-up latch: the watchdog must cap fruitless restarts (burst
+    # counter + gave-up flag) and write the notification flag file the
+    # user-session path unit watches. A regression to restart-forever
+    # recreates the 2026-06-05 incident: a boot-wedged guest restart-
+    # looped 62×/6h, silently pinning a host core the whole time.
+    dellan.succeed(f"grep -q 'restart-burst-count' {script_path}")
+    dellan.succeed(f"grep -q 'GIVING UP' {script_path}")
+    dellan.succeed(
+        f"grep -q '/run/microvm-healthcheck-notify/research-agent' {script_path}"
+    )
+    # Notification chain: user path + service units installed, flag dir
+    # exists and is world-readable so the user session can inotify it.
+    dellan.succeed(
+        "test -f /etc/systemd/user/research-agent-healthcheck-notify.path"
+    )
+    dellan.succeed(
+        "test -f /etc/systemd/user/research-agent-healthcheck-notify.service"
+    )
+    notify_perms = dellan.succeed(
+        "stat -c '%a %U' /run/microvm-healthcheck-notify"
+    ).strip()
+    assert notify_perms == "755 root", (
+        f"notify flag dir perms expected '755 root', got {notify_perms!r}"
     )
     # Probe should treat operator-stopped microvm as a no-op (exit 0
     # silently) — otherwise an admin `systemctl stop microvm@...` would
@@ -249,6 +287,17 @@ pkgs.testers.runNixOSTest {
     # failure. A rename of the microvm unit would silently break this.
     dellan.succeed(
         f"grep -q 'systemctl restart --no-block microvm@scraper.service' {scraper_script}"
+    )
+    # Give-up latch + notify chain — mirror of the research-agent
+    # assertions above.
+    dellan.succeed(f"grep -q 'restart-burst-count' {scraper_script}")
+    dellan.succeed(f"grep -q 'GIVING UP' {scraper_script}")
+    dellan.succeed(
+        f"grep -q '/run/microvm-healthcheck-notify/scraper' {scraper_script}"
+    )
+    dellan.succeed("test -f /etc/systemd/user/scraper-healthcheck-notify.path")
+    dellan.succeed(
+        "test -f /etc/systemd/user/scraper-healthcheck-notify.service"
     )
     # Probe operator-stopped microvm as a no-op (the scraper unit is
     # stopped in this test via wantedBy mkForce []), exit 0 silently.
