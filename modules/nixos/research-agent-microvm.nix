@@ -27,7 +27,19 @@
       microvm = {
         hypervisor = "qemu";
         vcpu = 2;
-        mem = 2048;
+        # NOT 2048: qemu's microvm machine type serves a corrupt DSDT
+        # when guest RAM ends exactly at the 2 GiB split boundary
+        # (microvm-nix/microvm.nix#171, open since 2023). The guest
+        # kernel busy-spins in acpi_tb_checksum before init — sshd
+        # never starts, one host core pins at 100%, and the sshd
+        # watchdog restart-loops forever. Latent until PR #111 added
+        # the 4th virtiofs share (scraper-token), which grew the DSDT
+        # enough to shift table placement into the bad region.
+        # Empirically bounded 2026-06-05: 2047/2049/2560/3072/4096 all
+        # emit a clean DSDT and boot; only exactly 2048 corrupts.
+        # 3072 matches the scraper VM. acpi=off is NOT a workaround
+        # (drops the PCIe bridge; all virtio-*-pci devices fail).
+        mem = 3072;
 
         shares = [
           {

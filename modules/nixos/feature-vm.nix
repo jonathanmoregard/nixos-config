@@ -193,7 +193,7 @@
     # desktop session via QMP send-key without typing credentials at the
     # greeter every boot. Matches `tests/lib/common.nix`'s autologin
     # override — both are test/smoke contexts and never reach prod.
-    services.xserver.displayManager.autoLogin = {
+    services.displayManager.autoLogin = {
       enable = lib.mkForce true;
       user = "jonathan";
     };

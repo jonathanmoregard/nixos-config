@@ -121,7 +121,7 @@ Adding a new test: drop `tests/<feature>.nix` (use existing files as templates),
 | Status check | What it does |
 |---|---|
 | `verify-fork-guards` | Asserts every PR-triggered workflow has a fork-guard predicate |
-| `flake check (eval)` | `nix flake check --no-build --all-systems` |
+| `flake check (eval)` | `scripts/check-eval-warnings.sh`: `nix flake check --no-build --all-systems` + **fail on unallowlisted `lib.warn`/`warnIf` output** (allowlist: `scripts/eval-warnings-allowlist.txt`) |
 | `build dellan toplevel` | Builds `nixosConfigurations.dellan.config.system.build.toplevel` |
 | `vm-minimal (<lane>)` | Ephemeral VM e2e test; one matrix lane per `tests/<feature>.nix` (base / desktop / keyring / kitty / claude-pane) |
 | `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |

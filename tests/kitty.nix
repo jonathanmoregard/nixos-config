@@ -94,7 +94,7 @@ in
         # a DISPLAY to attach to. Registers `none+xterm` as a session.
         desktopManager.xterm.enable = true;
       };
-      services.xserver.displayManager.autoLogin = {
+      services.displayManager.autoLogin = {
         enable = true;
         user = "jonathan";
       };
