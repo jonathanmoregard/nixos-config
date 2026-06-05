@@ -64,5 +64,30 @@
     # writeTextFile body, tighten this to a regex/word-boundary check.
     assert 'ENV{ID_MEDIA_PLAYER}=""' not in kindle_rule, \
         f"kindle rule clears ID_MEDIA_PLAYER — breaks uaccess; see PR #108 regression:\n{kindle_rule}"
+
+    # claude-agent-N users (modules/nixos/claude-agent-users.nix) must be
+    # hidden from the LightDM greeter. slick-greeter builds its user list
+    # from AccountsService, which drops accounts whose SystemAccount
+    # property is true — assert the property the greeter actually filters
+    # on, not just the keyfile on disk.
+    def system_account(user):
+        path = dellan.succeed(
+            "busctl call org.freedesktop.Accounts /org/freedesktop/Accounts"
+            f" org.freedesktop.Accounts FindUserByName s {user}"
+            " | awk '{print $2}'"
+        ).strip().strip('"')
+        return dellan.succeed(
+            f"busctl get-property org.freedesktop.Accounts {path}"
+            " org.freedesktop.Accounts.User SystemAccount"
+        ).strip()
+
+    for agent in ["claude-agent-1", "claude-agent-2", "claude-agent-3"]:
+        prop = system_account(agent)
+        assert prop == "b true", \
+            f"{agent} visible in greeter user list (SystemAccount={prop!r})"
+    # jonathan must stay visible — guard against over-hiding.
+    jprop = system_account("jonathan")
+    assert jprop == "b false", \
+        f"jonathan hidden from greeter (SystemAccount={jprop!r})"
   '';
 }
