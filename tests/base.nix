@@ -87,6 +87,8 @@
     agents = dellan.succeed(
         "getent passwd | awk -F: '/^claude-agent-/{print $1}'"
     ).split()
+    # Floor assumes dellan keeps services.claudeAgentUsers.count >= 3
+    # (testScript can't read cfg.count); lower the floor if count drops.
     assert len(agents) >= 3, \
         f"expected >=3 claude-agent users, found {agents}"
     for agent in agents:
