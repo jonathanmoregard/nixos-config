@@ -81,7 +81,15 @@
             " org.freedesktop.Accounts.User SystemAccount"
         ).strip()
 
-    for agent in ["claude-agent-1", "claude-agent-2", "claude-agent-3"]:
+    # Enumerate agents from /etc/passwd rather than hardcoding the list:
+    # the module scales with services.claudeAgentUsers.count, and a
+    # hardcoded list would silently skip claude-agent-4+ if count grows.
+    agents = dellan.succeed(
+        "getent passwd | awk -F: '/^claude-agent-/{print $1}'"
+    ).split()
+    assert len(agents) >= 3, \
+        f"expected >=3 claude-agent users, found {agents}"
+    for agent in agents:
         prop = system_account(agent)
         assert prop == "b true", \
             f"{agent} visible in greeter user list (SystemAccount={prop!r})"
