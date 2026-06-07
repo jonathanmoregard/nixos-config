@@ -1,0 +1,7 @@
+# Allowlist for check-eval-warnings.sh — one extended-regex per line.
+# Every entry MUST carry a comment explaining why the warning is
+# acceptable and when it can be removed. An unexplained entry defeats
+# the whole gate: the 2048-MiB microvm outage (PR #117) happened while
+# upstream warned about it on every single eval.
+#
+# (currently empty — keep it that way if you can)

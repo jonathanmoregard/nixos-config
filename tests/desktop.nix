@@ -22,12 +22,12 @@
   extraModules = [
     ../modules/nixos/desktop.nix
     ({ pkgs, ... }: {
-      services.xserver.displayManager.autoLogin = {
+      services.displayManager.autoLogin = {
         enable = true;
         user = "jonathan";
       };
       services.displayManager.defaultSession = "cinnamon";
-      environment.systemPackages = with pkgs; [ jq ];
+      environment.systemPackages = with pkgs; [ jq xdg-utils ];
     })
   ];
   testScript = ''
@@ -87,6 +87,27 @@
     # are also acceptable signals that the binding is unset.
     assert media_keys in ("@as []", "[]", "EMPTY", ""), \
         f"default screenshot media-key not cleared: {media_keys!r}"
+
+    # XDG MIME defaults — magnet links and .torrent files route to qBittorrent.
+    # User-realistic check: `xdg-open magnet:?xt=...` resolves via xdg-mime,
+    # which reads ~/.config/mimeapps.list (Home Manager writes it from
+    # xdg.mimeApps.defaultApplications).
+    mimeapps = dellan.succeed("cat /home/jonathan/.config/mimeapps.list")
+    print("[diag] mimeapps.list:\n" + mimeapps)
+    assert "x-scheme-handler/magnet=org.qbittorrent.qBittorrent.desktop" in mimeapps, \
+        f"magnet handler not mapped to qbittorrent:\n{mimeapps}"
+    assert "application/x-bittorrent=org.qbittorrent.qBittorrent.desktop" in mimeapps, \
+        f".torrent handler not mapped to qbittorrent:\n{mimeapps}"
+    magnet_default = dellan.succeed(
+        "su - jonathan -c 'xdg-mime query default x-scheme-handler/magnet'"
+    ).strip()
+    assert magnet_default == "org.qbittorrent.qBittorrent.desktop", \
+        f"xdg-mime resolves magnet to {magnet_default!r}, expected qbittorrent"
+    torrent_default = dellan.succeed(
+        "su - jonathan -c 'xdg-mime query default application/x-bittorrent'"
+    ).strip()
+    assert torrent_default == "org.qbittorrent.qBittorrent.desktop", \
+        f"xdg-mime resolves .torrent to {torrent_default!r}, expected qbittorrent"
 
     # LightDM display-setup-script — silences the X11 bell so arrow
     # keys at the password field don't "twoink". Greeter user is

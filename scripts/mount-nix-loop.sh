@@ -17,7 +17,19 @@ if mountpoint -q /nix 2>/dev/null; then
   exit 0
 fi
 
-sudo fallocate -l 60G /mnt/nix.img
+# Sparse file via truncate, not fallocate. `fallocate -l 60G` reserves
+# the full 60GB on /mnt's underlying filesystem upfront — fine on
+# ubuntu-latest images where /mnt = /dev/sdb1 with ~70GB free, but
+# some image rollouts have collapsed /mnt onto /dev/root, leaving
+# only ~47GB free after free-root-disk.sh. fallocate then ENOSPCs
+# and the job dies in step 6 (observed on runs 26387387551 attempt 3
+# and 26397985441 attempt 1 during the PR #101 stability loop).
+# truncate creates a sparse image: only filesystem metadata is
+# materialised, actual disk consumed grows as paths are written. The
+# 60G cap is enforced by underlying /mnt free space at runtime —
+# graceful ENOSPC mid-build instead of cold ENOSPC at job start.
+# Works identically on both image variants.
+sudo truncate -s 60G /mnt/nix.img
 sudo mkfs.ext4 -F -E lazy_itable_init=1,lazy_journal_init=1 /mnt/nix.img
 sudo mkdir -p /nix
 sudo mount -o loop,noatime /mnt/nix.img /nix
@@ -27,5 +39,16 @@ sudo mount -o loop,noatime /mnt/nix.img /nix
 # canonical victim ('Cannot open: Permission denied' → tar exits 2 →
 # 'Could not save the new cache' → /nix/store never persists between
 # runs). Removing the dir is cleaner than chmod-ing it readable.
-sudo rmdir /nix/lost+found 2>/dev/null || true
+#
+# If rmdir fails (a future runner image pre-populates the dir, or
+# mke2fs starts respecting -T no-lost+found), surface the failure
+# loudly so the cache regression is grep-able in CI logs. Don't fail
+# the step — the breakage is a perf bug, not a correctness one — but
+# the warning shows up in the GitHub UI annotation list.
+if ! sudo rmdir /nix/lost+found 2>/dev/null; then
+  # GHA workflow-command parser only reads STDOUT for ::warning::
+  # annotations. Stderr would be logged but not annotate the run.
+  echo "::warning::could not rmdir /nix/lost+found; cache-nix-action tar may fail"
+  sudo ls -la /nix/lost+found >&2 || true
+fi
 df -h /nix

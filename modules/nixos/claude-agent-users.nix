@@ -71,8 +71,19 @@ in
     # subdirectories. The bare repo at ~/Repos/nixos-config (NOT under
     # this dir) stays jonathan-owned: agents read it via group, can't
     # push origin without their own SSH key.
+    #
+    # The AccountsService keyfiles mark each agent SystemAccount=true so
+    # the LightDM greeter (slick-greeter reads AccountsService) doesn't
+    # list them on the login screen. isNormalUser puts them at UID ≥ 1000,
+    # which AccountsService would otherwise classify as human accounts.
+    # Dir modes mirror what accounts-daemon itself creates; f+ rewrites
+    # the keyfiles every boot in case the daemon normalises them.
     systemd.tmpfiles.rules = [
       "d ${cfg.sharedWorktreeRoot} 0775 jonathan claude-agents - -"
-    ];
+      "d /var/lib/AccountsService 0775 root root - -"
+      "d /var/lib/AccountsService/users 0700 root root - -"
+    ] ++ map (n:
+      "f+ /var/lib/AccountsService/users/claude-agent-${toString n} 0600 root root - [User]\\nSystemAccount=true\\n"
+    ) (lib.range 1 cfg.count);
   };
 }

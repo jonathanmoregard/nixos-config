@@ -5,7 +5,15 @@
     ../../modules/nixos/desktop.nix
     ../../modules/nixos/docker.nix  # TODO(nixos-migration): swap for microvm.nix (Firecracker)
     ../../modules/nixos/tailscale.nix
+    ../../modules/nixos/agenix-rekey-common.nix
   ];
+
+  # Legacy nixos-vm has its own ssh host pubkey (matches the pre-rekey
+  # `vm` constant from the old secrets.nix). No rekey-managed secrets
+  # consume anything on this host today, but the module assertion needs
+  # SOME pubkey to evaluate.
+  age.rekey.hostPubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJaYUR/n99axrFFFr/uv987jwaa6fYik7Ykf9iRSieZV root@nixos-vm";
+  age.rekey.localStorageDir = ../../secrets/rekeyed/nixos-vm;
 
   # systemd-boot works cleanly with the GPT+ESP partition scheme used during install
   boot.loader.systemd-boot.enable = true;

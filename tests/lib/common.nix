@@ -25,6 +25,7 @@ let
   node = { config, ... }: {
     imports = [
       inputs.agenix.nixosModules.default
+      inputs.agenix-rekey.nixosModules.default
       inputs.home-manager.nixosModules.home-manager
       inputs.microvm.nixosModules.host
       ../../hosts/dellan/default.nix
@@ -53,7 +54,7 @@ let
     # Auto-login into a real X session so kitty has a DISPLAY to attach to
     # and we can drive it via remote control — the e2e signal the no-op
     # path alone misses.
-    services.xserver.displayManager.autoLogin = {
+    services.displayManager.autoLogin = {
       enable = true;
       user = "jonathan";
     };
