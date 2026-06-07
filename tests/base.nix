@@ -99,5 +99,18 @@
     jprop = system_account("jonathan")
     assert jprop == "b false", \
         f"jonathan hidden from greeter (SystemAccount={jprop!r})"
+
+    # home.sessionVariables.GEMINI_API_KEY_FILE must reach jonathan's
+    # interactive shell — prose-decorate --audio and any future Gemini
+    # tool reads this env var to find the agenix-decrypted key. `su -`
+    # loads jonathan's login shell, which sources the HM-generated env
+    # files; assert the value matches the agenix path the host wires up.
+    gemini_var = dellan.succeed(
+        "su - jonathan -c 'echo $GEMINI_API_KEY_FILE'"
+    ).strip()
+    assert gemini_var == "/run/agenix/gemini-api-key", (
+        f"GEMINI_API_KEY_FILE in jonathan's login shell = {gemini_var!r}, "
+        f"expected '/run/agenix/gemini-api-key'"
+    )
   '';
 }
