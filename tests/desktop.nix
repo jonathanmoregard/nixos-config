@@ -41,6 +41,14 @@
         "test -f /home/jonathan/.config/autostart/copyq.desktop"
     )
 
+    # Voquill must NOT have a cinnamon autostart entry — it is launched by
+    # systemd.user.services.voquill (home/router-services.nix); a duplicate
+    # autostart entry raced with the systemd unit on every login
+    # (proposals/2026-05-05-voquill-autostart-race.md).
+    dellan.succeed(
+        "test ! -e /home/jonathan/.config/autostart/voquill.desktop"
+    )
+
     # Nemo (GTK) sidebar bookmarks — declarative pins for ~/Downloads
     # and ~/Dropbox in the file manager's left menu.
     bookmarks = dellan.succeed(
