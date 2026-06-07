@@ -106,6 +106,12 @@
     group = "users";
     mode = "0400";
   };
+  age.secrets.gemini-api-key = {
+    rekeyFile = ../../secrets/gemini-api-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
   age.secrets.claude-token = {
     rekeyFile = ../../secrets/claude-token.age;
     owner = "jonathan";
