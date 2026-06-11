@@ -18,6 +18,7 @@
     thunderbird
     obsidian # markdown vault editor for ~/Dropbox/1. Exocortex
     mpv # CLI + GUI media player; default for MP3 output from tts-tool
+    cheese # GNOME webcam viewer/capture (see Dellan IPU6 camera notes)
     gnome-text-editor # GTK4 — used for scroll-behavior comparison vs Mint (drift-debug 2026-04-28)
     android-studio # nixpkgs, NOT flatpak — RAM-hungry, avoid in 4GB VM
     tor-browser
