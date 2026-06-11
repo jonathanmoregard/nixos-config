@@ -132,17 +132,25 @@
     # recovery is verified on dellan after deploy.
     dellan.succeed(
         "systemctl cat ipu6-camera-watchdog.timer "
-        "| grep -q 'OnUnitActiveSec=12s'"
+        "| grep -q 'OnUnitActiveSec=15s'"
+    )
+    # The relay must carry the syslog log-sink env: with the default
+    # stdout sink, CamHAL lines reach journald in multi-minute buffered
+    # bursts and watchdog detection latency degrades from ~15-30s to the
+    # flush interval.
+    dellan.succeed(
+        "systemctl cat v4l2-relayd-ipu6.service | grep -q 'logSink=SYSLOG'"
     )
     cam_script = dellan.succeed(
         "systemctl cat ipu6-camera-watchdog.service "
         "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
     ).strip()
-    # Recovery must restart the relay by name and key off the waitFrame
-    # signal (a rename of either silently breaks self-heal).
-    dellan.succeed(f"grep -q 'systemctl restart' {cam_script}")
+    # Recovery must restart the relay by name, non-blocking, and key off
+    # both wedge signals (a rename of any silently breaks self-heal).
+    dellan.succeed(f"grep -q 'systemctl restart --no-block' {cam_script}")
     dellan.succeed(f"grep -q 'v4l2-relayd-ipu6.service' {cam_script}")
     dellan.succeed(f"grep -q 'waitFrame, time out happens' {cam_script}")
+    dellan.succeed(f"grep -q 'Scheduled restart job' {cam_script}")
     # Hard regression guard: the watchdog must NEVER touch the PCI bus.
     # Unbind/rebind of intel-ipu6 corrupts IVSC/CSE state and turns a
     # soft wedge into a reboot-only hard wedge (learned empirically).
@@ -163,8 +171,9 @@
     assert cam_notify_perms == "755 root", (
         f"camera notify flag dir perms expected '755 root', got {cam_notify_perms!r}"
     )
-    # No camera in the VM → relay emits no waitFrame → healthy no-op path.
-    # A fresh run must exit 0, not fight a non-existent wedge.
+    # No camera in the VM: the relay emits no waitFrame (quiet path) or
+    # crash-loops without a sensor (thrash path → a harmless --no-block
+    # restart). Either way a run must exit 0, never 'failed'.
     dellan.succeed("systemctl start ipu6-camera-watchdog.service")
     rc = dellan.succeed(
         "systemctl is-failed ipu6-camera-watchdog.service || true"

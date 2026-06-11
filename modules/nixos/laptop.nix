@@ -99,6 +99,16 @@
   #    prefixed with `-` so a prolonged failure to prime never marks
   #    the relay itself as failed (the relay is up regardless).
   systemd.services.v4l2-relayd-ipu6 = {
+    # Route Intel HAL (CamHAL[...]) logs through syslog(3) instead of
+    # stdout. With the default stdout sink, glibc full-buffers the pipe to
+    # journald and the low-volume CamHAL[WAR] lines arrive in multi-minute
+    # bursts (measured on dellan: journal receive timestamps lag the
+    # embedded HAL timestamps by 2-4 min). The camera watchdog below greps
+    # these lines; syslog delivery makes detection near-realtime. The env
+    # contract (logSink=STDOUT|SYSLOG|FILELOG) comes from the HAL's
+    # CameraLog.cpp — undocumented upstream, so the watchdog's state
+    # machine below is also built to stay correct with bursty delivery.
+    environment.logSink = "SYSLOG";
     unitConfig.StartLimitBurst = 0;
     serviceConfig.RestartSec = "5s";
     serviceConfig.ExecStartPost = [
@@ -137,26 +147,39 @@
   # black in Chrome").
   #
   # The ONLY reliable userspace recovery is to force a fresh icamerasrc
-  # build — exactly what opening Cheese does: a real consumer's OPEN +
-  # STREAMON makes v4l2-relayd tear down and recreate the producer. A bare
-  # `systemctl restart v4l2-relayd` with NO consumer attached does NOT
-  # help (demand-driven: the producer is never rebuilt, so the sensor is
-  # never re-initialised). This watchdog automates the Cheese trick:
-  # detect the waitFrame signal in the relay journal, then restart the
-  # relay (rebuilds the producer against the still-attached, wedged
-  # consumer) and prime one frame. Detection is passive journal-grep, so
-  # it only fires when a consumer is actually attached and starved —
-  # demand-driven is preserved (camera LED stays off when idle, zero idle
-  # CPU). It NEVER touches the PCI bus: unbind/rebind of intel-ipu6
-  # corrupts IVSC/CSE state and turns a soft wedge into a reboot-only hard
-  # wedge (learned the hard way).
+  # build — exactly what opening Cheese does. Restarting the relay does
+  # the same: the new relayd reads the loopback's client-usage count on
+  # subscribe (V4L2_EVENT_PRI_CLIENT_USAGE) and rebuilds the producer
+  # against the still-attached consumer, whose starving capture stream
+  # then unblacks in place. This watchdog automates that: detect the
+  # wedge in the relay journal, restart the relay. Detection is passive
+  # journal-grep, so demand-driven is preserved (camera LED stays off
+  # when idle, zero idle CPU). Two wedge signals are matched:
+  #   - the HAL waitFrame line (frame-starved producer), and
+  #   - a run of systemd "Scheduled restart job" lines (relay
+  #     crash-looping, e.g. icamerasrc dying at pipeline build — observed
+  #     on dellan at 5s cadence for hours, silently).
   #
-  # Bounded exactly like research-agent-microvm-healthcheck.nix: after
-  # GIVEUP_AFTER restarts with no healthy tick in between, it latches
-  # gave-up, fires a critical desktop notification (a hard wedge lives in
-  # kernel/firmware/IVSC and only a reboot escapes it), and stops
-  # restarting until the camera recovers. Same flag-file + PathChanged
-  # user-unit notification chain as nixos-auto-deploy.nix.
+  # Deliberate non-choices, verified the hard way:
+  #   - NO active frame probe (v4l2-ctl/gst grab) as a detection signal
+  #     or recovery prime: a second reader's REQBUFS against the loopback
+  #     gets EBUSY while a consumer (Chrome) holds the capture stream
+  #     token on current v4l2loopback, and on older versions it can
+  #     destroy the consumer's live stream outright. A probe would
+  #     false-fail during every healthy call.
+  #   - NEVER touch the PCI bus: rebinding the IPU6 device corrupts
+  #     IVSC/CSE state and turns a soft wedge into a reboot-only hard
+  #     wedge.
+  #
+  # Bounded like research-agent-microvm-healthcheck.nix (cooldown, burst
+  # counter, give-up latch + desktop notification, auto re-arm), with one
+  # deviation: latches clear only after a sustained quiet streak
+  # (CLEAR_AFTER_S), not on a single quiet tick. CamHAL stdout reaches
+  # journald in delayed multi-minute bursts when the logSink=SYSLOG knob
+  # above is ineffective; clearing on one quiet tick would reset the
+  # burst counter between bursts and the give-up latch could never fire
+  # on a hard wedge (infinite restart loop, no notification). The streak
+  # must exceed the worst observed flush interval (~4 min).
   systemd.tmpfiles.rules = [
     "d /run/ipu6-camera-watchdog 0700 root root -"
     # Notify flag lives in a world-readable dir so the user-session path
@@ -173,50 +196,66 @@
     serviceConfig = {
       Type = "oneshot";
       User = "root"; # `systemctl restart` of the relay needs root
-      # 60s (not 30s): a recovery does a *blocking* `systemctl restart` of
-      # the relay, whose own ExecStartPost prime can take up to ~15s, plus
-      # this script's sleep 5 + timeout 8 prime (~28s worst case). A 30s
-      # cap could SIGTERM the oneshot mid-recovery — after the burst
-      # counter was already incremented — biasing toward premature give-up.
-      TimeoutStartSec = "60s";
+      # Recovery uses `restart --no-block`, so a tick is journalctl + a
+      # queued job — seconds. 30s is generous headroom; a SIGTERM'd tick
+      # mid-recovery would strand an incremented burst counter, so the
+      # script is kept short rather than the timeout long.
+      TimeoutStartSec = "30s";
     };
-    path = [ pkgs.systemd pkgs.v4l-utils pkgs.coreutils pkgs.gnugrep ];
+    path = [ pkgs.systemd pkgs.coreutils pkgs.gnugrep ];
+    # NB: NixOS makeJobScript runs this under `bash -e`; every command
+    # that may legitimately fail is guarded. Script-body comments must
+    # not contain the strings the vm-base PCI-guard greps reject.
     script = ''
       set -u
 
       STATE_DIR=/run/ipu6-camera-watchdog
       LAST_RESTART_FILE="$STATE_DIR/last-restart-epoch"
+      WEDGE_SEEN_FILE="$STATE_DIR/last-wedge-epoch"
       BURST_FILE="$STATE_DIR/restart-burst-count"
       GAVEUP_FILE="$STATE_DIR/gave-up"
       NOTIFY_FILE=/run/ipu6-camera-notify/wedged
       RELAY=v4l2-relayd-ipu6.service
-      DEV=/dev/video50
       WEDGE_RE='waitFrame, time out happens'
-      # waitFrame lines in the look-back window before we call it wedged.
-      # The HAL logs one per ~5s and never self-heals, so >=2 means the
-      # wedge has persisted >~5s — past any benign single timeout at
-      # stream start, while still detecting within one or two ticks.
+      THRASH_RE='Scheduled restart job'
+      # The HAL emits waitFrame every ~5s early in a wedge, backing off to
+      # ~60s after the first minute (measured). 2 lines in a 150s window
+      # catches both cadences while a benign single timeout at stream
+      # start stays below threshold.
       WEDGE_THRESHOLD=2
-      LOOKBACK_S=18
-      # Consecutive restarts with no healthy tick in between before giving
-      # up. 2 = "a restart didn't fix it, and neither did the next" — past
+      # Relay auto-restarts run at RestartSec=5s when icamerasrc dies at
+      # pipeline build; 5 scheduled restarts in the window means a crash
+      # loop, not a one-off blip (boot settling produces a handful at
+      # most, and OnBootSec delays the first tick past it).
+      THRASH_THRESHOLD=5
+      LOOKBACK_S=150
+      # Never count journal lines received before (last restart +
+      # margin): the dying relay's buffered stdout flushes at kill time,
+      # landing right at the restart timestamp, and must not be mistaken
+      # for a fresh wedge.
+      ANCHOR_MARGIN_S=5
+      # 2 = "a restart didn't fix it, and neither did the next" — past
       # that the wedge is in kernel/firmware and only a reboot escapes.
       GIVEUP_AFTER=2
       RENOTIFY_S=3600
-      # 60s cooldown: a real recovery takes one restart (~5s rebuild). If
-      # a restart didn't clear the waitFrame loop, restarting 12s later
-      # won't either, and rapid icamerasrc start/stop is itself a
-      # documented wedge trigger — so give the rebuild room to settle.
-      # State in /run (tmpfs) is wiped on reboot, which is correct: a
-      # reboot is a far longer cooldown and clears any hard wedge anyway.
+      # A real recovery takes one restart (~5-20s incl. the relay's own
+      # prime). Rapid icamerasrc start/stop is itself a documented wedge
+      # trigger, so give each rebuild room to settle. State in /run
+      # (tmpfs) is wiped on reboot — correct, a reboot clears any wedge.
       COOLDOWN_S=60
+      # Quiet streak required before burst/give-up state clears. MUST
+      # exceed the worst CamHAL stdout flush interval (~4 min measured):
+      # clearing on a single quiet tick would reset the burst counter
+      # between delayed log bursts and the give-up latch could never
+      # fire on a hard wedge.
+      CLEAR_AFTER_S=600
 
       mkdir -p "$STATE_DIR"
 
       # Read a non-negative integer from a state file. Strips non-digits
       # and clamps to 12 chars. Empty/missing/corrupt -> 0. Without this,
-      # `set -u` + arithmetic on a garbage byte would abort the script and
-      # brick the watchdog forever (see healthcheck rationale).
+      # arithmetic on a garbage byte would abort the script under -e/-u
+      # and brick the watchdog forever (see healthcheck rationale).
       read_int() {
         local v
         v=$(cat "$1" 2>/dev/null | tr -cd '0-9' | head -c 12)
@@ -226,36 +265,43 @@
 
       now=$(date +%s)
 
-      # Passive detection: count waitFrame lines in the recent relay
-      # journal. Anchor the window so we never re-count lines emitted
-      # *before* our last restart — otherwise the pre-recovery waitFrame
-      # spam still inside the lookback window could be mistaken for a
-      # fresh wedge right after a successful heal. The window is the last
-      # LOOKBACK_S seconds, clamped to start no earlier than 1s past the
-      # last restart. (This makes correctness independent of the
-      # cooldown-vs-lookback timing relationship.)
       window_start=$((now - LOOKBACK_S))
-      last_restart=$(read_int "$LAST_RESTART_FILE")
-      [ "$last_restart" -gt "$window_start" ] && window_start=$((last_restart + 1))
-      since_ts=$(date -d "@$window_start" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$LOOKBACK_S sec ago")
-      # grep -c exits 1 on zero matches; `|| true` keeps that from
-      # aborting under the assignment.
-      wedge_lines=$(journalctl -u "$RELAY" --since "$since_ts" --no-pager 2>/dev/null | grep -c "$WEDGE_RE") || true
-      wedge_lines=$(printf '%s' "$wedge_lines" | tr -cd '0-9')
-      [ -z "$wedge_lines" ] && wedge_lines=0
+      anchor=$(( $(read_int "$LAST_RESTART_FILE") + ANCHOR_MARGIN_S ))
+      if [ "$anchor" -gt "$window_start" ]; then
+        window_start=$anchor
+      fi
+      since_ts=$(date -d "@$window_start" "+%Y-%m-%d %H:%M:%S" 2>/dev/null) || since_ts="$LOOKBACK_S sec ago"
 
-      if [ "$wedge_lines" -lt "$WEDGE_THRESHOLD" ]; then
-        # Not wedged (healthy-in-use, or idle). Clear any latch so a
-        # future wedge starts from a clean slate and re-notifies.
+      journal=$(journalctl -u "$RELAY" --since "$since_ts" --no-pager 2>/dev/null) || journal=""
+      # grep -c exits 1 on zero matches; `|| true` keeps that from
+      # aborting the assignment under -e.
+      wedge_lines=$(printf '%s' "$journal" | grep -c "$WEDGE_RE") || true
+      thrash_lines=$(printf '%s' "$journal" | grep -c "$THRASH_RE") || true
+      wedge_lines=$(printf '%s' "$wedge_lines" | tr -cd '0-9'); [ -n "$wedge_lines" ] || wedge_lines=0
+      thrash_lines=$(printf '%s' "$thrash_lines" | tr -cd '0-9'); [ -n "$thrash_lines" ] || thrash_lines=0
+
+      wedged=0
+      if [ "$wedge_lines" -ge "$WEDGE_THRESHOLD" ] || [ "$thrash_lines" -ge "$THRASH_THRESHOLD" ]; then
+        wedged=1
+      fi
+
+      if [ "$wedged" -eq 0 ]; then
+        # Quiet tick. Clear latches only after a sustained quiet streak —
+        # absence of lines is NOT proof of health while CamHAL stdout may
+        # still be buffering (see CLEAR_AFTER_S rationale).
         if [ -e "$GAVEUP_FILE" ] || [ "$(read_int "$BURST_FILE")" -gt 0 ]; then
-          echo "watchdog: camera healthy; clearing restart-burst/give-up state"
-          rm -f "$GAVEUP_FILE"
-          echo 0 > "$BURST_FILE"
+          last_wedge=$(read_int "$WEDGE_SEEN_FILE")
+          if [ $((now - last_wedge)) -ge "$CLEAR_AFTER_S" ]; then
+            echo "watchdog: quiet for ''${CLEAR_AFTER_S}s+; clearing restart-burst/give-up state"
+            rm -f "$GAVEUP_FILE"
+            echo 0 > "$BURST_FILE"
+          fi
         fi
         exit 0
       fi
 
-      echo "watchdog: waitFrame wedge detected ($wedge_lines lines in window)"
+      echo "watchdog: wedge signal (waitFrame=$wedge_lines, relay-restarts=$thrash_lines in window)"
+      echo "$now" > "$WEDGE_SEEN_FILE"
 
       # Give-up gate: stop restarting once the burst budget is spent.
       burst=$(read_int "$BURST_FILE")
@@ -279,24 +325,20 @@
       last=$(read_int "$LAST_RESTART_FILE")
       since_last=$((now - last))
       if [ "$since_last" -lt "$COOLDOWN_S" ]; then
-        echo "watchdog: wedge seen but cooldown active (''${since_last}s < ''${COOLDOWN_S}s); not restarting"
+        echo "watchdog: wedge but cooldown active (''${since_last}s < ''${COOLDOWN_S}s); not restarting"
         exit 0
       fi
 
-      # Recover — mimic opening Cheese. Restart the relay (tears the
-      # wedged icamerasrc to NULL and rebuilds the producer against the
-      # still-attached consumer), then prime one frame to force a fresh
-      # STREAMON in case the consumer detached. The NEXT tick verifies: no
-      # waitFrame -> healthy -> burst/give-up latch cleared above.
+      # Recover: restart the relay. The new relayd reads the loopback's
+      # client-usage count on subscribe and rebuilds the icamerasrc
+      # producer against the still-attached consumer; its ExecStartPost
+      # prime covers the no-consumer case. No frame-grab here — a second
+      # reader's REQBUFS gets EBUSY (or worse) while a consumer streams.
+      # --no-block keeps this oneshot short; the next ticks verify.
       echo "$now" > "$LAST_RESTART_FILE"
       echo $((burst + 1)) > "$BURST_FILE"
-      echo "watchdog: recovering — restart $RELAY + prime (mimics opening Cheese)"
-      systemctl restart "$RELAY" || true
-      sleep 5
-      # The prime is a transient consumer: it opens the loopback, grabs
-      # one frame, and exits, so it does not keep the sensor powered —
-      # the demand-driven / LED-off-when-idle invariant is preserved.
-      timeout 8 v4l2-ctl -d "$DEV" --stream-mmap --stream-count=1 --stream-to=/dev/null >/dev/null 2>&1 || true
+      echo "watchdog: recovering — restarting $RELAY (rebuilds the icamerasrc producer)"
+      systemctl restart --no-block "$RELAY" || true
       exit 0
     '';
   };
@@ -305,11 +347,14 @@
     description = "Periodic IPU6 camera waitFrame-wedge probe";
     wantedBy = [ "timers.target" ];
     timerConfig = {
-      # Short boot delay so the sensor stack + relay settle first.
+      # Boot delay past the relay's cold-boot settling (a few auto-
+      # restarts are normal there and must not trip the thrash signal).
       OnBootSec = "90s";
-      # 12s cadence: with an 18s look-back and a 2-line threshold, a wedge
-      # is caught within ~one to two ticks (~12-24s of black) then healed.
-      OnUnitActiveSec = "12s";
+      # 15s cadence: with syslog-delivered HAL lines (5s cadence early in
+      # a wedge), detection + restart lands within ~15-30s of wedge
+      # onset. With bursty stdout fallback it degrades to the flush
+      # interval (2-4 min) but stays correct.
+      OnUnitActiveSec = "15s";
       # Don't replay missed ticks all at once after suspend/resume.
       Persistent = false;
       Unit = "ipu6-camera-watchdog.service";
