@@ -100,6 +100,16 @@
     assert jprop == "b false", \
         f"jonathan hidden from greeter (SystemAccount={jprop!r})"
 
+    # The drift-warning banner (home/jonathan.nix loginExtra) is gated to
+    # interactive shells; it must NOT leak into a non-interactive
+    # `su - -c '…'`, or it pollutes scripted output (it previously broke
+    # the GEMINI_API_KEY_FILE assertion below, and would break any su -c
+    # parse like the camera-watchdog checks).
+    drift_leak = dellan.succeed("su - jonathan -c 'true'")
+    assert "drift warning" not in drift_leak, (
+        f"drift banner leaked into non-interactive login shell:\n{drift_leak}"
+    )
+
     # home.sessionVariables.GEMINI_API_KEY_FILE must reach jonathan's
     # interactive shell — prose-decorate --audio and any future Gemini
     # tool reads this env var to find the agenix-decrypted key. `su -`
@@ -111,6 +121,78 @@
     assert gemini_var == "/run/agenix/gemini-api-key", (
         f"GEMINI_API_KEY_FILE in jonathan's login shell = {gemini_var!r}, "
         f"expected '/run/agenix/gemini-api-key'"
+    )
+
+    # ── IPU6 camera self-heal watchdog (modules/nixos/laptop.nix) ──
+    # The real recovery can't be modelled in a VM (no OV02C10 sensor /
+    # IVSC), so — like the kindle udev rule above — this asserts the
+    # wiring is installed correctly and that the script's healthy/no-op
+    # path runs cleanly under real systemd. The state machine itself is
+    # covered exhaustively by the runtime-invocation suite; full sensor
+    # recovery is verified on dellan after deploy.
+    dellan.succeed(
+        "systemctl cat ipu6-camera-watchdog.timer "
+        "| grep -q 'OnUnitActiveSec=15s'"
+    )
+    # The relay must carry the syslog log-sink env: with the default
+    # stdout sink, CamHAL lines reach journald in multi-minute buffered
+    # bursts and watchdog detection latency degrades from ~15-30s to the
+    # flush interval.
+    dellan.succeed(
+        "systemctl cat v4l2-relayd-ipu6.service | grep -q 'logSink=SYSLOG'"
+    )
+    cam_script = dellan.succeed(
+        "systemctl cat ipu6-camera-watchdog.service "
+        "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
+    ).strip()
+    # Recovery must restart the relay by name, non-blocking, and key off
+    # both wedge signals (a rename of any silently breaks self-heal).
+    dellan.succeed(f"grep -q 'systemctl restart --no-block' {cam_script}")
+    dellan.succeed(f"grep -q 'v4l2-relayd-ipu6.service' {cam_script}")
+    dellan.succeed(f"grep -q 'waitFrame, time out happens' {cam_script}")
+    dellan.succeed(f"grep -q 'Scheduled restart job' {cam_script}")
+    # Hard regression guard: the watchdog must NEVER touch the PCI bus.
+    # Unbind/rebind of intel-ipu6 corrupts IVSC/CSE state and turns a
+    # soft wedge into a reboot-only hard wedge (learned empirically).
+    dellan.fail(f"grep -q 'unbind' {cam_script}")
+    dellan.fail(f"grep -q 'intel-ipu6' {cam_script}")
+    # Give-up latch + notify flag — regression guard against restart-
+    # forever (same failure class as the microvm watchdog incident).
+    dellan.succeed(f"grep -q 'restart-burst-count' {cam_script}")
+    dellan.succeed(f"grep -q 'GIVING UP' {cam_script}")
+    dellan.succeed(f"grep -q '/run/ipu6-camera-notify/wedged' {cam_script}")
+    dellan.succeed("test -f /etc/systemd/user/ipu6-camera-watchdog-notify.path")
+    dellan.succeed(
+        "test -f /etc/systemd/user/ipu6-camera-watchdog-notify.service"
+    )
+    cam_notify_perms = dellan.succeed(
+        "stat -c '%a %U' /run/ipu6-camera-notify"
+    ).strip()
+    assert cam_notify_perms == "755 root", (
+        f"camera notify flag dir perms expected '755 root', got {cam_notify_perms!r}"
+    )
+    # No camera in the VM: the relay emits no waitFrame (quiet path) or
+    # crash-loops without a sensor (thrash path → a harmless --no-block
+    # restart). Either way a run must exit 0, never 'failed'.
+    dellan.succeed("systemctl start ipu6-camera-watchdog.service")
+    rc = dellan.succeed(
+        "systemctl is-failed ipu6-camera-watchdog.service || true"
+    ).strip()
+    assert rc != "failed", (
+        f"camera watchdog must no-op cleanly with no camera; got is-failed={rc!r}"
+    )
+    # Corrupt state file MUST NOT brick the watchdog (read_int clamp);
+    # mirrors the microvm watchdog's corruption guard.
+    dellan.succeed(
+        "mkdir -p /run/ipu6-camera-watchdog "
+        "&& printf 'abc\\n0\\n5garbage' > /run/ipu6-camera-watchdog/restart-burst-count"
+    )
+    dellan.succeed("systemctl start ipu6-camera-watchdog.service")
+    rc = dellan.succeed(
+        "systemctl is-failed ipu6-camera-watchdog.service || true"
+    ).strip()
+    assert rc != "failed", (
+        f"camera watchdog must survive corrupted state; got is-failed={rc!r}"
     )
   '';
 }
