@@ -1,5 +1,11 @@
 { pkgs, ... }:
 {
+  imports = [
+    # Camera relay dies without write-buffer headroom on the loopback
+    # device — see the module for the full post-mortem.
+    ./v4l2loopback-buffers.nix
+  ];
+
   # Intel CPU microcode updates
   hardware.cpu.intel.updateMicrocode = true;
 
