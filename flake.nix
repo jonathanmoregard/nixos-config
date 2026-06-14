@@ -134,6 +134,7 @@
         };
       in {
         vm-base         = mkLane ./tests/base.nix;
+        vm-camera-relay = mkLane ./tests/camera-relay.nix;
         vm-desktop      = mkLane ./tests/desktop.nix;
         vm-keyring      = mkLane ./tests/keyring.nix;
         vm-kitty        = mkLane ./tests/kitty.nix;
