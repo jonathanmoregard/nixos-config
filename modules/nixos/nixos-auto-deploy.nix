@@ -81,10 +81,24 @@ let
       { IFS= read -r recorded_sha || true; } < "$STATE/last-deployed-sha" 2>/dev/null || true
 
       cd "${cfg.workingDir}"
-      ${lib.optionalString (cfg.sshKeyFile != null) ''
-        export GIT_SSH_COMMAND="ssh -i ${cfg.sshKeyFile} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-      ''}
-      git fetch --quiet origin "${cfg.branch}"
+      # Bound every network op so a stalled TCP/ssh connection (DNS
+      # hang, half-open socket, GitHub blip) ABORTS instead of wedging
+      # the deploy forever while holding the flock. Incident 2026-06-14:
+      # a fetch stall left nixos-deploy "activating" for 17h, and every
+      # later timer tick hit `flock -n` and silently no-op'd, so merged
+      # PRs never reached the host. ConnectTimeout caps the handshake;
+      # ServerAlive* tears down a connection that goes silent
+      # mid-transfer (3 missed 15s probes -> abort).
+      export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4${lib.optionalString (cfg.sshKeyFile != null) " -i ${cfg.sshKeyFile} -o IdentitiesOnly=yes"}"
+      # Belt-and-braces over the ssh keepalives: bound the whole fetch
+      # so a connected-but-stalled upload-pack still can't run unbounded.
+      # On failure: release the flock (exit) and let the next timer tick
+      # retry — a transient network blip is NOT a poisoned commit, so we
+      # must not fall through to the poison-latch path below.
+      if ! timeout 120 git fetch --quiet origin "${cfg.branch}"; then
+        echo "git fetch failed or timed out (120s); releasing lock, will retry next tick"
+        exit 1
+      fi
       target_sha=$(git rev-parse "origin/${cfg.branch}")
 
       # Step 5: poison-latch check + auto-clear.
@@ -223,6 +237,27 @@ in
         Type = "oneshot";
         ExecStart = "${deployScript}/bin/nixos-deploy";
         StateDirectory = "nixos-deploy";
+        # Hard backstop independent of the in-script `timeout` on the
+        # fetch: bounds the ENTIRE run, so a hang anywhere downstream
+        # (a `nixos-rebuild switch` wedged on an unreachable substituter,
+        # say) can't hold the deploy lock indefinitely the way the
+        # 2026-06-14 fetch stall did (17h "activating"). 60min
+        # comfortably exceeds any real cached/semi-cached switch; a
+        # truly cold full rebuild that needs longer is retried on the
+        # next timer tick (more in cache by then).
+        #
+        # Conscious tradeoff (the alternative — no backstop — reopens the
+        # unbounded-wedge hole for every non-fetch hang): on expiry
+        # systemd SIGTERMs then SIGKILLs the run. Almost always that
+        # lands in the long build phase (harmless — no system change).
+        # The narrow risk is a cold build that burns ~59min then gets
+        # killed mid `switch-to-configuration`, leaving a half-applied
+        # generation. That is recoverable, not bricking:
+        # switch-to-configuration is re-entrant, last-deployed-sha is
+        # only written on SUCCESS, so the next tick re-runs switch to the
+        # SAME target_sha and re-converges. Net: bounded-wedge +
+        # self-healing beats unbounded-wedge.
+        TimeoutStartSec = "60min";
       };
     };
 
