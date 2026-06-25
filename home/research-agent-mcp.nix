@@ -49,8 +49,17 @@
         EXA_API_KEY=$(< /run/agenix/exa-api-key)
         TAVILY_API_KEY=$(< /run/agenix/tavily-api-key)
         CLAUDE_CODE_OAUTH_TOKEN=$(< /run/agenix/claude-token)
+        # EUIPO OAuth2 client_credentials for the trademark_shim. Both
+        # files start empty (placeholder) and decrypt to empty strings
+        # until the EUIPO dev-portal subscription is approved; the shim's
+        # _clean_env() guard treats an empty value as unset and the tool
+        # errors cleanly only when actually called — so existing research
+        # paths keep working with the secrets unset.
+        EUIPO_CLIENT_ID=$(< /run/agenix/euipo-client-id)
+        EUIPO_CLIENT_SECRET=$(< /run/agenix/euipo-client-secret)
         export ANTHROPIC_API_KEY OPENAI_API_KEY \
-               EXA_API_KEY TAVILY_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+               EXA_API_KEY TAVILY_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
+               EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET
 
         # Host-to-VM SSH private key. The mcp_server reads this lazily
         # in _ssh_settings(); we only need to point it at the agenix

@@ -118,6 +118,26 @@
     group = "users";
     mode = "0400";
   };
+  # EUIPO OAuth2 credentials for the research-agent's trademark_shim
+  # (queries the EU trademark register over its REST API). Both files
+  # are empty placeholders until the EUIPO developer-portal
+  # subscription is approved — the shim treats empty values as unset
+  # and errors cleanly only when the tool is actually called, so
+  # leaving these unset does not break any existing research path.
+  # When the keys land, replace the file contents with
+  # `nix run .#agenix -- edit secrets/euipo-client-id.age` (then -- rekey).
+  age.secrets.euipo-client-id = {
+    rekeyFile = ../../secrets/euipo-client-id.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.euipo-client-secret = {
+    rekeyFile = ../../secrets/euipo-client-secret.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
 
   # Private half of the SSH keypair the MCP server uses to ssh into the
   # research-agent microvm. Matching public key is plaintext inside
