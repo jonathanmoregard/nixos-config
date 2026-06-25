@@ -125,7 +125,7 @@
   # and errors cleanly only when the tool is actually called, so
   # leaving these unset does not break any existing research path.
   # When the keys land, replace the file contents with
-  # `nix run .#agenix -- edit secrets/euipo-client-id.age` (then -- rekey).
+  # `agenix -e euipo-client-id.age` / `euipo-client-secret.age`.
   age.secrets.euipo-client-id = {
     rekeyFile = ../../secrets/euipo-client-id.age;
     owner = "jonathan";
