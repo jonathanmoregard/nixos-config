@@ -26,6 +26,7 @@ in
     ./jonathan.nix
     ./cinnamon.nix
     ./desktop-apps.nix
+    ./calibre-plugins.nix
     ./ghostty.nix
     ./kitty.nix
     ./autodoro.nix
@@ -35,6 +36,13 @@ in
     ./claude-skills.nix
     ./research-agent-mcp.nix
   ];
+
+  # Point Gemini-aware tools at the agenix-decrypted key path. Consumers
+  # (prose-decorate --audio, future Gemini tools) read this env var and
+  # do `Path($GEMINI_API_KEY_FILE).read_text().strip()` — wrapping with
+  # writeShellApplication is unnecessary because home.sessionVariables
+  # reach interactive shells (which is where prose-decorate runs).
+  home.sessionVariables.GEMINI_API_KEY_FILE = "/run/agenix/gemini-api-key";
 
   # User crontab — declarative source of truth. Re-applied on every rebuild
   # (overwrites any ad-hoc `crontab -e` edits).

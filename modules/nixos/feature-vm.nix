@@ -104,8 +104,12 @@
         # that path; in the feature-vm we 9p-mount the host worktree so
         # the inner microvm's virtiofs share for /workspace has actual
         # code to run for an E2E research() call.
+        #
+        # Path tracks the worktree currently under test — the scraper
+        # microvm needs `scraper/server.py` from this branch's
+        # research-agent worktree at /workspace/scraper/server.py.
         "-virtfs"
-        "local,path=/home/jonathan/worktrees/research-agent-feat-microvm-migration,security_model=mapped-xattr,mount_tag=research-agent"
+        "local,path=/home/jonathan/worktrees/research-agent-js-render,security_model=mapped-xattr,mount_tag=research-agent"
       ];
 
       # Mount the host-ssh 9p export read-only at /mnt/host-ssh.
@@ -189,7 +193,7 @@
     # desktop session via QMP send-key without typing credentials at the
     # greeter every boot. Matches `tests/lib/common.nix`'s autologin
     # override — both are test/smoke contexts and never reach prod.
-    services.xserver.displayManager.autoLogin = {
+    services.displayManager.autoLogin = {
       enable = lib.mkForce true;
       user = "jonathan";
     };

@@ -4,6 +4,9 @@
   # tests/lib/common.nix' minimal node so the framework can boot the
   # ephemeral VM without touching EFI variables.
   boot.loader.systemd-boot.enable = true;
+  # Cap boot menu to 8 most recent generations (older ones still GC-able
+  # via nix-collect-garbage; this only trims the menu + /boot entries).
+  boot.loader.systemd-boot.configurationLimit = 8;
   boot.loader.efi.canTouchEfiVariables = true;
 
   # Networking — NetworkManager + hostname

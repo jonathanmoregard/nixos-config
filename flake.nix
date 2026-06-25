@@ -10,6 +10,24 @@
     agenix.url = "github:ryantm/agenix";
     agenix.inputs.nixpkgs.follows = "nixpkgs";
 
+    # agenix-rekey: extends agenix with a master-identity model so each
+    # host's per-pubkey ciphertext is derived automatically from one
+    # canonical secret. Removes the per-secret `publicKeys` bookkeeping
+    # in secrets/secrets.nix and lets new hosts (test-vm, future
+    # laptops) decrypt without re-editing every .age file.
+    agenix-rekey.url = "github:oddlama/agenix-rekey";
+    agenix-rekey.inputs.nixpkgs.follows = "nixpkgs";
+
+    # Personal CLI tools — own uv2nix flakes, exposed system-wide via
+    # `modules/nixos/listen-tools.nix`. Pinned to a tag in production
+    # eventually; track main for now.
+    tts-tool.url = "github:jonathanmoregard/tts-tool";
+    tts-tool.inputs.nixpkgs.follows = "nixpkgs";
+    substack-url-tool.url = "github:jonathanmoregard/substack-url-tool";
+    substack-url-tool.inputs.nixpkgs.follows = "nixpkgs";
+    prose-decorate.url = "github:jonathanmoregard/prose-decorate";
+    prose-decorate.inputs.nixpkgs.follows = "nixpkgs";
+
     # microvm.nix — qemu+KVM microvm host module. Tracking `main`
     # because the most recent tagged release (v0.5.0, 2024-04) calls
     # `pkgs.writeReferencesToFile` which has been removed in current
@@ -21,7 +39,8 @@
     microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, home-manager, agenix, microvm, ... }:
+  outputs = { self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
+              tts-tool, substack-url-tool, prose-decorate, ... }:
   let
     linuxSystem = "x86_64-linux";
 
@@ -30,10 +49,33 @@
     # reuse the same pkgs: the nixosTest framework injects pkgs
     # externally and that makes `nixpkgs.config` / `nixpkgs.overlays`
     # read-only inside modules.
+    #
+    # The listen-tools overlay exposes the standalone CLI packages
+    # (substack-url-tool, tts-tool) as plain `pkgs.<name>` attributes
+    # so modules don't need flake-input specialArgs threading.
     pkgsLinux = import nixpkgs {
       system = linuxSystem;
       config.allowUnfree = true;
-      overlays = [ (import ./overlays/beeper.nix) ];
+      # Required for pkgs.androidenv.composeAndroidPackages — the
+      # Android SDK terms of service must be accepted at evaluation
+      # time, otherwise the derivation fails with a redirect to
+      # `https://developer.android.com/studio/terms`. Consumed by
+      # modules/nixos/android-dev.nix. Note: the flag scopes to this
+      # whole `pkgsLinux` instance, so any future module that pulls in
+      # an androidenv derivation auto-accepts the license. Today only
+      # `android-dev.nix` does — if a build-farm host or anything
+      # contributor-facing imports androidenv, scope a separate pkgs
+      # import without this flag.
+      config.android_sdk.accept_license = true;
+      overlays = [
+        (import ./overlays/beeper.nix)
+        (import ./overlays/auphonic-cli.nix)
+        (final: prev: {
+          tts-tool = tts-tool.packages.${linuxSystem}.default;
+          substack-url-tool = substack-url-tool.packages.${linuxSystem}.default;
+          prose-decorate = prose-decorate.packages.${linuxSystem}.default;
+        })
+      ];
     };
   in {
     # NixOS VM (headless, QEMU/KVM)
@@ -45,6 +87,7 @@
         ./modules/common.nix
         ./modules/nixos/vm-tweaks.nix
         agenix.nixosModules.default
+        agenix-rekey.nixosModules.default
         { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
         home-manager.nixosModules.home-manager
         {
@@ -64,6 +107,7 @@
         ./hosts/dellan/default.nix
         ./modules/common.nix
         agenix.nixosModules.default
+        agenix-rekey.nixosModules.default
         { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
         microvm.nixosModules.host
         home-manager.nixosModules.home-manager
@@ -86,16 +130,20 @@
       let
         mkLane = path: import path {
           pkgs = pkgsLinux;
-          inputs = { inherit home-manager agenix microvm; };
+          inputs = { inherit home-manager agenix agenix-rekey microvm; };
         };
       in {
-        vm-base        = mkLane ./tests/base.nix;
-        vm-desktop     = mkLane ./tests/desktop.nix;
-        vm-keyring     = mkLane ./tests/keyring.nix;
-        vm-kitty       = mkLane ./tests/kitty.nix;
-        vm-claude-pane = mkLane ./tests/claude-pane.nix;
-        vm-autodoro    = mkLane ./tests/autodoro.nix;
-        vm-microvm     = mkLane ./tests/microvm.nix;
+        vm-base         = mkLane ./tests/base.nix;
+        vm-auto-deploy  = mkLane ./tests/auto-deploy.nix;
+        vm-camera-relay = mkLane ./tests/camera-relay.nix;
+        vm-desktop      = mkLane ./tests/desktop.nix;
+        vm-keyring      = mkLane ./tests/keyring.nix;
+        vm-kitty        = mkLane ./tests/kitty.nix;
+        vm-claude-pane  = mkLane ./tests/claude-pane.nix;
+        vm-autodoro     = mkLane ./tests/autodoro.nix;
+        vm-microvm      = mkLane ./tests/microvm.nix;
+        vm-listen-tools = mkLane ./tests/listen-tools.nix;
+        vm-android-dev  = mkLane ./tests/android-dev.nix;
       };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.
@@ -221,5 +269,15 @@
     # `nix run .#update-beeper` — rewrites overlays/beeper.nix to the latest
     # upstream Beeper release. Wired into .github/workflows/update-beeper.yml.
     packages.${linuxSystem}.update-beeper = pkgsLinux.beeper-update;
+
+    # agenix-rekey CLI plumbing. Exposes:
+    #   nix run .#agenix -- generate           — bootstrap missing rekeyed copies
+    #   nix run .#agenix -- edit <file>.age    — decrypt-edit-re-encrypt with master
+    #   nix run .#agenix -- rekey              — regenerate per-host rekeyed copies
+    #   nix run .#agenix -- update-masterkeys  — bulk re-encrypt to a new master
+    agenix-rekey = agenix-rekey.configure {
+      userFlake = self;
+      nixosConfigurations = self.nixosConfigurations;
+    };
   };
 }

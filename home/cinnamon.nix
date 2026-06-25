@@ -89,19 +89,11 @@ in
     X-GNOME-Autostart-enabled=true
   '';
 
-  # Voquill (local) autostart — locally built voice typing app
-  home.file.".config/autostart/voquill.desktop".text = ''
-    [Desktop Entry]
-    Type=Application
-    Version=1.0
-    Name=Voquill (local)
-    Comment=Voquill (local) startup script
-    Exec=/home/jonathan/Repos/voquill/apps/desktop/src-tauri/target/debug/Voquill --voquill-autostart-hidden
-    StartupNotify=false
-    Terminal=false
-    Hidden=false
-    X-GNOME-Autostart-enabled=true
-  '';
+  # Voquill autostart intentionally NOT declared here: it is launched by
+  # systemd.user.services.voquill (home/router-services.nix) via voquillWrapper,
+  # which injects LD_LIBRARY_PATH and execs the release binary. A previous
+  # cinnamon autostart entry here pointed at the stale debug binary and raced
+  # with the systemd unit on every login (proposals/2026-05-05-voquill-autostart-race.md).
 
   # Cinnamon applet configs — written as real files (not symlinks) so applets can read/write them
   home.activation.cinnamonAppletConfigs = lib.hm.dag.entryAfter ["writeBoundary"] ''
@@ -379,6 +371,8 @@ in
       "image/bmp" = "xviewer.desktop";
       "image/webp" = "xviewer.desktop";
       "inode/directory" = "nemo.desktop";
+      "x-scheme-handler/magnet" = "org.qbittorrent.qBittorrent.desktop";
+      "application/x-bittorrent" = "org.qbittorrent.qBittorrent.desktop";
     };
   };
 }

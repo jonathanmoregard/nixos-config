@@ -23,61 +23,63 @@
 # Run: nix build .#checks.x86_64-linux.vm-kitty -L
 { pkgs, inputs }:
 let
-  # Phase A — copy-pipeline round-trip. Mirrors the EXACT shell command
-  # that the ctrl+shift+c binding invokes (see home/kitty.nix). Lives
-  # outside the testScript so its multi-line payload doesn't fight the
-  # Nix `''` indent-strip — the original inline-heredoc form broke the
-  # generated test-script with a Python "unexpected indent" lint error
-  # because the shebang at column 0 forced strip-width = 0, leaving the
-  # surrounding 4-space test-script indent in place on line 1.
+  # Phase A — TUI hanging-indent unwrap regression. Drives the EXACT
+  # shell pipeline the ctrl+shift+c binding invokes (see home/kitty.nix),
+  # with xclip replaced by a file sink. Reason for file: xclip in the
+  # bare-xterm test VM daemonises waiting for a paste-request that
+  # never arrives and hangs the pipe-parent indefinitely. xclip is
+  # kitty's already-stable primitive — what we changed is the SHELL
+  # TRANSFORM (`| kitty-copy-unwrap`), which is fully sink-independent.
+  #
+  # PAYLOAD below is the VERBATIM mangled clipboard contents from a
+  # 2026-05-22 session: a single-line PCI rebind command that the
+  # claude-code TUI wrapped across 5 physical rows with a 2-space
+  # hanging indent, copied raw with the prior "preserve newlines"
+  # binding, pasted into a shell, and exploded into 5 broken sub-
+  # commands. EXPECTED is the original single line the AI typed.
+  #
+  # Fails if the unwrap heuristic regresses: binding loses the
+  # `| kitty-copy-unwrap` stage, kitten algorithm misdetects K,
+  # rstrip dropped, or block join switches from ' '.join to ''.join.
+  #
+  # Lives outside the testScript so its multi-line payload doesn't
+  # fight the Nix `''` indent-strip — the original inline-heredoc form
+  # broke the generated test-script with a Python "unexpected indent"
+  # lint error because the shebang at column 0 forced strip-width = 0,
+  # leaving the surrounding 4-space test-script indent in place.
   testCopyPipeline = pkgs.writeShellScript "vm-kitty-test-copy-pipeline" ''
     set -euo pipefail
-    PAYLOAD='line one
-    line two with spaces
-    line three
-        four-indented
-    line five'
-    # Mirrors the EXACT shape of the prod ctrl+shift+c binding's shell
-    # pipeline (see home/kitty.nix), with one substitution: write to a
-    # file instead of xclip. Reason: xclip in the bare-xterm test VM
-    # daemonises waiting for a paste-request that never comes from a
-    # clipboard manager, hanging the pipe-parent shell indefinitely.
-    # The behaviour we changed and need to validate is the SHELL
-    # TRANSFORM (`printf %s "$0"` preserving embedded newlines) — that
-    # transform is wholly independent of the sink (xclip vs file).
-    # xclip itself is kitty's already-stable primitive; if the shell
-    # delivers the right bytes to its stdin, xclip stores them
-    # byte-for-byte on the X11 clipboard (proven on every desktop
-    # session that's ever copied multi-line out of kitty).
-    # Selection is passed as $0 of the inner sh -c, mirroring
-    # kitty's `pass_selection_to_program`.
+    PAYLOAD='sudo sh -c '"'"'echo 0000:00:05.0 > /sys/bus/pci/drivers/intel-ipu6/unbind && sleep 1 && echo
+      0000:00:05.0 > /sys/bus/pci/drivers/intel-ipu6/bind && sleep 2 && systemctl reset-failed
+      v4l2-relayd-ipu6.service && systemctl restart v4l2-relayd-ipu6.service && sleep 4 &&
+      systemctl is-active v4l2-relayd-ipu6.service && journalctl -u v4l2-relayd-ipu6.service
+      --since "10 sec ago" --no-pager | tail -10'"'"
+    EXPECTED='sudo sh -c '"'"'echo 0000:00:05.0 > /sys/bus/pci/drivers/intel-ipu6/unbind && sleep 1 && echo 0000:00:05.0 > /sys/bus/pci/drivers/intel-ipu6/bind && sleep 2 && systemctl reset-failed v4l2-relayd-ipu6.service && systemctl restart v4l2-relayd-ipu6.service && sleep 4 && systemctl is-active v4l2-relayd-ipu6.service && journalctl -u v4l2-relayd-ipu6.service --since "10 sec ago" --no-pager | tail -10'"'"
     rm -f /tmp/vm-kitty-copy-out
-    sh -c 'printf %s "$0" > /tmp/vm-kitty-copy-out' "$PAYLOAD"
+    sh -c 'printf %s "$0" | kitty-copy-unwrap > /tmp/vm-kitty-copy-out' "$PAYLOAD"
     RESULT=$(cat /tmp/vm-kitty-copy-out)
-    if [ "$RESULT" != "$PAYLOAD" ]; then
-      printf 'Phase A FAIL: shell pipeline mangled the payload\n' >&2
-      printf 'expected: %q\n' "$PAYLOAD" >&2
+    if [ "$RESULT" != "$EXPECTED" ]; then
+      printf 'Phase A FAIL: unwrap pipeline did not recover the original single line\n' >&2
+      printf 'payload:  %q\n' "$PAYLOAD" >&2
+      printf 'expected: %q\n' "$EXPECTED" >&2
       printf 'got:      %q\n' "$RESULT" >&2
       exit 1
     fi
-    # 4 embedded newlines → 5 awk-counted lines. Catches the regression
-    # where a future config strip (e.g. someone re-adds `tr -d "\n"`)
-    # leaves only the first line.
+    # Result must be exactly one line — no embedded newlines.
     LINES=$(printf '%s\n' "$RESULT" | awk 'END { print NR }')
-    if [ "$LINES" -lt 5 ]; then
-      printf 'Phase A FAIL: pipeline collapsed to %s lines\n' "$LINES" >&2
+    if [ "$LINES" -ne 1 ]; then
+      printf 'Phase A FAIL: unwrap produced %s lines, expected 1\n' "$LINES" >&2
       exit 2
     fi
-    # Trailing-newline regression check. `printf %s` does NOT append
-    # \n; the result must not end with one. Catches a regression where
-    # someone replaces `printf %s "$0"` with `echo "$0"` (which would
-    # auto-execute the last line on paste in a downstream shell).
+    # Trailing-newline regression check. The kitten only writes what
+    # split/join produced; result must not end with \n. Auto-execute-
+    # on-paste safety.
     if [ "$(tail -c1 /tmp/vm-kitty-copy-out | wc -c)" -ne 1 ] || \
        [ "$(tail -c1 /tmp/vm-kitty-copy-out)" = "" ]; then
       printf 'Phase A FAIL: output has trailing newline (would auto-execute on paste)\n' >&2
       exit 3
     fi
-    echo "Phase A OK: 5-line payload preserved by binding shell transform"
+    echo "Phase A OK: TUI-wrapped 5-row payload unwrapped to original single line"
   '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
@@ -92,7 +94,7 @@ in
         # a DISPLAY to attach to. Registers `none+xterm` as a session.
         desktopManager.xterm.enable = true;
       };
-      services.xserver.displayManager.autoLogin = {
+      services.displayManager.autoLogin = {
         enable = true;
         user = "jonathan";
       };
@@ -133,8 +135,18 @@ in
     dellan.fail(
         f"grep -qE '^map ctrl\\+shift\\+c.*tr -d' {kitty_conf}"
     )
-    # Escape-hatch binding still present (parity with old config; both
-    # bindings now preserve newlines).
+    # Positive assertion: binding pipes through kitty-copy-unwrap
+    # (the TUI hanging-indent un-wrapper, see home/kitty.nix). Losing
+    # this stage is the regression Phase A protects against.
+    dellan.succeed(
+        f"grep -qE '^map ctrl\\+shift\\+c.*kitty-copy-unwrap' {kitty_conf}"
+    )
+    dellan.succeed(
+        "test -x /etc/profiles/per-user/jonathan/bin/kitty-copy-unwrap"
+    )
+    # Escape-hatch binding: kitty built-in copy_to_clipboard, no
+    # transform. Use for uniformly-indented multi-line shell bodies
+    # that the unwrap heuristic would collapse.
     dellan.succeed(
         f"grep -qE '^map ctrl\\+shift\\+alt\\+c copy_to_clipboard' {kitty_conf}"
     )

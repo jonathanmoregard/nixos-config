@@ -88,6 +88,12 @@
     loginExtra = ''
       # NixOS drift check — runs once on login
       _nixos_drift_check() {
+        # Only nag on interactive logins. A scripted `su - jonathan -c
+        # '…'` runs a non-interactive login shell and must get clean
+        # stdout — a banner here pollutes command output and breaks
+        # anything parsing it (e.g. tests/automation reading an env var).
+        [[ -o interactive ]] || return 0
+
         local warnings=()
 
         # Imperatively installed packages (nix-env) — outside the flake, lost on rebuild

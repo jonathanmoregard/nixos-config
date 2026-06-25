@@ -1,9 +1,10 @@
 ---
-status: proposed
+status: done
 category: drift
 subcategory: autostart
 date: 2026-05-05
 source: advice-refine-loop
+done_evidence: home.file autostart block removed from home/cinnamon.nix 2026-06-07; voquill.service confirmed sole launcher (systemctl --user is-active voquill → active, pgrep shows release binary).
 ---
 
 ## Voquill cinnamon autostart .desktop races with systemd-managed unit

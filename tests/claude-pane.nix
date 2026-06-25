@@ -41,10 +41,18 @@
   # not jonathan). The full-host node got jq transitively via
   # modules/common.nix; the minimal feature node doesn't import it.
   extraModules = [
-    ({ pkgs, ... }: { environment.systemPackages = [ pkgs.jq ]; })
+    ({ pkgs, ... }: {
+      environment.systemPackages = [
+        pkgs.jq
+        # 6g-2 binds a unix-domain socket at /tmp/kitty.sock-fake to
+        # assert the wrapper's wipe MUST NOT fire when a socket exists.
+        pkgs.python3Minimal
+      ];
+    })
   ];
   testScript = ''
     import json
+    import shlex
 
     dellan.wait_for_unit("multi-user.target")
     dellan.wait_for_unit("home-manager-jonathan.service")
@@ -253,6 +261,14 @@
         f"non-claude window got claude_session_id (has_field={has_field!r})"
     )
 
+    # The fake_ls_noclaude run above had `live_window_ids = {wid_a}`,
+    # so the enricher's prune-pass DROPPED wid_b's row as a side effect.
+    # Re-add it before downstream phases that rely on both wids present.
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
+        "claude-kitty-pane-record < /tmp/hook-b.json'"
+    )
+
     # --- 6c: pruning — stale TSV entries for windows not in `ls` are
     # removed on each enrich pass, keeping the TSV bounded.
     sid_stale = "dddd4444-dddd-dddd-dddd-dddddddddddd"
@@ -315,7 +331,9 @@
     # --- 6e: malformed TSV lines (non-uuid sid, non-numeric wid, too
     # few fields) are ignored by enricher rather than crashing or
     # mis-attributing. Mix junk around a valid row and assert only the
-    # valid one wins.
+    # valid one wins. Uses a single-window fake_ls so the assertion is
+    # purely about row parsing (the multi-window race-window guard in
+    # 6f-1 is exercised separately and would mask this signal).
     dellan.succeed(
         f"su - jonathan -c \"printf '"
         f"not-a-number\\tnot-a-uuid\\n"
@@ -324,10 +342,21 @@
         f"truncated\\n"
         f"' > /tmp/junk-tsv\""
     )
+    fake_ls_one = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": wid_a, "cwd": "/tmp/fake", "title": "pane-a",
+                 "foreground_processes": [
+                     {"pid": 11111, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/fake-ls-one.json", fake_ls_one)
     dellan.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/junk-tsv kitty-session-enrich "
-        "< /tmp/fake-ls.json > /tmp/enriched-junk.json'"
+        "< /tmp/fake-ls-one.json > /tmp/enriched-junk.json'"
     )
     id_a_junk = dellan.succeed(
         "jq -r '.[0].tabs[0].windows[0].claude_session_id // empty' "
@@ -335,6 +364,390 @@
     ).strip()
     assert id_a_junk == sid_a, (
         f"junk TSV: expected {sid_a!r} for window {wid_a}, got {id_a_junk!r}"
+    )
+
+    # --- 6f: race-window guards. The SessionStart hook can fire after
+    # the periodic kitty-session-save tick that captured the pane, so a
+    # snapshot can land with one same-cwd claude pane enriched and a
+    # sibling un-enriched. Without the guards, that snapshot would
+    # collapse both panes onto the enriched sibling's sid on next
+    # restore (un-enriched pane falls back to latest-by-mtime → finds
+    # sibling's freshly-touched jsonl).
+    #
+    # 6f-1: enricher exits 2 on collision-risk (multiple same-cwd
+    # claude panes with at least one un-enriched). The save wrapper
+    # treats exit 2 as "preserve prior good snapshot, don't commit
+    # this partial".
+    dellan.succeed(f"rm -f {tsv}")
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
+    )
+    # wid_b has NO TSV row — race window: hook hasn't fired yet.
+    fake_ls_partial = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": wid_a, "cwd": "/tmp/fake", "title": "pane-a",
+                 "foreground_processes": [
+                     {"pid": 11111, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+                {"id": wid_b, "cwd": "/tmp/fake", "title": "pane-b",
+                 "foreground_processes": [
+                     {"pid": 22222, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/fake-ls-partial.json", fake_ls_partial)
+    rc_partial = int(dellan.succeed(
+        "su - jonathan -c 'kitty-session-enrich "
+        "< /tmp/fake-ls-partial.json > /tmp/enriched-partial.json; "
+        "echo $?'"
+    ).strip().splitlines()[-1])
+    assert rc_partial == 2, (
+        f"enricher should exit 2 on partial same-cwd; got rc={rc_partial}"
+    )
+
+    # 6f-2: solo claude pane lacking a TSV row is NOT collision risk
+    # (no sibling to collide with). Exit 0; snapshot may commit.
+    fake_ls_solo_unenriched = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": 555, "cwd": "/tmp/solo", "title": "lone",
+                 "foreground_processes": [
+                     {"pid": 33333, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/fake-ls-solo.json", fake_ls_solo_unenriched)
+    rc_solo = int(dellan.succeed(
+        "su - jonathan -c 'kitty-session-enrich "
+        "< /tmp/fake-ls-solo.json > /dev/null; echo $?'"
+    ).strip().splitlines()[-1])
+    assert rc_solo == 0, (
+        f"solo un-enriched claude pane should exit 0; got rc={rc_solo}"
+    )
+
+    # 6f-3: two same-cwd panes BOTH enriched — exit 0 (normal commit).
+    # 6f-2's enrich pruned the TSV to live_set={555}, so wipe and
+    # re-seed both rows for a clean precondition here.
+    dellan.succeed(f"rm -f {tsv}")
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
+    )
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
+        "claude-kitty-pane-record < /tmp/hook-b.json'"
+    )
+    rc_full = int(dellan.succeed(
+        "su - jonathan -c 'kitty-session-enrich "
+        "< /tmp/fake-ls-partial.json > /dev/null; echo $?'"
+    ).strip().splitlines()[-1])
+    assert rc_full == 0, (
+        f"both panes enriched: exit 0 expected, got rc={rc_full}"
+    )
+
+    # 6f-4: empty CLAUDE_CODE_ENTRYPOINT fails the gate. Before this
+    # fix the bash ''${VAR:-cli} default treated empty-string the same
+    # as unset, so a misconfigured shell launcher injecting an empty
+    # env var would silently write to TSV as if it were the main
+    # interactive session. The bare ''${VAR-cli} default flips that.
+    dellan.succeed(f"rm -f {tsv}")
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "CLAUDE_CODE_ENTRYPOINT= "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
+    )
+    empty_entrypoint_wrote = dellan.succeed(
+        f"test -f {tsv} && wc -l < {tsv} || echo 0"
+    ).strip()
+    assert empty_entrypoint_wrote == "0", (
+        f"empty CLAUDE_CODE_ENTRYPOINT wrote TSV "
+        f"({empty_entrypoint_wrote} lines); gate must reject"
+    )
+    # Sanity: explicit `cli` still writes.
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "CLAUDE_CODE_ENTRYPOINT=cli "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
+    )
+    dellan.succeed(f"grep -qP '^{wid_a}\\t{sid_a}\\t' {tsv}")
+
+    # 6f-5: restore-side load_panes refuses to collide. Stage a
+    # snapshot.json where two same-cwd claude panes share a cwd but
+    # only one has claude_session_id attached; pre-create both panes'
+    # .jsonl files in the encoded cwd dir, with the enriched pane's
+    # being the FRESHEST. The un-enriched pane's latest-by-mtime
+    # fallback would, without the guard, pick the sibling's sid and
+    # collide. With the guard, it must EITHER pick a different jsonl
+    # OR drop --resume entirely.
+    restore_cwd = "/tmp/restore-test"
+    encoded = restore_cwd.replace("/", "-")
+    proj = f"/home/jonathan/.claude/projects/{encoded}"
+    dellan.succeed(f"su - jonathan -c 'mkdir -p {proj}'")
+    sid_p1 = "11111111-1111-1111-1111-111111111111"
+    sid_p2 = "22222222-2222-2222-2222-222222222222"
+    # p1 is the enriched one (also the freshest jsonl on disk).
+    dellan.succeed(
+        f"su - jonathan -c 'touch -d \"2020-01-01\" {proj}/{sid_p2}.jsonl'"
+    )
+    dellan.succeed(
+        f"su - jonathan -c 'touch -d \"2030-01-01\" {proj}/{sid_p1}.jsonl'"
+    )
+    cache_dir = "/home/jonathan/.cache/kitty-session"
+    dellan.succeed(f"su - jonathan -c 'mkdir -p {cache_dir}'")
+    snap = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": 201, "cwd": restore_cwd, "title": "enriched",
+                 "claude_session_id": sid_p1,
+                 "foreground_processes": [
+                     {"pid": 71, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+                {"id": 202, "cwd": restore_cwd, "title": "unenriched",
+                 "foreground_processes": [
+                     {"pid": 72, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/race-snap.json", snap)
+    dellan.succeed(
+        f"su - jonathan -c 'cp /tmp/race-snap.json {cache_dir}/snapshot.json'"
+    )
+    dump = dellan.succeed(
+        "su - jonathan -c 'kitty-restore-session --dump-panes'"
+    )
+    print("[diag phase6f-5] resolved panes:\n" + dump)
+    resolved = json.loads(dump)
+    assert len(resolved) == 2, f"expected 2 panes, got {len(resolved)}"
+    # Pane 1: enriched, must resume sid_p1.
+    cmd1 = resolved[0]["cmd"]
+    assert cmd1[:3] == ["/usr/bin/claude", "--resume", sid_p1], (
+        f"enriched pane: expected --resume {sid_p1!r}, got {cmd1!r}"
+    )
+    # Pane 2: un-enriched, latest-by-mtime would pick sid_p1
+    # (touch'd to 2030); the collision guard must NOT let it.
+    cmd2 = resolved[1]["cmd"]
+    if cmd2[1:2] == ["--resume"]:
+        resumed_sid = cmd2[2]
+        assert resumed_sid != sid_p1, (
+            f"COLLISION: un-enriched pane resumed sibling's sid "
+            f"{sid_p1!r}; cmd={cmd2!r}"
+        )
+        # Acceptable fallback: the OTHER jsonl in proj_dir (sid_p2).
+        assert resumed_sid == sid_p2, (
+            f"unexpected fallback target {resumed_sid!r}; expected "
+            f"{sid_p2!r} (only non-claimed jsonl) or no --resume"
+        )
+    else:
+        # Also acceptable: no --resume at all (claude launches fresh).
+        assert cmd2 == ["/usr/bin/claude"], (
+            f"un-enriched pane has unexpected cmd: {cmd2!r}"
+        )
+
+    # 6f-6: when EVERY jsonl in proj_dir is claimed by enriched
+    # siblings, un-enriched fallback must drop --resume rather than
+    # wrong-collide. Remove the spare sid_p2 jsonl so the only option
+    # collides; load_panes must return cmd unchanged for pane 2.
+    dellan.succeed(f"su - jonathan -c 'rm -f {proj}/{sid_p2}.jsonl'")
+    dump_no_spare = dellan.succeed(
+        "su - jonathan -c 'kitty-restore-session --dump-panes'"
+    )
+    resolved_no_spare = json.loads(dump_no_spare)
+    cmd2_no_spare = resolved_no_spare[1]["cmd"]
+    assert cmd2_no_spare == ["/usr/bin/claude"], (
+        f"all-claimed fallback should drop --resume; got {cmd2_no_spare!r}"
+    )
+
+    # --- 6g: Layer C — pane-sessions.tsv wipe on kitty wrapper
+    # first-launch. The wrapper at home/kitty.nix's kittyWithSession
+    # wipes the TSV when no kitty sockets exist (cross-instance wid
+    # collision defense). Behaviourally replicates the wrapper's
+    # exact wipe condition here: stale TSV present, no kitty sockets
+    # in /tmp/kitty.sock-* → TSV gone after the snippet runs. If the
+    # wrapper diverges from this shape, this test will pass while the
+    # real wrapper breaks; keep them in sync (see kittyWithSession
+    # postBuild in home/kitty.nix).
+    dellan.succeed(
+        f"su - jonathan -c \""
+        f"printf '7\\t{sid_a}\\t/some/old/cwd\\t0\\n8\\t{sid_b}\\t/other\\t0\\n'"
+        f" > {tsv}\""
+    )
+    dellan.succeed(f"test -s {tsv}")
+    # Write the wrapper's wipe snippet to a script so the test invokes
+    # the same shell logic without nested-quote escaping hell.
+    wipe_script = (
+        "#!/usr/bin/env bash\n"
+        "shopt -s nullglob\n"
+        "sockets_seen=0\n"
+        "for f in /tmp/kitty.sock-*; do\n"
+        "  [ -S \"$f\" ] || continue\n"
+        "  sockets_seen=1\n"
+        "done\n"
+        "if [ \"$sockets_seen\" -eq 0 ]; then\n"
+        "  rm -f \"''${XDG_CACHE_HOME:-$HOME/.cache}/kitty-session/pane-sessions.tsv\"\n"
+        "fi\n"
+    )
+    stage_input("/tmp/wipe.sh", wipe_script)
+    dellan.succeed("chmod +x /tmp/wipe.sh")
+    dellan.succeed("su - jonathan -c '/tmp/wipe.sh'")
+    dellan.fail(f"test -f {tsv}")
+
+    # 6g-2: a unix socket file present → wipe MUST NOT fire (defends
+    # against blast-radius: a live kitty whose @ ls transiently
+    # failed would otherwise get its TSV nuked underfoot).
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
+    )
+    dellan.succeed(f"test -s {tsv}")
+    # Synchronously create a unix-socket file at /tmp/kitty.sock-fake.
+    # bind() creates the inode; the file persists after python exits.
+    dellan.succeed(
+        "rm -f /tmp/kitty.sock-fake && "
+        "python3 -c 'import socket; "
+        "s=socket.socket(socket.AF_UNIX); "
+        "s.bind(\"/tmp/kitty.sock-fake\")'"
+    )
+    dellan.succeed("test -S /tmp/kitty.sock-fake")
+    dellan.succeed("su - jonathan -c '/tmp/wipe.sh'")
+    dellan.succeed(f"test -s {tsv}")
+    # Cleanup the fixture socket.
+    dellan.succeed("rm -f /tmp/kitty.sock-fake")
+
+    # --- 6h: Layer B — kitty-session-save preserves prior good
+    # snapshot.json when kitty-session-enrich exits 2. Inline-replicate
+    # the save wrapper's enrich/mv/preserve flow; if the wrapper
+    # diverges from this shape, this test will silently pass while
+    # the real wrapper breaks. Keep in sync with kittySessionSave in
+    # home/kitty.nix.
+    dellan.succeed(f"rm -f {tsv}")
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
+        "claude-kitty-pane-record < /tmp/hook-a.json'"
+    )
+    # Pre-write a known-good snapshot with a bytes-equality fingerprint.
+    good_snapshot = '{"_FIXTURE": "GOOD-1", "panes": []}'
+    cache = "/home/jonathan/.cache/kitty-session"
+    dellan.succeed(f"su - jonathan -c 'mkdir -p {cache}'")
+    dellan.succeed(
+        f"su - jonathan -c 'printf %s {shlex.quote(good_snapshot)} "
+        f"> {cache}/snapshot.json'"
+    )
+    sha_before = dellan.succeed(
+        f"sha256sum {cache}/snapshot.json | cut -d\" \" -f1"
+    ).strip()
+    # Stage an input that triggers collision-risk (two same-cwd claude
+    # panes, only wid_a in TSV).
+    partial_json = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": wid_a, "cwd": "/tmp/fake",
+                 "foreground_processes": [
+                     {"pid": 1, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+                {"id": wid_b, "cwd": "/tmp/fake",
+                 "foreground_processes": [
+                     {"pid": 2, "cmdline": ["/usr/bin/claude"]}
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/partial-for-save.json", partial_json)
+    # Inline-replicate kittySessionSave's preserve-on-rc-2 logic.
+    save_snippet = (
+        "set +e; "
+        f"json=$(cat /tmp/partial-for-save.json); "
+        f"printf %s \"$json\" | kitty-session-enrich "
+        f"> {cache}/snapshot.json.tmp; "
+        "enrich_rc=$?; "
+        "set -e; "
+        f"if [ \"$enrich_rc\" -eq 0 ]; then "
+        f"  mv {cache}/snapshot.json.tmp {cache}/snapshot.json; "
+        f"else "
+        f"  rm -f {cache}/snapshot.json.tmp; "
+        f"fi; "
+        f"echo rc=$enrich_rc"
+    )
+    out = dellan.succeed(f"su - jonathan -c '{save_snippet}'").strip()
+    assert "rc=2" in out, (
+        f"enricher should have exited 2 for the staged collision-risk "
+        f"input; got: {out!r}"
+    )
+    # snapshot.json bytes must be unchanged.
+    sha_after = dellan.succeed(
+        f"sha256sum {cache}/snapshot.json | cut -d\" \" -f1"
+    ).strip()
+    assert sha_before == sha_after, (
+        f"snapshot.json was overwritten despite rc=2 collision-risk; "
+        f"sha_before={sha_before!r} sha_after={sha_after!r}"
+    )
+    # Tmp must have been removed.
+    dellan.fail(f"test -f {cache}/snapshot.json.tmp")
+
+    # 6h-2: when collision-risk clears (TSV gains the missing row),
+    # the next save MUST overwrite the snapshot.
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
+        "claude-kitty-pane-record < /tmp/hook-b.json'"
+    )
+    dellan.succeed(f"su - jonathan -c '{save_snippet}'")
+    sha_after_full = dellan.succeed(
+        f"sha256sum {cache}/snapshot.json | cut -d\" \" -f1"
+    ).strip()
+    assert sha_after_full != sha_before, (
+        "snapshot.json was NOT updated after collision-risk cleared; "
+        "still bytes-equal to GOOD-1 fixture"
+    )
+
+    # --- 6i: concurrent SessionStart hooks (N panes start in rapid
+    # succession). flock + atomic mv must yield exactly N rows, no
+    # corruption, no duplicates. Stress: 20 parallel writes, distinct
+    # window ids + sids.
+    dellan.succeed(f"rm -f {tsv}")
+    parallel_n = 20
+    for i in range(parallel_n):
+        sid = f"{i:08x}-feed-feed-feed-{i:012x}"
+        stage_input(
+            f"/tmp/hook-par-{i}.json",
+            f'{{"session_id":"{sid}","cwd":"/tmp/par-{i}"}}',
+        )
+    # Spawn all N concurrently as jonathan; wait for all to finish.
+    par_cmd = "su - jonathan -c '" + " ".join(
+        f"KITTY_WINDOW_ID={200 + i} "
+        f"claude-kitty-pane-record < /tmp/hook-par-{i}.json &"
+        for i in range(parallel_n)
+    ) + " wait'"
+    dellan.succeed(par_cmd)
+    actual_rows = int(
+        dellan.succeed(f"wc -l < {tsv}").strip()
+    )
+    assert actual_rows == parallel_n, (
+        f"concurrent hooks: expected {parallel_n} rows, got {actual_rows}; "
+        f"flock guard missed a write race"
+    )
+    # Every row must be well-formed: 4 tab-separated fields, sid is UUID,
+    # wid is numeric. Any malformed row indicates a partial-write race.
+    bad = dellan.succeed(
+        "awk -F'\\t' '"
+        "NF!=4 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9a-f-]+$/ "
+        "{print NR\": \"$0}' "
+        f"{tsv} | wc -l"
+    ).strip()
+    assert bad == "0", (
+        f"concurrent hooks corrupted TSV: {bad} malformed row(s); "
+        f"see TSV at {tsv}"
+    )
+    # Every wid must appear exactly once (no duplicates).
+    dup_wids = dellan.succeed(
+        f"awk -F'\\t' '{{print $1}}' {tsv} | sort | uniq -d | wc -l"
+    ).strip()
+    assert dup_wids == "0", (
+        f"concurrent hooks left duplicate wid rows: {dup_wids}; "
+        f"awk replace-then-append race"
     )
   '';
 }
