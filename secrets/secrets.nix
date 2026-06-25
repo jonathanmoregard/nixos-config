@@ -56,12 +56,22 @@ in {
   #   claude-token.age        — Claude Code OAuth token (research-agent
   #                              calls headless `claude` inside the
   #                              isolated dev container)
+  #   euipo-client-id.age     — EUIPO OAuth2 client_id (also sent as
+  #                              X-IBM-Client-Id header); consumed by the
+  #                              research-agent's trademark_shim. Empty
+  #                              plaintext until the EUIPO dev-portal
+  #                              subscription is approved (`agenix -e`
+  #                              to replace).
+  #   euipo-client-secret.age — EUIPO OAuth2 client_secret; same shim,
+  #                              same empty-until-approved status.
   # ---------------------------------------------------------------------
-  "anthropic-api-key.age".publicKeys = allKeys;
-  "openai-api-key.age".publicKeys    = allKeys;
-  "exa-api-key.age".publicKeys       = allKeys;
-  "tavily-api-key.age".publicKeys    = allKeys;
-  "claude-token.age".publicKeys      = allKeys;
+  "anthropic-api-key.age".publicKeys   = allKeys;
+  "openai-api-key.age".publicKeys      = allKeys;
+  "exa-api-key.age".publicKeys         = allKeys;
+  "tavily-api-key.age".publicKeys      = allKeys;
+  "claude-token.age".publicKeys        = allKeys;
+  "euipo-client-id.age".publicKeys     = allKeys;
+  "euipo-client-secret.age".publicKeys = allKeys;
 
   # ---------------------------------------------------------------------
   # Cachix push token.
