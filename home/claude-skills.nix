@@ -19,6 +19,7 @@ let
     "nixos-config-dev"
     "nixos-automated-testing"
     "nixos-agent-testing"
+    "nixos-agenix-secret"
   ];
 in
 {
