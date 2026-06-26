@@ -151,12 +151,13 @@ if [ "$ETC_BRANCH" != "main" ]; then
   fail "$CONFIG_PATH is on branch '$ETC_BRANCH', not main."
 fi
 
-# Sanity: post-migration secrets.nix must reference deploy-ssh-key + the
-# webhook + janitor secrets. Skipped in DRY_RUN since the test fixture
-# stubs these.
+# Sanity: dellan host must declare the deploy-ssh-key secret (post
+# agenix-rekey migration this lives as `rekeyFile` in hosts/dellan/default.nix
+# rather than the old secrets.nix recipients map). Skipped in DRY_RUN since
+# the test fixture stubs these.
 if [ "$DRY_RUN" != "1" ]; then
-  if ! grep -q '"deploy-ssh-key.age"' "$CONFIG_PATH/secrets/secrets.nix" 2>/dev/null; then
-    fail "$CONFIG_PATH/secrets/secrets.nix missing deploy-ssh-key entry."
+  if ! grep -q 'deploy-ssh-key\.age' "$CONFIG_PATH/hosts/dellan/default.nix" 2>/dev/null; then
+    fail "$CONFIG_PATH/hosts/dellan/default.nix missing deploy-ssh-key.age declaration."
   fi
   if ! grep -q 'services.nixosDeploy' "$CONFIG_PATH/hosts/dellan/default.nix" 2>/dev/null; then
     fail "$CONFIG_PATH/hosts/dellan/default.nix missing services.nixosDeploy block."

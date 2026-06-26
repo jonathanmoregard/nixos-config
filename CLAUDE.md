@@ -65,6 +65,7 @@ gh pr view <PR_NUMBER>   # confirm merged
 - `git push origin main` directly — branch protection rejects (no direct push).
 - `sudo nixos-rebuild switch` casually — bypasses the gate stack.
 - Edit `/etc/nixos` directly — root-owned + auto-deploy will overwrite.
+- **`git rebase` to sync a PR branch with `main`.** Use `git merge origin/main` instead. Rebase rewrites the published branch's history and then requires `git push --force-with-lease` to publish — `--force*` is denied at the safe-bash MCP layer, so the agent gets stuck mid-sync. Merge commits the conflict resolution as a normal merge commit; `git push` (no flags) advances the ref cleanly. The merge-commit noise in `git log` is a feature, not a bug — it records when the branch caught up.
 - **Split related work into stacked PRs.** One logical change = one PR,
   even if the diff grows. Stacks couple merge order to the CI risk-
   classifier: a "low risk" child PR can auto-merge into its parent
@@ -120,7 +121,7 @@ Adding a new test: drop `tests/<feature>.nix` (use existing files as templates),
 | Status check | What it does |
 |---|---|
 | `verify-fork-guards` | Asserts every PR-triggered workflow has a fork-guard predicate |
-| `flake check (eval)` | `nix flake check --no-build --all-systems` |
+| `flake check (eval)` | `scripts/check-eval-warnings.sh`: `nix flake check --no-build --all-systems` + **fail on unallowlisted `lib.warn`/`warnIf` output** (allowlist: `scripts/eval-warnings-allowlist.txt`) |
 | `build dellan toplevel` | Builds `nixosConfigurations.dellan.config.system.build.toplevel` |
 | `vm-minimal (<lane>)` | Ephemeral VM e2e test; one matrix lane per `tests/<feature>.nix` (base / desktop / keyring / kitty / claude-pane) |
 | `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |

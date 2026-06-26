@@ -1,0 +1,182 @@
+# .github/workflows/auto-update-prs.yml
+#
+# After every merge to main, update *at most one* open auto-merge PR
+# whose branch is behind main AND whose existing CI is not red, so its
+# CI re-runs against the now-current base. If several PRs qualify, the
+# lowest PR number wins (rough FIFO); the next merge to main picks up
+# the next one. Limiting to one per run keeps the post-merge CI fan-out
+# bounded — without it, N behind auto-merge PRs would all re-run
+# simultaneously and N-tuple the runner load.
+#
+# Triggers on push: main only — never on pull_request — so there's
+# no fork exposure to gate against. The `if: github.repository == ...`
+# predicate is belt-and-suspenders against the workflow running from
+# any clone of this code.
+#
+# Three design decisions worth understanding:
+#
+# 1. Behind detection via compare API, not mergeStateStatus.
+#    `mergeStateStatus` is invalidated on every push to main and
+#    recomputed asynchronously (seconds to minutes). The push-triggered
+#    workflow fires within ~1-2s and reads `UNKNOWN` for every PR, so
+#    a `select(.mergeStateStatus == "BEHIND")` filter matches nothing
+#    → "no behind PR" even when 4+ are behind. The compare API
+#    (`repos/.../compare/main...<head>` → `.behind_by`) is computed on
+#    demand and isn't subject to that lag.
+#
+# 2. Skip PRs with red CI. A PR whose latest head has a terminal-
+#    failure conclusion (FAILURE / TIMED_OUT / STARTUP_FAILURE /
+#    ACTION_REQUIRED / STALE / ERROR) on any rollup entry won't merge
+#    after update-branch either — updating it just wastes runner-min.
+#    Pending / in-progress / empty rollups are NOT disqualifying:
+#    an empty rollup means no CI has run on the current SHA (brand-new
+#    PR or a recent update-branch), and bailing there would permanently
+#    skip fast-update scenarios. Rollup entries are deduped by name
+#    (latest wins) to handle `cancel-in-progress` duplicates from
+#    workflow re-runs (see cli/cli#12895).
+#
+# 3. Auth via a GitHub App installation token, not GITHUB_TOKEN.
+#    GitHub's documented anti-recursion guard suppresses workflow
+#    triggers for events created by GITHUB_TOKEN — so update-branch
+#    via GITHUB_TOKEN moves the head SHA but never re-fires the
+#    PR's CI workflows, leaving the PR stuck. An App installation
+#    token is a separate actor; the synchronize event it generates
+#    triggers CI normally.
+#
+#    Required secrets (set at repo level):
+#      AUTO_UPDATE_APP_ID          — the GitHub App's numeric ID
+#      AUTO_UPDATE_APP_PRIVATE_KEY — the App's .pem private key
+#    Required GitHub App permissions:
+#      Contents: Read & write
+#      Pull requests: Read & write
+#    The App must be installed on this repo.
+#
+# `gh pr update-branch` returns non-zero on merge conflict; logged as
+# non-fatal so the workflow still exits 0 (next merge to main will
+# pick a different PR if this one stays blocked).
+
+name: auto-update-prs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# GITHUB_TOKEN permissions are read-only; the App token (generated
+# below) carries the write permissions actually needed.
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: auto-update-prs
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.repository == 'jonathanmoregard/nixos-config'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate App installation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.AUTO_UPDATE_APP_ID }}
+          private-key: ${{ secrets.AUTO_UPDATE_APP_PRIVATE_KEY }}
+
+      - name: Update one behind, green auto-merge PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # 1. List open auto-merge PRs (number + head ref). headRefName
+          #    is the branch name within this repo — fork PRs would need
+          #    `owner:branch` form, but this repo doesn't accept forks.
+          prs=$(gh pr list \
+            --base main --state open --limit 100 \
+            --json number,headRefName,autoMergeRequest \
+            --jq '.[] | select(.autoMergeRequest != null) | "\(.number) \(.headRefName)"')
+
+          if [ -z "$prs" ]; then
+            echo "no open auto-merge PRs"
+            exit 0
+          fi
+
+          echo "evaluating auto-merge PRs:"
+          # Indent each line for log readability (bash param expansion;
+          # avoids `sed` per SC2001).
+          printf '  %s\n' "${prs//$'\n'/$'\n  '}"
+
+          # 2. For each, ask GitHub's compare API how many commits the
+          #    PR head is behind main, then check the rollup for any
+          #    hard-failure conclusion. Only PRs that are BOTH behind
+          #    AND not-red are update candidates.
+          candidates=$(
+            while read -r num head; do
+              [ -z "$num" ] && continue
+
+              # Behind detection — compare API is computed on demand,
+              # immune to the mergeStateStatus lazy-recompute lag.
+              # `|| true` keeps the loop going on transient failure;
+              # stderr is intentionally NOT suppressed so a 403 from
+              # the App token (e.g. permission regression) surfaces in
+              # the workflow log instead of being silently classified
+              # as "compare API failed, skipped".
+              by=$(gh api "repos/$GH_REPO/compare/main...$head" \
+                --jq '.behind_by' || true)
+              case "$by" in
+                ''|*[!0-9]*)
+                  echo "  PR #$num ($head): compare API failed, skipped" >&2
+                  continue
+                  ;;
+                0)
+                  echo "  PR #$num ($head): up to date, skipped" >&2
+                  continue
+                  ;;
+              esac
+
+              # Red-check filter. Dedupe rollup entries by name so
+              # cancel-in-progress duplicates don't leak through
+              # (older=CANCELLED, newer=SUCCESS). Empty rollup → include.
+              # See cli/cli#12895 for the dedupe rationale.
+              # `|| echo "false"` defaults to "not red" on gh failure
+              # (bias toward attempting update vs. incorrectly skipping).
+              # stderr left visible so permission / API issues surface.
+              is_red=$(gh pr view "$num" --json statusCheckRollup --jq '
+                [ .statusCheckRollup
+                  | group_by(.name // .context)
+                  | map(sort_by(.startedAt // .completedAt) | last)
+                  | .[]
+                  | (.conclusion // .state // "")
+                  | ascii_upcase
+                ]
+                | map(select(. == "FAILURE" or . == "TIMED_OUT"
+                          or . == "STARTUP_FAILURE" or . == "ACTION_REQUIRED"
+                          or . == "STALE" or . == "ERROR"))
+                | length > 0
+              ' || echo "false")
+              if [ "$is_red" = "true" ]; then
+                echo "  PR #$num ($head): has failing check, skipped" >&2
+                continue
+              fi
+
+              echo "$num $by"
+            done <<< "$prs" | sort -n -k1,1
+          )
+
+          if [ -z "$candidates" ]; then
+            echo "no behind+green auto-merge PR to update"
+            exit 0
+          fi
+
+          target=$(echo "$candidates" | head -1 | awk '{print $1}')
+          behind_by=$(echo "$candidates" | head -1 | awk '{print $2}')
+
+          echo "updating PR #$target (behind main by $behind_by commits, lowest-numbered behind+green auto-merge PR)"
+          if gh pr update-branch "$target" 2>&1; then
+            echo "[ok] PR #$target: branch updated — CI should re-fire under App-token actor"
+          else
+            echo "[skip] PR #$target: merge conflict or transient gh error (non-fatal)"
+          fi

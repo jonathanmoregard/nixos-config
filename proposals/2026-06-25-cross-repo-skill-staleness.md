@@ -146,3 +146,36 @@ git checkout home/claude-skills/nixos-agenix-secret/SKILL.md
 ### Recommendation
 
 Proceed. Skill staleness is a recurring failure mode (this is the second incident: the [agenix-rekey migration commit message itself](https://github.com/jonathanmoregard/nixos-config/commit/e451e78) documents `nix run .#agenix -- edit ...` which never worked — same class of drift, in the canonical source). One small PR closes both the present orphan and the future-drift gap.
+
+---
+
+### Implementation note (2026-06-26)
+
+Phase 1 shipped as **PR #130**. Two adjustments to the plan above:
+
+1. **The `.claude` repo is private.** The original proposal assumed it was public; it isn't. The default `GITHUB_TOKEN` cannot read it cross-repo. The first attempt at PR #130 included a `dotclaude` checkout step and failed with `Not Found - https://docs.github.com/rest/repos/repos#get-a-repository` against the private repo.
+
+2. **Cross-repo lint dropped from the nixos-config side. Phase 2 dropped too.** The pragmatic structural fix is to **relocate the skills that care about this flake into this flake** (Phase 1, executed). Once every `nixos-*` skill lives in `home/claude-skills/`, the in-repo linter catches drift the moment a PR introduces or renames an attribute that an in-repo skill documents. No cross-repo coordination is needed.
+
+The remaining residual gap — a stale `nix run .#X` reference in a `.claude`-resident, non-`nixos-*` skill (e.g. a generic skill that happens to include a flake example) — is small and addressable if it materializes:
+
+- **Option A (cheap, if it ever matters)**: PAT-based cross-repo lint from nixos-config CI (~5 min: create PAT with `repo:read`, store as `secrets.CROSS_REPO_PAT`, restore the dotclaude checkout). Closes the residual gap from the nixos-config side.
+- **Option B**: mirror `check-docs-commands.sh` workflow in `.claude` CI cloning `nixos-config@main` (public, no PAT). Closes from the .claude side, but only on `.claude` push events — so a nixos-config rename remains undetected until somebody touches `.claude`.
+
+Neither is needed right now. The relocation handles every concrete drift case we've actually hit.
+
+### What actually shipped in PR #130
+
+- `nixos-agenix-secret` skill moved into `home/claude-skills/nixos-agenix-secret/`.
+- `scripts/check-docs-commands.sh` — grep + `nix eval --apply 'x: null'` per unique `nix run .#X` reference, probing the same `apps`/`packages`/`legacyPackages`/root chain `nix run` walks.
+- New CI job `docs (eval)` — runs the linter against this repo only. Took ~36s on the first green build (well under the sub-minute prediction).
+- Bonus: linter caught a real stale `nix run .#agenix -- rekey` comment in `hosts/dellan/default.nix:65` from the agenix-rekey migration era; fixed inline.
+
+### Subsequent verifications carried over
+
+- Migration verify (`readlink ~/.claude/skills/nixos-agenix-secret/SKILL.md` after auto-deploy) unchanged.
+- Docs-linter verify simplified — no `~/.claude` arg:
+  ```bash
+  cd ~/Repos/nixos-config-worktrees/<slug>
+  scripts/check-docs-commands.sh
+  ```

@@ -27,7 +27,19 @@
       microvm = {
         hypervisor = "qemu";
         vcpu = 2;
-        mem = 2048;
+        # NOT 2048: qemu's microvm machine type serves a corrupt DSDT
+        # when guest RAM ends exactly at the 2 GiB split boundary
+        # (microvm-nix/microvm.nix#171, open since 2023). The guest
+        # kernel busy-spins in acpi_tb_checksum before init — sshd
+        # never starts, one host core pins at 100%, and the sshd
+        # watchdog restart-loops forever. Latent until PR #111 added
+        # the 4th virtiofs share (scraper-token), which grew the DSDT
+        # enough to shift table placement into the bad region.
+        # Empirically bounded 2026-06-05: 2047/2049/2560/3072/4096 all
+        # emit a clean DSDT and boot; only exactly 2048 corrupts.
+        # 3072 matches the scraper VM. acpi=off is NOT a workaround
+        # (drops the PCIe bridge; all virtio-*-pci devices fail).
+        mem = 3072;
 
         shares = [
           {
@@ -35,8 +47,17 @@
             mountPoint = "/workspace";
             tag = "workspace";
             proto = "virtiofs";
+            # RO so a prompt-injected agent cannot rewrite its own
+            # CLAUDE.md / shims / scripts on the host. microvm.nix's
+            # `shares` default is readOnly=false — the flag MUST be
+            # set explicitly. (Verified via:
+            # `nix eval .#nixosConfigurations.dellan.config.microvm.vms.research-agent.config.config.microvm.shares`.)
+            readOnly = true;
           }
           {
+            # /out is RW because the agent writes one report file per
+            # call here; the host MCP server reads the file from this
+            # virtiofs share after the agent exits.
             source = "/home/jonathan/Repos/research-agent/reports";
             mountPoint = "/out";
             tag = "out";
@@ -55,6 +76,20 @@
             mountPoint = "/etc/ssh/keys";
             tag = "ssh-keys";
             proto = "virtiofs";
+          }
+          {
+            # Bearer token for the scraper microvm's HTTP API. The file
+            # lives on the host at /var/lib/scraper-bearer/token
+            # (generated per-boot by scraper-bearer-init.service in
+            # modules/nixos/scraper-microvm.nix). render_shim.py reads
+            # /etc/scraper/token at call time.
+            # readOnly=true: a prompt-injected agent inside the VM
+            # cannot rotate the bearer out from under the scraper.
+            source = "/var/lib/scraper-bearer";
+            mountPoint = "/etc/scraper";
+            tag = "scraper-token";
+            proto = "virtiofs";
+            readOnly = true;
           }
         ];
 
@@ -91,6 +126,13 @@
         shell = pkgs.bashInteractive;
         openssh.authorizedKeys.keys = [
           "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJTpnxCppc/riWtTthEqc6FDX3tHoJvPkVjiKACOYZUl research-agent-host-key"
+          # jonathan@dellan operator key — debug ssh access only (the
+          # data path is host-MCP-over-ssh-stdin, not human ssh). Listed
+          # so feature-vm interactive smoke can reach the agent VM
+          # without needing the agenix-decrypted research-agent-host-key
+          # (which doesn't decrypt inside feature-vm because the
+          # host-ssh 9p mount's identity isn't a secrets.nix recipient).
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINT9HeHhu82OoNsAHe/QAh116pSEANuZUr1h5m8R8kpp jonathan@dellan"
         ];
       };
 
@@ -139,6 +181,13 @@
               udp dport 53 accept
               tcp dport 53 accept
               ip daddr @research_allowed tcp dport 443 accept
+              # Scraper microvm HTTP API. 10.0.2.2 is the SLIRP host
+              # gateway from inside this VM (qemu user-mode default).
+              # The host's forwardPorts rule on the scraper VM exposes
+              # the scraper's guest port 8000 at host loopback :8123,
+              # so this rule lets the agent's render_shim reach the
+              # scraper without widening the broader egress allowlist.
+              ip daddr 10.0.2.2 tcp dport 8123 accept
             }
           }
         '';
