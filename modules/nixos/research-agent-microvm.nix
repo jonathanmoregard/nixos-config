@@ -231,6 +231,29 @@
             mcp.exa.ai
             api.tavily.com
             mcp.tavily.com
+            # Trademark-clearance shims (agent/shims/{trademark,bolagsverket}
+            # _shim.py in the research-agent repo). Added to the agent in
+            # 2026-06 but never to this allowlist — every call dialled out,
+            # hit dropped packets, and hung to its client timeout (EUIPO
+            # curl-28 after 30s, bolagsverket urllib after 120s), burning
+            # whole research budgets on dead waits.
+            # EUIPO sandbox (in use until the production subscription is
+            # approved):
+            auth-sandbox.euipo.europa.eu
+            api-sandbox.euipo.europa.eu
+            # EUIPO production (pre-added so the sandbox->prod flip is a
+            # shim-env change, not another firewall PR):
+            euipo.europa.eu
+            api.euipo.europa.eu
+            # Bolagsverket open-data bulk file (CC-BY, weekly refresh):
+            vardefulla-datamangder.bolagsverket.se
+            # PRV open-data FTP (Swedish national trademark register;
+            # sanctioned bulk channel used by prv_shim). NOTE: FTP —
+            # control on :21 plus PASV data connections to the same
+            # host on ephemeral ports; the allowlist is IP-based so
+            # PASV lands on the same allowed IPs, and outbound
+            # ESTABLISHED/RELATED handles the rest.
+            opendata.prv.se
           )
 
           DNS_RETRIES=5

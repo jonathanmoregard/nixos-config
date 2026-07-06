@@ -29,13 +29,18 @@
 #   1 — at least one reference is stale (printed to stderr with file:line)
 set -euo pipefail
 
+# proposals/ is deliberately EXCLUDED: proposals are point-in-time
+# archival records that legitimately quote dead or placeholder syntax
+# (e.g. the cross-repo-skill-staleness proposal documents the broken
+# `nix run .#agenix` form and the `.#agenix-DEAD` negative-test string
+# as cautionary examples). Living docs must stay fresh; archives must
+# not be forced to rewrite history. First tripped on PR #131.
 ROOTS=(
   CLAUDE.md
   docs
   home
   hosts
   modules
-  proposals
   scripts
 )
 # Append any extra search roots from the caller (e.g. a sibling .claude
