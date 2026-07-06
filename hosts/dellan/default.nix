@@ -183,8 +183,23 @@
   # state anyway.
   # ---------------------------------------------------------------------
   systemd.tmpfiles.rules = [
-    "d /var/lib/research-agent 0700 root root -"
+    # 0711 (not 0700): jonathan must traverse into tool-cache below for
+    # pre-seeding and debugging. vm-ssh keeps its own 0700, so the SSH
+    # host key stays root-only.
+    "d /var/lib/research-agent 0711 root root -"
     "d /var/lib/research-agent/vm-ssh 0700 root root -"
+    # Persistent tool cache for the research-agent jail (PRV +
+    # Bolagsverket SQLite indexes). Shared RW into the microvm at
+    # /tool-cache and bind-mounted into the bwrap jail by run-agent.sh.
+    # Without persistence each jail rebuilds the ~888 MiB PRV index into
+    # its RAM-backed tmpfs — which is also how bolagsverket_search died
+    # with "database or disk is full" (2026-07-06).
+    # Subdirs are 0777 because writes from inside the jail arrive as a
+    # non-owner uid (bwrap --unshare-user; same empirical reason
+    # run-agent.sh chmods its report file 666).
+    "d /var/lib/research-agent/tool-cache 0755 jonathan users -"
+    "d /var/lib/research-agent/tool-cache/prv 0777 jonathan users -"
+    "d /var/lib/research-agent/tool-cache/bolagsverket 0777 jonathan users -"
   ];
 
   # ---------------------------------------------------------------------

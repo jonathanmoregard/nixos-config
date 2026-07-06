@@ -78,6 +78,23 @@
             proto = "virtiofs";
           }
           {
+            # Persistent tool cache (PRV + Bolagsverket SQLite indexes).
+            # RW: run-agent.sh binds this into the bwrap jail and points
+            # PRV_CACHE_DIR / BOLAGSVERKET_CACHE_DIR at it, so the
+            # ~888 MiB PRV index survives across calls instead of being
+            # rebuilt per-jail into a RAM-backed tmpfs (which failed
+            # with "database or disk is full"). Threat note: a
+            # prompt-injected agent can poison the cached indexes
+            # (false-negative trademark hits on later calls) but gains
+            # no host code execution — same exposure class as /out.
+            # Backed by /var/lib/research-agent/tool-cache on the host
+            # (systemd.tmpfiles.rules in hosts/dellan/default.nix).
+            source = "/var/lib/research-agent/tool-cache";
+            mountPoint = "/tool-cache";
+            tag = "tool-cache";
+            proto = "virtiofs";
+          }
+          {
             # Bearer token for the scraper microvm's HTTP API. The file
             # lives on the host at /var/lib/scraper-bearer/token
             # (generated per-boot by scraper-bearer-init.service in
