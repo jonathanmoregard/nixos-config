@@ -5,6 +5,8 @@
 #   - microvm@research-agent.service template lands in /etc/systemd/system
 #   - /var/lib/research-agent/vm-ssh (host-side persisted ssh-host-keys
 #     share) is created via systemd.tmpfiles, owner root mode 700
+#   - /var/lib/research-agent/tool-cache/{prv,bolagsverket} (persistent
+#     jail tool-cache share) created via systemd.tmpfiles, 0777 jonathan
 #   - agenix activation script references research-agent-host-key
 #
 # Nested-VM gate: starting microvm@research-agent.service would require
@@ -124,6 +126,19 @@ pkgs.testers.runNixOSTest {
     assert perms == "700 root", (
         f"vm-ssh dir perms expected '700 root', got {perms!r}"
     )
+
+    # Persistent tool-cache dirs (PRV / Bolagsverket SQLite indexes,
+    # shared RW into the jail). 0777 is the load-bearing part: writes
+    # from inside the bwrap --unshare-user jail arrive as a non-owner
+    # uid, so anything tighter breaks index builds (same empirical
+    # reason run-agent.sh chmods its report file 666).
+    for sub in ["prv", "bolagsverket"]:
+        perms = dellan.succeed(
+            f"stat -c '%a %U' /var/lib/research-agent/tool-cache/{sub}"
+        ).strip()
+        assert perms == "777 jonathan", (
+            f"tool-cache/{sub} perms expected '777 jonathan', got {perms!r}"
+        )
 
     # Health-check watchdog: timer and oneshot service must be installed,
     # the script must defer to operator-stopped state cleanly, and the
