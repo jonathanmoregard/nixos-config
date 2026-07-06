@@ -247,8 +247,13 @@
             api.euipo.europa.eu
             # Bolagsverket open-data bulk file (CC-BY, weekly refresh):
             vardefulla-datamangder.bolagsverket.se
-            # TMview (planned tmview_shim; robots.txt-allowed):
-            www.tmdn.org
+            # PRV open-data FTP (Swedish national trademark register;
+            # sanctioned bulk channel used by prv_shim). NOTE: FTP —
+            # control on :21 plus PASV data connections to the same
+            # host on ephemeral ports; the allowlist is IP-based so
+            # PASV lands on the same allowed IPs, and outbound
+            # ESTABLISHED/RELATED handles the rest.
+            opendata.prv.se
           )
 
           DNS_RETRIES=5
