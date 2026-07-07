@@ -7,9 +7,13 @@
 #   network-online.target → nftables.service →
 #   research-agent-egress-init.service → sshd.service
 #
-# sshd is gated on egress-init via Requires=, so a DNS-resolution
-# failure surfaces as `Connection refused` from the host MCP server's
-# SSH call rather than a 10-minute silent timeout.
+# sshd is gated on egress-init via Requires=/After=. egress-init never
+# hard-fails on DNS: it retries forever with capped backoff, so a host
+# that is offline at guest boot surfaces as `Connection refused` (sshd
+# not up YET) and self-heals the moment connectivity returns — no
+# operator, no watchdog restart needed. (2026-07-07 incident: the old
+# 5-retry/exit-1 design turned an offline laptop into a failed sshd,
+# a give-up-latched watchdog, and a false "VM DOWN" alert.)
 #
 # Host MCP server reaches the VM via ssh on 127.0.0.1:2223 (port
 # forward from SLIRP user-mode networking). Per-call isolation is
@@ -172,6 +176,12 @@
       systemd.services.sshd = {
         after = [ "research-agent-egress-init.service" ];
         requires = [ "research-agent-egress-init.service" ];
+        # Requires= propagates explicit restarts (verified empirically
+        # with toy units 2026-07-07: restarting the dependency restarts
+        # the dependent), so an nftables reload can never leave sshd
+        # serving against a flushed allowlist. bindsTo additionally
+        # covers non-job deactivations of egress-init — belt and braces.
+        bindsTo = [ "research-agent-egress-init.service" ];
       };
 
       # Egress allowlist — declarative nftables, populated at boot.
@@ -229,6 +239,11 @@
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
+          # The retry-forever loop in the script may legitimately run
+          # for hours (laptop offline). The 90s default would kill the
+          # unit and re-create the dead-sshd incident this design
+          # exists to prevent.
+          TimeoutStartSec = "infinity";
         };
         # pkgs.getent (a separate small derivation) provides the
         # `getent` binary. `glibc.bin` on current nixpkgs does NOT
@@ -240,7 +255,10 @@
         # cascades sshd into `failed` via the Requires= above.
         path = [ pkgs.nftables pkgs.getent pkgs.coreutils pkgs.gawk ];
         script = ''
-          set -euo pipefail
+          # -e deliberately absent: a failing getent inside the retry
+          # loop IS the expected offline case, not an error. -u and
+          # pipefail stay.
+          set -uo pipefail
 
           ALLOWED=(
             api.anthropic.com
@@ -273,36 +291,55 @@
             opendata.prv.se
           )
 
-          DNS_RETRIES=5
-          DNS_RETRY_SLEEP=2
-
-          resolve_or_die() {
-            local domain="$1" attempt ips
-            for ((attempt=1; attempt<=DNS_RETRIES; attempt++)); do
-              ips=$(getent ahostsv4 "$domain" | awk '{print $1}' | sort -u)
-              if [ -n "$ips" ]; then
-                printf '%s\n' "$ips"
-                return 0
-              fi
-              if [ $attempt -lt $DNS_RETRIES ]; then
-                echo "[egress-init] DNS miss for $domain ($attempt/$DNS_RETRIES), retrying in $DNS_RETRY_SLEEP s" >&2
-                sleep $DNS_RETRY_SLEEP
-              fi
-            done
-            echo "[egress-init] ERROR: failed to resolve $domain after $DNS_RETRIES attempts" >&2
-            return 1
-          }
+          # Never hard-fail on DNS. This unit gates sshd (Requires=),
+          # so exiting non-zero turns a flaky uplink into a VM that
+          # needs an operator. Instead: insert what resolves
+          # incrementally (partial connectivity opens what it can) and
+          # retry the rest forever with capped backoff. sshd starts
+          # only once the FULL allowlist is populated — the security
+          # posture is unchanged, just patient. Pairs with
+          # TimeoutStartSec=infinity above and the host watchdog's
+          # offline gate (research-agent-microvm-healthcheck.nix).
+          # Contract enforced by checks.egress-init-retry.
 
           # Idempotent: flush the set so re-runs don't accumulate.
           nft flush set inet filter research_allowed || true
 
-          for d in "''${ALLOWED[@]}"; do
-            ips=$(resolve_or_die "$d") || exit 1
-            while IFS= read -r ip; do
-              [ -z "$ip" ] && continue
-              nft add element inet filter research_allowed { $ip } || true
-              echo "[egress-init] allow $d -> $ip"
-            done <<< "$ips"
+          declare -A RESOLVED=()
+          attempt=0
+          while :; do
+            missing=0
+            for d in "''${ALLOWED[@]}"; do
+              [ -n "''${RESOLVED[$d]:-}" ] && continue
+              # /STREAM/ filter: getent ahostsv4 emits STREAM/DGRAM/RAW
+              # triplets per IP; unfiltered $1 would also swallow any
+              # oddball non-address lines.
+              if ips=$(getent ahostsv4 "$d" | awk '/STREAM/{print $1}' | sort -u) \
+                 && [ -n "$ips" ]; then
+                while IFS= read -r ip; do
+                  [ -z "$ip" ] && continue
+                  # Log nft failures instead of swallowing them — a set
+                  # that's missing mid-reload is worth seeing in the
+                  # journal even though the retry architecture and
+                  # sshd's BindsTo make it non-fatal.
+                  nft add element inet filter research_allowed { $ip } \
+                    || echo "[egress-init] WARN: nft add $ip ($d) failed" >&2
+                  echo "[egress-init] allow $d -> $ip"
+                done <<< "$ips"
+                RESOLVED[$d]=1
+              else
+                missing=$((missing + 1))
+              fi
+            done
+            [ "$missing" -eq 0 ] && break
+            attempt=$((attempt + 1))
+            if [ "$attempt" -lt 12 ]; then
+              sleep_s=$((attempt * 5))
+            else
+              sleep_s=60
+            fi
+            echo "[egress-init] $missing domain(s) unresolved (attempt $attempt) — host offline? retrying in ''${sleep_s}s" >&2
+            sleep "$sleep_s"
           done
 
           echo "[egress-init] firewall active"

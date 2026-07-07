@@ -173,6 +173,13 @@ pkgs.testers.runNixOSTest {
     dellan.succeed(
         f"grep -q '/run/microvm-healthcheck-notify/research-agent' {script_path}"
     )
+    # Offline gate: probe failures while the HOST is offline must not
+    # count toward restarts/give-up — the guest self-heals when the
+    # network returns (retry-forever egress-init; contract enforced by
+    # checks.egress-init-retry). Removing this gate regresses to the
+    # 2026-07-07 false "VM DOWN" incident.
+    dellan.succeed(f"grep -q 'host is offline' {script_path}")
+    dellan.succeed(f"grep -q 'getent ahostsv4' {script_path}")
     # Notification chain: user path + service units installed, flag dir
     # exists and is world-readable so the user session can inotify it.
     dellan.succeed(
