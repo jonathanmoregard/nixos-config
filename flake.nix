@@ -144,6 +144,15 @@
         vm-microvm      = mkLane ./tests/microvm.nix;
         vm-listen-tools = mkLane ./tests/listen-tools.nix;
         vm-android-dev  = mkLane ./tests/android-dev.nix;
+        # Not a VM lane: runtime-invocation harness for the research-agent
+        # guest's egress-init script (offline-resilience contract). Cheap
+        # runCommand; seconds, not minutes.
+        egress-init-retry = import ./tests/egress-init-retry.nix {
+          pkgs = pkgsLinux;
+          script = self.nixosConfigurations.dellan.config
+            .microvm.vms.research-agent.config.config
+            .systemd.services.research-agent-egress-init.script;
+        };
       };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.

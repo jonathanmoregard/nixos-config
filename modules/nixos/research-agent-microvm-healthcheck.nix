@@ -33,6 +33,11 @@
 # later successful probe (e.g. operator restart or fixed deploy)
 # clears the latch and re-arms everything automatically.
 #
+# Offline gate: a probe failure while the HOST has no DNS is not
+# counted at all — the guest is just waiting for the network (see the
+# retry-forever egress-init) and heals itself on reconnect; restarting
+# or latching would manufacture a false outage out of a missing WiFi.
+#
 # Defense-in-depth: this is the safety net. The microvm config remains
 # the primary path; if it boots and stays healthy, this script is a
 # no-op forever (just one journal line per minute saying "ok").
@@ -61,7 +66,7 @@
       # next timer tick retries.
       TimeoutStartSec = "30s";
     };
-    path = [ pkgs.openssh pkgs.systemd pkgs.coreutils ];
+    path = [ pkgs.openssh pkgs.systemd pkgs.coreutils pkgs.getent pkgs.bash ];
     script = ''
       set -u
 
@@ -206,6 +211,35 @@
           rm -f "$GAVEUP_FILE"
           echo 0 > "$BURST_FILE"
         fi
+        echo 0 > "$COUNT_FILE"
+        exit 0
+      fi
+
+      # Probe failed. If the HOST itself can't resolve, we're offline —
+      # the guest's egress-init (retry-forever; research-agent-microvm.nix)
+      # is deliberately holding sshd back until connectivity returns and
+      # will self-heal on its own. A VM restart cannot help and would
+      # burn the give-up budget on a false alarm (2026-07-07 incident:
+      # offline boot → 26 failed probes → 2 futile restarts → give-up
+      # latch + CRITICAL "VM DOWN" while the only real problem was no
+      # WiFi). Don't count, don't restart; reset the streak so
+      # post-reconnect failures need three fresh strikes.
+      # Two-stage beacon: DNS alone lies behind captive portals (the
+      # portal resolves every name to itself), which would re-arm the
+      # restart/give-up path in exactly the offline situation this gate
+      # exists for. Demand a real TCP handshake to :443 as well.
+      # --kill-after: glibc NSS lookups can shrug off SIGTERM while
+      # blocked in the resolver; force SIGKILL so a hung resolver can't
+      # eat the oneshot's 30s budget.
+      host_online() {
+        timeout --kill-after=2 5 getent ahostsv4 api.anthropic.com >/dev/null 2>&1 \
+          || return 1
+        timeout --kill-after=2 5 bash -c 'exec 3<>/dev/tcp/api.anthropic.com/443' 2>/dev/null \
+          || return 1
+        return 0
+      }
+      if ! host_online; then
+        echo "healthcheck: probe failed but host is offline; guest egress-init is waiting for network — not counting"
         echo 0 > "$COUNT_FILE"
         exit 0
       fi
