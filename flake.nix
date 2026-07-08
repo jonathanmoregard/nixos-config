@@ -153,6 +153,20 @@
             .microvm.vms.research-agent.config.config
             .systemd.services.research-agent-egress-init.script;
         };
+        # Not a VM lane: fail-closed contract harness for the merged-and-
+        # stale worktree sweeper (home/worktree-sweep-script.nix). Builds
+        # a fixture bare repo + worktrees with real git, stubs gh, and
+        # asserts every keep/delete predicate — destructive automation
+        # ships only behind this. Cheap runCommand; seconds.
+        worktree-sweep = import ./tests/worktree-sweep.nix {
+          pkgs = pkgsLinux;
+          sweepScript = import ./home/worktree-sweep-script.nix { pkgs = pkgsLinux; };
+          # Drift gate: the harness asserts the deployed user unit execs
+          # exactly the derivation under test.
+          deployedExecStart = self.nixosConfigurations.dellan.config
+            .home-manager.users.jonathan
+            .systemd.user.services.nixos-worktree-sweep.Service.ExecStart;
+        };
       };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.

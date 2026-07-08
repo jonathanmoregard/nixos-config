@@ -202,6 +202,12 @@ jobs:
       # here rather than as a vm-minimal lane because it boots nothing.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.egress-init-retry -L
+      # worktree-sweep fail-closed contract: fixture bare repo +
+      # worktrees + stubbed gh, asserting the sweeper deletes only
+      # merged+old+clean+no-live-cwd and that a gh outage means zero
+      # deletions (tests/worktree-sweep.nix). Tiny runCommand — seconds.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.worktree-sweep -L
 
   docs:
     # Validate that every `nix run .#<attr>` reference in this repo's
