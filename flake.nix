@@ -153,6 +153,14 @@
             .microvm.vms.research-agent.config.config
             .systemd.services.research-agent-egress-init.script;
         };
+        # Not a VM lane: runtime-invocation harness for the cachix
+        # post-build-hook's push-budget filter (skip microvm erofs +
+        # >256MiB paths; never fail the build). Cheap runCommand.
+        cachix-push-filter = import ./tests/cachix-push-filter.nix {
+          pkgs = pkgsLinux;
+          prodHook = self.nixosConfigurations.dellan.config
+            .nix.settings.post-build-hook;
+        };
         # Not a VM lane: fail-closed contract harness for the merged-and-
         # stale worktree sweeper (home/worktree-sweep-script.nix). Builds
         # a fixture bare repo + worktrees with real git, stubs gh, and
