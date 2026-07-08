@@ -38,6 +38,18 @@ let
       exec {lock_fd}>"$STATE/lock"
       flock -n "$lock_fd" || { echo "another run in progress; exiting"; exit 0; }
 
+      # One-shot migration: the pull-based rewrite (4ad9306, 2026-05-06)
+      # renamed the previous module's `last-good` state file to
+      # `last-deployed-sha`, orphaning the on-disk `last-good` the docs
+      # advertise — it froze at the old module's final deploy while
+      # deploys kept succeeding. The record lives at `last-good` again;
+      # carry a pre-rename value forward (clobbering the frozen copy)
+      # so the first post-fix tick stays a no-op, and remove the old
+      # name so no second stale file is left behind.
+      if [ -e "$STATE/last-deployed-sha" ]; then
+        mv "$STATE/last-deployed-sha" "$STATE/last-good"
+      fi
+
       if [ -e "$STATE/manual-hold" ]; then
         echo "manual-hold present; halting"
         echo "  to clear: sudo rm $STATE/manual-hold"
@@ -78,7 +90,7 @@ let
 
       # Idempotency input: SHA of the last successfully-deployed commit.
       recorded_sha=""
-      { IFS= read -r recorded_sha || true; } < "$STATE/last-deployed-sha" 2>/dev/null || true
+      { IFS= read -r recorded_sha || true; } < "$STATE/last-good" 2>/dev/null || true
 
       cd "${cfg.workingDir}"
       # Bound every network op so a stalled TCP/ssh connection (DNS
@@ -131,11 +143,12 @@ let
       echo "deploying $target_sha"
       git reset --hard "$target_sha"
       if nixos-rebuild switch --flake ".#${cfg.flakeAttr}"; then
-        # Record the deployed SHA so the next tick can short-circuit when
-        # origin/main hasn't advanced. The generation comparison above is
-        # what catches a human-driven rollback — toplevel-hash tracking
-        # is no longer needed.
-        printf '%s\n' "$target_sha" > "$STATE/last-deployed-sha"
+        # Record the deployed SHA in `last-good` — both the idempotency
+        # input for the next tick AND the operator-facing "what's on the
+        # box" record documented in CLAUDE.md's Deploy workflow. The
+        # generation comparison above is what catches a human-driven
+        # rollback — toplevel-hash tracking is no longer needed.
+        printf '%s\n' "$target_sha" > "$STATE/last-good"
         touch "$STATE/has-deployed"
         # Trigger desktop notification (path-watcher in user systemd
         # picks this up; notify-send in the user service).
@@ -253,7 +266,7 @@ in
         # The narrow risk is a cold build that burns ~59min then gets
         # killed mid `switch-to-configuration`, leaving a half-applied
         # generation. That is recoverable, not bricking:
-        # switch-to-configuration is re-entrant, last-deployed-sha is
+        # switch-to-configuration is re-entrant, last-good is
         # only written on SUCCESS, so the next tick re-runs switch to the
         # SAME target_sha and re-converges. Net: bounded-wedge +
         # self-healing beats unbounded-wedge.
@@ -358,7 +371,7 @@ in
           Type = "oneshot";
           ExecStart = pkgs.writeShellScript "deploy-notify-success" ''
             set -e
-            SHA=$(${pkgs.coreutils}/bin/head -1 /var/lib/nixos-deploy/last-deployed-sha 2>/dev/null || echo unknown)
+            SHA=$(${pkgs.coreutils}/bin/head -1 /var/lib/nixos-deploy/last-good 2>/dev/null || echo unknown)
             ${pkgs.libnotify}/bin/notify-send -u low "nixos-deploy" "Applied $SHA"
           '';
         };

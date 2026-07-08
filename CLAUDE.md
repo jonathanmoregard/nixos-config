@@ -85,7 +85,7 @@ Public repo = unlimited free minutes. KVM nested-virt is ~30-50% slower than bar
 
 **Fork-PR policy:** this repo does NOT accept external contributions. `ci.yml` and `gate.yml` jobs skip on fork PRs (`if: head.repo == base.repo`); `close-fork-prs.yml` auto-closes any fork PR with a polite note. `scripts/check-fork-guards.sh` runs as a CI job to assert future workflows keep the guard.
 
-**Self-hosted runner is gone** — `modules/nixos/actions-runner.nix` and `modules/nixos/atticd.nix` deleted; the only CI-related code on dellan is the webhook handler (`modules/nixos/github-webhook.nix`) and the auto-deploy unit (`modules/nixos/nixos-deploy.nix`).
+**Self-hosted runner is gone** — `modules/nixos/actions-runner.nix` and `modules/nixos/atticd.nix` deleted; the only CI-related code on dellan is `modules/nixos/nixos-auto-deploy.nix` (auto-deploy unit + webhook receiver, subsuming the former `github-webhook.nix` + `nixos-deploy.nix`).
 
 ## VM e2e tests
 
@@ -171,8 +171,7 @@ Manual recovery: `sudo nixos-rebuild switch --rollback`.
 | `home/ghostty.nix` | Ghostty terminal config |
 | `home/autodoro.nix` | Autodoro systemd user service |
 | `modules/nixos/desktop.nix` | Cinnamon/LightDM system config + Chrome policies |
-| `modules/nixos/github-webhook.nix` | Webhook ingress for `push: main` events |
-| `modules/nixos/nixos-deploy.nix` | Auto-deploy systemd unit |
+| `modules/nixos/nixos-auto-deploy.nix` | Auto-deploy timer/unit + GitHub webhook receiver |
 
 ## Cinnamon applet notes
 
