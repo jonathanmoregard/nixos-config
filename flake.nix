@@ -153,6 +153,14 @@
             .microvm.vms.research-agent.config.config
             .systemd.services.research-agent-egress-init.script;
         };
+        # Not a VM lane: runtime-invocation harness for the cachix
+        # post-build-hook's push-budget filter (skip microvm erofs +
+        # >256MiB paths; never fail the build). Cheap runCommand.
+        cachix-push-filter = import ./tests/cachix-push-filter.nix {
+          pkgs = pkgsLinux;
+          prodHook = self.nixosConfigurations.dellan.config
+            .nix.settings.post-build-hook;
+        };
       };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.
