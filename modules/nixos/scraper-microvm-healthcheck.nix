@@ -29,6 +29,18 @@
 # flag-file + PathChanged user-unit chain. A later healthy probe
 # clears the latch and re-arms.
 #
+# INTENTIONAL DIVERGENCE from the research-agent twin: this watchdog has
+# NO host-offline gate. The research-agent guest gates sshd on an
+# egress-init that waits for DNS, so a host without network means a
+# probe that fails "legitimately" and self-heals — restarting there is
+# harmful noise. The scraper guest's sshd has no such network
+# dependency and the ssh-keyscan probe is loopback-only, so a probe
+# failure here means the VM itself is unhealthy REGARDLESS of host
+# connectivity, and restarting is exactly right. Porting the offline
+# gate here would only mask real failures while offline. Keep the twins
+# different on purpose; revisit only if scraper sshd ever grows a
+# network-gated dependency.
+#
 # Defense-in-depth: this is the safety net. The microvm config remains
 # the primary path; if it boots and stays healthy, this script is a no-op
 # forever (just one journal line per minute saying "ok").
