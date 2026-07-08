@@ -1,5 +1,5 @@
-# vm-auto-deploy: the CD path cannot wedge forever, and a failed fetch
-# is handled cleanly.
+# vm-auto-deploy: the CD path cannot wedge forever, a failed fetch is
+# handled cleanly, and success/failure bookkeeping lands in `last-good`.
 #
 # Guards the 2026-06-14 incident: nixos-deploy's `git fetch` stalled on
 # a half-open ssh connection (no ConnectTimeout / keepalive / overall
@@ -20,6 +20,16 @@
 #     (no hang), and — critically — does NOT latch the (never-computed)
 #     SHA as poisoned. This exercises the real fetch-failure branch,
 #     not a hand-typed analogue.
+#   - BEHAVIOURAL (success/failure bookkeeping): re-run the rendered
+#     script against a REAL local origin with ONLY the `nixos-rebuild
+#     switch` invocation stubbed (`if true` / `if false`); assert the
+#     success tail records the deployed SHA in `last-good` (and
+#     migrates away the pre-rename `last-deployed-sha` file), and that
+#     a failed deploy latches without advancing `last-good`. Guards
+#     the stale-last-good bug: 4ad9306 (2026-05-06) renamed the old
+#     module's `last-good` state file to `last-deployed-sha`, so the
+#     on-disk `last-good` the docs advertise froze at the old module's
+#     final deploy (64fc3c4, 2026-05-05) while deploys kept succeeding.
 #
 # What the VM canNOT model: a genuine network *stall* to github over
 # ssh (the literal incident). That a hung fetch is aborted rests on
@@ -102,5 +112,66 @@
     assert rc2 != 0 and "another run in progress" not in out2 and "git fetch failed" in out2, (
         f"lock not released / didn't re-reach fetch branch (rc2={rc2}): {out2!r}"
     )
+
+    # 4. Success-path bookkeeping: a successful deploy must record the
+    #    deployed SHA in /var/lib/nixos-deploy/last-good. Runs the REAL
+    #    rendered script with ONLY the `nixos-rebuild switch` invocation
+    #    stubbed to `true` (the VM cannot run a real switch); fetch,
+    #    poison-latch handling and the bookkeeping tail are untouched.
+    dellan.succeed(
+        "git init -q -b main /tmp/origin-repo "
+        "&& git -C /tmp/origin-repo -c user.email=t@test -c user.name=t "
+        "commit -q --allow-empty -m seed"
+    )
+    target = dellan.succeed("git -C /tmp/origin-repo rev-parse main").strip()
+    dellan.succeed("git -C /tmp/deploy-repo remote set-url origin /tmp/origin-repo")
+    dellan.succeed(
+        f"sed 's|if nixos-rebuild switch --flake|if true --flake|' {script} "
+        "> /tmp/deploy-stub-ok "
+        "&& grep -q 'if true --flake' /tmp/deploy-stub-ok "
+        "&& chmod +x /tmp/deploy-stub-ok"
+    )
+    # Seed the pre-rename state file: the script must migrate it to
+    # last-good (mv), not leave a second, permanently-stale record —
+    # an orphaned state file is exactly the bug class under test.
+    dellan.succeed("printf 'deadbeef\\n' > /var/lib/nixos-deploy/last-deployed-sha")
+    rc, out = dellan.execute("/tmp/deploy-stub-ok 2>&1")
+    print(f"[diag] success-path rc={rc} out={out!r}")
+    assert rc == 0 and f"deploy success: {target}" in out, (
+        f"stubbed success run did not reach the success tail (rc={rc}): {out!r}"
+    )
+    last_good = dellan.succeed(
+        "cat /var/lib/nixos-deploy/last-good 2>/dev/null || echo MISSING"
+    ).strip()
+    assert last_good == target, (
+        f"last-good must equal the deployed SHA; got {last_good!r}, want {target!r}"
+    )
+    dellan.succeed("test ! -e /var/lib/nixos-deploy/last-deployed-sha")
+
+    # 5. Failure path must NOT advance last-good (it is last-GOOD, not
+    #    last-attempted): a new commit whose rebuild fails is latched
+    #    as poisoned while last-good keeps the previously-deployed SHA.
+    dellan.succeed(
+        "git -C /tmp/origin-repo -c user.email=t@test -c user.name=t "
+        "commit -q --allow-empty -m next"
+    )
+    target2 = dellan.succeed("git -C /tmp/origin-repo rev-parse main").strip()
+    dellan.succeed(
+        f"sed 's|if nixos-rebuild switch --flake|if false --flake|' {script} "
+        "> /tmp/deploy-stub-fail "
+        "&& grep -q 'if false --flake' /tmp/deploy-stub-fail "
+        "&& chmod +x /tmp/deploy-stub-fail"
+    )
+    rc, out = dellan.execute("/tmp/deploy-stub-fail 2>&1")
+    print(f"[diag] failure-path rc={rc} out={out!r}")
+    assert rc != 0 and "latched as poisoned" in out, (
+        f"stubbed failure run should latch + exit non-zero (rc={rc}): {out!r}"
+    )
+    last_good = dellan.succeed("cat /var/lib/nixos-deploy/last-good").strip()
+    assert last_good == target, (
+        f"failed deploy must not advance last-good; got {last_good!r}, want {target!r}"
+    )
+    latch = dellan.succeed("cat /var/lib/nixos-deploy/poison-latch").strip()
+    assert latch == target2, f"poison-latch should hold {target2!r}; got {latch!r}"
   '';
 }
