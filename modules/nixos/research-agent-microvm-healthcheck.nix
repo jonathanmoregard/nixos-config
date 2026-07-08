@@ -37,6 +37,10 @@
 # counted at all — the guest is just waiting for the network (see the
 # retry-forever egress-init) and heals itself on reconnect; restarting
 # or latching would manufacture a false outage out of a missing WiFi.
+# NOTE: the scraper twin deliberately has NO such gate — its sshd has
+# no egress dependency, so offline cannot cause a false probe failure
+# there and the gate would only mask real breakage. See the divergence
+# note in scraper-microvm-healthcheck.nix before "syncing" the twins.
 #
 # Defense-in-depth: this is the safety net. The microvm config remains
 # the primary path; if it boots and stays healthy, this script is a
