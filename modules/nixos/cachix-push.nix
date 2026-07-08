@@ -18,9 +18,17 @@
 #   - Each push is wrapped in `timeout` so a stalled upload (cachix.org
 #     hiccup, slow network, server-side rate limit) can't hang the
 #     whole rebuild. SIGKILL after the timeout; log and move on.
+#   - Paths that can't realistically finish inside the timeout are
+#     skipped up front (push-budget filter: *-microvm-store-disk.erofs
+#     by name, plus anything over maxPathBytes) — otherwise EVERY
+#     referencing derivation re-attempts the same doomed upload.
 #   - Failures + timeouts go to the journal (stderr is captured by
 #     systemd-journald via the nix-daemon service), so they're
 #     diagnosable but invisible to interactive build sessions.
+#
+# Contract enforced by checks.cachix-push-filter
+# (tests/cachix-push-filter.nix), a runtime-invocation harness over the
+# shared script template in ./cachix-push-hook.nix.
 #
 # Past incident (2026-05-19): with no timeout and `set -euf`, an
 # 80 MiB firefox tarball push hung for 11+ minutes against an
@@ -42,45 +50,33 @@ let
   # before we cut losses.
   pushTimeoutSeconds = 600;
 
+  # Per-path push budget. Anything larger than this cannot finish
+  # inside pushTimeoutSeconds on dellan's ~2.4 Mbit uplink, so every
+  # referencing derivation re-attempts the same blob forever.
+  # Incident (2026-07-07): the ~621 MiB *-microvm-store-disk.erofs was
+  # re-pushed dozens of times across two VM-gate runs (30-50 min each)
+  # and once livelocked the uplink. Skipping is safe — the hook is
+  # opportunistic; CI rebuilds whatever the cache misses.
+  maxPathBytes = 256 * 1024 * 1024;
+
   # Nix daemon invokes this after every successful local build.
   # OUT_PATHS is space-separated store paths; `cachix push` accepts
   # multiple paths in one invocation. We DELIBERATELY DO NOT use
   # `set -e`: any subcommand failure must be swallowed locally so
   # the script returns 0 to nix-daemon.
-  pushHook = pkgs.writeShellScript "cachix-push-hook" ''
-    set -uf
-    export IFS=' '
-    if [ -z "''${OUT_PATHS:-}" ]; then
-      exit 0
-    fi
-    tokenFile="${config.age.secrets.cachix-auth-token.path}"
-    if [ ! -r "$tokenFile" ]; then
-      # Secret not yet activated (early boot, or recipient mismatch).
-      exit 0
-    fi
-
-    # Capture the exit code BEFORE any `if`-test or `!`-inversion —
-    # bash zeroes `$?` once a conditional has decided, so reading rc
-    # from inside an `if ! cmd; then` block always sees 0 and the
-    # 124/137 timeout-vs-failure discriminator below would be wrong.
-    rc=0
-    # shellcheck disable=SC2086 # OUT_PATHS is intentionally word-split
-    CACHIX_AUTH_TOKEN="$(< "$tokenFile")" \
-      ${pkgs.coreutils}/bin/timeout \
-        --signal=KILL --kill-after=5s ${toString pushTimeoutSeconds}s \
-      ${pkgs.cachix}/bin/cachix push ${cacheName} $OUT_PATHS \
-      >&2 || rc=$?
-    if [ "$rc" -ne 0 ]; then
-      if [ "$rc" = "137" ] || [ "$rc" = "124" ]; then
-        echo "cachix-push-hook: timed out after ${toString pushTimeoutSeconds}s pushing $OUT_PATHS" >&2
-      else
-        echo "cachix-push-hook: cachix push failed with exit $rc (ignoring; build artifact is local)" >&2
-      fi
-    fi
-
-    # Always succeed: the push is opportunistic.
-    exit 0
-  '';
+  #
+  # The script body lives in ./cachix-push-hook.nix, parameterized so
+  # the runtime-invocation check (nix build
+  # .#checks.x86_64-linux.cachix-push-filter -L) can exercise the same
+  # logic with stubbed binaries and a short timeout. Keep logic there.
+  pushHook = pkgs.writeShellScript "cachix-push-hook" (import ./cachix-push-hook.nix {
+    inherit cacheName pushTimeoutSeconds maxPathBytes;
+    tokenFile = config.age.secrets.cachix-auth-token.path;
+    cachixBin = "${pkgs.cachix}/bin/cachix";
+    timeoutBin = "${pkgs.coreutils}/bin/timeout";
+    duBin = "${pkgs.coreutils}/bin/du";
+    cutBin = "${pkgs.coreutils}/bin/cut";
+  });
 in
 {
   age.secrets.cachix-auth-token.rekeyFile = ../../secrets/cachix-auth-token.age;
