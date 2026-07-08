@@ -31,6 +31,7 @@ in
     ./kitty.nix
     ./autodoro.nix
     ./drift-analyzer.nix
+    ./worktree-sweep.nix
     ./router-services.nix
     ./claude-services.nix
     ./claude-skills.nix
