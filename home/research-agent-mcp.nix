@@ -36,7 +36,9 @@
   home.packages = [
     (pkgs.writeShellApplication {
       name = "research-agent-mcp";
-      runtimeInputs = [ pkgs.uv ];
+      # tesseract: the post-run artifact gate OCRs browser screenshots
+      # (mcp_server/artifact_gate.py) before they reach reports/.
+      runtimeInputs = [ pkgs.uv pkgs.tesseract ];
       text = ''
         # Read raw-value secrets from agenix decrypt paths. The `.age`
         # files contain ONLY the key (no `ANTHROPIC_API_KEY=` prefix),
