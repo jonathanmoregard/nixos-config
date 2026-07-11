@@ -18,7 +18,7 @@
 #    └─ scraper microvm (this module)
 #         - chromium + playwright via headless HTTP server on guest :8000
 #         - SLIRP forwarded to host 127.0.0.1:8123
-#         - nftables: ssh + scraper port inbound, * outbound
+#         - stock NixOS firewall: ssh + scraper port inbound, * outbound
 #         - holds NO secrets; the bearer token gates incoming requests only
 #    └─ research-agent microvm (sibling module)
 #         - reaches scraper via 10.0.2.2:8123 (SLIRP host gateway)
@@ -229,30 +229,33 @@
         };
       };
 
-      # nftables: inbound restricted to ssh + scraper API. Outbound
-      # unrestricted on purpose — the scraper's job is to fetch arbitrary
-      # URLs. That widened egress is contained by the VM boundary; no
-      # API keys or operator data live here, so the exfil ceiling for a
-      # chromium compromise is "the HTML the operator asked it to fetch
-      # anyway".
-      networking.nftables = {
-        enable = true;
-        ruleset = ''
-          table inet filter {
-            chain input {
-              type filter hook input priority 0; policy drop;
-              iif lo accept
-              ct state established,related accept
-              tcp dport 22 accept
-              tcp dport 8000 accept
-            }
+      # Inbound: ssh (opened by services.openssh.openFirewall) + the
+      # scraper API. Outbound unrestricted on purpose — the scraper's
+      # job is to fetch arbitrary URLs. That widened egress is contained
+      # by the VM boundary; no API keys or operator data live here, so
+      # the exfil ceiling for a chromium compromise is "the HTML the
+      # operator asked it to fetch anyway".
+      #
+      # Stock NixOS firewall ONLY. A custom nftables ruleset used to
+      # coexist here — but every base chain hooked at input must accept
+      # a packet for it to pass, and the default nixos-fw chain (on by
+      # default, fed only by openssh's port 22) silently dropped :8000
+      # SYNs. Result: the host→scraper hostfwd (127.0.0.1:8123) hung on
+      # every connect while ssh worked, diagnosed 2026-07-11. One
+      # firewall layer, stock options, nothing to fall out of sync.
+      networking.firewall.allowedTCPPorts = [ 8000 ];
 
-            chain output {
-              type filter hook output priority 0; policy accept;
-            }
-          }
-        '';
-      };
+      # Guardrail: any host-forwarded guest port must actually be
+      # admitted by the guest firewall, or the forward dies the same
+      # silent death. Fails the build, not the runtime.
+      assertions = [{
+        assertion = lib.all (p:
+          p.from or "host" != "host"
+          || p.proto or "tcp" != "tcp"
+          || builtins.elem p.guest.port config.networking.firewall.allowedTCPPorts
+        ) config.microvm.forwardPorts;
+        message = "scraper microvm: a TCP forwardPorts guest port is not in networking.firewall.allowedTCPPorts — the hostfwd would stall (see 2026-07-11 incident)";
+      }];
 
       networking.hostName = "scraper";
       # IPv4-only — mirrors research-agent for the same SLIRP-resolver
