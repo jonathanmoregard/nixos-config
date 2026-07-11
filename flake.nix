@@ -34,7 +34,6 @@
     # nixpkgs. flake.lock pins the exact SHA so the build remains
     # reproducible; bumping via `nix flake update microvm` is a
     # deliberate PR with a re-run dellan-vm test.
-    # .github/workflows/update-microvm-pin.yml watches for new commits.
     microvm.url = "github:astro/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
