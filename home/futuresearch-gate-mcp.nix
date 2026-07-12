@@ -16,11 +16,11 @@
 # providers, no Claude Code OAuth token, no EUIPO credentials, no
 # RESEARCH_SSH_KEY.
 #
-# The python module (mcp_server.futuresearch_gate) lands with
-# research-agent PR #15. Until the ~/Repos/research-agent checkout
-# contains it, this wrapper exits with a Python module error —
-# acceptable: Claude Code just shows the MCP as failed-to-connect.
-# Deploy order therefore doesn't matter in either direction.
+# The python module (futuresearch_gate.server) lives in the standalone
+# futuresearch-gate repo (github.com/jonathanmoregard/futuresearch-gate,
+# depends only on the injection-scanner package), already checked out
+# at ~/Repos/futuresearch-gate — so there is no deploy-order dependency:
+# the wrapper works as soon as it lands on PATH.
 {
   home.packages = [
     (pkgs.writeShellApplication {
@@ -42,10 +42,10 @@
         # testing (mirrors the RESEARCH_SSH_KEY pattern in
         # research-agent-mcp.nix): a caller exporting
         # FUTURESEARCH_GATE_PROJECT before us wins.
-        GATE_PROJECT="''${FUTURESEARCH_GATE_PROJECT:-$HOME/Repos/research-agent}"
+        GATE_PROJECT="''${FUTURESEARCH_GATE_PROJECT:-$HOME/Repos/futuresearch-gate}"
 
         exec uv run --project "$GATE_PROJECT" \
-            python3 -m mcp_server.futuresearch_gate "$@"
+            python3 -m futuresearch_gate.server "$@"
       '';
     })
   ];
