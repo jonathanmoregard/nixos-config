@@ -48,6 +48,9 @@
         # as an env var value.
         ANTHROPIC_API_KEY=$(< /run/agenix/anthropic-api-key)
         OPENAI_API_KEY=$(< /run/agenix/openai-api-key)
+        # injection-scanner L2 (Lakera Guard) is fail-closed — without this
+        # the scanner rejects every report. Must be a real key.
+        LAKERA_API_KEY=$(< /run/agenix/lakera-api-key)
         EXA_API_KEY=$(< /run/agenix/exa-api-key)
         TAVILY_API_KEY=$(< /run/agenix/tavily-api-key)
         CLAUDE_CODE_OAUTH_TOKEN=$(< /run/agenix/claude-token)
@@ -59,7 +62,7 @@
         # paths keep working with the secrets unset.
         EUIPO_CLIENT_ID=$(< /run/agenix/euipo-client-id)
         EUIPO_CLIENT_SECRET=$(< /run/agenix/euipo-client-secret)
-        export ANTHROPIC_API_KEY OPENAI_API_KEY \
+        export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY \
                EXA_API_KEY TAVILY_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
                EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET
 
