@@ -94,6 +94,18 @@
     group = "users";
     mode = "0400";
   };
+  # injection-scanner L2 hosted classifier (Lakera Guard). The scanner's
+  # Lakera layer is FAIL-CLOSED: if this key is missing or empty the scan
+  # rejects loudly, so this must be provisioned (a real key, not an empty
+  # placeholder) before injection-scanner's fail-closed Lakera lands on
+  # main. Consumed by claude-cl-sync.service and the research-agent-mcp
+  # wrapper, same raw-value `$(< file)` pattern as the keys above.
+  age.secrets.lakera-api-key = {
+    rekeyFile = ../../secrets/lakera-api-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
   age.secrets.exa-api-key = {
     rekeyFile = ../../secrets/exa-api-key.age;
     owner = "jonathan";

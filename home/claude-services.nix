@@ -8,17 +8,20 @@
 # the units will fail at first tick until that scaffolding is set up
 # separately.
 let
-  # claude-cl-sync's injection-scanner honeypot probes Anthropic + OpenAI
-  # on every tick. systemd's `EnvironmentFile=` expects KEY=VALUE format,
-  # but our agenix `.age` files contain the raw key value only (no
-  # `ANTHROPIC_API_KEY=` prefix). Read the raw bytes with `$(< file)`
-  # (strips trailing newline) and export before execing the real entry.
+  # claude-cl-sync's injection-scanner probes Anthropic + OpenAI (L3
+  # honeypot) and Lakera Guard (L2 classifier) on every tick. systemd's
+  # `EnvironmentFile=` expects KEY=VALUE format, but our agenix `.age`
+  # files contain the raw key value only (no `ANTHROPIC_API_KEY=` prefix).
+  # Read the raw bytes with `$(< file)` (strips trailing newline) and
+  # export before execing the real entry. LAKERA is fail-closed in the
+  # scanner — without it the scan rejects, so it must be a real key.
   claude-cl-sync-wrap = pkgs.writeShellApplication {
     name = "claude-cl-sync-wrap";
     text = ''
       ANTHROPIC_API_KEY=$(< /run/agenix/anthropic-api-key)
       OPENAI_API_KEY=$(< /run/agenix/openai-api-key)
-      export ANTHROPIC_API_KEY OPENAI_API_KEY
+      LAKERA_API_KEY=$(< /run/agenix/lakera-api-key)
+      export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY
       exec "$HOME/.claude/dev-container/.venv/bin/python3" \
            "$HOME/.claude/dev-container/bin/claude-cl-sync"
     '';
