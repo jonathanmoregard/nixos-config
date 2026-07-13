@@ -5,14 +5,17 @@
 # (configured in ~/.claude.json). The gate is an injection-screening
 # proxy for FutureSearch forecast results: content coming back from the
 # FutureSearch API is scanned for prompt injection before it reaches
-# the calling agent. Like research-agent-mcp, the injection-scanner's
-# L3 honeypot calls Anthropic + OpenAI on every scan, and the server
-# runs a boot smoke at startup — without ANTHROPIC_API_KEY /
-# OPENAI_API_KEY in the spawn env the smoke fails closed and the
-# server exits 2 before binding stdio.
+# the calling agent. Like research-agent-mcp, the gate self-updates the
+# injection-scanner to latest on every boot and then runs a fail-closed
+# boot smoke; the scanner's L3 honeypot calls Anthropic + OpenAI, and
+# its L2 layer calls Lakera Guard, on every scan. Without ANTHROPIC_API_KEY
+# / OPENAI_API_KEY / LAKERA_API_KEY in the spawn env the boot smoke fails
+# closed (benign probe rejects, e.g. lakera_unavailable:no-key) and the
+# server exits 2 before binding stdio — CC then reports the MCP as failed
+# to connect (-32000).
 #
 # Unlike research-agent-mcp, the gate does no research and drives no
-# VM, so it needs ONLY the two scanner keys — no EXA/TAVILY search
+# VM, so it needs ONLY the three scanner keys — no EXA/TAVILY search
 # providers, no Claude Code OAuth token, no EUIPO credentials, no
 # RESEARCH_SSH_KEY.
 #
@@ -36,7 +39,11 @@
         # newline — exactly what we want as an env var value.
         ANTHROPIC_API_KEY=$(< /run/agenix/anthropic-api-key)
         OPENAI_API_KEY=$(< /run/agenix/openai-api-key)
-        export ANTHROPIC_API_KEY OPENAI_API_KEY
+        # injection-scanner L2 (Lakera Guard) is fail-closed — the gate
+        # self-updates to the latest scanner at boot, so without this the
+        # boot smoke rejects and the server exits 2 (-32000).
+        LAKERA_API_KEY=$(< /run/agenix/lakera-api-key)
+        export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY
 
         # Project dir for `uv run`. Override-friendly for pre-deploy
         # testing (mirrors the RESEARCH_SSH_KEY pattern in
