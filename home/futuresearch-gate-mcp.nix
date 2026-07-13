@@ -45,6 +45,12 @@
         LAKERA_API_KEY=$(< /run/agenix/lakera-api-key)
         export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY
 
+        # The scanner's Lakera call uses stdlib urllib, which finds no
+        # CA bundle on NixOS with a uv-managed CPython — cert verify
+        # fails (lakera_unavailable:URLError) and the fail-closed boot
+        # smoke rejects. Full rationale in research-agent-mcp.nix.
+        export SSL_CERT_FILE="''${SSL_CERT_FILE:-/etc/ssl/certs/ca-bundle.crt}"
+
         # Project dir for `uv run`. Override-friendly for pre-deploy
         # testing (mirrors the RESEARCH_SSH_KEY pattern in
         # research-agent-mcp.nix): a caller exporting
