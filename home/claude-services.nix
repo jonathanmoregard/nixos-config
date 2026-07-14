@@ -21,7 +21,12 @@ let
       ANTHROPIC_API_KEY=$(< /run/agenix/anthropic-api-key)
       OPENAI_API_KEY=$(< /run/agenix/openai-api-key)
       LAKERA_API_KEY=$(< /run/agenix/lakera-api-key)
-      export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY
+      # The scanner's Lakera call uses stdlib urllib, which finds no CA
+      # bundle on NixOS in a non-nix CPython — cert verify fails
+      # (lakera_unavailable:URLError) and the fail-closed scan rejects.
+      # Full rationale in research-agent-mcp.nix.
+      SSL_CERT_FILE="''${SSL_CERT_FILE:-/etc/ssl/certs/ca-bundle.crt}"
+      export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY SSL_CERT_FILE
       exec "$HOME/.claude/dev-container/.venv/bin/python3" \
            "$HOME/.claude/dev-container/bin/claude-cl-sync"
     '';

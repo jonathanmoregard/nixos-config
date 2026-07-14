@@ -72,6 +72,17 @@
         # RESEARCH_SSH_KEY before us wins.
         export RESEARCH_SSH_KEY="''${RESEARCH_SSH_KEY:-/run/agenix/research-agent-host-key}"
 
+        # injection-scanner L2 posts to Lakera Guard with stdlib urllib,
+        # which verifies TLS against Python's default CA paths. The
+        # uv-managed CPython finds no CA bundle on NixOS (no cafile;
+        # the /etc/ssl/certs capath fallback needs hash-named symlinks
+        # NixOS doesn't provide), so cert verify fails and the
+        # fail-closed boot smoke rejects with lakera_unavailable:URLError
+        # — server exits 2 before binding stdio. Point stdlib SSL at the
+        # system bundle. The Anthropic/OpenAI SDKs bundle certifi and
+        # never hit this, which is why only the urllib call breaks.
+        export SSL_CERT_FILE="''${SSL_CERT_FILE:-/etc/ssl/certs/ca-bundle.crt}"
+
         exec uv run --project "$HOME/Repos/research-agent" \
             python3 -m mcp_server.server "$@"
       '';
