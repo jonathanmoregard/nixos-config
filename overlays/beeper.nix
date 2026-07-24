@@ -13,10 +13,10 @@
 final: prev:
 let
   pname = "beeper";
-  version = "4.2.808";
+  version = "4.2.1004";
   src = prev.fetchurl {
     url = "https://beeper-desktop.download.beeper.com/builds/Beeper-${version}-x86_64.AppImage";
-    hash = "sha256-ql5WkKVgQiKIHkNKd805xFezsvoW+8dqXx6MzfsxceM="; # pragma: allowlist secret
+    hash = "sha256-JmeD/gVBdj6Tb7Y9L43V2WoFgw3y9q1xiIjF723JmuQ="; # pragma: allowlist secret
   };
   appimageContents = prev.appimageTools.extract {
     inherit pname version src;
