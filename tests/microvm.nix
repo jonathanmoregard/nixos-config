@@ -180,6 +180,23 @@ pkgs.testers.runNixOSTest {
     # 2026-07-07 false "VM DOWN" incident.
     dellan.succeed(f"grep -q 'host is offline' {script_path}")
     dellan.succeed(f"grep -q 'getent ahostsv4' {script_path}")
+    # Wedge-snapshot instrumentation: before the recovery restart destroys
+    # the wedged qemu, the watchdog must capture the guest console (streamed
+    # to the journal via the qemu stdio chardev) to a persistent, pruned
+    # file — the only window the warm-reboot second-boot failure is still on
+    # record. Assert the logic is wired and the persistent dir is root-only.
+    dellan.succeed(f"grep -q 'snapshot_console' {script_path}")
+    dellan.succeed(f"grep -q 'wedge-logs' {script_path}")
+    dellan.succeed(
+        f"grep -q 'journalctl -u microvm@research-agent.service' {script_path}"
+    )
+    dellan.succeed("test -d /var/lib/research-agent/wedge-logs")
+    wperms = dellan.succeed(
+        "stat -c '%a %U' /var/lib/research-agent/wedge-logs"
+    ).strip()
+    assert wperms == "700 root", (
+        f"wedge-logs dir perms expected '700 root', got {wperms!r}"
+    )
     # Notification chain: user path + service units installed, flag dir
     # exists and is world-readable so the user session can inotify it.
     dellan.succeed(
