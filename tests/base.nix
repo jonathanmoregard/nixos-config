@@ -228,5 +228,74 @@
     )
     assert "skipping" in run_log, \
         f"guard-path 'skipping' marker missing from run.log:\n{run_log}"
+
+    # notify-send must resolve on jonathan's PATH: the runner's Claude
+    # allowlist includes Bash(notify-send*) for medium/high findings,
+    # and that entry was dead (exit 127) until libnotify landed in
+    # home.packages — this assertion keeps it from regressing.
+    dellan.succeed(
+        "su - jonathan -c 'command -v notify-send'"
+    )
+
+    # Negative control BEFORE the failure lane: a clean guard-path run
+    # must NOT have tripped the OnFailure notify unit. Without this, the
+    # failure lane's journal grep below could pass vacuously if OnFailure
+    # were mis-wired to fire on every run.
+    notify_log = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u sota-watch-failure-notify.service --no-pager' "
+        "|| true"
+    )
+    assert "SOTA-watch runner failed" not in notify_log, (
+        "notify marker present after a SUCCESSFUL guard-path run — "
+        f"OnFailure is mis-wired:\n{notify_log}"
+    )
+
+    # sota-watch OnFailure chain — a failing runner must trigger the
+    # sota-watch-failure-notify user unit (the 2026-07 incident: expired
+    # OAuth made the runner exit 1 daily for 11 days with zero signal).
+    # Plant a fake runner that exits 1, start the service (expected to
+    # fail), and assert the notify unit's guaranteed journal marker.
+    # The desktop notify-send itself is best-effort (headless VM has no
+    # notification daemon) — the marker line is the testable contract.
+    # Created as ROOT with absolute paths: /home/jonathan/Repos is
+    # pre-created root-owned in this VM by the microvm share plumbing,
+    # so jonathan cannot mkdir under it (verified via driverInteractive:
+    # "mkdir: cannot create directory ... Permission denied"). A root
+    # 0755 file is still executable by the service user, which is all
+    # the wrapper's `[ ! -x "$RUNNER" ]` guard needs.
+    dellan.succeed(
+        "mkdir -p /home/jonathan/Repos/sota-watch/runner && "
+        "printf '#!/bin/sh\\nexit 1\\n' > /home/jonathan/Repos/sota-watch/runner/run-watch.sh && "
+        "chmod 755 /home/jonathan/Repos/sota-watch/runner/run-watch.sh"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start sota-watch.service; true'"
+    )
+    state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed sota-watch.service || true'"
+    ).strip()
+    assert state == "failed", (
+        "fake failing runner should leave sota-watch.service failed; "
+        f"got is-failed={state!r}"
+    )
+    # OnFailure dispatch is asynchronous; poll the notify unit's journal
+    # for the marker instead of asserting instantly.
+    dellan.wait_until_succeeds(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u sota-watch-failure-notify.service --no-pager' "
+        "| grep -q 'SOTA-watch runner failed'",
+        timeout=60,
+    )
+    # Leave the VM state clean for any later lane: drop the fake runner
+    # (as root — jonathan can't write under /home/jonathan/Repos here)
+    # and clear the deliberately-failed unit.
+    dellan.succeed("rm -rf /home/jonathan/Repos/sota-watch")
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user reset-failed sota-watch.service'"
+    )
   '';
 }
