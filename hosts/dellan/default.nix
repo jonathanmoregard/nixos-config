@@ -56,6 +56,12 @@
     # them and wraps tts-tool to inject FISH_AUDIO_API_KEY_FILE from
     # the agenix secret at runtime.
     ../../modules/nixos/listen-tools.nix
+
+    # `blog-style-neural` — API-based neural detector channels (StyleDistance
+    # via HF, Fast-DetectGPT-lite via DeepInfra) that complement the local
+    # stylometric blog style-detector. Declares deepinfra-api-key + hf-token
+    # agenix secrets and a wrapper that injects them at exec time.
+    ../../modules/nixos/blog-style-neural.nix
   ];
 
   # ---------------------------------------------------------------------
