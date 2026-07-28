@@ -48,6 +48,11 @@
 {
   systemd.tmpfiles.rules = [
     "d /run/research-agent-healthcheck 0700 root root -"
+    # Persistent wedge snapshots (guest console captured by the watchdog
+    # the instant it detects a wedge, before the recovery restart). Under
+    # /var/lib so they survive a host reboot; the watchdog prunes to the
+    # newest 20. root-only (guest console can contain arbitrary output).
+    "d /var/lib/research-agent/wedge-logs 0700 root root -"
     # Notify flag files live in a world-readable dir (separate from the
     # 0700 state dir) so the user-session path unit can inotify-watch
     # them. Shared by both microvm watchdogs; created by whichever
@@ -124,6 +129,48 @@
         printf '%s' "$v"
       }
 
+      # Capture the guest serial console the instant a wedge is detected,
+      # BEFORE the restart destroys the wedged qemu. The guest console is
+      # streamed to the journal via qemu's stdio chardev, so this is the
+      # only window in which the warm-reboot failure (second-boot PCI
+      # enumeration → /dev/disk/by-label/nix-store never materializes →
+      # emergency shell) is still on record — journald may later rotate it
+      # out. Written to /var/lib (survives host reboot) and pruned to the
+      # newest 20 so it can't grow unbounded. Best-effort: a failure to
+      # snapshot must never block the recovery restart, so every step
+      # swallows errors and returns 0. This is diagnostic instrumentation
+      # for the unreproduced 2026-07 warm-reboot wedge.
+      #
+      # TWIN DIVERGENCE (intentional): the scraper healthcheck has NO
+      # equivalent — the warm-reboot wedge has only been observed on
+      # research-agent. Don't "sync the twins" by copying this over
+      # without an observed scraper wedge to diagnose.
+      WEDGE_LOG_DIR=/var/lib/research-agent/wedge-logs
+      snapshot_console() {
+        local reason="$1" ts f
+        ts=$(date +%Y%m%dT%H%M%S 2>/dev/null) || return 0
+        mkdir -p "$WEDGE_LOG_DIR" 2>/dev/null || return 0
+        f="$WEDGE_LOG_DIR/wedge-$ts.log"
+        {
+          echo "# research-agent microvm wedge snapshot"
+          echo "# captured: $(date -Iseconds 2>/dev/null)"
+          echo "# reason: $reason"
+          echo "# ---- last 10 min of microvm@research-agent.service (guest console) ----"
+          # timeout: a wedged guest can pin a host core and make journald
+          # slow; the dump must never eat the oneshot's 30s budget. -n 5000
+          # bounds the file so a boot-looping guest can't write MBs ×20.
+          timeout --kill-after=2 10 \
+            journalctl -u microvm@research-agent.service \
+              --since "-10min" -n 5000 --no-pager 2>/dev/null || true
+        } > "$f" 2>/dev/null || return 0
+        echo "healthcheck: wrote wedge snapshot $f"
+        # Keep only the newest 20 snapshots.
+        ls -1t "$WEDGE_LOG_DIR"/wedge-*.log 2>/dev/null | tail -n +21 | while IFS= read -r old; do
+          rm -f "$old" 2>/dev/null || true
+        done
+        return 0
+      }
+
       # Restart the VM unless the burst budget is exhausted. $1 is the
       # journal line explaining why. Burst counts consecutive watchdog
       # restarts with no healthy probe in between; a successful probe
@@ -142,7 +189,8 @@
           if [ ! -e "$GAVEUP_FILE" ]; then
             : > "$GAVEUP_FILE"
             date +%s > "$NOTIFY_FILE" || true
-            echo "healthcheck: GIVING UP after $burst restarts without recovery; not restarting again. Inspect: journalctl -u microvm@research-agent.service; recover: systemctl restart microvm@research-agent.service"
+            snapshot_console "give-up: $burst restarts without recovery"
+            echo "healthcheck: GIVING UP after $burst restarts without recovery; not restarting again. Inspect: journalctl -u microvm@research-agent.service and $WEDGE_LOG_DIR; recover: systemctl restart microvm@research-agent.service"
           else
             # NOTIFY_FILE holds the epoch of the last notification —
             # re-touch when stale so a session that appears after the
@@ -159,7 +207,14 @@
         echo "$now" > "$LAST_RESTART_FILE"
         echo 0 > "$COUNT_FILE"
         echo $((burst + 1)) > "$BURST_FILE"
+        # Queue the recovery restart FIRST — --no-block returns as soon as
+        # the job is enqueued, so recovery is guaranteed even if the
+        # snapshot below hangs and systemd SIGTERMs this oneshot at its 30s
+        # budget. The guest console lives in the HOST journal, which the
+        # qemu restart does not erase, so snapshotting after the restart
+        # loses no evidence while removing any risk of blocking recovery.
         systemctl restart --no-block microvm@research-agent.service
+        snapshot_console "$why"
         exit 0
       }
 
