@@ -194,5 +194,39 @@
     assert rc != "failed", (
         f"camera watchdog must survive corrupted state; got is-failed={rc!r}"
     )
+
+    # sota-watch daily timer — durable schedule for the SOTA-watch runner.
+    # The runner script lives in ~/Repos/sota-watch/runner/run-watch.sh
+    # (a separate userspace repo NOT present in this VM), so the wrapper
+    # must guard: missing runner → log "skipping" and exit 0. This lane
+    # asserts (a) the timer unit is loaded + active for the user, and
+    # (b) starting the service exits cleanly and the run log records the
+    # skip — the behavioural guard-path signal.
+    timers = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user list-timers --all'"
+    )
+    assert "sota-watch.timer" in timers, \
+        f"sota-watch.timer missing from user timer list:\n{timers}"
+
+    # Start the service synchronously and assert it did NOT fail. `start`
+    # with a oneshot unit blocks until ExecStart returns; a non-zero exit
+    # (guard bug) surfaces as a failed unit.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start sota-watch.service'"
+    )
+    state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed sota-watch.service || true'"
+    ).strip()
+    assert state != "failed", \
+        f"sota-watch.service is in failed state after guard-path run: {state!r}"
+
+    run_log = dellan.succeed(
+        "cat /home/jonathan/.local/share/sota-watch/run.log"
+    )
+    assert "skipping" in run_log, \
+        f"guard-path 'skipping' marker missing from run.log:\n{run_log}"
   '';
 }

@@ -36,7 +36,9 @@
   home.packages = [
     (pkgs.writeShellApplication {
       name = "research-agent-mcp";
-      runtimeInputs = [ pkgs.uv ];
+      # tesseract: the post-run artifact gate OCRs browser screenshots
+      # (mcp_server/artifact_gate.py) before they reach reports/.
+      runtimeInputs = [ pkgs.uv pkgs.tesseract ];
       text = ''
         # Read raw-value secrets from agenix decrypt paths. The `.age`
         # files contain ONLY the key (no `ANTHROPIC_API_KEY=` prefix),
@@ -46,6 +48,9 @@
         # as an env var value.
         ANTHROPIC_API_KEY=$(< /run/agenix/anthropic-api-key)
         OPENAI_API_KEY=$(< /run/agenix/openai-api-key)
+        # injection-scanner L2 (Lakera Guard) is fail-closed — without this
+        # the scanner rejects every report. Must be a real key.
+        LAKERA_API_KEY=$(< /run/agenix/lakera-api-key)
         EXA_API_KEY=$(< /run/agenix/exa-api-key)
         TAVILY_API_KEY=$(< /run/agenix/tavily-api-key)
         CLAUDE_CODE_OAUTH_TOKEN=$(< /run/agenix/claude-token)
@@ -57,7 +62,7 @@
         # paths keep working with the secrets unset.
         EUIPO_CLIENT_ID=$(< /run/agenix/euipo-client-id)
         EUIPO_CLIENT_SECRET=$(< /run/agenix/euipo-client-secret)
-        export ANTHROPIC_API_KEY OPENAI_API_KEY \
+        export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY \
                EXA_API_KEY TAVILY_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
                EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET
 
@@ -66,6 +71,17 @@
         # decrypt path. Override-friendly: a caller exporting
         # RESEARCH_SSH_KEY before us wins.
         export RESEARCH_SSH_KEY="''${RESEARCH_SSH_KEY:-/run/agenix/research-agent-host-key}"
+
+        # injection-scanner L2 posts to Lakera Guard with stdlib urllib,
+        # which verifies TLS against Python's default CA paths. The
+        # uv-managed CPython finds no CA bundle on NixOS (no cafile;
+        # the /etc/ssl/certs capath fallback needs hash-named symlinks
+        # NixOS doesn't provide), so cert verify fails and the
+        # fail-closed boot smoke rejects with lakera_unavailable:URLError
+        # — server exits 2 before binding stdio. Point stdlib SSL at the
+        # system bundle. The Anthropic/OpenAI SDKs bundle certifi and
+        # never hit this, which is why only the urllib call breaks.
+        export SSL_CERT_FILE="''${SSL_CERT_FILE:-/etc/ssl/certs/ca-bundle.crt}"
 
         exec uv run --project "$HOME/Repos/research-agent" \
             python3 -m mcp_server.server "$@"

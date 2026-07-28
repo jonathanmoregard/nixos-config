@@ -31,11 +31,13 @@ in
     ./kitty.nix
     ./autodoro.nix
     ./drift-analyzer.nix
+    ./sota-watch.nix
     ./worktree-sweep.nix
     ./router-services.nix
     ./claude-services.nix
     ./claude-skills.nix
     ./research-agent-mcp.nix
+    ./futuresearch-gate-mcp.nix
   ];
 
   # Point Gemini-aware tools at the agenix-decrypted key path. Consumers
