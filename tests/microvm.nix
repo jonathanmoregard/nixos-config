@@ -112,8 +112,13 @@ pkgs.testers.runNixOSTest {
         "grep -qE -- '-m 2048( |$)' "
         "/var/lib/microvms/research-agent/current/bin/microvm-run"
     )
+    # 6144 (bumped from 3072 on 2026-07-30): a single research run OOM'd
+    # the 3 GiB guest, stalling sshd until the watchdog restarted the VM
+    # mid-run (research call died rc=255). More headroom keeps the guest
+    # responsive to the probe during a run. Assert on the materialized
+    # runner — the artifact qemu actually execs.
     dellan.succeed(
-        "grep -q -- '-m 3072' "
+        "grep -q -- '-m 6144' "
         "/var/lib/microvms/research-agent/current/bin/microvm-run"
     )
 
