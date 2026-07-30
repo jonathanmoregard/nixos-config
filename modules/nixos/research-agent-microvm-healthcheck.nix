@@ -48,6 +48,16 @@
 {
   systemd.tmpfiles.rules = [
     "d /run/research-agent-healthcheck 0700 root root -"
+    # Liveness-heartbeat dir. The research-agent MCP (running as jonathan)
+    # touches /run/research-agent/active while a research call is dialing
+    # the VM; this root watchdog reads its mtime to tell "busy" from
+    # "dead". Owned by jonathan so the MCP can write; the watchdog only
+    # reads. tmpfs (/run) — cleared on host reboot, which is correct (a
+    # fresh boot has no in-flight call). Threat model: any process running
+    # as jonathan could re-touch this file to suppress recovery — accepted
+    # on single-user dellan (such a process could DoS the VM directly);
+    # re-evaluate if this host ever becomes multi-user.
+    "d /run/research-agent 0755 jonathan users -"
     # Persistent wedge snapshots (guest console captured by the watchdog
     # the instant it detects a wedge, before the recovery restart). Under
     # /var/lib so they survive a host reboot; the watchdog prunes to the
@@ -301,6 +311,33 @@
         echo "healthcheck: probe failed but host is offline; guest egress-init is waiting for network — not counting"
         echo 0 > "$COUNT_FILE"
         exit 0
+      fi
+
+      # Busy gate: a research call actively dialing the VM keeps its
+      # heartbeat file fresh (the research-agent MCP touches
+      # /run/research-agent/active every ~20s while its ssh subprocess
+      # runs). A slow/unanswered ssh-keyscan DURING a live agent run is
+      # expected — a single research run loads the 3 GiB guest enough to
+      # delay the probe — NOT a dead VM. Restarting here would kill the
+      # in-flight call (2026-07-30: 93 mid-run restarts / 55 rc=255
+      # research failures in two days). Honor a FRESH heartbeat like the
+      # offline gate: don't count, don't restart. Staleness-bounded: the
+      # MCP clears the file on call-exit and only heartbeats around the
+      # live ssh call (not its own reconnect wait), so a genuinely dead VM
+      # or a crashed MCP goes stale within ACTIVITY_FRESH_S and normal
+      # recovery resumes — a dead VM is never masked longer than that.
+      ACTIVITY_FILE=/run/research-agent/active
+      ACTIVITY_FRESH_S=90
+      if [ -e "$ACTIVITY_FILE" ]; then
+        now=$(date +%s)
+        hb=$(stat -c %Y "$ACTIVITY_FILE" 2>/dev/null | tr -cd '0-9')
+        [ -z "$hb" ] && hb=0
+        age=$((now - hb))
+        if [ "$age" -lt "$ACTIVITY_FRESH_S" ]; then
+          echo "healthcheck: probe failed but a research call is active (heartbeat ''${age}s old); not counting"
+          echo 0 > "$COUNT_FILE"
+          exit 0
+        fi
       fi
 
       count=$((count + 1))

@@ -180,6 +180,19 @@ pkgs.testers.runNixOSTest {
     # 2026-07-07 false "VM DOWN" incident.
     dellan.succeed(f"grep -q 'host is offline' {script_path}")
     dellan.succeed(f"grep -q 'getent ahostsv4' {script_path}")
+    # Busy gate: while a research call is dialing the VM the MCP keeps a
+    # heartbeat fresh; the watchdog must NOT count a failed probe (and so
+    # must not restart) while it's fresh — otherwise it kills the in-flight
+    # research call (the 2026-07-30 mid-run-restart failure). Assert the
+    # gate is wired and the shared /run dir is jonathan-writable so the
+    # MCP can actually touch the heartbeat.
+    dellan.succeed(f"grep -q '/run/research-agent/active' {script_path}")
+    dellan.succeed(f"grep -q 'a research call is active' {script_path}")
+    dellan.succeed("test -d /run/research-agent")
+    aperms = dellan.succeed("stat -c '%a %U' /run/research-agent").strip()
+    assert aperms == "755 jonathan", (
+        f"/run/research-agent perms expected '755 jonathan', got {aperms!r}"
+    )
     # Wedge-snapshot instrumentation: before the recovery restart destroys
     # the wedged qemu, the watchdog must capture the guest console (streamed
     # to the journal via the qemu stdio chardev) to a persistent, pruned
