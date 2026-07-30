@@ -83,6 +83,16 @@
         # never hit this, which is why only the urllib call breaks.
         export SSL_CERT_FILE="''${SSL_CERT_FILE:-/etc/ssl/certs/ca-bundle.crt}"
 
+        # Liveness heartbeat the microvm watchdog reads to tell "busy" from
+        # "dead". While a research call is dialing the VM the MCP touches
+        # this file; the watchdog (research-agent-microvm-healthcheck.nix)
+        # treats a fresh heartbeat as "busy, don't restart", so it no longer
+        # kills a legitimately-running agent (2026-07-30: 93 mid-run
+        # restarts in 2 days). The /run/research-agent dir is created
+        # jonathan-owned by a tmpfiles rule in the healthcheck module;
+        # writer (here) and reader (watchdog) agree on this exact path.
+        export RESEARCH_ACTIVITY_FILE="''${RESEARCH_ACTIVITY_FILE:-/run/research-agent/active}"
+
         exec uv run --project "$HOME/Repos/research-agent" \
             python3 -m mcp_server.server "$@"
       '';
