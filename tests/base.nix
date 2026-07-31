@@ -61,13 +61,9 @@
             f"{unit} probe has empty -t argument (would fail every probe): {probe}"
         )
 
-    crontab_src = dellan.succeed(
-        "cat /home/jonathan/.config/crontab"
-    )
-    assert (
-        "git -C /home/jonathan/Repos/nixos-config fetch origin main:main"
-        in crontab_src
-    ), f"nixos-config bare-repo fetch line missing from crontab source:\n{crontab_src}"
+    # (The bare-repo fetch assertion that lived here is owned by PR #150
+    # — this branch is the ssh-keyscan fix and stays out of #150's way so
+    # the two PRs merge in either order without touching the same lines.)
 
     # modules/nixos/kindle.nix installs a udev rule that stops
     # gvfs-mtp-volume-monitor from claiming the kindle USB interface
