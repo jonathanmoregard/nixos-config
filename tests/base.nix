@@ -35,10 +35,43 @@
     crontab_src = dellan.succeed(
         "cat /home/jonathan/.config/crontab"
     )
+    # Must fast-forward THROUGH the main worktree. The old
+    # `fetch origin main:main` against the bare repo failed every run
+    # ("refusing to fetch into branch 'main' checked out at ...") and left
+    # local main 99 files behind, so new worktrees started stale.
     assert (
-        "git -C /home/jonathan/Repos/nixos-config fetch origin main:main"
+        "git -C /home/jonathan/Repos/nixos-config-worktrees/main pull --ff-only origin main"
         in crontab_src
-    ), f"nixos-config bare-repo fetch line missing from crontab source:\n{crontab_src}"
+    ), f"nixos-config main-sync line missing from crontab source:\n{crontab_src}"
+    # Comments in this crontab quote the broken form on purpose, so
+    # only the executable half of each non-comment line counts. Split on
+    # `#` after stripping so inline trailing comments are dropped too
+    # (a future edit like `KEY=val # fetch origin main:main` should not
+    # spuriously fail this assertion).
+    def _cron_command(line):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            return ""
+        return s.split("#", 1)[0]
+
+    active_commands = [_cron_command(l) for l in crontab_src.splitlines()]
+    assert not any("fetch origin main:main" in c for c in active_commands), (
+        "the bare-repo fetch form cannot move a ref a worktree has checked out; "
+        f"it must not come back as a live entry:\n{crontab_src}"
+    )
+
+    # The research-agent MCP server runs straight out of ~/Repos/research-agent
+    # (`uv run --project`), and the research microvm bind-mounts that same
+    # directory read-only at /workspace. An unpulled merge therefore means
+    # every freshly spawned server AND every jailed agent runs stale code.
+    # 2026-07-29..31: a merged model-fallback fix sat unpulled for three days
+    # while every research call failed 429 — the processes churned constantly,
+    # the checkout did not. --ff-only so a dirty or diverged tree fails loudly
+    # in the log rather than fabricating a merge commit.
+    assert (
+        "git -C /home/jonathan/Repos/research-agent pull --ff-only"
+        in crontab_src
+    ), f"research-agent auto-pull line missing from crontab source:\n{crontab_src}"
 
     # modules/nixos/kindle.nix installs a udev rule that stops
     # gvfs-mtp-volume-monitor from claiming the kindle USB interface
