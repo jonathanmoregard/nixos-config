@@ -52,6 +52,14 @@
         assert f"-t ed25519 -p {port}" in probe, (
             f"{unit} must scan only the ed25519 host key its guest serves, got: {probe}"
         )
+        # Guard against the empty-key-types regression: an empty
+        # keyscanTypes would render as `-t  -p ...` (two spaces), which
+        # ssh-keyscan tokenises as `-t -p ...` and fails every probe.
+        # The Nix throw fires at eval time, but assert it can't be
+        # bypassed by a change that swaps to a runtime default.
+        assert "-t  -p" not in probe and "-t -p" not in probe, (
+            f"{unit} probe has empty -t argument (would fail every probe): {probe}"
+        )
 
     crontab_src = dellan.succeed(
         "cat /home/jonathan/.config/crontab"

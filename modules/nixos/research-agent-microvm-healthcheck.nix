@@ -30,7 +30,17 @@ let
   guestHostKeyTypes =
     map (k: k.type)
       config.microvm.vms.research-agent.config.config.services.openssh.hostKeys;
-  keyscanTypes = lib.concatStringsSep "," guestHostKeyTypes;
+  # Empty hostKeys would render `-t ${keyscanTypes}` as `-t ` (two
+  # spaces), which bash tokenises to `-t -p 2223 ...` — ssh-keyscan
+  # then treats "-p" as the requested key type ("Unknown key type") and
+  # every probe fails unconditionally, silently reinstating the exact
+  # 35-49/day restart burst this module was added to eliminate. Fail
+  # evaluation so a future config edit that empties hostKeys is caught
+  # at build time, not at 3am on a healthy VM.
+  keyscanTypes =
+    if guestHostKeyTypes == []
+    then throw "research-agent-microvm-healthcheck: guest has no ssh hostKeys — probe would spin forever; add at least one key or remove this watchdog"
+    else lib.concatStringsSep "," guestHostKeyTypes;
 in
 # Host-side liveness watchdog for microvm@research-agent.service.
 #

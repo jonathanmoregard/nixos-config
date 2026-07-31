@@ -14,7 +14,14 @@ let
   guestHostKeyTypes =
     map (k: k.type)
       config.microvm.vms.scraper.config.config.services.openssh.hostKeys;
-  keyscanTypes = lib.concatStringsSep "," guestHostKeyTypes;
+  # See research-agent-microvm-healthcheck.nix for the reasoning: an
+  # empty list renders `-t ${keyscanTypes}` as `-t ` and every probe
+  # then fails with "Unknown key type '-p'", silently reintroducing the
+  # bug this module fixes. Fail eval instead.
+  keyscanTypes =
+    if guestHostKeyTypes == []
+    then throw "scraper-microvm-healthcheck: guest has no ssh hostKeys — probe would spin forever; add at least one key or remove this watchdog"
+    else lib.concatStringsSep "," guestHostKeyTypes;
 in
 # Host-side liveness watchdog for microvm@scraper.service.
 #
