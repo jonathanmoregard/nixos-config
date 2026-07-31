@@ -1,4 +1,47 @@
 { config, lib, pkgs, ... }:
+
+let
+  # Host-key types the guest actually serves, read from the guest's own
+  # sshd config so the probe can never drift from it.
+  #
+  # Why this is derived rather than written literally: `ssh-keyscan` with
+  # no -t scans rsa, ecdsa AND ed25519. This guest is configured with an
+  # ed25519 host key only, so two of those three scans can never succeed
+  # — and they do not fail fast, they hang until -T expires, taking the
+  # whole probe's exit status with them. Measured on the live host
+  # 2026-07-31, idle VM, no restarts in the window:
+  #
+  #     ssh-keyscan -t ed25519 -T 10   18/20 ok    17-44 ms
+  #     ssh-keyscan (default)  -T 10   12/20 ok    ~1 s ok / 10 s timeout
+  #     ssh-keyscan -t rsa     -T 5     0/5        (no such host key)
+  #     ssh-keyscan -t ecdsa   -T 5     0/5        (no such host key)
+  #
+  # A plain TCP connect + banner read succeeded 15/15 in the same window,
+  # so the guest was healthy throughout; only the multi-type scan failed.
+  # At a ~40% per-probe false-failure rate, one probe per minute and a
+  # 3-strike threshold, the arithmetic predicts ~30 spurious restarts per
+  # day. Observed: 35-49/day, every day from 2026-07-23 to 2026-07-31
+  # (321 restarts in 8 days), including 14 overnight on 2026-07-29 when
+  # zero research calls ran. Each one killed any in-flight research call.
+  #
+  # The 2026-07-30 fix raised -T 5 to -T 10 on the theory that the probe
+  # was merely slow. It is not slow, it hangs: at -T 30 the same failures
+  # reappear at 30 s. Constraining the key type is the actual fix.
+  guestHostKeyTypes =
+    map (k: k.type)
+      config.microvm.vms.research-agent.config.config.services.openssh.hostKeys;
+  # Empty hostKeys would render `-t ${keyscanTypes}` as `-t ` (two
+  # spaces), which bash tokenises to `-t -p 2223 ...` — ssh-keyscan
+  # then treats "-p" as the requested key type ("Unknown key type") and
+  # every probe fails unconditionally, silently reinstating the exact
+  # 35-49/day restart burst this module was added to eliminate. Fail
+  # evaluation so a future config edit that empties hostKeys is caught
+  # at build time, not at 3am on a healthy VM.
+  keyscanTypes =
+    if guestHostKeyTypes == []
+    then throw "research-agent-microvm-healthcheck: guest has no ssh hostKeys — probe would spin forever; add at least one key or remove this watchdog"
+    else lib.concatStringsSep "," guestHostKeyTypes;
+in
 # Host-side liveness watchdog for microvm@research-agent.service.
 #
 # Why this exists: research-agent's microvm has been observed entering
@@ -271,7 +314,11 @@
       # a spurious restart of a warm guest. Banner exchange is cheap;
       # the bigger budget only delays detection of a truly dead VM by
       # seconds. Still well inside the unit's TimeoutStartSec=30s.
-      if ssh-keyscan -p 2223 -T 10 127.0.0.1 2>/dev/null | grep -q '^[^#]'; then
+      # -t is derived from the guest's own hostKeys (see keyscanTypes at
+      # the top of this file): without it, keyscan also probes rsa and
+      # ecdsa, which this guest does not serve, and those attempts hang
+      # until -T and fail the whole probe ~40% of the time.
+      if ssh-keyscan -t ${keyscanTypes} -p 2223 -T 10 127.0.0.1 2>/dev/null | grep -q '^[^#]'; then
         if [ "$count" -gt 0 ]; then
           echo "healthcheck: recovered after $count consecutive failures"
         fi

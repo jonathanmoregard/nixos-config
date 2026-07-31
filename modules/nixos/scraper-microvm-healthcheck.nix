@@ -1,4 +1,28 @@
 { config, lib, pkgs, ... }:
+
+let
+  # Same derivation as the research-agent twin, and for the same reason:
+  # this guest serves an ed25519 host key only, so a bare `ssh-keyscan`
+  # also probes rsa and ecdsa, which hang until -T and intermittently
+  # fail the whole probe. See the long comment in
+  # research-agent-microvm-healthcheck.nix for the measurements — the
+  # research-agent VM was restarting 35-49x/day on false failures.
+  #
+  # This twin's symptom was milder (the earlier -T 5 -> -T 10 bump was
+  # made *because of* this probe's flakiness) but the defect is
+  # identical, so it is fixed identically rather than left to resurface.
+  guestHostKeyTypes =
+    map (k: k.type)
+      config.microvm.vms.scraper.config.config.services.openssh.hostKeys;
+  # See research-agent-microvm-healthcheck.nix for the reasoning: an
+  # empty list renders `-t ${keyscanTypes}` as `-t ` and every probe
+  # then fails with "Unknown key type '-p'", silently reintroducing the
+  # bug this module fixes. Fail eval instead.
+  keyscanTypes =
+    if guestHostKeyTypes == []
+    then throw "scraper-microvm-healthcheck: guest has no ssh hostKeys — probe would spin forever; add at least one key or remove this watchdog"
+    else lib.concatStringsSep "," guestHostKeyTypes;
+in
 # Host-side liveness watchdog for microvm@scraper.service.
 #
 # Mirrors research-agent-microvm-healthcheck.nix. Probes the scraper VM's
@@ -159,7 +183,7 @@
       # killing a warm guest every ~15min once 3 misses lined up. The
       # scraper renders JS with chromium on 2 vcpus — banner latency
       # spikes past 5s under load are routine, not a liveness signal.
-      if ssh-keyscan -p 2225 -T 10 127.0.0.1 2>/dev/null | grep -q '^[^#]'; then
+      if ssh-keyscan -t ${keyscanTypes} -p 2225 -T 10 127.0.0.1 2>/dev/null | grep -q '^[^#]'; then
         if [ "$count" -gt 0 ]; then
           echo "healthcheck: recovered after $count consecutive failures"
         fi
