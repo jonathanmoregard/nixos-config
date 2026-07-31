@@ -14,6 +14,7 @@
   environment.systemPackages = with pkgs; [
     # --- pre-existing core ---
     claude-code
+    codex          # OpenAI Codex CLI — cross-vendor validator lane
     git
     gh
     ripgrep        # rg — fast grep, respects .gitignore
