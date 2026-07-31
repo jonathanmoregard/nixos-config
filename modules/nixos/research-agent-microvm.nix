@@ -44,18 +44,18 @@
         # well clear of that boundary. acpi=off is NOT a workaround
         # (drops the PCIe bridge; all virtio-*-pci devices fail).
         #
-        # 6144 (was 3072): a single research run (claude + the exa/tavily/
-        # render MCP shims doing live web work) drove the 3 GiB guest into
-        # heavy OOM-killing, which stalled sshd enough that the host
-        # watchdog's ssh-keyscan probe timed out 3× and RESTARTED the VM
-        # out from under the in-flight agent — the research call died
-        # rc=255 (observed 2026-07-30 13:11: single normal-depth call ran
-        # 113s, watchdog restarted at exactly the failure instant, VM
-        # recovered ~1 min later). Doubling headroom removes the memory
-        # pressure so the guest stays responsive to the probe during a
-        # run. Host has 30 GiB; the memfd backing is allocated on use, and
-        # research-agent + scraper (3 GiB) still leave ample margin.
-        mem = 6144;
+        # 4096 (was 6144): 6144 was over-sized. The 2026-07-31 4-concurrent
+        # Opus/deep load test measured guest peak VmRSS at 1268 MiB (21% of
+        # 6144); the earlier 2-concurrent cgroup measurement (in
+        # research-agent/mcp_server/server.py comment above _VM_SLOTS_DEFAULT)
+        # extrapolates ~0.43 GB per concurrent call, so the companion PR
+        # bumping the slot cap to 6 (jonathanmoregard/research-agent#20)
+        # projects peak baseline + 6*0.43 ≈ 3.3 GB. 4096 MiB gives ~+20%
+        # buffer over that projected peak. Frees 2 GiB back to the host —
+        # the OOM incident that motivated the swap+zram PR (#152) was
+        # exactly this class of oversubscription. Still well clear of the
+        # 2048 DSDT-corruption boundary noted above.
+        mem = 4096;
 
         shares = [
           {
