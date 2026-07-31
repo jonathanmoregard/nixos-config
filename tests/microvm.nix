@@ -173,6 +173,31 @@ pkgs.testers.runNixOSTest {
     # user-session path unit watches. A regression to restart-forever
     # recreates the 2026-06-05 incident: a boot-wedged guest restart-
     # looped 62×/6h, silently pinning a host core the whole time.
+    # Probe MUST pass `-t ed25519`, matching the guest's own hostKeys.
+    # Without it, ssh-keyscan also probes rsa and ecdsa; the guest serves
+    # neither, and those attempts hang until -T rather than failing
+    # fast, so the probe intermittently fails against a healthy VM.
+    # Measured 2026-07-31 on the live host: default scan 12/20 vs 18/20
+    # with -t ed25519, driving 35-49 spurious restarts a day (321 in 8
+    # days). The flag is derived from the guest's own
+    # services.openssh.hostKeys, so this assertion also catches an
+    # empty-list regression: the throw at eval time is the primary
+    # guard, and `-t <empty> -p` would produce `-t -p 2223` after bash
+    # collapses the double space, which ssh-keyscan answers with
+    # "Unknown key type '-p'" and every probe fails unconditionally.
+    for unit, port in (("research-agent-healthcheck", "2223"),
+                       ("scraper-healthcheck", "2225")):
+        probe = dellan.succeed(
+            f"grep -ho 'ssh-keyscan[^|]*' "
+            f"$(systemctl cat {unit}.service | sed -n 's/^ExecStart=//p')"
+        )
+        assert f"-t ed25519 -p {port}" in probe, (
+            f"{unit} must scan only the ed25519 host key its guest serves, got: {probe}"
+        )
+        assert "-t  -p" not in probe and "-t -p" not in probe, (
+            f"{unit} probe has empty -t argument (would fail every probe): {probe}"
+        )
+
     dellan.succeed(f"grep -q 'restart-burst-count' {script_path}")
     dellan.succeed(f"grep -q 'GIVING UP' {script_path}")
     dellan.succeed(
