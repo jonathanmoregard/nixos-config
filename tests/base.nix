@@ -40,6 +40,19 @@
         in crontab_src
     ), f"nixos-config bare-repo fetch line missing from crontab source:\n{crontab_src}"
 
+    # The research-agent MCP server runs straight out of ~/Repos/research-agent
+    # (`uv run --project`), and the research microvm bind-mounts that same
+    # directory read-only at /workspace. An unpulled merge therefore means
+    # every freshly spawned server AND every jailed agent runs stale code.
+    # 2026-07-29..31: a merged model-fallback fix sat unpulled for three days
+    # while every research call failed 429 — the processes churned constantly,
+    # the checkout did not. --ff-only so a dirty or diverged tree fails loudly
+    # in the log rather than fabricating a merge commit.
+    assert (
+        "git -C /home/jonathan/Repos/research-agent pull --ff-only"
+        in crontab_src
+    ), f"research-agent auto-pull line missing from crontab source:\n{crontab_src}"
+
     # modules/nixos/kindle.nix installs a udev rule that stops
     # gvfs-mtp-volume-monitor from claiming the kindle USB interface
     # (calibre needs libusb). Rule clears ID_MTP_DEVICE so
