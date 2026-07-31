@@ -67,7 +67,17 @@ in
     # origin/main so new worktrees (`git worktree add ... main`) don't
     # start behind. Bare repo = no working tree, no conflicts possible;
     # `main:main` refspec advances the ref in-place.
-    */30 * * * * git -C /home/jonathan/Repos/nixos-config fetch origin main:main >> /home/jonathan/.claude/logs/nixos-config-fetch.log 2>&1
+    # NOT `git -C ~/Repos/nixos-config fetch origin main:main`: that form
+    # died every run with "refusing to fetch into branch 'main' checked
+    # out at .../nixos-config-worktrees/main" — git will not move a ref
+    # that a worktree has checked out. It failed silently into the log
+    # from the day the `main` browse worktree was created until
+    # 2026-07-31, by which point local `main` sat at PR #79, 99 files
+    # behind origin/main, and every `git worktree add ... main` started
+    # a hundred files in the past. Fast-forwarding through the worktree
+    # that holds the ref is the form that actually works; --ff-only
+    # keeps it a no-op-or-advance on a browse-only checkout.
+    */30 * * * * git -C /home/jonathan/Repos/nixos-config-worktrees/main pull --ff-only origin main >> /home/jonathan/.claude/logs/nixos-config-fetch.log 2>&1
     # Keep the research-agent working copy current. That checkout IS
     # production twice over: research-agent-mcp runs it directly
     # (`uv run --project ~/Repos/research-agent`), and the research

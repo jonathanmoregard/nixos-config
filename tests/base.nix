@@ -35,10 +35,24 @@
     crontab_src = dellan.succeed(
         "cat /home/jonathan/.config/crontab"
     )
+    # Must fast-forward THROUGH the main worktree. The old
+    # `fetch origin main:main` against the bare repo failed every run
+    # ("refusing to fetch into branch 'main' checked out at ...") and left
+    # local main 99 files behind, so new worktrees started stale.
     assert (
-        "git -C /home/jonathan/Repos/nixos-config fetch origin main:main"
+        "git -C /home/jonathan/Repos/nixos-config-worktrees/main pull --ff-only origin main"
         in crontab_src
-    ), f"nixos-config bare-repo fetch line missing from crontab source:\n{crontab_src}"
+    ), f"nixos-config main-sync line missing from crontab source:\n{crontab_src}"
+    # Comments in this crontab quote the broken form on purpose, so only
+    # actual schedule lines count.
+    active_cron = [
+        l for l in crontab_src.splitlines()
+        if l.strip() and not l.strip().startswith("#")
+    ]
+    assert not any("fetch origin main:main" in l for l in active_cron), (
+        "the bare-repo fetch form cannot move a ref a worktree has checked out; "
+        f"it must not come back as a live entry:\n{crontab_src}"
+    )
 
     # The research-agent MCP server runs straight out of ~/Repos/research-agent
     # (`uv run --project`), and the research microvm bind-mounts that same
