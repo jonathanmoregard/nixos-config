@@ -32,6 +32,27 @@
     # crontab is installed by an activation hook whose timing relative to
     # /run/wrappers/bin/crontab in this VM image isn't load-bearing for
     # production (real hardware activates after setuid-wrappers).
+    # Both microvm watchdogs must probe with the key type their guest
+    # actually serves. A bare `ssh-keyscan` also scans rsa and ecdsa;
+    # neither guest has those host keys, and the doomed attempts hang
+    # until -T rather than failing fast, so the probe reports a healthy
+    # VM as dead. Measured 2026-07-31 on the live host: default scan
+    # 12/20 successes vs 18/20 with -t ed25519, which drove 35-49
+    # spurious research-agent VM restarts a day (321 in 8 days), each
+    # killing any in-flight research call. The flag is derived from the
+    # guest's own services.openssh.hostKeys, so this assertion is what
+    # catches a regression to the default scan or a host-key change that
+    # forgets the probe.
+    for unit, port in (("research-agent-healthcheck", "2223"),
+                       ("scraper-healthcheck", "2225")):
+        probe = dellan.succeed(
+            f"grep -ho 'ssh-keyscan[^|]*' "
+            f"$(systemctl cat {unit}.service | sed -n 's/^ExecStart=//p')"
+        )
+        assert f"-t ed25519 -p {port}" in probe, (
+            f"{unit} must scan only the ed25519 host key its guest serves, got: {probe}"
+        )
+
     crontab_src = dellan.succeed(
         "cat /home/jonathan/.config/crontab"
     )
