@@ -262,6 +262,20 @@
     assert "skipping" in run_log, \
         f"guard-path 'skipping' marker missing from run.log:\n{run_log}"
 
+    # Swap: zram must activate on boot. Without any swap, memory pressure
+    # OOM-kills instead of paging (2026-07-31 incident: 6 chrome OOM-kills
+    # in 10 min on the zero-swap host, visible desktop freeze).
+    #
+    # The /var/lib/swapfile entry is NOT asserted here — nixpkgs' qemu-vm
+    # module force-sets swapDevices=[] via mkVMOverride (priority 10) so
+    # file-swap can't be exercised in nixosTest. Prod dellan's declaration
+    # (hosts/dellan/swap.nix, 16 GiB swapfile) is verified via
+    # `nix eval .#nixosConfigurations.dellan.config.swapDevices` pre-push
+    # and by /proc/swaps on the real host post-deploy.
+    swaps = dellan.succeed("cat /proc/swaps")
+    assert "/dev/zram" in swaps, \
+        f"zram swap device missing from /proc/swaps:\n{swaps}"
+
     # notify-send must resolve on jonathan's PATH: the runner's Claude
     # allowlist includes Bash(notify-send*) for medium/high findings,
     # and that entry was dead (exit 127) until libnotify landed in

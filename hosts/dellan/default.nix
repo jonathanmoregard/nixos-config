@@ -2,6 +2,7 @@
 {
   imports = [
     ./hardware-configuration.nix
+    ./swap.nix
 
     # Composable profiles. profiles/* hold feature slices that tests
     # can pull in independently of the rest of the host (so a test
