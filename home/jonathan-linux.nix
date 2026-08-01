@@ -49,34 +49,65 @@ let
     import sys
     from pathlib import Path
 
+    # Exit codes: 0 clean; 2 anomaly (reject/truncation/missing-END) so
+    # the wrapper preserves the raw model output for forensics — a
+    # bad-model night must stay distinguishable from a quiet good one.
+    anomalies = 0
     dest = Path(sys.argv[1])
+    # mode applies to the LEAF only (parents get umask); fine here, the
+    # parent chain lives under ~/.claude which is already 0700.
     dest.mkdir(parents=True, exist_ok=True, mode=0o700)
     # 2 MiB stdin cap: 10 proposals x 64 KiB bodies + delimiter/prose
-    # slack. A runaway model can't OOM the sink or the regex scan.
+    # slack. A runaway model can't OOM the sink or the scan.
     text = sys.stdin.read(2 * 1024 * 1024)
     if sys.stdin.read(1):
         print("sink: WARNING stdin exceeded 2MiB cap; trailing output dropped")
-    block = re.compile(
-        r"^===PROPOSAL: (?P<name>[^\n]*)===\n"
-        r"(?P<body>.*?)^===END PROPOSAL===$",
-        re.M | re.S,
-    )
+        anomalies += 1
+    # Line state machine, NOT a multiline regex: a non-greedy regex body
+    # would glue proposals together when the model omits one END marker,
+    # then lose them all to the size cap. Here a missing END rejects
+    # only the block it belongs to.
+    header = re.compile(r"^===PROPOSAL: (.*)===$")
     # Lowercase kebab only — matches both known proposal shapes
     # (YYYY-MM-DD-<slug>.md, monthly-themes-YYYY-MM.md) and rejects
     # squat-bait like CLAUDE.md / README.md as a side effect.
     name_ok = re.compile(r"^[a-z0-9][a-z0-9-]{0,100}\.md$")
+    blocks = []
+    name = None
+    buf = []
+    for ln in text.split("\n"):
+        m = header.match(ln)
+        if m:
+            if name is not None:
+                print("sink: rejected %r (missing END marker)" % name)
+                anomalies += 1
+            name = m.group(1).strip()
+            buf = []
+            continue
+        if ln == "===END PROPOSAL===":
+            if name is not None:
+                blocks.append((name, "\n".join(buf) + "\n"))
+                name = None
+            continue
+        if name is not None:
+            buf.append(ln)
+    if name is not None:
+        print("sink: rejected %r (missing END marker)" % name)
+        anomalies += 1
     written = 0
-    for m in block.finditer(text):
+    for name, body_s in blocks:
         if written >= 10:
             print("sink: cap of 10 proposals reached, ignoring remainder")
+            anomalies += 1
             break
-        name = m.group("name").strip()
-        body = m.group("body").encode("utf-8")
+        body = body_s.encode("utf-8")
         if not name_ok.match(name):
             print("sink: rejected filename %r" % name)
+            anomalies += 1
             continue
         if len(body) > 65536:
             print("sink: rejected oversized body for %s" % name)
+            anomalies += 1
             continue
         # O_EXCL: atomic create-or-skip, no exists()/write TOCTOU window;
         # 0600 because content is model output shaped by untrusted
@@ -95,6 +126,9 @@ let
         written += 1
         print("sink: wrote %s" % name)
     print("sink: done, %d proposal(s) written" % written)
+    if anomalies:
+        print("sink: %d anomaly(ies) — raw output worth keeping" % anomalies)
+        sys.exit(2)
   '';
 
   rsiDailyReview = pkgs.writeShellApplication {
@@ -119,10 +153,16 @@ let
         echo "rsi-daily-review: $prompt_file is ''${psize}B (>100KiB cap); refusing (ARG_MAX)" >&2
         exit 1
       fi
+      # Derive XDG_RUNTIME_DIR up front (cron doesn't set it): mktemp
+      # below and the bus check both depend on it — deriving it late
+      # would silently send mktemp to /tmp on every cron run.
+      export XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
       # Raw model output derives from untrusted transcript content — keep
       # it in the per-user tmpfs when available rather than world-listable
       # /tmp (mktemp still gives 0600 either way).
-      raw="$(mktemp -p "''${XDG_RUNTIME_DIR:-/tmp}" rsi-daily-review.XXXXXX)"
+      tmpdir="/tmp"
+      [ -d "$XDG_RUNTIME_DIR" ] && tmpdir="$XDG_RUNTIME_DIR"
+      raw="$(mktemp -p "$tmpdir" rsi-daily-review.XXXXXX)"
       trap 'rm -f "$raw"' EXIT
       override="
 
@@ -145,11 +185,9 @@ let
       echo "rsi-daily-review: start $(date -Is)"
       # Memory-bound the model call when the user bus is reachable (same
       # per-call cgroup pattern research-agent uses, commit 48447eb
-      # there). Cron doesn't set XDG_RUNTIME_DIR, so derive it; if the
-      # bus socket is absent (nobody logged in, no lingering) run plain —
-      # an unbounded 03:20 run beats a dead one, and the host now has
-      # swap+zram headroom.
-      export XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      # there). If the bus socket is absent (nobody logged in, no
+      # lingering) run plain — an unbounded 03:20 run beats a dead one,
+      # and the host now has swap+zram headroom.
       scope=()
       if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
         scope=(systemd-run --user --scope --quiet -p MemoryMax=6G -p MemoryHigh=4G)
@@ -172,11 +210,19 @@ let
         echo "rsi-daily-review: claude (or scope setup) exited rc=$rc" >&2
         exit "$rc"
       fi
-      if ! rsi-proposal-sink "$dest" < "$raw"; then
+      sink_rc=0
+      rsi-proposal-sink "$dest" < "$raw" || sink_rc=$?
+      if [ "$sink_rc" -ne 0 ]; then
         keep="$HOME/.claude/logs/rsi-raw-failed-$(date +%Y%m%dT%H%M%S).txt"
         cp "$raw" "$keep" || echo "rsi-daily-review: could not preserve raw output to $keep" >&2
-        echo "rsi-daily-review: sink failed; raw output kept at $keep" >&2
-        exit 1
+        if [ "$sink_rc" -eq 2 ]; then
+          # Anomalies (rejects/truncation/missing-END) but the run itself
+          # succeeded — keep forensics, don't fail the cron entry.
+          echo "rsi-daily-review: sink reported anomalies; raw kept at $keep" >&2
+        else
+          echo "rsi-daily-review: sink failed rc=$sink_rc; raw kept at $keep" >&2
+          exit "$sink_rc"
+        fi
       fi
       echo "rsi-daily-review: done $(date -Is)"
     '';
