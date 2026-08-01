@@ -53,6 +53,9 @@ let
     # the wrapper preserves the raw model output for forensics — a
     # bad-model night must stay distinguishable from a quiet good one.
     anomalies = 0
+    # Cron sets no LANG; don't let a locale-dependent stdin encoding
+    # crash the sink on non-ASCII prose.
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     dest = Path(sys.argv[1])
     # mode applies to the LEAF only (parents get umask); fine here, the
     # parent chain lives under ~/.claude which is already 0700.
@@ -67,7 +70,7 @@ let
     # would glue proposals together when the model omits one END marker,
     # then lose them all to the size cap. Here a missing END rejects
     # only the block it belongs to.
-    header = re.compile(r"^===PROPOSAL: (.*)===$")
+    header = re.compile(r"^===PROPOSAL: (.*?)===$")
     # Lowercase kebab only — matches both known proposal shapes
     # (YYYY-MM-DD-<slug>.md, monthly-themes-YYYY-MM.md) and rejects
     # squat-bait like CLAUDE.md / README.md as a side effect.
@@ -95,18 +98,18 @@ let
         print("sink: rejected %r (missing END marker)" % name)
         anomalies += 1
     written = 0
-    for name, body_s in blocks:
+    for fname, body_s in blocks:
         if written >= 10:
             print("sink: cap of 10 proposals reached, ignoring remainder")
             anomalies += 1
             break
         body = body_s.encode("utf-8")
-        if not name_ok.match(name):
-            print("sink: rejected filename %r" % name)
+        if not name_ok.match(fname):
+            print("sink: rejected filename %r" % fname)
             anomalies += 1
             continue
         if len(body) > 65536:
-            print("sink: rejected oversized body for %s" % name)
+            print("sink: rejected oversized body for %s" % fname)
             anomalies += 1
             continue
         # O_EXCL: atomic create-or-skip, no exists()/write TOCTOU window;
@@ -114,17 +117,17 @@ let
         # transcript material.
         try:
             fd = os.open(
-                dest / name,
+                dest / fname,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                 0o600,
             )
         except FileExistsError:
-            print("sink: skipped existing %s" % name)
+            print("sink: skipped existing %s" % fname)
             continue
         with os.fdopen(fd, "wb") as f:
             f.write(body)
         written += 1
-        print("sink: wrote %s" % name)
+        print("sink: wrote %s" % fname)
     print("sink: done, %d proposal(s) written" % written)
     if anomalies:
         print("sink: %d anomaly(ies) — raw output worth keeping" % anomalies)
