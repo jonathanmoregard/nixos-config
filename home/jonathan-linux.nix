@@ -54,6 +54,8 @@ let
     # 2 MiB stdin cap: 10 proposals x 64 KiB bodies + delimiter/prose
     # slack. A runaway model can't OOM the sink or the regex scan.
     text = sys.stdin.read(2 * 1024 * 1024)
+    if sys.stdin.read(1):
+        print("sink: WARNING stdin exceeded 2MiB cap; trailing output dropped")
     block = re.compile(
         r"^===PROPOSAL: (?P<name>[^\n]*)===\n"
         r"(?P<body>.*?)^===END PROPOSAL===$",
@@ -108,6 +110,10 @@ let
         echo "rsi-daily-review: claude not resolvable on PATH" >&2
         exit 127
       }
+      if [ ! -r "$prompt_file" ]; then
+        echo "rsi-daily-review: prompt file missing/unreadable: $prompt_file" >&2
+        exit 1
+      fi
       psize="$(stat -c%s "$prompt_file")"
       if [ "$psize" -gt 102400 ]; then
         echo "rsi-daily-review: $prompt_file is ''${psize}B (>100KiB cap); refusing (ARG_MAX)" >&2
@@ -157,13 +163,18 @@ let
       if [ "$rc" -eq 124 ]; then
         echo "rsi-daily-review: claude timed out after ''${RSI_REVIEW_TIMEOUT:-3600}s" >&2
         exit "$rc"
+      elif [ "$rc" -eq 137 ]; then
+        echo "rsi-daily-review: killed rc=137 — likely MemoryMax OOM-kill in the scope" >&2
+        exit "$rc"
       elif [ "$rc" -ne 0 ]; then
-        echo "rsi-daily-review: claude exited rc=$rc" >&2
+        # rc can also originate from systemd-run scope setup (203 exec
+        # failure etc.), not only claude itself — keep both in view.
+        echo "rsi-daily-review: claude (or scope setup) exited rc=$rc" >&2
         exit "$rc"
       fi
       if ! rsi-proposal-sink "$dest" < "$raw"; then
         keep="$HOME/.claude/logs/rsi-raw-failed-$(date +%Y%m%dT%H%M%S).txt"
-        cp "$raw" "$keep"
+        cp "$raw" "$keep" || echo "rsi-daily-review: could not preserve raw output to $keep" >&2
         echo "rsi-daily-review: sink failed; raw output kept at $keep" >&2
         exit 1
       fi
@@ -201,8 +212,14 @@ in
   # (overwrites any ad-hoc `crontab -e` edits).
   # Several cron entries redirect into ~/.claude/logs/ before their
   # command runs; the shell opens the redirect target first, so a
-  # missing directory kills the whole entry silently. Guarantee it.
-  home.file.".claude/logs/.keep".text = "";
+  # missing directory kills the whole entry silently. mkdir via
+  # activation rather than a home.file .keep: ~/.claude is a user git
+  # repo and logs/ is not gitignored there, so a store symlink would
+  # pollute its git status — and HM aborts activation outright if a
+  # regular file already sits at the .keep path.
+  home.activation.ensureClaudeLogsDir = lib.hm.dag.entryAfter ["writeBoundary"] ''
+    mkdir -p "$HOME/.claude/logs"
+  '';
 
   home.file.".config/crontab".text = ''
     CRON_TZ=Europe/Stockholm
