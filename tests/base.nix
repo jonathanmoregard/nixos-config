@@ -73,6 +73,25 @@
         in crontab_src
     ), f"research-agent auto-pull line missing from crontab source:\n{crontab_src}"
 
+    # RSI daily-reviewer cron. The plugin's install.sh tries to install
+    # this via `crontab -e`, which loses on every rebuild + every Monday
+    # backup-crontab.sh run. That's exactly why review-agent.log stopped
+    # writing 2026-04-17 the day a rebuild wiped the crontab-e insertion,
+    # and stayed silent for four months. Declaring it in
+    # home/jonathan-linux.nix is the only durable install path on dellan;
+    # this assertion guards the entry from silently being deleted again.
+    # The comment tag matches the one install.sh uses so a live entry
+    # from either path would satisfy this check.
+    assert (
+        "# recursive-self-improvement-analysis" in crontab_src
+    ), f"RSI daily-reviewer cron entry missing from crontab source:\n{crontab_src}"
+    # Belt-and-braces: assert the entry actually invokes the reviewer
+    # prompt, not just a stray tag on some other line. Guards against a
+    # future edit that keeps the tag comment but drops the command body.
+    assert (
+        "recursive-self-improvement/config/prompt.md" in crontab_src
+    ), f"RSI reviewer prompt reference missing from crontab source:\n{crontab_src}"
+
     # modules/nixos/kindle.nix installs a udev rule that stops
     # gvfs-mtp-volume-monitor from claiming the kindle USB interface
     # (calibre needs libusb). Rule clears ID_MTP_DEVICE so

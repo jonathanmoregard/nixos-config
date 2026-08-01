@@ -63,6 +63,30 @@ in
     */30 6-22 * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/habit-tracker.py >> /home/jonathan/.claude/logs/habit-tracker.log 2>&1
     */30 * * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/sunset-walk-tracker.py >> /home/jonathan/.claude/logs/sunset-walk-tracker.log 2>&1
     37 15 * * * /home/jonathan/Repos/superpowers/sync-agent.sh >> /home/jonathan/Repos/superpowers/sync.log 2>&1
+    # Recursive Self-Improvement daily reviewer. The plugin's install.sh
+    # tries to install this via `crontab -e`, which loses on every
+    # nixos-rebuild switch (activation hook `installCrontab` below
+    # rewrites the crontab from this file's rendered content) and every
+    # Monday 11:00 via backup-crontab.sh capturing whatever's live.
+    # Consequence: the RSI analysis job stopped firing 2026-04-17 — the
+    # day a rebuild landed after the plugin was configured — and there
+    # was no reviewer output for four months until this entry landed.
+    # Declaring the schedule here is the only durable path on dellan.
+    #
+    # 03:20 slot is deliberately off-peak (no other cron entries between
+    # 00:00-06:00 except the */30 pulls) so the headless `claude --print`
+    # subagent doesn't contend with wellbeing trackers or backups. The
+    # reviewer prompt itself is still known-broken (produces
+    # duplicate-of-shipped-work proposals per empirical 2026-08-01 03am
+    # runs) — the human reviews the output via /review-improvements
+    # before anything auto-lands, so daily cadence is safe until the
+    # grep-gate / scorer-gate fixes ship in a separate PR.
+    #
+    # allowedTools mirrors the plugin's install.sh so the two paths
+    # produce identical behaviour: Read for context, Write scoped to
+    # observations/, Glob+Grep for log walking, plus one du to keep
+    # the observation ledger from silently blowing up.
+    20 3 * * * cd ~/.claude && claude --model opus --print --allowedTools "Read Write(~/.claude/recursive-self-improvement/observations/*) Glob Grep Bash(du -sm ~/.claude/recursive-self-improvement/observations/observations.jsonl)" -p "$(cat ~/.claude/recursive-self-improvement/config/prompt.md)" >> ~/.claude/logs/review-agent.log 2>&1 # recursive-self-improvement-analysis
     # Keep the bare nixos-config repo's local `main` ref in sync with
     # origin/main so new worktrees (`git worktree add ... main`) don't
     # start behind. Bare repo = no working tree, no conflicts possible;
