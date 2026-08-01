@@ -6,9 +6,11 @@ let
   wellbeingPython = pkgs.python3.withPackages (ps: with ps; [ python-dateutil ]);
 
   # PATH for cron jobs. Vixie-cron parses `NAME=value` lines at the top
-  # of the crontab as env assignments (no shell expansion — `$HOME` and
-  # `~` don't work, neither do systemd `%h` specifiers; only Nix
-  # interpolation works here, evaluated at activation time).
+  # of the crontab as env assignments (no shell expansion IN THOSE ENV
+  # LINES — `$HOME`, `~` and systemd `%h` specifiers don't work there;
+  # only Nix interpolation does, evaluated at activation time). Command
+  # lines are different: cron hands them to SHELL, so `$HOME` in a
+  # command field expands normally.
   # nix-profile paths first so user-installed binaries win over the
   # system; /run/wrappers/bin last so a cron job can't accidentally
   # resolve to a setuid wrapper ahead of its nix-profile equivalent.
@@ -20,6 +22,154 @@ let
     "/usr/bin"
     "/bin"
   ];
+
+  # RSI daily reviewer. Three stacked failures killed the naive
+  # `claude --print --allowedTools "... Write(...)"` cron approach:
+  #   1. path-scoped Write(...) grants passed via --allowedTools never
+  #      register headless (probed 2026-08-01: unscoped "Write" writes,
+  #      "Write(/tmp/x/*)" and "Write(/tmp/x/**)" both deny);
+  #   2. even a registered Write is refused for any path under ~/.claude/
+  #      by Claude Code's built-in sensitive-path gate, which --print
+  #      short-circuits from ask into deny (probed: --allowedTools,
+  #      --settings allow-rule and unscoped grants all lose to it);
+  #   3. `crontab -e` installs are wiped on every rebuild (see the
+  #      crontab comment below).
+  # So the reviewer model runs READ-ONLY (Read/Glob/Grep — which also
+  # means a prompt-injected transcript can't make it write anywhere) and
+  # emits proposals as delimited stdout blocks; a trusted sink parses
+  # and persists them. Proposer emits, pipeline persists.
+  #
+  # The sink enforces: basename-only *.md filenames (no traversal), no
+  # overwrite of existing proposals, 64 KiB body cap, 10 proposals per
+  # run. Model output is downstream of untrusted transcript content, so
+  # every one of these is a security boundary, not tidiness.
+  rsiProposalSink = pkgs.writers.writePython3Bin "rsi-proposal-sink" { } ''
+    import os
+    import re
+    import sys
+    from pathlib import Path
+
+    dest = Path(sys.argv[1])
+    dest.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # 2 MiB stdin cap: 10 proposals x 64 KiB bodies + delimiter/prose
+    # slack. A runaway model can't OOM the sink or the regex scan.
+    text = sys.stdin.read(2 * 1024 * 1024)
+    block = re.compile(
+        r"^===PROPOSAL: (?P<name>[^\n]*)===\n"
+        r"(?P<body>.*?)^===END PROPOSAL===$",
+        re.M | re.S,
+    )
+    # Lowercase kebab only — matches both known proposal shapes
+    # (YYYY-MM-DD-<slug>.md, monthly-themes-YYYY-MM.md) and rejects
+    # squat-bait like CLAUDE.md / README.md as a side effect.
+    name_ok = re.compile(r"^[a-z0-9][a-z0-9-]{0,100}\.md$")
+    written = 0
+    for m in block.finditer(text):
+        if written >= 10:
+            print("sink: cap of 10 proposals reached, ignoring remainder")
+            break
+        name = m.group("name").strip()
+        body = m.group("body").encode("utf-8")
+        if not name_ok.match(name):
+            print("sink: rejected filename %r" % name)
+            continue
+        if len(body) > 65536:
+            print("sink: rejected oversized body for %s" % name)
+            continue
+        # O_EXCL: atomic create-or-skip, no exists()/write TOCTOU window;
+        # 0600 because content is model output shaped by untrusted
+        # transcript material.
+        try:
+            fd = os.open(
+                dest / name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            print("sink: skipped existing %s" % name)
+            continue
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+        written += 1
+        print("sink: wrote %s" % name)
+    print("sink: done, %d proposal(s) written" % written)
+  '';
+
+  rsiDailyReview = pkgs.writeShellApplication {
+    name = "rsi-daily-review";
+    runtimeInputs = [ rsiProposalSink pkgs.coreutils ];
+    text = ''
+      prompt_file="$HOME/.claude/recursive-self-improvement/config/prompt.md"
+      dest="$HOME/.claude/recursive-self-improvement/proposals"
+      # claude is deliberately NOT in runtimeInputs (it lives in the user
+      # profile and updates independently); fail loudly if the cron PATH
+      # doesn't resolve it rather than dying cryptically mid-pipeline.
+      command -v claude >/dev/null 2>&1 || {
+        echo "rsi-daily-review: claude not resolvable on PATH" >&2
+        exit 127
+      }
+      psize="$(stat -c%s "$prompt_file")"
+      if [ "$psize" -gt 102400 ]; then
+        echo "rsi-daily-review: $prompt_file is ''${psize}B (>100KiB cap); refusing (ARG_MAX)" >&2
+        exit 1
+      fi
+      # Raw model output derives from untrusted transcript content — keep
+      # it in the per-user tmpfs when available rather than world-listable
+      # /tmp (mktemp still gives 0600 either way).
+      raw="$(mktemp -p "''${XDG_RUNTIME_DIR:-/tmp}" rsi-daily-review.XXXXXX)"
+      trap 'rm -f "$raw"' EXIT
+      override="
+
+      ## Headless run override (appended by the rsi-daily-review wrapper)
+
+      You are running non-interactively with READ-ONLY tools. Do not
+      attempt Write, Edit or Bash — they are not granted, and file
+      writes under ~/.claude are blocked in --print mode anyway.
+      Instead of writing proposal files in Step 4, emit each proposal
+      on stdout as:
+
+      ===PROPOSAL: YYYY-MM-DD-<slug>.md===
+      <full proposal file body, frontmatter included>
+      ===END PROPOSAL===
+
+      The delimiters must start at column one. Skip Step 5 (push)
+      entirely: a trusted wrapper persists these blocks to the
+      proposals directory, and pushing happens behind the proposals
+      intake gate."
+      echo "rsi-daily-review: start $(date -Is)"
+      # Memory-bound the model call when the user bus is reachable (same
+      # per-call cgroup pattern research-agent uses, commit 48447eb
+      # there). Cron doesn't set XDG_RUNTIME_DIR, so derive it; if the
+      # bus socket is absent (nobody logged in, no lingering) run plain —
+      # an unbounded 03:20 run beats a dead one, and the host now has
+      # swap+zram headroom.
+      export XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      scope=()
+      if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+        scope=(systemd-run --user --scope --quiet -p MemoryMax=6G -p MemoryHigh=4G)
+      else
+        echo "rsi-daily-review: no user bus; running without MemoryMax scope" >&2
+      fi
+      rc=0
+      "''${scope[@]}" timeout "''${RSI_REVIEW_TIMEOUT:-3600}" \
+        claude --model opus --print --allowedTools "Read Glob Grep" \
+        -p "$(cat "$prompt_file")$override" > "$raw" || rc=$?
+      if [ "$rc" -eq 124 ]; then
+        echo "rsi-daily-review: claude timed out after ''${RSI_REVIEW_TIMEOUT:-3600}s" >&2
+        exit "$rc"
+      elif [ "$rc" -ne 0 ]; then
+        echo "rsi-daily-review: claude exited rc=$rc" >&2
+        exit "$rc"
+      fi
+      if ! rsi-proposal-sink "$dest" < "$raw"; then
+        keep="$HOME/.claude/logs/rsi-raw-failed-$(date +%Y%m%dT%H%M%S).txt"
+        cp "$raw" "$keep"
+        echo "rsi-daily-review: sink failed; raw output kept at $keep" >&2
+        exit 1
+      fi
+      echo "rsi-daily-review: done $(date -Is)"
+    '';
+  };
 in
 {
   imports = [
@@ -49,6 +199,11 @@ in
 
   # User crontab — declarative source of truth. Re-applied on every rebuild
   # (overwrites any ad-hoc `crontab -e` edits).
+  # Several cron entries redirect into ~/.claude/logs/ before their
+  # command runs; the shell opens the redirect target first, so a
+  # missing directory kills the whole entry silently. Guarantee it.
+  home.file.".claude/logs/.keep".text = "";
+
   home.file.".config/crontab".text = ''
     CRON_TZ=Europe/Stockholm
     PATH=${cronPath}
@@ -82,11 +237,23 @@ in
     # before anything auto-lands, so daily cadence is safe until the
     # grep-gate / scorer-gate fixes ship in a separate PR.
     #
-    # allowedTools mirrors the plugin's install.sh so the two paths
-    # produce identical behaviour: Read for context, Write scoped to
-    # observations/, Glob+Grep for log walking, plus one du to keep
-    # the observation ledger from silently blowing up.
-    20 3 * * * cd ~/.claude && claude --model opus --print --allowedTools "Read Write(~/.claude/recursive-self-improvement/observations/*) Glob Grep Bash(du -sm ~/.claude/recursive-self-improvement/observations/observations.jsonl)" -p "$(cat ~/.claude/recursive-self-improvement/config/prompt.md)" >> ~/.claude/logs/review-agent.log 2>&1 # recursive-self-improvement-analysis
+    # The entry does NOT mirror the plugin's install.sh line — that line
+    # was broken-by-construction headless (path-scoped Write grants
+    # don't register via --allowedTools, and ~/.claude is behind Claude
+    # Code's sensitive-path gate; both probed 2026-08-01). See the
+    # rsiDailyReview comment in the let-block above: read-only model,
+    # stdout proposal blocks, trusted sink persists.
+    20 3 * * * ${rsiDailyReview}/bin/rsi-daily-review >> /home/jonathan/.claude/logs/review-agent.log 2>&1 # recursive-self-improvement-analysis
+    # Permission-ledger nightly evaluator (shipped 2026-08-01 by a
+    # separate session into ~/.claude/permission-ledger/). Its installer
+    # wrote this entry into the LIVE crontab only — same trap as the RSI
+    # line above: the installCrontab activation hook rewrites the live
+    # crontab from this file on every rebuild, so without this line the
+    # first deploy after 2026-08-01 silently kills the evaluator.
+    # Line copied verbatim from the live crontab entry the installer
+    # created (verified accepted by cron), tag comment included so the
+    # installer's idempotency check recognises it as already present.
+    30 17 * * * $HOME/.claude/permission-ledger/run-evaluate.sh >> $HOME/.claude/logs/permission-ledger.log 2>&1 # permission-ledger-evaluate
     # Keep the bare nixos-config repo's local `main` ref in sync with
     # origin/main so new worktrees (`git worktree add ... main`) don't
     # start behind. Bare repo = no working tree, no conflicts possible;

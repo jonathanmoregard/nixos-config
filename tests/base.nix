@@ -86,11 +86,49 @@
         "# recursive-self-improvement-analysis" in crontab_src
     ), f"RSI daily-reviewer cron entry missing from crontab source:\n{crontab_src}"
     # Belt-and-braces: assert the entry actually invokes the reviewer
-    # prompt, not just a stray tag on some other line. Guards against a
+    # wrapper, not just a stray tag on some other line. Guards against a
     # future edit that keeps the tag comment but drops the command body.
     assert (
-        "recursive-self-improvement/config/prompt.md" in crontab_src
-    ), f"RSI reviewer prompt reference missing from crontab source:\n{crontab_src}"
+        "/bin/rsi-daily-review" in crontab_src
+    ), f"RSI reviewer wrapper invocation missing from crontab source:\n{crontab_src}"
+    # Guard against reintroducing the dead-grant pattern: path-scoped
+    # Write(...) grants passed via --allowedTools never register in
+    # headless mode, and ~/.claude is behind Claude Code's built-in
+    # sensitive-path gate which --print short-circuits into a deny
+    # (both probed 2026-08-01). Any --allowedTools Write/Bash grant in
+    # a cron line is therefore a silent no-op that misleads readers —
+    # headless writers must go through a trusted sink instead (see
+    # rsiProposalSink in home/jonathan-linux.nix). Also refuse the
+    # opposite over-correction: permission-bypass flags on a cron
+    # agent that reads untrusted transcript content.
+    # Comment lines are exempt so prose ABOUT the pattern can't trip it.
+    for cron_line in crontab_src.splitlines():
+        cron_line = cron_line.strip()
+        if not cron_line or cron_line.startswith("#"):
+            continue
+        assert (
+            "--dangerously-skip-permissions" not in cron_line
+        ), f"cron line bypasses permissions: {cron_line}"
+        assert (
+            "--permission-mode" not in cron_line
+        ), f"cron line overrides permission mode: {cron_line}"
+        if "--allowedTools" in cron_line:
+            assert (
+                "Write(" not in cron_line and "Bash(" not in cron_line
+            ), f"cron line grants Write/Bash via --allowedTools (dead grant headless): {cron_line}"
+
+    # Permission-ledger nightly evaluator. Shipped 2026-08-01 by a
+    # separate session; its installer wrote only the LIVE crontab, which
+    # the installCrontab activation hook overwrites from
+    # home/jonathan-linux.nix on every rebuild. Without a declarative
+    # copy, the first deploy after install silently kills the evaluator
+    # — same failure shape as the RSI 2026-04-17 outage above.
+    assert (
+        "# permission-ledger-evaluate" in crontab_src
+    ), f"permission-ledger cron entry missing from crontab source:\n{crontab_src}"
+    assert (
+        "permission-ledger/run-evaluate.sh" in crontab_src
+    ), f"permission-ledger run-evaluate.sh reference missing from crontab source:\n{crontab_src}"
 
     # modules/nixos/kindle.nix installs a udev rule that stops
     # gvfs-mtp-volume-monitor from claiming the kindle USB interface
