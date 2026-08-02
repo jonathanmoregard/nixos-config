@@ -32,6 +32,11 @@
 # Wrapper name `research-agent-mcp` matches the ~/.claude.json command
 # string so the config doesn't need to change. The wrapped binary lives
 # inside the project venv at a different absolute path, so no PATH loop.
+let
+  # Lakera Guard tuned-policy pointer, single-sourced in home/lakera.nix
+  # (shared with futuresearch-gate-mcp.nix and claude-services.nix).
+  lakera = import ./lakera.nix;
+in
 {
   home.packages = [
     (pkgs.writeShellApplication {
@@ -65,6 +70,12 @@
         export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY \
                EXA_API_KEY TAVILY_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
                EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET
+
+        # Lakera Guard tuned-policy project (not a secret — see
+        # home/lakera.nix). injection_scanner/lakera.py sends
+        # payload["project_id"] when this is set, selecting the tuned
+        # L3 project policy instead of the account default.
+        export LAKERA_PROJECT_ID=${lakera.lakeraProjectId}
 
         # Host-to-VM SSH private key. The mcp_server reads this lazily
         # in _ssh_settings(); we only need to point it at the agenix
