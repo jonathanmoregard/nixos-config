@@ -5,7 +5,9 @@ description: >
   modifies anything in the nixos-config repo. Routes into the right
   testing skills (`nixos-automated-testing`, `nixos-agent-testing`,
   `test-driven-development`, `advice-refine-test-loop`) based on
-  the shape of the change.
+  the shape of the change. Also triggers on "add a skill" / "add
+  this to my config" during NixOS work — repo-managed skills and
+  config are never edited directly.
 ---
 
 ## First action when triggered

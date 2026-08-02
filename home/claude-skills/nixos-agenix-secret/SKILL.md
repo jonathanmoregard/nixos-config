@@ -1,6 +1,6 @@
 ---
 name: nixos-agenix-secret
-description: Use when creating or editing an agenix-managed NixOS secret. Triggers on "create a secret", "add API key", "agenix -e", "encrypt with agenix", "nixos secret", "store credential".
+description: Use when creating or editing an agenix-managed NixOS secret. Triggers on "create a secret", "add API key", "agenix -e", "encrypt with agenix", "nixos secret", "store credential", "setup agenix", "add agenix secrets", "add secrets", "add environment variable to nixos", and key-assignment shapes ("FOO_CLIENT_ID=...", "FOO_API_KEY=...").
 ---
 
 # NixOS Agenix Secret
