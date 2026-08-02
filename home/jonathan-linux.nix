@@ -284,6 +284,7 @@ in
     */30 6-22 * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/habit-tracker.py >> /home/jonathan/.claude/logs/habit-tracker.log 2>&1
     */30 * * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/sunset-walk-tracker.py >> /home/jonathan/.claude/logs/sunset-walk-tracker.log 2>&1
     37 15 * * * /home/jonathan/Repos/superpowers/sync-agent.sh >> /home/jonathan/Repos/superpowers/sync.log 2>&1
+    11 16 * * * /home/jonathan/Repos/aggregator/sync-agent.sh >> /home/jonathan/Repos/aggregator/sync.log 2>&1
     # Recursive Self-Improvement daily reviewer. The plugin's install.sh
     # tries to install this via `crontab -e`, which loses on every
     # nixos-rebuild switch (activation hook `installCrontab` below
