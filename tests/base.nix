@@ -429,5 +429,44 @@
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user reset-failed sota-watch.service'"
     )
+
+    # sota-watch-refresh-roster — parallel unit + timer that refreshes
+    # the AI power-users roster from the source Google Sheet ahead of
+    # the research runner. Same guard-path shape as sota-watch: missing
+    # refresh-roster.sh must produce a "skipping" log and exit 0 so a
+    # fresh checkout or a VM without the userspace repo does not turn
+    # the unit red. Same OnFailure notifier is reused; the failure lane
+    # is exercised once (above) for the main service — asserting again
+    # for the refresh unit would only test systemd's OnFailure wiring
+    # a second time, so we cover only the loaded-and-guard-clean path
+    # here to keep the lane fast.
+    timers = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user list-timers --all'"
+    )
+    assert "sota-watch-refresh-roster.timer" in timers, (
+        "sota-watch-refresh-roster.timer missing from user timer list:\n"
+        f"{timers}"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start sota-watch-refresh-roster.service'"
+    )
+    refresh_state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed sota-watch-refresh-roster.service "
+        "|| true'"
+    ).strip()
+    assert refresh_state != "failed", (
+        "sota-watch-refresh-roster.service failed on guard-path run: "
+        f"{refresh_state!r}"
+    )
+    refresh_log = dellan.succeed(
+        "cat /home/jonathan/.local/share/sota-watch/refresh-roster.log"
+    )
+    assert "skipping" in refresh_log, (
+        "guard-path 'skipping' marker missing from refresh-roster.log:\n"
+        f"{refresh_log}"
+    )
   '';
 }
