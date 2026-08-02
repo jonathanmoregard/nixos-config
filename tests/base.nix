@@ -73,6 +73,63 @@
         in crontab_src
     ), f"research-agent auto-pull line missing from crontab source:\n{crontab_src}"
 
+    # RSI daily-reviewer cron. The plugin's install.sh tries to install
+    # this via `crontab -e`, which loses on every rebuild + every Monday
+    # backup-crontab.sh run. That's exactly why review-agent.log stopped
+    # writing 2026-04-17 the day a rebuild wiped the crontab-e insertion,
+    # and stayed silent for four months. Declaring it in
+    # home/jonathan-linux.nix is the only durable install path on dellan;
+    # this assertion guards the entry from silently being deleted again.
+    # The comment tag matches the one install.sh uses so a live entry
+    # from either path would satisfy this check.
+    assert (
+        "# recursive-self-improvement-analysis" in crontab_src
+    ), f"RSI daily-reviewer cron entry missing from crontab source:\n{crontab_src}"
+    # Belt-and-braces: assert the entry actually invokes the reviewer
+    # wrapper, not just a stray tag on some other line. Guards against a
+    # future edit that keeps the tag comment but drops the command body.
+    assert (
+        "/bin/rsi-daily-review" in crontab_src
+    ), f"RSI reviewer wrapper invocation missing from crontab source:\n{crontab_src}"
+    # Guard against reintroducing the dead-grant pattern: path-scoped
+    # Write(...) grants passed via --allowedTools never register in
+    # headless mode, and ~/.claude is behind Claude Code's built-in
+    # sensitive-path gate which --print short-circuits into a deny
+    # (both probed 2026-08-01). Any --allowedTools Write/Bash grant in
+    # a cron line is therefore a silent no-op that misleads readers —
+    # headless writers must go through a trusted sink instead (see
+    # rsiProposalSink in home/jonathan-linux.nix). Also refuse the
+    # opposite over-correction: permission-bypass flags on a cron
+    # agent that reads untrusted transcript content.
+    # Comment lines are exempt so prose ABOUT the pattern can't trip it.
+    for cron_line in crontab_src.splitlines():
+        cron_line = cron_line.strip()
+        if not cron_line or cron_line.startswith("#"):
+            continue
+        assert (
+            "--dangerously-skip-permissions" not in cron_line
+        ), f"cron line bypasses permissions: {cron_line}"
+        assert (
+            "--permission-mode" not in cron_line
+        ), f"cron line overrides permission mode: {cron_line}"
+        if "--allowedTools" in cron_line:
+            assert (
+                "Write(" not in cron_line and "Bash(" not in cron_line
+            ), f"cron line grants Write/Bash via --allowedTools (dead grant headless): {cron_line}"
+
+    # Permission-ledger nightly evaluator. Shipped 2026-08-01 by a
+    # separate session; its installer wrote only the LIVE crontab, which
+    # the installCrontab activation hook overwrites from
+    # home/jonathan-linux.nix on every rebuild. Without a declarative
+    # copy, the first deploy after install silently kills the evaluator
+    # — same failure shape as the RSI 2026-04-17 outage above.
+    assert (
+        "# permission-ledger-evaluate" in crontab_src
+    ), f"permission-ledger cron entry missing from crontab source:\n{crontab_src}"
+    assert (
+        "permission-ledger/run-evaluate.sh" in crontab_src
+    ), f"permission-ledger run-evaluate.sh reference missing from crontab source:\n{crontab_src}"
+
     # modules/nixos/kindle.nix installs a udev rule that stops
     # gvfs-mtp-volume-monitor from claiming the kindle USB interface
     # (calibre needs libusb). Rule clears ID_MTP_DEVICE so
@@ -154,6 +211,34 @@
     assert gemini_var == "/run/agenix/gemini-api-key", (
         f"GEMINI_API_KEY_FILE in jonathan's login shell = {gemini_var!r}, "
         f"expected '/run/agenix/gemini-api-key'"
+    )
+
+    # ── Lakera tuned-project pointer (home/lakera.nix) ──
+    # All three injection-scanner call sites must export
+    # LAKERA_PROJECT_ID from the single source in home/lakera.nix, so
+    # injection_scanner/lakera.py pins Lakera Guard to the tuned L3
+    # project policy instead of the account default. Assert on the
+    # rendered wrapper text: a call site that drops the import would
+    # silently fall back to the default policy with zero runtime error.
+    lakera_marker = "export LAKERA_PROJECT_ID=project-5833252261"
+    for wrapper in ["research-agent-mcp", "futuresearch-gate-mcp"]:
+        wrapper_txt = dellan.succeed(
+            f"su - jonathan -c 'cat $(command -v {wrapper})'"
+        )
+        assert lakera_marker in wrapper_txt, (
+            f"{wrapper} wrapper lost the LAKERA_PROJECT_ID export:\n{wrapper_txt}"
+        )
+    # claude-cl-sync-wrap is not on PATH — resolve the store script from
+    # the user unit's ExecStart (same extraction pattern as the camera
+    # watchdog above; ExecStartPre doesn't match /^ExecStart=/).
+    cl_sync_script = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-cl-sync.service' "
+        "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
+    ).strip()
+    cl_sync_txt = dellan.succeed(f"cat {cl_sync_script}")
+    assert lakera_marker in cl_sync_txt, (
+        f"claude-cl-sync-wrap lost the LAKERA_PROJECT_ID export:\n{cl_sync_txt}"
     )
 
     # ── IPU6 camera self-heal watchdog (modules/nixos/laptop.nix) ──

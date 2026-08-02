@@ -24,6 +24,11 @@
 # depends only on the injection-scanner package), already checked out
 # at ~/Repos/futuresearch-gate — so there is no deploy-order dependency:
 # the wrapper works as soon as it lands on PATH.
+let
+  # Lakera Guard tuned-policy pointer, single-sourced in home/lakera.nix
+  # (shared with research-agent-mcp.nix and claude-services.nix).
+  lakera = import ./lakera.nix;
+in
 {
   home.packages = [
     (pkgs.writeShellApplication {
@@ -44,6 +49,12 @@
         # boot smoke rejects and the server exits 2 (-32000).
         LAKERA_API_KEY=$(< /run/agenix/lakera-api-key)
         export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY
+
+        # Lakera Guard tuned-policy project (not a secret — see
+        # home/lakera.nix). injection_scanner/lakera.py sends
+        # payload["project_id"] when this is set, selecting the tuned
+        # L3 project policy instead of the account default.
+        export LAKERA_PROJECT_ID=${lakera.lakeraProjectId}
 
         # The scanner's Lakera call uses stdlib urllib, which finds no
         # CA bundle on NixOS with a uv-managed CPython — cert verify
