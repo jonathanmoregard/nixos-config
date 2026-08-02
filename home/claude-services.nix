@@ -8,6 +8,10 @@
 # the units will fail at first tick until that scaffolding is set up
 # separately.
 let
+  # Lakera Guard tuned-policy pointer, single-sourced in home/lakera.nix
+  # (shared with research-agent-mcp.nix and futuresearch-gate-mcp.nix).
+  lakera = import ./lakera.nix;
+
   # claude-cl-sync's injection-scanner probes Anthropic + OpenAI (L3
   # honeypot) and Lakera Guard (L2 classifier) on every tick. systemd's
   # `EnvironmentFile=` expects KEY=VALUE format, but our agenix `.age`
@@ -27,6 +31,11 @@ let
       # Full rationale in research-agent-mcp.nix.
       SSL_CERT_FILE="''${SSL_CERT_FILE:-/etc/ssl/certs/ca-bundle.crt}"
       export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY SSL_CERT_FILE
+      # Lakera Guard tuned-policy project (not a secret — see
+      # home/lakera.nix). injection_scanner/lakera.py sends
+      # payload["project_id"] when this is set, selecting the tuned
+      # L3 project policy instead of the account default.
+      export LAKERA_PROJECT_ID=${lakera.lakeraProjectId}
       exec "$HOME/.claude/dev-container/.venv/bin/python3" \
            "$HOME/.claude/dev-container/bin/claude-cl-sync"
     '';
