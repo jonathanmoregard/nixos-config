@@ -112,13 +112,17 @@ pkgs.testers.runNixOSTest {
         "grep -qE -- '-m 2048( |$)' "
         "/var/lib/microvms/research-agent/current/bin/microvm-run"
     )
-    # 6144 (bumped from 3072 on 2026-07-30): a single research run OOM'd
-    # the 3 GiB guest, stalling sshd until the watchdog restarted the VM
-    # mid-run (research call died rc=255). More headroom keeps the guest
-    # responsive to the probe during a run. Assert on the materialized
-    # runner — the artifact qemu actually execs.
+    # 4096 (shrunk from 6144 on 2026-08-02, previously bumped 3072 -> 6144
+    # on 2026-07-30 after a research run OOM'd the 3 GiB guest). Load
+    # testing at 6144 showed 4-concurrent Opus/deep peaked guest VmRSS at
+    # ~1.3 GiB (21% used), and the projected 6-concurrent peak from cgroup
+    # per-call deltas is ~3.3 GiB — 4 GiB gives ~+20% headroom over that
+    # projection and frees 2 GiB back to the host (the swap+zram PR #152
+    # exists because of exactly this oversubscription). Well clear of the
+    # 2048 MiB DSDT-corruption boundary. Assert on the materialized runner
+    # — the artifact qemu actually execs.
     dellan.succeed(
-        "grep -q -- '-m 6144' "
+        "grep -q -- '-m 4096' "
         "/var/lib/microvms/research-agent/current/bin/microvm-run"
     )
 
