@@ -310,7 +310,20 @@ in
     # Code's sensitive-path gate; both probed 2026-08-01). See the
     # rsiDailyReview comment in the let-block above: read-only model,
     # stdout proposal blocks, trusted sink persists.
-    20 3 * * * ${rsiDailyReview}/bin/rsi-daily-review >> /home/jonathan/.claude/logs/review-agent.log 2>&1 # recursive-self-improvement-analysis
+    # DISABLED 2026-08-02 — usage cap. The entry is a nightly headless
+    # Opus pass over the whole transcript corpus; its token cost has
+    # never been measured, and measuring it costs usage too, so both the
+    # run and the measurement are deferred. Commented rather than
+    # deleted: this line IS the re-enable point.
+    #
+    # To re-enable: restore the line below to
+    #   20 3 * * * ''${rsiDailyReview}/bin/rsi-daily-review >> ...
+    # (with the interpolation live) and flip the inverted assertion in
+    # tests/base.nix back to asserting presence, in the same PR. The
+    # interpolation is deliberately escaped here so the commented line
+    # does not pull rsiDailyReview into the system closure — a `#` in
+    # the crontab text does not stop Nix from evaluating ''${...}.
+    # 20 3 * * * <rsiDailyReview>/bin/rsi-daily-review >> /home/jonathan/.claude/logs/review-agent.log 2>&1 # recursive-self-improvement-analysis
     # Permission-ledger nightly evaluator (shipped 2026-08-01 by a
     # separate session into ~/.claude/permission-ledger/). Its installer
     # wrote this entry into the LIVE crontab only — same trap as the RSI

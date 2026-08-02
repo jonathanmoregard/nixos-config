@@ -73,24 +73,31 @@
         in crontab_src
     ), f"research-agent auto-pull line missing from crontab source:\n{crontab_src}"
 
-    # RSI daily-reviewer cron. The plugin's install.sh tries to install
-    # this via `crontab -e`, which loses on every rebuild + every Monday
-    # backup-crontab.sh run. That's exactly why review-agent.log stopped
-    # writing 2026-04-17 the day a rebuild wiped the crontab-e insertion,
-    # and stayed silent for four months. Declaring it in
-    # home/jonathan-linux.nix is the only durable install path on dellan;
-    # this assertion guards the entry from silently being deleted again.
-    # The comment tag matches the one install.sh uses so a live entry
-    # from either path would satisfy this check.
+    # RSI daily-reviewer cron — DISABLED 2026-08-02. The nightly run is a
+    # headless Opus call over the whole transcript corpus; with the
+    # account near its usage cap that cost has to be measured before the
+    # entry earns its slot back, and measuring it also costs usage. So
+    # the line stays in home/jonathan-linux.nix commented out rather than
+    # deleted: re-enabling is uncommenting one line plus flipping this
+    # assertion back, in one deliberate PR.
+    #
+    # The history this still guards: the plugin's install.sh installs the
+    # entry via `crontab -e`, which loses on every rebuild and every
+    # Monday backup-crontab.sh run — that is why review-agent.log went
+    # silent 2026-04-17 and stayed silent for four months.
+    # home/jonathan-linux.nix is the only durable install path on dellan.
+    # Inverted, the assertion now does double duty: it catches
+    # install.sh (or a future setup skill) quietly re-adding a live entry
+    # behind the user's back, which is the same failure with the sign
+    # flipped.
+    assert not any(
+        "rsi-daily-review" in c for c in active_commands
+    ), f"RSI daily-reviewer cron is disabled on purpose (2026-08-02, usage cap); re-enable it deliberately and flip this assertion in the same PR:\n{crontab_src}"
+    # Keep the disabled line discoverable in the source: deleting it
+    # loses the re-enable point and the reasoning above.
     assert (
         "# recursive-self-improvement-analysis" in crontab_src
-    ), f"RSI daily-reviewer cron entry missing from crontab source:\n{crontab_src}"
-    # Belt-and-braces: assert the entry actually invokes the reviewer
-    # wrapper, not just a stray tag on some other line. Guards against a
-    # future edit that keeps the tag comment but drops the command body.
-    assert (
-        "/bin/rsi-daily-review" in crontab_src
-    ), f"RSI reviewer wrapper invocation missing from crontab source:\n{crontab_src}"
+    ), f"the commented-out RSI cron line should stay in the source as the re-enable point:\n{crontab_src}"
     # Guard against reintroducing the dead-grant pattern: path-scoped
     # Write(...) grants passed via --allowedTools never register in
     # headless mode, and ~/.claude is behind Claude Code's built-in
