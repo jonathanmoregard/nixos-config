@@ -137,6 +137,17 @@
     group = "users";
     mode = "0400";
   };
+  # GitHub read-only PAT consumed by the aggregator's github ingest
+  # (~/Repos/aggregator). Raw token only in the .age file (no `KEY=`
+  # prefix); the aggregator reads it with `$(< file)` and exports
+  # GH_TOKEN itself. owner=jonathan + mode=0400 because the ingest
+  # runs as the user.
+  age.secrets.github-readonly-pat = {
+    rekeyFile = ../../secrets/github-readonly-pat.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
   # EUIPO OAuth2 credentials for the research-agent's trademark_shim
   # (queries the EU trademark register over its REST API). Both files
   # are empty placeholders until the EUIPO developer-portal
