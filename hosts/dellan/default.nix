@@ -63,6 +63,14 @@
     # stylometric blog style-detector. Declares deepinfra-api-key + hf-token
     # agenix secrets and a wrapper that injects them at exec time.
     ../../modules/nixos/blog-style-neural.nix
+
+    # `aggregator-github-timer` — systemd user timer running the
+    # aggregator's github ingest every 30 min. Standalone wrapper (the
+    # aggregator repo lives at ~/Repos/aggregator, never pushed, so
+    # cannot be a flake input; see the module header for the SOTA
+    # rationale). Consumes age.secrets.github-readonly-pat declared
+    # below.
+    ../../modules/nixos/aggregator-github-timer.nix
   ];
 
   # ---------------------------------------------------------------------
