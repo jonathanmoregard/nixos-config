@@ -5,6 +5,7 @@
 {
   home.packages = with pkgs; [
     google-chrome
+    signal-desktop
     beeper
     discord        # nixpkgs, NOT flatpak
     gimp
