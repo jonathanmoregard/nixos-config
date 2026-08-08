@@ -365,6 +365,18 @@ in
     # diverged tree fails loudly into the log instead of fabricating a
     # merge commit on a live production path.
     */30 * * * * git -C /home/jonathan/Repos/research-agent pull --ff-only >> /home/jonathan/.claude/logs/research-agent-pull.log 2>&1
+    # ── crontab-drift-check insertion point ──────────────────────────
+    # crontab-drift-check (home/crontab-drift-script.nix, hourly on the
+    # nixos-drift-analyzer timer) compares the LIVE crontab against this
+    # block. Entries found live but not declared get proposed in a PR,
+    # inserted directly above the anchor line below. It is a crontab
+    # comment, so it is inert once installed, and the checker's own
+    # normaliser drops comment lines — no feedback loop.
+    # Keep this anchor unique and keep it inside this string: the
+    # inserter refuses to write when it matches zero or multiple lines,
+    # which turns a botched edit into a loud failure instead of a
+    # mangled config.
+    # crontab-drift-check inserts newly-found live entries directly above this line
   '';
 
   # `crontab` is a setuid wrapper at /run/wrappers/bin/crontab (provided by

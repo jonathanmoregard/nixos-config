@@ -174,6 +174,20 @@
             .home-manager.users.jonathan
             .systemd.user.services.nixos-worktree-sweep.Service.ExecStart;
         };
+        # Not a VM lane: runtime-invocation harness for the PR-gated
+        # live-vs-declared crontab drift writer
+        # (home/crontab-drift-script.nix). Real git fixtures, stubbed
+        # gh/crontab/notify-send; asserts one PR per distinct drift,
+        # Nix-metacharacter escaping on inserted entries, loud failure on
+        # every path it cannot complete, and that `main` never moves.
+        # Cheap runCommand; seconds.
+        crontab-drift = import ./tests/crontab-drift.nix {
+          pkgs = pkgsLinux;
+          driftScript = import ./home/crontab-drift-script.nix { pkgs = pkgsLinux; };
+          deployedExecStart = self.nixosConfigurations.dellan.config
+            .home-manager.users.jonathan
+            .systemd.user.services.crontab-drift-check.Service.ExecStart;
+        };
       };
 
     # Feature-VM flake apps. Two interactive modes + a screencap helper.
