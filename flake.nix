@@ -69,6 +69,7 @@
       overlays = [
         (import ./overlays/beeper.nix)
         (import ./overlays/auphonic-cli.nix)
+        (import ./overlays/signal-expiry.nix)
         (final: prev: {
           tts-tool = tts-tool.packages.${linuxSystem}.default;
           substack-url-tool = substack-url-tool.packages.${linuxSystem}.default;
@@ -173,6 +174,16 @@
           deployedExecStart = self.nixosConfigurations.dellan.config
             .home-manager.users.jonathan
             .systemd.user.services.nixos-worktree-sweep.Service.ExecStart;
+        };
+        # Not a VM lane: runtime-invocation harness for the Signal build-
+        # expiry probe (overlays/signal-expiry.nix). Drives the deployed
+        # `check-signal-expiry` via its `--asar` form against crafted
+        # app.asar fixtures — pins max-selection over the zero decoys,
+        # "expired still measures", and "unreadable fails loud". Cheap
+        # runCommand; seconds.
+        signal-expiry = import ./tests/signal-expiry.nix {
+          pkgs = pkgsLinux;
+          checkScript = pkgsLinux.signal-expiry-check;
         };
       };
 
@@ -298,7 +309,17 @@
 
     # `nix run .#update-beeper` — rewrites overlays/beeper.nix to the latest
     # upstream Beeper release. Wired into .github/workflows/update-beeper.yml.
-    packages.${linuxSystem}.update-beeper = pkgsLinux.beeper-update;
+    #
+    # `nix run .#check-signal-expiry` — reports how many days remain before
+    # the currently-locked signal-desktop hits its 90-day build expiry and
+    # starts refusing to connect. Wired into
+    # .github/workflows/update-signal.yml, which bumps nixpkgs when the
+    # runway gets short. See overlays/signal-expiry.nix for why this
+    # measures nixpkgs staleness instead of repackaging Signal.
+    packages.${linuxSystem} = {
+      update-beeper = pkgsLinux.beeper-update;
+      check-signal-expiry = pkgsLinux.signal-expiry-check;
+    };
 
     # agenix-rekey CLI plumbing. Exposes:
     #   nix run .#agenix -- generate           — bootstrap missing rekeyed copies

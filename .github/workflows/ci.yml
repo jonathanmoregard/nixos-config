@@ -214,6 +214,15 @@ jobs:
       # deletions (tests/worktree-sweep.nix). Tiny runCommand — seconds.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.worktree-sweep -L
+      # Signal build-expiry probe contract: crafted app.asar fixtures
+      # asserting max-selection over the zero decoys, that an expired
+      # build still MEASURES (exit 0, negative days), and that an
+      # unreadable expiry fails loud (tests/signal-expiry.nix). The
+      # update-signal.yml bumper parses this tool's stdout, so a silent
+      # misparse would either spam nixpkgs-bump PRs or go blind at
+      # expiry. Tiny runCommand — seconds.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.signal-expiry -L
 
   docs:
     # Validate that every `nix run .#<attr>` reference in this repo's
