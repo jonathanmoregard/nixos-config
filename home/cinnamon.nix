@@ -370,6 +370,12 @@ in
       "image/gif" = "xviewer.desktop";
       "image/bmp" = "xviewer.desktop";
       "image/webp" = "xviewer.desktop";
+      "video/mp4" = "vlc.desktop";
+      "video/x-matroska" = "vlc.desktop";
+      "video/webm" = "vlc.desktop";
+      "video/quicktime" = "vlc.desktop";
+      "video/x-msvideo" = "vlc.desktop";
+      "video/mpeg" = "vlc.desktop";
       "inode/directory" = "nemo.desktop";
       "x-scheme-handler/magnet" = "org.qbittorrent.qBittorrent.desktop";
       "application/x-bittorrent" = "org.qbittorrent.qBittorrent.desktop";

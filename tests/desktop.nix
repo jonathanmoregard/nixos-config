@@ -117,6 +117,13 @@
     assert torrent_default == "org.qbittorrent.qBittorrent.desktop", \
         f"xdg-mime resolves .torrent to {torrent_default!r}, expected qbittorrent"
 
+    for mime in ("video/mp4", "video/x-matroska", "video/webm"):
+        video_default = dellan.succeed(
+            f"su - jonathan -c 'xdg-mime query default {mime}'"
+        ).strip()
+        assert video_default == "vlc.desktop", \
+            f"xdg-mime resolves {mime} to {video_default!r}, expected vlc.desktop"
+
     # LightDM display-setup-script — silences the X11 bell so arrow
     # keys at the password field don't "twoink". Greeter user is
     # `lightdm`, separate from jonathan's user-session dconf, so the
