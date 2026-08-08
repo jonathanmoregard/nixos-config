@@ -475,5 +475,153 @@
         "guard-path 'skipping' marker missing from refresh-roster.log:\n"
         f"{refresh_log}"
     )
+
+    # ── crontab drift check (home/drift-analyzer.nix) ──
+    # The user crontab is declarative: home.file.".config/crontab" is the
+    # truth and installCrontab rewrites the live crontab from it on every
+    # rebuild. Anything added with `crontab -e` therefore evaporates at
+    # the next switch — that is how the RSI reviewer stayed dead for four
+    # months. crontab-drift-check compares live against declared and
+    # opens a PR for live-only entries; it must never commit to main.
+    #
+    # Deliberately NOT on its own timer: it is pulled in by the existing
+    # hourly nixos-drift-analyzer.service via Wants=, so there is one
+    # drift cadence on this host, not two that can silently diverge.
+    def user_ctl(cmd):
+        return (
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"systemctl --user {cmd}'"
+        )
+
+    def user_journal(unit, tolerate_missing=False):
+        # `; true` belongs INSIDE the su -c quotes. Outside, a journalctl
+        # error would still fail the outer command under the driver's
+        # `set -e` — and for the negative control below that would make
+        # the absence assertion pass vacuously.
+        suffix = "; true" if tolerate_missing else ""
+        return (
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"journalctl --user -u {unit} --no-pager{suffix}'"
+        )
+
+    drift_unit = dellan.succeed(user_ctl("cat crontab-drift-check.service"))
+    assert "crontab-drift-check" in drift_unit, (
+        f"crontab-drift-check.service not installed:\n{drift_unit}"
+    )
+    # The setuid crontab wrapper cannot elevate once no_new_privs is
+    # set, and on a USER unit PrivateTmp brings no_new_privs with it
+    # (unprivileged user namespace). Both probed on dellan — same
+    # error either way: "cannot chdir(/var/cron), bailing out.
+    # /var/cron: Permission denied". A hardening pass that adds either
+    # makes the checker blind to the live crontab, i.e. reintroduces
+    # the silent failure this whole unit exists to stop.
+    for opt in ["NoNewPrivileges", "PrivateTmp"]:
+        assert opt not in drift_unit, (
+            f"{opt} implies no_new_privs for a user unit, which blocks the "
+            "setuid crontab wrapper — the checker would silently see an "
+            f"empty live crontab:\n{drift_unit}"
+        )
+    # Timer coupling: removing this Wants= would leave the checker
+    # installed but never scheduled — silent death, same failure class.
+    analyzer_unit = dellan.succeed(
+        user_ctl("cat nixos-drift-analyzer.service")
+    )
+    assert "crontab-drift-check.service" in analyzer_unit, (
+        "nixos-drift-analyzer.service lost Wants=crontab-drift-check."
+        f"service — the drift check would never be scheduled:\n{analyzer_unit}"
+    )
+
+    # Clean path: a real run against this VM's own crontab must exit 0.
+    dellan.succeed(user_ctl("start crontab-drift-check.service"))
+    drift_state = dellan.succeed(
+        user_ctl("is-failed crontab-drift-check.service || true")
+    ).strip()
+    assert drift_state != "failed", (
+        f"crontab-drift-check failed on the clean path: {drift_state!r}"
+    )
+    # Behavioural guard on top of the string checks above: the run must
+    # report how many live entries it saw. Any future sandboxing option
+    # that silently breaks the setuid crontab wrapper fails here even if
+    # its name is not on the list.
+    clean_journal = dellan.succeed(
+        user_journal("crontab-drift-check.service")
+    )
+    assert "live entries:" in clean_journal, (
+        "the checker did not report a live-entry count — it could not read "
+        f"the live crontab:\n{clean_journal}"
+    )
+    # Negative control before the failure lane, mirroring sota-watch: a
+    # clean run must NOT have tripped the notifier, or the grep below
+    # could pass vacuously.
+    drift_notify = dellan.succeed(
+        user_journal(
+            "crontab-drift-check-failure-notify.service",
+            tolerate_missing=True,
+        )
+    )
+    assert "crontab-drift-check FAILED" not in drift_notify, (
+        "notifier marker present after a clean run — OnFailure is "
+        f"mis-wired:\n{drift_notify}"
+    )
+
+    # Failure lane: drift that CANNOT be filed must go loud. Plant a
+    # declared/live pair differing by one entry and point the checker at
+    # a repo that does not exist, so the drift is real and unfilable.
+    # This lane proves the systemd half — unit goes red, OnFailure fires,
+    # the journal names what drifted. WHICH unfilable reason triggered it
+    # is not the point here; tests/crontab-drift.nix walks every reason
+    # (gh outage, missing anchor, absent crontab binary) against real git
+    # fixtures. Fixtures live under ~/.cache because /home/jonathan/Repos
+    # is root-owned in this VM.
+    fixture = "/home/jonathan/.cache/crondrift-test"
+    dellan.succeed(
+        f"mkdir -p {fixture} && "
+        f"printf '0 5 * * * /bin/true\\n' > {fixture}/declared && "
+        "printf '#!/bin/sh\\nprintf \"0 5 * * * /bin/true\\\\n"
+        f"7 7 * * * /bin/stray\\\\n\"\\n' > {fixture}/crontab && "
+        f"chmod 755 {fixture}/crontab && "
+        f"chown -R jonathan:users {fixture}"
+    )
+    dellan.succeed(
+        user_ctl(
+            "set-environment "
+            f"CRONDRIFT_DECLARED_FILE={fixture}/declared "
+            f"CRONDRIFT_CRONTAB_BIN={fixture}/crontab "
+            f"CRONDRIFT_BARE_REPO={fixture}/no-such-repo"
+        )
+    )
+    # `; true` must sit INSIDE the su -c quotes: the test driver runs the
+    # outer command under `set -e`, so a trailing `; true` outside would
+    # never be reached.
+    dellan.succeed(user_ctl("start crontab-drift-check.service; true"))
+    drift_state = dellan.succeed(
+        user_ctl("is-failed crontab-drift-check.service || true")
+    ).strip()
+    assert drift_state == "failed", (
+        "unfilable drift must fail the unit (loudly), got "
+        f"is-failed={drift_state!r}"
+    )
+    dellan.wait_until_succeeds(
+        user_journal("crontab-drift-check-failure-notify.service")
+        + " | grep -q 'crontab-drift-check FAILED'",
+        timeout=60,
+    )
+    # The stray entry must be named in the journal — a failure that does
+    # not say WHAT drifted is barely better than silence.
+    drift_journal = dellan.succeed(
+        user_journal("crontab-drift-check.service")
+    )
+    assert "/bin/stray" in drift_journal, (
+        f"stray entry not named in the failure journal:\n{drift_journal}"
+    )
+    # Leave the VM clean for later assertions.
+    dellan.succeed(
+        user_ctl(
+            "unset-environment CRONDRIFT_DECLARED_FILE "
+            "CRONDRIFT_CRONTAB_BIN CRONDRIFT_BARE_REPO"
+        )
+    )
+    dellan.succeed(user_ctl("reset-failed crontab-drift-check.service"))
+    dellan.succeed(f"rm -rf {fixture}")
   '';
 }
