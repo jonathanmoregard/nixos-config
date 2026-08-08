@@ -437,6 +437,58 @@
         "systemctl --user reset-failed sota-watch.service'"
     )
 
+    # claude-idle-handoff — proactive mission.md writer + opus-5 autofork
+    # for idle Claude Code sessions. Declared in home/claude-services.nix
+    # after four months of the shipped-imperative footgun (RSI reviewer)
+    # — same failure shape: units under ~/.config/systemd/user/ evaporate
+    # on a fresh host. Unit + timer only; the SCRIPT
+    # (~/.claude/scripts/idle-handoff.sh) is deliberately NOT nix-managed
+    # because it iterates hot and lives in the ~/.claude git repo.
+    #
+    # This lane cannot run the real script — it lives outside the VM
+    # closure — so we assert (a) the timer is loaded with the exact
+    # cadence + jitter the design specifies, (b) the service is loaded
+    # with the exact ExecStart the timer will call, and (c) the
+    # resource-shape flags a stray tick can rely on
+    # (Nice=15 / IOSchedulingClass=idle / TimeoutStartSec=180). A
+    # rebuild that silently drops any of these puts the schedule back
+    # in the same 5-min stampede window that motivated the caps.
+    timers = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user list-timers --all'"
+    )
+    assert "claude-idle-handoff.timer" in timers, (
+        "claude-idle-handoff.timer missing from user timer list:\n"
+        f"{timers}"
+    )
+    handoff_timer = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-idle-handoff.timer'"
+    )
+    for marker in [
+        "OnBootSec=5min",
+        "OnUnitActiveSec=5min",
+        "AccuracySec=30s",
+        "Unit=claude-idle-handoff.service",
+    ]:
+        assert marker in handoff_timer, (
+            f"claude-idle-handoff.timer lost '{marker}':\n{handoff_timer}"
+        )
+    handoff_service = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-idle-handoff.service'"
+    )
+    for marker in [
+        "Type=oneshot",
+        "ExecStart=%h/.claude/scripts/idle-handoff.sh",
+        "Nice=15",
+        "IOSchedulingClass=idle",
+        "TimeoutStartSec=",
+    ]:
+        assert marker in handoff_service, (
+            f"claude-idle-handoff.service lost '{marker}':\n{handoff_service}"
+        )
+
     # sota-watch-refresh-roster — parallel unit + timer that refreshes
     # the AI power-users roster from the source Google Sheet ahead of
     # the research runner. Same guard-path shape as sota-watch: missing

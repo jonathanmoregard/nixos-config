@@ -120,6 +120,60 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # claude-idle-handoff — proactive mission.md writer + opus-5 autofork
+  # for idle Claude Code sessions. Scans every 5 min for sessions that
+  # have been silent long enough to be considered "walked away from"
+  # and drops a mission.md handoff so the next session can pick up
+  # without replaying the whole log.
+  #
+  # The SCRIPT itself lives at ~/.claude/scripts/idle-handoff.sh (with
+  # a helper at ~/.claude/skills/session-reflect/reflect.sh in `mission`
+  # mode). Both are tracked in the ~/.claude git repo separately, NOT
+  # pinned into the nix store — the script iterates hot on its own
+  # cadence and putting it under nix would force a rebuild for every
+  # tweak. Only the TIMER + SERVICE are declared here, so a fresh
+  # rebuild re-creates the schedule; the script is (like the rest of
+  # ~/.claude) provisioned by its own sync path.
+  #
+  # Captured from live imperative units at
+  # ~/.config/systemd/user/claude-idle-handoff.{service,timer} on
+  # 2026-08-08 — same rationale as the file-level comment above.
+  systemd.user.services.claude-idle-handoff = {
+    Unit = {
+      Description = "Claude Code idle handoff — proactive mission.md write for idle sessions";
+      After = [ "default.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # %h expands to $HOME under home-manager's systemd --user.
+      ExecStart = "%h/.claude/scripts/idle-handoff.sh";
+      # Scanner, not real work — stay out of interactive processes' way.
+      Nice = 15;
+      IOSchedulingClass = "idle";
+      # reflect.sh may spawn a real claude call in mission mode; 3 min
+      # is comfortably above p99 and well below the 5 min timer cadence
+      # so a stuck run cannot pile up two invocations.
+      TimeoutStartSec = 180;
+    };
+  };
+
+  systemd.user.timers.claude-idle-handoff = {
+    Unit.Description = "Run claude-idle-handoff every 5 minutes";
+    Timer = {
+      OnBootSec = "5min";
+      OnUnitActiveSec = "5min";
+      # ±30s jitter keeps every 5-min tick from stampeding when several
+      # user timers land on the same wall-clock boundary.
+      AccuracySec = "30s";
+      # Idle-scanner: catching up after a suspend would fire a stale
+      # tick against sessions that are no longer idle — skip missed
+      # runs and wait for the next natural boundary.
+      Persistent = false;
+      Unit = "claude-idle-handoff.service";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # claude-sandbox-proxy — hostname-allowlisted HTTP/HTTPS proxy for Claude
   # sandboxes. Long-running service, started at session login.
   systemd.user.services.claude-sandbox-proxy = {
