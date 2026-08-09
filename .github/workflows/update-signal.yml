@@ -1,0 +1,255 @@
+# .github/workflows/update-signal.yml
+#
+# Signal Desktop hard-expires 90 days after each build is cut. Past that
+# point the client refuses to open its provisioning/auth websocket and the
+# user sees "failed to connect to server" with a perfectly healthy network.
+# The only fix is shipping a newer Signal — which, since we take Signal
+# straight from nixpkgs, means bumping the nixpkgs pin.
+#
+# This job measures the *remaining runway* rather than bumping on a blind
+# cadence: `nix run .#check-signal-expiry` reads `buildExpiration` out of
+# the locked signal-desktop's app.asar (see overlays/signal-expiry.nix).
+# When fewer than THRESHOLD_DAYS remain, it runs
+# `nix flake update nixpkgs home-manager microvm` (the two followers move
+# with nixpkgs — see the bump step for why) and opens a PR. When there's
+# plenty of runway it exits without touching anything, so this doesn't
+# generate weekly nixpkgs-bump churn.
+#
+# Weekly cadence + a 30-day threshold means the bump PR appears with ~23
+# days of slack even in the worst case (expiry crosses the threshold right
+# after a run). That is deliberate headroom: unlike the Beeper bump, this
+# PR rewrites the *entire* nixpkgs pin, so it runs the full CI matrix and
+# waits for a human merge click. It does NOT enable auto-merge.
+#
+# If nixpkgs has no fresher Signal than what we already have, the job
+# discards the lock change rather than opening a no-op PR — and then
+# the final step decides how loud to be about it: a warning while there
+# is still runway, a hard job failure once the build has ALREADY
+# expired. Silence at that point would mean the one job that exists to
+# notice a broken Signal goes green while Signal is broken.
+#
+# Same close+reopen trick as update-beeper.yml: PRs opened with the
+# workflow-default GITHUB_TOKEN don't fire `pull_request` events on the
+# initial open, and ci.yml subscribes to `reopened`.
+name: update-signal
+
+on:
+  schedule:
+    # 05:23 UTC Mondays. Off-the-hour to dodge the cron stampede on :00,
+    # and a different slot from update-beeper.yml (06:17) so the two
+    # bumpers don't contend for runners.
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      threshold_days:
+        description: 'Open a bump PR when fewer than this many days of Signal runway remain'
+        required: false
+        default: '30'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Same NIX_CONFIG belt-and-braces as ci.yml — pre-empts any later
+# NIX_USER_CONF_FILES shadowing of /etc/nix/nix.conf.
+env:
+  NIX_CONFIG: |
+    access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+concurrency:
+  group: update-signal
+  cancel-in-progress: true
+
+jobs:
+  update:
+    if: github.repository == 'jonathanmoregard/nixos-config'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Real history so a force-push to bot/update-signal resets cleanly
+          # rather than tracking back to a shallow root.
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      # Same agenix-rekey prewarm ci.yml's flake-check and docs jobs do.
+      # `check-signal-expiry` resolves
+      # `nixosConfigurations.dellan.pkgs.signal-desktop`, and the
+      # agenix-rekey module reaches the per-host rekeyed dir through
+      # `builtins.path`. On a fresh runner that store path isn't
+      # materialised, and the eval dies with `path '<hash>-dellan' is
+      # not valid`. Registering each dir up front produces the same
+      # store hash builtins.path computes, so the check short-circuits.
+      - name: Prewarm rekeyed secret dirs
+        run: |
+          shopt -s nullglob
+          for dir in secrets/rekeyed/*/; do
+            nix store add-path "${dir%/}"
+          done
+
+      - name: Measure remaining Signal runway
+        id: runway
+        env:
+          THRESHOLD_DAYS: ${{ github.event.inputs.threshold_days || '30' }}
+        run: |
+          set -euo pipefail
+
+          out="$(nix run .#check-signal-expiry)"
+          echo "$out"
+
+          days_left="$(echo "$out" | grep '^days_left=' | cut -d= -f2)"
+          version="$(echo "$out" | grep '^version=' | cut -d= -f2)"
+
+          echo "days_left=$days_left" >> "$GITHUB_OUTPUT"
+          echo "old_version=$version" >> "$GITHUB_OUTPUT"
+
+          if [ "$days_left" -gt "$THRESHOLD_DAYS" ]; then
+            echo "update-signal: $version has $days_left days left (threshold $THRESHOLD_DAYS) — nothing to do"
+            echo "needs_bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "update-signal: $version has only $days_left days left (threshold $THRESHOLD_DAYS) — bumping nixpkgs"
+            echo "needs_bump=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump nixpkgs and confirm it actually helps
+        id: bump
+        if: steps.runway.outputs.needs_bump == 'true'
+        env:
+          OLD_DAYS: ${{ steps.runway.outputs.days_left }}
+        run: |
+          set -euo pipefail
+
+          # home-manager and microvm both `follows` nixpkgs, and both
+          # track upstream `main` rather than a release branch. Moving
+          # nixpkgs alone strands them: home-manager starts emitting the
+          # release-mismatch eval warning that check-eval-warnings.sh
+          # fails CI on, and an old microvm pin calls nixpkgs internals
+          # that have since been removed (the 2026-08 bump had to move
+          # all three for exactly these two reasons). A bot PR that
+          # cannot go green is worse than no bot PR, so the followers
+          # move with the thing they follow.
+          nix flake update nixpkgs home-manager microvm
+
+          if git diff --quiet -- flake.lock; then
+            echo "update-signal: nixpkgs already at latest revision — no newer Signal available yet"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          out="$(nix run .#check-signal-expiry)"
+          echo "$out"
+
+          new_days="$(echo "$out" | grep '^days_left=' | cut -d= -f2)"
+          new_version="$(echo "$out" | grep '^version=' | cut -d= -f2)"
+
+          # Guard against opening a churn PR that rewrites the whole nixpkgs
+          # pin without buying any Signal runway — e.g. nixpkgs advanced but
+          # hasn't picked up a newer signal-desktop yet.
+          if [ "$new_days" -le "$OLD_DAYS" ]; then
+            echo "update-signal: bumped nixpkgs still gives $new_days days (was $OLD_DAYS) — no gain, discarding"
+            git checkout -- flake.lock
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "update-signal: $new_version buys $new_days days (was $OLD_DAYS)"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+          echo "new_days=$new_days" >> "$GITHUB_OUTPUT"
+
+      - name: Push branch and open or refresh PR
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLD_VERSION: ${{ steps.runway.outputs.old_version }}
+          OLD_DAYS: ${{ steps.runway.outputs.days_left }}
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+          NEW_DAYS: ${{ steps.bump.outputs.new_days }}
+        run: |
+          set -euo pipefail
+          branch=bot/update-signal
+
+          git config user.name 'signal-update-bot[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # Multi-line commit message and PR body are composed into files
+          # with printf rather than written as literal multi-line shell
+          # strings. A continuation line inside a `run: |` block has to
+          # keep the block's indentation, and any indentation would then
+          # show up inside the commit message itself — so the obvious
+          # spelling silently produces either a mangled message or, if
+          # the continuations are dedented to column 0, a workflow file
+          # that isn't valid YAML at all. printf keeps both the YAML and
+          # the message shape correct.
+          msg_file="$(mktemp)"
+          {
+            printf 'flake: bump nixpkgs — signal-desktop %s -> %s\n\n' \
+              "$OLD_VERSION" "$NEW_VERSION"
+            printf 'Signal Desktop hard-expires 90 days after its build date; past that\n'
+            printf 'the client refuses to open its provisioning socket and presents as\n'
+            printf '"failed to connect to server". The locked build had %s days left,\n' "$OLD_DAYS"
+            printf 'under the runway threshold, so .github/workflows/update-signal.yml\n'
+            printf 'bumped nixpkgs along with the home-manager and microvm inputs that\n'
+            printf 'follow it.\n\n'
+            printf 'New runway: %s days.\n\n' "$NEW_DAYS"
+            printf 'Pre-push checklist:\n'
+            printf -- '- Type: pure-data\n'
+          } > "$msg_file"
+
+          # Branch off main, force-push so retries overwrite stale state.
+          git checkout -B "$branch"
+          git add flake.lock
+          git commit -F "$msg_file"
+
+          git push --force origin "$branch"
+
+          pr_number=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number' || true)
+          if [ -z "$pr_number" ]; then
+            body_file="$(mktemp)"
+            {
+              printf 'Automated by `.github/workflows/update-signal.yml`.\n\n'
+              printf 'The locked `signal-desktop` (`%s`) had **%s days** before its 90-day build expiry. Past expiry Signal refuses to open its provisioning/auth websocket and shows "failed to connect to server" on a perfectly healthy network.\n\n' \
+                "$OLD_VERSION" "$OLD_DAYS"
+              printf 'Bumping nixpkgs moves Signal to `%s`, restoring **%s days** of runway. The `home-manager` and `microvm` inputs move with it: both `follows` nixpkgs, and both break evaluation when left behind a large nixpkgs jump.\n\n' \
+                "$NEW_VERSION" "$NEW_DAYS"
+              printf 'Note that this rewrites the entire `nixpkgs` pin, not just Signal — it is not a trivial bump. The full CI matrix applies and this PR deliberately does **not** enable auto-merge. Review the CI results, then merge by hand.\n'
+            } > "$body_file"
+            gh pr create \
+              --head "$branch" \
+              --base main \
+              --title "flake: bump nixpkgs — signal-desktop ${OLD_VERSION} -> ${NEW_VERSION}" \
+              --body-file "$body_file"
+            pr_number=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')
+          fi
+
+          # close+reopen to fire pull_request events on a workflow-token PR.
+          gh pr close "$pr_number" --comment 'closing to refresh CI triggers'
+          gh pr reopen "$pr_number"
+
+      # Runway is short but no PR could be opened — nixpkgs simply has
+      # nothing newer. Distinguish "getting close, retry next Monday"
+      # from "Signal is broken RIGHT NOW and no bump can fix it": the
+      # latter must fail the job, because a green scheduled run is
+      # indistinguishable from no problem at all, and a green run while
+      # the user's Signal refuses to connect is the exact failure this
+      # workflow was written to prevent.
+      #
+      # No `always()`: if an earlier step errored the job is already red
+      # and this would only add a confusing second failure.
+      - name: Report short runway that no bump could fix
+        if: steps.runway.outputs.needs_bump == 'true' && steps.bump.outputs.changed != 'true'
+        env:
+          DAYS_LEFT: ${{ steps.runway.outputs.days_left }}
+          VERSION: ${{ steps.runway.outputs.old_version }}
+        run: |
+          set -euo pipefail
+          if [ "$DAYS_LEFT" -le 0 ]; then
+            echo "::error::signal-desktop ${VERSION} is ALREADY EXPIRED (${DAYS_LEFT} days) and nixpkgs has no newer build — Signal will refuse to connect until upstream ships one. Check https://github.com/NixOS/nixpkgs/commits/nixos-unstable/pkgs/by-name/si/signal-desktop"
+            exit 1
+          fi
+          echo "::warning::signal-desktop ${VERSION} has ${DAYS_LEFT} days left but nixpkgs has no newer build yet — retrying next Monday."
