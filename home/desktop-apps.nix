@@ -26,6 +26,7 @@
     tor-browser
     gnupg          # gpg CLI; gpg-agent is enabled via programs.gnupg.agent in modules/nixos/desktop.nix
     seahorse       # GTK key manager (PGP + SSH); discoverable via Cinnamon menu as "Passwords and Keys"
+    claude-desktop # Anthropic official Linux app repackaged via aaddrick/claude-desktop-debian overlay (flake input)
     # cursor: package name in nixpkgs is `code-cursor`. Re-add as
     #   code-cursor # rarely used but kept (drift-scan 2026-04-19)
     # if Cursor IDE actually wanted on this host.

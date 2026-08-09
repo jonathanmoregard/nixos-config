@@ -28,6 +28,14 @@
     prose-decorate.url = "github:jonathanmoregard/prose-decorate";
     prose-decorate.inputs.nixpkgs.follows = "nixpkgs";
 
+    # Anthropic ships an official Linux app since 2026-06-30, but not
+    # via nixpkgs. `aaddrick/claude-desktop-debian` repackages the
+    # upstream Linux app as `.deb`/`.rpm`/AppImage plus a Nix flake
+    # with an `overlays.default` exposing `pkgs.claude-desktop` and
+    # `pkgs.claude-desktop-fhs`. Tracking `main`; flake.lock pins.
+    claude-desktop.url = "github:aaddrick/claude-desktop-debian";
+    claude-desktop.inputs.nixpkgs.follows = "nixpkgs";
+
     # microvm.nix — qemu+KVM microvm host module. Tracking `main`
     # because the most recent tagged release (v0.5.0, 2024-04) calls
     # `pkgs.writeReferencesToFile` which has been removed in current
@@ -39,7 +47,7 @@
   };
 
   outputs = { self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
-              tts-tool, substack-url-tool, prose-decorate, ... }:
+              tts-tool, substack-url-tool, prose-decorate, claude-desktop, ... }:
   let
     linuxSystem = "x86_64-linux";
 
@@ -70,6 +78,7 @@
         (import ./overlays/beeper.nix)
         (import ./overlays/auphonic-cli.nix)
         (import ./overlays/signal-expiry.nix)
+        claude-desktop.overlays.default
         (final: prev: {
           tts-tool = tts-tool.packages.${linuxSystem}.default;
           substack-url-tool = substack-url-tool.packages.${linuxSystem}.default;
