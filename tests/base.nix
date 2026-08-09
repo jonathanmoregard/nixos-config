@@ -263,7 +263,7 @@
         "GOOGLE_OAUTH_CLIENT_ID=$(< /run/agenix/google-oauth-client-id)",
         "GOOGLE_OAUTH_CLIENT_SECRET=$(< /run/agenix/google-oauth-client-secret)",
         "export GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET",
-        'export USER_GOOGLE_EMAIL="jonathan@klaffat.com"',
+        'export USER_GOOGLE_EMAIL="''${USER_GOOGLE_EMAIL:-jonathan@klaffat.com}"',
         "WORKSPACE_MCP_CREDENTIALS_DIR",
         "SSL_CERT_FILE",
         "--tools docs docs_preview forms drive",

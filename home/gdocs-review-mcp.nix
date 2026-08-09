@@ -74,7 +74,10 @@
 
         # Single-user mode: every tool call defaults to this account
         # instead of requiring an explicit user_google_email argument.
-        export USER_GOOGLE_EMAIL="jonathan@klaffat.com"
+        # Same `''${VAR:-default}` shape as WORKSPACE_MCP_CREDENTIALS_DIR
+        # and SSL_CERT_FILE below — a caller testing another account
+        # wins instead of being silently clobbered.
+        export USER_GOOGLE_EMAIL="''${USER_GOOGLE_EMAIL:-jonathan@klaffat.com}"
 
         # Where the refresh-token JSON lives. Must stay stable across
         # deploys — a different path means a fresh consent flow.
