@@ -272,6 +272,28 @@
             f"gdocs-review-mcp wrapper missing {marker!r}:\n{gdocs_wrapper}"
         )
 
+    # …but a substring match on the intended `--tools` line cannot see
+    # what gets APPENDED to it, so assert the tool surface can't be
+    # widened by running the real wrapper. main.py's `--tools` is
+    # argparse `nargs="*"` over a choices list and the parser declares
+    # no positionals, so a single extra word used to be folded into the
+    # service set: `gdocs-review-mcp gmail` registered the Gmail tools,
+    # send_gmail_message included (measured on dellan via the MCP
+    # protocol: 50 tools -> 64). The wrapper must refuse arguments
+    # outright, and must do so before it reads agenix or execs the
+    # server — restoring a `"$@"` passthrough fails this.
+    gdocs_rc, gdocs_out = dellan.execute(
+        "su - jonathan -c 'gdocs-review-mcp gmail' 2>&1"
+    )
+    assert gdocs_rc == 64, (
+        f"gdocs-review-mcp accepted a caller-supplied positional "
+        f"(exit {gdocs_rc}, expected 64) — argv can still widen "
+        f"--tools:\n{gdocs_out}"
+    )
+    assert "refusing caller-supplied arguments" in gdocs_out, (
+        f"gdocs-review-mcp did not refuse the extra argument:\n{gdocs_out}"
+    )
+
     # The two OAuth values must never be baked into the world-readable
     # Nix store — they may only ever arrive via the agenix decrypt paths.
     # Any other assignment shape (a literal, a Nix-interpolated value) is

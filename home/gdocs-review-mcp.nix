@@ -35,6 +35,22 @@
       name = "gdocs-review-mcp";
       runtimeInputs = [ pkgs.uv ];
       text = ''
+        # The enabled service set is FIXED, and nothing a caller passes
+        # may widen it. `--tools` in main.py is argparse `nargs="*"`
+        # over `choices=VALID_SERVICES`, and the parser declares no
+        # positionals — so any argument that reaches it is greedily
+        # folded into the service list. Forwarding `"$@"` here meant
+        # `gdocs-review-mcp gmail` registered the Gmail tools too
+        # (measured on dellan: 50 tools -> 64, including
+        # send_gmail_message). Claude Code invokes this wrapper with an
+        # empty args list, so refusing arguments costs nothing and
+        # closes the hole; silently dropping them would hide misuse.
+        if [ "$#" -gt 0 ]; then
+          echo "gdocs-review-mcp: refusing caller-supplied arguments ($*)." >&2
+          echo "gdocs-review-mcp: the service set is fixed at 'docs docs_preview forms drive'." >&2
+          exit 64
+        fi
+
         # Read raw-value secrets from agenix decrypt paths. The `.age`
         # files contain ONLY the value (no `GOOGLE_OAUTH_CLIENT_ID=`
         # prefix), so `source` would mis-interpret line 1 as a shell
@@ -70,7 +86,7 @@
         # relative to the working directory.
         exec uv run --directory "$GDOCS_PROJECT" \
             python main.py --transport stdio --single-user \
-            --tools docs docs_preview forms drive "$@"
+            --tools docs docs_preview forms drive
       '';
     })
   ];
