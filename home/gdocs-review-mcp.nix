@@ -58,6 +58,18 @@
         # trailing newline — exactly what we want as an env var value.
         GOOGLE_OAUTH_CLIENT_ID=$(< /run/agenix/google-oauth-client-id)
         GOOGLE_OAUTH_CLIENT_SECRET=$(< /run/agenix/google-oauth-client-secret)
+
+        # errexit covers a MISSING decrypt path, but an empty one reads
+        # as the empty string and exports cleanly — the server then
+        # starts and only fails much later, at the next consent
+        # round-trip, with "OAuth client credentials not found". Fail
+        # here instead. Never echo the values themselves.
+        if [ -z "$GOOGLE_OAUTH_CLIENT_ID" ] || [ -z "$GOOGLE_OAUTH_CLIENT_SECRET" ]; then
+          echo "gdocs-review-mcp: an OAuth secret under /run/agenix decrypted to an empty value." >&2
+          echo "gdocs-review-mcp: refusing to start — new Google consent grants would fail." >&2
+          exit 78
+        fi
+
         export GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET
 
         # Single-user mode: every tool call defaults to this account
