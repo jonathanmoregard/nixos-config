@@ -177,6 +177,28 @@
     mode = "0400";
   };
 
+  # Google OAuth 2.0 installed-app client credentials for the
+  # gdocs-review-mcp wrapper (home/gdocs-review-mcp.nix). The server
+  # reads GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET from its
+  # process env (auth/oauth_config.py) and needs BOTH present to run a
+  # consent flow — which is what granting a new API scope requires.
+  # Split across two secrets rather than one `KEY=value` env file to
+  # match the euipo-client-{id,secret} precedent above: raw value only,
+  # consumer does `$(< file)` and exports the name itself.
+  # owner=jonathan + mode=0400 because the MCP runs as the user.
+  age.secrets.google-oauth-client-id = {
+    rekeyFile = ../../secrets/google-oauth-client-id.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.google-oauth-client-secret = {
+    rekeyFile = ../../secrets/google-oauth-client-secret.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   # Private half of the SSH keypair the MCP server uses to ssh into the
   # research-agent microvm. Matching public key is plaintext inside
   # modules/nixos/research-agent-microvm.nix as authorized_keys.

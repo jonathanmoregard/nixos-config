@@ -248,6 +248,7 @@ in
     ./claude-skills.nix
     ./research-agent-mcp.nix
     ./futuresearch-gate-mcp.nix
+    ./gdocs-review-mcp.nix
   ];
 
   # Point Gemini-aware tools at the agenix-decrypted key path. Consumers

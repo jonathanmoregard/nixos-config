@@ -248,6 +248,56 @@
         f"claude-cl-sync-wrap lost the LAKERA_PROJECT_ID export:\n{cl_sync_txt}"
     )
 
+    # ── gdocs-review-mcp wrapper (home/gdocs-review-mcp.nix) ──
+    # Claude Code spawns this by bare name from ~/.claude.json, so it must
+    # resolve on jonathan's PATH. The server can only run a NEW OAuth
+    # consent — which is what enabling the Forms scopes requires — when
+    # GOOGLE_OAUTH_CLIENT_ID/SECRET are in its process env; the whole
+    # point of the wrapper is supplying them from agenix at exec time.
+    # Assert on the rendered wrapper because the runtime path needs live
+    # Google credentials and network, neither of which exist in the VM.
+    gdocs_wrapper = dellan.succeed(
+        "su - jonathan -c 'cat $(command -v gdocs-review-mcp)'"
+    )
+    for marker in [
+        "GOOGLE_OAUTH_CLIENT_ID=$(< /run/agenix/google-oauth-client-id)",
+        "GOOGLE_OAUTH_CLIENT_SECRET=$(< /run/agenix/google-oauth-client-secret)",
+        "export GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET",
+        'export USER_GOOGLE_EMAIL="jonathan@klaffat.com"',
+        "WORKSPACE_MCP_CREDENTIALS_DIR",
+        "SSL_CERT_FILE",
+        "--tools docs docs_preview forms drive",
+    ]:
+        assert marker in gdocs_wrapper, (
+            f"gdocs-review-mcp wrapper missing {marker!r}:\n{gdocs_wrapper}"
+        )
+
+    # The two OAuth values must never be baked into the world-readable
+    # Nix store — they may only ever arrive via the agenix decrypt paths.
+    # Any other assignment shape (a literal, a Nix-interpolated value) is
+    # the failure this guards.
+    for var in ["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"]:
+        slug = var.lower().replace("_", "-")
+        assigns = [
+            ln.strip() for ln in gdocs_wrapper.splitlines()
+            if ln.strip().startswith(f"{var}=")
+        ]
+        assert assigns == [f"{var}=$(< /run/agenix/{slug})"], (
+            f"{var} is assigned from something other than its agenix path "
+            f"(secret leaked into the store?): {assigns!r}"
+        )
+
+    # …and those agenix paths only exist if the host actually declares
+    # the secrets. agenix renders every declared secret name into the
+    # system activation script, so this catches a wrapper wired to a
+    # decrypt path nothing populates.
+    activate = dellan.succeed("cat /run/current-system/activate")
+    for secret in ["google-oauth-client-id", "google-oauth-client-secret"]:
+        assert secret in activate, (
+            f"age.secrets.{secret} not wired into system activation — "
+            f"/run/agenix/{secret} would never exist"
+        )
+
     # ── IPU6 camera self-heal watchdog (modules/nixos/laptop.nix) ──
     # The real recovery can't be modelled in a VM (no OV02C10 sensor /
     # IVSC), so — like the kindle udev rule above — this asserts the
