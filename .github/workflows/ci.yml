@@ -456,9 +456,14 @@ jobs:
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
           primary-key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/*.nix') }}
+          # Lock-scoped prefixes only. A bare `nix-store-${{ runner.os }}-`
+          # fallback matches a store built from a *different* flake.lock,
+          # whose paths the new closure cannot reuse — both generations
+          # then have to fit in the 59G /nix loop from mount-nix-loop.sh,
+          # and they don't. Restoring nothing on a lock bump costs one
+          # cold build (~35G, fits); restoring the wrong store is fatal.
           restore-prefixes-first-match: |
             nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
-            nix-store-${{ runner.os }}-
           # `8G` is parsed as binary (8 * 2^30 bytes ≈ 8.59 GB decimal)
           # by the action's parseNixGcMax — see src/utils/inputs.ts.
           gc-max-store-size-linux: 8G
@@ -593,9 +598,10 @@ jobs:
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
           primary-key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/*.nix') }}
+          # Lock-scoped only — see the build-dellan block for why a bare
+          # runner.os fallback overflows the /nix loop.
           restore-prefixes-first-match: |
             nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
-            nix-store-${{ runner.os }}-
           save: false
       # cachix remains the secondary substituter: it covers paths the
       # GHA cache didn't have (e.g. brand-new VM-specific closure) and
