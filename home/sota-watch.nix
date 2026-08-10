@@ -18,9 +18,13 @@
 # Second unit — `sota-watch-refresh-roster` — refreshes the AI power-
 # users roster from the source Google Sheet ahead of the research
 # runner (fires at 06:47 daily so the 07:37 research pass sees the
-# latest roster). Fully deterministic: HTTPS GET → CSV parse → git
-# commit only if content actually changed. No AI, no MCP, no
-# credentials — the sheet is publicly viewable via its CSV export URL.
+# latest roster). Fully deterministic: HTTPS GET → CSV parse → write
+# the rendered file, only if content actually changed. No AI, no MCP,
+# no credentials — the sheet is publicly viewable via its CSV export
+# URL. Nothing is committed: as of 2026-08-10 the sota-watch repo keeps
+# its watchlist, config and research output out of git entirely (the
+# repo is public and holds the tool, not the data), so the refresh
+# writes to an ignored path and stops there.
 # Same guard-path semantics: missing runner script → log skip + exit 0.
 #
 # OnFailure notification: the runner sat red for 11 days (2026-07-17 →
