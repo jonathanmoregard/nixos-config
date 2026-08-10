@@ -285,8 +285,20 @@ in
     0 */6 * * * /home/jonathan/.claude/repo-autosync-data/token-optimizer/wrapper.sh
     */30 6-22 * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/habit-tracker.py >> /home/jonathan/.claude/logs/habit-tracker.log 2>&1
     */30 * * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/sunset-walk-tracker.py >> /home/jonathan/.claude/logs/sunset-walk-tracker.log 2>&1
-    37 15 * * * /home/jonathan/Repos/superpowers/sync-agent.sh >> /home/jonathan/Repos/superpowers/sync.log 2>&1
+    # superpowers is a PUBLIC fork of obra/superpowers and gitignores
+    # sync-agent.sh on purpose — local automation must not land in the
+    # tree or leak into an upstream PR. The previous line pointed at an
+    # in-repo copy that consequently did not exist, so every run since
+    # logged `No such file or directory` and synced nothing. The canonical
+    # script now takes a SYNC_REPO override so it can sync a repo it does
+    # not live inside; nothing needs to exist in the public tree.
+    37 15 * * * SYNC_REPO=/home/jonathan/Repos/superpowers /home/jonathan/.claude/skills/repo-autosync/sync-agent.sh >> /home/jonathan/Repos/superpowers/sync.log 2>&1
     11 16 * * * /home/jonathan/Repos/aggregator/sync-agent.sh >> /home/jonathan/Repos/aggregator/sync.log 2>&1
+    # ~/.claude auto-commit + push. Declared here rather than via
+    # `crontab -` because installCrontab rewrites the live crontab on
+    # every rebuild — the same trap that killed the RSI reviewer for four
+    # months and swallowed the permission-ledger entry.
+    47 13 * * * /home/jonathan/.claude/sync-agent.sh >> /home/jonathan/.claude/sync.log 2>&1
     # Recursive Self-Improvement daily reviewer. The plugin's install.sh
     # tries to install this via `crontab -e`, which loses on every
     # nixos-rebuild switch (activation hook `installCrontab` below
