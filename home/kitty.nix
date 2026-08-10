@@ -853,7 +853,16 @@ in
     # the `kittyReloadConfig` activation hook below. Keeping the
     # directive anyway covers the direct-edit case (e.g. user fiddling
     # with kitty.conf out-of-band for prototyping).
-    auto_reload_config yes
+    #
+    # NOT a boolean. kitty 0.48 retyped this option from bool to float:
+    # the value is the debounce delay in SECONDS before a changed config
+    # is re-read, and a NEGATIVE value disables auto-reload. The old
+    # `yes` spelling no longer parses, and kitty reports config errors
+    # by popping an `Errors parsing configuration` overlay window rather
+    # than by failing to start — so the breakage is invisible to every
+    # liveness check and just quietly adds a window. 0.1 is upstream's
+    # default; set explicitly so the intent survives future retypings.
+    auto_reload_config 0.1
 
     # === Ghostty-default-dark theme port + matching aesthetics ===
     # Source: ghostty-org/ghostty discussions #5390
@@ -1002,7 +1011,7 @@ in
 
   # Send `kitty @ load-config` to every running kitty socket after
   # home-manager finishes activation. Compensates for the fact that
-  # `auto_reload_config yes` (above) does NOT pick up HM's symlink-
+  # `auto_reload_config` (above) does NOT pick up HM's symlink-
   # target swap — kitty's inotify watcher stays bound to the original
   # /nix/store path, which never mutates. Without this hook, every
   # config-change PR (PR #70 ctrl+shift+c xclip fix being the

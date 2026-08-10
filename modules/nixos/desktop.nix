@@ -48,6 +48,14 @@
   # PATH and the installCrontab activation silently skips.
   services.cron.enable = true;
 
+  # Anthropic's official Linux Claude Desktop app, repackaged for Nix via the
+  # aaddrick/claude-desktop-debian flake overlay (see flake.nix input). Installed
+  # system-wide rather than through home.packages because the ~230 MiB Electron
+  # closure pushes home-manager-jonathan.service past its 5min start timeout
+  # inside the 4 GiB / 2-core CI VM (observed in PR #171 vm-base run 31328041482).
+  # System activation has no equivalent per-service cap.
+  environment.systemPackages = [ pkgs.claude-desktop ];
+
   # Google Chrome: set Google as default search engine (recommended, user can override)
   environment.etc."opt/google/chrome/policies/recommended/search.json" = {
     text = builtins.toJSON {

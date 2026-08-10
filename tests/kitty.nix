@@ -81,6 +81,52 @@ let
     fi
     echo "Phase A OK: TUI-wrapped 5-row payload unwrapped to original single line"
   '';
+
+  # Config-parse probe, run through `kitty +runpy` so the check uses
+  # kitty's OWN loader (and therefore the deployed kitty version's
+  # notion of every option's type) rather than a reimplementation.
+  #
+  # MUST call the raw kitty binary. `/etc/profiles/per-user/jonathan/
+  # bin/kitty` is the session-restoring bash wrapper from home/kitty.nix
+  # (the test asserts as much a few lines up); handed `+runpy` it does
+  # not pass the argument through — it proceeds to open a terminal and
+  # blocks until the 3600s test timeout.
+  configParseProbe = pkgs.writeShellScript "vm-kitty-config-parse-probe" ''
+    set -euo pipefail
+    # Bounded so a future hang fails the lane in a minute with a clear
+    # rc=124 instead of burning the whole test timeout.
+    exec ${pkgs.coreutils}/bin/timeout 60 \
+      ${pkgs.kitty}/bin/kitty +runpy "$(cat ${configParseProbePy})"
+  '';
+
+  # Kept in a writeText and passed as `"$(cat …)"` rather than inlined:
+  # Python is indentation-sensitive and an embedded multi-line block
+  # fights the surrounding `''` indent-strip — the same trap documented
+  # above testCopyPipeline. The config path arrives via $KITTY_CONF to
+  # keep the shell quoting flat.
+  configParseProbePy = pkgs.writeText "vm-kitty-config-parse-probe.py" ''
+    import os
+    import sys
+
+    from kitty.config import load_config
+
+    bad = []
+    load_config(os.environ["KITTY_CONF"], accumulate_bad_lines=bad)
+    for b in bad:
+        print(
+            f"kitty.conf line {b.number}: {b.line!r} -> {b.exception}",
+            file=sys.stderr,
+        )
+    if bad:
+        print(
+            f"FAIL: kitty rejected {len(bad)} config line(s). kitty starts "
+            "anyway and shows an error overlay window, so this would "
+            "otherwise only surface as an off-by-N window count.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print("config parses clean under the deployed kitty")
+  '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
   name = "vm-kitty";
@@ -162,11 +208,29 @@ in
     dellan.succeed(
         f"grep -qE '^paste_actions .*quote-urls-at-prompt' {kitty_conf}"
     )
-    # auto_reload_config yes so config bumps land on a running kitty
+    # auto_reload_config enabled so config bumps land on a running kitty
     # without a restart (e.g. the ctrl+shift+c xclip fix that PR #70
     # shipped but PR #70 deploy left invisible until kitty restarted).
+    #
+    # kitty 0.48 retyped this from a boolean to a float — debounce
+    # SECONDS, with a negative value meaning "disabled". So the
+    # assertion is "set to a non-negative number", which rejects both
+    # the dead `yes` spelling and an accidental `-1`.
     dellan.succeed(
-        f"grep -qE '^auto_reload_config[[:space:]]+yes' {kitty_conf}"
+        f"grep -qE '^auto_reload_config[[:space:]]+[0-9]' {kitty_conf}"
+    )
+
+    # Whole-config parse guard. kitty does NOT fail to start on a bad
+    # directive — it starts fine and pops an `Errors parsing
+    # configuration` OVERLAY WINDOW instead. That is invisible to every
+    # liveness assertion above, and the only downstream symptom is an
+    # inflated window count, which surfaces three phases later as an
+    # inscrutable `length == 4` timeout. (Exactly how the 0.48
+    # auto_reload_config retyping presented: 4 real panes + 3 error
+    # windows = 7.) Ask kitty's own config loader instead, and name the
+    # offending line.
+    dellan.succeed(
+        f"su jonathan -c 'KITTY_CONF={kitty_conf} ${configParseProbe}'"
     )
 
     # Persistence timer is active and scheduled
@@ -227,10 +291,10 @@ in
     # The failure mode being defended: home-manager activation
     # rewrites the kitty.conf SYMLINK target to a new /nix/store path.
     # A running kitty does NOT notice that swap on its own — kitty's
-    # `auto_reload_config yes` inotify watcher binds to the resolved
+    # `auto_reload_config` inotify watcher binds to the resolved
     # store-path inode at launch, and that inode never mutates.
     # Verified empirically (this exact test, see git history): with
-    # only `auto_reload_config yes`, a symlink swap + 10s wait shows
+    # only `auto_reload_config` set, a symlink swap + 10s wait shows
     # no foreground-color change in `kitty @ get-colors`.
     #
     # The actual fix is the `home.activation.kittyReloadConfig` hook
