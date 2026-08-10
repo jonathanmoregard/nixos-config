@@ -1,4 +1,4 @@
-{ config, ... }:
+{ config, pkgs, ... }:
 {
   imports = [
     ./hardware-configuration.nix
@@ -222,6 +222,12 @@
     mode = "0400";
   };
 
+  # `add-secret` inserts new `age.secrets.<name>` blocks immediately
+  # ABOVE this marker. Do not remove — the tool refuses to insert
+  # without it. See home/add-secret.nix + skill doc
+  # home/claude-skills/nixos-agenix-secret/SKILL.md.
+  # add-secret:insert-here
+
   # ---------------------------------------------------------------------
   # research-agent microvm — persisted state.
   #
@@ -274,4 +280,18 @@
   };
 
   services.claudeAgentUsers.enable = true;    # claude-agent-N users
+
+  # ---------------------------------------------------------------------
+  # Host-level tools on PATH.
+  #
+  # `add-secret <name>` — one-command wrapper for the agenix-rekey add
+  # flow (host-file edit → encrypt → rekey → commit → PR). See
+  # home/add-secret.nix + home/claude-skills/nixos-agenix-secret/SKILL.md.
+  # Smoke-tested via checks.x86_64-linux.add-secret-smoke; the smoke
+  # harness asserts the store path here matches the one it tested
+  # (drift gate).
+  # ---------------------------------------------------------------------
+  environment.systemPackages = [
+    (import ../../home/add-secret.nix { inherit pkgs; })
+  ];
 }

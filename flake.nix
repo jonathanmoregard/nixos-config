@@ -184,6 +184,31 @@
             .home-manager.users.jonathan
             .systemd.user.services.nixos-worktree-sweep.Service.ExecStart;
         };
+        # Not a VM lane: runtime-invocation harness for `add-secret`
+        # (home/add-secret.nix). Exercises name validation, worktree
+        # preflight, dup-refuse, happy-path insertion, and KEY=VALUE
+        # stripping under TEST_MODE=1 (which skips the network / eval /
+        # gh steps that a nix sandbox can't run). Drift-gated: pulls
+        # the add-secret derivation out of dellan's
+        # environment.systemPackages and asserts its store path equals
+        # the one we smoke. If hosts/dellan swaps it for anything else,
+        # the check fails.
+        # See tests/add-secret-smoke.nix for what is NOT covered here.
+        add-secret-smoke =
+          let
+            addSecretPkg = import ./home/add-secret.nix { pkgs = pkgsLinux; };
+            dellanPkgs = self.nixosConfigurations.dellan.config
+              .environment.systemPackages;
+            matches = builtins.filter
+              (p: (p.name or "") == "add-secret") dellanPkgs;
+          in
+            if matches == []
+            then throw "add-secret not on dellan's PATH — did environment.systemPackages get pruned?"
+            else import ./tests/add-secret-smoke.nix {
+              pkgs = pkgsLinux;
+              inherit addSecretPkg;
+              deployedBin = "${builtins.head matches}/bin/add-secret";
+            };
         # Not a VM lane: runtime-invocation harness for the Signal build-
         # expiry probe (overlays/signal-expiry.nix). Drives the deployed
         # `check-signal-expiry` via its `--asar` form against crafted
@@ -325,9 +350,15 @@
     # .github/workflows/update-signal.yml, which bumps nixpkgs when the
     # runway gets short. See overlays/signal-expiry.nix for why this
     # measures nixpkgs staleness instead of repackaging Signal.
+    #
+    # `add-secret <name>` — one-command wrapper for the agenix-rekey add
+    # flow (host-file edit → encrypt → rekey → commit → PR). Deployed on
+    # dellan's PATH via environment.systemPackages in hosts/dellan/default.nix;
+    # smoke-tested via checks.x86_64-linux.add-secret-smoke.
     packages.${linuxSystem} = {
       update-beeper = pkgsLinux.beeper-update;
       check-signal-expiry = pkgsLinux.signal-expiry-check;
+      add-secret = import ./home/add-secret.nix { pkgs = pkgsLinux; };
     };
 
     # agenix-rekey CLI plumbing. Exposes:
