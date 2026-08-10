@@ -262,7 +262,9 @@ in
     ./calibre-plugins.nix
     ./ghostty.nix
     ./kitty.nix
+    ./git-hooks.nix
     ./autodoro.nix
+    ./claude-mcp-sync.nix
     ./drift-analyzer.nix
     ./sota-watch.nix
     ./worktree-sweep.nix
