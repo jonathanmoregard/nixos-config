@@ -178,6 +178,30 @@
         "permission-ledger/run-evaluate.sh" in crontab_src
     ), f"permission-ledger run-evaluate.sh reference missing from crontab source:\n{crontab_src}"
 
+    # repo-autosync entries — third instance of the same trap. The
+    # ~/.claude sync was installed with `crontab -` on 2026-08-08 and would
+    # have survived exactly until the next rebuild, like the RSI reviewer
+    # (four months dead) and the permission-ledger evaluator above.
+    assert (
+        "/home/jonathan/.claude/sync-agent.sh" in crontab_src
+    ), f"~/.claude repo-autosync cron entry missing from crontab source:\n{crontab_src}"
+
+    # superpowers is a PUBLIC fork of obra/superpowers and gitignores
+    # sync-agent.sh so local automation cannot leak upstream. The in-repo
+    # path therefore does not exist: pointing cron at it logged
+    # `No such file or directory` on every run and synced nothing. It must
+    # be driven through the canonical script via the SYNC_REPO override.
+    assert (
+        "SYNC_REPO=/home/jonathan/Repos/superpowers" in crontab_src
+    ), f"superpowers autosync must run via the SYNC_REPO override:\n{crontab_src}"
+    assert not any(
+        "/home/jonathan/Repos/superpowers/sync-agent.sh" in c
+        for c in [_cron_command(l) for l in crontab_src.splitlines()]
+    ), (
+        "superpowers gitignores sync-agent.sh (public fork), so this path "
+        f"cannot exist; it must not come back as a live entry:\n{crontab_src}"
+    )
+
     # modules/nixos/kindle.nix installs a udev rule that stops
     # gvfs-mtp-volume-monitor from claiming the kindle USB interface
     # (calibre needs libusb). Rule clears ID_MTP_DEVICE so
