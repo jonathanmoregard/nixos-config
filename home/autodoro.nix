@@ -11,16 +11,15 @@
 #      crashes inside python with "Namespace Gtk not available" /
 #      "Couldn't recognize the image file format".
 #
-#   2. the *reload trigger* — a `pre-push` git hook installed into
-#      the user's global `~/.config/git/hooks/` dir. Fires only on
-#      `git push` from the autodoro repo and restarts the service.
-#      Replaces the older `.githooks/post-push` flow, which silently
-#      no-op'd: (a) `post-push` is not a real git hook (git only
-#      defines `pre-push`), and (b) the user's global
+#   2. the *reload trigger* — one entry in the shared pre-push git
+#      hook (home/git-hooks.nix owns the file at
+#      ~/.config/git/hooks/pre-push and dispatches by repo toplevel).
+#      Fires only on `git push` from the autodoro repo and restarts
+#      the service. Replaces the older `.githooks/post-push` flow,
+#      which silently no-op'd: (a) `post-push` is not a real git hook
+#      (git only defines `pre-push`), and (b) the user's global
 #      `core.hooksPath=~/.config/git/hooks` overrode the per-repo
-#      `.githooks/` dir anyway. The hook lives in the global dir
-#      (matching that override) and guards by repo toplevel so it's
-#      a cheap no-op for pushes from any other repo.
+#      `.githooks/` dir anyway.
 let
   pythonEnv = pkgs.python3.withPackages (ps: with ps; [ pygobject3 ]);
 
@@ -125,26 +124,19 @@ in
     };
   };
 
-  # Global pre-push hook → restart autodoro.service after a push from
-  # ~/Repos/autodoro. Lives in the global hooks dir because that's
-  # where the user's `core.hooksPath` (set in home/jonathan.nix)
-  # points; any per-repo `.githooks/` would be silently shadowed.
-  # Guard by `git rev-parse --show-toplevel` so pushes from every
-  # other repo are a cheap no-op.
-  #
-  # Fires synchronously inside `git push` and exits 0 unconditionally
-  # so a systemd error does not block the push itself. The restart
-  # is fire-and-forget — by the time the network push completes the
-  # service is already on the new code.
-  home.file.".config/git/hooks/pre-push" = {
-    executable = true;
-    text = ''
-      #!/usr/bin/env bash
-      # Run from any git push; this dispatches on the current repo.
-      if [ "$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null)" = "$HOME/Repos/autodoro" ]; then
+  # Register a pre-push dispatch: restart autodoro.service after a
+  # push from ~/Repos/autodoro. The shared hook (see home/git-hooks.nix)
+  # already lives in the user's core.hooksPath and dispatches by repo
+  # toplevel; here we just contribute one entry. Restart is
+  # fire-and-forget under `|| true` so a systemd error never blocks
+  # the push itself.
+  homeGitHooks.prePush = [
+    {
+      name = "autodoro-reload";
+      repoPath = "$HOME/Repos/autodoro";
+      body = ''
         ${pkgs.systemd}/bin/systemctl --user restart autodoro.service || true
-      fi
-      exit 0
-    '';
-  };
+      '';
+    }
+  ];
 }
