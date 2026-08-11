@@ -21,6 +21,47 @@
     dellan.wait_for_unit("home-manager-jonathan.service")
     # systemd --user for jonathan comes up via linger
     dellan.wait_for_unit("default.target", "jonathan")
+
+    # home-manager-jonathan TimeoutStartSec floor.
+    #
+    # systemd's default TimeoutStartSec is 5min; jonathan's HM closure
+    # activation on the 4 GiB / 2-core CI VM has repeatedly hit that
+    # ceiling (PR #171 moved claude-desktop to environment.systemPackages
+    # to fit; PR #175 vm-autodoro re-hit at 316s). modules/common.nix
+    # pins the ceiling at 20min. This assertion guards against the
+    # override silently dropping — either via a bad merge or a module
+    # that overwrites the whole serviceConfig.
+    #
+    # Pattern mirrors tests/auto-deploy.nix (which grep-locks
+    # nixos-deploy.service's TimeoutStartSec=60min against the same
+    # incident class).
+    dellan.succeed(
+        "systemctl cat home-manager-jonathan.service "
+        "| grep -q 'TimeoutStartSec=20min'"
+    )
+    # Belt-and-braces floor check: parse systemd's normalised value and
+    # assert >= 15min (900s). Catches an override that keeps a
+    # `TimeoutStartSec=` line but lowers it below the floor. systemctl
+    # show renders "20min" for 1200s, "1h" for 3600s, "infinity" for
+    # unlimited — accept any of those; reject anything below 15min.
+    raw = dellan.succeed(
+        "systemctl show -P TimeoutStartUSec home-manager-jonathan.service"
+    ).strip()
+    def _parse_systemd_time(s):
+        if s == "infinity":
+            return float("inf")
+        import re
+        units = {"h": 3600, "min": 60, "s": 1, "ms": 0.001, "us": 0.000001}
+        total = 0.0
+        for m in re.finditer(r"(\d+)(h|min|ms|us|s)", s):
+            total += int(m.group(1)) * units[m.group(2)]
+        return total
+    seconds = _parse_systemd_time(raw)
+    assert seconds >= 900, (
+        f"home-manager-jonathan TimeoutStartSec={raw!r} ({seconds}s) is below "
+        f"the 15min floor — the modules/common.nix override was dropped or "
+        f"lowered. See PR #175 for the incident context."
+    )
     # X session must come up too — every lane inherits autoLogin from
     # tests/lib/common.nix, so a LightDM regression should fail here
     # rather than masquerade as a kitty/desktop-lane failure later.

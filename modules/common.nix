@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
 {
   # NB: `nixpkgs.config.allowUnfree` and `nixpkgs.overlays` live in
   # flake.nix at the pkgs-construction level. Setting them here would
@@ -73,6 +73,23 @@
     direnv         # per-directory env vars
     hyperfine      # CLI benchmarking
   ];
+
+  # home-manager itself sets home-manager-jonathan.service's
+  # TimeoutStartSec="5m" (systemd's default). On CI's nested-KVM VM
+  # (4 GiB / 2-core before this raise; see tests/lib/common.nix),
+  # jonathan's HM activation sits at the knife's edge — PR #171 moved
+  # `claude-desktop` out of `home.packages` to fit (home/desktop-apps.nix),
+  # then PR #175's `vm-autodoro` still tripped it at 316s.
+  #
+  # `lib.mkForce` because home-manager's module ships the "5m" definition
+  # as a normal-priority option; a plain assignment collides.
+  #
+  # Applies to both dellan and the vm host (both import this file via
+  # flake.nix), and to the mkTest node (which imports
+  # hosts/dellan/default.nix + this file). Drift-asserted in
+  # tests/base.nix: a >= 15min floor + a hard grep for "20min".
+  systemd.services.home-manager-jonathan.serviceConfig.TimeoutStartSec =
+    lib.mkForce "20min";
 
   nix.settings = {
     experimental-features = [ "nix-command" "flakes" ];
