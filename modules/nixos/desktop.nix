@@ -50,10 +50,18 @@
 
   # Anthropic's official Linux Claude Desktop app, repackaged for Nix via the
   # aaddrick/claude-desktop-debian flake overlay (see flake.nix input). Installed
-  # system-wide rather than through home.packages because the ~230 MiB Electron
-  # closure pushes home-manager-jonathan.service past its 5min start timeout
-  # inside the 4 GiB / 2-core CI VM (observed in PR #171 vm-base run 31328041482).
-  # System activation has no equivalent per-service cap.
+  # system-wide rather than through home.packages.
+  #
+  # HISTORY: originally moved here because the ~230 MiB Electron closure pushed
+  # home-manager-jonathan.service past systemd's default 5min TimeoutStartSec
+  # inside the 4 GiB / 2-core CI VM (PR #171 vm-base run 31328041482, PR #175
+  # vm-autodoro run 31428xxx). That 5min ceiling has since been raised to 20min
+  # in modules/common.nix + drift-asserted in tests/base.nix, so this file is
+  # no longer FORCED to hold claude-desktop by timeout pressure. It still lives
+  # here because a shared GUI application legitimately belongs in system scope;
+  # if we ever gain a second user (agent user or otherwise) they'll want it too.
+  # Rule of thumb: use environment.systemPackages only when the package genuinely
+  # benefits from system scope, not just to shave HM activation time.
   environment.systemPackages = [ pkgs.claude-desktop ];
 
   # Google Chrome: set Google as default search engine (recommended, user can override)
