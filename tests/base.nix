@@ -592,5 +592,62 @@
         "guard-path 'skipping' marker missing from refresh-roster.log:\n"
         f"{refresh_log}"
     )
+
+    # ── virtualisation-desktop (modules/nixos/virtualisation-desktop.nix) ──
+    # Full libvirt/QEMU stack for desktop-grade guest VMs (Windows,
+    # other-distro onboarding tests). Runtime cannot be exercised in
+    # nixosTest — the test VM has no nested-KVM and libvirtd's default
+    # network needs iptables/NAT scaffolding the framework doesn't
+    # model — so we assert the wiring: unit loaded, jonathan in the
+    # groups needed to drive libvirt without sudo, and the `win-vm`
+    # wrapper resolves on PATH. Runtime boot of Windows itself is
+    # verified on real dellan post-deploy via `win-vm fetch-iso <url>`
+    # + `win-vm create` + `win-vm view`.
+    dellan.succeed("systemctl cat libvirtd.service >/dev/null")
+    # jonathan must be in libvirtd + kvm — without these the wrapper's
+    # `require_group` guard fails and every virsh call needs sudo.
+    groups = dellan.succeed("id -nG jonathan").split()
+    for g in ["libvirtd", "kvm"]:
+        assert g in groups, \
+            f"jonathan missing from '{g}' group; libvirt access broken. groups={groups}"
+    # win-vm on PATH — the CLI itself. Resolves at HM login shell
+    # (system-wide package), so plain `command -v` under su - is enough.
+    dellan.succeed("su - jonathan -c 'command -v win-vm'")
+    # swtpm on PATH — Win11 install requirement for the TPM 2.0 device.
+    # OVMF's presence is implicitly asserted by successful eval of
+    # virtualisation.libvirtd.qemu.ovmf.packages, so we don't check
+    # its firmware descriptor path (which drifts across nixpkgs).
+    dellan.succeed("command -v swtpm")
+    # /var/lib/libvirt/images must exist with group=libvirtd so
+    # `win-vm fetch-iso` can drop ISOs in without sudo.
+    img_perms = dellan.succeed("stat -c '%a %U %G' /var/lib/libvirt/images").strip()
+    assert img_perms == "770 root libvirtd", (
+        f"/var/lib/libvirt/images perms expected '770 root libvirtd', got {img_perms!r}"
+    )
+
+    # win-vm wrapper — runtime invocation of the case-dispatch layer +
+    # adversarial argument handling. Skill mandates this for any module
+    # shipping writeShellApplication: eval + PATH check don't prove the
+    # script's error paths surface cleanly. The libvirt-touching
+    # subcommands (create, view, start) can't run here — the CI VM
+    # cannot nest KVM to boot a Windows guest — but the guard rails
+    # around them still must.
+    #
+    # help: prints usage + exits 0. `2>&1` because the wrapper writes
+    # usage to stderr (writeShellApplication convention).
+    help_out = dellan.succeed("su - jonathan -c 'win-vm help 2>&1'")
+    for marker in ["fetch-iso", "create", "view", "microsoft.com/software-download/windows11"]:
+        assert marker in help_out, f"win-vm help lost '{marker}':\n{help_out}"
+    # unknown subcommand: usage to stderr + non-zero exit.
+    bogus = dellan.fail("su - jonathan -c 'win-vm nope-not-a-subcommand 2>&1'")
+    assert "unknown subcommand" in bogus.lower() or "usage" in bogus.lower(), (
+        f"win-vm bogus-subcommand should print usage/unknown message:\n{bogus}"
+    )
+    # fetch-iso without URL: dies with the MS download hint so a user
+    # who forgets the arg gets a fix, not a hang.
+    no_url = dellan.fail("su - jonathan -c 'win-vm fetch-iso 2>&1'")
+    assert "microsoft.com" in no_url.lower() or "url" in no_url.lower(), (
+        f"win-vm fetch-iso (no arg) should surface the MS URL hint:\n{no_url}"
+    )
   '';
 }

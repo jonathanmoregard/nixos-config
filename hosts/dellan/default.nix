@@ -37,6 +37,12 @@
     ../../modules/nixos/research-agent-microvm.nix
     ../../modules/nixos/research-agent-microvm-healthcheck.nix
 
+    # Desktop libvirt/QEMU stack for full-OS guest VMs (Win11 + other
+    # distros for onboarding-flow testing). Stateful, imperative-VM
+    # sibling to microvm.nix (which is for lightweight NixOS-only
+    # guests declared as flake modules).
+    ../../modules/nixos/virtualisation-desktop.nix
+
     # scraper microvm — sibling to research-agent for JS-rendering
     # crawls. See module header for the trust-boundary rationale.
     ../../modules/nixos/scraper-microvm.nix
