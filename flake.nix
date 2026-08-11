@@ -184,6 +184,14 @@
             .home-manager.users.jonathan
             .systemd.user.services.nixos-worktree-sweep.Service.ExecStart;
         };
+        # Not a VM lane: eval-time guard that no age.secret re-declares a
+        # credential whose real home is elsewhere (see the test's header for
+        # why this is not a VM assertion). Pure eval; instant.
+        secrets-no-dead-credentials = import ./tests/secrets-no-dead-credentials.nix {
+          pkgs = pkgsLinux;
+          declaredSecrets = builtins.attrNames
+            self.nixosConfigurations.dellan.config.age.secrets;
+        };
         # Not a VM lane: runtime-invocation harness for `add-secret`
         # (home/add-secret.nix). Exercises name validation, worktree
         # preflight, dup-refuse, happy-path insertion, and KEY=VALUE

@@ -156,24 +156,11 @@
     group = "users";
     mode = "0400";
   };
-  # TickTick Open API bearer token consumed by the aggregator's ticktick
-  # ingest (~/Repos/aggregator). Same shape as the PAT above: raw token
-  # only, read with `$(< file)`. The token also carries write scope —
-  # TickTick issues no read-only variant — so the aggregator source
-  # refuses to issue any non-GET request as the compensating control.
-  # An empty file is a supported state: the ingest falls back to
-  # CSV-backup-only and skips the API leg without erroring. It currently
-  # holds a single newline — agenix-rekey refuses to write a zero-byte
-  # secret, and the aggregator strips before testing for empty, so
-  # whitespace reads as unpopulated. Populate with:
-  #   EDITOR=nano nix run .#agenix-rekey.x86_64-linux.edit-view -- \
-  #     edit secrets/ticktick-api-token.age
-  age.secrets.ticktick-api-token = {
-    rekeyFile = ../../secrets/ticktick-api-token.age;
-    owner = "jonathan";
-    group = "users";
-    mode = "0400";
-  };
+  # No ticktick-api-token here on purpose. The aggregator's ticktick ingest
+  # reads TICKTICK_ACCESS_TOKEN from ~/.config/todo/env, the same store
+  # ~/.claude/todo/backends/ticktick.py rewrites whenever it refreshes the
+  # OAuth token. An agenix copy would be a snapshot of a moving value.
+  # Enforced by checks.x86_64-linux.secrets-no-dead-credentials.
   # EUIPO OAuth2 credentials for the research-agent's trademark_shim
   # (queries the EU trademark register over its REST API). Both files
   # are empty placeholders until the EUIPO developer-portal
