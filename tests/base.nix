@@ -14,6 +14,80 @@
 #
 # Run: nix build .#checks.x86_64-linux.vm-base -L
 { pkgs, inputs }:
+let
+  # TLS trust-store probe for aggregator-ingest.service.
+  #
+  # Installed as an ExecStart drop-in on the REAL unit, so it runs inside
+  # that unit's own execution environment — [Service] Environment= merged by
+  # systemd, nothing re-derived by hand. The claim under test is not "the
+  # module mentions a variable" but "the process systemd starts can load a
+  # non-empty set of CA certificates", which is precisely what was missing on
+  # 2026-08-15 (unit had no SSL_CERT_FILE; uv's python-build-standalone
+  # CPython falls back to cafile=/etc/ssl/cert.pem, absent on NixOS, and
+  # capath=/etc/ssl/certs, which holds symlinks rather than an OpenSSL hashed
+  # CA dir → zero trusted roots → every HTTPS source reporting
+  # CERTIFICATE_VERIFY_FAILED "self-signed certificate in certificate chain").
+  #
+  # Note the VM's own pkgs.python3 CANNOT reproduce that fallback: it is
+  # compiled with cafile=/etc/ssl/certs/ca-certificates.crt, which NixOS does
+  # provide, so `ssl.create_default_context()` would hold 172 CAs here even
+  # with the fix reverted. That is why the probe reads the environment
+  # variables explicitly and loads the file they name, instead of asserting
+  # on the default context — the latter would be green on a broken unit.
+  #
+  # Kept in a writeText rather than inlined via `python3 -c`: python is
+  # indentation-sensitive and a multi-line block fights the surrounding `''`
+  # indent-strip (same trap documented in tests/kitty.nix).
+  aggregatorCaProbePy = pkgs.writeText "vm-base-aggregator-ca-probe.py" ''
+    import os
+    import ssl
+    import sys
+
+    failures = []
+    paths = {}
+
+    for var in ("SSL_CERT_FILE", "NIX_SSL_CERT_FILE"):
+        value = os.environ.get(var, "")
+        print("[ca-probe] " + var + "=" + (value or "<unset>"))
+        if not value:
+            failures.append(
+                var + " is not set in aggregator-ingest.service's environment"
+            )
+            continue
+        paths[var] = value
+        if not os.path.isfile(value):
+            failures.append(var + "=" + value + " does not exist in the unit's view")
+
+    # Both spellings must name the same bundle. A unit where they disagree is
+    # a unit where half the process tree (openssl consumers) trusts a
+    # different set of roots than the other half (nixpkgs cacert wrappers).
+    if len(paths) == 2 and paths["SSL_CERT_FILE"] != paths["NIX_SSL_CERT_FILE"]:
+        failures.append(
+            "SSL_CERT_FILE and NIX_SSL_CERT_FILE name different bundles: "
+            + paths["SSL_CERT_FILE"] + " vs " + paths["NIX_SSL_CERT_FILE"]
+        )
+
+    # The behavioural half: OpenSSL must actually parse the named file into
+    # CA certificates. A path that exists but is empty, truncated, or a
+    # non-PEM blob loads zero roots and fails exactly like no path at all.
+    cafile = paths.get("SSL_CERT_FILE")
+    if cafile and os.path.isfile(cafile):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(cafile=cafile)
+        loaded = ctx.cert_store_stats()["x509_ca"]
+        print("[ca-probe] x509_ca loaded from " + cafile + ": " + str(loaded))
+        if loaded < 1:
+            failures.append(
+                cafile + " parsed into " + str(loaded) + " CA certificates"
+            )
+
+    for line in failures:
+        print("[ca-probe] FAIL: " + line, file=sys.stderr)
+    if failures:
+        sys.exit(1)
+    print("[ca-probe] OK")
+  '';
+in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
   name = "vm-base";
   testScript = ''
@@ -832,6 +906,79 @@
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user reset-failed aggregator-ingest.service'"
+    )
+
+    # (5) TLS trust store. The unit must hand its process a CA bundle that
+    # OpenSSL can actually parse.
+    #
+    # Regression lock for 2026-08-15: the unit set neither SSL_CERT_FILE nor
+    # NIX_SSL_CERT_FILE, `uv run` supplies a python-build-standalone CPython
+    # whose compiled cafile (/etc/ssl/cert.pem) does not exist on NixOS, and
+    # the run therefore opened every HTTPS connection with ZERO trusted
+    # roots. ticktick — the only source that speaks HTTPS from python's
+    # stdlib — reported it as "self-signed certificate in certificate chain",
+    # which reads as a MITM and is not one. Nothing in this lane asserted the
+    # unit's trust store, which is why a config with no trusted CAs shipped
+    # green; that is the hole this block closes.
+    #
+    # Driven through systemd, ExecStart-only drop-in exactly like (3)/(4), so
+    # the [Service] Environment= block under test is the production one and
+    # the probe observes what the real ingest run would observe. The rest of
+    # the unit is untouched, so an exit-1 from the probe also re-proves the
+    # OnFailure edge — but this run must exit 0.
+    dellan.succeed(
+        "mkdir -p /home/jonathan/.config/systemd/user/aggregator-ingest.service.d && "
+        "printf '[Service]\\nExecStart=\\nExecStart=%s %s\\n' "
+        "'${pkgs.python3}/bin/python3' '${aggregatorCaProbePy}' "
+        "> /home/jonathan/.config/systemd/user/aggregator-ingest.service.d/ca-probe.conf"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user daemon-reload'"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start aggregator-ingest.service; true'"
+    )
+    # Dump before asserting — once the assertion raises, the VM is torn down
+    # and the probe's own diagnosis is the only thing that explains why.
+    agg_ca_log = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u aggregator-ingest.service -n 40 --no-pager' || true"
+    )
+    print("[diag] aggregator-ingest CA probe journal:\n" + agg_ca_log)
+    agg_ca_status = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -P ExecMainStatus aggregator-ingest.service'"
+    ).strip()
+    assert agg_ca_status == "0", (
+        "aggregator-ingest.service does not carry a usable TLS trust store — "
+        "an ingest run would verify every HTTPS certificate against an empty "
+        f"CA set. Probe exited {agg_ca_status!r}; see [ca-probe] FAIL lines "
+        f"in:\n{agg_ca_log}"
+    )
+    assert "[ca-probe] OK" in agg_ca_log, (
+        "the CA probe exited 0 without reaching its success line — the "
+        f"drop-in may not have taken effect:\n{agg_ca_log}"
+    )
+    # Independent of the probe's own arithmetic: the journal must show a
+    # positive CA count, so a probe silently degraded to a no-op cannot pass.
+    agg_ca_counts = _re.findall(r"x509_ca loaded from \S+: (\d+)", agg_ca_log)
+    assert agg_ca_counts and int(agg_ca_counts[-1]) > 0, (
+        "CA probe reported no positive x509_ca count; a bundle that parses "
+        f"into zero roots is indistinguishable from no bundle:\n{agg_ca_log}"
+    )
+
+    dellan.succeed(
+        "rm -rf /home/jonathan/.config/systemd/user/aggregator-ingest.service.d"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user daemon-reload'"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user reset-failed aggregator-ingest.service; true'"
     )
     # Re-arm the timer stopped above. Separate call on purpose: a
     # `VAR=x cmd1; cmd2` prefix scopes VAR to cmd1 only, so a second
