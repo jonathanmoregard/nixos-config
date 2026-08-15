@@ -59,9 +59,16 @@ let
       user = "jonathan";
     };
 
+    # GitHub Actions ubuntu-latest gives 16 GiB / 4 cores. 4 GiB / 2-core
+    # (the prior sizing) had jonathan's HM activation on the knife's edge
+    # of systemd's default 5min TimeoutStartSec — PR #171 moved
+    # claude-desktop out of home.packages to fit, PR #175 vm-autodoro
+    # still tripped it at 316s. modules/common.nix now raises the ceiling
+    # to 20min AND we give the VM more headroom here so the activation
+    # runs faster; leaves ~10 GiB for host + KVM overhead on the runner.
     virtualisation = {
-      memorySize = 4096;
-      cores = 2;
+      memorySize = 6144;
+      cores = 4;
       diskSize = 8192;
     };
   };

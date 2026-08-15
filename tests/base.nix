@@ -21,6 +21,47 @@
     dellan.wait_for_unit("home-manager-jonathan.service")
     # systemd --user for jonathan comes up via linger
     dellan.wait_for_unit("default.target", "jonathan")
+
+    # home-manager-jonathan TimeoutStartSec floor.
+    #
+    # systemd's default TimeoutStartSec is 5min; jonathan's HM closure
+    # activation on the 4 GiB / 2-core CI VM has repeatedly hit that
+    # ceiling (PR #171 moved claude-desktop to environment.systemPackages
+    # to fit; PR #175 vm-autodoro re-hit at 316s). modules/common.nix
+    # pins the ceiling at 20min. This assertion guards against the
+    # override silently dropping — either via a bad merge or a module
+    # that overwrites the whole serviceConfig.
+    #
+    # Pattern mirrors tests/auto-deploy.nix (which grep-locks
+    # nixos-deploy.service's TimeoutStartSec=60min against the same
+    # incident class).
+    dellan.succeed(
+        "systemctl cat home-manager-jonathan.service "
+        "| grep -q 'TimeoutStartSec=20min'"
+    )
+    # Belt-and-braces floor check: parse systemd's normalised value and
+    # assert >= 15min (900s). Catches an override that keeps a
+    # `TimeoutStartSec=` line but lowers it below the floor. systemctl
+    # show renders "20min" for 1200s, "1h" for 3600s, "infinity" for
+    # unlimited — accept any of those; reject anything below 15min.
+    raw = dellan.succeed(
+        "systemctl show -P TimeoutStartUSec home-manager-jonathan.service"
+    ).strip()
+    def _parse_systemd_time(s):
+        if s == "infinity":
+            return float("inf")
+        import re
+        units = {"h": 3600, "min": 60, "s": 1, "ms": 0.001, "us": 0.000001}
+        total = 0.0
+        for m in re.finditer(r"(\d+)(h|min|ms|us|s)", s):
+            total += int(m.group(1)) * units[m.group(2)]
+        return total
+    seconds = _parse_systemd_time(raw)
+    assert seconds >= 900, (
+        f"home-manager-jonathan TimeoutStartSec={raw!r} ({seconds}s) is below "
+        f"the 15min floor — the modules/common.nix override was dropped or "
+        f"lowered. See PR #175 for the incident context."
+    )
     # X session must come up too — every lane inherits autoLogin from
     # tests/lib/common.nix, so a LightDM regression should fail here
     # rather than masquerade as a kitty/desktop-lane failure later.
@@ -177,6 +218,30 @@
     assert (
         "permission-ledger/run-evaluate.sh" in crontab_src
     ), f"permission-ledger run-evaluate.sh reference missing from crontab source:\n{crontab_src}"
+
+    # repo-autosync entries — third instance of the same trap. The
+    # ~/.claude sync was installed with `crontab -` on 2026-08-08 and would
+    # have survived exactly until the next rebuild, like the RSI reviewer
+    # (four months dead) and the permission-ledger evaluator above.
+    assert (
+        "/home/jonathan/.claude/sync-agent.sh" in crontab_src
+    ), f"~/.claude repo-autosync cron entry missing from crontab source:\n{crontab_src}"
+
+    # superpowers is a PUBLIC fork of obra/superpowers and gitignores
+    # sync-agent.sh so local automation cannot leak upstream. The in-repo
+    # path therefore does not exist: pointing cron at it logged
+    # `No such file or directory` on every run and synced nothing. It must
+    # be driven through the canonical script via the SYNC_REPO override.
+    assert (
+        "SYNC_REPO=/home/jonathan/Repos/superpowers" in crontab_src
+    ), f"superpowers autosync must run via the SYNC_REPO override:\n{crontab_src}"
+    assert not any(
+        "/home/jonathan/Repos/superpowers/sync-agent.sh" in c
+        for c in [_cron_command(l) for l in crontab_src.splitlines()]
+    ), (
+        "superpowers gitignores sync-agent.sh (public fork), so this path "
+        f"cannot exist; it must not come back as a live entry:\n{crontab_src}"
+    )
 
     # modules/nixos/kindle.nix installs a udev rule that stops
     # gvfs-mtp-volume-monitor from claiming the kindle USB interface
@@ -478,6 +543,58 @@
         "systemctl --user reset-failed sota-watch.service'"
     )
 
+    # claude-idle-handoff — proactive mission.md writer + opus-5 autofork
+    # for idle Claude Code sessions. Declared in home/claude-services.nix
+    # after four months of the shipped-imperative footgun (RSI reviewer)
+    # — same failure shape: units under ~/.config/systemd/user/ evaporate
+    # on a fresh host. Unit + timer only; the SCRIPT
+    # (~/.claude/scripts/idle-handoff.sh) is deliberately NOT nix-managed
+    # because it iterates hot and lives in the ~/.claude git repo.
+    #
+    # This lane cannot run the real script — it lives outside the VM
+    # closure — so we assert (a) the timer is loaded with the exact
+    # cadence + jitter the design specifies, (b) the service is loaded
+    # with the exact ExecStart the timer will call, and (c) the
+    # resource-shape flags a stray tick can rely on
+    # (Nice=15 / IOSchedulingClass=idle / TimeoutStartSec=180). A
+    # rebuild that silently drops any of these puts the schedule back
+    # in the same 5-min stampede window that motivated the caps.
+    timers = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user list-timers --all'"
+    )
+    assert "claude-idle-handoff.timer" in timers, (
+        "claude-idle-handoff.timer missing from user timer list:\n"
+        f"{timers}"
+    )
+    handoff_timer = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-idle-handoff.timer'"
+    )
+    for marker in [
+        "OnBootSec=5min",
+        "OnUnitActiveSec=5min",
+        "AccuracySec=30s",
+        "Unit=claude-idle-handoff.service",
+    ]:
+        assert marker in handoff_timer, (
+            f"claude-idle-handoff.timer lost '{marker}':\n{handoff_timer}"
+        )
+    handoff_service = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-idle-handoff.service'"
+    )
+    for marker in [
+        "Type=oneshot",
+        "ExecStart=%h/.claude/scripts/idle-handoff.sh",
+        "Nice=15",
+        "IOSchedulingClass=idle",
+        "TimeoutStartSec=",
+    ]:
+        assert marker in handoff_service, (
+            f"claude-idle-handoff.service lost '{marker}':\n{handoff_service}"
+        )
+
     # sota-watch-refresh-roster — parallel unit + timer that refreshes
     # the AI power-users roster from the source Google Sheet ahead of
     # the research runner. Same guard-path shape as sota-watch: missing
@@ -515,6 +632,63 @@
     assert "skipping" in refresh_log, (
         "guard-path 'skipping' marker missing from refresh-roster.log:\n"
         f"{refresh_log}"
+    )
+
+    # ── virtualisation-desktop (modules/nixos/virtualisation-desktop.nix) ──
+    # Full libvirt/QEMU stack for desktop-grade guest VMs (Windows,
+    # other-distro onboarding tests). Runtime cannot be exercised in
+    # nixosTest — the test VM has no nested-KVM and libvirtd's default
+    # network needs iptables/NAT scaffolding the framework doesn't
+    # model — so we assert the wiring: unit loaded, jonathan in the
+    # groups needed to drive libvirt without sudo, and the `win-vm`
+    # wrapper resolves on PATH. Runtime boot of Windows itself is
+    # verified on real dellan post-deploy via `win-vm fetch-iso <url>`
+    # + `win-vm create` + `win-vm view`.
+    dellan.succeed("systemctl cat libvirtd.service >/dev/null")
+    # jonathan must be in libvirtd + kvm — without these the wrapper's
+    # `require_group` guard fails and every virsh call needs sudo.
+    groups = dellan.succeed("id -nG jonathan").split()
+    for g in ["libvirtd", "kvm"]:
+        assert g in groups, \
+            f"jonathan missing from '{g}' group; libvirt access broken. groups={groups}"
+    # win-vm on PATH — the CLI itself. Resolves at HM login shell
+    # (system-wide package), so plain `command -v` under su - is enough.
+    dellan.succeed("su - jonathan -c 'command -v win-vm'")
+    # swtpm on PATH — Win11 install requirement for the TPM 2.0 device.
+    # OVMF's presence is implicitly asserted by successful eval of
+    # virtualisation.libvirtd.qemu.ovmf.packages, so we don't check
+    # its firmware descriptor path (which drifts across nixpkgs).
+    dellan.succeed("command -v swtpm")
+    # /var/lib/libvirt/images must exist with group=libvirtd so
+    # `win-vm fetch-iso` can drop ISOs in without sudo.
+    img_perms = dellan.succeed("stat -c '%a %U %G' /var/lib/libvirt/images").strip()
+    assert img_perms == "770 root libvirtd", (
+        f"/var/lib/libvirt/images perms expected '770 root libvirtd', got {img_perms!r}"
+    )
+
+    # win-vm wrapper — runtime invocation of the case-dispatch layer +
+    # adversarial argument handling. Skill mandates this for any module
+    # shipping writeShellApplication: eval + PATH check don't prove the
+    # script's error paths surface cleanly. The libvirt-touching
+    # subcommands (create, view, start) can't run here — the CI VM
+    # cannot nest KVM to boot a Windows guest — but the guard rails
+    # around them still must.
+    #
+    # help: prints usage + exits 0. `2>&1` because the wrapper writes
+    # usage to stderr (writeShellApplication convention).
+    help_out = dellan.succeed("su - jonathan -c 'win-vm help 2>&1'")
+    for marker in ["fetch-iso", "create", "view", "microsoft.com/software-download/windows11"]:
+        assert marker in help_out, f"win-vm help lost '{marker}':\n{help_out}"
+    # unknown subcommand: usage to stderr + non-zero exit.
+    bogus = dellan.fail("su - jonathan -c 'win-vm nope-not-a-subcommand 2>&1'")
+    assert "unknown subcommand" in bogus.lower() or "usage" in bogus.lower(), (
+        f"win-vm bogus-subcommand should print usage/unknown message:\n{bogus}"
+    )
+    # fetch-iso without URL: dies with the MS download hint so a user
+    # who forgets the arg gets a fix, not a hang.
+    no_url = dellan.fail("su - jonathan -c 'win-vm fetch-iso 2>&1'")
+    assert "microsoft.com" in no_url.lower() or "url" in no_url.lower(), (
+        f"win-vm fetch-iso (no arg) should surface the MS URL hint:\n{no_url}"
     )
   '';
 }

@@ -1,4 +1,4 @@
-{ config, ... }:
+{ config, pkgs, ... }:
 {
   imports = [
     ./hardware-configuration.nix
@@ -36,6 +36,12 @@
     ../../modules/nixos/docker.nix
     ../../modules/nixos/research-agent-microvm.nix
     ../../modules/nixos/research-agent-microvm-healthcheck.nix
+
+    # Desktop libvirt/QEMU stack for full-OS guest VMs (Win11 + other
+    # distros for onboarding-flow testing). Stateful, imperative-VM
+    # sibling to microvm.nix (which is for lightweight NixOS-only
+    # guests declared as flake modules).
+    ../../modules/nixos/virtualisation-desktop.nix
 
     # scraper microvm — sibling to research-agent for JS-rendering
     # crawls. See module header for the trust-boundary rationale.
@@ -156,6 +162,11 @@
     group = "users";
     mode = "0400";
   };
+  # No ticktick-api-token here on purpose. The aggregator's ticktick ingest
+  # reads TICKTICK_ACCESS_TOKEN from ~/.config/todo/env, the same store
+  # ~/.claude/todo/backends/ticktick.py rewrites whenever it refreshes the
+  # OAuth token. An agenix copy would be a snapshot of a moving value.
+  # Enforced by checks.x86_64-linux.secrets-no-dead-credentials.
   # EUIPO OAuth2 credentials for the research-agent's trademark_shim
   # (queries the EU trademark register over its REST API). Both files
   # are empty placeholders until the EUIPO developer-portal
@@ -203,6 +214,12 @@
     group = "users";
     mode = "0400";
   };
+
+  # `add-secret` inserts new `age.secrets.<name>` blocks immediately
+  # ABOVE this marker. Do not remove — the tool refuses to insert
+  # without it. See home/add-secret.nix + skill doc
+  # home/claude-skills/nixos-agenix-secret/SKILL.md.
+  # add-secret:insert-here
 
   # ---------------------------------------------------------------------
   # research-agent microvm — persisted state.
@@ -256,4 +273,18 @@
   };
 
   services.claudeAgentUsers.enable = true;    # claude-agent-N users
+
+  # ---------------------------------------------------------------------
+  # Host-level tools on PATH.
+  #
+  # `add-secret <name>` — one-command wrapper for the agenix-rekey add
+  # flow (host-file edit → encrypt → rekey → commit → PR). See
+  # home/add-secret.nix + home/claude-skills/nixos-agenix-secret/SKILL.md.
+  # Smoke-tested via checks.x86_64-linux.add-secret-smoke; the smoke
+  # harness asserts the store path here matches the one it tested
+  # (drift gate).
+  # ---------------------------------------------------------------------
+  environment.systemPackages = [
+    (import ../../home/add-secret.nix { inherit pkgs; })
+  ];
 }
