@@ -155,12 +155,19 @@ let
       # The permission-ledger evaluator defaults the opposite way (absent =
       # on) because it is cheap and it is the only stage that surfaces the
       # permission ledger to a human. Expensive fails off, cheap fails on.
-      enabled=false
-      if [ -r "$config_file" ]; then
-        enabled="$(jq -r '.components.daily_review // false' "$config_file" 2>/dev/null || echo false)"
-      fi
-      if [ "$enabled" != "true" ]; then
-        echo "rsi-daily-review: components.daily_review is not true in $config_file — skipping (no model call)"
+      #
+      # The identity test lives INSIDE jq, and jq's exit status is the gate.
+      # It must not be a shell string comparison against a `jq -r` render:
+      # `-r` prints the JSON string "true" as the bare text `true`, exactly
+      # as it prints boolean true, so `[ "$enabled" = true ]` accepted a
+      # config typo of "daily_review": "true" and started the spend. Every
+      # other shape already failed shut, so the string was the whole hole.
+      # `jq -e` exits 1 when the expression yields false or null and 5 on
+      # malformed input; with `[ -r ]` in front, an unreadable or missing
+      # file never reaches jq. Boolean true is the only ON.
+      if ! [ -r "$config_file" ] \
+        || ! jq -e '.components.daily_review == true' "$config_file" >/dev/null 2>&1; then
+        echo "rsi-daily-review: components.daily_review is not boolean true in $config_file — skipping (no model call)"
         exit 0
       fi
       # claude is deliberately NOT in runtimeInputs (it lives in the user
