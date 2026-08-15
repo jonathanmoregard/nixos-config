@@ -171,6 +171,41 @@
     assert "skipping (no model call)" in off_explicit, (
         f"daily_review=false must gate the run off:\n{off_explicit}"
     )
+
+    # Only boolean true may open this gate. The shapes below are the ones a
+    # human typo actually produces, and the JSON STRING "true" is the one
+    # that used to get through: the gate compared the shell against a
+    # `jq -r` render, and `-r` prints the string "true" as the bare text
+    # `true` — byte-identical to how it prints boolean true. A quoted value
+    # in config.json therefore started a headless Opus pass over the whole
+    # transcript corpus, cost unmeasured. Verified with
+    # `jq -rn '"true" // false'` → `true`. Expensive fails off: the gate now
+    # tests identity against boolean true inside jq and reads its exit code,
+    # so anything that is not literally `true` costs nothing.
+    for bad_value, label in [
+        ('"true"', 'JSON string "true" (the quoted-typo case)'),
+        ("1", "number 1"),
+        ("null", "explicit null"),
+    ]:
+        set_daily_review(bad_value)
+        off_bad = run_rsi()
+        assert "skipping (no model call)" in off_bad, (
+            f"daily_review={bad_value} ({label}) is not boolean true and must "
+            f"gate the run off — no model call:\n{off_bad}"
+        )
+
+    # Malformed JSON must fail shut too (jq exits 5; the gate must not read
+    # that as consent). Written directly rather than via set_daily_review
+    # because the point is that it never parses.
+    dellan.succeed(
+        "echo '{\"components\": {\"daily_review\": tru' > %s/config.json"
+        % rsi_cfg_dir
+    )
+    off_malformed = run_rsi()
+    assert "skipping (no model call)" in off_malformed, (
+        f"malformed config JSON must gate the run off:\n{off_malformed}"
+    )
+
     set_daily_review("true")
     on = run_rsi(expect_ok=False)
     assert "skipping (no model call)" not in on, (
