@@ -114,31 +114,72 @@
         in crontab_src
     ), f"research-agent auto-pull line missing from crontab source:\n{crontab_src}"
 
-    # RSI daily-reviewer cron — DISABLED 2026-08-02. The nightly run is a
-    # headless Opus call over the whole transcript corpus; with the
-    # account near its usage cap that cost has to be measured before the
-    # entry earns its slot back, and measuring it also costs usage. So
-    # the line stays in home/jonathan-linux.nix commented out rather than
-    # deleted: re-enabling is uncommenting one line plus flipping this
-    # assertion back, in one deliberate PR.
+    # RSI daily-reviewer cron. Live again as of 2026-08-03 after the
+    # 2026-08-02 usage-cap disable, but the on/off decision no longer
+    # lives in this file: the wrapper reads components.daily_review from
+    # ~/.claude/recursive-self-improvement/config/config.json and exits
+    # before starting a model unless it is exactly true. A live entry is
+    # therefore not the same claim it used to be — the cost gate is the
+    # JSON key, asserted behaviourally below.
     #
     # The history this still guards: the plugin's install.sh installs the
     # entry via `crontab -e`, which loses on every rebuild and every
     # Monday backup-crontab.sh run — that is why review-agent.log went
     # silent 2026-04-17 and stayed silent for four months.
     # home/jonathan-linux.nix is the only durable install path on dellan.
-    # Inverted, the assertion now does double duty: it catches
-    # install.sh (or a future setup skill) quietly re-adding a live entry
-    # behind the user's back, which is the same failure with the sign
-    # flipped.
-    assert not any(
+    assert any(
         "rsi-daily-review" in c for c in active_commands
-    ), f"RSI daily-reviewer cron is disabled on purpose (2026-08-02, usage cap); re-enable it deliberately and flip this assertion in the same PR:\n{crontab_src}"
-    # Keep the disabled line discoverable in the source: deleting it
-    # loses the re-enable point and the reasoning above.
+    ), f"RSI daily-reviewer cron entry missing from crontab source:\n{crontab_src}"
     assert (
         "# recursive-self-improvement-analysis" in crontab_src
-    ), f"the commented-out RSI cron line should stay in the source as the re-enable point:\n{crontab_src}"
+    ), f"the RSI cron line should keep its tag comment (install.sh keys idempotency on it):\n{crontab_src}"
+
+    # The gate itself, exercised rather than grepped. The VM has no
+    # ~/.claude/recursive-self-improvement/config/config.json (that tree
+    # is user runtime state, not flake content), which is precisely the
+    # absent-config case: it must read as OFF and cost nothing. Then with
+    # the switch on, the wrapper must get past the gate and fail on one
+    # of its later preflight checks instead — which one depends on what
+    # the VM happens to have (claude resolves on PATH here, the prompt
+    # file does not), so assert on leaving the gate rather than on the
+    # specific downstream complaint.
+    rsi_bin = dellan.succeed(
+        "grep -o '/nix/store/[^ ]*/bin/rsi-daily-review' /home/jonathan/.config/crontab | head -1"
+    ).strip()
+    rsi_cfg_dir = "/home/jonathan/.claude/recursive-self-improvement/config"
+
+    def run_rsi(expect_ok=True):
+        cmd = f"su - jonathan -c {rsi_bin} 2>&1"
+        return dellan.succeed(cmd) if expect_ok else dellan.fail(cmd)
+
+    def set_daily_review(value):
+        dellan.succeed(f"mkdir -p {rsi_cfg_dir}")
+        dellan.succeed(
+            "echo '{\"components\": {\"daily_review\": %s}}' > %s/config.json"
+            % (value, rsi_cfg_dir)
+        )
+        dellan.succeed(
+            "chown -R jonathan:users /home/jonathan/.claude/recursive-self-improvement"
+        )
+
+    off_absent = run_rsi()
+    assert "skipping (no model call)" in off_absent, (
+        f"absent config must gate the run off:\n{off_absent}"
+    )
+    set_daily_review("false")
+    off_explicit = run_rsi()
+    assert "skipping (no model call)" in off_explicit, (
+        f"daily_review=false must gate the run off:\n{off_explicit}"
+    )
+    set_daily_review("true")
+    on = run_rsi(expect_ok=False)
+    assert "skipping (no model call)" not in on, (
+        f"daily_review=true must get past the component gate:\n{on}"
+    )
+    assert "rsi-daily-review:" in on, (
+        f"daily_review=true must reach the wrapper's own preflight:\n{on}"
+    )
+    dellan.succeed(f"rm -f {rsi_cfg_dir}/config.json")
     # Guard against reintroducing the dead-grant pattern: path-scoped
     # Write(...) grants passed via --allowedTools never register in
     # headless mode, and ~/.claude is behind Claude Code's built-in

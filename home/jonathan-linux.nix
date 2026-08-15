@@ -136,10 +136,33 @@ let
 
   rsiDailyReview = pkgs.writeShellApplication {
     name = "rsi-daily-review";
-    runtimeInputs = [ rsiProposalSink pkgs.coreutils ];
+    runtimeInputs = [ rsiProposalSink pkgs.coreutils pkgs.jq ];
     text = ''
       prompt_file="$HOME/.claude/recursive-self-improvement/config/prompt.md"
       dest="$HOME/.claude/recursive-self-improvement/proposals"
+      config_file="$HOME/.claude/recursive-self-improvement/config/config.json"
+      # Component gate, and it runs FIRST — before the claude lookup, before
+      # the prompt read, before anything that could fail for an unrelated
+      # reason. RSI's parts are switched individually from config.json
+      # (components.daily_review / auto_research / permission_ledger), so
+      # pausing the nightly reviewer is a one-key JSON edit rather than a
+      # crontab PR — which is the whole reason the cron line below is live
+      # again after the 2026-08-02 usage-cap disable.
+      #
+      # Absent config, absent key or unparseable JSON all read as OFF here.
+      # This run is a headless Opus pass over the whole transcript corpus and
+      # its cost has never been measured; a config fault must not start it.
+      # The permission-ledger evaluator defaults the opposite way (absent =
+      # on) because it is cheap and it is the only stage that surfaces the
+      # permission ledger to a human. Expensive fails off, cheap fails on.
+      enabled=false
+      if [ -r "$config_file" ]; then
+        enabled="$(jq -r '.components.daily_review // false' "$config_file" 2>/dev/null || echo false)"
+      fi
+      if [ "$enabled" != "true" ]; then
+        echo "rsi-daily-review: components.daily_review is not true in $config_file — skipping (no model call)"
+        exit 0
+      fi
       # claude is deliberately NOT in runtimeInputs (it lives in the user
       # profile and updates independently); fail loudly if the cron PATH
       # doesn't resolve it rather than dying cryptically mid-pipeline.
@@ -324,20 +347,20 @@ in
     # Code's sensitive-path gate; both probed 2026-08-01). See the
     # rsiDailyReview comment in the let-block above: read-only model,
     # stdout proposal blocks, trusted sink persists.
-    # DISABLED 2026-08-02 — usage cap. The entry is a nightly headless
-    # Opus pass over the whole transcript corpus; its token cost has
-    # never been measured, and measuring it costs usage too, so both the
-    # run and the measurement are deferred. Commented rather than
-    # deleted: this line IS the re-enable point.
     #
-    # To re-enable: restore the line below to
-    #   20 3 * * * ''${rsiDailyReview}/bin/rsi-daily-review >> ...
-    # (with the interpolation live) and flip the inverted assertion in
-    # tests/base.nix back to asserting presence, in the same PR. The
-    # interpolation is deliberately escaped here so the commented line
-    # does not pull rsiDailyReview into the system closure — a `#` in
-    # the crontab text does not stop Nix from evaluating ''${...}.
-    # 20 3 * * * <rsiDailyReview>/bin/rsi-daily-review >> /home/jonathan/.claude/logs/review-agent.log 2>&1 # recursive-self-improvement-analysis
+    # Disabled 2026-08-02 by commenting this line out (usage cap: a
+    # nightly headless Opus pass over the whole transcript corpus, cost
+    # never measured). Re-enabled 2026-08-03 as a LIVE line whose work
+    # is gated at runtime instead: the wrapper reads
+    # components.daily_review from
+    # ~/.claude/recursive-self-improvement/config/config.json and exits
+    # before spending anything unless it is exactly true. It currently
+    # is false, so this entry fires nightly and no-ops in milliseconds.
+    # The switch moved out of the crontab on purpose — flipping RSI's
+    # parts individually is now a JSON edit, not a PR + rebuild + deploy
+    # cycle, and the entry can no longer rot silently in a comment the
+    # way the 2026-04-17..08-01 outage did.
+    20 3 * * * ${rsiDailyReview}/bin/rsi-daily-review >> /home/jonathan/.claude/logs/review-agent.log 2>&1 # recursive-self-improvement-analysis
     # Permission-ledger nightly evaluator (shipped 2026-08-01 by a
     # separate session into ~/.claude/permission-ledger/). Its installer
     # wrote this entry into the LIVE crontab only — same trap as the RSI
