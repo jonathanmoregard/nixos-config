@@ -543,6 +543,270 @@
         "systemctl --user reset-failed sota-watch.service'"
     )
 
+    # ── aggregator all-sources ingest (modules/nixos/aggregator-ingest-timer.nix) ──
+    # One user timer walks all nine aggregator sources every 30 min. The
+    # predecessor (aggregator-github-ingest) ran one source and had NO
+    # failure reporting at all: a broken run reached the journal and
+    # nowhere else. Both halves of the replacement are asserted here
+    # behaviourally, because presence-only checks on this module would
+    # pass with the notifier silently disabled — which is precisely the
+    # state it exists to prevent.
+    #
+    # What cannot be exercised in this VM: the aggregator CLI itself.
+    # ~/Repos/aggregator is a local-only checkout that is not in the VM
+    # closure and `uv run` has no network here, so no run of the real
+    # command can reach exit 3 from inside the test. The exit-3 -> OnFailure
+    # edge is therefore driven by overriding ONLY ExecStart via a drop-in
+    # (the [Unit] section, and with it the OnFailure edge under test, stays
+    # the production one), while the wrapper half is covered by invoking the
+    # real generated script and by starting the real unit unmodified.
+    agg_timers = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user list-timers --all'"
+    )
+    assert "aggregator-ingest.timer" in agg_timers, (
+        f"aggregator-ingest.timer missing from user timer list:\n{agg_timers}"
+    )
+    # wantedBy = timers.target, proven by systemd rather than by a symlink
+    # stat: enabled (the install symlink resolved) AND active (the user
+    # manager actually armed it, so a tick will come).
+    for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
+        got = dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"systemctl --user {prop} aggregator-ingest.timer'"
+        ).strip()
+        assert got == expected, (
+            f"aggregator-ingest.timer {prop}={got!r}, expected {expected!r} "
+            f"— the timer is not wanted by timers.target"
+        )
+    # The github-only predecessor must be gone, not merely shadowed: a
+    # leftover unit file would keep ingesting one source on its own tick.
+    dellan.fail("test -f /etc/systemd/user/aggregator-github-ingest.service")
+    dellan.fail("test -f /etc/systemd/user/aggregator-github-ingest.timer")
+
+    agg_unit = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat aggregator-ingest.service'"
+    )
+    # The OnFailure edge itself, and the timeout backstop that makes a
+    # wedged nine-source run fail (Type=oneshot disables TimeoutStartSec by
+    # default, which is how a hang becomes an unbounded "activating").
+    assert "OnFailure=aggregator-ingest-failure-notify.service" in agg_unit, (
+        f"aggregator-ingest.service lost its OnFailure edge:\n{agg_unit}"
+    )
+    assert "TimeoutStartSec=" in agg_unit, (
+        f"aggregator-ingest.service lost its TimeoutStartSec backstop:\n{agg_unit}"
+    )
+
+    # AGGREGATOR_NOTIFY_COMMAND: present, NON-EMPTY, and executable. All
+    # three matter. `Environment=AGGREGATOR_NOTIFY_COMMAND=` (the empty
+    # spelling) and a mistyped program are the two shapes the aggregator
+    # documents as historically silent-in-the-wrong-direction; a config
+    # that produced either would let this unit run for months believing
+    # notifications were on while they were off.
+    import re as _re
+    m = _re.search(r'Environment="AGGREGATOR_NOTIFY_COMMAND=([^"]*)"', agg_unit)
+    assert m, (
+        "aggregator-ingest.service does not set AGGREGATOR_NOTIFY_COMMAND, so "
+        f"the in-process staleness notifier is not installed:\n{agg_unit}"
+    )
+    agg_notify_cmd = m.group(1).strip()
+    assert agg_notify_cmd, (
+        "AGGREGATOR_NOTIFY_COMMAND is set but blank — the aggregator treats "
+        "that as a run error, not as 'off'"
+    )
+    dellan.succeed(f"test -x {agg_notify_cmd.split()[0]}")
+
+    agg_exec = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat aggregator-ingest.service' "
+        "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
+    ).strip()
+    agg_script = dellan.succeed(f"cat {agg_exec}")
+    # What it runs: every source through the one runner, not `ingest github`.
+    assert "ingest --all" in agg_script, (
+        f"aggregator wrapper no longer drives all sources:\n{agg_script}"
+    )
+    # `exec`, so the CLI's exit status is the unit's exit status. Anything
+    # that captures and re-raises the status by hand can zero it (PR #67),
+    # and a zeroed 3 is a run that dropped data reported as success.
+    assert "exec uv run" in agg_script, (
+        f"aggregator wrapper must exec the CLI so exit 3 reaches systemd:\n{agg_script}"
+    )
+
+    # The notifier must be reachable ONLY through OnFailure. `static` means
+    # the unit has no [Install] section, so nothing can pull it in on its
+    # own — the race-free half of the "does not fire spuriously" control
+    # (the behavioural half is the exit-0 run below).
+    agg_notify_enabled = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-enabled aggregator-ingest-failure-notify.service'"
+    ).strip()
+    assert agg_notify_enabled == "static", (
+        "the failure notifier must be OnFailure-only (no [Install]); "
+        f"is-enabled={agg_notify_enabled!r}"
+    )
+
+    # Stop the timer before driving the unit by hand. The timer carries
+    # OnBootSec=5min + Persistent=true, so on a slow lane it can fire the
+    # service underneath these assertions and make the marker counts
+    # nondeterministic. Everything below is expressed as a DELTA against a
+    # baseline captured after the stop, so an autonomous fire that already
+    # happened is harmless.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user stop aggregator-ingest.timer aggregator-ingest.service; true'"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user reset-failed aggregator-ingest.service; true'"
+    )
+
+    AGG_MARKER = "aggregator ingest run FAILED"
+
+    def agg_notify_count():
+        out = dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            "journalctl --user -u aggregator-ingest-failure-notify.service "
+            "--no-pager' || true"
+        )
+        return out.count(AGG_MARKER)
+
+    def wait_agg_notify(baseline, what):
+        # OnFailure dispatch is asynchronous, so poll rather than assert
+        # instantly. Compares against a baseline instead of grepping for
+        # presence: this lane trips the notifier more than once and a
+        # presence check would pass on a previous run's line.
+        import time as _time
+        for _ in range(30):
+            if agg_notify_count() > baseline:
+                return
+            _time.sleep(2)
+        raise AssertionError(
+            f"aggregator OnFailure notifier never fired for {what}; marker "
+            f"count stuck at {agg_notify_count()} (baseline {baseline})"
+        )
+
+    agg_baseline = agg_notify_count()
+
+    # (1) The real generated wrapper, invoked directly with the adversarial
+    # input this VM naturally supplies: no decrypted agenix secret. It must
+    # exit non-zero and say which guard tripped, not proceed to ingest
+    # anonymously.
+    agg_guard = dellan.fail(f"su - jonathan -c '{agg_exec}' 2>&1")
+    assert "aggregator-ingest: secret" in agg_guard, (
+        "wrapper must name the failing guard when the agenix secret is not "
+        f"readable:\n{agg_guard}"
+    )
+
+    # (2) The real unit, unmodified, taking that same guard path: a
+    # non-zero ExecStart must fail the unit and fire the notifier.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start aggregator-ingest.service; true'"
+    )
+    agg_state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed aggregator-ingest.service || true'"
+    ).strip()
+    assert agg_state == "failed", (
+        f"aggregator-ingest.service should be failed after the guard path; "
+        f"got is-failed={agg_state!r}"
+    )
+    wait_agg_notify(agg_baseline, "the real wrapper's guard-path failure")
+    agg_baseline = agg_notify_count()
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user reset-failed aggregator-ingest.service'"
+    )
+
+    # (3) and (4) inject exit codes the aggregator CLI cannot produce here
+    # (no checkout, no network for `uv`) by overriding ONLY ExecStart. The
+    # [Unit] section — and with it the OnFailure edge under test — stays
+    # exactly the production one.
+    def agg_dropin(exit_code):
+        dellan.succeed(
+            f"printf '#!/bin/sh\\nexit {exit_code}\\n' > /run/agg-exit && "
+            "chmod 755 /run/agg-exit"
+        )
+        dellan.succeed(
+            "mkdir -p /home/jonathan/.config/systemd/user/aggregator-ingest.service.d && "
+            "printf '[Service]\\nExecStart=\\nExecStart=/run/agg-exit\\n' "
+            "> /home/jonathan/.config/systemd/user/aggregator-ingest.service.d/exit.conf"
+        )
+        dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            "systemctl --user daemon-reload'"
+        )
+        dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            "systemctl --user start aggregator-ingest.service; true'"
+        )
+        return dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            "systemctl --user show -P ExecMainStatus aggregator-ingest.service'"
+        ).strip()
+
+    # (3) Behavioural negative control: a CLEAN run (exit 0) must leave the
+    # unit healthy and must NOT wake the notifier. Without this, (2) and (4)
+    # would both pass on an OnFailure wired to fire unconditionally.
+    agg_status = agg_dropin(0)
+    assert agg_status == "0", f"exit-0 run reported ExecMainStatus={agg_status!r}"
+    agg_state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed aggregator-ingest.service || true'"
+    ).strip()
+    assert agg_state != "failed", (
+        f"a clean run must not fail the unit; is-failed={agg_state!r}"
+    )
+    dellan.sleep(6)
+    assert agg_notify_count() == agg_baseline, (
+        "the failure notifier fired on a CLEAN run — OnFailure is mis-wired "
+        f"(marker count {agg_notify_count()}, expected {agg_baseline})"
+    )
+
+    # (4) The exit-3 contract. `aggregator ingest --all` exits 3 when the
+    # run COMPLETED but ended with a non-empty errors list — a partially
+    # successful run, which must still be loud. systemd has to treat 3 as a
+    # failure (no SuccessExitStatus= may creep in) and route it to the
+    # notifier.
+    agg_status = agg_dropin(3)
+    assert agg_status == "3", (
+        f"expected the injected exit 3 to reach systemd verbatim; "
+        f"ExecMainStatus={agg_status!r}"
+    )
+    agg_state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed aggregator-ingest.service || true'"
+    ).strip()
+    assert agg_state == "failed", (
+        "exit 3 (completed with errors) must fail the unit, not be absorbed "
+        f"as success; got is-failed={agg_state!r}"
+    )
+    wait_agg_notify(agg_baseline, "an exit-3 run")
+
+    # Leave the VM clean for later assertions in this lane.
+    dellan.succeed(
+        "rm -rf /home/jonathan/.config/systemd/user/aggregator-ingest.service.d "
+        "/run/agg-exit"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user daemon-reload'"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user reset-failed aggregator-ingest.service'"
+    )
+    # Re-arm the timer stopped above. Separate call on purpose: a
+    # `VAR=x cmd1; cmd2` prefix scopes VAR to cmd1 only, so a second
+    # systemctl in the same `su -c` runs without XDG_RUNTIME_DIR and cannot
+    # reach the user bus.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start aggregator-ingest.timer'"
+    )
+
     # claude-idle-handoff — proactive mission.md writer + opus-5 autofork
     # for idle Claude Code sessions. Declared in home/claude-services.nix
     # after four months of the shipped-imperative footgun (RSI reviewer)

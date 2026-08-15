@@ -1,0 +1,250 @@
+# Aggregator ingest — ONE systemd user timer that walks all nine sources.
+#
+# Replaces the github-only timer (modules/nixos/aggregator-github-timer.nix,
+# unit `aggregator-github-ingest`). The aggregator grew a unified import
+# runner: `aggregator ingest --all` drives sessions, github, chatgpt,
+# claude-web, research, sota-watch, substack, dropbox and ticktick through
+# one pass with per-source failure isolation — one source raising costs its
+# own line in the run report and nothing else. One timer, one report, one
+# notify wiring, instead of nine of each.
+#
+# WHY this is still a standalone wrapper (not `services.aggregator.enable`
+# via the aggregator's own home-manager module at ~/Repos/aggregator/nix/
+# aggregator.nix):
+#
+# The aggregator repo is local-only, never pushed (owner directive). Adding
+# it as a flake input (path:, git+file:) would fail `nix flake check` on the
+# GitHub Actions runner which has no such path — flake fetchers evaluate
+# before the check gates run. A `builtins.pathExists`-guarded conditional
+# import also fails: NixOS pure evaluation silently reports the path as
+# absent even on dellan, which would make the timer vanish from prod without
+# CI catching it. SOTA guidance (research 2026-08-02): treat the aggregator
+# as an opaque on-disk command, wrap it in a writeShellApplication that reads
+# the agenix PAT and exports GH_TOKEN, invoke via `uv run`. That constraint
+# has not changed, so this module keeps duplicating ~30 lines of systemd glue
+# rather than importing the aggregator's own module. Price of CI safety.
+#
+# Consumes: age.secrets.github-readonly-pat (declared in
+# hosts/dellan/default.nix with owner=jonathan / mode=0400). The PAT is
+# stored raw (no `KEY=` prefix); the wrapper cats + exports it. github is one
+# of the nine sources and still needs GH_TOKEN, so the agenix wrapper stays
+# exactly as it was.
+#
+# NO agenix secret for ticktick, deliberately. The ticktick source reads
+# TICKTICK_ACCESS_TOKEN from the shared ~/.config/todo/env store, which
+# ~/.claude/todo/backends/ticktick.py rewrites on every OAuth refresh. PR
+# #177 removed the duplicate declaration and
+# `checks.x86_64-linux.secrets-no-dead-credentials` fails the build if it
+# comes back. Nothing here declares one.
+#
+# ── Failure reporting: TWO channels, deliberately, covering disjoint holes ──
+#
+#   1. `OnFailure=aggregator-ingest-failure-notify.service` (systemd).
+#      Fires when the UNIT fails — i.e. the wrapper died before or instead
+#      of producing a run report: unreadable/empty agenix secret, missing
+#      checkout, `uv` broken, TimeoutStartSec reaped a wedged run, OOM kill.
+#      In every one of those cases the aggregator's in-process notifier
+#      never got to run, so without this channel the failure reaches the
+#      journal and nowhere else. Same shape as the sota-watch OnFailure
+#      chain (home/sota-watch.nix) — which is itself the user-manager
+#      instance of the nixos-deploy.service notify pattern
+#      (modules/nixos/nixos-auto-deploy.nix): `notify-send -u critical`,
+#      journal marker first. nixos-deploy needs a root->user flag-file hop
+#      via a path unit because it runs on the SYSTEM manager; this unit
+#      already runs on jonathan's user manager, so `OnFailure=` reaches the
+#      session bus directly and the hop is unnecessary.
+#
+#   2. `AGGREGATOR_NOTIFY_COMMAND` (in-process, the aggregator's own
+#      notifier). Fires on a run that SUCCEEDS at the systemd level but has
+#      something to say: a hand-refreshed export archive has gone stale (the
+#      chat exports, the TickTick CSV). Such a run exits 0 with every count
+#      at 0 and is otherwise indistinguishable from a healthy no-op —
+#      OnFailure can never see it. Presence of the variable is what installs
+#      the notifier, so no argv change is needed; its value names the
+#      program, shlex-split and argv-exec'd, never a shell.
+#
+#   Overlap is intentional and cheap: a run that ends with a non-empty
+#   errors list exits 3, so BOTH channels fire (one CRITICAL toast from the
+#   CLI naming the failing sources, one from OnFailure naming the unit).
+#   Two toasts for one incident beats dropping either channel, each of which
+#   is the only cover for its own class.
+#
+#   The value is an ABSOLUTE store path on purpose. The aggregator resolves
+#   it with shutil.which() on every run and turns an unresolvable program
+#   into a run error (exit 3), so a bare `notify-send` would depend on the
+#   user manager's PATH. Note also that `Environment=AGGREGATOR_NOTIFY_COMMAND=`
+#   — the empty spelling — is the one shape the aggregator treats as a loud
+#   config error rather than "off"; the VM test asserts the value is
+#   non-empty and executable so that footgun cannot land silently.
+#
+# ── Cadence: still every 30 minutes ──
+#
+# Kept at `*:0/30` even though the unit now walks nine sources rather than
+# one:
+#
+#   * The freshness that matters is `sessions`. ~/.claude/projects is
+#     appended to continuously and is what `aggregator_search_memory`
+#     answers "what did we decide an hour ago" from. Halving the poll rate
+#     halves recall freshness for the only source that changes
+#     minute-to-minute; the other eight change daily at best.
+#   * Seven of the nine read local directories. On a tick with nothing new
+#     they cost a directory walk and zero writes — the upsert path is
+#     idempotent per stable id.
+#   * Network budget is unchanged in shape. github still makes the same `gh`
+#     calls it made at this cadence before; ticktick adds one bounded HTTPS
+#     poll per tick. 48 runs/day is nowhere near either API's limits, and
+#     every network call in the source layer carries its own timeout.
+#   * Ticks cannot pile up. systemd will not re-trigger a timer whose unit
+#     is still active — a long run costs a skipped tick, not a second
+#     concurrent writer against cache.db.
+#
+# Rejected: hourly (costs the sessions freshness that motivates the whole
+# index, and does not fix anything else); per-source timers (that is exactly
+# what `--all` replaced).
+#
+# KNOWN, ACCEPTED NAG: staleness is recomputed per run and not deduplicated,
+# so while an export archive is past --stale-after-days (default 14) the
+# in-process notifier emits one normal-urgency toast per tick. If that gets
+# annoying before the export ritual is automated, the fix belongs in the
+# aggregator (a delivered-receipt barrier for staleness warnings), not here.
+{ config, pkgs, lib, ... }:
+let
+  aggregatorRoot = "/home/jonathan/Repos/aggregator";
+
+  # Absolute path — see the AGGREGATOR_NOTIFY_COMMAND note in the header.
+  notifyCommand = "${pkgs.libnotify}/bin/notify-send";
+
+  # Activated only via OnFailure. Emits the journal marker FIRST and treats
+  # the desktop toast as best-effort: a headless boot or a session with no
+  # notification daemon must not turn the notifier itself red (which would
+  # then be a second failed unit reporting nothing), but the fallback is
+  # logged so it stays diagnosable. The marker is also what the VM test
+  # asserts on — it works without a notification daemon.
+  failureNotifyScript = pkgs.writeShellScript "aggregator-ingest-failure-notify" ''
+    set -uo pipefail
+
+    echo "aggregator ingest run FAILED — inspect: journalctl --user -u aggregator-ingest.service -n 200"
+    if ! ${notifyCommand} -u critical -a aggregator \
+      "aggregator ingest FAILED" \
+      "The all-sources ingest run exited non-zero. Likely: unreadable/empty github-readonly-pat, missing ~/Repos/aggregator checkout, or a run that ended with errors (exit 3). Details: journalctl --user -u aggregator-ingest.service -n 200"; then
+      echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only"
+    fi
+  '';
+
+  ingestScript = pkgs.writeShellApplication {
+    name = "aggregator-ingest";
+    # `uv` for running the aggregator CLI in its own venv; `git` because
+    # `uv run` may probe the working tree. `gh` is the CLI the github source
+    # shells out to. `coreutils` so `cat` does not depend on whatever PATH
+    # the user manager happened to inherit. `libnotify` so a future edit
+    # that spells the notify command bare still resolves it.
+    runtimeInputs = [ pkgs.uv pkgs.git pkgs.gh pkgs.coreutils pkgs.libnotify ];
+    text = ''
+      set -euo pipefail
+
+      secret_path=${lib.escapeShellArg config.age.secrets.github-readonly-pat.path}
+      if [ ! -r "$secret_path" ]; then
+        echo "aggregator-ingest: secret unreadable at $secret_path (mode/owner?)" >&2
+        exit 1
+      fi
+      # Separate assignment + export so `set -e` catches a read failure.
+      # `export FOO=$(cmd)` masks cmd's exit through the export builtin.
+      token=$(cat "$secret_path")
+      if [ -z "$token" ]; then
+        # Fail loud instead of exporting GH_TOKEN="" — an empty secret
+        # usually means agenix decryption produced a zero-byte file
+        # (wrong recipient, empty plaintext). Silent-degrading to
+        # empty would fall through to `gh auth` (write-capable) which
+        # the aggregator then refuses with WriteCapableTokenError; the
+        # explicit check makes the root cause obvious in the journal.
+        echo "aggregator-ingest: secret at $secret_path is empty" >&2
+        exit 1
+      fi
+      export GH_TOKEN="$token"
+
+      # Fail loudly if the checkout is missing (e.g. user renamed / moved).
+      if [ ! -d ${lib.escapeShellArg aggregatorRoot} ]; then
+        echo "aggregator-ingest: repo not found at ${aggregatorRoot}" >&2
+        exit 1
+      fi
+
+      # `exec`, so the CLI's exit status IS the unit's exit status with no
+      # wrapper in between. That matters for the aggregator's exit-code
+      # contract: 0 clean, 2 usage error, 3 completed with errors (a
+      # PARTIALLY successful run still exits 3, deliberately). 3 must reach
+      # systemd unaltered so the unit fails and OnFailure fires. Capturing
+      # the status by hand to log a friendlier line is exactly the shape
+      # that produced the PR #67 incident (`if ! cmd; then rc=$?` — bash
+      # zeroes rc), so we do not; the CLI already prints its own error
+      # lines to the journal ahead of exiting.
+      #
+      # No --notify: AGGREGATOR_NOTIFY_COMMAND in the unit environment
+      # installs the notifier on its own. No --stale-after-days: the
+      # aggregator's default of 14 days is half an export-refresh cycle,
+      # which is the intended cadence here.
+      exec uv run --directory ${lib.escapeShellArg aggregatorRoot} \
+        aggregator ingest --all
+    '';
+  };
+in
+{
+  systemd.user.services.aggregator-ingest = {
+    description = "Aggregator: all-sources ingest (agenix-wrapped)";
+    unitConfig.OnFailure = "aggregator-ingest-failure-notify.service";
+    environment = {
+      # Presence installs the aggregator's in-process notifier; the value
+      # names the program. See the two-channel note in the header.
+      AGGREGATOR_NOTIFY_COMMAND = notifyCommand;
+    };
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${ingestScript}/bin/aggregator-ingest";
+      # Type=oneshot disables TimeoutStartSec by DEFAULT (systemd.service(5)),
+      # so without this line a wedged run can hold the unit "activating"
+      # forever and every later tick silently no-ops — the exact shape of
+      # the 2026-06-14 nixos-deploy incident (17h activating, merged PRs
+      # never reaching the host). 4h is chosen ABOVE the measured cold
+      # first-run cost of the sessions source (~3.1h against a real
+      # ~/.claude/projects tree, 5678 sessions / 348168 observations,
+      # measured 2026-08-02) so a legitimate cold scan is never reaped into
+      # a loop that can never converge; steady-state incremental runs are
+      # orders of magnitude under it. On expiry systemd fails the unit,
+      # which routes into OnFailure and tells a human — the point is that a
+      # wedge is BOUNDED and LOUD, not that it is fast.
+      TimeoutStartSec = "4h";
+      # Journal captures errors + the per-source run report printed by the
+      # CLI. This is where an operator reads what happened after the fact.
+      StandardOutput = "journal";
+      StandardError = "journal";
+    };
+  };
+
+  # Activated only via OnFailure — no wantedBy on purpose.
+  systemd.user.services.aggregator-ingest-failure-notify = {
+    description = "Desktop notification: aggregator ingest run failed";
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${failureNotifyScript}";
+    };
+  };
+
+  systemd.user.timers.aggregator-ingest = {
+    description = "Aggregator: all-sources ingest timer (every 30 min)";
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      # Every 30 minutes wall-clock — see the cadence section in the header
+      # for why nine sources did not change this.
+      OnCalendar = "*:0/30";
+      # Fire ~5 minutes after boot so a resumed laptop catches up once
+      # network/VPN come back, jittered by up to 3 min so the run does not
+      # land exactly on the tick boundary shared with every other user
+      # timer on this host.
+      OnBootSec = "5min";
+      RandomizedDelaySec = "3min";
+      # Fire immediately on activation if the previous scheduled run was
+      # missed (laptop closed). User timers need $XDG_STATE_HOME/systemd —
+      # home-manager sets that up.
+      Persistent = true;
+    };
+  };
+}
