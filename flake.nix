@@ -36,6 +36,40 @@
     claude-desktop.url = "github:aaddrick/claude-desktop-debian";
     claude-desktop.inputs.nixpkgs.follows = "nixpkgs";
 
+    # aggregator — the personal search index behind
+    # `aggregator_search_memory`. Consumed as SOURCE ONLY (`flake = false`)
+    # and built here by overlays/aggregator.nix, because the aggregator's
+    # own `packages.default` is a stub with an empty dependency list. The
+    # rev pinned in flake.lock IS the deployed version: bump with
+    # `nix flake update aggregator-src`, PR, merge, auto-deploy.
+    #
+    # NOTE FOR CI: this repo is currently PRIVATE, and nix cannot fetch a
+    # private repo without an access token. nixos-config's workflows pass
+    # `access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}`, which is
+    # scoped to nixos-config and returns 404 here. Either make the
+    # aggregator repo public (every other personal tool above is) or add a
+    # PAT with read access to it on all three surfaces that evaluate this
+    # flake: the Actions runner, dellan's user nix, and root's nix (which
+    # is what nixos-deploy.service rebuilds with).
+    #
+    # The three uv2nix inputs below were already in flake.lock transitively
+    # (tts-tool / substack-url-tool / prose-decorate each pull them); the
+    # `follows` lines keep them deduplicated to one copy each.
+    aggregator-src = {
+      url = "github:jonathanmoregard/aggregator/65fdec34afa35bcebc601c0f7f3a207b71946e9f";
+      flake = false;
+    };
+
+    pyproject-nix.url = "github:pyproject-nix/pyproject.nix";
+    pyproject-nix.inputs.nixpkgs.follows = "nixpkgs";
+    uv2nix.url = "github:pyproject-nix/uv2nix";
+    uv2nix.inputs.pyproject-nix.follows = "pyproject-nix";
+    uv2nix.inputs.nixpkgs.follows = "nixpkgs";
+    pyproject-build-systems.url = "github:pyproject-nix/build-system-pkgs";
+    pyproject-build-systems.inputs.pyproject-nix.follows = "pyproject-nix";
+    pyproject-build-systems.inputs.uv2nix.follows = "uv2nix";
+    pyproject-build-systems.inputs.nixpkgs.follows = "nixpkgs";
+
     # microvm.nix — qemu+KVM microvm host module. Tracking `main`
     # because the most recent tagged release (v0.5.0, 2024-04) calls
     # `pkgs.writeReferencesToFile` which has been removed in current
@@ -47,7 +81,9 @@
   };
 
   outputs = { self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
-              tts-tool, substack-url-tool, prose-decorate, claude-desktop, ... }:
+              tts-tool, substack-url-tool, prose-decorate, claude-desktop,
+              aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
+              ... }:
   let
     linuxSystem = "x86_64-linux";
 
@@ -78,6 +114,14 @@
         (import ./overlays/beeper.nix)
         (import ./overlays/auphonic-cli.nix)
         (import ./overlays/signal-expiry.nix)
+        # `pkgs.aggregator` — a real store path for the ingest timer, so
+        # modules/nixos/aggregator-ingest-timer.nix needs no flake-input
+        # specialArgs threading (same reason the listen-tools tools are
+        # exposed as plain attributes below).
+        (import ./overlays/aggregator.nix {
+          inherit pyproject-nix uv2nix pyproject-build-systems;
+          src = aggregator-src;
+        })
         claude-desktop.overlays.default
         (final: prev: {
           tts-tool = tts-tool.packages.${linuxSystem}.default;

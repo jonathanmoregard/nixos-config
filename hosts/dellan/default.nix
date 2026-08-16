@@ -74,11 +74,11 @@
     # aggregator's all-sources ingest (`ingest --all`, nine sources with
     # per-source failure isolation) every 30 min, with an OnFailure
     # desktop notification and the in-process staleness notifier wired
-    # up. Standalone wrapper (the aggregator repo lives at
-    # ~/Repos/aggregator, never pushed, so cannot be a flake input; see
-    # the module header for the SOTA rationale). Consumes
-    # age.secrets.github-readonly-pat declared below; ticktick reads its
-    # own token from ~/.config/todo/env and gets no secret here.
+    # up. The CLI it runs is `pkgs.aggregator` — a uv2nix build of the rev
+    # pinned as the `aggregator-src` flake input (overlays/aggregator.nix),
+    # NOT the developer checkout the wrapper used to `uv run` against.
+    # Consumes age.secrets.github-readonly-pat declared below; ticktick
+    # reads its own token from ~/.config/todo/env and gets no secret here.
     ../../modules/nixos/aggregator-ingest-timer.nix
   ];
 
@@ -155,8 +155,8 @@
     mode = "0400";
   };
   # GitHub read-only PAT consumed by the aggregator's github source, one
-  # of the nine driven by the `aggregator-ingest` timer above
-  # (~/Repos/aggregator). Raw token only in the .age file (no `KEY=`
+  # of the nine driven by the `aggregator-ingest` timer above.
+  # Raw token only in the .age file (no `KEY=`
   # prefix); the wrapper reads it with `cat` and exports GH_TOKEN itself.
   # owner=jonathan + mode=0400 because the ingest runs as the user.
   age.secrets.github-readonly-pat = {

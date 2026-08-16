@@ -8,21 +8,31 @@
 # own line in the run report and nothing else. One timer, one report, one
 # notify wiring, instead of nine of each.
 #
-# WHY this is still a standalone wrapper (not `services.aggregator.enable`
-# via the aggregator's own home-manager module at ~/Repos/aggregator/nix/
-# aggregator.nix):
+# ── What this unit runs: a store path, and ONLY a store path ──
 #
-# The aggregator repo is local-only, never pushed (owner directive). Adding
-# it as a flake input (path:, git+file:) would fail `nix flake check` on the
-# GitHub Actions runner which has no such path — flake fetchers evaluate
-# before the check gates run. A `builtins.pathExists`-guarded conditional
-# import also fails: NixOS pure evaluation silently reports the path as
-# absent even on dellan, which would make the timer vanish from prod without
-# CI catching it. SOTA guidance (research 2026-08-02): treat the aggregator
-# as an opaque on-disk command, wrap it in a writeShellApplication that reads
-# the agenix PAT and exports GH_TOKEN, invoke via `uv run`. That constraint
-# has not changed, so this module keeps duplicating ~30 lines of systemd glue
-# rather than importing the aggregator's own module. Price of CI safety.
+# Until 2026-08-16 the wrapper's last line was
+#
+#     exec uv run --directory /home/jonathan/Repos/aggregator aggregator ingest --all
+#
+# so ExecStart's store path was a decoy: the code that actually ran was
+# whatever happened to be checked out in the developer's tree at the moment
+# the timer fired — any branch, any uncommitted edit. `uv run` also WRITES
+# to that tree (venv resolve/sync, potentially uv.lock) from an unattended
+# systemd unit. There was no deployed artifact at all; "merged to main" and
+# "what runs" were unrelated facts.
+#
+# It now execs `${pkgs.aggregator}/bin/aggregator`, built by
+# overlays/aggregator.nix (uv2nix) from the rev pinned in flake.lock. Read
+# that file for the packaging rationale, the spaCy/Presidio note, and the
+# bump procedure. Nothing below may name a path under /home/ for the code
+# it runs — tests/base.nix asserts that mechanically, because a config
+# change with no test regresses silently and that is exactly how the `uv
+# run` line survived four PRs.
+#
+# The unit still does NOT use `services.aggregator.enable` from the
+# aggregator's own home-manager module: that module predates the unified
+# `ingest --all` runner and still wires one unit per source, which is what
+# this timer deliberately replaced.
 #
 # Consumes: age.secrets.github-readonly-pat (declared in
 # hosts/dellan/default.nix with owner=jonathan / mode=0400). The PAT is
@@ -115,7 +125,7 @@
 # paths its build baked in, and for the interpreter this unit actually runs
 # those paths are wrong on NixOS:
 #
-#   `uv run` does not use the system python. It fetches a python-build-
+#   `uv run` did not use the system python. It fetched a python-build-
 #   standalone CPython whose OpenSSL was compiled with
 #   cafile=/etc/ssl/cert.pem (absent on NixOS) and capath=/etc/ssl/certs
 #   (present, but two symlinks — not an OpenSSL hashed CA directory). Both
@@ -143,9 +153,20 @@
 # `security.pki.certificateFiles` (a store path silently drops those), and it
 # does not pin the trust store to the closure this module happened to be
 # evaluated against.
+#
+# Kept after the move to a store-path build even though the interpreter
+# changed. The packaged venv runs nixpkgs' python311, which IS compiled
+# against /etc/ssl/certs/ca-certificates.crt, so the zero-CA fallback above
+# is no longer reachable through that particular door — but SSL_CERT_FILE
+# is read by OpenSSL itself, NIX_SSL_CERT_FILE by every nixpkgs cacert
+# wrapper on this unit's PATH (`gh` among them), and a unit that names its
+# trust store explicitly cannot inherit a broken one. Removing two
+# Environment= lines to save nothing is how the 2026-08-15 incident would
+# come back through a different interpreter.
 { config, pkgs, lib, ... }:
 let
-  aggregatorRoot = "/home/jonathan/Repos/aggregator";
+  # The deployed artifact. Store path, pinned rev, no working tree.
+  aggregatorBin = lib.getExe pkgs.aggregator;
 
   # Absolute path — see the AGGREGATOR_NOTIFY_COMMAND note in the header.
   notifyCommand = "${pkgs.libnotify}/bin/notify-send";
@@ -166,19 +187,22 @@ let
     echo "aggregator ingest run FAILED — inspect: journalctl --user -u aggregator-ingest.service -n 200"
     if ! ${notifyCommand} -u critical -a aggregator \
       "aggregator ingest FAILED" \
-      "The all-sources ingest run exited non-zero. Likely: unreadable/empty github-readonly-pat, missing ~/Repos/aggregator checkout, or a run that ended with errors (exit 3). Details: journalctl --user -u aggregator-ingest.service -n 200"; then
+      "The all-sources ingest run exited non-zero. Likely: unreadable/empty github-readonly-pat, no usable CA bundle, or a run that ended with errors (exit 3). Details: journalctl --user -u aggregator-ingest.service -n 200"; then
       echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only"
     fi
   '';
 
   ingestScript = pkgs.writeShellApplication {
     name = "aggregator-ingest";
-    # `uv` for running the aggregator CLI in its own venv; `git` because
-    # `uv run` may probe the working tree. `gh` is the CLI the github source
-    # shells out to. `coreutils` so `cat` does not depend on whatever PATH
-    # the user manager happened to inherit. `libnotify` so a future edit
-    # that spells the notify command bare still resolves it.
-    runtimeInputs = [ pkgs.uv pkgs.git pkgs.gh pkgs.coreutils pkgs.libnotify ];
+    # `gh` is the only external command the aggregator shells out to
+    # (aggregator/sources/github.py). `coreutils` so `cat` does not depend
+    # on whatever PATH the user manager happened to inherit. `libnotify` so
+    # a future edit that spells the notify command bare still resolves it.
+    #
+    # `uv` and `git` are deliberately GONE. They were here to run the CLI
+    # out of the developer's checkout; keeping them on PATH would leave the
+    # tools that made the old failure mode possible one typo away.
+    runtimeInputs = [ pkgs.gh pkgs.coreutils pkgs.libnotify ];
     text = ''
       set -euo pipefail
 
@@ -202,11 +226,13 @@ let
       fi
       export GH_TOKEN="$token"
 
-      # Fail loudly if the checkout is missing (e.g. user renamed / moved).
-      if [ ! -d ${lib.escapeShellArg aggregatorRoot} ]; then
-        echo "aggregator-ingest: repo not found at ${aggregatorRoot}" >&2
-        exit 1
-      fi
+      # No checkout guard any more, and that absence is the point: the code
+      # is a store path in this unit's own closure, so it cannot be missing
+      # while the unit exists. The guard it replaces ("repo not found at
+      # ...") only ever protected against the working-tree dependency this
+      # change removed. NOTE: nothing in this script may spell a path under
+      # the home directory, not even in a comment — tests/base.nix greps
+      # the generated text, deliberately without parsing shell syntax.
 
       # CA bundle guard. The unit sets SSL_CERT_FILE (see the TLS note in
       # the header); this asserts the value still resolves to a non-empty
@@ -238,8 +264,7 @@ let
       # installs the notifier on its own. No --stale-after-days: the
       # aggregator's default of 14 days is half an export-refresh cycle,
       # which is the intended cadence here.
-      exec uv run --directory ${lib.escapeShellArg aggregatorRoot} \
-        aggregator ingest --all
+      exec ${lib.escapeShellArg aggregatorBin} ingest --all
     '';
   };
 in

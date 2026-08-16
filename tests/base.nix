@@ -661,10 +661,12 @@ in
     # pass with the notifier silently disabled — which is precisely the
     # state it exists to prevent.
     #
-    # What cannot be exercised in this VM: the aggregator CLI itself.
-    # ~/Repos/aggregator is a local-only checkout that is not in the VM
-    # closure and `uv run` has no network here, so no run of the real
-    # command can reach exit 3 from inside the test. The exit-3 -> OnFailure
+    # Since 2026-08-16 the CLI itself IS in the VM closure (the unit execs
+    # a store path built by overlays/aggregator.nix, not a checkout), so
+    # `--help` and the Presidio-path assertion below run the real binary.
+    # A full ingest still cannot run here — no network, no agenix secret,
+    # no ~/.claude/projects — so no run of the real command reaches exit 3
+    # from inside the test. The exit-3 -> OnFailure
     # edge is therefore driven by overriding ONLY ExecStart via a drop-in
     # (the [Unit] section, and with it the OnFailure edge under test, stays
     # the production one), while the wrapper half is covered by invoking the
@@ -736,11 +738,87 @@ in
     assert "ingest --all" in agg_script, (
         f"aggregator wrapper no longer drives all sources:\n{agg_script}"
     )
+    # ── The unit must run a DEPLOYED ARTIFACT, not a working tree ──
+    #
+    # Regression lock for the defect fixed on 2026-08-16. ExecStart had
+    # been a store path the whole time, and the timer still ran whatever
+    # was checked out in ~/Repos/aggregator, because the wrapper's last
+    # line was `exec uv run --directory /home/jonathan/Repos/aggregator`.
+    # Everything a reviewer would naturally glance at — the unit file, the
+    # ExecStart= line, `systemctl cat` — looked correct. Four PRs went by.
+    #
+    # So the assertion is on the wrapper's TEXT, not on ExecStart: no path
+    # under /home/ may appear in the program this unit runs, at all. The
+    # aggregator keeps its state under ~/.local/share and reads sources
+    # from ~/Dropbox etc, but it resolves those itself at runtime from
+    # $HOME — none of it belongs in the wrapper, so a blanket ban here has
+    # no legitimate casualty and no wording for a future edit to slip past.
+    assert "/home/" not in agg_script, (
+        "aggregator-ingest's wrapper references a home-directory path, so "
+        "the unit is running (or reading) a developer working tree rather "
+        "than a store path pinned in flake.lock. This is the exact defect "
+        f"the 2026-08-16 packaging change closed:\n{agg_script}"
+    )
+    # `uv run` by name, separately: it is the specific mechanism that both
+    # ran the tree AND wrote to it (venv resolve/sync, uv.lock) from an
+    # unattended systemd unit. `uv` is no longer even in runtimeInputs.
+    assert "uv run" not in agg_script, (
+        f"aggregator wrapper must not shell out to `uv run`:\n{agg_script}"
+    )
     # `exec`, so the CLI's exit status is the unit's exit status. Anything
     # that captures and re-raises the status by hand can zero it (PR #67),
-    # and a zeroed 3 is a run that dropped data reported as success.
-    assert "exec uv run" in agg_script, (
-        f"aggregator wrapper must exec the CLI so exit 3 reaches systemd:\n{agg_script}"
+    # and a zeroed 3 is a run that dropped data reported as success. The
+    # exec'd program must be a store path — parsed out and probed below.
+    agg_exec_lines = [
+        ln.strip() for ln in agg_script.splitlines() if ln.strip().startswith("exec ")
+    ]
+    assert len(agg_exec_lines) == 1, (
+        f"expected exactly one `exec` line in the wrapper:\n{agg_script}"
+    )
+    agg_cli = agg_exec_lines[0].split()[1].strip("'\"")
+    assert agg_cli.startswith("/nix/store/"), (
+        f"aggregator wrapper execs {agg_cli!r}, which is not a store path:\n{agg_script}"
+    )
+    assert agg_exec_lines[0].endswith("ingest --all"), (
+        f"aggregator wrapper no longer execs the all-sources runner:\n{agg_script}"
+    )
+
+    # Same ban on the unit body — narrower wording because a future
+    # ReadWritePaths=/home/... could be legitimate, whereas naming the
+    # checkout never is.
+    assert "Repos/aggregator" not in agg_unit, (
+        f"aggregator-ingest.service still names the dev checkout:\n{agg_unit}"
+    )
+
+    # Behavioural half: the packaged CLI runs to completion in a machine
+    # that has no aggregator checkout at all. A static path assertion
+    # cannot tell a complete deployed artifact from a store path whose
+    # dependencies live somewhere else.
+    dellan.succeed("test ! -e /home/jonathan/Repos/aggregator")
+    dellan.succeed(f"test -x {agg_cli}")
+    agg_cli_out = dellan.succeed(f"su - jonathan -c '{agg_cli} --help' 2>&1")
+    assert "ingest" in agg_cli_out, (
+        f"packaged aggregator CLI did not print its usage:\n{agg_cli_out}"
+    )
+
+    # ── Presidio must be on the FULL path, not the regex fallback ──
+    #
+    # aggregator/core/scrub.py falls back to regex-only PII detection when
+    # the spaCy model Presidio is configured for (en_core_web_lg) is not
+    # installed. That fallback is silent in every way that would surface
+    # it: the run exits 0, the row is still stamped with the
+    # "presidio+gitleaks/v1" scrub fingerprint, and nothing rescrubs it.
+    # Packaging the app is exactly the change that could drop the model —
+    # it is not on PyPI and therefore not in uv.lock — so the assertion
+    # lives here rather than in a comment. See overlays/aggregator.nix.
+    #
+    # The warning goes to stderr at import time, so `--help` above already
+    # exercised it; assert on that output rather than paying a second
+    # model load on a CI VM.
+    assert "Presidio unavailable" not in agg_cli_out, (
+        "the packaged aggregator degraded to regex-only PII scrubbing — "
+        "en_core_web_lg is missing from the closure, and a degraded scrub "
+        f"is indistinguishable from a healthy one downstream:\n{agg_cli_out}"
     )
 
     # The notifier must be reachable ONLY through OnFailure. `static` means
