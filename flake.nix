@@ -56,7 +56,7 @@
     # (tts-tool / substack-url-tool / prose-decorate each pull them); the
     # `follows` lines keep them deduplicated to one copy each.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/72ca1444442e42bf946ecaeeaaea96e3bd0644dc";
+      url = "github:jonathanmoregard/aggregator/65fdec34afa35bcebc601c0f7f3a207b71946e9f";
       flake = false;
     };
 
