@@ -174,6 +174,60 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # claude-pull — the pull half of ~/.claude's continuous delivery.
+  #
+  # ~/.claude had a push side and no pull side: sync-agent.sh (cron,
+  # 13:47) auto-commits and pushes, but nothing brought origin's commits
+  # back down. A PR merged in the GitHub UI therefore never reached the
+  # checkout that actually runs the config — skills, hooks and settings
+  # sat at the last local commit until someone pulled by hand — and once
+  # both sides had commits the daily push failed non-fast-forward.
+  #
+  # Same split as claude-idle-handoff above: the TIMER and SERVICE are
+  # declared here so a fresh rebuild re-creates the schedule, while the
+  # script lives in the ~/.claude repo (it iterates on that repo's own
+  # cadence and pinning it into the store would force a rebuild per
+  # tweak). The script is fast-forward-only by construction — unlike
+  # /etc/nixos, ~/.claude is a live working tree that sessions write to,
+  # so nixos-deploy's `git reset --hard` would destroy in-flight work.
+  systemd.user.services.claude-pull = {
+    Unit = {
+      Description = "Fast-forward ~/.claude to origin (CD for the Claude config repo)";
+      After = [ "default.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # %h expands to $HOME under home-manager's systemd --user.
+      ExecStart = "%h/.claude/scripts/claude-pull.sh";
+      # Background maintenance — never compete with an interactive session.
+      Nice = 10;
+      IOSchedulingClass = "idle";
+      # The script bounds its own fetch at 60s; this is the backstop for a
+      # hang anywhere else in the run. Comfortably under the 10min cadence
+      # so a wedged tick cannot overlap the next one.
+      TimeoutStartSec = 180;
+    };
+  };
+
+  systemd.user.timers.claude-pull = {
+    Unit.Description = "Poll origin for merged ~/.claude PRs every 10 minutes";
+    Timer = {
+      # Calendar rather than monotonic (unlike its neighbours) precisely so
+      # Persistent= applies: it has no effect on OnUnitActiveSec= timers.
+      # This is a laptop that suspends, and a merge landing while it sleeps
+      # should arrive on resume, not at the next natural boundary.
+      OnCalendar = "*:0/10";
+      Persistent = true;
+      # Nothing downstream cares about the exact second; the slack lets
+      # systemd coalesce this tick with other wakeups instead of waking the
+      # machine on its own, and keeps it out of the on-the-minute stampede.
+      AccuracySec = "1min";
+      RandomizedDelaySec = "1min";
+      Unit = "claude-pull.service";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # claude-sandbox-proxy — hostname-allowlisted HTTP/HTTPS proxy for Claude
   # sandboxes. Long-running service, started at session login.
   systemd.user.services.claude-sandbox-proxy = {
