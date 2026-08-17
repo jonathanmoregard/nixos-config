@@ -1,10 +1,23 @@
-{ pkgs }:
+{ pkgs
+, # Directories scanned for git worktrees. Every worktree found under a
+  # root is a deletion CANDIDATE; anything outside them is never touched,
+  # which is what keeps a repo's own main checkout (e.g. ~/.claude) safe.
+  roots ? [ "$HOME/Repos/nixos-config-worktrees" "$HOME/worktrees" ]
+, maxAgeDays ? 7
+}:
 
-# nixos-worktree-sweep — delete merged-and-stale nixos-config worktrees
-# and local branches. PRs merge by SQUASH, so `git branch --merged`
-# never matches; GitHub PR state is the source of truth and `branch -D`
-# (not -d) is required — which is exactly why every predicate below
-# fails closed.
+# worktree-sweep — delete merged-and-stale worktrees and local branches
+# across every repo that has a worktree under one of `roots`. PRs merge by
+# SQUASH, so `git branch --merged` never matches; GitHub PR state is the
+# source of truth and `branch -D` (not -d) is required — which is exactly
+# why every predicate below fails closed.
+#
+# Repos are DISCOVERED, not configured: each candidate worktree is resolved
+# to its owning repo via `git rev-parse --git-common-dir`, and that repo's
+# slug and default branch are read from its own git config. A new repo with
+# a worktree under a root is swept with no edit here. The cost of that
+# convenience is that both derivations must fail closed, and they do — a
+# non-GitHub remote or an unreadable repo means "keep", logged.
 #
 # FAIL-CLOSED CONTRACT (asserted by tests/worktree-sweep.nix): an item
 # is deleted only when EVERY predicate positively holds. Any error,
@@ -13,45 +26,46 @@
 # per decision.
 #
 # Worktree predicates (ALL must hold to delete):
-#   1. a merged PR exists whose headRefOid equals the local branch tip
+#   1. the worktree lives under one of `roots`
+#   2. a merged PR exists whose headRefOid equals the local branch tip
 #      — tip equality also proves no post-merge commits would be lost
 #        to `branch -D`
-#   2. branch tip commit is older than 7 days
-#   3. `git status --porcelain` is empty (no uncommitted/untracked work)
-#   4. no live process cwd (/proc/*/cwd) resolves inside the worktree
+#   3. branch tip commit is older than maxAgeDays
+#   4. `git status --porcelain` is empty (no uncommitted/untracked work)
+#   5. no live process cwd (/proc/*/cwd) resolves inside the worktree
 #      — 2026-07-07 incident: a directory deleted under a running
 #        Claude session ENOENT-broke every hook in it (posix_spawn)
 #
-# Branches without worktrees: predicates 1 + 2, then `branch -D`.
+# Branches without worktrees: predicates 2 + 3, then `branch -D`. Only
+# repos discovered through a worktree are scanned this way — a repo that
+# has never had a worktree under a root is never touched at all.
 #
 # Env overrides — FOR THE TEST HARNESS ONLY (tests/worktree-sweep.nix).
 # Production runs (the systemd user timer) must not set these:
-#   SWEEP_BARE_REPO        bare repo path
-#   SWEEP_WORKTREES_DIR    worktrees root
+#   SWEEP_ROOTS            colon-separated worktree roots (discovery mode)
+#   SWEEP_BARE_REPO        single-repo mode: sweep exactly this repo
+#   SWEEP_WORKTREES_DIR    single-repo mode: its allowed worktree root
+#   SWEEP_REPO_SLUG        single-repo mode: slug instead of deriving one
+#   SWEEP_PROTECTED_BRANCH single-repo mode: default branch to protect
 #   SWEEP_GH_BIN           gh executable (stubbed in the harness —
 #                          runtimeInputs pins the real gh ahead of
 #                          PATH, so a PATH stub can't shadow it)
 #   SWEEP_EXTRA_LIVE_CWDS  colon-separated paths treated as live cwds
 #                          IN ADDITION to the /proc scan, which always
 #                          runs (/proc can't be faked in the sandbox)
+let
+  defaultRoots = builtins.concatStringsSep ":" roots;
+in
 pkgs.writeShellApplication {
-  name = "nixos-worktree-sweep";
+  name = "worktree-sweep";
   runtimeInputs = with pkgs; [ git jq coreutils ];
   text = ''
-    BARE="''${SWEEP_BARE_REPO:-$HOME/Repos/nixos-config}"
-    WTS="''${SWEEP_WORKTREES_DIR:-$HOME/Repos/nixos-config-worktrees}"
     GH_BIN="''${SWEEP_GH_BIN:-${pkgs.gh}/bin/gh}"
-    REPO_SLUG="jonathanmoregard/nixos-config"
-    MAX_AGE_DAYS=7
+    MAX_AGE_DAYS=${toString maxAgeDays}
 
     log() { echo "[worktree-sweep] $*"; }
 
     now=$(date +%s)
-
-    if [ ! -d "$BARE" ]; then
-      log "abort: bare repo not found at $BARE — zero deletions"
-      exit 0
-    fi
 
     # Global gh gate: no auth (keyring locked, offline, token expired)
     # means the merged-PR predicate can never positively hold → do
@@ -61,24 +75,66 @@ pkgs.writeShellApplication {
       exit 0
     fi
 
-    # --- predicates ----------------------------------------------------
-    # Each check returns 0 = predicate holds, non-zero = keep; the keep
-    # reason travels in $REASON. check_merged also sets $MERGED_PR,
-    # check_age sets $AGE_DAYS (for the deletion log line).
+    # --- per-repo context ------------------------------------------------
+    # Set by sweep_repo before the predicates run.
+    REPO=""        # repo dir: a bare repo, or the main checkout's toplevel
+    SLUG=""        # owner/name on GitHub
+    PROTECTED=()   # branch names this repo must never delete
+    ROOTS=()       # worktree roots a candidate must live under
+
     REASON=""
     MERGED_PR=""
     AGE_DAYS=""
+
+    is_protected() {  # <branch>
+      local b
+      for b in "''${PROTECTED[@]}"; do
+        [ "$1" = "$b" ] && return 0
+      done
+      return 1
+    }
+
+    under_roots() {  # <path>
+      local p="$1" root
+      for root in "''${ROOTS[@]}"; do
+        [ -n "$root" ] || continue
+        case "$p" in
+          "$root"/*) return 0 ;;
+        esac
+      done
+      return 1
+    }
+
+    # owner/name from a GitHub remote URL, or non-zero for anything else.
+    # A repo whose origin is not GitHub has no PR state to consult, so it
+    # must never reach the delete path.
+    slug_from_url() {  # <url>
+      local s="$1"
+      s="''${s%.git}"
+      case "$s" in
+        *github.com[:/]*)
+          s="''${s##*github.com}"
+          s="''${s#[:/]}"
+          ;;
+        *) return 1 ;;
+      esac
+      case "$s" in
+        */*/*) return 1 ;;   # more than owner/name — not a repo slug
+        */*)   printf '%s' "$s" ;;
+        *)     return 1 ;;
+      esac
+    }
 
     check_merged() {  # <branch>
       local branch="$1" tip pr_json count match
       REASON=""
       # --verify -q: plain rev-parse echoes unresolvable refs back to
       # stdout; --verify guarantees $tip is a real oid or the guard fires.
-      if ! tip=$(git -C "$BARE" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null); then
+      if ! tip=$(git -C "$REPO" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null); then
         REASON="cannot resolve local tip — fail closed"
         return 1
       fi
-      if ! pr_json=$("$GH_BIN" pr list --repo "$REPO_SLUG" --head "$branch" \
+      if ! pr_json=$("$GH_BIN" pr list --repo "$SLUG" --head "$branch" \
                        --state merged --json number,headRefOid 2>/dev/null); then
         REASON="gh pr list failed — fail closed"
         return 1
@@ -108,7 +164,7 @@ pkgs.writeShellApplication {
     check_age() {  # <branch>
       local branch="$1" ts
       REASON=""
-      if ! ts=$(git -C "$BARE" log -1 --format=%ct "refs/heads/$branch" 2>/dev/null); then
+      if ! ts=$(git -C "$REPO" log -1 --format=%ct "refs/heads/$branch" 2>/dev/null); then
         REASON="cannot read tip commit time — fail closed"
         return 1
       fi
@@ -181,16 +237,21 @@ pkgs.writeShellApplication {
       fi
       wt_branches["$branch"]=1
 
-      if [ "$branch" = "main" ] || [ "$wt" = "$WTS/main" ]; then
-        log "kept worktree $wt (branch $branch): protected (main)"
+      if is_protected "$branch"; then
+        log "kept worktree $wt (branch $branch): protected (default branch)"
         return 0
       fi
-      case "$wt" in
-        "$WTS"/*) : ;;
-        *)
-          log "kept worktree $wt (branch $branch): outside $WTS — fail closed"
-          return 0 ;;
-      esac
+      # The repo's own checkout is never a candidate: it sits outside the
+      # roots. Belt and braces for the case where someone points a root at
+      # a repo's parent directory anyway.
+      if [ "$wt" = "$REPO" ]; then
+        log "kept worktree $wt (branch $branch): the repo's own checkout"
+        return 0
+      fi
+      if ! under_roots "$wt"; then
+        log "kept worktree $wt (branch $branch): outside the swept roots — fail closed"
+        return 0
+      fi
       if [ "$is_locked" = "1" ]; then
         log "kept worktree $wt (branch $branch): locked"
         return 0
@@ -223,59 +284,143 @@ pkgs.writeShellApplication {
 
       # All predicates hold. Non-force remove: git re-verifies the tree
       # is clean, a last belt against TOCTOU between check and delete.
-      if ! git -C "$BARE" worktree remove "$wt" 2>/dev/null; then
+      if ! git -C "$REPO" worktree remove "$wt" 2>/dev/null; then
         log "kept worktree $wt (branch $branch): git worktree remove refused — fail closed"
         return 0
       fi
-      if git -C "$BARE" branch -D "$branch" >/dev/null 2>&1; then
+      if git -C "$REPO" branch -D "$branch" >/dev/null 2>&1; then
         log "deleted worktree $wt + branch $branch (PR #$MERGED_PR merged at this tip, ''${AGE_DAYS}d old, clean, no live cwd)"
       else
         log "deleted worktree $wt; branch $branch delete FAILED — manual cleanup needed"
       fi
     }
 
-    # Snapshot the list before mutating it (worktree remove during
-    # iteration would race a streamed read).
-    worktree_dump=$(git -C "$BARE" worktree list --porcelain)
+    sweep_repo() {  # <repo-dir>
+      local repo="$1" url derived head
+      REPO="$repo"
+      SLUG=""
+      PROTECTED=(main master)
+      wt_branches=()
 
-    cur_wt=""; cur_branch=""; cur_bare=0; cur_detached=0; cur_locked=0
-    flush() {
-      [ -n "$cur_wt" ] || return 0
-      process_worktree "$cur_wt" "$cur_branch" "$cur_bare" "$cur_detached" "$cur_locked"
-      cur_wt=""; cur_branch=""; cur_bare=0; cur_detached=0; cur_locked=0
-    }
-    while IFS= read -r line; do
-      case "$line" in
-        "worktree "*)          flush; cur_wt="''${line#worktree }" ;;
-        "branch refs/heads/"*) cur_branch="''${line#branch refs/heads/}" ;;
-        bare)                  cur_bare=1 ;;
-        detached)              cur_detached=1 ;;
-        locked*)               cur_locked=1 ;;
-      esac
-    done <<<"$worktree_dump"
-    flush
-
-    # --- phase 2: local branches without worktrees ------------------------
-    branch_dump=$(git -C "$BARE" for-each-ref refs/heads --format='%(refname:short)')
-
-    while IFS= read -r branch; do
-      [ -n "$branch" ] || continue
-      [ "$branch" = "main" ] && continue
-      [ -n "''${wt_branches[$branch]+x}" ] && continue  # decided in phase 1
-      if ! check_merged "$branch"; then
-        log "kept branch $branch: $REASON"
-        continue
-      fi
-      if ! check_age "$branch"; then
-        log "kept branch $branch: $REASON"
-        continue
-      fi
-      if git -C "$BARE" branch -D "$branch" >/dev/null 2>&1; then
-        log "deleted branch $branch (PR #$MERGED_PR merged at this tip, ''${AGE_DAYS}d old, no worktree)"
+      if [ -n "''${SWEEP_REPO_SLUG:-}" ]; then
+        SLUG="$SWEEP_REPO_SLUG"
       else
-        log "kept branch $branch: git branch -D failed — fail closed"
+        if ! url=$(git -C "$repo" remote get-url origin 2>/dev/null); then
+          log "skipped repo $repo: no origin remote — fail closed"
+          return 0
+        fi
+        if ! derived=$(slug_from_url "$url"); then
+          log "skipped repo $repo: origin '$url' is not a GitHub repo — no PR state to consult, fail closed"
+          return 0
+        fi
+        SLUG="$derived"
       fi
-    done <<<"$branch_dump"
+
+      # The default branch is protected on top of main/master. Unresolvable
+      # origin/HEAD (never set locally by `git remote set-head`) is common
+      # and not itself dangerous — every deletion still needs a merged PR at
+      # the same tip — so fall back rather than skip, and say so.
+      if [ -n "''${SWEEP_PROTECTED_BRANCH:-}" ]; then
+        PROTECTED=("$SWEEP_PROTECTED_BRANCH")
+      elif head=$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null); then
+        PROTECTED+=("''${head#origin/}")
+      else
+        log "note: $SLUG has no origin/HEAD — protecting main and master by name"
+      fi
+
+      log "sweeping $SLUG (repo $repo)"
+
+      # Snapshot the list before mutating it (worktree remove during
+      # iteration would race a streamed read).
+      local worktree_dump cur_wt cur_branch cur_bare cur_detached cur_locked line branch branch_dump
+      if ! worktree_dump=$(git -C "$repo" worktree list --porcelain 2>/dev/null); then
+        log "skipped repo $repo: worktree list failed — fail closed"
+        return 0
+      fi
+
+      cur_wt=""; cur_branch=""; cur_bare=0; cur_detached=0; cur_locked=0
+      flush() {
+        [ -n "$cur_wt" ] || return 0
+        process_worktree "$cur_wt" "$cur_branch" "$cur_bare" "$cur_detached" "$cur_locked"
+        cur_wt=""; cur_branch=""; cur_bare=0; cur_detached=0; cur_locked=0
+      }
+      while IFS= read -r line; do
+        case "$line" in
+          "worktree "*)          flush; cur_wt="''${line#worktree }" ;;
+          "branch refs/heads/"*) cur_branch="''${line#branch refs/heads/}" ;;
+          bare)                  cur_bare=1 ;;
+          detached)              cur_detached=1 ;;
+          locked*)               cur_locked=1 ;;
+        esac
+      done <<<"$worktree_dump"
+      flush
+
+      # --- phase 2: local branches without worktrees ----------------------
+      branch_dump=$(git -C "$repo" for-each-ref refs/heads --format='%(refname:short)')
+
+      while IFS= read -r branch; do
+        [ -n "$branch" ] || continue
+        is_protected "$branch" && continue
+        [ -n "''${wt_branches[$branch]+x}" ] && continue  # decided in phase 1
+        if ! check_merged "$branch"; then
+          log "kept branch $branch: $REASON"
+          continue
+        fi
+        if ! check_age "$branch"; then
+          log "kept branch $branch: $REASON"
+          continue
+        fi
+        if git -C "$repo" branch -D "$branch" >/dev/null 2>&1; then
+          log "deleted branch $branch (PR #$MERGED_PR merged at this tip, ''${AGE_DAYS}d old, no worktree)"
+        else
+          log "kept branch $branch: git branch -D failed — fail closed"
+        fi
+      done <<<"$branch_dump"
+    }
+
+    # --- target selection -------------------------------------------------
+    # Single-repo mode (harness) sweeps exactly the repo it is handed.
+    # Otherwise every repo owning a worktree under a root is discovered:
+    # the repo list is not configured anywhere, so a new repo needs no
+    # edit here to be swept.
+    declare -A seen_repos=()
+    repos=()
+
+    if [ -n "''${SWEEP_BARE_REPO:-}" ]; then
+      IFS=':' read -r -a ROOTS <<<"''${SWEEP_WORKTREES_DIR:-}"
+      : "''${SWEEP_REPO_SLUG:=jonathanmoregard/nixos-config}"
+      : "''${SWEEP_PROTECTED_BRANCH:=main}"
+      export SWEEP_REPO_SLUG SWEEP_PROTECTED_BRANCH
+      if [ ! -d "$SWEEP_BARE_REPO" ]; then
+        log "abort: repo not found at $SWEEP_BARE_REPO — zero deletions"
+        exit 0
+      fi
+      repos=("$SWEEP_BARE_REPO")
+    else
+      IFS=':' read -r -a ROOTS <<<"''${SWEEP_ROOTS:-${defaultRoots}}"
+      for root in "''${ROOTS[@]}"; do
+        [ -d "$root" ] || { log "root $root does not exist — skipping"; continue; }
+        for candidate in "$root"/*/; do
+          candidate="''${candidate%/}"
+          [ -d "$candidate" ] || continue
+          # git-common-dir resolves a linked worktree to its owner: the
+          # bare repo itself, or <toplevel>/.git for a normal checkout.
+          common=$(git -C "$candidate" rev-parse --path-format=absolute \
+                     --git-common-dir 2>/dev/null) || continue
+          owner="''${common%/.git}"
+          [ -d "$owner" ] || continue
+          if [ -z "''${seen_repos[$owner]+x}" ]; then
+            seen_repos["$owner"]=1
+            repos+=("$owner")
+          fi
+        done
+      done
+      log "discovered ''${#repos[@]} repo(s) with worktrees under: ''${ROOTS[*]}"
+    fi
+
+    for repo in "''${repos[@]}"; do
+      sweep_repo "$repo"
+    done
 
     log "sweep complete"
   '';

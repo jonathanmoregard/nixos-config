@@ -221,15 +221,21 @@ can't model (touchpad, GPU, LUKS), emergency rollback
 git -C ~/Repos/nixos-config worktree remove ~/Repos/nixos-config-worktrees/<slug>
 ```
 
-Stale worktrees waste disk; the daily `nixos-worktree-sweep` systemd
-user timer (home/worktree-sweep.nix) removes a worktree + its branch
-only when ALL of: its PR is merged with the merged head matching the
-local tip, the tip commit is >7 days old, `git status --porcelain` is
-empty, and no live process has its cwd inside. It also deletes
-worktree-less local branches whose PR is merged and tip is >7 days
-old. Everything else is kept with a journal-logged reason
-(`journalctl --user -u nixos-worktree-sweep`); a gh outage means zero
-deletions. Still tidier to remove eagerly.
+Stale worktrees waste disk; the daily `worktree-sweep` systemd user
+timer (home/worktree-sweep.nix) removes a worktree + its branch only
+when ALL of: its PR is merged with the merged head matching the local
+tip, the tip commit is >7 days old, `git status --porcelain` is empty,
+and no live process has its cwd inside. It also deletes worktree-less
+local branches whose PR is merged and tip is >7 days old. Everything
+else is kept with a journal-logged reason (`journalctl --user -u
+worktree-sweep`); a gh outage means zero deletions. Still tidier to
+remove eagerly.
+
+It is not nixos-config-only: every repo with a worktree under
+`~/Repos/nixos-config-worktrees` or `~/worktrees` is discovered and
+swept under the same predicates, with the repo's slug and default
+branch read from its own git config. A repo whose origin is not GitHub
+is skipped entirely — there is no PR state to fail closed against.
 
 ## Failure-mode quick reference
 

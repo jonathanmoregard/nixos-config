@@ -25,18 +25,28 @@
 #   branch w/o worktree: unmerged / young  → kept, logged
 #   gh outage (auth check fails)           → ZERO deletions
 #
+# Run 3 covers discovery mode (the production path since 2026-08-17):
+# repos are found from the worktree roots rather than named, so the
+# harness also asserts the derivations that discovery adds —
+#
+#   two repos under one root            → both swept in one run
+#   repo's own main checkout            → never a candidate (outside roots)
+#   non-default branch (master) repo    → its default branch protected
+#   non-GitHub origin                   → repo skipped entirely, logged
+#   worktree outside every root         → kept, logged
+#
 # Run: nix build .#checks.x86_64-linux.worktree-sweep -L
 { pkgs, sweepScript, deployedExecStart }:
 
 pkgs.runCommand "worktree-sweep-harness"
   {
     inherit deployedExecStart;
-    sweep = "${sweepScript}/bin/nixos-worktree-sweep";
+    sweep = "${sweepScript}/bin/worktree-sweep";
     nativeBuildInputs = with pkgs; [ bash git jq coreutils gnugrep ];
   } ''
     fail() {
       echo "FAIL: $*"
-      for f in run1.log run2.log gh.log; do
+      for f in run1.log run2.log run3.log gh.log; do
         [ -f "$f" ] && { echo "=== $f ==="; cat "$f"; }
       done
       exit 1
@@ -126,7 +136,15 @@ pkgs.runCommand "worktree-sweep-harness"
       tip-mismatch)
         echo '[{"number":77,"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}]' ;;
       *)
-        tip=$(git -C "$FIXTURE_BARE" rev-parse "refs/heads/$head")
+        # Run 3 sweeps several repos in one invocation, so the tip is
+        # resolved from whichever fixture repo knows the branch.
+        dirs="''${FIXTURE_REPO_DIRS:-$FIXTURE_BARE}"
+        tip=""
+        for r in $(echo "$dirs" | tr ':' ' '); do
+          t=$(git -C "$r" rev-parse "refs/heads/$head" 2>/dev/null) || continue
+          tip="$t"; break
+        done
+        [ -n "$tip" ] || { echo "[]"; exit 0; }
         printf '[{"number":42,"headRefOid":"%s"}]\n' "$tip" ;;
     esac
     STUB
@@ -242,6 +260,113 @@ pkgs.runCommand "worktree-sweep-harness"
     grep -q "gh auth unavailable" run2.log \
       || fail "gh-down run did not log the outage reason"
 
-    echo "ok: delete fired only on merged+old+clean+no-cwd; every failure mode kept + logged; gh outage = zero deletions"
+    # =====================================================================
+    # Run 3: discovery mode — repos found from the roots, not named
+    # =====================================================================
+    # Three repos, each a normal checkout OUTSIDE the swept root with its
+    # worktrees INSIDE it. That layout is the production one (~/.claude
+    # and ~/worktrees) and is what keeps a repo's own checkout safe: it is
+    # never a candidate because it never lives under a root.
+    ROOT3="$PWD/fix3/roots"
+    mkdir -p "$ROOT3"
+
+    mkrepo3() {  # <name> <default-branch> <origin-url>
+      local name="$1" defbranch="$2" url="$3"
+      local seed="$PWD/fix3/seed-$name" repo="$PWD/fix3/$name"
+      git init -q -b "$defbranch" "$seed"
+      git -C "$seed" commit -q --allow-empty -m init
+      git clone -q "$seed" "$repo"           # sets refs/remotes/origin/HEAD
+      git -C "$repo" remote set-url origin "$url"
+    }
+
+    mkwt3() {  # <repo-name> <branch> <worktree-path> <commit-date>
+      local repo="$PWD/fix3/$1" branch="$2" path="$3" date="$4"
+      git -C "$repo" worktree add -q -b "$branch" "$path"
+      echo "$branch" > "$path/file.txt"
+      git -C "$path" add file.txt
+      GIT_AUTHOR_DATE="$date" GIT_COMMITTER_DATE="$date" \
+        git -C "$path" commit -qm "work on $branch"
+    }
+
+    # A standalone CLONE sitting under a root, checked out on a merged,
+    # old, clean feature branch. ~/Repos/nixos-config-worktrees holds one
+    # of these (scraper-microvm) — discovery resolves it to a repo whose
+    # only "worktree" is itself, so without the own-checkout guard the
+    # sweep would try to delete a full clone, objects and all. Its own
+    # unpushed commits are invisible to `git status`, so this fails closed
+    # regardless of the other predicates.
+    mkstandalone3() {  # <path> <branch> <commit-date>
+      local path="$1" branch="$2" date="$3" seed="$PWD/fix3/seed-standalone"
+      git init -q -b main "$seed"
+      git -C "$seed" commit -q --allow-empty -m init
+      git clone -q "$seed" "$path"
+      git -C "$path" remote set-url origin "git@github.com:jonathanmoregard/standalone.git"
+      git -C "$path" checkout -q -b "$branch"
+      echo standalone > "$path/file.txt"
+      git -C "$path" add file.txt
+      GIT_AUTHOR_DATE="$date" GIT_COMMITTER_DATE="$date" \
+        git -C "$path" commit -qm "work on $branch"
+    }
+
+    mkrepo3 repoA main   "git@github.com:jonathanmoregard/nixos-config.git"
+    mkrepo3 repoB master "https://github.com/jonathanmoregard/dotclaude.git"
+    mkrepo3 repoC main   "$PWD/fix3/seed-repoC"   # not GitHub → no PR state
+
+    mkwt3 repoA feat/a-merged-old "$ROOT3/a-merged-old" "$OLD"
+    mkwt3 repoA feat/a-outside    "$PWD/fix3/outside"   "$OLD"
+    mkwt3 repoB feat/b-merged-old "$ROOT3/b-merged-old" "$OLD"
+    mkwt3 repoC feat/c-merged-old "$ROOT3/c-merged-old" "$OLD"
+    mkstandalone3 "$ROOT3/standalone" feat/d-standalone "$OLD"
+
+    FIXTURE_REPO_DIRS="$PWD/fix3/repoA:$PWD/fix3/repoB:$PWD/fix3/repoC:$ROOT3/standalone" \
+    SWEEP_ROOTS="$ROOT3" \
+    SWEEP_GH_BIN="$PWD/bin/gh" \
+      "$sweep" > run3.log 2>&1 || fail "sweep exited non-zero on run 3"
+
+    echo "=== run 3 (discovery) decisions ==="
+    cat run3.log
+
+    # 12. every repo owning a worktree under the root is swept in one run
+    [ ! -e "$ROOT3/a-merged-old" ] || fail "repoA worktree survived discovery-mode sweep"
+    [ ! -e "$ROOT3/b-merged-old" ] || fail "repoB worktree survived — only the first repo was swept?"
+    if git -C "$PWD/fix3/repoA" show-ref --verify -q refs/heads/feat/a-merged-old
+      then fail "repoA branch survived"; fi
+    if git -C "$PWD/fix3/repoB" show-ref --verify -q refs/heads/feat/b-merged-old
+      then fail "repoB branch survived"; fi
+
+    # 13. per-repo slug derivation: repoB was queried under its OWN slug
+    grep -q -- "--repo jonathanmoregard/dotclaude" gh.log \
+      || fail "repoB was not queried with its derived slug"
+
+    # 14. each repo's own checkout and default branch are untouched —
+    #     repoB's default is master, which the old main-only guard missed
+    for r in repoA repoB repoC; do
+      [ -d "$PWD/fix3/$r" ] || fail "$r checkout was deleted"
+    done
+    git -C "$PWD/fix3/repoB" show-ref --verify -q refs/heads/master \
+      || fail "repoB's default branch (master) was deleted"
+    git -C "$PWD/fix3/repoA" show-ref --verify -q refs/heads/main \
+      || fail "repoA's default branch was deleted"
+
+    # 15. non-GitHub origin → whole repo skipped, nothing deleted, logged
+    [ -d "$ROOT3/c-merged-old" ] || fail "repoC worktree deleted despite non-GitHub origin"
+    grep -q "is not a GitHub repo" run3.log \
+      || fail "no skip log line for the non-GitHub repo"
+
+    # 16. a standalone clone under a root is never its own deletion
+    #     candidate, however merged/old/clean its branch looks
+    [ -d "$ROOT3/standalone" ] || fail "standalone clone under the root was deleted"
+    [ -f "$ROOT3/standalone/file.txt" ] || fail "standalone clone lost its content"
+    git -C "$ROOT3/standalone" show-ref --verify -q refs/heads/feat/d-standalone \
+      || fail "standalone clone's branch was deleted"
+    grep -qF "the repo's own checkout" run3.log \
+      || fail "no kept log line for the standalone clone"
+
+    # 17. worktree outside every root → kept, logged
+    [ -d "$PWD/fix3/outside" ] || fail "worktree outside the roots was deleted"
+    grep -qF "outside the swept roots" run3.log \
+      || fail "no kept log line for the out-of-root worktree"
+
+    echo "ok: delete fired only on merged+old+clean+no-cwd; every failure mode kept + logged; gh outage = zero deletions; discovery sweeps every repo under the roots and skips the rest"
     touch $out
   ''
