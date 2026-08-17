@@ -1119,6 +1119,63 @@ in
             f"claude-idle-handoff.service lost '{marker}':\n{handoff_service}"
         )
 
+    # claude-pull — the pull half of ~/.claude's continuous delivery.
+    # sync-agent.sh (cron) only ever pushed, so a PR merged in the GitHub
+    # UI never reached this machine: skills, hooks and settings stayed at
+    # the last local commit until someone pulled by hand, and once both
+    # sides had commits the daily auto-push started failing
+    # non-fast-forward. Same split as claude-idle-handoff above — timer +
+    # unit are nix-managed so a fresh host re-creates the schedule, while
+    # the script (~/.claude/scripts/claude-pull.sh) lives in the ~/.claude
+    # repo and is therefore outside the VM closure.
+    #
+    # What this lane can prove: the schedule and the exact ExecStart the
+    # timer will call. The OnCalendar + Persistent pairing is the
+    # load-bearing part and the reason this is not a monotonic timer like
+    # its neighbours — Persistent= only has an effect on OnCalendar=, and
+    # this machine is a laptop that suspends. Without catch-up, a merge
+    # that lands while it is asleep waits for the next natural boundary
+    # instead of arriving on resume. The script's own behaviour
+    # (fast-forward-only, divergence refusal, lock contention,
+    # fetch-failure threshold) is covered by tests/test_claude_pull.sh in
+    # the ~/.claude repo.
+    assert "claude-pull.timer" in timers, (
+        f"claude-pull.timer missing from user timer list:\n{timers}"
+    )
+    pull_timer = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-pull.timer'"
+    )
+    for marker in [
+        "OnCalendar=*:0/10",
+        "Persistent=true",
+        "Unit=claude-pull.service",
+    ]:
+        assert marker in pull_timer, (
+            f"claude-pull.timer lost '{marker}':\n{pull_timer}"
+        )
+    for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
+        got = dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"systemctl --user {prop} claude-pull.timer'"
+        ).strip()
+        assert got == expected, (
+            f"claude-pull.timer {prop}={got!r}, expected {expected!r} "
+            f"— merged PRs would never reach the host"
+        )
+    pull_service = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-pull.service'"
+    )
+    for marker in [
+        "Type=oneshot",
+        "ExecStart=%h/.claude/scripts/claude-pull.sh",
+        "TimeoutStartSec=",
+    ]:
+        assert marker in pull_service, (
+            f"claude-pull.service lost '{marker}':\n{pull_service}"
+        )
+
     # sota-watch-refresh-roster — parallel unit + timer that refreshes
     # the AI power-users roster from the source Google Sheet ahead of
     # the research runner. Same guard-path shape as sota-watch: missing
