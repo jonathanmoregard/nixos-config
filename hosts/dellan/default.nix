@@ -80,7 +80,18 @@
     # Consumes age.secrets.github-readonly-pat declared below; ticktick
     # reads its own token from ~/.config/todo/env and gets no secret here.
     ../../modules/nixos/aggregator-ingest-timer.nix
+
+    # `claude-egress-observe` — phase 1 of the Claude Code egress
+    # control: an nftables OUTPUT rule scoped by cgroup to
+    # claude-egress.slice that LOGS every new outbound connection and
+    # blocks nothing. The launcher half (the zsh functions that put the
+    # session in that slice) is home/claude-egress-slice.nix. Phase 2
+    # flips this to `drop` in a separate PR, using the allowlist this
+    # phase's data produces.
+    ../../modules/nixos/claude-egress-observe.nix
   ];
+
+  services.claudeEgressObserve.enable = true;
 
   # ---------------------------------------------------------------------
   # agenix-rekey per-host config.

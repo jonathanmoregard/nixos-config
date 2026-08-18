@@ -197,6 +197,7 @@
         vm-microvm      = mkLane ./tests/microvm.nix;
         vm-listen-tools = mkLane ./tests/listen-tools.nix;
         vm-android-dev  = mkLane ./tests/android-dev.nix;
+        vm-claude-egress = mkLane ./tests/claude-egress.nix;
         # Not a VM lane: runtime-invocation harness for the research-agent
         # guest's egress-init script (offline-resilience contract). Cheap
         # runCommand; seconds, not minutes.
