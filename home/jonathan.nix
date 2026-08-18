@@ -83,16 +83,27 @@
       # during a recursive clone. No repo here uses submodules.
       submodule.recurse = false;
 
-      # NOT set: safe.bareRepository = "explicit". It was in the original
-      # hardening pass (#184) and had to be reverted — this host keeps a
-      # real bare repo at ~/Repos/nixos-config and drives the entire
-      # worktree -> PR flow through it, so `git -C ~/Repos/nixos-config
-      # worktree add` is a first-class workflow, not the embedded-bare-repo
-      # attack the setting exists to stop. Unlike safe.directory there is
-      # no per-path allowlist for it, so it is all-or-nothing, and the
-      # trade is not worth it here. tests/base.nix asserts the workflow
-      # keeps working rather than asserting the setting is absent, so any
-      # future reintroduction fails the gate on behaviour.
+      # Refuse to treat a directory as a bare repo unless GIT_DIR names it.
+      # Stops the embedded-bare-repo trick: a hostile repo commits a bare
+      # repo directory inside itself, git discovery picks it up, and an
+      # ordinary `git status` in that tree runs the attacker's hooks,
+      # core.fsmonitor and diff.external.
+      #
+      # This shipped once in #184 and had to be reverted — it broke
+      # `git -C ~/Repos/nixos-config worktree add`, which was how every
+      # change to this repo started. Reinstated here only because the
+      # callers now anchor on the `main` worktree instead of the bare
+      # directory: same refs, same worktree list, no discovery of a bare
+      # repo requested. See home/worktree-sweep-script.nix and the
+      # nixos-config-dev skill. The bare repo itself is unchanged and is
+      # still the shared object store.
+      #
+      # `git worktree add` from a linked worktree is the supported path;
+      # GIT_DIR=<bare> remains the escape hatch for the one bootstrap case
+      # (recreating the `main` worktree itself). tests/base.nix asserts the
+      # workflow rather than the setting, so a future change that breaks the
+      # flow fails the gate whatever it is called.
+      safe.bareRepository = "explicit";
 
       # Never guess an identity from hostname/username. An agent commit
       # carries the configured author or it fails loudly, rather than
@@ -244,6 +255,15 @@
       # Use `claudee` to start a fresh session.
       claude()  { clear; command claude --continue "$@"; }
       claudee() { clear; command claude "$@"; }
+
+      # nixos-config git anchor. safe.bareRepository = explicit means
+      # `git -C ~/Repos/nixos-config ...` is refused, so worktree operations
+      # address the `main` browse worktree instead — same refs, same
+      # worktree list. Here so the long path is not muscle memory:
+      #   ncfg worktree add ~/Repos/nixos-config-worktrees/foo -b feat/foo main
+      #   ncfg worktree remove ~/Repos/nixos-config-worktrees/foo
+      #   ncfg worktree list
+      ncfg() { git -C "$HOME/Repos/nixos-config-worktrees/main" "$@"; }
     '';
 
     envExtra = ''

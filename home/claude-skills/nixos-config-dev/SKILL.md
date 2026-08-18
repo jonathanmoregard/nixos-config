@@ -21,9 +21,11 @@ create one (see "Standard flow" below).
 ## The repo layout (you cannot edit /etc/nixos directly)
 
 ```
-~/Repos/nixos-config/                    ← bare repo (no working tree)
+~/Repos/nixos-config/                    ← bare repo (object store only —
+                                           NEVER address it directly)
 ~/Repos/nixos-config-worktrees/
-    main/                                ← read-only browse
+    main/                                ← browse checkout AND the git
+                                           anchor for every worktree command
     <branch-slug>/                       ← work happens here, one per branch
 /etc/nixos/                              ← root-owned; auto-deployed from
                                            origin/main on push:main events
@@ -34,12 +36,52 @@ on every merge to `main`. Edits there are pointless (overwritten on next
 deploy) and require sudo. `~/Repos/nixos-config/` is bare — there's
 literally no working tree to edit. **Always work in a worktree.**
 
+**The anchor rule.** `safe.bareRepository = "explicit"`
+(home/jonathan.nix) stops git from *discovering* a bare directory as a
+starting point — that is the embedded-bare-repo attack, where a hostile
+repo ships a bare repo inside itself and an ordinary `git status` in that
+tree runs the attacker's hooks and `core.fsmonitor`. The cost is that
+`git -C ~/Repos/nixos-config …` is refused outright:
+
+```
+fatal: cannot use bare repository '/home/jonathan/Repos/nixos-config'
+       (safe.bareRepository is 'explicit')
+```
+
+So **address `~/Repos/nixos-config-worktrees/main` instead**. It reaches
+the same refs and the same worktree list through the same bare repo —
+verified identical, 84 branches and 74 worktrees from either — without
+requesting that discovery. The `ncfg` shell function is that path
+pre-bound:
+
+```bash
+ncfg worktree list
+ncfg worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
+ncfg worktree remove ~/Repos/nixos-config-worktrees/<slug>
+```
+
+The single exception is recreating the `main` worktree itself, which has
+no anchor to use yet. Name GIT_DIR explicitly — that is the escape hatch
+`explicit` is defined around:
+
+```bash
+GIT_DIR=~/Repos/nixos-config git worktree add ~/Repos/nixos-config-worktrees/main main
+```
+
+This bit at least once: PR #184 shipped the setting without moving the
+callers, which broke every worktree operation and silently turned the
+daily `nixos-worktree-sweep` into a no-op. `tests/base.nix` now asserts
+the anchor lifecycle AND that bare discovery is still refused; the
+worktree-sweep harness runs under the real setting.
+
 ## Standard flow
 
 ```bash
-# 1. New worktree off main
-cd ~/Repos/nixos-config
-git worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
+# 1. New worktree off main — anchored on the main worktree, NOT the bare
+#    repo (see "The anchor rule" above). `ncfg` is the same command with
+#    the anchor pre-bound.
+git -C ~/Repos/nixos-config-worktrees/main \
+    worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
 cd ~/Repos/nixos-config-worktrees/<slug>
 
 # 2. Plan + edit
@@ -218,7 +260,7 @@ can't model (touchpad, GPU, LUKS), emergency rollback
 ## Cleanup after PR closes
 
 ```bash
-git -C ~/Repos/nixos-config worktree remove ~/Repos/nixos-config-worktrees/<slug>
+git -C ~/Repos/nixos-config-worktrees/main worktree remove ~/Repos/nixos-config-worktrees/<slug>
 ```
 
 Stale worktrees waste disk; the daily `nixos-worktree-sweep` systemd

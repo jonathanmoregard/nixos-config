@@ -52,36 +52,52 @@ pkgs.runCommand "worktree-sweep-harness"
     git config --global user.email "harness@example.invalid"
     git config --global user.name "harness"
     git config --global init.defaultBranch main
+    # Model production, not a permissive sandbox. home/jonathan.nix sets
+    # this, and it is precisely what broke the sweep once: every
+    # `git -C <bare-repo>` call returns "cannot use bare repository" and the
+    # fail-closed predicates below turn the whole run into a silent no-op.
+    # Without this line the harness passes against a bare anchor that cannot
+    # work on the real host.
+    git config --global safe.bareRepository explicit
 
     OLD=$(date -d "10 days ago" +%Y-%m-%dT%H:%M:%S)
     NEW=$(date -d "1 day ago" +%Y-%m-%dT%H:%M:%S)
 
     # --- fixture: bare repo + registered worktrees, real layout ---------
+    # The bare repo stays — it is still the shared object store on the real
+    # host. What changed is the ANCHOR: every command addresses the `main`
+    # worktree instead of the bare directory, because safe.bareRepository
+    # above forbids discovering the latter. Same refs, same worktree list.
     mkfixture() {
       local root="$1"
       local bare="$root/nixos-config"
       local wts="$root/nixos-config-worktrees"
+      local anchor="$wts/main"
       mkdir -p "$root"
       git init -q "$root/seed"
       git -C "$root/seed" commit -q --allow-empty -m init
       git clone -q --bare "$root/seed" "$bare"
       mkdir -p "$wts"
-      git -C "$bare" worktree add -q "$wts/main" main
+      # Bootstrap only. Creating the first worktree is the one operation
+      # with no anchor to use yet, and naming GIT_DIR explicitly is exactly
+      # the escape hatch `explicit` is defined around. Everything after this
+      # goes through $anchor.
+      GIT_DIR="$bare" git worktree add -q "$anchor" main
 
       mkwt() {  # <name> <commit-date>
-        git -C "$bare" worktree add -q -b "feat/$1" "$wts/$1" main
+        git -C "$anchor" worktree add -q -b "feat/$1" "$wts/$1" main
         echo "$1" > "$wts/$1/file.txt"
         git -C "$wts/$1" add file.txt
         GIT_AUTHOR_DATE="$2" GIT_COMMITTER_DATE="$2" \
           git -C "$wts/$1" commit -qm "work on $1"
       }
       mkbranch() {  # <name> <commit-date> — branch with NO worktree
-        git -C "$bare" worktree add -q -b "feat/$1" "$root/tmp-$1" main
+        git -C "$anchor" worktree add -q -b "feat/$1" "$root/tmp-$1" main
         echo "$1" > "$root/tmp-$1/file.txt"
         git -C "$root/tmp-$1" add file.txt
         GIT_AUTHOR_DATE="$2" GIT_COMMITTER_DATE="$2" \
           git -C "$root/tmp-$1" commit -qm "work on $1"
-        git -C "$bare" worktree remove "$root/tmp-$1"
+        git -C "$anchor" worktree remove "$root/tmp-$1"
       }
 
       mkwt merged-old-clean "$OLD"
@@ -126,7 +142,7 @@ pkgs.runCommand "worktree-sweep-harness"
       tip-mismatch)
         echo '[{"number":77,"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}]' ;;
       *)
-        tip=$(git -C "$FIXTURE_BARE" rev-parse "refs/heads/$head")
+        tip=$(git -C "$FIXTURE_ANCHOR" rev-parse "refs/heads/$head")
         printf '[{"number":42,"headRefOid":"%s"}]\n' "$tip" ;;
     esac
     STUB
@@ -136,10 +152,10 @@ pkgs.runCommand "worktree-sweep-harness"
     # Run 1: gh healthy — mixed keep/delete decisions
     # =====================================================================
     mkfixture "$PWD/fix1"
-    export FIXTURE_BARE="$PWD/fix1/nixos-config"
+    export FIXTURE_ANCHOR="$PWD/fix1/nixos-config-worktrees/main"
     WTS1="$PWD/fix1/nixos-config-worktrees"
 
-    SWEEP_BARE_REPO="$FIXTURE_BARE" \
+    SWEEP_REPO="$FIXTURE_ANCHOR" \
     SWEEP_WORKTREES_DIR="$WTS1" \
     SWEEP_GH_BIN="$PWD/bin/gh" \
     SWEEP_EXTRA_LIVE_CWDS="$WTS1/live-cwd" \
@@ -148,7 +164,7 @@ pkgs.runCommand "worktree-sweep-harness"
     echo "=== run 1 decisions ==="
     cat run1.log
 
-    has_branch() { git -C "$FIXTURE_BARE" show-ref --verify -q "refs/heads/$1"; }
+    has_branch() { git -C "$FIXTURE_ANCHOR" show-ref --verify -q "refs/heads/$1"; }
 
     # 1. all predicates hold → worktree AND branch deleted
     [ ! -e "$WTS1/merged-old-clean" ] || fail "merged-old-clean worktree survived"
@@ -216,12 +232,12 @@ pkgs.runCommand "worktree-sweep-harness"
     # Run 2: gh outage — MUST mean zero deletions
     # =====================================================================
     mkfixture "$PWD/fix2"
-    FIX2_BARE="$PWD/fix2/nixos-config"
+    FIX2_ANCHOR="$PWD/fix2/nixos-config-worktrees/main"
     WTS2="$PWD/fix2/nixos-config-worktrees"
 
     GH_STUB_DOWN=1 \
-    FIXTURE_BARE="$FIX2_BARE" \
-    SWEEP_BARE_REPO="$FIX2_BARE" \
+    FIXTURE_ANCHOR="$FIX2_ANCHOR" \
+    SWEEP_REPO="$FIX2_ANCHOR" \
     SWEEP_WORKTREES_DIR="$WTS2" \
     SWEEP_GH_BIN="$PWD/bin/gh" \
       "$sweep" > run2.log 2>&1 || fail "sweep exited non-zero during gh outage"
@@ -236,7 +252,7 @@ pkgs.runCommand "worktree-sweep-harness"
     for b in main feat/merged-old-clean feat/dirty feat/live-cwd feat/gh-fails \
              feat/unmerged feat/merged-recent feat/tip-mismatch \
              feat/branch-merged-old feat/branch-unmerged feat/branch-recent; do
-      git -C "$FIX2_BARE" show-ref --verify -q "refs/heads/$b" \
+      git -C "$FIX2_ANCHOR" show-ref --verify -q "refs/heads/$b" \
         || fail "gh-down run deleted branch $b"
     done
     grep -q "gh auth unavailable" run2.log \
