@@ -37,12 +37,104 @@
       credential."https://github.com".helper = "!/run/current-system/sw/bin/gh auth git-credential";
       core.hooksPath = "~/.config/git/hooks";
       core.excludesfile = "~/.config/git/ignore";
+
+      # ── Hardening ──────────────────────────────────────────────────
+      # Agents author branches on this machine and clone third-party
+      # repos into it, so a repo-local git setting is attacker-supplied
+      # input. Everything below is either an integrity check or a
+      # default-deny; none of it changes how a normal fetch/commit/push
+      # behaves. Behaviour-changing items (pull.ff only, commit signing)
+      # deliberately stay out.
+
+      # Object integrity. These are three separate code paths — clone
+      # and fetch (transfer/fetch) and push (receive) — so setting one
+      # does not cover the others.
+      transfer.fsckObjects = true;
+      fetch.fsckObjects = true;
+      receive.fsckObjects = true;
+      # Bundle-URI lets a server redirect a clone to fetch part of the
+      # history from an arbitrary URL it names. Nothing here needs it.
+      transfer.bundleURI = false;
+      fetch.prune = true;
+
+      # Transport: default-deny, then re-allow only what is used.
+      # git:// is unauthenticated and unencrypted; ext:: executes a
+      # command named in the remote URL. `file` stays at `user` so
+      # direct local clones and worktree operations still work while
+      # submodule/recursive contexts cannot reach it.
+      protocol.version = 2;
+      protocol.allow = "never";
+      protocol.https.allow = "always";
+      protocol.ssh.allow = "always";
+      protocol.file.allow = "user";
+      protocol.git.allow = "never";
+      protocol.ext.allow = "never";
+      http.sslVerify = true;
+
+      # core.fsmonitor names a command git runs during ordinary status
+      # and diff. A cloned repo can set it repo-locally, which turns
+      # `git status` in that tree into code execution. Nothing here uses
+      # fsmonitor, so pin it off instead of leaving it settable.
+      core.fsmonitor = false;
+      core.protectNTFS = true;
+      core.protectHFS = true;
+
+      # CVE-2024-32002: a crafted submodule can write into .git/hooks
+      # during a recursive clone. No repo here uses submodules.
+      submodule.recurse = false;
+      # Refuse to operate on a directory that merely looks like a bare
+      # repo unless GIT_DIR says so explicitly.
+      safe.bareRepository = "explicit";
+
+      # Never guess an identity from hostname/username. An agent commit
+      # carries the configured author or it fails loudly, rather than
+      # landing as jonathan@dellan.
+      user.useConfigOnly = true;
+
+      # Forensics. reflogExpireUnreachable governs entries orphaned by
+      # force-push, reset and rebase — the exact history that answers
+      # "what did that get overwritten with" — and defaults to 30 days.
+      gc.reflogExpire = "180.days";
+      gc.reflogExpireUnreachable = "90.days";
     };
   };
 
-  # Global gitignore
+  # Global gitignore. Second line of defence behind the gitleaks
+  # pre-commit hook below: gitleaks catches secrets by content, this
+  # catches the well-known filenames by shape, in every repo on this
+  # machine including ones an agent clones and commits into.
+  #
+  # Deliberately NOT ignored: .npmrc — pnpm workspaces legitimately
+  # commit one, and silently dropping it from `git add -A` would be a
+  # confusing failure. The gitleaks hook covers the `_authToken=` case.
   home.file.".config/git/ignore".text = ''
     **/.claude/settings.local.json
+
+    # Environment files (negations must follow the glob that catches them)
+    .env
+    .env.*
+    !.env.example
+    !.env.sample
+    !.env.template
+
+    # Keys and certificates
+    *.pem
+    *.key
+    *.p12
+    *.pfx
+    *.jks
+
+    # Credential stores
+    .git-credentials
+    .netrc
+    .authinfo
+    .pypirc
+    credentials.json
+    service-account*.json
+
+    # Terraform state (contains resolved secret values in plaintext)
+    *.tfstate
+    *.tfstate.backup
   '';
 
   # Husky pre-commit hook helper — loads nvm so node-based hooks find the
