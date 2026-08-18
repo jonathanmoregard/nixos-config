@@ -435,6 +435,59 @@ in
         f"expected '/run/agenix/gemini-api-key'"
     )
 
+    # ── git hardening (home/jonathan.nix programs.git.settings) ──
+    # These are integrity checks and default-deny transport rules: they
+    # only bite when something is already wrong, so nothing else in the
+    # suite notices if home-manager silently stops emitting them (an
+    # upstream settings-vs-extraConfig rename would do exactly that).
+    # Read the values back out of the generated config.
+    expected_git_config = {
+        "transfer.fsckObjects": "true",
+        "fetch.fsckObjects": "true",
+        "receive.fsckObjects": "true",
+        "protocol.allow": "never",
+        "protocol.https.allow": "always",
+        "protocol.file.allow": "user",
+        "protocol.ext.allow": "never",
+        "core.fsmonitor": "false",
+        "submodule.recurse": "false",
+        "safe.bareRepository": "explicit",
+        "user.useConfigOnly": "true",
+        "gc.reflogExpireUnreachable": "90.days",
+    }
+    for key, want in expected_git_config.items():
+        got = dellan.succeed(
+            f"su - jonathan -c 'git config --global --get {key}'"
+        ).strip()
+        assert got == want, (
+            f"git config --global {key} = {got!r}, expected {want!r} "
+            f"(home/jonathan.nix programs.git.settings)"
+        )
+
+    # The global ignore file's negations only work if the `!` lines
+    # follow the glob that catches them — `.env.*` swallows
+    # .env.example otherwise. Ordering is invisible in the Nix source,
+    # so prove it against a real repo rather than by reading the file.
+    ignore_probe = dellan.succeed(
+        "su - jonathan -c '"
+        "d=$(mktemp -d); cd $d; git init -q .; "
+        "for f in .env .env.local secrets.pem terraform.tfstate "
+        ".env.example README.md; do "
+        "git check-ignore -q $f && echo IGNORED $f || echo TRACKED $f; "
+        "done'"
+    )
+    for want in [
+        "IGNORED .env",
+        "IGNORED .env.local",
+        "IGNORED secrets.pem",
+        "IGNORED terraform.tfstate",
+        "TRACKED .env.example",
+        "TRACKED README.md",
+    ]:
+        assert want in ignore_probe, (
+            f"global gitignore probe missing {want!r}:\n{ignore_probe}"
+        )
+
     # ── Lakera tuned-project pointer (home/lakera.nix) ──
     # All three injection-scanner call sites must export
     # LAKERA_PROJECT_ID from the single source in home/lakera.nix, so
