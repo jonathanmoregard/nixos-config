@@ -82,9 +82,17 @@
       # CVE-2024-32002: a crafted submodule can write into .git/hooks
       # during a recursive clone. No repo here uses submodules.
       submodule.recurse = false;
-      # Refuse to operate on a directory that merely looks like a bare
-      # repo unless GIT_DIR says so explicitly.
-      safe.bareRepository = "explicit";
+
+      # NOT set: safe.bareRepository = "explicit". It was in the original
+      # hardening pass (#184) and had to be reverted — this host keeps a
+      # real bare repo at ~/Repos/nixos-config and drives the entire
+      # worktree -> PR flow through it, so `git -C ~/Repos/nixos-config
+      # worktree add` is a first-class workflow, not the embedded-bare-repo
+      # attack the setting exists to stop. Unlike safe.directory there is
+      # no per-path allowlist for it, so it is all-or-nothing, and the
+      # trade is not worth it here. tests/base.nix asserts the workflow
+      # keeps working rather than asserting the setting is absent, so any
+      # future reintroduction fails the gate on behaviour.
 
       # Never guess an identity from hostname/username. An agent commit
       # carries the configured author or it fails loudly, rather than

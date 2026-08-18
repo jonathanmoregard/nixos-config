@@ -451,7 +451,6 @@ in
         "protocol.ext.allow": "never",
         "core.fsmonitor": "false",
         "submodule.recurse": "false",
-        "safe.bareRepository": "explicit",
         "user.useConfigOnly": "true",
         "gc.reflogExpireUnreachable": "90.days",
     }
@@ -486,6 +485,37 @@ in
     ]:
         assert want in ignore_probe, (
             f"global gitignore probe missing {want!r}:\n{ignore_probe}"
+        )
+
+    # ── bare-repo worktree flow must keep working ──
+    # This host drives the entire nixos-config change flow through a real bare
+    # repo at ~/Repos/nixos-config: `git -C <bare> worktree add`. PR #184 set
+    # `safe.bareRepository = explicit` as generic hardening and silently broke
+    # exactly that, plus the daily nixos-worktree-sweep timer (which then
+    # failed closed to zero deletions). The VM gate did not catch it because
+    # nothing here exercised a bare repo.
+    #
+    # Asserted as BEHAVIOUR, not as "the setting is absent" — the point is that
+    # the workflow works, so any future setting that breaks it fails here too,
+    # whatever its name.
+    bare_probe = dellan.succeed(
+        "su - jonathan -c '"
+        "d=$(mktemp -d); cd $d; "
+        "git init -q --bare bare.git; "
+        "git clone -q bare.git seed; cd seed; "
+        "git commit -q --allow-empty -m seed; "
+        "git push -q origin HEAD:refs/heads/main; cd $d; "
+        "git -C bare.git worktree list >/dev/null 2>&1 "
+        "&& echo BARE_LIST_OK || echo BARE_LIST_FAIL; "
+        "git -C bare.git worktree add $d/wt main >/dev/null 2>&1 "
+        "&& echo BARE_ADD_OK || echo BARE_ADD_FAIL; "
+        "git -C bare.git worktree remove $d/wt >/dev/null 2>&1 "
+        "&& echo BARE_REMOVE_OK || echo BARE_REMOVE_FAIL'"
+    )
+    for want in ["BARE_LIST_OK", "BARE_ADD_OK", "BARE_REMOVE_OK"]:
+        assert want in bare_probe, (
+            f"bare-repo worktree flow broken ({want} missing) — this is the "
+            f"~/Repos/nixos-config workflow. Probe output:\n{bare_probe}"
         )
 
     # ── Lakera tuned-project pointer (home/lakera.nix) ──
