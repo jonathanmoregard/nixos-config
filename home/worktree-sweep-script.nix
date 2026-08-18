@@ -26,7 +26,7 @@
 #
 # Env overrides — FOR THE TEST HARNESS ONLY (tests/worktree-sweep.nix).
 # Production runs (the systemd user timer) must not set these:
-#   SWEEP_BARE_REPO        bare repo path
+#   SWEEP_REPO             git anchor path (see below)
 #   SWEEP_WORKTREES_DIR    worktrees root
 #   SWEEP_GH_BIN           gh executable (stubbed in the harness —
 #                          runtimeInputs pins the real gh ahead of
@@ -38,7 +38,19 @@ pkgs.writeShellApplication {
   name = "nixos-worktree-sweep";
   runtimeInputs = with pkgs; [ git jq coreutils ];
   text = ''
-    BARE="''${SWEEP_BARE_REPO:-$HOME/Repos/nixos-config}"
+    # Anchor is the `main` browse worktree, NOT the bare repo, even though
+    # the bare repo is still the shared object store and every ref below
+    # resolves through it. `safe.bareRepository = explicit` (home/jonathan.nix)
+    # stops git from DISCOVERING a bare directory as a starting point, which
+    # is what `git -C ~/Repos/nixos-config ...` asks it to do. Addressing a
+    # linked worktree instead reaches the same refs and the same worktree
+    # list — verified identical: 84 branches and 74 worktrees from either —
+    # without asking for that discovery.
+    #
+    # `main` is safe to depend on: phase 2 below protects it from its own
+    # sweep, and the */30 cron in home/jonathan-linux.nix already anchors
+    # its `pull --ff-only` there for an unrelated reason.
+    REPO="''${SWEEP_REPO:-$HOME/Repos/nixos-config-worktrees/main}"
     WTS="''${SWEEP_WORKTREES_DIR:-$HOME/Repos/nixos-config-worktrees}"
     GH_BIN="''${SWEEP_GH_BIN:-${pkgs.gh}/bin/gh}"
     REPO_SLUG="jonathanmoregard/nixos-config"
@@ -48,8 +60,18 @@ pkgs.writeShellApplication {
 
     now=$(date +%s)
 
-    if [ ! -d "$BARE" ]; then
-      log "abort: bare repo not found at $BARE — zero deletions"
+    if [ ! -d "$REPO" ]; then
+      log "abort: git anchor not found at $REPO — zero deletions"
+      exit 0
+    fi
+
+    # Fail closed and loudly if the anchor is unusable for any other reason
+    # (bare-repo refusal, corrupt worktree pointer, wrong path). Without this
+    # every predicate below just returns empty and the sweep degrades to a
+    # silent no-op — which is exactly how the safe.bareRepository regression
+    # went unnoticed.
+    if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+      log "abort: $REPO is not a usable git anchor — zero deletions"
       exit 0
     fi
 
@@ -74,7 +96,7 @@ pkgs.writeShellApplication {
       REASON=""
       # --verify -q: plain rev-parse echoes unresolvable refs back to
       # stdout; --verify guarantees $tip is a real oid or the guard fires.
-      if ! tip=$(git -C "$BARE" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null); then
+      if ! tip=$(git -C "$REPO" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null); then
         REASON="cannot resolve local tip — fail closed"
         return 1
       fi
@@ -108,7 +130,7 @@ pkgs.writeShellApplication {
     check_age() {  # <branch>
       local branch="$1" ts
       REASON=""
-      if ! ts=$(git -C "$BARE" log -1 --format=%ct "refs/heads/$branch" 2>/dev/null); then
+      if ! ts=$(git -C "$REPO" log -1 --format=%ct "refs/heads/$branch" 2>/dev/null); then
         REASON="cannot read tip commit time — fail closed"
         return 1
       fi
@@ -223,11 +245,11 @@ pkgs.writeShellApplication {
 
       # All predicates hold. Non-force remove: git re-verifies the tree
       # is clean, a last belt against TOCTOU between check and delete.
-      if ! git -C "$BARE" worktree remove "$wt" 2>/dev/null; then
+      if ! git -C "$REPO" worktree remove "$wt" 2>/dev/null; then
         log "kept worktree $wt (branch $branch): git worktree remove refused — fail closed"
         return 0
       fi
-      if git -C "$BARE" branch -D "$branch" >/dev/null 2>&1; then
+      if git -C "$REPO" branch -D "$branch" >/dev/null 2>&1; then
         log "deleted worktree $wt + branch $branch (PR #$MERGED_PR merged at this tip, ''${AGE_DAYS}d old, clean, no live cwd)"
       else
         log "deleted worktree $wt; branch $branch delete FAILED — manual cleanup needed"
@@ -236,7 +258,7 @@ pkgs.writeShellApplication {
 
     # Snapshot the list before mutating it (worktree remove during
     # iteration would race a streamed read).
-    worktree_dump=$(git -C "$BARE" worktree list --porcelain)
+    worktree_dump=$(git -C "$REPO" worktree list --porcelain)
 
     cur_wt=""; cur_branch=""; cur_bare=0; cur_detached=0; cur_locked=0
     flush() {
@@ -256,7 +278,7 @@ pkgs.writeShellApplication {
     flush
 
     # --- phase 2: local branches without worktrees ------------------------
-    branch_dump=$(git -C "$BARE" for-each-ref refs/heads --format='%(refname:short)')
+    branch_dump=$(git -C "$REPO" for-each-ref refs/heads --format='%(refname:short)')
 
     while IFS= read -r branch; do
       [ -n "$branch" ] || continue
@@ -270,7 +292,7 @@ pkgs.writeShellApplication {
         log "kept branch $branch: $REASON"
         continue
       fi
-      if git -C "$BARE" branch -D "$branch" >/dev/null 2>&1; then
+      if git -C "$REPO" branch -D "$branch" >/dev/null 2>&1; then
         log "deleted branch $branch (PR #$MERGED_PR merged at this tip, ''${AGE_DAYS}d old, no worktree)"
       else
         log "kept branch $branch: git branch -D failed — fail closed"

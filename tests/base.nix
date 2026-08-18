@@ -488,6 +488,84 @@ in
             f"global gitignore probe missing {want!r}:\n{ignore_probe}"
         )
 
+    # ── worktree flow under safe.bareRepository = explicit ──
+    # The nixos-config change flow runs on a bare repo at ~/Repos/nixos-config
+    # with linked worktrees. #184 set `safe.bareRepository = explicit` as
+    # generic hardening and broke every `git -C <bare>` call — the worktree
+    # flow itself, plus the daily nixos-worktree-sweep, which then failed
+    # closed to zero deletions. The VM gate missed it because nothing here
+    # exercised the layout at all.
+    #
+    # Callers now anchor on the `main` linked worktree instead, which reaches
+    # the same refs without asking git to discover a bare directory. This
+    # probe asserts BOTH halves, because either alone is a false pass:
+    #   1. the anchor pattern supports the full lifecycle, and
+    #   2. discovery of a bare repo is genuinely still refused — otherwise
+    #      the setting is not actually protecting anything.
+    #
+    # Asserted as BEHAVIOUR, not as config values, so any future change that
+    # breaks the flow fails here whatever it is named.
+    wt_probe = dellan.succeed(
+        "su - jonathan -c '"
+        "d=$(mktemp -d); cd $d; "
+        "git init -q --bare bare.git; "
+        "git clone -q bare.git seed >/dev/null 2>&1; cd seed; "
+        "git commit -q --allow-empty -m seed; "
+        "git push -q origin HEAD:refs/heads/main; cd $d; "
+        # Bootstrap the anchor the one supported way: GIT_DIR named explicitly.
+        "GIT_DIR=$d/bare.git git worktree add -q $d/main main >/dev/null 2>&1 "
+        "&& echo BOOTSTRAP_OK || echo BOOTSTRAP_FAIL; "
+        # The anchor pattern: every day-to-day operation goes through here.
+        "git -C $d/main worktree list >/dev/null 2>&1 "
+        "&& echo ANCHOR_LIST_OK || echo ANCHOR_LIST_FAIL; "
+        "git -C $d/main worktree add -q $d/wt -b feat/probe main >/dev/null 2>&1 "
+        "&& echo ANCHOR_ADD_OK || echo ANCHOR_ADD_FAIL; "
+        "git -C $d/main rev-parse --verify -q refs/heads/feat/probe >/dev/null 2>&1 "
+        "&& echo ANCHOR_REFS_OK || echo ANCHOR_REFS_FAIL; "
+        "git -C $d/main worktree remove $d/wt >/dev/null 2>&1 "
+        "&& echo ANCHOR_REMOVE_OK || echo ANCHOR_REMOVE_FAIL; "
+        # And the protection itself must still bite.
+        "git -C $d/bare.git worktree list >/dev/null 2>&1 "
+        "&& echo BARE_DISCOVERY_ALLOWED || echo BARE_DISCOVERY_REFUSED'"
+    )
+    for want in [
+        "BOOTSTRAP_OK",
+        "ANCHOR_LIST_OK",
+        "ANCHOR_ADD_OK",
+        "ANCHOR_REFS_OK",
+        "ANCHOR_REMOVE_OK",
+        # If this flips to ALLOWED, safe.bareRepository stopped applying and
+        # the hardening is silently inert.
+        "BARE_DISCOVERY_REFUSED",
+    ]:
+        assert want in wt_probe, (
+            f"nixos-config worktree flow assertion failed ({want} missing). "
+            f"Anchor is ~/Repos/nixos-config-worktrees/main; see "
+            f"home/worktree-sweep-script.nix. Probe output:\n{wt_probe}"
+        )
+
+    # The ncfg helper is the ergonomic half of the same change — without it
+    # the anchor path is long enough that muscle memory reaches for the bare
+    # repo, which now fails.
+    #
+    # Asserts wiring, not execution: initContent lands in .zshrc, which only
+    # an INTERACTIVE zsh sources, and `su - jonathan -c` is a login
+    # non-interactive shell. Driving a real interactive zsh here would drag in
+    # p10k and the drift banner (see the drift_leak assertion above) for no
+    # extra coverage — the function body is a one-line `git -C`, and the path
+    # it points at is already exercised by the anchor probe.
+    ncfg_src = dellan.succeed(
+        "su - jonathan -c 'cat ~/.zshrc'"
+    )
+    assert "ncfg()" in ncfg_src, (
+        "ncfg shell function missing from ~/.zshrc "
+        "(home/jonathan.nix programs.zsh.initContent)"
+    )
+    assert "Repos/nixos-config-worktrees/main" in ncfg_src, (
+        "ncfg is present but does not anchor on the main worktree — it must "
+        "not point at the bare repo, which safe.bareRepository now refuses"
+    )
+
     # ── Lakera tuned-project pointer (home/lakera.nix) ──
     # All three injection-scanner call sites must export
     # LAKERA_PROJECT_ID from the single source in home/lakera.nix, so

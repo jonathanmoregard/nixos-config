@@ -21,9 +21,10 @@ Layout:
 **Must run from a worktree root** (`~/Repos/nixos-config-worktrees/<slug>`). Refuses otherwise — see the footgun list.
 
 ```bash
-# 1. Get onto a feature branch (the tool refuses on main).
-cd ~/Repos/nixos-config
-git worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
+# 1. Get onto a feature branch (the tool refuses on main). Anchor on the
+#    `main` worktree — safe.bareRepository = explicit refuses the bare repo.
+git -C ~/Repos/nixos-config-worktrees/main \
+    worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
 cd ~/Repos/nixos-config-worktrees/<slug>
 
 # 2a. Preferred: pipe the value in — no flag needed. The tool

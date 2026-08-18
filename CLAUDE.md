@@ -34,9 +34,11 @@ You CANNOT edit `~/Repos/nixos-config/` (no working tree). You CANNOT edit `/etc
 **Standard flow for any change:**
 
 ```bash
-# 1. Open a worktree
-cd ~/Repos/nixos-config
-git worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
+# 1. Open a worktree. Anchor on the `main` worktree, NOT the bare repo:
+#    safe.bareRepository = explicit refuses `git -C ~/Repos/nixos-config`.
+#    Same refs, same worktree list. `ncfg` is this path pre-bound.
+git -C ~/Repos/nixos-config-worktrees/main \
+    worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
 cd ~/Repos/nixos-config-worktrees/<slug>
 
 # 2. Edit, commit
@@ -57,7 +59,7 @@ gh pr checks <PR_NUMBER>
 #    Desktop notification fires on success/failure.
 
 # 6. Clean up
-git -C ~/Repos/nixos-config worktree remove ~/Repos/nixos-config-worktrees/<slug>
+git -C ~/Repos/nixos-config-worktrees/main worktree remove ~/Repos/nixos-config-worktrees/<slug>
 gh pr view <PR_NUMBER>   # confirm merged
 ```
 
