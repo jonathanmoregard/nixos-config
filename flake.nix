@@ -226,7 +226,7 @@
           # exactly the derivation under test.
           deployedExecStart = self.nixosConfigurations.dellan.config
             .home-manager.users.jonathan
-            .systemd.user.services.nixos-worktree-sweep.Service.ExecStart;
+            .systemd.user.services.worktree-sweep.Service.ExecStart;
         };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
         # credential whose real home is elsewhere (see the test's header for
