@@ -1,3 +1,54 @@
+## 2026-08-09: Google Forms scopes need a browser OAuth re-consent
+
+**Why blocked**: Granting a Google API scope requires an interactive consent
+screen in a browser. The stored token at
+`/home/jonathan/.google_workspace_mcp/credentials/jonathan@klaffat.com.json`
+was minted with docs + drive scopes only, so every Forms tool will fail with
+an insufficient-scope error until you re-consent. Everything the machine can
+do declaratively is done; this is the one click-through left.
+
+**Steps for human**:
+1. Wait for the PR adding `home/gdocs-review-mcp.nix` to merge and auto-deploy,
+   then confirm the wrapper is on PATH:
+   `command -v gdocs-review-mcp`  → expect `/etc/profiles/per-user/jonathan/bin/gdocs-review-mcp`
+2. Make sure the Google Cloud project behind the OAuth client has the Forms API
+   enabled, otherwise consent succeeds but calls 403:
+   https://console.cloud.google.com/apis/library/forms.googleapis.com
+3. Force a fresh consent by removing the stale token (back it up first, so a
+   failed consent is recoverable):
+   ```
+   cp /home/jonathan/.google_workspace_mcp/credentials/jonathan@klaffat.com.json \
+      /home/jonathan/.google_workspace_mcp/credentials/jonathan@klaffat.com.json.bak
+   rm /home/jonathan/.google_workspace_mcp/credentials/jonathan@klaffat.com.json
+   ```
+4. Restart Claude Code so it respawns the `gdocs-review` MCP through the new
+   wrapper, then call the `start_google_auth` tool (or any Forms tool — the
+   server returns an auth URL when it has no valid token). Open the URL it
+   prints, sign in as `jonathan@klaffat.com`, and approve the consent screen.
+   Google will warn the app is unverified — that is expected for a personal
+   OAuth client; choose "Advanced" → "Go to … (unsafe)".
+
+**Verify it worked**:
+```
+python3 -c "import json;print(*json.load(open('/home/jonathan/.google_workspace_mcp/credentials/jonathan@klaffat.com.json'))['scopes'],sep='\n')" | grep forms
+```
+Expect at least `https://www.googleapis.com/auth/forms.body`. Then ask Claude
+Code to list the tools on the `gdocs-review` server — the six `gforms` tools
+should be present and a Forms read call should return data rather than a
+403/insufficient-scope error. If it still 403s, redo step 3; a partially
+approved consent screen leaves the old scope set in place.
+
+**Everything else done**: agenix secrets `google-oauth-client-id` /
+`google-oauth-client-secret` created and rekeyed for dellan; wrapper
+`home/gdocs-review-mcp.nix` exports both plus `USER_GOOGLE_EMAIL`,
+`WORKSPACE_MCP_CREDENTIALS_DIR` and `SSL_CERT_FILE` and runs the fork with
+`--tools docs docs_preview forms drive`; module imported from
+`home/jonathan-linux.nix`; secrets declared in `hosts/dellan/default.nix`;
+`tests/base.nix` asserts the wrapper's exports, argv, no-secret-in-store
+property, and that both secrets reach system activation.
+
+---
+
 # Install — minimal version
 
 One command + a handful of paste-and-clicks. ~15 minutes start to finish.
