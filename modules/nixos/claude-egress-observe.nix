@@ -225,6 +225,15 @@ let
   # this host and this resolver, keeps a near-in-time answer available for
   # every observation window. The reporter unions the snapshot with a fresh
   # resolution so it still works before the timer has ever fired.
+  #
+  # The same short TTLs are why entries have to AGE OUT as well as roll.
+  # An address that belonged to a candidate host in March may belong to
+  # someone else entirely by June; a snapshot row with no expiry would go
+  # on vouching for it, and the new occupant — a genuinely unknown
+  # destination — would be filed as matched and never reach section 2.
+  # Both writer and reader therefore honour resolutionTtlDays: the roll
+  # drops expired rows, and the reporter ignores any that survive in a
+  # file it did not write.
   resolveScript = pkgs.writeShellApplication {
     name = "claude-egress-resolve";
     runtimeInputs = with pkgs; [ coreutils gawk getent ];
@@ -239,18 +248,42 @@ let
       # shellcheck disable=SC2064
       trap "rm -f '$tmp'" EXIT
 
+      # Third column: when this pair was observed to be true. Without it a
+      # pair is true forever, and cloud/CDN addresses are recycled to other
+      # operators — so a months-old row keeps filing a NEW occupant of that
+      # address as a known destination, suppressing the unmatched signal in
+      # section 2 of the report, which is the one thing that section is for.
+      now="$(date +%s)"
+      cutoff=$(( now - ${toString cfg.resolutionTtlDays} * 86400 ))
+
       for host in "''${candidates[@]}"; do
         while IFS= read -r ip; do
           [ -n "$ip" ] || continue
-          printf '%s\t%s\n' "$ip" "$host"
+          printf '%s\t%s\t%s\n' "$ip" "$host" "$now"
         done < <(getent ahosts "$host" 2>/dev/null | awk '/STREAM/{print $1}' | sort -u)
       done > "$tmp"
 
       new_count="$(wc -l < "$tmp")"
+      # `if`, not `[ -r … ] && …`: as the last command of a top-level list
+      # under `set -e`, a false test is a non-zero exit status and takes
+      # the whole unit down on the very first run, when the table does not
+      # exist yet.
+      old_count=0
+      if [ -r "$table" ]; then
+        old_count="$(wc -l < "$table")"
+      fi
 
-      # Newest first, de-duplicated, then capped. `sort -u` would be
-      # simpler but would throw away recency, and the cap is what keeps an
-      # ever-rotating CDN from growing this file without bound.
+      # Newest first, aged out, de-duplicated, then capped. `sort -u` would
+      # be simpler but would throw away recency, and the cap is what keeps
+      # an ever-rotating CDN from growing this file without bound.
+      #
+      # The dedup key is the ip/name PAIR, not the whole line: with a
+      # timestamp on every row, keying on $0 would make each refresh a new
+      # unique row and the file would grow one copy per pass.
+      #
+      # A row whose third field is missing or non-numeric evaluates to 0
+      # and is dropped, so a legacy two-column file ages out on the first
+      # pass rather than living on as un-expirable rows.
       #
       # One awk over both files, deliberately NOT `cat … | awk | head`:
       # under `set -o pipefail`, `head` closing the pipe early SIGPIPEs its
@@ -258,15 +291,16 @@ let
       # turns into a failed unit — a bug that only appears once the table
       # exceeds the cap, i.e. months in, on the busiest host.
       touch "$table"
-      awk -v max=${toString cfg.resolutionTableMaxEntries} \
-        '!seen[$0]++ { print; if (++n >= max) exit }' \
+      awk -F'\t' -v max=${toString cfg.resolutionTableMaxEntries} -v cutoff="$cutoff" \
+        '$3 + 0 >= cutoff && !seen[$1 FS $2]++ { print; if (++n >= max) exit }' \
         "$tmp" "$table" > "$table.new"
       mv "$table.new" "$table"
       chmod 0644 "$table"
       date -Is > "$lib_dir/resolved-at"
       chmod 0644 "$lib_dir/resolved-at"
 
-      echo "claude-egress-resolve: $new_count address/name pairs this pass, $(wc -l < "$table") retained"
+      retained="$(wc -l < "$table")"
+      echo "claude-egress-resolve: $new_count address/name pairs this pass, $retained retained of $((old_count + new_count)) seen (TTL ${toString cfg.resolutionTtlDays}d)"
     '';
   };
 
@@ -288,7 +322,14 @@ let
       # ── observed destinations ────────────────────────────────────────
       # nft log lines are printk records, so they land in the kernel
       # journal. DST/DPT are the two fields an allowlist needs.
-      observed="$(journalctl -k --no-pager --since "$since" 2>/dev/null \
+      #
+      # `_TRANSPORT=kernel`, never `-k`: journalctl(1) says -k "implies -b",
+      # so `journalctl -k --since '-7 days'` silently returns only what
+      # happened since the last boot, with nothing in the output admitting
+      # the window was cut. On this host that was 1349 lines versus 27368
+      # for the same 30-day window. A truncated window here is a phase-2
+      # allowlist with holes in it, which is a hang-to-timeout later.
+      observed="$(journalctl _TRANSPORT=kernel --no-pager --since "$since" 2>/dev/null \
         | grep -F ${lib.escapeShellArg logPrefix} \
         | sed -n 's/.*DST=\([0-9a-fA-F.:]*\).*DPT=\([0-9]*\).*/\1 \2/p' \
         | sort | uniq -c | sort -rn || true)"
@@ -310,9 +351,30 @@ let
 
       # The rolling snapshot first — it holds answers from when the
       # traffic was actually observed, which is the whole point.
+      #
+      # Expired rows are skipped rather than trusted. The roll normally
+      # removes them, but the reader must not depend on the writer having
+      # run: a resolve unit that has been failing for a month leaves a
+      # table full of pairs that are all quietly out of date, and that is
+      # precisely when joining against them is most wrong.
+      snap_used=0
+      snap_expired=0
+      ttl_cutoff=$(( $(date +%s) - ${toString cfg.resolutionTtlDays} * 86400 ))
       if [ -r "$lib_dir/resolutions.tsv" ]; then
-        while IFS=$'\t' read -r ip host; do
-          [ -n "$ip" ] && [ -n "$host" ] && remember "$ip" "$host"
+        while IFS=$'\t' read -r ip host ts; do
+          [ -n "$ip" ] && [ -n "$host" ] || continue
+          # Non-numeric or absent timestamp counts as expired: a pair that
+          # cannot prove its age is a pair that cannot be trusted to still
+          # be true, and over-reporting section 2 is the safe direction.
+          case "''${ts:-}" in
+            ""|*[!0-9]*) snap_expired=$((snap_expired + 1)); continue ;;
+          esac
+          if [ "$ts" -lt "$ttl_cutoff" ]; then
+            snap_expired=$((snap_expired + 1))
+            continue
+          fi
+          snap_used=$((snap_used + 1))
+          remember "$ip" "$host"
         done < "$lib_dir/resolutions.tsv"
       fi
 
@@ -418,9 +480,23 @@ let
       # an "unmatched" one, which reads as alarming rather than as broken.
       if [ -r "$lib_dir/resolutions.tsv" ]; then
         echo "  resolution snapshot: $(wc -l < "$lib_dir/resolutions.tsv") pairs, last refreshed $(cat "$lib_dir/resolved-at" 2>/dev/null || echo never)"
+        echo "                       $snap_used within the ${toString cfg.resolutionTtlDays}-day TTL, $snap_expired aged out and ignored"
       else
         echo "  resolution snapshot: MISSING — section 2 will over-report until claude-egress-resolve.service has run"
       fi
+
+      # How much of the requested window the journal can actually answer
+      # for. The gap between the two is the difference between "no
+      # unknown destinations" and "no records", and a report that cannot
+      # tell those apart is worse than no report. Scoped to the window so
+      # it costs no more than the query above.
+      #
+      # `awk NR==1` without an `exit`, never `head -1`: an early-exiting
+      # reader SIGPIPEs journalctl, and under writeShellApplication's
+      # `set -o pipefail` that exits 141 and kills the script.
+      oldest_kernel="$(journalctl _TRANSPORT=kernel --no-pager -o short-iso \
+        --since "$since" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)"
+      echo "  kernel journal:  oldest record in window ''${oldest_kernel:-(none readable)}"
 
       # Reading the ruleset needs CAP_NET_ADMIN; say so rather than
       # printing a blank section when run unprivileged.
@@ -450,6 +526,21 @@ in
         Cap on retained address/name pairs in the rolling resolution
         snapshot. Newest entries are kept; CDN address rotation would
         otherwise grow the file without bound.
+      '';
+    };
+
+    resolutionTtlDays = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 30;
+      description = ''
+        How long an address/name pair in the rolling resolution snapshot
+        is allowed to keep vouching for an address. Cloud and CDN
+        addresses are recycled between operators, so a pair with no expiry
+        eventually joins a genuinely unknown destination back to a name it
+        no longer has — and the report files it as matched instead of
+        surfacing it. Must exceed the widest window passed to
+        claude-egress-report (default -7 days), or observations at the far
+        end of that window come back nameless.
       '';
     };
 

@@ -22,6 +22,14 @@
 # 2 is deliberately ordered AFTER 1 and written as a count DELTA: as a
 # presence check it would pass vacuously whenever the observer is simply
 # broken, which is the one situation it is supposed to catch.
+#
+# Three invariants ride along inside those sections rather than as
+# sections of their own, because each one needs state the section around
+# it has already built:
+#
+#   - the reporter's window spans a REBOOT (inside 3, which reboots)
+#   - an aged-out resolution pair stops matching (inside the report block)
+#   - the launcher does not leak XDG_RUNTIME_DIR (inside 5)
 { pkgs, inputs }:
 let
   nft = "${pkgs.nftables}/bin/nft";
@@ -166,8 +174,21 @@ in
     )
     rel = cg[len("/sys/fs/cgroup/"):]
     level = len(rel.split("/"))
-    print(f"[setup] slice cgroup={cg}\n[setup] rel={rel} level={level}")
-    assert level == len(rel.split("/")), "level must be the depth of the found path"
+    # The arithmetic a reader would write without knowing about the
+    # auto-created parent slice. Naming it here makes the gap explicit
+    # rather than leaving "5, not 4" as prose in the module header.
+    naive_rel = f"user.slice/user-{uid}.slice/user@{uid}.service/claude-egress.slice"
+    naive_level = len(naive_rel.split("/"))
+    print(f"[setup] slice cgroup={cg}\n[setup] rel={rel} level={level} naive={naive_level}")
+    assert rel.endswith("claude.slice/claude-egress.slice"), (
+        "systemd no longer nests the dashed slice name under an auto-created "
+        f"claude.slice, so the discovered depth is not what the module documents: {rel}"
+    )
+    assert level > naive_level, (
+        f"the discovered level ({level}) equals the naive computation "
+        f"({naive_level}) — discovery is no longer load-bearing and the "
+        "wrong-level control below stops meaning anything"
+    )
 
     run_bind()
     chain = nft_chain()
@@ -319,10 +340,20 @@ in
         "chown -R jonathan:users /home/jonathan/.local /home/jonathan/fake-claude.log"
     )
 
+    # The FIRST interactive zsh in a cold VM pays for compinit and the whole
+    # rc chain before it runs anything: 77s on a green run, and then 124
+    # (timeout) on the next one under a 120s cap. Warm it once outside any
+    # assertion — after this the dump is cached and the calls below take
+    # ~10s — and keep the cap far enough above the cold cost that a slow
+    # runner cannot turn a passing gate red.
+    dellan.succeed(
+        f"timeout 600 su - jonathan -c '{RUNTIME} TERM=xterm zsh -ic true' || true"
+    )
+
     def zsh(cmd, runtime=True):
         env = f"{RUNTIME} " if runtime else ""
         return dellan.succeed(
-            f"timeout 120 su - jonathan -c \"{env}TERM=xterm zsh -ic '{cmd}'\" 2>&1"
+            f"timeout 300 su - jonathan -c \"{env}TERM=xterm zsh -ic '{cmd}'\" 2>&1"
         )
 
     def fake_log():
@@ -380,7 +411,7 @@ in
     # fails to start.
     clear_fake_log()
     out = dellan.succeed(
-        "timeout 120 su - jonathan -c \"XDG_RUNTIME_DIR=/run/nonexistent "
+        "timeout 300 su - jonathan -c \"XDG_RUNTIME_DIR=/run/nonexistent "
         "TERM=xterm zsh -ic 'claude --version'\" 2>&1"
     )
     log = fake_log()
@@ -393,6 +424,42 @@ in
     )
     assert "claude-egress.slice" not in log, (
         f"fallback claimed to be unobserved but landed in the slice anyway:\n{log}"
+    )
+
+    # ── XDG_RUNTIME_DIR must not leak into the caller ────────────────
+    # The launcher has to default XDG_RUNTIME_DIR when the caller has none,
+    # but a bare `export` sets it in the CALLING interactive shell, so every
+    # later command in that terminal inherits a value the user never set —
+    # and on the fallback path that value is a guess the launcher itself
+    # just proved wrong. The probe lives in a file so no outer shell layer
+    # can expand the variable before zsh sees it.
+    # The brackets are the delimiters that make an empty value visible, and
+    # they MUST be quoted: zsh globs an unquoted `[...]` and dies with
+    # "no matches found" before printing anything.
+    dellan.succeed(
+        "cat > /run/leak-probe.zsh <<'PROBE'\n"
+        "print -r -- \"BEFORE=[$XDG_RUNTIME_DIR]\"\n"
+        "claude --version >/dev/null 2>&1\n"
+        "print -r -- \"AFTER=[$XDG_RUNTIME_DIR]\"\n"
+        "PROBE"
+    )
+    clear_fake_log()
+    leak = dellan.succeed(
+        "timeout 300 su - jonathan -c \"env -u XDG_RUNTIME_DIR TERM=xterm "
+        "zsh -ic 'source /run/leak-probe.zsh'\" 2>&1"
+    )
+    log = fake_log()
+    print("[5] runtime-dir leak probe:\n" + leak + "\n---\n" + log)
+    assert "BEFORE=[]" in leak, (
+        "the probe shell already carried XDG_RUNTIME_DIR, so a leak out of the "
+        f"launcher could not be distinguished from the ambient value:\n{leak}"
+    )
+    assert "argv: --continue --version" in log, (
+        f"the probe never actually invoked the launcher:\n{log}"
+    )
+    assert "AFTER=[]" in leak, (
+        "_claude_slice exported XDG_RUNTIME_DIR into the calling shell; it must "
+        f"scope the default to the function:\n{leak}"
     )
 
     # ── claude-egress-report ─────────────────────────────────────────
@@ -421,11 +488,41 @@ in
     # dial that address. If the snapshot is ignored, it lands in section 2.
     snap_only_ip = "192.168.1.97"
     dellan.succeed(
-        f"printf '%s\\t%s\\n' {snap_only_ip} snapshot-only.invalid "
+        f"printf '%s\\t%s\\t%s\\n' {snap_only_ip} snapshot-only.invalid \"$(date +%s)\" "
         ">> /var/lib/claude-egress/resolutions.tsv"
     )
     dellan.fail("getent ahosts snapshot-only.invalid")
     dial_in_slice(snap_only_ip)
+
+    # ── Aged-out pairs must stop matching ────────────────────────────
+    # A pair with no expiry is a pair that is right forever. CDN and cloud
+    # addresses get recycled to different operators, so a months-old row
+    # keeps filing a NEW owner of that address as "matched" — silently
+    # suppressing section 2, which exists to surface exactly that. Planted
+    # with a 1970 timestamp so no plausible TTL can keep it alive.
+    expired_ip = "192.168.1.96"
+    dellan.succeed(
+        f"printf '%s\\t%s\\t%s\\n' {expired_ip} expired.invalid 1 "
+        ">> /var/lib/claude-egress/resolutions.tsv"
+    )
+    dial_in_slice(expired_ip)
+
+    # The roll has to drop it too, or the file grows a permanent tail of
+    # rows the reporter then has to keep re-ignoring.
+    dellan.succeed("systemctl start claude-egress-resolve.service")
+    rolled = dellan.succeed("cat /var/lib/claude-egress/resolutions.tsv")
+    print("[report] snapshot after the roll:\n" + rolled)
+    assert "expired.invalid" not in rolled, (
+        "claude-egress-resolve kept an aged-out pair, so the snapshot never "
+        f"forgets a recycled address:\n{rolled}"
+    )
+    assert "snapshot-only.invalid" in rolled, (
+        "the roll dropped a pair that is still within its TTL — aging is "
+        f"discarding live data:\n{rolled}"
+    )
+    assert f"{known_ip}\tapi.anthropic.com" in rolled, (
+        f"the roll lost the freshly resolved candidate host:\n{rolled}"
+    )
 
     report = dellan.succeed(
         "timeout 120 su - jonathan -c 'claude-egress-report \"-1 hour\"' 2>&1"
@@ -467,6 +564,16 @@ in
     ), (
         "the reporter ignored the rolling resolution snapshot and joined only "
         f"against a live lookup:\n{report}"
+    )
+    # And the aged-out pair must fall through to section 2 — the signal the
+    # report exists to surface — rather than be silently absorbed by a row
+    # that stopped being true months ago.
+    assert expired_ip in unmatched_section, (
+        f"{expired_ip} was joined off an expired snapshot row instead of "
+        f"being reported as an unknown destination:\n{report}"
+    )
+    assert expired_ip not in matched_section and "expired.invalid" not in report, (
+        f"the reporter honoured an aged-out resolution pair:\n{report}"
     )
     assert "resolution snapshot:" in health_section and (
         "MISSING" not in health_section
@@ -613,6 +720,30 @@ in
     # It must not invent a stale-binding diagnosis out of an empty path.
     assert "STALE" not in absent_report, (
         f"absent was misreported as a stale binding:\n{absent_report}"
+    )
+
+    # ── Observations must survive the reboot ─────────────────────────
+    # `journalctl -k` implies `-b`, so a reporter that uses it silently
+    # truncates its window at the last boot however long a window was
+    # asked for — and the phase-2 allowlist is then built from whatever
+    # happened since the machine last came up, with nothing in the output
+    # saying so. Every address below was dialled BEFORE the reboot above,
+    # inside the one-hour window this report was given.
+    print("[3] cross-boot window check, dialled pre-reboot: "
+          f"{dial_ip} {known_ip} {snap_only_ip}")
+    assert dial_ip in absent_report, (
+        "the report lost every observation made before the reboot — its "
+        "journal query is capped at the current boot, so the phase-2 "
+        f"allowlist under-reports with no visible sign:\n{absent_report}"
+    )
+    assert known_ip in absent_report and snap_only_ip in absent_report, (
+        "only part of the pre-reboot observation window survived:\n"
+        f"{absent_report}"
+    )
+    # The join has to survive it too — /var/lib, not /run, for this reason.
+    assert "api.anthropic.com" in absent_report, (
+        "the resolution snapshot did not survive the reboot, so pre-reboot "
+        f"observations come back nameless:\n{absent_report}"
     )
     # Networking must be unaffected.
     node_ip = dellan.succeed(

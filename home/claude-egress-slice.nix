@@ -77,7 +77,12 @@
 
       runner="$(whence -p systemd-run 2>/dev/null)"
       nop="$(whence -p true 2>/dev/null)"
-      export XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      # `local -x`, never a bare `export`: the default has to reach the
+      # child, but exporting it would set it in the CALLING interactive
+      # shell for the rest of that terminal's life — and on the fallback
+      # path below it is a guess this function just proved wrong. zsh
+      # restores the caller's value (or its absence) on return.
+      local -x XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
       # Observation degrades; the tool never fails to start. Every exit
       # below still runs Claude Code — it just says so on stderr, because
