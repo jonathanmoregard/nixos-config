@@ -280,6 +280,10 @@ in
     ./claude-skills.nix
     ./research-agent-mcp.nix
     ./futuresearch-gate-mcp.nix
+    # Must stay AFTER ./jonathan.nix: it redefines claude()/claudee()
+    # through `programs.zsh.initContent = lib.mkAfter`, and the later
+    # definition is the one the shell keeps.
+    ./claude-egress-slice.nix
   ];
 
   # Point Gemini-aware tools at the agenix-decrypted key path. Consumers
