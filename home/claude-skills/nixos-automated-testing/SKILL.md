@@ -196,3 +196,34 @@ proof. The two skills are intentional complements: this one is the
 automated assertion gate every PR runs; agent-testing is the
 human-style verification you reach for when assertions alone can't
 prove the change.
+
+## `systemd-analyze` asserts less than it appears to
+
+Both measured 2026-08-20. Each makes a check look meaningful when it
+is asserting nothing, which is worse than having no check — a green
+gate reads as protection.
+
+**Inside the Nix build sandbox it exits 0 having done nothing.**
+`systemd-analyze security` and `systemd-analyze verify` both print
+
+```
+Failed to initialize manager: No such device or address
+```
+
+and then **exit 0**. A `checks.*` derivation that runs either one and
+gates on its exit status therefore passes forever, including against
+a unit whose hardening you just deleted. If you want a sandbox check
+on unit directives, assert on the rendered unit FILE — grep the
+generated `.service` text — rather than on a tool that needs a live
+manager.
+
+**`systemd-analyze verify` ignores `OnFailure=` entirely.** Control:
+point `OnFailure=` at a unit that does not exist and `verify` raises
+no complaint. So it cannot be used to prove a failure-notification
+wiring is correct. Assert the relationship in the rendered unit text,
+or exercise it for real in the feature VM via `nixos-agent-testing`.
+
+Corollary for any cached derivation: `nix flake check` prints
+`running 0 flake checks` when the check is already in the store,
+which looks identical to one that just passed. Force it with
+`nix build --rebuild <check>` when you need evidence it ran.
