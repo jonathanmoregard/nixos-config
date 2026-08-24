@@ -45,7 +45,21 @@
 # dropbox + substack + claude-web ~4 days, the whole corpus ~54.8 days, of
 # which 91% is sessions + subagents. A tick that reports progress and does
 # not finish is the normal case for weeks.
-{ pkgs, aggregator-src, ... }:
+#
+# THE DEFAULT ON `aggregator-src` IS A DIAGNOSTIC, not a fallback. This module
+# uses the argument inside `imports`, and the module system resolves an
+# argument it was not handed by looking in `_module.args` — which needs
+# `config`, which needs `imports`. The result is `error: infinite recursion
+# encountered` with a trace that never names the missing specialArg. Giving
+# the argument a default stops that lookup, so a home config built without
+# `extraSpecialArgs` fails with the sentence below instead. Every site that
+# constructs one must pass it: both host blocks in flake.nix, both builders in
+# tests/lib/common.nix, and tests/microvm.nix, which rolls its own.
+{ pkgs, aggregator-src ? throw (
+    "home/aggregator-embed.nix needs the `aggregator-src` specialArg and was "
+    + "not given it. Add `extraSpecialArgs = { inherit aggregator-src; };` to "
+    + "the home-manager block that built this configuration."
+  ), ... }:
 
 {
   imports = [ "${aggregator-src}/nix/aggregator.nix" ];
