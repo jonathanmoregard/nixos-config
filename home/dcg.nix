@@ -49,16 +49,16 @@
 # does NOT auto-clone ~/.claude (see home/jonathan-linux.nix), so a fresh
 # host boots straight into it, and claude-pull can delete the file later.
 #
-# The activation hook below closes that. It has two arms, and the split
+# The activation hooks below close that. There are two arms, and the split
 # is about whether there is operator content to lose:
 #
-#   TARGET ABSENT  → seed ./dcg-fallback.toml at the target and print an
-#                    unmissable banner. Nothing is overwritten (the seed
-#                    only ever runs when the path does not exist), the
-#                    guard comes up ARMED rather than silently disarmed,
-#                    and every deny the fallback issues names itself in
-#                    its reason text.
-#   TARGET BROKEN  → hard-fail activation, quoting dcg's own parse error.
+#   TARGET ABSENT  → seed ./dcg-fallback.toml at the target, announce it
+#                    three ways (see "TELLING THE OPERATOR" below).
+#                    Nothing is overwritten (the seed only ever runs when
+#                    the path does not exist), the guard comes up ARMED
+#                    rather than silently disarmed, and every deny the
+#                    fallback issues names itself in its reason text.
+#   TARGET BROKEN  → fail activation, quoting dcg's own parse error.
 #                    (unreadable, dangling, malformed TOML) A malformed
 #                    dcg.toml today produces `Warning: Failed to parse
 #                    config file …` on the STDERR OF A PRETOOLUSE HOOK,
@@ -79,6 +79,92 @@
 # file to already exist, so it can only ever fire on a host where someone
 # hand-edited it.
 #
+# WHY THE CHECK IS SPLIT ACROSS TWO ACTIVATION ENTRIES
+#
+# `dcgConfigState` seeds and records; `dcgConfigVerdict` is the only one
+# that can exit 1, and it runs after EVERY other activation entry.
+#
+# That split is not cosmetic. Home-manager inlines all activation entries
+# into a single `set -eu` bash script, and hm.dag breaks ties between
+# same-dependency entries by attribute name — so the previous single
+# `entryAfter [ "linkGeneration" ]` entry (`dcgConfigArmed`) sorted ahead
+# of eight later steps. Measured in the GENERATED `activate` script, not
+# inferred from the DAG: `dcgConfigArmed` was step 8 of 16, followed by
+# `installPackages`, `dconfSettings`, `ensureClaudeLogsDir`,
+# `installCalibrePlugins`, `installCrontab`, `kittyReloadConfig`,
+# `onFilesChange` and `reloadSystemd`. Its `exit 1` killed all eight —
+# including the crontab reinstall whose entire reason for existing is that
+# skipping it leaves the live crontab silently stale (see the comment above
+# `installCrontab` in home/jonathan-linux.nix), and including
+# `reloadSystemd`, which is how changed user units reach systemd at all.
+#
+# A guard whose firing breaks unrelated machinery is a guard the operator
+# learns to comment out, which converts a loud failure into a permanent
+# silent one — the exact trade this module exists to refuse. So the verdict
+# entry declares `entryAfter` on every other activation entry by name,
+# computed from `config.home.activation` rather than hand-listed, so a
+# module added later cannot quietly sort after it. Everything that can be
+# applied gets applied; only the final "this generation is good" is
+# withheld. The unit still fails, `nixos-rebuild switch` still reports it,
+# and nixos-deploy still poisons the SHA.
+#
+# TELLING THE OPERATOR THAT THE FALLBACK IS IN FORCE
+#
+# The seeded state is the dangerous-quiet one: the host is armed, but with
+# a strictly weaker rule set than the operator believes is loaded. On
+# NixOS, home-manager activation runs inside `home-manager-jonathan.service`
+# and `nixos-rebuild` does not stream unit logs — so a banner on stderr
+# lands in `journalctl` and nowhere else, i.e. in front of nobody. Three
+# channels, because each one covers the others' blind spot:
+#
+#   1. the stderr banner            → the record, for whoever reads the log
+#   2. a desktop notification       → the human, at the moment it happens
+#      (critical urgency, same channel ~/.claude/hooks/harness-tripwire.py
+#      uses; best-effort — a headless or pre-login activation has no bus,
+#      and that must never fail the rebuild)
+#   3. a marker FILE                → the agent, at every session start
+#
+# Channel 3 is the durable one, and it is a cross-repo contract. Written
+# and removed only here; read by the session-start guard-health hook in
+# the ~/.claude repo, which this flake cannot edit.
+#
+#   PATH    $XDG_STATE_HOME/dcg/fallback-active.json
+#           = /home/<user>/.local/state/dcg/fallback-active.json
+#           (userspace state, deliberately NOT under ~/.claude — that tree
+#           is Claude Code's own config/state surface and is a protected
+#           path for the agent, so a marker there would be unwritable by
+#           activation and unreadable-without-prompting by the hook.)
+#
+#   ABSENT  The dcg user layer is the operator's own file — or activation
+#           has never run on this host. Both are "not the fallback".
+#
+#   PRESENT As of `observed_at`, the file at `target` was byte-identical
+#           to `fallback_source`, i.e. the guard is running nixos-config's
+#           bootstrap fallback and the operator's real pattern list is NOT
+#           loaded. A reader wanting a fresher answer than `observed_at`
+#           re-runs the same test: `cmp -s <target> <fallback_source>`.
+#
+#   FORMAT  A single JSON object, written atomically (temp + rename):
+#             { "schema":          1,
+#               "component":       "dcg",
+#               "state":           "fallback-active",
+#               "target":          "/home/<user>/.claude/dcg.toml",
+#               "fallback_source": "/nix/store/…-dcg-fallback.toml",
+#               "observed_at":     "2026-08-24T09:11:22Z",   # UTC, ISO-8601
+#               "remedy":          "<one-line fix instruction>" }
+#
+#   SCHEMA  `schema` is bumped on any incompatible change. A reader that
+#           does not recognise the value must treat the file as "fallback
+#           possibly active" and warn — never as "unparseable, therefore
+#           fine". Unreadable/garbled is the same: warn. The whole point of
+#           the marker is that silence means healthy, so anything that is
+#           not a confident "healthy" has to be noisy.
+#
+#   REFRESH Rewritten on every activation that finds the fallback in force
+#           (so `observed_at` tracks reality and the notification re-fires
+#           until it is fixed), and deleted on the first activation that
+#           finds it is not. It is never left behind to go stale by design.
+#
 # WHAT THIS DOES NOT COVER
 #
 # The window between a deletion and the next activation. Nothing on the
@@ -94,6 +180,37 @@ let
   # .claude repo. Single source for the link, the seed and the check, so
   # the three cannot drift onto different paths.
   claudeConfig = "${config.home.homeDirectory}/.claude/dcg.toml";
+
+  # The seed, as a store path. Named once so the marker's
+  # `fallback_source` field and the `install` that writes it cannot
+  # disagree about which file "the fallback" means.
+  fallbackSource = ./dcg-fallback.toml;
+
+  # Cross-repo contract file — see "TELLING THE OPERATOR" above for the
+  # full reader contract. Literal path rather than `config.xdg.stateHome`
+  # because the reader lives in another repo and needs a path it can hard-
+  # code; the two agree under the XDG default.
+  fallbackMarker =
+    "${config.home.homeDirectory}/.local/state/dcg/fallback-active.json";
+
+  remedy =
+    "restore ~/.claude (git clone git@github.com:jonathanmoregard/.claude.git "
+    + "~/.claude, or git -C ~/.claude checkout -- dcg.toml) and rebuild";
+
+  # A dry run creates no files, so seeding would be a lie and validating
+  # afterwards would report a state this run deliberately did not make.
+  #
+  # BOTH variables are tested. `DRY_RUN` is the live one (home-manager's
+  # own CLI exports `DRY_RUN=1` and tests it with `[[ -v DRY_RUN ]]`);
+  # `DRY_RUN_CMD` is derived from it and marked deprecated in home-manager's
+  # generated activate script. Keying on the deprecated one ALONE — which
+  # this hook used to do — means the day home-manager drops it, a
+  # `dry-activate` starts seeding files and validating for real. Keying on
+  # the live one alone would break in the mirror-image case. Either signal
+  # is enough to skip, which is the safe direction: the failure mode of a
+  # missed skip is writing a file during a dry run, while the failure mode
+  # of a spurious skip is only a check deferred to the next real switch.
+  notDryRun = ''[[ ! -v DRY_RUN && -z "''${DRY_RUN_CMD:-}" ]]'';
 in
 {
   home.packages = [ pkgs.dcg ];
@@ -101,16 +218,17 @@ in
   home.file.".config/dcg/config.toml".source =
     config.lib.file.mkOutOfStoreSymlink claudeConfig;
 
+  # ── Entry 1: seed, and record whether the fallback is in force ────────
+  #
   # Runs after linkGeneration so ~/.config/dcg/config.toml already exists
-  # and `dcg config` sees the real, fully-linked state — and as late as
-  # possible, so the hard-fail arm aborts after the rest of the
-  # generation has already been applied.
-  home.activation.dcgConfigArmed = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+  # and the state this records is the real, fully-linked one. Nothing here
+  # can fail the activation; that is entry 2's job and entry 2's alone.
+  home.activation.dcgConfigState = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
     dcgTarget="${claudeConfig}"
+    dcgFallbackSource="${fallbackSource}"
+    dcgMarker="${fallbackMarker}"
 
-    # A dry run creates no files, so seeding is skipped and validating
-    # afterwards would report a state this run deliberately did not make.
-    if [ -z "''${DRY_RUN_CMD:-}" ]; then
+    if ${notDryRun}; then
 
       # ── Arm 1: absent → seed, loudly ────────────────────────────────
       # -e is false for a dangling symlink, so -L is tested separately:
@@ -118,7 +236,7 @@ in
       # it and write wherever it points). It falls to arm 2 instead.
       if [ ! -e "$dcgTarget" ] && [ ! -L "$dcgTarget" ]; then
         ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$dcgTarget")"
-        ${pkgs.coreutils}/bin/install -m 0644 ${./dcg-fallback.toml} "$dcgTarget"
+        ${pkgs.coreutils}/bin/install -m 0644 "$dcgFallbackSource" "$dcgTarget"
         ${pkgs.coreutils}/bin/printf '%s\n' \
           "" \
           "################################################################" \
@@ -135,65 +253,130 @@ in
           "#  dropped the whole user layer silently, permitting" \
           "#  curl -X DELETE with exit 0 and no output at all." \
           "#" \
-          "#  Fix: restore ~/.claude (clone the .claude repo, or" \
-          "#  git -C ~/.claude checkout -- dcg.toml) and rebuild." \
+          "#  Fix: ${remedy}." \
           "################################################################" \
           "" \
           >&2
       fi
 
-      # ── Arm 2: ask dcg itself whether the user layer actually loaded ─
+      # ── The marker, and the desktop notification ────────────────────
       #
-      # dcg's own loader is the oracle. Re-implementing a TOML parse or a
-      # readlink check here would be a second implementation to drift;
-      # `dcg config --format json` reports per-layer status straight out
-      # of the code path the hook uses (loaded / missing / invalid /
-      # rejected), with the parse error in `.detail`.
-      #
-      # cd / because dcg auto-discovers a project .dcg.toml from the cwd
-      # and would report a layer that has nothing to do with this check.
-      # env -u because DCG_CONFIG / DCG_FORMAT in the activation
-      # environment would silently redirect what gets validated.
-      dcgUser=$(
-        cd / \
-          && ${pkgs.coreutils}/bin/env -u DCG_CONFIG -u DCG_FORMAT \
-               XDG_CONFIG_HOME="$HOME/.config" \
-               ${pkgs.dcg}/bin/dcg config --format json 2>/dev/null \
-          | ${pkgs.jq}/bin/jq -c '.config_sources[] | select(.level == "user")'
-      ) || dcgUser=""
+      # Keyed on the CURRENT state, not on whether this run did the
+      # seeding: a host that was seeded three rebuilds ago is just as
+      # degraded as one seeded a second ago, and the operator who has not
+      # fixed it yet is exactly the one who needs telling again.
+      ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$dcgMarker")"
+      if ${pkgs.diffutils}/bin/cmp -s "$dcgTarget" "$dcgFallbackSource"; then
+        # Temp + rename, so a reader never sees a half-written object.
+        ${pkgs.jq}/bin/jq -n \
+          --arg target "$dcgTarget" \
+          --arg fallback "$dcgFallbackSource" \
+          --arg observed "$(${pkgs.coreutils}/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg remedy "${remedy}" \
+          '{ schema: 1,
+             component: "dcg",
+             state: "fallback-active",
+             target: $target,
+             fallback_source: $fallback,
+             observed_at: $observed,
+             remedy: $remedy }' \
+          > "$dcgMarker.tmp"
+        ${pkgs.coreutils}/bin/mv -f "$dcgMarker.tmp" "$dcgMarker"
 
-      dcgStatus=$(${pkgs.coreutils}/bin/printf '%s' "$dcgUser" \
-        | ${pkgs.jq}/bin/jq -r '.status // "unreadable"' 2>/dev/null) || dcgStatus=""
-      dcgDetail=$(${pkgs.coreutils}/bin/printf '%s' "$dcgUser" \
-        | ${pkgs.jq}/bin/jq -r '.detail // "(dcg reported no detail)"' 2>/dev/null) \
-        || dcgDetail="(dcg reported no detail)"
-
-      if [ "$dcgStatus" != "loaded" ]; then
-        ${pkgs.coreutils}/bin/printf '%s\n' \
-          "" \
-          "################################################################" \
-          "#  dcg: USER CONFIG LAYER IS NOT LOADED - activation refused" \
-          "#" \
-          "#  ~/.config/dcg/config.toml -> $dcgTarget" \
-          "#  dcg reports status: ''${dcgStatus:-<no answer from dcg config>}" \
-          "#  detail: $dcgDetail" \
-          "#" \
-          "#  In this state dcg still runs, still exits 0, and drops your" \
-          "#  ENTIRE override list. curl -X DELETE would be PERMITTED with" \
-          "#  no output on stdout or stderr, while rm -rf / would still be" \
-          "#  denied by a built-in pack - so the guard would look alive." \
-          "#" \
-          "#  Activation is failing on purpose rather than repairing the" \
-          "#  file, because the file is yours and repairing it would" \
-          "#  destroy what you were editing." \
-          "#" \
-          "#  Fix the TOML (the parse error above names the line), then" \
-          "#  rerun. Verify with: dcg config" \
-          "################################################################" \
-          "" \
-          >&2
-        exit 1
+        # Best-effort, and deliberately so: activation must not fail
+        # because nobody is logged in. `|| true` covers a missing daemon,
+        # the socket test covers a pre-login activation where there is no
+        # bus at all, and `timeout` covers the remaining case — a bus that
+        # accepts the call and never answers. A notification channel that
+        # can wedge a rebuild is worse than no notification channel.
+        dcgBus="/run/user/$(${pkgs.coreutils}/bin/id -u)/bus"
+        if [ -S "$dcgBus" ]; then
+          DBUS_SESSION_BUS_ADDRESS="unix:path=$dcgBus" \
+            ${pkgs.coreutils}/bin/timeout 5 \
+            ${pkgs.libnotify}/bin/notify-send \
+              --urgency=critical --app-name=dcg \
+              "dcg is running the BOOTSTRAP FALLBACK" \
+              "$dcgTarget is nixos-config's fallback, not your pattern list. Destructive HTTP verbs are blocked; nothing else you added is. Fix: ${remedy}." \
+            || true
+        fi
+      else
+        # Not the fallback → the operator's own file is in force. Clear
+        # the marker so its presence keeps meaning something.
+        ${pkgs.coreutils}/bin/rm -f "$dcgMarker" "$dcgMarker.tmp"
       fi
     fi
   '';
+
+  # ── Entry 2: the verdict, and the only thing here that can exit 1 ─────
+  #
+  # `entryAfter` every other activation entry, computed rather than
+  # hand-listed so a module added later cannot sort after it. hm.dag
+  # tolerates names it does not know (topoSort's `before` predicate simply
+  # never matches them), so this stays correct if an entry is removed.
+  # `removeAttrs` on itself is what keeps it from depending on itself,
+  # which hm.dag would report as a cycle.
+  home.activation.dcgConfigVerdict = lib.hm.dag.entryAfter
+    (lib.attrNames (removeAttrs config.home.activation [ "dcgConfigVerdict" ]))
+    ''
+      dcgTarget="${claudeConfig}"
+
+      if ${notDryRun}; then
+        # Ask dcg itself whether the user layer actually loaded.
+        #
+        # dcg's own loader is the oracle. Re-implementing a TOML parse or a
+        # readlink check here would be a second implementation to drift;
+        # `dcg config --format json` reports per-layer status straight out
+        # of the code path the hook uses (loaded / missing / invalid /
+        # rejected), with the parse error in `.detail`.
+        #
+        # cd / because dcg auto-discovers a project .dcg.toml from the cwd
+        # and would report a layer that has nothing to do with this check.
+        # env -u because DCG_CONFIG / DCG_FORMAT in the activation
+        # environment would silently redirect what gets validated.
+        dcgUser=$(
+          cd / \
+            && ${pkgs.coreutils}/bin/env -u DCG_CONFIG -u DCG_FORMAT \
+                 XDG_CONFIG_HOME="$HOME/.config" \
+                 ${pkgs.dcg}/bin/dcg config --format json 2>/dev/null \
+            | ${pkgs.jq}/bin/jq -c '.config_sources[] | select(.level == "user")'
+        ) || dcgUser=""
+
+        dcgStatus=$(${pkgs.coreutils}/bin/printf '%s' "$dcgUser" \
+          | ${pkgs.jq}/bin/jq -r '.status // "unreadable"' 2>/dev/null) || dcgStatus=""
+        dcgDetail=$(${pkgs.coreutils}/bin/printf '%s' "$dcgUser" \
+          | ${pkgs.jq}/bin/jq -r '.detail // "(dcg reported no detail)"' 2>/dev/null) \
+          || dcgDetail="(dcg reported no detail)"
+
+        if [ "$dcgStatus" != "loaded" ]; then
+          ${pkgs.coreutils}/bin/printf '%s\n' \
+            "" \
+            "################################################################" \
+            "#  dcg: USER CONFIG LAYER IS NOT LOADED - activation refused" \
+            "#" \
+            "#  ~/.config/dcg/config.toml -> $dcgTarget" \
+            "#  dcg reports status: ''${dcgStatus:-<no answer from dcg config>}" \
+            "#  detail: $dcgDetail" \
+            "#" \
+            "#  In this state dcg still runs, still exits 0, and drops your" \
+            "#  ENTIRE override list. curl -X DELETE would be PERMITTED with" \
+            "#  no output on stdout or stderr, while rm -rf / would still be" \
+            "#  denied by a built-in pack - so the guard would look alive." \
+            "#" \
+            "#  Every other activation step has already run; this generation" \
+            "#  is simply refusing to report success. Nothing else was" \
+            "#  skipped on account of dcg." \
+            "#" \
+            "#  Activation is failing on purpose rather than repairing the" \
+            "#  file, because the file is yours and repairing it would" \
+            "#  destroy what you were editing." \
+            "#" \
+            "#  Fix the TOML (the parse error above names the line), then" \
+            "#  rerun. Verify with: dcg config" \
+            "################################################################" \
+            "" \
+            >&2
+          exit 1
+        fi
+      fi
+    '';
 }

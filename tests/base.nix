@@ -1409,6 +1409,37 @@ in
     # on a TOML parse error, but only on the stderr of a PreToolUse hook,
     # which Claude Code discards — so today it reaches nobody while every
     # override silently stops applying.
+    #
+    # Two more, both about who actually finds out:
+    #
+    #   (f) the MARKER FILE. On NixOS, home-manager activation runs inside
+    #       home-manager-jonathan.service and `nixos-rebuild` does not
+    #       stream unit logs, so the seed banner lands in journalctl and
+    #       in front of nobody. A seeded host would look fully configured
+    #       while running a strictly weaker rule set — the same silent
+    #       degradation in a new costume. home/dcg.nix therefore writes
+    #       $XDG_STATE_HOME/dcg/fallback-active.json whenever the fallback
+    #       is in force and deletes it when it is not; the session-start
+    #       guard-health hook in the ~/.claude repo reads it. That is a
+    #       cross-repo contract, so this lane pins its path, its schema and
+    #       its lifecycle in both directions.
+    #   (g) a dcg problem must not take out the REST of activation. The
+    #       hard-fail used to live in an `entryAfter [ "linkGeneration" ]`
+    #       entry, which hm.dag sorted ahead of installPackages,
+    #       dconfSettings, installCrontab, kittyReloadConfig and
+    #       reloadSystemd — so a malformed dcg.toml silently skipped eight
+    #       unrelated steps, including the crontab reinstall whose whole
+    #       purpose is to stop cron going stale. A guard that breaks
+    #       unrelated machinery when it fires is a guard that gets
+    #       commented out.
+    #
+    # Every banner assertion below is scoped to a journal CURSOR taken
+    # before the restart that is supposed to produce it. The unscoped
+    # `journalctl -n 400` the previous revision used could be satisfied by
+    # the BOOT-time seed's identical banner, so a silent-reseed regression
+    # would have passed. `dcg_journal_since` is the fix; the control
+    # assertion under (d) proves the old form was satisfiable without any
+    # restart at all.
 
     # (a) On jonathan's PATH (home.packages -> per-user profile) and
     # executable. `su -` so the assertion is about the login PATH the
@@ -1454,6 +1485,7 @@ in
     # fresh-host state, and what the lane asserts is that the fresh-host
     # state comes up ARMED rather than silently disarmed.
     import json as _dcg_json
+    import re as _re
 
     dellan.succeed("test -L /home/jonathan/.config/dcg/config.toml")
     dcg_cfg_target = dellan.succeed(
@@ -1480,6 +1512,54 @@ in
     # any "copied verbatim" claim about it would be unkeepable.)
     dellan.succeed(
         "cmp ${../home/dcg-fallback.toml} /home/jonathan/.claude/dcg.toml"
+    )
+
+    # (f) The marker file, and its contract with the ~/.claude session-start
+    # guard-health hook. Path and schema are asserted literally, not read
+    # out of the Nix that wrote them, because the reader lives in another
+    # repo and hard-codes them — a drift here is a drift the other side
+    # cannot see. Bump `schema` on any incompatible change and this
+    # assertion will tell you the hook needs updating too.
+    dcg_marker_path = "/home/jonathan/.local/state/dcg/fallback-active.json"
+
+    def dcg_read_marker():
+        """The marker as a dict, or None when it is absent."""
+        if dellan.execute(f"test -f {dcg_marker_path}")[0] != 0:
+            return None
+        return _dcg_json.loads(dellan.succeed(f"cat {dcg_marker_path}"))
+
+    dcg_marker = dcg_read_marker()
+    assert dcg_marker is not None, (
+        f"{dcg_marker_path} is absent on a host running the seeded "
+        "bootstrap fallback. The banner home/dcg.nix printed went to "
+        "journalctl only — nixos-rebuild does not stream unit logs — so "
+        "without this file nothing tells the operator or the agent that "
+        "the guard is running a weaker rule set than they think:\n"
+        + dellan.succeed("ls -la /home/jonathan/.local/state/dcg || true")
+    )
+    assert dcg_marker["schema"] == 1, (
+        f"marker schema is {dcg_marker['schema']!r}, not 1. The "
+        "session-start guard-health hook in the ~/.claude repo reads this "
+        "file and keys on the schema; bumping it here without bumping it "
+        "there means the hook silently stops recognising the degraded "
+        "state."
+    )
+    assert dcg_marker["component"] == "dcg", dcg_marker
+    assert dcg_marker["state"] == "fallback-active", dcg_marker
+    assert dcg_marker["target"] == "/home/jonathan/.claude/dcg.toml", dcg_marker
+    assert dcg_marker["fallback_source"].startswith("/nix/store/"), dcg_marker
+    assert dcg_marker["remedy"].strip(), dcg_marker
+    # observed_at is UTC ISO-8601 to the second; the reader compares it
+    # against now to decide how stale its answer is.
+    assert _re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", dcg_marker["observed_at"]
+    ), dcg_marker
+    # And the claim the file makes must actually hold: `target` really is
+    # byte-identical to `fallback_source`. That is the same test the hook
+    # re-runs when it wants an answer fresher than observed_at, so if it
+    # cannot be run from the fields in the file, the contract is broken.
+    dellan.succeed(
+        f"cmp {dcg_marker['fallback_source']} {dcg_marker['target']}"
     )
 
     # And dcg's own loader must agree the user layer LOADED. From outside,
@@ -1601,23 +1681,83 @@ in
         "curl -X DELETE https://example.com/x", "${dcgVmBlockReason}"
     )
 
+    # Journal scoping. Every banner assertion from here on is about output
+    # a SPECIFIC restart produced, so it is read from a cursor taken just
+    # before that restart. `journalctl --show-cursor -n 0` prints only the
+    # `-- cursor: …` trailer, which is exactly what --after-cursor wants.
+    def dcg_journal_cursor():
+        line = dellan.succeed(
+            "journalctl -u home-manager-jonathan.service --no-pager "
+            "-n 0 --show-cursor"
+        )
+        return line.rsplit("-- cursor:", 1)[1].strip()
+
+    def dcg_journal_since(cursor):
+        return dellan.succeed(
+            "journalctl -u home-manager-jonathan.service --no-pager -o cat "
+            f"--after-cursor '{cursor}'"
+        )
+
+    # An activation that finds the operator's file in place must leave it
+    # ALONE and must not claim to have seeded anything. Two jobs at once:
+    # it is a real property (the seed arm must never clobber a hand-edited
+    # list), and it is the control that shows why the scoping above is
+    # load-bearing.
+    dcg_cursor = dcg_journal_cursor()
+    dellan.succeed("systemctl restart home-manager-jonathan.service")
+    dcg_noseed_log = dcg_journal_since(dcg_cursor)
+    assert "SEEDED BOOTSTRAP FALLBACK CONFIG" not in dcg_noseed_log, (
+        "home-manager announced a seed on a run where the target already "
+        "existed. Either it overwrote the operator's pattern list, or it "
+        "printed a banner it had not earned:\n" + dcg_noseed_log[-3000:]
+    )
+    dellan.succeed("cmp ${dcgVmConfig} /home/jonathan/.claude/dcg.toml")
+    # THE CONTROL. Unscoped, the boot-time seed's identical banner is still
+    # sitting in this unit's journal — so the previous revision's
+    # `journalctl -n 400 | grep SEEDED` was satisfied here, on a restart
+    # that seeded nothing. That is the silent-reseed regression the
+    # cursor closes, demonstrated rather than argued.
+    dcg_whole_log = dellan.succeed(
+        "journalctl -u home-manager-jonathan.service --no-pager -o cat"
+    )
+    assert "SEEDED BOOTSTRAP FALLBACK CONFIG" in dcg_whole_log, (
+        "control failed: the boot-time seed banner is no longer in this "
+        "unit's journal at all, so the fresh-host seed did not happen or "
+        "the journal was cleared. Everything (b) asserted is in doubt."
+    )
+    # And with the operator's own file in force, the marker must be GONE.
+    # A marker that is never cleared is a marker the reader learns to
+    # ignore, which is the same silence in a different place.
+    assert dcg_read_marker() is None, (
+        "the fallback marker survived an activation that found the "
+        "operator's own config in place. It now reports a degraded state "
+        "that is not happening, and the session-start hook will warn on "
+        "every healthy session until someone deletes it by hand."
+    )
+
     # (d) The degraded state must be UNREACHABLE across an activation.
     # Delete the target — the thing a fresh host, or claude-pull, or a
     # stray rm actually does — and re-run home-manager. Activation must
     # succeed, re-seed, and say loudly that it did.
     dellan.succeed("rm /home/jonathan/.claude/dcg.toml")
+    dcg_cursor = dcg_journal_cursor()
     dellan.succeed("systemctl restart home-manager-jonathan.service")
     dellan.succeed("test -f /home/jonathan/.claude/dcg.toml")
     dellan.succeed(
         "cmp ${../home/dcg-fallback.toml} /home/jonathan/.claude/dcg.toml"
     )
-    reseed_log = dellan.succeed(
-        "journalctl -u home-manager-jonathan.service --no-pager -o cat -n 400"
-    )
+    reseed_log = dcg_journal_since(dcg_cursor)
     assert "SEEDED BOOTSTRAP FALLBACK CONFIG" in reseed_log, (
         "home-manager re-seeded nothing, or did it silently. A silent repair "
         "is still a config the operator believes is theirs and is not:\n"
         + reseed_log[-3000:]
+    )
+    # …and the marker is back, with a fresh observation.
+    dcg_marker = dcg_read_marker()
+    assert dcg_marker is not None and dcg_marker["state"] == "fallback-active", (
+        "the re-seeded fallback left no marker, so the only trace of the "
+        "degraded state is again a banner in a unit log nobody reads: "
+        f"{dcg_marker!r}"
     )
     dcg_assert_denied_by_user_config(
         "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"
@@ -1632,10 +1772,9 @@ in
         "install -D -o jonathan -g users -m 0644 "
         "${dcgBrokenConfig} /home/jonathan/.claude/dcg.toml"
     )
+    dcg_cursor = dcg_journal_cursor()
     dellan.fail("systemctl restart home-manager-jonathan.service")
-    broken_log = dellan.succeed(
-        "journalctl -u home-manager-jonathan.service --no-pager -o cat -n 400"
-    )
+    broken_log = dcg_journal_since(dcg_cursor)
     assert "USER CONFIG LAYER IS NOT LOADED" in broken_log, (
         "home-manager activation failed, but not with the dcg diagnostic — "
         "so the failure does not tell the operator what to fix:\n"
@@ -1645,6 +1784,43 @@ in
         "the activation failure does not quote dcg's own parse error, so the "
         "operator gets no line number:\n" + broken_log[-3000:]
     )
+
+    # (g) …and the rest of activation still ran. home-manager inlines every
+    # activation entry into one `set -eu` script, so an `exit 1` from an
+    # entry sorted early kills every entry after it. The check used to sit
+    # in `entryAfter [ "linkGeneration" ]`, which hm.dag placed 8th of 16 —
+    # ahead of installPackages, dconfSettings, ensureClaudeLogsDir,
+    # installCalibrePlugins, installCrontab, kittyReloadConfig,
+    # onFilesChange and reloadSystemd. So a typo in dcg.toml silently
+    # skipped the crontab reinstall, which is the exact stale-crontab drift
+    # the comment above `installCrontab` in home/jonathan-linux.nix was
+    # written about, plus the systemd reload that makes changed user units
+    # take effect at all. The fix splits the check in two and makes the
+    # verdict entry depend on every other entry, so it sorts last: the
+    # generation applies everything it can and then refuses to report
+    # success. Read from the SAME failed run as the banner above, using the
+    # step markers home-manager itself logs.
+    dcg_steps = _re.findall(r"Activating (\S+)", broken_log)
+    assert dcg_steps[-1] == "dcgConfigVerdict", (
+        "the dcg verdict is not the last activation step; anything sorted "
+        f"after it dies when it exits 1. Order was: {dcg_steps}"
+    )
+    assert "dcgConfigState" in dcg_steps, (
+        f"the dcg seed/marker step did not run at all: {dcg_steps}"
+    )
+    # installCrontab specifically, because the stale-crontab drift is the
+    # documented incident this would re-create (see the comment above
+    # `installCrontab` in home/jonathan-linux.nix); reloadSystemd because
+    # skipping it is how changed user units quietly fail to take effect.
+    dcg_after_state = dcg_steps[dcg_steps.index("dcgConfigState") + 1:]
+    for dcg_late_step in ["installCrontab", "reloadSystemd"]:
+        assert dcg_late_step in dcg_after_state, (
+            f"activation never reached {dcg_late_step!r} on a run that "
+            "failed only because dcg.toml was malformed. A guard whose "
+            "firing breaks the crontab reinstall and the systemd reload is "
+            "a guard that gets commented out, which turns one loud failure "
+            f"into a permanent silent one. Order was: {dcg_steps}"
+        )
 
     # Restore, so the lane does not end on a deliberately failed unit.
     dellan.succeed("rm /home/jonathan/.claude/dcg.toml")

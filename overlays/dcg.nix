@@ -86,6 +86,10 @@ let
   # than a heredoc inside the phase: a heredoc body would be re-indented
   # by the surrounding Nix `''` string and its terminator would stop
   # terminating.
+  #
+  # The reason string is bound to a Nix variable and interpolated into both
+  # the fixture and the assertion, so the two cannot drift.
+  dcgFixtureReason = "installCheck fixture rule, not a built-in pack";
   dcgFixtureConfig = prev.writeText "dcg-installcheck-config.toml" ''
     [general]
     verbose = false
@@ -93,7 +97,7 @@ let
     [overrides]
     allow = []
     block = [
-        { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "installCheck fixture" },
+        { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "${dcgFixtureReason}" },
     ]
   '';
 in
@@ -163,6 +167,39 @@ in
         *'"permissionDecision"'*'"deny"'*) : ;;
         *)
           echo "dcg installCheck: destructive command was NOT denied" >&2
+          echo "$deny_out" >&2
+          exit 1
+          ;;
+      esac
+
+      # A `deny` alone proves too little. dcg ships built-in packs, and a
+      # future pack that happens to cover destructive HTTP verbs would
+      # satisfy the check above on a build where the fixture config was
+      # never opened — which is precisely the "guard looks alive while its
+      # config is unread" shape this package exists to detect. So the deny
+      # has to be ATTRIBUTED to the fixture, two ways:
+      #
+      #   - it carries the fixture's own reason string, and
+      #   - it carries neither ruleId nor packId. dcg tags a pack match
+      #     with those and an `[overrides]` match with neither, so their
+      #     absence is the positive marker of a user-config decision.
+      #
+      # Same pair of assertions the vm-base lane makes against the deployed
+      # binary (tests/base.nix, dcg_assert_denied_by_user_config).
+      case "$deny_out" in
+        *'${dcgFixtureReason}'*) : ;;
+        *)
+          echo "dcg installCheck: the deny does not carry the fixture's reason" >&2
+          echo "  expected to find: ${dcgFixtureReason}" >&2
+          echo "$deny_out" >&2
+          exit 1
+          ;;
+      esac
+      case "$deny_out" in
+        *'"packId"'* | *'"ruleId"'*)
+          echo "dcg installCheck: the deny came from a built-in pack, not from" >&2
+          echo "  the fixture config - so it proves nothing about the config" >&2
+          echo "  path being read at all" >&2
           echo "$deny_out" >&2
           exit 1
           ;;
