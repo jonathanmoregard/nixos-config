@@ -26,7 +26,56 @@
     # define `microvm.runner.qemu` twice. `flake = ...` is mutually
     # exclusive with `config` and would fail assertion
     # `Fully-declarative VMs cannot also set a flake!`.
-    config = { config, pkgs, ... }: {
+    config = { config, pkgs, ... }: let
+
+      # Egress allowlist — SINGLE SOURCE OF TRUTH. Consumed by both
+      # research-agent-egress-init (resolves at boot, gates sshd) and
+      # research-agent-egress-refresh (re-resolves on a timer). Keep it
+      # one list: a domain added to init but not refresh would be
+      # silently dropped from the set at the next refresh, which is a
+      # worse failure than the drift this exists to fix.
+      egressAllowlist = [
+        "api.anthropic.com"
+        "api.exa.ai"
+        "mcp.exa.ai"
+        # api.tavily.com is AWS ELB-backed and its A records rotate on a
+        # scale of hours-to-days — this is the domain that motivated the
+        # refresh timer (2026-08-24; see research-agent-egress-refresh).
+        "api.tavily.com"
+        "mcp.tavily.com"
+        # Trademark-clearance shims (agent/shims/{trademark,bolagsverket}
+        # _shim.py in the research-agent repo). Added to the agent in
+        # 2026-06 but never to this allowlist — every call dialled out,
+        # hit dropped packets, and hung to its client timeout (EUIPO
+        # curl-28 after 30s, bolagsverket urllib after 120s), burning
+        # whole research budgets on dead waits.
+        # EUIPO sandbox (in use until the production subscription is
+        # approved):
+        "auth-sandbox.euipo.europa.eu"
+        "api-sandbox.euipo.europa.eu"
+        # EUIPO production (pre-added so the sandbox->prod flip is a
+        # shim-env change, not another firewall PR):
+        "euipo.europa.eu"
+        "api.euipo.europa.eu"
+        # Bolagsverket open-data bulk file (CC-BY, weekly refresh):
+        "vardefulla-datamangder.bolagsverket.se"
+        # PRV open-data FTP (Swedish national trademark register;
+        # sanctioned bulk channel used by prv_shim). NOTE: FTP —
+        # control on :21 plus PASV data connections to the same
+        # host on ephemeral ports; the allowlist is IP-based so
+        # PASV lands on the same allowed IPs, and outbound
+        # ESTABLISHED/RELATED handles the rest.
+        "opendata.prv.se"
+      ];
+
+      # Rendered as a bash array literal for both unit scripts.
+      allowedArray = ''
+        ALLOWED=(
+          ${lib.concatStringsSep "\n          " egressAllowlist}
+        )
+      '';
+
+    in {
 
       microvm = {
         hypervisor = "qemu";
@@ -272,36 +321,7 @@
           # pipefail stay.
           set -uo pipefail
 
-          ALLOWED=(
-            api.anthropic.com
-            api.exa.ai
-            mcp.exa.ai
-            api.tavily.com
-            mcp.tavily.com
-            # Trademark-clearance shims (agent/shims/{trademark,bolagsverket}
-            # _shim.py in the research-agent repo). Added to the agent in
-            # 2026-06 but never to this allowlist — every call dialled out,
-            # hit dropped packets, and hung to its client timeout (EUIPO
-            # curl-28 after 30s, bolagsverket urllib after 120s), burning
-            # whole research budgets on dead waits.
-            # EUIPO sandbox (in use until the production subscription is
-            # approved):
-            auth-sandbox.euipo.europa.eu
-            api-sandbox.euipo.europa.eu
-            # EUIPO production (pre-added so the sandbox->prod flip is a
-            # shim-env change, not another firewall PR):
-            euipo.europa.eu
-            api.euipo.europa.eu
-            # Bolagsverket open-data bulk file (CC-BY, weekly refresh):
-            vardefulla-datamangder.bolagsverket.se
-            # PRV open-data FTP (Swedish national trademark register;
-            # sanctioned bulk channel used by prv_shim). NOTE: FTP —
-            # control on :21 plus PASV data connections to the same
-            # host on ephemeral ports; the allowlist is IP-based so
-            # PASV lands on the same allowed IPs, and outbound
-            # ESTABLISHED/RELATED handles the rest.
-            opendata.prv.se
-          )
+          ${allowedArray}
 
           # Never hard-fail on DNS. This unit gates sshd (Requires=),
           # so exiting non-zero turns a flaky uplink into a VM that
@@ -356,6 +376,120 @@
 
           echo "[egress-init] firewall active"
         '';
+      };
+
+      # Egress allowlist REFRESH — the counterpart to egress-init.
+      #
+      # egress-init resolves each FQDN exactly once (`[ -n "$RESOLVED[$d]" ]
+      # && continue`) and the unit is Type=oneshot/RemainAfterExit, so the
+      # nftables set is pinned to whatever DNS said at guest boot. Hosts
+      # behind rotating IPs drift out of it, and because the output chain
+      # is policy=drop the drift is SILENT: packets are blackholed and the
+      # client hangs to its own timeout rather than getting a refusal.
+      #
+      # Found 2026-08-24: the VM had been up 11.5 days (zero restarts) and
+      # every mcp__tavily call in three consecutive research runs timed out
+      # at 30s, while Exa worked throughout. The difference is CDN, not
+      # code — api.exa.ai is Cloudflare anycast (172.66.x, stable for
+      # years) whereas api.tavily.com is AWS ELB-backed (3.211.x/44.216.x,
+      # rotates in hours-to-days). Exa had been surviving this bug by luck.
+      #
+      # Deliberately a SEPARATE unit rather than a rewrite of egress-init:
+      # egress-init gates sshd via Requires=, so a regression there makes
+      # the VM unreachable and takes the whole research path down with it.
+      # This unit can only ever leave the set as it found it.
+      #
+      # Contract enforced by checks.egress-refresh.
+      systemd.services.research-agent-egress-refresh = {
+        description = "Re-resolve allowlist FQDNs, atomically replace nftables set";
+        # Ordering only. No Requires=: if egress-init is somehow not up,
+        # `nft -f` fails on the missing set, gets logged, and the unit
+        # still exits 0 — the timer must not latch into failed state.
+        after = [ "research-agent-egress-init.service" "network-online.target" ];
+        wants = [ "network-online.target" ];
+        serviceConfig.Type = "oneshot";
+        path = [ pkgs.nftables pkgs.getent pkgs.coreutils pkgs.gawk ];
+        script = ''
+          # -e absent for the same reason as egress-init: a failing getent
+          # is the expected offline case, not an error.
+          set -uo pipefail
+
+          ${allowedArray}
+
+          # Resolve EVERYTHING before touching the live set.
+          #
+          # This ordering is the whole safety argument for running on a
+          # timer unattended. The bug being fixed is a STALE set (some
+          # calls hang). The bug that must not be introduced is an EMPTY
+          # set (every call hangs, including the agent's own Anthropic
+          # API traffic). So a partial DNS answer produces no mutation at
+          # all — worst case we keep today's behaviour until the next tick.
+          txn=$(mktemp)
+          pool=$(mktemp)
+          trap 'rm -f "$txn" "$pool"' EXIT
+
+          for d in "''${ALLOWED[@]}"; do
+            # /STREAM/ filter: getent ahostsv4 emits STREAM/DGRAM/RAW
+            # triplets per IP; unfiltered $1 would also swallow any
+            # oddball non-address lines.
+            if ips=$(getent ahostsv4 "$d" | awk '/STREAM/{print $1}' | sort -u) \
+               && [ -n "$ips" ]; then
+              printf '%s\n' "$ips" >> "$pool"
+            else
+              echo "[egress-refresh] $d unresolved — live set left untouched" >&2
+              exit 0
+            fi
+          done
+
+          # GLOBAL de-dup, not per-domain. Distinct FQDNs routinely share
+          # an address — euipo.europa.eu and api.euipo.europa.eu both
+          # resolve to 169.50.35.246 today — and `add element` on an
+          # already-present element is an error, which inside a single
+          # `nft -f` transaction aborts the WHOLE batch. egress-init is
+          # immune because it issues one `nft add` per IP with a
+          # `|| warn` fallback; an atomic transaction has no such luck,
+          # so the duplicate must be removed before it is emitted.
+          # (Caught 2026-08-24 by running the generated script against
+          # live DNS; a stub that always returns 0 hides this.)
+          count=$(sort -u "$pool" | grep -c '[^[:space:]]' || true)
+
+          {
+            echo "flush set inet filter research_allowed"
+            sort -u "$pool" | while IFS= read -r ip; do
+              [ -z "$ip" ] && continue
+              echo "add element inet filter research_allowed { $ip }"
+            done
+          } > "$txn"
+
+          # Belt and braces: every domain "resolved" but produced nothing.
+          [ "$count" -gt 0 ] || {
+            echo "[egress-refresh] resolved zero addresses — live set left untouched" >&2
+            exit 0
+          }
+
+          # flush + adds in ONE `nft -f` transaction. Applied atomically,
+          # so no concurrent connection ever observes a half-built set.
+          if nft -f "$txn"; then
+            echo "[egress-refresh] allowlist refreshed: $count addresses"
+          else
+            echo "[egress-refresh] WARN: nft -f failed (set missing mid-reload?) — live set left as-is" >&2
+          fi
+          exit 0
+        '';
+      };
+
+      systemd.timers.research-agent-egress-refresh = {
+        description = "Periodically re-resolve the research-agent egress allowlist";
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          # First tick 10min after boot — egress-init has just resolved,
+          # so there is nothing to correct before then.
+          OnBootSec = "10min";
+          OnUnitActiveSec = "10min";
+          # Monotonic timers already fire on resume if the interval
+          # elapsed while suspended, which is the laptop-lid case.
+          AccuracySec = "1min";
+        };
       };
 
       networking.hostName = "research-agent";
