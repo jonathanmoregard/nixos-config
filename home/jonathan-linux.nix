@@ -272,6 +272,7 @@ in
     ./git-hooks.nix
     ./autodoro.nix
     ./claude-mcp-sync.nix
+    ./dcg.nix
     ./drift-analyzer.nix
     ./sota-watch.nix
     ./worktree-sweep.nix

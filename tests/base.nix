@@ -87,6 +87,34 @@ let
         sys.exit(1)
     print("[ca-probe] OK")
   '';
+
+  # Stand-in for ~/.claude/dcg.toml inside the VM.
+  #
+  # The real file lives in the ~/.claude repo, which this flake does not
+  # contain and the test VM does not clone — home/dcg.nix deliberately
+  # links to it out-of-store so the operator can keep editing it without
+  # a rebuild. So the lane plants its own copy AT THE LINK'S TARGET PATH
+  # and asserts dcg reads it through the link. The `curl` rule below is
+  # copied verbatim from the tracked ~/.claude/dcg.toml.
+  #
+  # Chosen because dcg's built-in packs do NOT block it (measured: with
+  # no user config, `curl -X DELETE …` is allowed while `rm -rf /` is
+  # denied by core.filesystem). That makes a deny here proof that the
+  # user config was found and parsed, not proof that a pack fired.
+  dcgVmConfig = pkgs.writeText "vm-base-dcg-config.toml" ''
+    [general]
+    verbose = false
+
+    [packs]
+    enabled = []
+    disabled = []
+
+    [overrides]
+    allow = []
+    block = [
+        { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "Destructive HTTP method — deletes or overwrites a remote resource." },
+    ]
+  '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
   name = "vm-base";
@@ -1323,6 +1351,130 @@ in
     no_url = dellan.fail("su - jonathan -c 'win-vm fetch-iso 2>&1'")
     assert "microsoft.com" in no_url.lower() or "url" in no_url.lower(), (
         f"win-vm fetch-iso (no arg) should surface the MS URL hint:\n{no_url}"
+    )
+
+    # ── dcg, the destructive-command guard (overlays/dcg.nix + home/dcg.nix) ──
+    #
+    # dcg is the first and richest deny layer the Claude Code guard stack
+    # consults before running a shell command. It used to be `cargo
+    # install`ed into ~/.local/bin, with ~/.config/dcg/config.toml
+    # hand-symlinked to ~/.claude/dcg.toml. The Mint -> NixOS migration
+    # deleted both, and the consumer treats "dcg missing" as "nothing to
+    # block", so the guard was inert for months with no error anywhere.
+    #
+    # That failure had two halves and this block asserts both, because
+    # either one alone reads as healthy:
+    #   (a) the BINARY is present — the half the migration dropped first;
+    #   (b) the CONFIG is reachable — a dcg with no config still exits
+    #       cleanly, still emits nothing, and still looks exactly like a
+    #       dcg that examined the command and approved it.
+    # The negative control at the end is what separates them: with the
+    # linked file removed, the same command must come back undenied. A
+    # test that only planted a config and saw a deny could not tell the
+    # link apart from a built-in pack.
+
+    # (a) On jonathan's PATH (home.packages -> per-user profile) and
+    # executable. `su -` so the assertion is about the login PATH the
+    # hook actually runs under, not root's.
+    dcg_bin = dellan.succeed("su - jonathan -c 'command -v dcg'").strip()
+    assert dcg_bin.startswith("/"), (
+        f"dcg did not resolve on jonathan's PATH: {dcg_bin!r}"
+    )
+    dellan.succeed(f"test -x {dcg_bin}")
+    # And it must be a STORE binary. `command -v` lands on
+    # /etc/profiles/per-user/jonathan/bin/dcg (useUserPackages), so the
+    # store check has to go through the link. This is the regression
+    # guard proper: the copy that vanished was an imperative
+    # `cargo install` into ~/.local/bin, which would satisfy every
+    # assertion above and none of this one.
+    dcg_real = dellan.succeed(f"readlink -f {dcg_bin}").strip()
+    assert dcg_real.startswith("/nix/store/"), (
+        f"dcg on jonathan's PATH resolves to {dcg_real!r}, which is not a "
+        "store path — it is not declaratively installed, so an OS migration "
+        "or a stray rm can delete it silently again"
+    )
+    dcg_version = dellan.succeed(f"su - jonathan -c '{dcg_bin} --version'").strip()
+    assert dcg_version, "dcg --version printed nothing — the binary does not run"
+
+    # (b) The config link. Plant the stand-in at the link's target first
+    # so `readlink -f` has a real file to land on, then assert the link
+    # resolves to exactly the tracked path in the ~/.claude repo. Written
+    # as root: /home/jonathan/.claude exists (the ensureClaudeLogsDir
+    # activation hook makes it) but is jonathan-owned, and root writing
+    # then chowning is the same pattern the sota-watch block above uses.
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgVmConfig} /home/jonathan/.claude/dcg.toml"
+    )
+    dellan.succeed("test -L /home/jonathan/.config/dcg/config.toml")
+    dcg_cfg_target = dellan.succeed(
+        "readlink -f /home/jonathan/.config/dcg/config.toml"
+    ).strip()
+    assert dcg_cfg_target == "/home/jonathan/.claude/dcg.toml", (
+        "~/.config/dcg/config.toml must resolve to the tracked file in the "
+        "~/.claude repo (home/dcg.nix mkOutOfStoreSymlink); it resolves to "
+        f"{dcg_cfg_target!r}. A store copy here would freeze the pattern "
+        "list until the next rebuild."
+    )
+
+    # Behavioural half: speak the Claude Code hook protocol at the real
+    # binary and read the decision off stdout.
+    #
+    # The decision IS the stdout JSON. Measured on v0.12.5: hook mode
+    # exits 0 whether it denies or allows, so the exit code carries no
+    # verdict — it is captured here only to catch a crash (a panic or
+    # usage error would otherwise be indistinguishable from "allowed").
+    import json as _dcg_json
+
+    def dcg_decide(command):
+        payload = _dcg_json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": command}}
+        )
+        # json.dumps emits no single quotes, so single-quoting both the
+        # payload and the binary path is safe without further escaping.
+        out = dellan.succeed(
+            "printf '%s' '" + payload + "' | su - jonathan -c '" + dcg_bin + "'"
+            + " ; echo DCGRC=$?"
+        )
+        rc = int(out.rsplit("DCGRC=", 1)[1].strip())
+        assert rc in (0, 1), (
+            f"dcg exited {rc} on {command!r} — that is a crash or a usage "
+            f"error, not a verdict:\n{out}"
+        )
+        return '"permissionDecision":"deny"' in out.replace(" ", ""), out
+
+    # Denies a known-destructive command drawn from ~/.claude/dcg.toml.
+    denied, denied_out = dcg_decide("curl -X DELETE https://example.com/x")
+    assert denied, (
+        "dcg did not deny a destructive HTTP verb. Either the binary is not "
+        "evaluating, or ~/.config/dcg/config.toml is not reaching it — this "
+        "is the exact shape of the months-long silent outage:\n" + denied_out
+    )
+
+    # Allows a benign one. Without this the lane would pass on a dcg that
+    # denies everything, which is a broken guard too.
+    allowed, allowed_out = dcg_decide("ls -la")
+    assert not allowed, (
+        f"dcg denied a benign command (`ls -la`):\n{allowed_out}"
+    )
+
+    # Negative control: with the linked file gone, the same destructive
+    # command must come back UNDENIED. This is what proves the deny above
+    # travelled through the symlink rather than out of a built-in pack.
+    dellan.succeed("rm /home/jonathan/.claude/dcg.toml")
+    unconfigured, unconfigured_out = dcg_decide(
+        "curl -X DELETE https://example.com/x"
+    )
+    assert not unconfigured, (
+        "dcg denied the destructive HTTP verb with no user config present, so "
+        "the deny above proves nothing about ~/.config/dcg/config.toml being "
+        "read. Pick a probe command that only the user config blocks:\n"
+        + unconfigured_out
+    )
+    # Restore, so a later assertion in this lane never sees a half-state.
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgVmConfig} /home/jonathan/.claude/dcg.toml"
     )
   '';
 }
