@@ -1,0 +1,49 @@
+# dcg BOOTSTRAP FALLBACK CONFIG — a floor, not a copy.
+#
+# home/dcg.nix links ~/.config/dcg/config.toml to ~/.claude/dcg.toml, the
+# hand-edited pattern list that lives in the .claude repo. THIS file is
+# what home-manager activation seeds at that target path when the target
+# does not exist yet — a fresh host before .claude is cloned, or a host
+# where something (claude-pull, a stray rm) deleted it.
+#
+# WHY SEEDING BEATS LEAVING THE LINK DANGLING
+#
+# Measured against dcg v0.12.5 with the target absent: dcg still runs,
+# still exits 0, and drops the ENTIRE user layer. `curl -X DELETE
+# https://example.com/x` comes back PERMITTED with empty stdout and ZERO
+# bytes on stderr, while `rm -rf /` is still denied by a built-in pack —
+# so the guard looks alive and answers correctly on the famous command
+# while every rule in the user layer is gone. There is no warning to
+# miss, because dcg emits none on a read failure (its eprintln! warnings
+# are on the TOML-parse-error branch only, src/config.rs:4001/:4016).
+# Seeding makes that state unreachable across an activation.
+#
+# WHY IT IS NOT A COPY OF ~/.claude/dcg.toml
+#
+# That file lives in a repo this flake does not contain and cannot read
+# at eval time, so nothing here could keep a copy in sync — a "copied
+# verbatim" claim would be a promise this repo cannot keep. What this
+# file covers instead is the class the measurement showed going silently
+# missing: destructive HTTP verbs, which no built-in pack blocks.
+#
+# It announces itself. Every deny it issues says, in the reason text the
+# operator and the agent both see, that the real pattern list is not
+# loaded — so running on the fallback is obvious the first time it fires,
+# not something to be discovered months later.
+
+[general]
+verbose = false
+
+# Left at dcg's defaults, which resolve to ["core", "system.disk"] —
+# the same set an absent config produces. This file is strictly ADDITIVE
+# to the built-in protection; it never subtracts.
+[packs]
+enabled = []
+disabled = []
+
+[overrides]
+allow = []
+block = [
+    { pattern = "curl\\b.*\\s-X\\s*(DELETE|PUT|PATCH)\\b", reason = "Destructive HTTP method - deletes or overwrites a remote resource. NOTE: dcg is running its BOOTSTRAP FALLBACK config (nixos-config home/dcg-fallback.toml) because ~/.claude/dcg.toml was absent at home-manager activation. Your real pattern list is NOT loaded. Run it yourself with `! <command>` if intentional." },
+    { pattern = "curl\\b.*\\s--request[=\\s]*(DELETE|PUT|PATCH)\\b", reason = "Destructive HTTP method - deletes or overwrites a remote resource. NOTE: dcg is running its BOOTSTRAP FALLBACK config (nixos-config home/dcg-fallback.toml) because ~/.claude/dcg.toml was absent at home-manager activation. Your real pattern list is NOT loaded. Run it yourself with `! <command>` if intentional." },
+]

@@ -10,10 +10,24 @@
 # commands produce no output at all.
 #
 # The DECISION IS THE STDOUT JSON, NOT THE EXIT CODE. Measured against
-# v0.12.5: hook mode exits 0 whether it denies or allows (the documented
-# `EXIT_DENIED = 1` in src/exit_codes.rs governs the CLI subcommands, not
-# the stdin hook path). A consumer that reads the exit status instead of
-# the payload therefore sees every deny as an allow.
+# v0.12.5, invoking BARE `dcg` with no subcommand — the form
+# ~/.claude/settings.json actually registers: it exits 0 on a deny, on an
+# allow, on empty stdin and on garbage stdin alike. A consumer that reads
+# the exit status instead of the payload sees every deny as an allow.
+#
+# DO NOT "FIX" THAT BY SWITCHING THE HOOK TO `dcg hook`. Its own --help
+# claims that without `--batch` it "behaves identically to running `dcg`
+# with no subcommand". Measured, that is false. On the same stdin:
+#
+#   dcg      < payload  →  {"hookSpecificOutput":{…"permissionDecision":"deny"…}}
+#   dcg hook < payload  →  {"index":0,"decision":"deny","mode":"deny",…}
+#
+# `dcg hook` does exit 1 on a deny, but it speaks batch JSONL rather than
+# the Claude Code PreToolUse document, and it prints on allows too (bare
+# `dcg` prints nothing). Switching would buy a correct exit status and
+# lose the protocol — Claude Code would never see a `permissionDecision`
+# again, which is the same silent disarmament this package exists to
+# prevent. The exit code is not the contract; the stdout document is.
 #
 # WHY THIS IS PACKAGED HERE RATHER THAN `cargo install`ed
 #
@@ -33,6 +47,15 @@
 # is a deny-list evaluator whose behaviour IS the security boundary, so
 # it must not move under the host without a PR. Bump by editing `rev` +
 # `version`, running the build, and pasting the hashes nix reports.
+#
+# `version` and `rev` are two hand-edited strings that nothing forces to
+# agree. Editing `version` alone leaves `src` — and therefore its hash —
+# untouched, so the build stays green and ships the OLD binary under the
+# NEW label; the closure, `dcg --version`, and any provenance check that
+# trusts either would all report a version that was never built. postPatch
+# asserts the fetched source's own Cargo.toml agrees with `version` (that
+# is the assertion `rev` cannot dodge, because `rev` is what selects the
+# Cargo.toml), and installCheckPhase asserts the built binary prints it.
 #
 # BUILD NOTES
 #
@@ -90,6 +113,19 @@ in
 
     postPatch = ''
       rm -f .cargo/config.toml rust-toolchain.toml
+
+      # `version` vs `rev` drift guard. `[package]` is the first table in
+      # upstream's Cargo.toml, so the first column-0 `version = ` line is
+      # the crate version. Fails the build before a single crate compiles.
+      srcVersion=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+      if [ "$srcVersion" != "${version}" ]; then
+        echo "dcg: overlay version/rev disagree." >&2
+        echo "  overlays/dcg.nix version = ${version}" >&2
+        echo "  overlays/dcg.nix rev     = ${rev}" >&2
+        echo "  Cargo.toml at that rev   = $srcVersion" >&2
+        echo "Bump BOTH, or the closure ships $srcVersion labelled ${version}." >&2
+        exit 1
+      fi
     '';
 
     nativeBuildInputs = with prev; [ cmake pkg-config ];
@@ -105,6 +141,17 @@ in
     doInstallCheck = true;
     installCheckPhase = ''
       runHook preInstallCheck
+
+      # The BUILT binary agrees with the label. postPatch already tied
+      # `version` to the source; this ties it to the artifact, so the two
+      # together mean `pkgs.dcg.version` cannot be a claim about a binary
+      # that was never produced. The machine-readable string is on stdout;
+      # the decorated banner goes to stderr, hence the redirect.
+      binVersion=$($out/bin/dcg --version 2>/dev/null | head -n 1 | tr -d '[:space:]')
+      if [ "$binVersion" != "${version}" ]; then
+        echo "dcg installCheck: --version printed '$binVersion', pinned version is '${version}'" >&2
+        exit 1
+      fi
 
       export HOME="$TMPDIR/dcg-installcheck"
       mkdir -p "$HOME/.config/dcg"

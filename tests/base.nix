@@ -88,19 +88,30 @@ let
     print("[ca-probe] OK")
   '';
 
-  # Stand-in for ~/.claude/dcg.toml inside the VM.
+  # Stand-in for a hand-edited ~/.claude/dcg.toml inside the VM.
   #
-  # The real file lives in the ~/.claude repo, which this flake does not
-  # contain and the test VM does not clone — home/dcg.nix deliberately
-  # links to it out-of-store so the operator can keep editing it without
-  # a rebuild. So the lane plants its own copy AT THE LINK'S TARGET PATH
-  # and asserts dcg reads it through the link. The `curl` rule below is
-  # copied verbatim from the tracked ~/.claude/dcg.toml.
+  # NOT a copy of the real file, and deliberately no longer claimed to be
+  # one. The real file lives in the ~/.claude repo, which this flake does
+  # not contain and cannot read at eval time — so a "copied verbatim"
+  # claim is one this lane has no way to keep, and the previous revision
+  # had already drifted (its reason string was a truncation of the real
+  # one) with nothing able to notice. What this fixture is FOR is proving
+  # the mkOutOfStoreSymlink live-edit property: written straight to the
+  # link's target with no rebuild, it must take effect on the very next
+  # dcg invocation.
   #
-  # Chosen because dcg's built-in packs do NOT block it (measured: with
-  # no user config, `curl -X DELETE …` is allowed while `rm -rf /` is
-  # denied by core.filesystem). That makes a deny here proof that the
-  # user config was found and parsed, not proof that a pack fired.
+  # The one thing that IS verbatim-checkable is home/dcg-fallback.toml —
+  # it is in this flake, so the lane byte-compares the seeded copy against
+  # it below (`cmp`) instead of asserting a promise about a file it cannot
+  # see.
+  #
+  # `curl -X DELETE` is the probe because dcg's built-in packs do NOT
+  # block it (measured: with no user config it is allowed, while `rm -rf /`
+  # is denied by core.filesystem). Attribution is then nailed down
+  # positively — the deny document must carry this exact reason string and
+  # must carry NO ruleId/packId, which is how dcg distinguishes an
+  # `[overrides]` match from a pack match.
+  dcgVmBlockReason = "vm-base fixture rule, planted at the link target with no rebuild";
   dcgVmConfig = pkgs.writeText "vm-base-dcg-config.toml" ''
     [general]
     verbose = false
@@ -112,8 +123,16 @@ let
     [overrides]
     allow = []
     block = [
-        { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "Destructive HTTP method — deletes or overwrites a remote resource." },
+        { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "${dcgVmBlockReason}" },
     ]
+  '';
+
+  # Deliberately broken TOML, for the malformed-config arm. `x=` is the
+  # minimal input that makes dcg's loader report `invalid`; the shape that
+  # actually happens in practice is a git conflict marker landing in a
+  # hand-edited file, which produces the same status.
+  dcgBrokenConfig = pkgs.writeText "vm-base-dcg-broken.toml" ''
+    x=
   '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
@@ -1368,10 +1387,28 @@ in
     #   (b) the CONFIG is reachable — a dcg with no config still exits
     #       cleanly, still emits nothing, and still looks exactly like a
     #       dcg that examined the command and approved it.
-    # The negative control at the end is what separates them: with the
-    # linked file removed, the same command must come back undenied. A
-    # test that only planted a config and saw a deny could not tell the
-    # link apart from a built-in pack.
+    #
+    # An earlier revision of this block ended with a "negative control"
+    # that DELETED the linked config and asserted the destructive command
+    # then came back UNDENIED — encoding the fail-open as the expected
+    # result. It was a true statement about v0.12.5 and exactly the wrong
+    # thing to assert: it made the degraded state a documented feature, so
+    # any fix for it would have shown up as a test failure. It is replaced
+    # here by two assertions that point the other way:
+    #
+    #   (c) attribution WITHOUT a degraded state — the deny document must
+    #       carry the fixture's own reason string and NO ruleId/packId,
+    #       which is how dcg marks an `[overrides]` match as opposed to a
+    #       built-in pack match. That proves the config was read without
+    #       ever needing to observe the guard disarmed.
+    #   (d) the degraded state must be UNREACHABLE across an activation —
+    #       delete the target, re-run home-manager, and the guard must be
+    #       armed again (home/dcg.nix seeds home/dcg-fallback.toml).
+    #
+    # And (e): a malformed config must FAIL the activation. dcg does warn
+    # on a TOML parse error, but only on the stderr of a PreToolUse hook,
+    # which Claude Code discards — so today it reaches nobody while every
+    # override silently stops applying.
 
     # (a) On jonathan's PATH (home.packages -> per-user profile) and
     # executable. `su -` so the assertion is about the login PATH the
@@ -1393,19 +1430,31 @@ in
         "store path — it is not declaratively installed, so an OS migration "
         "or a stray rm can delete it silently again"
     )
-    dcg_version = dellan.succeed(f"su - jonathan -c '{dcg_bin} --version'").strip()
-    assert dcg_version, "dcg --version printed nothing — the binary does not run"
-
-    # (b) The config link. Plant the stand-in at the link's target first
-    # so `readlink -f` has a real file to land on, then assert the link
-    # resolves to exactly the tracked path in the ~/.claude repo. Written
-    # as root: /home/jonathan/.claude exists (the ensureClaudeLogsDir
-    # activation hook makes it) but is jonathan-owned, and root writing
-    # then chowning is the same pattern the sota-watch block above uses.
-    dellan.succeed(
-        "install -D -o jonathan -g users -m 0644 "
-        "${dcgVmConfig} /home/jonathan/.claude/dcg.toml"
+    # And it must be the version the overlay pins, EXACTLY. Asserting
+    # merely that --version printed something (the previous assertion) is
+    # satisfied by any binary at all, so a `version`-only bump in
+    # overlays/dcg.nix — which leaves `src` and its hash untouched — would
+    # build green and deploy the OLD binary under the NEW label with this
+    # lane still passing. `2>/dev/null` because the machine-readable
+    # string is on stdout while the decorated banner is on stderr, and the
+    # test driver merges the two.
+    dcg_version = dellan.succeed(
+        f"su - jonathan -c '{dcg_bin} --version 2>/dev/null'"
+    ).strip()
+    assert dcg_version == "${pkgs.dcg.version}", (
+        f"deployed dcg reports version {dcg_version!r}, but overlays/dcg.nix "
+        'pins version = "${pkgs.dcg.version}". The label and the artifact '
+        "disagree, so the closure is shipping a binary nobody asked for."
     )
+
+    # (b) The config link, and the seed behind it.
+    #
+    # Nothing is planted first. home/dcg.nix's activation hook already ran
+    # at boot, and the VM has no ~/.claude repo — so this is exactly the
+    # fresh-host state, and what the lane asserts is that the fresh-host
+    # state comes up ARMED rather than silently disarmed.
+    import json as _dcg_json
+
     dellan.succeed("test -L /home/jonathan/.config/dcg/config.toml")
     dcg_cfg_target = dellan.succeed(
         "readlink -f /home/jonathan/.config/dcg/config.toml"
@@ -1417,64 +1466,190 @@ in
         "list until the next rebuild."
     )
 
+    # THE LINK IS NOT DANGLING. This one assertion is the whole fix: a
+    # dangling link here means dcg drops the entire user layer, permits
+    # `curl -X DELETE` with exit 0, empty stdout and ZERO bytes of stderr,
+    # and still denies `rm -rf /` from a built-in pack — so every cheaper
+    # check in this block passes while the guard is disarmed.
+    dellan.succeed("test -f /home/jonathan/.claude/dcg.toml")
+
+    # Verbatim drift check — the one this lane can actually keep. The
+    # seeded file must be byte-identical to the tracked source in this
+    # flake. (There is deliberately no such check against the real
+    # ~/.claude/dcg.toml: it lives in a repo this flake cannot read, so
+    # any "copied verbatim" claim about it would be unkeepable.)
+    dellan.succeed(
+        "cmp ${../home/dcg-fallback.toml} /home/jonathan/.claude/dcg.toml"
+    )
+
+    # And dcg's own loader must agree the user layer LOADED. From outside,
+    # `missing`, `invalid` and `rejected` are indistinguishable from
+    # `loaded`: all four exit 0 and print nothing on an allow. This is the
+    # only place the difference is observable, and it is the same field
+    # home/dcg.nix's activation check reads.
+    dellan.succeed(
+        "su - jonathan -c 'dcg config --format json' "
+        "> /tmp/dcg-config.json 2>/dev/null"
+    )
+    dcg_cfg_doc = _dcg_json.loads(dellan.succeed("cat /tmp/dcg-config.json"))
+    dcg_user_layer = next(
+        s for s in dcg_cfg_doc["config_sources"] if s["level"] == "user"
+    )
+    assert dcg_user_layer["status"] == "loaded", (
+        "dcg reports its user config layer as "
+        f"{dcg_user_layer['status']!r} (detail: {dcg_user_layer.get('detail')!r}). "
+        "Every override the operator wrote is inert, and nothing anywhere "
+        "says so."
+    )
+
     # Behavioural half: speak the Claude Code hook protocol at the real
     # binary and read the decision off stdout.
     #
-    # The decision IS the stdout JSON. Measured on v0.12.5: hook mode
-    # exits 0 whether it denies or allows, so the exit code carries no
-    # verdict — it is captured here only to catch a crash (a panic or
-    # usage error would otherwise be indistinguishable from "allowed").
-    import json as _dcg_json
-
+    # The decision IS the stdout JSON. Measured on v0.12.5, bare `dcg`
+    # exits 0 on a deny, on an allow, on empty stdin and on garbage stdin
+    # alike. rc is therefore asserted to be EXACTLY 0: the previous
+    # `rc in (0, 1)` accepted an exit-code-signalling dcg as a valid
+    # verdict, so an upstream switch to rc=1-on-deny would slip through
+    # this lane while the stdout contract quietly changed underneath it.
+    #
+    # DO NOT relax this by moving the hook to `dcg hook`. Measured: it does
+    # exit 1 on a deny, but it emits batch JSONL
+    # ({"index":0,"decision":"deny",...}) instead of the PreToolUse
+    # document, and prints on allows too. Its --help claims the two are
+    # identical without --batch; they are not. Swapping would give a
+    # correct exit status and a payload Claude Code cannot read.
     def dcg_decide(command):
         payload = _dcg_json.dumps(
             {"tool_name": "Bash", "tool_input": {"command": command}}
         )
         # json.dumps emits no single quotes, so single-quoting both the
         # payload and the binary path is safe without further escaping.
-        out = dellan.succeed(
+        # stdout goes to a file because dcg's decorated banner lands on
+        # stderr and the test driver merges the two streams.
+        rc_line = dellan.succeed(
             "printf '%s' '" + payload + "' | su - jonathan -c '" + dcg_bin + "'"
+            + " > /tmp/dcg-decision.json 2>/tmp/dcg-decision.err"
             + " ; echo DCGRC=$?"
         )
-        rc = int(out.rsplit("DCGRC=", 1)[1].strip())
-        assert rc in (0, 1), (
-            f"dcg exited {rc} on {command!r} — that is a crash or a usage "
-            f"error, not a verdict:\n{out}"
+        rc = int(rc_line.rsplit("DCGRC=", 1)[1].strip())
+        assert rc == 0, (
+            f"bare dcg exited {rc} on {command!r}. Measured on v0.12.5 it "
+            "exits 0 for every input; a non-zero status means either a crash "
+            "or that the verdict has moved out of stdout and into the exit "
+            "code, which the Claude Code hook does not read.\n"
+            + dellan.succeed("cat /tmp/dcg-decision.err")
         )
-        return '"permissionDecision":"deny"' in out.replace(" ", ""), out
+        raw = dellan.succeed("cat /tmp/dcg-decision.json")
+        return (_dcg_json.loads(raw) if raw.strip() else None), raw
 
-    # Denies a known-destructive command drawn from ~/.claude/dcg.toml.
-    denied, denied_out = dcg_decide("curl -X DELETE https://example.com/x")
-    assert denied, (
-        "dcg did not deny a destructive HTTP verb. Either the binary is not "
-        "evaluating, or ~/.config/dcg/config.toml is not reaching it — this "
-        "is the exact shape of the months-long silent outage:\n" + denied_out
+    def dcg_assert_denied_by_user_config(command, expect_reason):
+        """Deny, AND attributable to the [overrides] layer rather than a pack.
+
+        dcg tags a pack match with ruleId/packId and a config-override
+        match with neither, so their absence plus the config's own reason
+        string coming back is positive proof the user layer was read.
+        The previous revision proved this by deleting the config and
+        asserting the command was then permitted — which made the
+        fail-open an expected result.
+        """
+        doc, raw = dcg_decide(command)
+        assert doc is not None, (
+            f"dcg emitted no decision document for {command!r}, i.e. it "
+            "PERMITTED a destructive HTTP verb. Either the binary is not "
+            "evaluating or ~/.config/dcg/config.toml is not reaching it — "
+            "this is the exact shape of the months-long silent outage."
+        )
+        hso = doc["hookSpecificOutput"]
+        assert hso.get("permissionDecision") == "deny", (
+            f"dcg did not deny {command!r}:\n{raw}"
+        )
+        assert "ruleId" not in hso and "packId" not in hso, (
+            f"the deny for {command!r} carries {hso.get('ruleId')!r} — it came "
+            "from a built-in pack, not from the user config, so it proves "
+            "nothing about the link being read:\n" + raw
+        )
+        assert expect_reason in hso["permissionDecisionReason"], (
+            f"the deny for {command!r} does not carry the expected reason "
+            f"{expect_reason!r}; the config that answered is not the one this "
+            "assertion is about:\n" + raw
+        )
+        return hso
+
+    # The seeded fallback denies, and says so in words the operator and
+    # the agent both see — running on the fallback announces itself.
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"
     )
 
     # Allows a benign one. Without this the lane would pass on a dcg that
     # denies everything, which is a broken guard too.
-    allowed, allowed_out = dcg_decide("ls -la")
-    assert not allowed, (
-        f"dcg denied a benign command (`ls -la`):\n{allowed_out}"
+    benign_doc, benign_raw = dcg_decide("ls -la")
+    assert benign_doc is None, (
+        f"dcg denied a benign command (`ls -la`):\n{benign_raw}"
     )
 
-    # Negative control: with the linked file gone, the same destructive
-    # command must come back UNDENIED. This is what proves the deny above
-    # travelled through the symlink rather than out of a built-in pack.
-    dellan.succeed("rm /home/jonathan/.claude/dcg.toml")
-    unconfigured, unconfigured_out = dcg_decide(
-        "curl -X DELETE https://example.com/x"
-    )
-    assert not unconfigured, (
-        "dcg denied the destructive HTTP verb with no user config present, so "
-        "the deny above proves nothing about ~/.config/dcg/config.toml being "
-        "read. Pick a probe command that only the user config blocks:\n"
-        + unconfigured_out
-    )
-    # Restore, so a later assertion in this lane never sees a half-state.
+    # (c) The live-edit property mkOutOfStoreSymlink exists for: write a
+    # DIFFERENT config straight to the link target, no rebuild, and the
+    # next invocation must answer out of it. Its reason string is defined
+    # once in Nix and interpolated into both the fixture and this
+    # assertion, so the two cannot drift.
     dellan.succeed(
         "install -D -o jonathan -g users -m 0644 "
         "${dcgVmConfig} /home/jonathan/.claude/dcg.toml"
     )
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "${dcgVmBlockReason}"
+    )
+
+    # (d) The degraded state must be UNREACHABLE across an activation.
+    # Delete the target — the thing a fresh host, or claude-pull, or a
+    # stray rm actually does — and re-run home-manager. Activation must
+    # succeed, re-seed, and say loudly that it did.
+    dellan.succeed("rm /home/jonathan/.claude/dcg.toml")
+    dellan.succeed("systemctl restart home-manager-jonathan.service")
+    dellan.succeed("test -f /home/jonathan/.claude/dcg.toml")
+    dellan.succeed(
+        "cmp ${../home/dcg-fallback.toml} /home/jonathan/.claude/dcg.toml"
+    )
+    reseed_log = dellan.succeed(
+        "journalctl -u home-manager-jonathan.service --no-pager -o cat -n 400"
+    )
+    assert "SEEDED BOOTSTRAP FALLBACK CONFIG" in reseed_log, (
+        "home-manager re-seeded nothing, or did it silently. A silent repair "
+        "is still a config the operator believes is theirs and is not:\n"
+        + reseed_log[-3000:]
+    )
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"
+    )
+
+    # (e) A malformed config must FAIL activation, not be absorbed.
+    # dcg does warn on a TOML parse error — but on the stderr of a
+    # PreToolUse hook, which Claude Code discards, so in the agent loop it
+    # reaches nobody while every override stops applying. The file is the
+    # operator's, so activation refuses to finish rather than rewriting it.
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgBrokenConfig} /home/jonathan/.claude/dcg.toml"
+    )
+    dellan.fail("systemctl restart home-manager-jonathan.service")
+    broken_log = dellan.succeed(
+        "journalctl -u home-manager-jonathan.service --no-pager -o cat -n 400"
+    )
+    assert "USER CONFIG LAYER IS NOT LOADED" in broken_log, (
+        "home-manager activation failed, but not with the dcg diagnostic — "
+        "so the failure does not tell the operator what to fix:\n"
+        + broken_log[-3000:]
+    )
+    assert "TOML parse error" in broken_log, (
+        "the activation failure does not quote dcg's own parse error, so the "
+        "operator gets no line number:\n" + broken_log[-3000:]
+    )
+
+    # Restore, so the lane does not end on a deliberately failed unit.
+    dellan.succeed("rm /home/jonathan/.claude/dcg.toml")
+    dellan.succeed("systemctl reset-failed home-manager-jonathan.service")
+    dellan.succeed("systemctl start home-manager-jonathan.service")
+    dellan.succeed("test -f /home/jonathan/.claude/dcg.toml")
   '';
 }
