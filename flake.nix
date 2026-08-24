@@ -43,20 +43,19 @@
     # rev pinned in flake.lock IS the deployed version: bump with
     # `nix flake update aggregator-src`, PR, merge, auto-deploy.
     #
-    # NOTE FOR CI: this repo is currently PRIVATE, and nix cannot fetch a
-    # private repo without an access token. nixos-config's workflows pass
-    # `access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}`, which is
-    # scoped to nixos-config and returns 404 here. Either make the
-    # aggregator repo public (every other personal tool above is) or add a
-    # PAT with read access to it on all three surfaces that evaluate this
-    # flake: the Actions runner, dellan's user nix, and root's nix (which
-    # is what nixos-deploy.service rebuilds with).
+    # The repo is PUBLIC as of 2026-08, so no access token is needed on any
+    # of the three surfaces that evaluate this flake (the Actions runner,
+    # dellan's user nix, and root's nix — the last being what
+    # nixos-deploy.service rebuilds with). This note previously said the
+    # opposite and named the token plumbing as a prerequisite; that was the
+    # state before the repo was opened up, and it is kept only as the reason
+    # no `access-tokens` line appears here.
     #
     # The three uv2nix inputs below were already in flake.lock transitively
     # (tts-tool / substack-url-tool / prose-decorate each pull them); the
     # `follows` lines keep them deduplicated to one copy each.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/65fdec34afa35bcebc601c0f7f3a207b71946e9f";
+      url = "github:jonathanmoregard/aggregator/4cb66f1ac00d57d0d7c9b942a992151ad21f0d52";
       flake = false;
     };
 
@@ -146,6 +145,11 @@
         {
           home-manager.useGlobalPkgs = true;
           home-manager.useUserPackages = true;
+          # `aggregator-src` reaches the home config because
+          # home/aggregator-embed.nix imports the embed timer straight from
+          # the pinned source tree rather than re-declaring it here. See that
+          # file for why the units are not vendored.
+          home-manager.extraSpecialArgs = { inherit aggregator-src; };
           home-manager.users.jonathan = import ./home/jonathan-linux.nix;
         }
       ];
@@ -167,6 +171,11 @@
         {
           home-manager.useGlobalPkgs = true;
           home-manager.useUserPackages = true;
+          # `aggregator-src` reaches the home config because
+          # home/aggregator-embed.nix imports the embed timer straight from
+          # the pinned source tree rather than re-declaring it here. See that
+          # file for why the units are not vendored.
+          home-manager.extraSpecialArgs = { inherit aggregator-src; };
           home-manager.users.jonathan = import ./home/jonathan-linux.nix;
         }
       ];
@@ -183,7 +192,9 @@
       let
         mkLane = path: import path {
           pkgs = pkgsLinux;
-          inputs = { inherit home-manager agenix agenix-rekey microvm; };
+          inputs = {
+            inherit home-manager agenix agenix-rekey microvm aggregator-src;
+          };
         };
       in {
         vm-base         = mkLane ./tests/base.nix;
