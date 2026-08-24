@@ -134,6 +134,67 @@ let
   dcgBrokenConfig = pkgs.writeText "vm-base-dcg-broken.toml" ''
     x=
   '';
+
+  # POSITIVE CONTROL for the self-heal arm (h). Identical in shape to the
+  # seeded fallback in the only respect that arm is about, except that it
+  # DELIBERATELY OMITS `self_heal_hook` under [general] — so it takes
+  # dcg's upstream default of true.
+  #
+  # DO NOT ADD `self_heal_hook` TO THIS FILE. Its whole job is to be the
+  # config that lets dcg rewrite settings.json, which is what proves the
+  # negative assertion in (h) is capable of failing. Set the key here and
+  # both arms go green while asserting nothing.
+  #
+  # It is a separate fixture rather than a reuse of dcgVmConfig on
+  # purpose: dcgVmConfig exists to prove the mkOutOfStoreSymlink live-edit
+  # property, so a future edit could reasonably add the key to it, and the
+  # control would then silently stop controlling.
+  dcgSelfHealReason = "vm-base self-heal CONTROL fixture, self_heal_hook deliberately unset";
+  dcgSelfHealConfig = pkgs.writeText "vm-base-dcg-selfheal-control.toml" ''
+    [general]
+    verbose = false
+
+    [overrides]
+    allow = []
+    block = [
+        { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "${dcgSelfHealReason}" },
+    ]
+  '';
+
+  # Stand-in for the operator's ~/.claude/settings.json inside the VM, for
+  # the self-heal arm (h).
+  #
+  # THE PLANT IS LOAD-BEARING. dcg's self-heal only rewrites a
+  # settings.json that ALREADY EXISTS — measured on v0.12.5 with
+  # self_heal_hook left at its upstream default of true and the file
+  # absent, a denying bare-`dcg` invocation creates nothing
+  # (cli.rs:13602). The ~/.claude repo is not cloned in the VM, so an arm
+  # that skipped installing this would hash a file that was never there
+  # and pass on a host where dcg rewrites everything it can reach.
+  #
+  # Shaped like the real thing in the one way that decides the outcome:
+  # dcg is registered INDIRECTLY, through bash-guard.py under a "Bash"
+  # matcher. The entry ensure_hook_registered() hunts for — matcher
+  # "Bash|PowerShell", command equal to the running binary's own absolute
+  # path — is therefore absent, which is what arms the repair branch. An
+  # entry it inserts lands at PreToolUse[0], ahead of this one.
+  dcgVmSettings = pkgs.writeText "vm-base-claude-settings.json" ''
+    {
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/home/jonathan/.claude/hooks/bash-guard.py"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
   name = "vm-base";
@@ -1432,6 +1493,12 @@ in
     #       purpose is to stop cron going stale. A guard that breaks
     #       unrelated machinery when it fires is a guard that gets
     #       commented out.
+    #   (h) dcg must not EDIT the operator's permission surface. Its
+    #       `general.self_heal_hook` defaults to true upstream, and true
+    #       means every bare-`dcg` hook invocation rewrites
+    #       ~/.claude/settings.json to register dcg's own PreToolUse entry
+    #       ahead of the real guard. home/dcg-fallback.toml pins it off;
+    #       this lane is what keeps it pinned.
     #
     # Every banner assertion below is scoped to a journal CURSOR taken
     # before the restart that is supposed to produce it. The unscoped
@@ -1666,6 +1733,151 @@ in
     benign_doc, benign_raw = dcg_decide("ls -la")
     assert benign_doc is None, (
         f"dcg denied a benign command (`ls -la`):\n{benign_raw}"
+    )
+
+    # (h) Consulting the guard must not let the guard EDIT the operator's
+    # permission surface.
+    #
+    # dcg's `general.self_heal_hook` defaults to TRUE upstream. With it on,
+    # every bare-`dcg` hook invocation calls ensure_hook_registered()
+    # (main.rs:1534), which reads $HOME/.claude/settings.json
+    # (cli.rs:13262 — hardcoded, CLAUDE_CONFIG_DIR is NOT honoured) looking
+    # for a PreToolUse entry whose matcher is "Bash|PowerShell" and whose
+    # command is the running binary's own absolute path. dcg is registered
+    # INDIRECTLY on this host, via ~/.claude/hooks/bash-guard.py, so that
+    # entry is never present and the repair branch (cli.rs:13635) fires on
+    # EVERY Bash tool call: it inserts dcg's entry at PreToolUse[0] — ahead
+    # of the real guard — and re-serialises the whole file.
+    #
+    # This is not hypothetical. It fired on the live host on 2026-08-24:
+    # the injected entry named a /nix/store path, the trailing newline was
+    # stripped, and the harness tripwire logged four
+    # ConfigChange/user_settings events for that single write. It is also
+    # not self-limiting — the injected command embeds the store path, so
+    # every version bump re-triggers it and a hand revert does not stick.
+    #
+    # home/dcg-fallback.toml pins `self_heal_hook = false`, and that pin is
+    # a ONE-LINE default that a version bump, a config rewrite or a
+    # well-meaning tidy-up could flip back with nothing to notice. This arm
+    # is the notice. It runs here, against the seeded fallback, because
+    # that is the config a FRESH host comes up on — before the operator has
+    # read a single line of output.
+    dcg_settings = "/home/jonathan/.claude/settings.json"
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgVmSettings} " + dcg_settings
+    )
+
+    def dcg_settings_sha():
+        return dellan.succeed("sha256sum " + dcg_settings).split()[0]
+
+    dcg_settings_before = dcg_settings_sha()
+    # The trigger has to be a BARE `dcg` hook invocation on a payload that
+    # DENIES — that is the only form reaching ensure_hook_registered().
+    # `dcg config` and the subcommands do not, so an arm that probed one of
+    # those would report an untouched settings.json from a code path that
+    # never had the chance to touch it. dcg_assert_denied_by_user_config
+    # speaks the hook protocol at the deployed binary, which is exactly the
+    # shape a real Bash tool call produces.
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"
+    )
+    dcg_settings_after = dcg_settings_sha()
+    assert dcg_settings_after == dcg_settings_before, (
+        "dcg REWROTE /home/jonathan/.claude/settings.json — the operator's "
+        "Claude Code PERMISSION SURFACE — from inside one PreToolUse hook "
+        "invocation. This is not a stale hash: it means "
+        "general.self_heal_hook is back ON (upstream defaults it to true), "
+        "so ensure_hook_registered() has inserted the "
+        'matcher-"Bash|PowerShell" entry pointing at dcg itself at '
+        "PreToolUse[0], AHEAD of the real guard, and re-serialised the "
+        "file. On the live host that ran once per Bash tool call. "
+        "FIX: restore `self_heal_hook = false` under [general] in "
+        "home/dcg-fallback.toml — do not relax this assertion.\n"
+        f"  sha256 before: {dcg_settings_before}\n"
+        f"  sha256 after:  {dcg_settings_after}\n"
+        "  settings.json now reads:\n"
+        + dellan.succeed("cat " + dcg_settings)
+    )
+
+    # THE POSITIVE CONTROL, and the reason the assertion above is worth
+    # anything. An unchanged hash has two explanations — the pin works, or
+    # the probe never reached the self-heal code path at all — and only one
+    # of them is a passing test. A future change that stopped the probe
+    # short (a helper rewired to `dcg config`, a payload that no longer
+    # denies, a plant that silently failed to land) would leave the arm
+    # above green and hollow.
+    #
+    # So: swap in a config that is the fallback in every respect the arm
+    # cares about EXCEPT that it omits `self_heal_hook`, and run the very
+    # same probe. The hash must now CHANGE. Attribution is via
+    # dcg_assert_denied_by_user_config against this fixture's own reason
+    # string, which matters more than usual here: a control config that
+    # failed to load would leave dcg running with NO user layer, and a dcg
+    # with no config rewrites settings.json too — so the control would
+    # "pass" while proving nothing about self_heal_hook.
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgSelfHealConfig} /home/jonathan/.claude/dcg.toml"
+    )
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgVmSettings} " + dcg_settings
+    )
+    dcg_control_before = dcg_settings_sha()
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "${dcgSelfHealReason}"
+    )
+    dcg_control_after = dcg_settings_sha()
+    assert dcg_control_after != dcg_control_before, (
+        "CONTROL FAILED: with `self_heal_hook` deliberately unset, dcg left "
+        "settings.json byte-identical. The self-heal path this lane exists "
+        "to pin down is no longer reachable from the probe, so the "
+        "unchanged-hash assertion above is proving nothing and would stay "
+        "green if the pin were dropped. Find out what changed — the "
+        "upstream default, the file dcg reads, or the shape of the probe — "
+        "before trusting either arm.\n"
+        f"  sha256 both:   {dcg_control_before}"
+    )
+    # And it changed in the specific way that makes it a security problem
+    # rather than a reformat: dcg's own entry, at index 0, AHEAD of the
+    # operator's guard, naming the running binary. Pinned tightly on
+    # purpose — the version is pinned too, so the only thing that can move
+    # this is a deliberate bump, which is exactly when it should be re-read.
+    dcg_healed = _dcg_json.loads(dellan.succeed("cat " + dcg_settings))
+    dcg_pre = dcg_healed["hooks"]["PreToolUse"]
+    assert dcg_pre[0]["matcher"] == "Bash|PowerShell", (
+        "CONTROL FAILED: dcg rewrote settings.json, but the entry it "
+        "inserted first is not the matcher-\"Bash|PowerShell\" one the (h) "
+        "failure message tells the reader to look for. The mechanism has "
+        f"moved and the diagnostic is now misleading: {dcg_pre!r}"
+    )
+    dcg_healed_cmd = dcg_pre[0]["hooks"][0]["command"]
+    assert dcg_healed_cmd == dcg_real, (
+        "CONTROL FAILED: the injected entry points at "
+        f"{dcg_healed_cmd!r}, not at the running binary {dcg_real!r}. The "
+        "store path in the injected command is why this is not idempotent "
+        "across version bumps, so it is part of what (h) is about."
+    )
+    assert any(
+        h["command"].endswith("bash-guard.py")
+        for e in dcg_pre[1:]
+        for h in e["hooks"]
+    ), (
+        "CONTROL FAILED: after the rewrite the operator's own guard entry "
+        "is not sitting behind the injected one. Either it was dropped "
+        f"outright or the ordering is not what (h) describes: {dcg_pre!r}"
+    )
+
+    # Restore. Remove the control config and the plant, then re-run
+    # home-manager so the arms below start from the seeded fallback they
+    # expect — and so nothing downstream inherits a self-heal-armed dcg or
+    # a settings.json for it to rewrite.
+    dellan.succeed("rm " + dcg_settings)
+    dellan.succeed("rm /home/jonathan/.claude/dcg.toml")
+    dellan.succeed("systemctl restart home-manager-jonathan.service")
+    dellan.succeed(
+        "cmp ${../home/dcg-fallback.toml} /home/jonathan/.claude/dcg.toml"
     )
 
     # (c) The live-edit property mkOutOfStoreSymlink exists for: write a
