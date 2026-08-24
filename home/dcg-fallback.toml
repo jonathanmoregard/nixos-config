@@ -34,6 +34,40 @@
 [general]
 verbose = false
 
+# DO NOT RE-ENABLE, and do not drop this key when editing the seed. Upstream
+# defaults it to true, and true means dcg REWRITES ~/.claude/settings.json
+# from inside the hook path.
+#
+# Measured on dcg 0.12.5: main.rs:1534 calls cli::ensure_hook_registered() on
+# every bare-`dcg` hook invocation — one per Bash tool call, since
+# ~/.claude/hooks/bash-guard.py consults dcg that way. It reads
+# $HOME/.claude/settings.json (cli.rs:13262, hardcoded; CLAUDE_CONFIG_DIR is
+# NOT honoured) looking for a PreToolUse entry whose matcher is
+# "Bash|PowerShell" and whose command is the running binary's absolute path.
+# dcg is registered INDIRECTLY here, through bash-guard.py, so that entry is
+# never present and the repair branch (cli.rs:13635) fires every time: it
+# inserts dcg's own entry at PreToolUse[0], AHEAD of the real guard, and
+# re-serialises the whole file — reflowing it and dropping the trailing
+# newline. It fired on the live host on 2026-08-24; the harness tripwire
+# logged four ConfigChange/user_settings events for that single write.
+#
+# Not idempotent across rebuilds either: the injected command embeds the
+# /nix/store path, so every dcg version bump re-triggers it, and reverting
+# the entry by hand does not stick.
+#
+# This is the seed a FRESH host comes up on, so without the key here a brand
+# new machine has dcg editing its own permission surface before the operator
+# has read a single line of output. Verified under an isolated HOME: with the
+# key, a bare `dcg` invocation on a denying payload leaves settings.json
+# byte-identical; without it, the same invocation rewrites it and the
+# "Bash|PowerShell" entry appears.
+#
+# What is lost by disabling: only dcg's ability to re-register its OWN direct
+# PreToolUse hook — an entry we never had and do not want. Evaluation, packs
+# and verdicts are unaffected (measured: `rm -fr /` and the curl rules below
+# still return a full deny document with this set to false).
+self_heal_hook = false
+
 # Left at dcg's defaults, which resolve to ["core", "system.disk"] —
 # the same set an absent config produces. This file is strictly ADDITIVE
 # to the built-in protection; it never subtracts.
