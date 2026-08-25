@@ -97,4 +97,38 @@
 
     embed.enable = true;
   };
+
+  # A MEMORY CEILING THAT THROTTLES, AND DELIBERATELY DOES NOT KILL.
+  #
+  # Upstream bounds this worker's CPU and IO (Nice=19, IOSchedulingClass=idle)
+  # but not its memory, and on a machine that actually runs out those are not
+  # interchangeable. dellan took 16 OOM-kills in the fortnight to 2026-08-25,
+  # and the process the kernel picked was rerank-paired.service's python3 at
+  # 10.4 GB anon-rss — the same torch / sentence-transformers workload class
+  # this unit loads. Unbounded, a ~55-day backfill is 55 days of exposure to
+  # that.
+  #
+  # MemoryHigh, NOT MemoryMax, and the difference is the entire point.
+  # MemoryMax kills. A SIGKILLed worker leaves its per-row claim on disk, and
+  # upstream treats a claim found at startup as proof the previous worker died
+  # on that row — so the row is set aside as POISON. A cap that kills would
+  # therefore condemn perfectly good rows out of the index, one per kill, for
+  # as long as the backfill runs, and the only symptom would be an index that
+  # looks complete and is quietly short. MemoryHigh applies reclaim pressure
+  # instead: over the limit the worker gets slower and never dies, which on a
+  # unit already pinned to idle CPU and idle IO costs nothing anyone notices.
+  #
+  # 6G against 30G of RAM. Above the 4G MemoryHigh home/jonathan-linux.nix
+  # gives rsi-daily-review, because torch inference is heavier than a CLI run;
+  # well under the reranker's observed 10.4 GB peak, because this unit runs
+  # the 0.6B embedder and not the reranker. It is an ESTIMATE, and a safe one
+  # to get wrong in either direction — too high and the session still has 24G,
+  # too low and a background job is throttled. Replace it with a measured
+  # figure once real weights exist: run one catchup batch under
+  # `systemd-run --user -p MemoryAccounting=yes` and read the peak.
+  #
+  # Enforced rather than advisory: the memory controller is delegated to this
+  # user manager, which is how those OOM records came to name a per-service
+  # memcg under user@1000.service in the first place.
+  systemd.user.services.aggregator-embed.Service.MemoryHigh = "6G";
 }

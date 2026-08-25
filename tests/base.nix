@@ -954,6 +954,42 @@ in
         "to this list."
     )
 
+    # AND ASK THE SAME QUESTION WITHOUT ASSUMING THE UNIT TYPE. A timer is not
+    # the only thing an aggregator-src bump can add under
+    # `services.aggregator.enable`: a service, path or socket unit carrying its
+    # own [Install] WantedBy is pulled in by a target directly and would never
+    # show up in a timer list at all. flake.nix records that this repo's CI is
+    # the ONLY gate on such a bump — `flake = false` means upstream's own
+    # checks never run here — so pin the general property instead of a
+    # spelling: WHICH aggregator units are ARMED, i.e. carry a WantedBy some
+    # target can follow. Everything else upstream ships (the two -seed and
+    # -failure-notify services) is reachable only by hand or via OnFailure, and
+    # that is the distinction worth defending.
+    agg_all_units = sorted(set(dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user list-unit-files --no-legend \"aggregator-*\"' "
+        "| awk '{print $1}'"
+    ).split()))
+    agg_armed = []
+    for unit in agg_all_units:
+        if "WantedBy=" in dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"systemctl --user cat {unit}'"
+        ):
+            agg_armed.append(unit)
+    assert agg_armed == [
+        "aggregator-embed.timer",
+        "aggregator-ingest.timer",
+    ], (
+        "the set of ARMED aggregator units changed. Only the two timers may "
+        f"carry an [Install] WantedBy; got {agg_armed} out of "
+        f"{agg_all_units}.\n"
+        "A newly armed unit is something an aggregator-src bump added that "
+        "starts ITSELF. Check whether it writes to cache.db before doing "
+        "anything else — if it does, switch it off in "
+        "home/aggregator-embed.nix rather than widening this list."
+    )
+
     agg_embed_unit = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user cat aggregator-embed.service'"
@@ -1002,6 +1038,45 @@ in
         "aggregator-embed.service carries AGGREGATOR_ALLOW_MODEL_DOWNLOAD — "
         "the scheduled worker is permitted to download model weights:\n"
         f"{agg_embed_unit}"
+    )
+
+    # THE POLITENESS DIRECTIVES ARE LOAD-BEARING, NOT COSMETIC. This worker is
+    # a CPU-bound torch process with TimeoutStartSec=infinity, measured at
+    # ~55 days of continuous work on the real corpus, running on an
+    # interactive laptop. Nice=19 and IOSchedulingClass=idle are the whole
+    # reason that is tolerable: they confine it to otherwise-idle capacity.
+    # Drop them and the same unit becomes a month-long foreground CPU burn,
+    # with no test going red and nothing else in this repo to notice — the
+    # bump that removed them would evaluate clean and auto-deploy. Same
+    # reasoning as the resource-flag assertions on claude-idle-handoff.
+    for directive in ["Nice=19", "IOSchedulingClass=idle"]:
+        assert directive in agg_embed_unit, (
+            f"aggregator-embed.service no longer carries {directive!r}, so a "
+            "backfill measured in weeks would compete with interactive work "
+            f"instead of yielding to it:\n{agg_embed_unit}"
+        )
+
+    # THE MEMORY CEILING IS THIS REPO'S OWN ADDITION, so it is asserted apart
+    # from the upstream directives above rather than riding along with them.
+    # Upstream caps CPU and IO but not memory, and this host has an OOM
+    # history in exactly this workload class — see home/aggregator-embed.nix
+    # for the records.
+    assert "MemoryHigh=6G" in agg_embed_unit, (
+        "aggregator-embed.service lost its MemoryHigh ceiling, so a torch "
+        "backfill measured in weeks runs unbounded on a 30G laptop with a "
+        f"standing OOM history:\n{agg_embed_unit}"
+    )
+    # AND IT MUST STAY A THROTTLE. MemoryMax kills, a SIGKILLed worker leaves
+    # its per-row claim on disk, and upstream condemns a claim found at
+    # startup as a poison row — so swapping this for a hard cap would drop a
+    # good row from the index on every kill, silently, and leave an index that
+    # looks complete and is short. If this assertion is ever in the way, that
+    # is the argument it exists to force.
+    assert "MemoryMax=" not in agg_embed_unit, (
+        "aggregator-embed.service gained a MemoryMax. That cap KILLS, and a "
+        "killed worker's row claim is treated as poison by the embedder, so "
+        "each kill silently removes a good row from the vector index. Use "
+        f"MemoryHigh, which throttles instead:\n{agg_embed_unit}"
     )
 
     # PARSE THE VALUE, NOT THE SECOND `=`-DELIMITED FIELD. `awk -F=` here used
