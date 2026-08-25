@@ -58,6 +58,11 @@
 #                    the path does not exist), the guard comes up ARMED
 #                    rather than silently disarmed, and every deny the
 #                    fallback issues names itself in its reason text.
+#   TARGET STALE   → the target is still byte-for-byte the fallback an
+#                    earlier activation seeded, and ./dcg-fallback.toml has
+#                    changed since: refresh it in place and announce that
+#                    too. Only ever overwrites this module's own bytes —
+#                    see "WHY A SEEDED TARGET IS REFRESHED" below.
 #   TARGET BROKEN  → fail activation, quoting dcg's own parse error.
 #                    (unreadable, dangling, malformed TOML) A malformed
 #                    dcg.toml today produces `Warning: Failed to parse
@@ -78,6 +83,49 @@
 # BROKEN arm cannot brick a bootstrap by construction: it requires the
 # file to already exist, so it can only ever fire on a host where someone
 # hand-edited it.
+#
+# WHY A SEEDED TARGET IS REFRESHED, AND HOW IT KNOWS IT IS ALLOWED TO
+#
+# The seed arm fires only on an ABSENT target, which leaves a hole exactly
+# where this module is least able to afford one. Edit ./dcg-fallback.toml,
+# rebuild a host that is still running the seeded copy, and:
+#
+#   - the seed arm does not fire, because the target exists, so the bytes
+#     on disk stay the OLD fallback; and
+#   - the `cmp` that decides the marker runs against the NEW store path,
+#     fails, and takes the "the operator's own file is in force" branch —
+#     deleting the marker and silencing the notification.
+#
+# The host therefore stops reporting that it is running the fallback while
+# it is still running one, and not even the current one. Every channel
+# under "TELLING THE OPERATOR" goes quiet at once, and it takes a routine
+# edit to a tracked file to get there. That is the silent-degradation shape
+# this whole module exists to make unreachable, so it cannot be left in it.
+#
+# What makes the refresh safe is `fallback_sha256` in the marker: it
+# records the CONTENT hash of the fallback that was seeded, so a target
+# that still hashes to it has not been touched since — there is provably
+# nothing of the operator's to lose, and the write replaces this module's
+# own bytes with this module's own bytes. A target hashing to anything else
+# is theirs (their real list, or the seed with a line added), is never
+# rewritten, and clears the marker exactly as before. The refusal to repair
+# the operator's file is unchanged; what changed is that "the file is the
+# operator's" is now a measurement rather than an assumption made from the
+# path existing.
+#
+# The store path alone could not carry this. `fallback_source` answers
+# "which file", which the edit makes unanswerable — the old path may be
+# garbage-collected, and a host holding the old copy has nothing left to
+# compare against. A hash does not go stale.
+#
+# The marker is the only provenance store, deliberately. It already means
+# "the target IS the fallback"; the refresh needs "…and it is THAT
+# fallback", one field further. A second state file would be a second thing
+# to keep in step and a second thing to lose. Deleting the marker by hand
+# therefore forfeits the refresh — the next activation cannot tell a seeded
+# target from a hand-written one and so leaves it alone, which is the safe
+# direction, and the marker's contract already says it is written and
+# removed only here.
 #
 # WHY THE CHECK IS SPLIT ACROSS TWO ACTIVATION ENTRIES
 #
@@ -150,8 +198,16 @@
 #               "state":           "fallback-active",
 #               "target":          "/home/<user>/.claude/dcg.toml",
 #               "fallback_source": "/nix/store/…-dcg-fallback.toml",
+#               "fallback_sha256": "e55b…",  # sha256 of that file, base16
 #               "observed_at":     "2026-08-24T09:11:22Z",   # UTC, ISO-8601
 #               "remedy":          "<one-line fix instruction>" }
+#
+#           `fallback_sha256` lets a reader re-run the marker's claim with
+#           `sha256sum <target>` alone, without needing `fallback_source`
+#           to still exist — a store path can be garbage-collected, a hash
+#           cannot. Activation reads it back on the NEXT run to decide
+#           whether a seeded target may be refreshed in place; see "WHY A
+#           SEEDED TARGET IS REFRESHED" above.
 #
 #   SCHEMA  `schema` is bumped on any incompatible change. A reader that
 #           does not recognise the value must treat the file as "fallback
@@ -164,6 +220,10 @@
 #           (so `observed_at` tracks reality and the notification re-fires
 #           until it is fixed), and deleted on the first activation that
 #           finds it is not. It is never left behind to go stale by design.
+#           A fallback that CHANGED in the repo still counts as in force:
+#           the target is refreshed first and the marker rewritten against
+#           the new content, so the record never downgrades to "not the
+#           fallback" merely because the seed moved.
 #
 # WHAT THIS DOES NOT COVER
 #
@@ -185,6 +245,15 @@ let
   # `fallback_source` field and the `install` that writes it cannot
   # disagree about which file "the fallback" means.
   fallbackSource = ./dcg-fallback.toml;
+
+  # The seed's CONTENT, as a hash. The store path above answers "which
+  # file", which stops being a useful question the moment the file is
+  # edited: the path moves, and a host still holding the old copy has no
+  # way to recognise it. The hash is what survives that, so it is what the
+  # marker records and what the refresh arm compares against on the next
+  # activation. `builtins.hashFile "sha256"` emits lowercase base16, which
+  # is exactly `sha256sum`'s first field — the two are compared directly.
+  fallbackSha = builtins.hashFile "sha256" fallbackSource;
 
   # Cross-repo contract file — see "TELLING THE OPERATOR" above for the
   # full reader contract. Literal path rather than `config.xdg.stateHome`
@@ -226,9 +295,33 @@ in
   home.activation.dcgConfigState = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
     dcgTarget="${claudeConfig}"
     dcgFallbackSource="${fallbackSource}"
+    dcgFallbackSha="${fallbackSha}"
     dcgMarker="${fallbackMarker}"
 
     if ${notDryRun}; then
+
+      # What a PREVIOUS activation seeded, read before anything below
+      # rewrites or clears the marker. Empty when there is no marker —
+      # i.e. when the target is not the fallback, or never was.
+      #
+      # `|| dcgSeededSha=""` on every capture: home-manager inlines these
+      # entries into one `set -eu` script, so an unguarded failing command
+      # substitution here would abort the WHOLE activation — which is the
+      # exact collateral damage the two-entry split exists to prevent. A
+      # missing or garbled marker must cost the refresh, nothing else.
+      dcgSeededSha=""
+      if [ -f "$dcgMarker" ]; then
+        dcgSeededSha=$(${pkgs.jq}/bin/jq -r '.fallback_sha256 // empty' \
+          "$dcgMarker" 2>/dev/null) || dcgSeededSha=""
+      fi
+
+      # The target's content, by the same measure. Empty for an absent
+      # target, a dangling link, or one that cannot be read.
+      dcgTargetSha=""
+      if [ -f "$dcgTarget" ]; then
+        dcgTargetSha=$(${pkgs.coreutils}/bin/sha256sum "$dcgTarget" 2>/dev/null \
+          | ${pkgs.coreutils}/bin/cut -d' ' -f1) || dcgTargetSha=""
+      fi
 
       # ── Arm 1: absent → seed, loudly ────────────────────────────────
       # -e is false for a dangling symlink, so -L is tested separately:
@@ -257,6 +350,46 @@ in
           "################################################################" \
           "" \
           >&2
+
+      # ── Arm 1b: still the fallback we seeded, but a DIFFERENT one ───
+      #
+      # The seed arm above only fires on an absent target, so without this
+      # branch a host already running the seeded fallback never picks up an
+      # edit to home/dcg-fallback.toml — and, worse, goes QUIET about it:
+      # the `cmp` below would run against the new store path, fail, and
+      # take the "operator's own file is in force" branch, deleting the
+      # marker and stopping the notification while the bytes on disk stayed
+      # the OLD fallback. See "WHY A SEEDED TARGET IS REFRESHED" above.
+      #
+      # The equality with $dcgSeededSha is the whole licence to write: the
+      # target still hashes to exactly what a previous activation put
+      # there, so there is nothing of the operator's to lose. Anything else
+      # — their real list, or this seed with one line added — is theirs and
+      # falls through untouched.
+      elif [ -n "$dcgTargetSha" ] \
+        && [ -n "$dcgSeededSha" ] \
+        && [ "$dcgTargetSha" = "$dcgSeededSha" ] \
+        && [ "$dcgTargetSha" != "$dcgFallbackSha" ]; then
+        ${pkgs.coreutils}/bin/install -m 0644 "$dcgFallbackSource" "$dcgTarget"
+        ${pkgs.coreutils}/bin/printf '%s\n' \
+          "" \
+          "################################################################" \
+          "#  dcg: REFRESHED BOOTSTRAP FALLBACK CONFIG" \
+          "#" \
+          "#  $dcgTarget was still byte-for-byte the fallback an earlier" \
+          "#  activation seeded, and nixos-config home/dcg-fallback.toml has" \
+          "#  changed since. It has been updated to the current one." \
+          "#" \
+          "#  Nothing of yours was touched: the refresh only ever replaces" \
+          "#  content this module wrote itself." \
+          "#" \
+          "#  Your real dcg pattern list is STILL NOT loaded. The fallback" \
+          "#  covers destructive HTTP verbs only." \
+          "#" \
+          "#  Fix: ${remedy}." \
+          "################################################################" \
+          "" \
+          >&2
       fi
 
       # ── The marker, and the desktop notification ────────────────────
@@ -271,6 +404,7 @@ in
         ${pkgs.jq}/bin/jq -n \
           --arg target "$dcgTarget" \
           --arg fallback "$dcgFallbackSource" \
+          --arg fallbackSha "$dcgFallbackSha" \
           --arg observed "$(${pkgs.coreutils}/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --arg remedy "${remedy}" \
           '{ schema: 1,
@@ -278,6 +412,7 @@ in
              state: "fallback-active",
              target: $target,
              fallback_source: $fallback,
+             fallback_sha256: $fallbackSha,
              observed_at: $observed,
              remedy: $remedy }' \
           > "$dcgMarker.tmp"

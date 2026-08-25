@@ -94,11 +94,60 @@ let
     [general]
     verbose = false
 
+    # Pinned off, and the phase below asserts the pin holds.
+    #
+    # `general.self_heal_hook` defaults to TRUE upstream, and true means a
+    # denying bare-`dcg` invocation rewrites $HOME/.claude/settings.json
+    # (cli.rs:13262 — the path is hardcoded off $HOME). The probe below is
+    # exactly such an invocation, so a fixture that omitted this key ran it
+    # with self-heal ARMED and was harmless only because the sandbox HOME
+    # happened to contain no settings.json — an assumption about $TMPDIR
+    # that nothing asserted, and that a later `mkdir`/`cp` in this phase
+    # could quietly falsify.
+    #
+    # A build-time probe that can write to a path named after a real
+    # Claude Code permission surface is the wrong shape whatever the
+    # sandbox makes of it, so the phase now plants a settings.json and
+    # asserts it comes back byte-identical. Drop this line and that
+    # assertion fails.
+    self_heal_hook = false
+
     [overrides]
     allow = []
     block = [
         { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "${dcgFixtureReason}" },
     ]
+  '';
+
+  # Stand-in for a Claude Code settings.json, for the self-heal assertion
+  # in installCheckPhase.
+  #
+  # THE PLANT IS LOAD-BEARING. Measured on v0.12.5 with self_heal_hook at
+  # its upstream default and the file ABSENT, a denying invocation creates
+  # nothing — so an assertion made against a HOME that has no settings.json
+  # passes identically whether the pin is there or not, and proves nothing.
+  #
+  # Shaped like the real thing in the one respect that decides the outcome:
+  # dcg is registered INDIRECTLY, under a "Bash" matcher pointing at
+  # another program. The entry ensure_hook_registered() looks for — matcher
+  # "Bash|PowerShell", command equal to the running binary's own path — is
+  # therefore absent, which is what arms the repair branch.
+  dcgFixtureSettings = prev.writeText "dcg-installcheck-settings.json" ''
+    {
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/nonexistent/.claude/hooks/bash-guard.py"
+              }
+            ]
+          }
+        ]
+      }
+    }
   '';
 in
 {
@@ -142,6 +191,9 @@ in
     # a `deny` decision on stdout, and a benign command must produce no
     # decision at all. Both run against a config written here, so the
     # assertion does not depend on which built-in packs ship by default.
+    # And answering must not REWRITE the settings.json it can see while
+    # doing it — the probe is a bare denying invocation, which is the one
+    # form that reaches dcg's self-heal path.
     doInstallCheck = true;
     installCheckPhase = ''
       runHook preInstallCheck
@@ -160,6 +212,13 @@ in
       export HOME="$TMPDIR/dcg-installcheck"
       mkdir -p "$HOME/.config/dcg"
       cp ${dcgFixtureConfig} "$HOME/.config/dcg/config.toml"
+
+      # Planted so the self-heal assertion after the probe is about a file
+      # dcg could actually have rewritten. 0644 rather than a bare `cp`
+      # from the store, which would land read-only and make the assertion
+      # pass on a permission error instead of on the pin.
+      install -D -m 0644 ${dcgFixtureSettings} "$HOME/.claude/settings.json"
+      settings_before=$(sha256sum "$HOME/.claude/settings.json" | cut -d' ' -f1)
 
       deny_out=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"curl -X DELETE https://example.com/x"}}' \
         | $out/bin/dcg || true)
@@ -204,6 +263,25 @@ in
           exit 1
           ;;
       esac
+
+      # Answering must not EDIT a Claude Code permission surface. That
+      # invocation above is the one that reaches ensure_hook_registered()
+      # (main.rs:1534 — bare `dcg` on a payload that denies; the
+      # subcommands never get there), so this is the only place in the
+      # build where the check is meaningful.
+      settings_after=$(sha256sum "$HOME/.claude/settings.json" | cut -d' ' -f1)
+      if [ "$settings_after" != "$settings_before" ]; then
+        echo "dcg installCheck: the probe REWROTE the planted settings.json." >&2
+        echo "  general.self_heal_hook is armed - either the pin is gone from" >&2
+        echo "  the fixture config in overlays/dcg.nix, or it no longer" >&2
+        echo "  suppresses ensure_hook_registered(). On a real host that runs" >&2
+        echo "  once per Bash tool call and inserts dcg ahead of the operator" >&2
+        echo "  guard at PreToolUse[0]." >&2
+        echo "  sha256 before: $settings_before" >&2
+        echo "  sha256 after:  $settings_after" >&2
+        cat "$HOME/.claude/settings.json" >&2
+        exit 1
+      fi
 
       allow_out=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' \
         | $out/bin/dcg || true)
