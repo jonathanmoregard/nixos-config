@@ -1,0 +1,83 @@
+# dcg BOOTSTRAP FALLBACK CONFIG — a floor, not a copy.
+#
+# home/dcg.nix links ~/.config/dcg/config.toml to ~/.claude/dcg.toml, the
+# hand-edited pattern list that lives in the .claude repo. THIS file is
+# what home-manager activation seeds at that target path when the target
+# does not exist yet — a fresh host before .claude is cloned, or a host
+# where something (claude-pull, a stray rm) deleted it.
+#
+# WHY SEEDING BEATS LEAVING THE LINK DANGLING
+#
+# Measured against dcg v0.12.5 with the target absent: dcg still runs,
+# still exits 0, and drops the ENTIRE user layer. `curl -X DELETE
+# https://example.com/x` comes back PERMITTED with empty stdout and ZERO
+# bytes on stderr, while `rm -rf /` is still denied by a built-in pack —
+# so the guard looks alive and answers correctly on the famous command
+# while every rule in the user layer is gone. There is no warning to
+# miss, because dcg emits none on a read failure (its eprintln! warnings
+# are on the TOML-parse-error branch only, src/config.rs:4001/:4016).
+# Seeding makes that state unreachable across an activation.
+#
+# WHY IT IS NOT A COPY OF ~/.claude/dcg.toml
+#
+# That file lives in a repo this flake does not contain and cannot read
+# at eval time, so nothing here could keep a copy in sync — a "copied
+# verbatim" claim would be a promise this repo cannot keep. What this
+# file covers instead is the class the measurement showed going silently
+# missing: destructive HTTP verbs, which no built-in pack blocks.
+#
+# It announces itself. Every deny it issues says, in the reason text the
+# operator and the agent both see, that the real pattern list is not
+# loaded — so running on the fallback is obvious the first time it fires,
+# not something to be discovered months later.
+
+[general]
+verbose = false
+
+# DO NOT RE-ENABLE, and do not drop this key when editing the seed. Upstream
+# defaults it to true, and true means dcg REWRITES ~/.claude/settings.json
+# from inside the hook path.
+#
+# Measured on dcg 0.12.5: main.rs:1534 calls cli::ensure_hook_registered() on
+# every bare-`dcg` hook invocation — one per Bash tool call, since
+# ~/.claude/hooks/bash-guard.py consults dcg that way. It reads
+# $HOME/.claude/settings.json (cli.rs:13262, hardcoded; CLAUDE_CONFIG_DIR is
+# NOT honoured) looking for a PreToolUse entry whose matcher is
+# "Bash|PowerShell" and whose command is the running binary's absolute path.
+# dcg is registered INDIRECTLY here, through bash-guard.py, so that entry is
+# never present and the repair branch (cli.rs:13635) fires every time: it
+# inserts dcg's own entry at PreToolUse[0], AHEAD of the real guard, and
+# re-serialises the whole file — reflowing it and dropping the trailing
+# newline. It fired on the live host on 2026-08-24; the harness tripwire
+# logged four ConfigChange/user_settings events for that single write.
+#
+# Not idempotent across rebuilds either: the injected command embeds the
+# /nix/store path, so every dcg version bump re-triggers it, and reverting
+# the entry by hand does not stick.
+#
+# This is the seed a FRESH host comes up on, so without the key here a brand
+# new machine has dcg editing its own permission surface before the operator
+# has read a single line of output. Verified under an isolated HOME: with the
+# key, a bare `dcg` invocation on a denying payload leaves settings.json
+# byte-identical; without it, the same invocation rewrites it and the
+# "Bash|PowerShell" entry appears.
+#
+# What is lost by disabling: only dcg's ability to re-register its OWN direct
+# PreToolUse hook — an entry we never had and do not want. Evaluation, packs
+# and verdicts are unaffected (measured: `rm -fr /` and the curl rules below
+# still return a full deny document with this set to false).
+self_heal_hook = false
+
+# Left at dcg's defaults, which resolve to ["core", "system.disk"] —
+# the same set an absent config produces. This file is strictly ADDITIVE
+# to the built-in protection; it never subtracts.
+[packs]
+enabled = []
+disabled = []
+
+[overrides]
+allow = []
+block = [
+    { pattern = "curl\\b.*\\s-X\\s*(DELETE|PUT|PATCH)\\b", reason = "Destructive HTTP method - deletes or overwrites a remote resource. NOTE: dcg is running its BOOTSTRAP FALLBACK config (nixos-config home/dcg-fallback.toml) because ~/.claude/dcg.toml was absent at home-manager activation. Your real pattern list is NOT loaded. Run it yourself with `! <command>` if intentional." },
+    { pattern = "curl\\b.*\\s--request[=\\s]*(DELETE|PUT|PATCH)\\b", reason = "Destructive HTTP method - deletes or overwrites a remote resource. NOTE: dcg is running its BOOTSTRAP FALLBACK config (nixos-config home/dcg-fallback.toml) because ~/.claude/dcg.toml was absent at home-manager activation. Your real pattern list is NOT loaded. Run it yourself with `! <command>` if intentional." },
+]
