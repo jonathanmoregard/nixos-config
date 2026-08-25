@@ -329,7 +329,17 @@ in
       # it and write wherever it points). It falls to arm 2 instead.
       if [ ! -e "$dcgTarget" ] && [ ! -L "$dcgTarget" ]; then
         ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$dcgTarget")"
-        ${pkgs.coreutils}/bin/install -m 0644 "$dcgFallbackSource" "$dcgTarget"
+        # Same-directory temp + rename, exactly as the marker write below.
+        # `install` straight onto the live path is a WINDOW: dcg reads this
+        # file on every bare-`dcg` hook invocation, i.e. once per Bash tool
+        # call, and a read landing mid-write sees partial TOML. dcg treats a
+        # parse error as "no user layer" and fail-opens SILENTLY on the
+        # override rules — the same shape as the outage this module exists
+        # to end, just narrowed to the width of one write. rename(2) is
+        # atomic within a filesystem, so a concurrent reader sees either the
+        # whole old file or the whole new one and never a torn one.
+        ${pkgs.coreutils}/bin/install -m 0644 "$dcgFallbackSource" "$dcgTarget.tmp"
+        ${pkgs.coreutils}/bin/mv -f "$dcgTarget.tmp" "$dcgTarget"
         ${pkgs.coreutils}/bin/printf '%s\n' \
           "" \
           "################################################################" \
@@ -370,7 +380,9 @@ in
         && [ -n "$dcgSeededSha" ] \
         && [ "$dcgTargetSha" = "$dcgSeededSha" ] \
         && [ "$dcgTargetSha" != "$dcgFallbackSha" ]; then
-        ${pkgs.coreutils}/bin/install -m 0644 "$dcgFallbackSource" "$dcgTarget"
+        # Atomic for the same reason as the seed arm above.
+        ${pkgs.coreutils}/bin/install -m 0644 "$dcgFallbackSource" "$dcgTarget.tmp"
+        ${pkgs.coreutils}/bin/mv -f "$dcgTarget.tmp" "$dcgTarget"
         ${pkgs.coreutils}/bin/printf '%s\n' \
           "" \
           "################################################################" \
