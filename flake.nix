@@ -114,6 +114,12 @@
         (import ./overlays/beeper.nix)
         (import ./overlays/auphonic-cli.nix)
         (import ./overlays/signal-expiry.nix)
+        # `pkgs.dcg` — the destructive-command guard the Claude Code hook
+        # stack shells out to. Declarative on purpose: the previous
+        # `cargo install` copy was deleted by the Mint → NixOS migration
+        # and its absence was silent for months because the consumer
+        # failed open. See overlays/dcg.nix.
+        (import ./overlays/dcg.nix)
         # `pkgs.aggregator` — a real store path for the ingest timer, so
         # modules/nixos/aggregator-ingest-timer.nix needs no flake-input
         # specialArgs threading (same reason the listen-tools tools are
