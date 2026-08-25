@@ -40,8 +40,21 @@
     # `aggregator_search_memory`. Consumed as SOURCE ONLY (`flake = false`)
     # and built here by overlays/aggregator.nix, because the aggregator's
     # own `packages.default` is a stub with an empty dependency list. The
-    # rev pinned in flake.lock IS the deployed version: bump with
-    # `nix flake update aggregator-src`, PR, merge, auto-deploy.
+    # rev in the URL below IS the deployed version.
+    #
+    # TO BUMP IT, EDIT THE REV IN THE URL and then `nix flake lock`, PR,
+    # merge, auto-deploy. NOT `nix flake update aggregator-src` — this ref is
+    # fully pinned (`github:owner/repo/<rev>`), so re-resolving it yields the
+    # same rev and the same narHash, and the command exits 0 having changed
+    # nothing. A bump that looks like it ran and did not is worse than one
+    # that errors.
+    #
+    # A bumped rev is NOT gated by the aggregator's own flake checks here.
+    # `flake = false` means this repo never evaluates that flake's outputs, so
+    # `checks.<system>.aggregator-embed-unit-hygiene` — which asserts the embed
+    # units' offline sandbox and seed entry point — runs in the aggregator's CI
+    # and not in this one. tests/base.nix therefore asserts the directives it
+    # depends on directly; keep it that way.
     #
     # The repo is PUBLIC as of 2026-08, so no access token is needed on any
     # of the three surfaces that evaluate this flake (the Actions runner,

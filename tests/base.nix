@@ -917,12 +917,42 @@ in
     # third writer against the same cache.db doing a subset of the same
     # work — which is exactly the arrangement the unified runner replaced,
     # and it would look like nothing more than two extra timers in a list.
-    for resurrected in ["aggregator-sessions", "aggregator-github"]:
-        assert f"{resurrected}.timer" not in agg_timers, (
-            f"{resurrected}.timer is armed — the upstream module's per-source "
-            f"ingest timers came back alongside the embed units, so this host "
-            f"now has more than one writer against cache.db:\n{agg_timers}"
-        )
+    #
+    # ENUMERATED, NOT SPOT-CHECKED, and the difference is the whole point.
+    # `sources.sessions.enable` and `sources.github.enable` BOTH DEFAULT TO
+    # TRUE upstream, so the module arms every source it knows about unless
+    # this repo names it and switches it off. A name-by-name check only ever
+    # covers the sources that existed when it was written: an aggregator-src
+    # bump that adds a third default-on source would sail straight past it
+    # and land a second writer on cache.db, silently, on auto-deploy. So
+    # assert the WHOLE SET and make a new name fail the lane until someone
+    # dispositions it deliberately.
+    #
+    # `list-unit-files` rather than `list-timers`, because the upstream units
+    # are `lib.mkIf`-gated: a disabled source has no unit FILE at all, and a
+    # file that exists but was never started would not appear in list-timers.
+    # It also spans both search paths — /etc/systemd/user for the NixOS-level
+    # ingest timer, ~/.config/systemd/user for the home-manager embed timer.
+    agg_timer_files = sorted(set(dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user list-unit-files --no-legend \"aggregator-*.timer\"' "
+        "| awk '{print $1}'"
+    ).split()))
+    assert agg_timer_files == [
+        "aggregator-embed.timer",
+        "aggregator-ingest.timer",
+    ], (
+        "the set of aggregator timers on this host changed. Expected exactly "
+        "the unified ingest runner plus the embed worker; got:\n"
+        f"{agg_timer_files}\n"
+        "A name MISSING here means a timer this host depends on stopped being "
+        "installed. A NEW name is almost certainly an upstream per-source "
+        "ingest timer whose `enable` defaults to true and which "
+        "home/aggregator-embed.nix does not switch off — i.e. a second writer "
+        "against the same cache.db, doing a subset of the work "
+        "aggregator-ingest.timer already does. Disable it there, then add it "
+        "to this list."
+    )
 
     agg_embed_unit = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -940,11 +970,64 @@ in
         f"aggregator-embed.service names the dev checkout:\n{agg_embed_unit}"
     )
 
+    # THE ENV VAR IS THE WEAKEST HALF OF "OFFLINE", and asserting only it is
+    # how this check quietly stops covering anything. HF_HUB_OFFLINE is a
+    # REQUEST: a library that does not read it, or any subprocess spawned
+    # along the way, still has the network. The load-bearing lines are the
+    # seccomp address-family restriction — which makes an AF_INET socket()
+    # fail outright — and the IP filter behind it.
+    #
+    # AND THIS REPO'S CI IS THE ONLY PLACE THAT CAN CATCH THEIR LOSS.
+    # `aggregator-src` is a `flake = false` input, so upstream's own
+    # `checks.<system>.aggregator-embed-unit-hygiene` never runs here. A rev
+    # bump that dropped these directives would evaluate clean, build clean,
+    # and auto-deploy to the laptop with the guarantee gone.
+    for directive in [
+        "TRANSFORMERS_OFFLINE=1",
+        "RestrictAddressFamilies=AF_UNIX AF_NETLINK",
+        "IPAddressDeny=any",
+    ]:
+        assert directive in agg_embed_unit, (
+            f"aggregator-embed.service no longer carries {directive!r}, so the "
+            "worker's offline guarantee rests on every library agreeing to "
+            f"read an environment variable:\n{agg_embed_unit}"
+        )
+
+    # The one opt-in that lets a run fetch weights. It belongs to the seed
+    # path and nowhere else; on the worker it would turn a 30-minute timer
+    # into a downloader, which is the exact failure HF_HUB_OFFLINE=1 above is
+    # there to prevent — so assert its ABSENCE rather than inferring it from
+    # the presence of the others.
+    assert "AGGREGATOR_ALLOW_MODEL_DOWNLOAD" not in agg_embed_unit, (
+        "aggregator-embed.service carries AGGREGATOR_ALLOW_MODEL_DOWNLOAD — "
+        "the scheduled worker is permitted to download model weights:\n"
+        f"{agg_embed_unit}"
+    )
+
+    # PARSE THE VALUE, NOT THE SECOND `=`-DELIMITED FIELD. `awk -F=` here used
+    # to take $2, which silently truncates the moment ExecStart carries an
+    # argument containing `=`, and emits one line per ExecStart — so a drop-in
+    # adding a second one made this variable multiline, and the `cat {var}`
+    # below then ran everything after the first newline as a shell command in
+    # the VM. Strip the key instead, stop at the first match, and refuse
+    # anything that is not a single bare store path, so a future ExecStart
+    # that grows arguments fails this lane loudly rather than reading whatever
+    # a truncated path happens to point at.
     agg_embed_exec = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user cat aggregator-embed.service' "
-        "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
+        "| awk '/^ExecStart=/{sub(/^ExecStart=/, \"\"); print; exit}' "
+        "| tr -d '\"'"
     ).strip()
+    assert (
+        agg_embed_exec.startswith("/nix/store/")
+        and len(agg_embed_exec.split()) == 1
+    ), (
+        "could not read a single bare store path out of "
+        f"aggregator-embed.service's ExecStart; got {agg_embed_exec!r}. "
+        "If ExecStart legitimately gained arguments, split the binary off "
+        "here — do not pass this string to a shell."
+    )
     agg_embed_script = dellan.succeed(f"cat {agg_embed_exec}")
     # Same store-path ban as the ingest wrapper, same reason (2026-08-16).
     assert "/home/" not in agg_embed_script, (
