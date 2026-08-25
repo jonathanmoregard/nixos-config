@@ -61,7 +61,7 @@ Body explaining the change.
 Pre-push checklist:
 - Type: risky                                # or 'pure-data'
 - Rebased on origin/main: yes
-- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0
+- Local gate: nix build .#checks.x86_64-linux.vm-base rc=0   # lane(s) the change touches
 - Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>
 - Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>
 - feature-vm.nix modified: no                # MUST match diff
@@ -122,7 +122,7 @@ activationScripts / systemd.services.\*) AND does not touch
 Pre-push checklist:
 - Type: risky
 - Rebased on origin/main: yes
-- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0
+- Local gate: nix build .#checks.x86_64-linux.<lane> rc=0
 - Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>
 - Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>
 - feature-vm.nix modified: no
@@ -134,7 +134,7 @@ Pre-push checklist:
 |---|---|---|
 | `Type` | yes (literal `pure-data` or `risky`) | Mismatch with diff = reject |
 | `Rebased on origin/main` | yes (`merge-base HEAD origin/main == origin/main`) | `yes` claim while behind main = reject |
-| `Local gate` | no — typed claim | Audited post-hoc via `git log` |
+| `Local gate` | no — typed claim | Audited post-hoc via `git log`. Name the real lane(s) — see "Check lanes" below. |
 | `Interactive smoke (nixos-agent-testing)` | no — typed claim | Required for branching / multistep / GUI / daemon-poke. `N/A` only when the VM can't model the change (hardware-only). |
 | `Advisor review (advice-refine-test-loop)` | no — typed claim | Required before merge on medium/high-risk PRs. `N/A` only for small / contained risky changes. |
 | `feature-vm.nix modified` | **yes — diff cross-checked** | `no` claim with feature-vm.nix in diff = reject |
@@ -152,6 +152,32 @@ Pre-push checklist:
 ### Override (audited)
 
 `Override: [skip-vm-gate] <reason>` line in the commit message bypasses the gate. Logged to stderr by the MCP; visible in `git log` forever. Reserve for true emergencies. Not a shortcut.
+
+## Check lanes
+
+**There is no aggregate check.** `.#checks.x86_64-linux.dellan-vm` was
+split into per-feature lanes and no longer evaluates — building it fails
+with an attribute error, not a test failure. Build the lane(s) your
+change touches. Authoritative list, always:
+
+```bash
+nix eval .#checks.x86_64-linux --apply builtins.attrNames
+```
+
+| Lane | Covers |
+|---|---|
+| `vm-base` | HM activation, systemd user units, binaries on PATH — the default lane |
+| `vm-desktop` | X session, Cinnamon, graphical bits |
+| `vm-microvm` | research-agent microvm, virtiofs shares, egress init |
+| `vm-keyring` · `vm-kitty` · `vm-claude-pane` · `vm-autodoro` | the named feature |
+| `vm-listen-tools` · `vm-android-dev` · `vm-camera-relay` | the named feature |
+| `vm-claude-egress` · `vm-auto-deploy` | egress policy · deploy pipeline |
+| `egress-init-retry` | the generated nftables script (no VM — fast) |
+| `cachix-push-filter` · `add-secret-smoke` · `secrets-no-dead-credentials` · `signal-expiry` · `worktree-sweep` | script/data assertions (no VM — fast) |
+
+The non-VM lanes run in seconds; the `vm-*` lanes boot a machine. When a
+change spans areas, build each affected lane and record all of them in
+the `Local gate` field.
 
 ## Testing skills
 
@@ -186,9 +212,18 @@ interactive VM. When in doubt, run it; the cost is cheap.
 
 | Status check | Meaning |
 |---|---|
-| `eval (dellan)`, `build (dellan)` | Flake evaluates + system derivation builds |
-| `vm-minimal (1..3)` | Three parallel ephemeral-VM e2e tests |
+| `preflight` | ~1s trivial-change short-circuit, before any nix runs |
+| `verify fork-guards` | Fork-safety guards intact |
+| `flake check (eval)` | Flake evaluates |
+| `docs (eval)` | Doc assertions |
+| `discover` | Computes which `vm-minimal` lanes the diff needs |
+| `build dellan toplevel` | System derivation builds (the slow one, ~15min) |
+| `vm-minimal (<lane>)` | One job per lane `discover` selected — matrix, not a fixed count |
 | `vm-graphical` | Runs only when desktop files change |
+| `close-fork` | Skipped on non-fork PRs |
+
+Job names come from `.github/workflows/ci.yml`; `close-fork` from
+`close-fork-prs.yml`. There is no `classify` or `label-gate` job.
 
 ## After merge
 
