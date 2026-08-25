@@ -7,8 +7,37 @@ let
   # those, same gap as tmux-resurrect.
   kittySessionConvert = pkgs.writers.writePython3Bin "kitty-session-convert" {} ''
     import json
+    import os
     import shlex
     import sys
+
+
+    def _is_claude(cmdline):
+        """True when cmdline[0] is the claude-code CLI."""
+        if not cmdline:
+            return False
+        return os.path.basename(cmdline[0]) == "claude"
+
+
+    def pane_cmd(win):
+        """The command this pane should be recorded as running.
+
+        Mirrors kitty-restore-session's picker: a `claude` entry
+        anywhere in the pid-ordered foreground list wins, then the
+        cmdline kitty actually launched the window with, then
+        foreground_processes[0]. Keeps last.session an honest
+        rendering of what restore will do.
+        """
+        fg = win.get("foreground_processes") or []
+        for fp in fg:
+            cl = fp.get("cmdline") or []
+            if _is_claude(cl):
+                return cl
+        wc = win.get("cmdline") or []
+        if wc:
+            return wc
+        return (fg[0].get("cmdline") or []) if fg else []
+
 
     data = json.load(sys.stdin)
     out = []
@@ -30,8 +59,7 @@ let
             for win in tab.get("windows", []):
                 cwd = win.get("cwd")
                 wtitle = win.get("title", "")
-                fg = win.get("foreground_processes") or []
-                cmdline = fg[0].get("cmdline", []) if fg else []
+                cmdline = pane_cmd(win)
                 # Skip transient kitty internals (e.g. the `kitten ask`
                 # confirmation dialog tab that kitty spawns when the user
                 # clicks X with running processes — restoring it
@@ -255,6 +283,49 @@ let
     STUB_PATH = "/tmp/kitty-stub-session"
 
 
+    def _is_claude(cmdline):
+        """True when cmdline[0] is the claude-code CLI."""
+        if not cmdline:
+            return False
+        return os.path.basename(cmdline[0]) == "claude"
+
+
+    def pane_cmd(win):
+        """Resolve the command a restored pane should be launched with.
+
+        Priority:
+          1. a `claude` entry anywhere in foreground_processes. kitty
+             reports that list in pid order, so index 0 is only claude
+             by luck — every MCP-server child claude spawns has a
+             higher pid, but the moment claude itself exits the list
+             starts with whichever child outlived it.
+          2. `window.cmdline` when kitty launched the pane AS claude.
+             This is the ZOMBIE case: claude is gone, an orphaned
+             stdio MCP server still holds the pty open, and fg lists
+             only that orphan. kitty remembers what it spawned, so the
+             pane is still recoverable as a claude pane (the sid comes
+             from the snapshot's claude_session_id, attached by
+             kitty-session-enrich from pane-sessions.tsv).
+          3. `window.cmdline` otherwise — what kitty actually spawned
+             beats whatever happens to be in the foreground right now.
+             Restoring the pane's shell is better than re-running
+             someone's half-finished `nix build`, and strictly better
+             than resurrecting an orphaned MCP server as if the user
+             had asked for it.
+          4. foreground_processes[0], for kitty builds that do not
+             report a per-window `cmdline` at all.
+        """
+        fg = win.get("foreground_processes") or []
+        for fp in fg:
+            cl = fp.get("cmdline") or []
+            if _is_claude(cl):
+                return cl
+        wc = win.get("cmdline") or []
+        if wc:
+            return wc
+        return (fg[0].get("cmdline") or []) if fg else []
+
+
     def load_panes():
         cache = os.environ.get(
             "XDG_CACHE_HOME",
@@ -279,8 +350,7 @@ let
         for osw in snap:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
-                    fg = win.get("foreground_processes") or []
-                    cmd = fg[0].get("cmdline", []) if fg else []
+                    cmd = pane_cmd(win)
                     # Skip kitty's transient `kitten ask` confirmation
                     # dialogs (saved if a snapshot fires while the
                     # close-confirmation tab is open).
@@ -491,6 +561,13 @@ let
     )
 
 
+    def _is_claude(cmdline):
+        """True when cmdline[0] is the claude-code CLI."""
+        if not cmdline:
+            return False
+        return os.path.basename(cmdline[0]) == "claude"
+
+
     def load_tsv():
         """Return {window_id: session_id}. Malformed lines ignored."""
         if not os.path.isfile(TSV_PATH):
@@ -582,10 +659,30 @@ let
                     if isinstance(wid, int):
                         live.add(wid)
                     fg = win.get("foreground_processes") or []
-                    has_claude = any(
-                        os.path.basename((fp.get("cmdline") or [""])[0])
-                        == "claude"
-                        for fp in fg
+                    # A window counts as a claude pane when claude is
+                    # among its foreground processes OR when claude is
+                    # what kitty launched it with.
+                    #
+                    # The second arm catches a ZOMBIE pane: claude has
+                    # exited but an orphaned stdio MCP server (in
+                    # practice research-agent, sitting in its 60s
+                    # scanner re-check loop and never noticing stdin
+                    # EOF) still holds the pty open, so kitty keeps the
+                    # window alive and reports only the orphan in
+                    # foreground_processes. Keying off fg alone left
+                    # such a window un-enriched, and restore then
+                    # relaunched the ORPHAN as the pane's command — the
+                    # user's session silently dropped, the pane came
+                    # back showing the MCP server's boot log.
+                    #
+                    # `window.cmdline` is what kitty spawned and
+                    # survives the death of that process, so it is the
+                    # stable record of "this pane is a claude pane".
+                    # It stays FALSE for a pane the user launched as a
+                    # shell and then quit claude inside — that window's
+                    # cmdline is the shell, so no resurrection.
+                    has_claude = _is_claude(win.get("cmdline")) or any(
+                        _is_claude(fp.get("cmdline")) for fp in fg
                     )
                     if not has_claude:
                         continue
