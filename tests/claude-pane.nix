@@ -269,6 +269,89 @@
         "claude-kitty-pane-record < /tmp/hook-b.json'"
     )
 
+    # --- 6b-2: ZOMBIE pane. `claude` has exited but an orphaned stdio
+    # MCP server still holds the pty open, so kitty keeps the window
+    # alive and reports ONLY the orphan in foreground_processes.
+    # kitty's per-window `cmdline` still records what it launched —
+    # claude — so the pane is recoverable, and the TSV row keyed by
+    # window id is still valid.
+    #
+    # Regression guard for 2026-08-25: after a kitty restart, two of
+    # four panes came back running
+    #   uv run --project .../research-agent python3 -m mcp_server.server
+    # instead of claude, because the enricher decided "is this a claude
+    # pane?" from foreground_processes alone, left the zombie window
+    # un-enriched, and restore then relaunched the orphan verbatim.
+    # research-agent is the orphan that shows up in practice: it sits
+    # in a 60s scanner re-check loop and never notices stdin EOF.
+    orphan = [
+        "/etc/profiles/per-user/jonathan/bin/uv", "run", "--project",
+        "/home/jonathan/Repos/research-agent", "python3", "-m",
+        "mcp_server.server",
+    ]
+    fake_ls_zombie = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": wid_a, "cwd": "/tmp/fake", "title": "zombie",
+                 "cmdline": ["/home/jonathan/.local/bin/claude"],
+                 "foreground_processes": [
+                     {"pid": 9001, "cmdline": orphan}
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/fake-ls-zombie.json", fake_ls_zombie)
+    dellan.succeed(
+        "su - jonathan -c 'kitty-session-enrich "
+        "< /tmp/fake-ls-zombie.json > /tmp/enriched-zombie.json'"
+    )
+    id_zombie = dellan.succeed(
+        "jq -r '.[0].tabs[0].windows[0].claude_session_id // empty' "
+        "/tmp/enriched-zombie.json"
+    ).strip()
+    assert id_zombie == sid_a, (
+        "zombie pane (claude dead, orphaned MCP server holding the pty) "
+        f"was not enriched: expected {sid_a!r}, got {id_zombie!r}"
+    )
+
+    # 6b-3: the mirror image. A pane whose window cmdline IS a shell
+    # and whose foreground is that shell — the user quit claude and
+    # stayed at the prompt — must NOT be marked as a claude pane, even
+    # though its TSV row survives for the window's whole lifetime.
+    # Otherwise restore would resurrect claude over the user's shell.
+    fake_ls_shell = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": wid_a, "cwd": "/tmp/fake", "title": "shell",
+                 "cmdline": ["/run/current-system/sw/bin/zsh"],
+                 "foreground_processes": [
+                     {"pid": 9002,
+                      "cmdline": ["/run/current-system/sw/bin/zsh"]}
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/fake-ls-shell.json", fake_ls_shell)
+    dellan.succeed(
+        "su - jonathan -c 'kitty-session-enrich "
+        "< /tmp/fake-ls-shell.json > /tmp/enriched-shell.json'"
+    )
+    has_shell_sid = dellan.succeed(
+        "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
+        "/tmp/enriched-shell.json"
+    ).strip()
+    assert has_shell_sid == "false", (
+        "pane back at a shell prompt was marked as a claude pane; "
+        "restore would resurrect claude over the user's shell"
+    )
+
+    # Both runs above pruned the TSV to live_window_ids={wid_a}.
+    # Re-seed wid_b for the phases that follow.
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
+        "claude-kitty-pane-record < /tmp/hook-b.json'"
+    )
+
     # --- 6c: pruning — stale TSV entries for windows not in `ls` are
     # removed on each enrich pass, keeping the TSV bounded.
     sid_stale = "dddd4444-dddd-dddd-dddd-dddddddddddd"
@@ -560,6 +643,74 @@
     cmd2_no_spare = resolved_no_spare[1]["cmd"]
     assert cmd2_no_spare == ["/usr/bin/claude"], (
         f"all-claimed fallback should drop --resume; got {cmd2_no_spare!r}"
+    )
+
+    # 6f-7: restore side of the zombie pane (see 6b-2). snapshot.json
+    # holds a window whose foreground is the orphaned MCP server but
+    # whose cmdline + claude_session_id both say claude. load_panes
+    # must resolve it to `claude --resume <sid>` and must NOT relaunch
+    # the orphan — relaunching it is exactly what dropped two of the
+    # user's four sessions on 2026-08-25.
+    zsid = "33333333-3333-3333-3333-333333333333"
+    dellan.succeed(f"su - jonathan -c 'touch {proj}/{zsid}.jsonl'")
+    snap_zombie = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": 301, "cwd": restore_cwd, "title": "zombie",
+                 "claude_session_id": zsid,
+                 "cmdline": ["/home/jonathan/.local/bin/claude"],
+                 "foreground_processes": [
+                     {"pid": 9001, "cmdline": orphan}
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/zombie-snap.json", snap_zombie)
+    dellan.succeed(
+        "su - jonathan -c 'cp /tmp/zombie-snap.json "
+        f"{cache_dir}/snapshot.json'"
+    )
+    resolved_zombie = json.loads(dellan.succeed(
+        "su - jonathan -c 'kitty-restore-session --dump-panes'"
+    ))
+    cmd_z = resolved_zombie[0]["cmd"]
+    assert cmd_z == ["/home/jonathan/.local/bin/claude", "--resume", zsid], (
+        f"zombie pane restored as {cmd_z!r}; expected claude --resume "
+        f"{zsid!r}"
+    )
+
+    # 6f-8: kitty reports foreground_processes in pid order, so once a
+    # pane has MCP-server children `claude` sits at index 0 only by
+    # luck — and not at all once claude itself dies. A claude entry
+    # ANYWHERE in the list must win, over both index 0 and the window
+    # cmdline.
+    osid = "44444444-4444-4444-4444-444444444444"
+    dellan.succeed(f"su - jonathan -c 'touch {proj}/{osid}.jsonl'")
+    snap_order = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": 302, "cwd": restore_cwd, "title": "unordered",
+                 "claude_session_id": osid,
+                 "cmdline": ["/run/current-system/sw/bin/zsh"],
+                 "foreground_processes": [
+                     {"pid": 9001, "cmdline": orphan},
+                     {"pid": 9002,
+                      "cmdline": ["/home/jonathan/.local/bin/claude"]},
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/order-snap.json", snap_order)
+    dellan.succeed(
+        "su - jonathan -c 'cp /tmp/order-snap.json "
+        f"{cache_dir}/snapshot.json'"
+    )
+    resolved_order = json.loads(dellan.succeed(
+        "su - jonathan -c 'kitty-restore-session --dump-panes'"
+    ))
+    cmd_o = resolved_order[0]["cmd"]
+    assert cmd_o == ["/home/jonathan/.local/bin/claude", "--resume", osid], (
+        f"claude at a non-zero foreground index was missed; got {cmd_o!r}"
     )
 
     # --- 6g: Layer C — pane-sessions.tsv wipe on kitty wrapper
