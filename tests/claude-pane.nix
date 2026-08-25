@@ -900,5 +900,125 @@
         f"concurrent hooks left duplicate wid rows: {dup_wids}; "
         f"awk replace-then-append race"
     )
+
+    # ── orphaned-subagent notice on restore (home/kitty.nix) ──────────
+    #
+    # A restored pane resumes a conversation whose PROCESSES are gone.
+    # Background subagents die with the parent; their file edits usually
+    # do not. The probe reads each subagent transcript this session
+    # spawned and reports the ones with no completion record, so the
+    # resumed session does not go on believing an agent is still running
+    # and does not re-dispatch work that is already staged on disk.
+    #
+    # Completion is decided by a RECORDED TERMINAL VALUE, not a
+    # timestamp: mtime-threshold recovery is defeated by clock movement
+    # in both directions, and a stop_reason already written to the
+    # transcript cannot move. The assertions below therefore never plant
+    # or compare mtimes.
+    #
+    # The deployed script carries an `if __name__ == "__main__"` guard,
+    # so the lane imports the REAL installed binary and calls the real
+    # function rather than reimplementing the rule and testing a copy.
+    krs = dellan.succeed(
+        "su - jonathan -c 'command -v kitty-restore-session'"
+    ).strip()
+    assert krs.startswith("/"), f"kitty-restore-session not on PATH: {krs!r}"
+
+    orphan_proj = "/home/jonathan/.claude/projects/orphan-probe"
+    orphan_sid = "sid-with-orphan"
+    clean_sid = "sid-all-clean"
+    for _sid in (orphan_sid, clean_sid):
+        dellan.succeed(
+            f"su - jonathan -c 'mkdir -p {orphan_proj}/{_sid}/subagents'"
+        )
+
+    def _plant(sid, agent, stop_reason, kind="assistant"):
+        """One-line transcript whose last record has the given shape.
+
+        Staged through stage_input, i.e. a quoted heredoc, NOT through
+        `su -c 'printf ...'`. The obvious spelling nests single quotes
+        inside the `su -c` single quotes, and the shell then strips the
+        JSON string delimiters before the bytes reach disk — the file
+        lands as unparseable, _last_record returns None, and every arm
+        below passes or fails for a reason that has nothing to do with
+        the probe.
+        """
+        msg = "null" if stop_reason is None else f'"{stop_reason}"'
+        rec = (
+            f'{{"type":"{kind}","cwd":"/home/jonathan",'
+            f'"gitBranch":"master","sessionId":"{sid}",'
+            f'"message":{{"role":"assistant","stop_reason":{msg}}}}}'
+        )
+        path = f"{orphan_proj}/{sid}/subagents/agent-{agent}.jsonl"
+        stage_input(path, rec)
+        # The planted bytes must be valid JSON, or the arms below are
+        # measuring the fixture rather than the probe.
+        dellan.succeed(
+            f"python3 -c \"import json,sys; json.load(open(sys.argv[1]))\" "
+            f"{path}"
+        )
+
+    # end_turn is the only shape that means "this agent finished".
+    _plant(clean_sid, "cleanone", "end_turn")
+    _plant(clean_sid, "cleantwo", "end_turn")
+    _plant(orphan_sid, "finished", "end_turn")
+    _plant(orphan_sid, "diedmidrun", None)
+
+    def _notice(sid):
+        """Call orphan_notice() inside the deployed script."""
+        # An explicit SourceFileLoader is required, not optional:
+        # spec_from_file_location() infers the loader from the file
+        # EXTENSION, and the deployed script has none (it is
+        # .../bin/kitty-restore-session), so it returns None and the
+        # import dies on `.loader`. Naming the loader keeps this arm
+        # pointed at the REAL installed binary instead of a .py copy.
+        prog = (
+            "import importlib.util as u, sys;"
+            "from importlib.machinery import SourceFileLoader as L;"
+            f"s=u.spec_from_file_location('krs', {krs!r},"
+            f" loader=L('krs', {krs!r}));"
+            "m=u.module_from_spec(s);sys.argv=['x'];"
+            "s.loader.exec_module(m);"
+            f"n=m.orphan_notice({orphan_proj!r}, {sid!r});"
+            "print('NONE' if n is None else n.replace(chr(10), ' | '))"
+        )
+        return dellan.succeed(
+            "su - jonathan -c " + shlex.quote(f"python3 -c {shlex.quote(prog)}")
+        ).strip()
+
+    # THE POSITIVE CASE: the orphan is named, the finished sibling is not.
+    got = _notice(orphan_sid)
+    assert "diedmidrun" in got, (
+        "the restore probe did not report a subagent whose transcript ends "
+        "with no completion record. A resumed pane will therefore keep "
+        f"believing that agent is still running:\n{got}"
+    )
+    assert "finished" not in got, (
+        "the probe reported an agent that ended with stop_reason end_turn. "
+        "Reporting completed agents as lost trains the reader to ignore the "
+        f"notice, which is how a real one gets missed:\n{got}"
+    )
+    assert "/home/jonathan" in got, (
+        f"the notice omits the cwd the orphan recorded, so the reader is not "
+        f"told where to look:\n{got}"
+    )
+
+    # THE NEGATIVE CONTROL, and the reason the assertion above is worth
+    # anything: an identical session whose agents all completed must be
+    # SILENT. Without this the probe could report unconditionally and the
+    # positive case would still pass.
+    quiet = _notice(clean_sid)
+    assert quiet == "NONE", (
+        "a session whose subagents all completed still produced a restore "
+        "notice. Every restore would then carry it, which is noise the "
+        f"reader learns to skip:\n{quiet}"
+    )
+
+    # Unknown session: silent, and no traceback. The probe runs while panes
+    # wait to launch, so a failure here must never break a restore.
+    unknown = _notice("no-such-session-at-all")
+    assert unknown == "NONE", (
+        f"probing an unknown session should be silent, got:\n{unknown}"
+    )
   '';
 }
