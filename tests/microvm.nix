@@ -47,6 +47,12 @@ pkgs.testers.runNixOSTest {
     home-manager = {
       useGlobalPkgs = true;
       useUserPackages = true;
+      # This lane builds its own home-manager block rather than going
+      # through tests/lib/common.nix, so it needs the same specialArg the
+      # two builders there pass. home/aggregator-embed.nix uses it in
+      # `imports`, and a module argument resolved from `_module.args`
+      # during import evaluation is an infinite recursion.
+      extraSpecialArgs = { inherit (inputs) aggregator-src; };
       users.jonathan = import ../home/jonathan-linux.nix;
     };
 
