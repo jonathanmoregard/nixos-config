@@ -272,6 +272,7 @@ in
     ./git-hooks.nix
     ./autodoro.nix
     ./claude-mcp-sync.nix
+    ./dcg.nix
     ./drift-analyzer.nix
     ./sota-watch.nix
     ./worktree-sweep.nix
@@ -483,6 +484,14 @@ in
   # On a fresh host: move runtime dirs aside, `git clone
   # git@github.com:jonathanmoregard/.claude.git ~/.claude`, restore
   # runtime dirs, `git submodule update --init --recursive`.
+  #
+  # As of home/dcg.nix, `dcg.toml` is also in the "move aside" set: this
+  # module's ensureClaudeLogsDir already makes ~/.claude non-empty before
+  # any clone, and home/dcg.nix additionally seeds ~/.claude/dcg.toml
+  # with a bootstrap fallback when it is absent — because a missing
+  # target there does not merely lose a file, it silently disarms the
+  # whole dcg user layer. Move it aside with the rest, clone, then let
+  # the repo's own dcg.toml win.
   home.activation.cloneRepos = lib.hm.dag.entryAfter ["writeBoundary"] ''
     mkdir -p "$HOME/Repos"
     mkdir -p "$HOME/.local/share"

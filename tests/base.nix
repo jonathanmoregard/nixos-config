@@ -87,6 +87,145 @@ let
         sys.exit(1)
     print("[ca-probe] OK")
   '';
+
+  # Stand-in for a hand-edited ~/.claude/dcg.toml inside the VM.
+  #
+  # NOT a copy of the real file, and deliberately no longer claimed to be
+  # one. The real file lives in the ~/.claude repo, which this flake does
+  # not contain and cannot read at eval time — so a "copied verbatim"
+  # claim is one this lane has no way to keep, and the previous revision
+  # had already drifted (its reason string was a truncation of the real
+  # one) with nothing able to notice. What this fixture is FOR is proving
+  # the mkOutOfStoreSymlink live-edit property: written straight to the
+  # link's target with no rebuild, it must take effect on the very next
+  # dcg invocation.
+  #
+  # The one thing that IS verbatim-checkable is home/dcg-fallback.toml —
+  # it is in this flake, so the lane byte-compares the seeded copy against
+  # it below (`cmp`) instead of asserting a promise about a file it cannot
+  # see.
+  #
+  # `curl -X DELETE` is the probe because dcg's built-in packs do NOT
+  # block it (measured: with no user config it is allowed, while `rm -rf /`
+  # is denied by core.filesystem). Attribution is then nailed down
+  # positively — the deny document must carry this exact reason string and
+  # must carry NO ruleId/packId, which is how dcg distinguishes an
+  # `[overrides]` match from a pack match.
+  dcgVmBlockReason = "vm-base fixture rule, planted at the link target with no rebuild";
+  dcgVmConfig = pkgs.writeText "vm-base-dcg-config.toml" ''
+    [general]
+    verbose = false
+
+    # Pinned off for the same reason home/dcg-fallback.toml pins it: this
+    # file gets planted at the link target and then probed with a denying
+    # payload, which is precisely the invocation that reaches
+    # ensure_hook_registered(). Omitting the key takes dcg's upstream
+    # default of TRUE, so the probe would run with self-heal ARMED and
+    # rewrite ~/.claude/settings.json. The version of this fixture that
+    # omitted it was harmless only because settings.json happened to have
+    # been deleted a few lines earlier in the lane — an ordering accident,
+    # asserted nowhere, that any later edit could undo. The arm that probes
+    # this fixture now plants settings.json first and asserts it comes back
+    # byte-identical, so dropping this line fails the lane instead.
+    #
+    # Not to be confused with dcgSelfHealConfig below, which omits the key
+    # DELIBERATELY and must keep omitting it.
+    self_heal_hook = false
+
+    [packs]
+    enabled = []
+    disabled = []
+
+    [overrides]
+    allow = []
+    block = [
+        { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "${dcgVmBlockReason}" },
+    ]
+  '';
+
+  # Deliberately broken TOML, for the malformed-config arm. `x=` is the
+  # minimal input that makes dcg's loader report `invalid`; the shape that
+  # actually happens in practice is a git conflict marker landing in a
+  # hand-edited file, which produces the same status.
+  dcgBrokenConfig = pkgs.writeText "vm-base-dcg-broken.toml" ''
+    x=
+  '';
+
+  # An OLDER revision of home/dcg-fallback.toml, for the refresh arm (i).
+  #
+  # A store path cannot change inside a running VM, so that arm stages the
+  # "the seed moved" state from the other end: it moves the TARGET
+  # backwards to a fallback that is no longer the current one. Built by
+  # APPENDING to the tracked file rather than by copying its text, so it
+  # cannot drift away from the real fallback, stays valid TOML, and keeps
+  # every rule in it — including the `self_heal_hook = false` pin, which
+  # matters because a denying probe runs while this is planted at the link
+  # target.
+  dcgStaleFallback = pkgs.runCommand "vm-base-dcg-stale-fallback.toml" { } ''
+    cat ${../home/dcg-fallback.toml} > $out
+    echo "# an older revision of home/dcg-fallback.toml, planted by vm-base" >> $out
+  '';
+
+  # POSITIVE CONTROL for the self-heal arm (h). Identical in shape to the
+  # seeded fallback in the only respect that arm is about, except that it
+  # DELIBERATELY OMITS `self_heal_hook` under [general] — so it takes
+  # dcg's upstream default of true.
+  #
+  # DO NOT ADD `self_heal_hook` TO THIS FILE. Its whole job is to be the
+  # config that lets dcg rewrite settings.json, which is what proves the
+  # negative assertion in (h) is capable of failing. Set the key here and
+  # both arms go green while asserting nothing.
+  #
+  # It is a separate fixture rather than a reuse of dcgVmConfig on
+  # purpose: dcgVmConfig exists to prove the mkOutOfStoreSymlink live-edit
+  # property, so a future edit could reasonably add the key to it, and the
+  # control would then silently stop controlling.
+  dcgSelfHealReason = "vm-base self-heal CONTROL fixture, self_heal_hook deliberately unset";
+  dcgSelfHealConfig = pkgs.writeText "vm-base-dcg-selfheal-control.toml" ''
+    [general]
+    verbose = false
+
+    [overrides]
+    allow = []
+    block = [
+        { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "${dcgSelfHealReason}" },
+    ]
+  '';
+
+  # Stand-in for the operator's ~/.claude/settings.json inside the VM, for
+  # the self-heal arm (h).
+  #
+  # THE PLANT IS LOAD-BEARING. dcg's self-heal only rewrites a
+  # settings.json that ALREADY EXISTS — measured on v0.12.5 with
+  # self_heal_hook left at its upstream default of true and the file
+  # absent, a denying bare-`dcg` invocation creates nothing
+  # (cli.rs:13602). The ~/.claude repo is not cloned in the VM, so an arm
+  # that skipped installing this would hash a file that was never there
+  # and pass on a host where dcg rewrites everything it can reach.
+  #
+  # Shaped like the real thing in the one way that decides the outcome:
+  # dcg is registered INDIRECTLY, through bash-guard.py under a "Bash"
+  # matcher. The entry ensure_hook_registered() hunts for — matcher
+  # "Bash|PowerShell", command equal to the running binary's own absolute
+  # path — is therefore absent, which is what arms the repair branch. An
+  # entry it inserts lands at PreToolUse[0], ahead of this one.
+  dcgVmSettings = pkgs.writeText "vm-base-claude-settings.json" ''
+    {
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/home/jonathan/.claude/hooks/bash-guard.py"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
   name = "vm-base";
@@ -1595,5 +1734,817 @@ in
     assert "microsoft.com" in no_url.lower() or "url" in no_url.lower(), (
         f"win-vm fetch-iso (no arg) should surface the MS URL hint:\n{no_url}"
     )
+
+    # ── dcg, the destructive-command guard (overlays/dcg.nix + home/dcg.nix) ──
+    #
+    # dcg is the first and richest deny layer the Claude Code guard stack
+    # consults before running a shell command. It used to be `cargo
+    # install`ed into ~/.local/bin, with ~/.config/dcg/config.toml
+    # hand-symlinked to ~/.claude/dcg.toml. The Mint -> NixOS migration
+    # deleted both, and the consumer treats "dcg missing" as "nothing to
+    # block", so the guard was inert for months with no error anywhere.
+    #
+    # That failure had two halves and this block asserts both, because
+    # either one alone reads as healthy:
+    #   (a) the BINARY is present — the half the migration dropped first;
+    #   (b) the CONFIG is reachable — a dcg with no config still exits
+    #       cleanly, still emits nothing, and still looks exactly like a
+    #       dcg that examined the command and approved it.
+    #
+    # An earlier revision of this block ended with a "negative control"
+    # that DELETED the linked config and asserted the destructive command
+    # then came back UNDENIED — encoding the fail-open as the expected
+    # result. It was a true statement about v0.12.5 and exactly the wrong
+    # thing to assert: it made the degraded state a documented feature, so
+    # any fix for it would have shown up as a test failure. It is replaced
+    # here by two assertions that point the other way:
+    #
+    #   (c) attribution WITHOUT a degraded state — the deny document must
+    #       carry the fixture's own reason string and NO ruleId/packId,
+    #       which is how dcg marks an `[overrides]` match as opposed to a
+    #       built-in pack match. That proves the config was read without
+    #       ever needing to observe the guard disarmed. It comes with a
+    #       positive control (`rm -rf /`, which a pack DOES block): an
+    #       absence only means something while a pack deny still carries
+    #       those fields, and nothing used to assert that it does.
+    #   (d) the degraded state must be UNREACHABLE across an activation —
+    #       delete the target, re-run home-manager, and the guard must be
+    #       armed again (home/dcg.nix seeds home/dcg-fallback.toml).
+    #
+    # And (e): a malformed config must FAIL the activation. dcg does warn
+    # on a TOML parse error, but only on the stderr of a PreToolUse hook,
+    # which Claude Code discards — so today it reaches nobody while every
+    # override silently stops applying.
+    #
+    # Two more, both about who actually finds out:
+    #
+    #   (f) the MARKER FILE. On NixOS, home-manager activation runs inside
+    #       home-manager-jonathan.service and `nixos-rebuild` does not
+    #       stream unit logs, so the seed banner lands in journalctl and
+    #       in front of nobody. A seeded host would look fully configured
+    #       while running a strictly weaker rule set — the same silent
+    #       degradation in a new costume. home/dcg.nix therefore writes
+    #       $XDG_STATE_HOME/dcg/fallback-active.json whenever the fallback
+    #       is in force and deletes it when it is not; the session-start
+    #       guard-health hook in the ~/.claude repo reads it. That is a
+    #       cross-repo contract, so this lane pins its path, its schema and
+    #       its lifecycle in both directions.
+    #   (g) a dcg problem must not take out the REST of activation. The
+    #       hard-fail used to live in an `entryAfter [ "linkGeneration" ]`
+    #       entry, which hm.dag sorted ahead of installPackages,
+    #       dconfSettings, installCrontab, kittyReloadConfig and
+    #       reloadSystemd — so a malformed dcg.toml silently skipped eight
+    #       unrelated steps, including the crontab reinstall whose whole
+    #       purpose is to stop cron going stale. A guard that breaks
+    #       unrelated machinery when it fires is a guard that gets
+    #       commented out.
+    #   (h) dcg must not EDIT the operator's permission surface. Its
+    #       `general.self_heal_hook` defaults to true upstream, and true
+    #       means every bare-`dcg` hook invocation rewrites
+    #       ~/.claude/settings.json to register dcg's own PreToolUse entry
+    #       ahead of the real guard. home/dcg-fallback.toml pins it off;
+    #       this lane is what keeps it pinned. Every OTHER config this lane
+    #       plants at the link target carries the same pin and is asserted
+    #       the same way — a probe running self-heal-armed is harmless only
+    #       while settings.json happens to be absent, which is an accident
+    #       of ordering, not a property.
+    #   (i) an edited fallback must REACH a host that is already running
+    #       the seeded one. The seed arm fires only on an absent target, so
+    #       the old copy stayed put while the marker's `cmp` — run against
+    #       the new store path — failed and cleared the marker: quiet, and
+    #       still degraded. The refresh is licensed by the seed's content
+    #       hash in the marker, so it can only ever overwrite bytes this
+    #       module wrote itself.
+    #
+    # Every banner assertion below is scoped to a journal CURSOR taken
+    # before the restart that is supposed to produce it. The unscoped
+    # `journalctl -n 400` the previous revision used could be satisfied by
+    # the BOOT-time seed's identical banner, so a silent-reseed regression
+    # would have passed. `dcg_journal_since` is the fix; the control
+    # assertion under (d) proves the old form was satisfiable without any
+    # restart at all.
+
+    # (a) On jonathan's PATH (home.packages -> per-user profile) and
+    # executable. `su -` so the assertion is about the login PATH the
+    # hook actually runs under, not root's.
+    dcg_bin = dellan.succeed("su - jonathan -c 'command -v dcg'").strip()
+    assert dcg_bin.startswith("/"), (
+        f"dcg did not resolve on jonathan's PATH: {dcg_bin!r}"
+    )
+    dellan.succeed(f"test -x {dcg_bin}")
+    # And it must be a STORE binary. `command -v` lands on
+    # /etc/profiles/per-user/jonathan/bin/dcg (useUserPackages), so the
+    # store check has to go through the link. This is the regression
+    # guard proper: the copy that vanished was an imperative
+    # `cargo install` into ~/.local/bin, which would satisfy every
+    # assertion above and none of this one.
+    dcg_real = dellan.succeed(f"readlink -f {dcg_bin}").strip()
+    assert dcg_real.startswith("/nix/store/"), (
+        f"dcg on jonathan's PATH resolves to {dcg_real!r}, which is not a "
+        "store path — it is not declaratively installed, so an OS migration "
+        "or a stray rm can delete it silently again"
+    )
+    # And it must be the version the overlay pins, EXACTLY. Asserting
+    # merely that --version printed something (the previous assertion) is
+    # satisfied by any binary at all, so a `version`-only bump in
+    # overlays/dcg.nix — which leaves `src` and its hash untouched — would
+    # build green and deploy the OLD binary under the NEW label with this
+    # lane still passing. `2>/dev/null` because the machine-readable
+    # string is on stdout while the decorated banner is on stderr, and the
+    # test driver merges the two.
+    dcg_version = dellan.succeed(
+        f"su - jonathan -c '{dcg_bin} --version 2>/dev/null'"
+    ).strip()
+    assert dcg_version == "${pkgs.dcg.version}", (
+        f"deployed dcg reports version {dcg_version!r}, but overlays/dcg.nix "
+        'pins version = "${pkgs.dcg.version}". The label and the artifact '
+        "disagree, so the closure is shipping a binary nobody asked for."
+    )
+
+    # (b) The config link, and the seed behind it.
+    #
+    # Nothing is planted first. home/dcg.nix's activation hook already ran
+    # at boot, and the VM has no ~/.claude repo — so this is exactly the
+    # fresh-host state, and what the lane asserts is that the fresh-host
+    # state comes up ARMED rather than silently disarmed.
+    import json as _dcg_json
+    import re as _re
+    import shlex as _shlex
+
+    dellan.succeed("test -L /home/jonathan/.config/dcg/config.toml")
+    dcg_cfg_target = dellan.succeed(
+        "readlink -f /home/jonathan/.config/dcg/config.toml"
+    ).strip()
+    assert dcg_cfg_target == "/home/jonathan/.claude/dcg.toml", (
+        "~/.config/dcg/config.toml must resolve to the tracked file in the "
+        "~/.claude repo (home/dcg.nix mkOutOfStoreSymlink); it resolves to "
+        f"{dcg_cfg_target!r}. A store copy here would freeze the pattern "
+        "list until the next rebuild."
+    )
+
+    # THE LINK IS NOT DANGLING. This one assertion is the whole fix: a
+    # dangling link here means dcg drops the entire user layer, permits
+    # `curl -X DELETE` with exit 0, empty stdout and ZERO bytes of stderr,
+    # and still denies `rm -rf /` from a built-in pack — so every cheaper
+    # check in this block passes while the guard is disarmed.
+    dellan.succeed("test -f /home/jonathan/.claude/dcg.toml")
+
+    # Verbatim drift check — the one this lane can actually keep. The
+    # seeded file must be byte-identical to the tracked source in this
+    # flake. (There is deliberately no such check against the real
+    # ~/.claude/dcg.toml: it lives in a repo this flake cannot read, so
+    # any "copied verbatim" claim about it would be unkeepable.)
+    dellan.succeed(
+        "cmp ${../home/dcg-fallback.toml} /home/jonathan/.claude/dcg.toml"
+    )
+
+    # (f) The marker file, and its contract with the ~/.claude session-start
+    # guard-health hook. Path and schema are asserted literally, not read
+    # out of the Nix that wrote them, because the reader lives in another
+    # repo and hard-codes them — a drift here is a drift the other side
+    # cannot see. Bump `schema` on any incompatible change and this
+    # assertion will tell you the hook needs updating too.
+    dcg_marker_path = "/home/jonathan/.local/state/dcg/fallback-active.json"
+
+    def dcg_read_marker():
+        """The marker as a dict, or None when it is absent."""
+        if dellan.execute(f"test -f {dcg_marker_path}")[0] != 0:
+            return None
+        return _dcg_json.loads(dellan.succeed(f"cat {dcg_marker_path}"))
+
+    dcg_marker = dcg_read_marker()
+    assert dcg_marker is not None, (
+        f"{dcg_marker_path} is absent on a host running the seeded "
+        "bootstrap fallback. The banner home/dcg.nix printed went to "
+        "journalctl only — nixos-rebuild does not stream unit logs — so "
+        "without this file nothing tells the operator or the agent that "
+        "the guard is running a weaker rule set than they think:\n"
+        + dellan.succeed("ls -la /home/jonathan/.local/state/dcg || true")
+    )
+    assert dcg_marker["schema"] == 1, (
+        f"marker schema is {dcg_marker['schema']!r}, not 1. The "
+        "session-start guard-health hook in the ~/.claude repo reads this "
+        "file and keys on the schema; bumping it here without bumping it "
+        "there means the hook silently stops recognising the degraded "
+        "state."
+    )
+    assert dcg_marker["component"] == "dcg", dcg_marker
+    assert dcg_marker["state"] == "fallback-active", dcg_marker
+    assert dcg_marker["target"] == "/home/jonathan/.claude/dcg.toml", dcg_marker
+    assert dcg_marker["fallback_source"].startswith("/nix/store/"), dcg_marker
+    assert dcg_marker["remedy"].strip(), dcg_marker
+    # The seed's CONTENT hash, and it must describe the file the marker
+    # names. This is the field the NEXT activation reads back to decide
+    # whether a seeded target may be refreshed in place (arm (i) below), so
+    # a wrong or missing value does not fail loudly — it silently costs the
+    # refresh, which is the failure mode the whole arm is about.
+    assert dcg_marker["fallback_sha256"] == dellan.succeed(
+        "sha256sum " + dcg_marker["fallback_source"]
+    ).split()[0], dcg_marker
+    # observed_at is UTC ISO-8601 to the second; the reader compares it
+    # against now to decide how stale its answer is.
+    assert _re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", dcg_marker["observed_at"]
+    ), dcg_marker
+    # And the claim the file makes must actually hold: `target` really is
+    # byte-identical to `fallback_source`. That is the same test the hook
+    # re-runs when it wants an answer fresher than observed_at, so if it
+    # cannot be run from the fields in the file, the contract is broken.
+    dellan.succeed(
+        f"cmp {dcg_marker['fallback_source']} {dcg_marker['target']}"
+    )
+
+    # And dcg's own loader must agree the user layer LOADED. From outside,
+    # `missing`, `invalid` and `rejected` are indistinguishable from
+    # `loaded`: all four exit 0 and print nothing on an allow. This is the
+    # only place the difference is observable, and it is the same field
+    # home/dcg.nix's activation check reads.
+    dellan.succeed(
+        "su - jonathan -c 'dcg config --format json' "
+        "> /tmp/dcg-config.json 2>/dev/null"
+    )
+    dcg_cfg_doc = _dcg_json.loads(dellan.succeed("cat /tmp/dcg-config.json"))
+    dcg_user_layer = next(
+        s for s in dcg_cfg_doc["config_sources"] if s["level"] == "user"
+    )
+    assert dcg_user_layer["status"] == "loaded", (
+        "dcg reports its user config layer as "
+        f"{dcg_user_layer['status']!r} (detail: {dcg_user_layer.get('detail')!r}). "
+        "Every override the operator wrote is inert, and nothing anywhere "
+        "says so."
+    )
+
+    # Behavioural half: speak the Claude Code hook protocol at the real
+    # binary and read the decision off stdout.
+    #
+    # The decision IS the stdout JSON. Measured on v0.12.5, bare `dcg`
+    # exits 0 on a deny, on an allow, on empty stdin and on garbage stdin
+    # alike. rc is therefore asserted to be EXACTLY 0: the previous
+    # `rc in (0, 1)` accepted an exit-code-signalling dcg as a valid
+    # verdict, so an upstream switch to rc=1-on-deny would slip through
+    # this lane while the stdout contract quietly changed underneath it.
+    #
+    # DO NOT relax this by moving the hook to `dcg hook`. Measured: it does
+    # exit 1 on a deny, but it emits batch JSONL
+    # ({"index":0,"decision":"deny",...}) instead of the PreToolUse
+    # document, and prints on allows too. Its --help claims the two are
+    # identical without --batch; they are not. Swapping would give a
+    # correct exit status and a payload Claude Code cannot read.
+    def dcg_decide(command):
+        payload = _dcg_json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": command}}
+        )
+        # json.dumps emits no single quotes, so single-quoting both the
+        # payload and the binary path is safe without further escaping.
+        # stdout goes to a file because dcg's decorated banner lands on
+        # stderr and the test driver merges the two streams.
+        rc_line = dellan.succeed(
+            "printf '%s' '" + payload + "' | su - jonathan -c '" + dcg_bin + "'"
+            + " > /tmp/dcg-decision.json 2>/tmp/dcg-decision.err"
+            + " ; echo DCGRC=$?"
+        )
+        rc = int(rc_line.rsplit("DCGRC=", 1)[1].strip())
+        assert rc == 0, (
+            f"bare dcg exited {rc} on {command!r}. Measured on v0.12.5 it "
+            "exits 0 for every input; a non-zero status means either a crash "
+            "or that the verdict has moved out of stdout and into the exit "
+            "code, which the Claude Code hook does not read.\n"
+            + dellan.succeed("cat /tmp/dcg-decision.err")
+        )
+        raw = dellan.succeed("cat /tmp/dcg-decision.json")
+        return (_dcg_json.loads(raw) if raw.strip() else None), raw
+
+    def dcg_assert_denied_by_user_config(command, expect_reason):
+        """Deny, AND attributable to the [overrides] layer rather than a pack.
+
+        dcg tags a pack match with ruleId/packId and a config-override
+        match with neither, so their absence plus the config's own reason
+        string coming back is positive proof the user layer was read.
+        The previous revision proved this by deleting the config and
+        asserting the command was then permitted — which made the
+        fail-open an expected result.
+        """
+        doc, raw = dcg_decide(command)
+        assert doc is not None, (
+            f"dcg emitted no decision document for {command!r}, i.e. it "
+            "PERMITTED a destructive HTTP verb. Either the binary is not "
+            "evaluating or ~/.config/dcg/config.toml is not reaching it — "
+            "this is the exact shape of the months-long silent outage."
+        )
+        hso = doc["hookSpecificOutput"]
+        assert hso.get("permissionDecision") == "deny", (
+            f"dcg did not deny {command!r}:\n{raw}"
+        )
+        assert "ruleId" not in hso and "packId" not in hso, (
+            f"the deny for {command!r} carries {hso.get('ruleId')!r} — it came "
+            "from a built-in pack, not from the user config, so it proves "
+            "nothing about the link being read:\n" + raw
+        )
+        assert expect_reason in hso["permissionDecisionReason"], (
+            f"the deny for {command!r} does not carry the expected reason "
+            f"{expect_reason!r}; the config that answered is not the one this "
+            "assertion is about:\n" + raw
+        )
+        return hso
+
+    # The seeded fallback denies, and says so in words the operator and
+    # the agent both see — running on the fallback announces itself.
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"
+    )
+
+    # Allows a benign one. Without this the lane would pass on a dcg that
+    # denies everything, which is a broken guard too.
+    benign_doc, benign_raw = dcg_decide("ls -la")
+    assert benign_doc is None, (
+        f"dcg denied a benign command (`ls -la`):\n{benign_raw}"
+    )
+
+    # THE POSITIVE CONTROL for the attribution above — the half nothing
+    # asserted before.
+    #
+    # dcg_assert_denied_by_user_config proves a deny came from the
+    # `[overrides]` layer rather than a built-in pack by asserting that
+    # ruleId and packId are ABSENT. That argument is worth exactly as much
+    # as the claim it rests on: that a deny which DID come from a pack
+    # carries them. Nothing measured that claim, so a future dcg that
+    # stopped tagging pack matches — or a config that accidentally enabled
+    # a pack covering destructive HTTP verbs — would leave every
+    # dcg_assert_denied_by_user_config call in this block passing while
+    # proving nothing about the config being read at all. Which is the
+    # "guard looks alive" shape, one level up.
+    #
+    # `rm -rf /` is the probe because it is the mirror image of the
+    # `curl -X DELETE` used everywhere else here: no pack blocks the curl,
+    # and no config this lane plants blocks the rm. Measured on v0.12.5 its
+    # deny carries packId "core.filesystem" and ruleId
+    # "core.filesystem:rm-rf-root-home". It runs against whatever config is
+    # in force at this point (the seeded fallback), which is the point —
+    # the fallback is strictly ADDITIVE to the built-in packs, so the pack
+    # verdict has to survive it.
+    dcg_pack_doc, dcg_pack_raw = dcg_decide("rm -rf /")
+    assert dcg_pack_doc is not None, (
+        "dcg PERMITTED `rm -rf /`, which its own core.filesystem pack "
+        "denies. Either the built-in packs are no longer loaded or the "
+        "binary is not evaluating — and either way every ruleId/packId "
+        "ABSENCE assertion in this block is now vacuous, because a deny "
+        "that came from a pack would look identical to one that came from "
+        "the user config:\n" + dcg_pack_raw
+    )
+    dcg_pack_hso = dcg_pack_doc["hookSpecificOutput"]
+    assert dcg_pack_hso.get("permissionDecision") == "deny", (
+        f"dcg did not deny `rm -rf /`:\n{dcg_pack_raw}"
+    )
+    assert "packId" in dcg_pack_hso and "ruleId" in dcg_pack_hso, (
+        "a deny that came from a BUILT-IN PACK carries "
+        f"packId={dcg_pack_hso.get('packId')!r} ruleId="
+        f"{dcg_pack_hso.get('ruleId')!r} — at least one is missing, so "
+        "their absence no longer distinguishes a pack match from an "
+        "`[overrides]` match. dcg_assert_denied_by_user_config is then "
+        "asserting nothing: a pack deny satisfies it exactly as well as a "
+        "user-config deny, which is the whole property it exists to "
+        "establish. Find dcg's new attribution field and rewrite the "
+        "helper around it before trusting any arm in this block.\n"
+        + dcg_pack_raw
+    )
+
+    # (h) Consulting the guard must not let the guard EDIT the operator's
+    # permission surface.
+    #
+    # dcg's `general.self_heal_hook` defaults to TRUE upstream. With it on,
+    # every bare-`dcg` hook invocation calls ensure_hook_registered()
+    # (main.rs:1534), which reads $HOME/.claude/settings.json
+    # (cli.rs:13262 — hardcoded, CLAUDE_CONFIG_DIR is NOT honoured) looking
+    # for a PreToolUse entry whose matcher is "Bash|PowerShell" and whose
+    # command is the running binary's own absolute path. dcg is registered
+    # INDIRECTLY on this host, via ~/.claude/hooks/bash-guard.py, so that
+    # entry is never present and the repair branch (cli.rs:13635) fires on
+    # EVERY Bash tool call: it inserts dcg's entry at PreToolUse[0] — ahead
+    # of the real guard — and re-serialises the whole file.
+    #
+    # This is not hypothetical. It fired on the live host on 2026-08-24:
+    # the injected entry named a /nix/store path, the trailing newline was
+    # stripped, and the harness tripwire logged four
+    # ConfigChange/user_settings events for that single write. It is also
+    # not self-limiting — the injected command embeds the store path, so
+    # every version bump re-triggers it and a hand revert does not stick.
+    #
+    # home/dcg-fallback.toml pins `self_heal_hook = false`, and that pin is
+    # a ONE-LINE default that a version bump, a config rewrite or a
+    # well-meaning tidy-up could flip back with nothing to notice. This arm
+    # is the notice. It runs here, against the seeded fallback, because
+    # that is the config a FRESH host comes up on — before the operator has
+    # read a single line of output.
+    dcg_settings = "/home/jonathan/.claude/settings.json"
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgVmSettings} " + dcg_settings
+    )
+
+    def dcg_settings_sha():
+        return dellan.succeed("sha256sum " + dcg_settings).split()[0]
+
+    dcg_settings_before = dcg_settings_sha()
+    # The trigger has to be a BARE `dcg` hook invocation on a payload that
+    # DENIES — that is the only form reaching ensure_hook_registered().
+    # `dcg config` and the subcommands do not, so an arm that probed one of
+    # those would report an untouched settings.json from a code path that
+    # never had the chance to touch it. dcg_assert_denied_by_user_config
+    # speaks the hook protocol at the deployed binary, which is exactly the
+    # shape a real Bash tool call produces.
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"
+    )
+    dcg_settings_after = dcg_settings_sha()
+    assert dcg_settings_after == dcg_settings_before, (
+        "dcg REWROTE /home/jonathan/.claude/settings.json — the operator's "
+        "Claude Code PERMISSION SURFACE — from inside one PreToolUse hook "
+        "invocation. This is not a stale hash: it means "
+        "general.self_heal_hook is back ON (upstream defaults it to true), "
+        "so ensure_hook_registered() has inserted the "
+        'matcher-"Bash|PowerShell" entry pointing at dcg itself at '
+        "PreToolUse[0], AHEAD of the real guard, and re-serialised the "
+        "file. On the live host that ran once per Bash tool call. "
+        "FIX: restore `self_heal_hook = false` under [general] in "
+        "home/dcg-fallback.toml — do not relax this assertion.\n"
+        f"  sha256 before: {dcg_settings_before}\n"
+        f"  sha256 after:  {dcg_settings_after}\n"
+        "  settings.json now reads:\n"
+        + dellan.succeed("cat " + dcg_settings)
+    )
+
+    # THE POSITIVE CONTROL, and the reason the assertion above is worth
+    # anything. An unchanged hash has two explanations — the pin works, or
+    # the probe never reached the self-heal code path at all — and only one
+    # of them is a passing test. A future change that stopped the probe
+    # short (a helper rewired to `dcg config`, a payload that no longer
+    # denies, a plant that silently failed to land) would leave the arm
+    # above green and hollow.
+    #
+    # So: swap in a config that is the fallback in every respect the arm
+    # cares about EXCEPT that it omits `self_heal_hook`, and run the very
+    # same probe. The hash must now CHANGE. Attribution is via
+    # dcg_assert_denied_by_user_config against this fixture's own reason
+    # string, which matters more than usual here: a control config that
+    # failed to load would leave dcg running with NO user layer, and a dcg
+    # with no config rewrites settings.json too — so the control would
+    # "pass" while proving nothing about self_heal_hook.
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgSelfHealConfig} /home/jonathan/.claude/dcg.toml"
+    )
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgVmSettings} " + dcg_settings
+    )
+    dcg_control_before = dcg_settings_sha()
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "${dcgSelfHealReason}"
+    )
+    dcg_control_after = dcg_settings_sha()
+    assert dcg_control_after != dcg_control_before, (
+        "CONTROL FAILED: with `self_heal_hook` deliberately unset, dcg left "
+        "settings.json byte-identical. The self-heal path this lane exists "
+        "to pin down is no longer reachable from the probe, so the "
+        "unchanged-hash assertion above is proving nothing and would stay "
+        "green if the pin were dropped. Find out what changed — the "
+        "upstream default, the file dcg reads, or the shape of the probe — "
+        "before trusting either arm.\n"
+        f"  sha256 both:   {dcg_control_before}"
+    )
+    # And it changed in the specific way that makes it a security problem
+    # rather than a reformat: dcg's own entry, at index 0, AHEAD of the
+    # operator's guard, naming the running binary. Pinned tightly on
+    # purpose — the version is pinned too, so the only thing that can move
+    # this is a deliberate bump, which is exactly when it should be re-read.
+    dcg_healed = _dcg_json.loads(dellan.succeed("cat " + dcg_settings))
+    dcg_pre = dcg_healed["hooks"]["PreToolUse"]
+    assert dcg_pre[0]["matcher"] == "Bash|PowerShell", (
+        "CONTROL FAILED: dcg rewrote settings.json, but the entry it "
+        "inserted first is not the matcher-\"Bash|PowerShell\" one the (h) "
+        "failure message tells the reader to look for. The mechanism has "
+        f"moved and the diagnostic is now misleading: {dcg_pre!r}"
+    )
+    dcg_healed_cmd = dcg_pre[0]["hooks"][0]["command"]
+    assert dcg_healed_cmd == dcg_real, (
+        "CONTROL FAILED: the injected entry points at "
+        f"{dcg_healed_cmd!r}, not at the running binary {dcg_real!r}. The "
+        "store path in the injected command is why this is not idempotent "
+        "across version bumps, so it is part of what (h) is about."
+    )
+    assert any(
+        h["command"].endswith("bash-guard.py")
+        for e in dcg_pre[1:]
+        for h in e["hooks"]
+    ), (
+        "CONTROL FAILED: after the rewrite the operator's own guard entry "
+        "is not sitting behind the injected one. Either it was dropped "
+        f"outright or the ordering is not what (h) describes: {dcg_pre!r}"
+    )
+
+    # Restore. Remove the control config and the plant, then re-run
+    # home-manager so the arms below start from the seeded fallback they
+    # expect — and so nothing downstream inherits a self-heal-armed dcg or
+    # a settings.json for it to rewrite.
+    dellan.succeed("rm " + dcg_settings)
+    dellan.succeed("rm /home/jonathan/.claude/dcg.toml")
+    dellan.succeed("systemctl restart home-manager-jonathan.service")
+    dellan.succeed(
+        "cmp ${../home/dcg-fallback.toml} /home/jonathan/.claude/dcg.toml"
+    )
+
+    # (c) The live-edit property mkOutOfStoreSymlink exists for: write a
+    # DIFFERENT config straight to the link target, no rebuild, and the
+    # next invocation must answer out of it. Its reason string is defined
+    # once in Nix and interpolated into both the fixture and this
+    # assertion, so the two cannot drift.
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgVmConfig} /home/jonathan/.claude/dcg.toml"
+    )
+    # …and answering out of THIS config must not edit the permission
+    # surface either. Arm (h) pinned that for the seeded fallback, but the
+    # fallback is not the only config this lane runs dcg under: every file
+    # planted at the link target is one, and dcgVmConfig used to omit
+    # `self_heal_hook` altogether — so this probe ran with self-heal ARMED.
+    # It was harmless only because settings.json had been removed eleven
+    # lines earlier, an ordering accident nothing asserted and any later
+    # edit could undo.
+    #
+    # The plant is what gives the assertion teeth: measured on v0.12.5,
+    # with settings.json ABSENT dcg creates nothing whatever the setting
+    # says, so an unplanted arm would pass just as happily on a host where
+    # the pin had been dropped.
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgVmSettings} " + dcg_settings
+    )
+    dcg_live_before = dcg_settings_sha()
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "${dcgVmBlockReason}"
+    )
+    dcg_live_after = dcg_settings_sha()
+    assert dcg_live_after == dcg_live_before, (
+        "dcg rewrote /home/jonathan/.claude/settings.json while answering "
+        "out of the live-edit fixture. `self_heal_hook = false` is missing "
+        "from dcgVmConfig in tests/base.nix, or it no longer suppresses "
+        "ensure_hook_registered(). Every config this lane plants at the "
+        "link target has to carry the pin — a probe that runs "
+        "self-heal-armed is only harmless while settings.json happens to "
+        "be absent, and that is not a property this lane should depend "
+        "on.\n"
+        f"  sha256 before: {dcg_live_before}\n"
+        f"  sha256 after:  {dcg_live_after}\n"
+        "  settings.json now reads:\n"
+        + dellan.succeed("cat " + dcg_settings)
+    )
+    # Remove the plant again. Everything below restarts activation and
+    # re-probes, and none of it should inherit a settings.json for a
+    # regression to rewrite — the same hygiene the restore above keeps.
+    dellan.succeed("rm " + dcg_settings)
+
+    # Journal scoping. Every banner assertion from here on is about output
+    # a SPECIFIC restart produced, so it is read from a cursor taken just
+    # before that restart. `journalctl --show-cursor -n 0` prints only the
+    # `-- cursor: …` trailer, which is exactly what --after-cursor wants.
+    def dcg_journal_cursor():
+        line = dellan.succeed(
+            "journalctl -u home-manager-jonathan.service --no-pager "
+            "-n 0 --show-cursor"
+        )
+        return line.rsplit("-- cursor:", 1)[1].strip()
+
+    def dcg_journal_since(cursor):
+        return dellan.succeed(
+            "journalctl -u home-manager-jonathan.service --no-pager -o cat "
+            f"--after-cursor '{cursor}'"
+        )
+
+    # An activation that finds the operator's file in place must leave it
+    # ALONE and must not claim to have seeded anything. Two jobs at once:
+    # it is a real property (the seed arm must never clobber a hand-edited
+    # list), and it is the control that shows why the scoping above is
+    # load-bearing.
+    dcg_cursor = dcg_journal_cursor()
+    dellan.succeed("systemctl restart home-manager-jonathan.service")
+    dcg_noseed_log = dcg_journal_since(dcg_cursor)
+    assert "SEEDED BOOTSTRAP FALLBACK CONFIG" not in dcg_noseed_log, (
+        "home-manager announced a seed on a run where the target already "
+        "existed. Either it overwrote the operator's pattern list, or it "
+        "printed a banner it had not earned:\n" + dcg_noseed_log[-3000:]
+    )
+    # Nor may the REFRESH arm (i) fire here, and this is the run that
+    # proves it discriminates. Its precondition is half-met on purpose: a
+    # marker written by the seed two restarts ago is still on disk, so the
+    # only thing standing between the operator's file and an overwrite is
+    # the content hash comparison. A refresh arm keyed on the marker's mere
+    # PRESENCE — the obvious cheaper implementation — would clobber the
+    # hand-edited list right here.
+    assert "REFRESHED BOOTSTRAP FALLBACK CONFIG" not in dcg_noseed_log, (
+        "home-manager announced a fallback refresh on a run where the "
+        "target was the operator's own config. The refresh arm is keyed on "
+        "something weaker than 'the bytes are still exactly what I seeded' "
+        "and has just overwritten a hand-edited pattern list:\n"
+        + dcg_noseed_log[-3000:]
+    )
+    dellan.succeed("cmp ${dcgVmConfig} /home/jonathan/.claude/dcg.toml")
+    # THE CONTROL. Unscoped, the boot-time seed's identical banner is still
+    # sitting in this unit's journal — so the previous revision's
+    # `journalctl -n 400 | grep SEEDED` was satisfied here, on a restart
+    # that seeded nothing. That is the silent-reseed regression the
+    # cursor closes, demonstrated rather than argued.
+    dcg_whole_log = dellan.succeed(
+        "journalctl -u home-manager-jonathan.service --no-pager -o cat"
+    )
+    assert "SEEDED BOOTSTRAP FALLBACK CONFIG" in dcg_whole_log, (
+        "control failed: the boot-time seed banner is no longer in this "
+        "unit's journal at all, so the fresh-host seed did not happen or "
+        "the journal was cleared. Everything (b) asserted is in doubt."
+    )
+    # And with the operator's own file in force, the marker must be GONE.
+    # A marker that is never cleared is a marker the reader learns to
+    # ignore, which is the same silence in a different place.
+    assert dcg_read_marker() is None, (
+        "the fallback marker survived an activation that found the "
+        "operator's own config in place. It now reports a degraded state "
+        "that is not happening, and the session-start hook will warn on "
+        "every healthy session until someone deletes it by hand."
+    )
+
+    # (d) The degraded state must be UNREACHABLE across an activation.
+    # Delete the target — the thing a fresh host, or claude-pull, or a
+    # stray rm actually does — and re-run home-manager. Activation must
+    # succeed, re-seed, and say loudly that it did.
+    dellan.succeed("rm /home/jonathan/.claude/dcg.toml")
+    dcg_cursor = dcg_journal_cursor()
+    dellan.succeed("systemctl restart home-manager-jonathan.service")
+    dellan.succeed("test -f /home/jonathan/.claude/dcg.toml")
+    dellan.succeed(
+        "cmp ${../home/dcg-fallback.toml} /home/jonathan/.claude/dcg.toml"
+    )
+    reseed_log = dcg_journal_since(dcg_cursor)
+    assert "SEEDED BOOTSTRAP FALLBACK CONFIG" in reseed_log, (
+        "home-manager re-seeded nothing, or did it silently. A silent repair "
+        "is still a config the operator believes is theirs and is not:\n"
+        + reseed_log[-3000:]
+    )
+    # …and the marker is back, with a fresh observation.
+    dcg_marker = dcg_read_marker()
+    assert dcg_marker is not None and dcg_marker["state"] == "fallback-active", (
+        "the re-seeded fallback left no marker, so the only trace of the "
+        "degraded state is again a banner in a unit log nobody reads: "
+        f"{dcg_marker!r}"
+    )
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"
+    )
+
+    # (i) A fallback that CHANGES must reach a host already running the
+    # seeded one — and must not go QUIET on the way.
+    #
+    # The seed arm fires only on an ABSENT target. So editing
+    # home/dcg-fallback.toml and rebuilding a still-seeded host used to
+    # leave the OLD copy exactly where it was, while the marker's `cmp` ran
+    # against the NEW store path, failed, and took the "the operator's own
+    # file is in force" branch: marker deleted, desktop notification
+    # silenced, journal banner never printed — with the bytes on disk still
+    # a bootstrap fallback, just not the current one. The host stops
+    # REPORTING the degraded state without leaving it, and the way in is a
+    # routine edit to a tracked file in this repo.
+    #
+    # A store path cannot change inside a running VM, so this stages the
+    # same state from the other end: put an OLDER fallback at the target
+    # and make the marker say that is what activation seeded. From the
+    # activation script's side the two are indistinguishable — the marker
+    # records content hash X, the target hashes to X, and X is not the
+    # current fallback.
+    dcg_target = "/home/jonathan/.claude/dcg.toml"
+    dcg_fallback_sha = dellan.succeed(
+        "sha256sum ${../home/dcg-fallback.toml}"
+    ).split()[0]
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgStaleFallback} " + dcg_target
+    )
+    dcg_stale_sha = dellan.succeed("sha256sum " + dcg_target).split()[0]
+    assert dcg_stale_sha != dcg_fallback_sha, (
+        "the stale-fallback fixture is byte-identical to the current "
+        "fallback, so there is no 'the seed moved' state to observe and "
+        "this arm would pass without exercising anything"
+    )
+    # Derived from the marker activation ACTUALLY wrote a moment ago, not
+    # hand-built: this arm is about activation reading its OWN record back,
+    # so the record has to be its own in every field it does not need to
+    # move.
+    dcg_stale_marker = dict(dcg_marker)
+    dcg_stale_marker["fallback_sha256"] = dcg_stale_sha
+    dcg_stale_marker["fallback_source"] = (
+        "/nix/store/" + "0" * 32 + "-dcg-fallback.toml"
+    )
+    dellan.succeed(
+        "printf '%s' " + _shlex.quote(_dcg_json.dumps(dcg_stale_marker))
+        + " > " + dcg_marker_path
+    )
+    dcg_cursor = dcg_journal_cursor()
+    dellan.succeed("systemctl restart home-manager-jonathan.service")
+
+    # The bytes on disk are the CURRENT fallback again…
+    dellan.succeed("cmp ${../home/dcg-fallback.toml} " + dcg_target)
+    # …activation said so…
+    dcg_refresh_log = dcg_journal_since(dcg_cursor)
+    assert "REFRESHED BOOTSTRAP FALLBACK CONFIG" in dcg_refresh_log, (
+        "home-manager updated a stale seeded fallback silently, or not at "
+        "all. A repair nobody is told about is a config the operator "
+        "believes is theirs and is not:\n" + dcg_refresh_log[-3000:]
+    )
+    # …and the half that makes this a security finding rather than a
+    # staleness one: the MARKER SURVIVED. This is the assertion the old
+    # code failed.
+    dcg_marker = dcg_read_marker()
+    assert dcg_marker is not None and dcg_marker["state"] == "fallback-active", (
+        "the marker was cleared on a host that is STILL running the "
+        "bootstrap fallback — it was merely running an older one. Nothing "
+        "now tells the session-start guard-health hook, the desktop or the "
+        "journal that the operator's real pattern list is not loaded, and "
+        "all it took was editing a tracked file in this repo: "
+        f"{dcg_marker!r}"
+    )
+    assert dcg_marker["fallback_sha256"] == dcg_fallback_sha, (
+        "the marker still records the OLD fallback's content hash "
+        f"({dcg_marker['fallback_sha256']!r}, current is "
+        f"{dcg_fallback_sha!r}). The next activation reads that back, "
+        "decides the target is not what it seeded, and never refreshes "
+        "again — so the repair would work exactly once: "
+        f"{dcg_marker!r}"
+    )
+    # And the guard answers out of the refreshed file.
+    dcg_assert_denied_by_user_config(
+        "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"
+    )
+
+    # (e) A malformed config must FAIL activation, not be absorbed.
+    # dcg does warn on a TOML parse error — but on the stderr of a
+    # PreToolUse hook, which Claude Code discards, so in the agent loop it
+    # reaches nobody while every override stops applying. The file is the
+    # operator's, so activation refuses to finish rather than rewriting it.
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${dcgBrokenConfig} /home/jonathan/.claude/dcg.toml"
+    )
+    dcg_cursor = dcg_journal_cursor()
+    dellan.fail("systemctl restart home-manager-jonathan.service")
+    broken_log = dcg_journal_since(dcg_cursor)
+    assert "USER CONFIG LAYER IS NOT LOADED" in broken_log, (
+        "home-manager activation failed, but not with the dcg diagnostic — "
+        "so the failure does not tell the operator what to fix:\n"
+        + broken_log[-3000:]
+    )
+    assert "TOML parse error" in broken_log, (
+        "the activation failure does not quote dcg's own parse error, so the "
+        "operator gets no line number:\n" + broken_log[-3000:]
+    )
+
+    # (g) …and the rest of activation still ran. home-manager inlines every
+    # activation entry into one `set -eu` script, so an `exit 1` from an
+    # entry sorted early kills every entry after it. The check used to sit
+    # in `entryAfter [ "linkGeneration" ]`, which hm.dag placed 8th of 16 —
+    # ahead of installPackages, dconfSettings, ensureClaudeLogsDir,
+    # installCalibrePlugins, installCrontab, kittyReloadConfig,
+    # onFilesChange and reloadSystemd. So a typo in dcg.toml silently
+    # skipped the crontab reinstall, which is the exact stale-crontab drift
+    # the comment above `installCrontab` in home/jonathan-linux.nix was
+    # written about, plus the systemd reload that makes changed user units
+    # take effect at all. The fix splits the check in two and makes the
+    # verdict entry depend on every other entry, so it sorts last: the
+    # generation applies everything it can and then refuses to report
+    # success. Read from the SAME failed run as the banner above, using the
+    # step markers home-manager itself logs.
+    dcg_steps = _re.findall(r"Activating (\S+)", broken_log)
+    assert dcg_steps[-1] == "dcgConfigVerdict", (
+        "the dcg verdict is not the last activation step; anything sorted "
+        f"after it dies when it exits 1. Order was: {dcg_steps}"
+    )
+    assert "dcgConfigState" in dcg_steps, (
+        f"the dcg seed/marker step did not run at all: {dcg_steps}"
+    )
+    # installCrontab specifically, because the stale-crontab drift is the
+    # documented incident this would re-create (see the comment above
+    # `installCrontab` in home/jonathan-linux.nix); reloadSystemd because
+    # skipping it is how changed user units quietly fail to take effect.
+    dcg_after_state = dcg_steps[dcg_steps.index("dcgConfigState") + 1:]
+    for dcg_late_step in ["installCrontab", "reloadSystemd"]:
+        assert dcg_late_step in dcg_after_state, (
+            f"activation never reached {dcg_late_step!r} on a run that "
+            "failed only because dcg.toml was malformed. A guard whose "
+            "firing breaks the crontab reinstall and the systemd reload is "
+            "a guard that gets commented out, which turns one loud failure "
+            f"into a permanent silent one. Order was: {dcg_steps}"
+        )
+
+    # Restore, so the lane does not end on a deliberately failed unit.
+    dellan.succeed("rm /home/jonathan/.claude/dcg.toml")
+    dellan.succeed("systemctl reset-failed home-manager-jonathan.service")
+    dellan.succeed("systemctl start home-manager-jonathan.service")
+    dellan.succeed("test -f /home/jonathan/.claude/dcg.toml")
   '';
 }
