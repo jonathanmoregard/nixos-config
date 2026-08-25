@@ -43,6 +43,10 @@ let
     home-manager = {
       useGlobalPkgs = true;
       useUserPackages = true;
+      # Mirrors flake.nix's host blocks — home/aggregator-embed.nix imports
+      # the embed units from the pinned aggregator source tree, so the home
+      # config needs the source path.
+      extraSpecialArgs = { inherit (inputs) aggregator-src; };
       users.jonathan = import ../../home/jonathan-linux.nix;
     };
 
@@ -111,6 +115,11 @@ let
     home-manager = {
       useGlobalPkgs = true;
       useUserPackages = true;
+      # Passed even though no per-lane HM entrypoint imports the aggregator
+      # module today: an unused specialArg costs nothing, and a lane that
+      # starts importing it should not fail with an unrelated "called
+      # without required argument" error.
+      extraSpecialArgs = { inherit (inputs) aggregator-src; };
       users.jonathan = import hm;
     };
 
