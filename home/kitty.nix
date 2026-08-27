@@ -476,9 +476,16 @@ let
                 "attributable to an agent."
             )
         parts.append(
-            "Establish current state from the filesystem before "
-            "continuing that work or describing its status, then pick "
-            "the work back up."
+            "Detached `systemd-run --user` units DO survive this "
+            "boundary, unlike subagents, and may have finished or failed "
+            "while the session was gone. `systemctl --user list-units` "
+            "and any sentinel log they were writing hold the result."
+        )
+        parts.append(
+            "Anything above, and anything the transcript describes as in "
+            "flight, is a claim about the past. Establish current state "
+            "from the filesystem before continuing that work or "
+            "describing its status, then pick the work back up."
         )
         return "\n".join(parts)
 
