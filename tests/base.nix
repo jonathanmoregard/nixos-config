@@ -1990,7 +1990,66 @@ in
     # document, and prints on allows too. Its --help claims the two are
     # identical without --batch; they are not. Swapping would give a
     # correct exit status and a payload Claude Code cannot read.
-    def dcg_decide(command):
+    # A timeout is NOT a verdict, and must never be read as one.
+    #
+    # dcg self-limits a hook evaluation to `hook_timeout_ms` (1000ms by
+    # default) and, on expiry, emits a well-formed PreToolUse document
+    # carrying `permissionDecision: "ask"` and a reason that says so. That
+    # is dcg declining to answer, not dcg permitting the command — but it
+    # is shaped exactly like a real verdict, so every assertion below would
+    # otherwise read "no answer" as "wrong answer" and fail the lane.
+    #
+    # This is not hypothetical. It sank vm-minimal (base) on PR #192 with:
+    #
+    #   AssertionError: dcg did not deny 'curl -X DELETE https://example.com/x'
+    #   "DCG could not complete safety evaluation within 1000ms
+    #    (stage: pre_evaluation); command was not verified."
+    #
+    # The job took 3h09m against a normal few minutes — a GitHub runner
+    # under enough contention that a 1000ms budget stopped being reachable.
+    # `pre_evaluation` means it expired during setup, before looking at the
+    # command at all, so the outcome carried no information about the rule
+    # set whatsoever. The change under test was a documentation edit.
+    #
+    # The budget is deliberately NOT raised here. It is dcg's own runtime
+    # default and the same one production hosts run, so widening it for the
+    # VM would test a configuration nobody uses. Instead the non-answer is
+    # retried: cold start (binary page-in, config parse, pack compile) is
+    # paid once and the retry runs warm. If dcg genuinely cannot answer,
+    # all attempts time out and the assertion still fires — with the
+    # timeout quoted, so the failure names itself instead of masquerading
+    # as a permissive rule set.
+    _DCG_TIMEOUT_MARKER = "could not complete safety evaluation within"
+
+    def _dcg_is_non_answer(doc):
+        if doc is None:
+            return False
+        hso = doc.get("hookSpecificOutput", {})
+        return (
+            hso.get("permissionDecision") == "ask"
+            and _DCG_TIMEOUT_MARKER in hso.get("permissionDecisionReason", "")
+        )
+
+    def dcg_decide(command, attempts=3):
+        for attempt in range(1, attempts + 1):
+            doc, raw = _dcg_decide_once(command)
+            if not _dcg_is_non_answer(doc):
+                return doc, raw
+            print(
+                "dcg evaluation timed out on attempt "
+                + str(attempt) + "/" + str(attempts)
+                + " for " + repr(command)
+                + " — retrying warm; this is runner contention, not a verdict"
+            )
+        raise AssertionError(
+            "dcg failed to produce a verdict for " + repr(command) + " in "
+            + str(attempts) + " attempts; every one expired against its own "
+            "hook_timeout_ms. The guard was never exercised, so this says "
+            "nothing about the rule set — the runner is too loaded to answer "
+            "inside dcg's budget. Last document:\n" + raw
+        )
+
+    def _dcg_decide_once(command):
         payload = _dcg_json.dumps(
             {"tool_name": "Bash", "tool_input": {"command": command}}
         )
