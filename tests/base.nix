@@ -804,12 +804,15 @@ in
     # fail), and assert the notify unit's guaranteed journal marker.
     # The desktop notify-send itself is best-effort (headless VM has no
     # notification daemon) — the marker line is the testable contract.
-    # Created as ROOT with absolute paths: /home/jonathan/Repos is
-    # pre-created root-owned in this VM by the microvm share plumbing,
-    # so jonathan cannot mkdir under it (verified via driverInteractive:
-    # "mkdir: cannot create directory ... Permission denied"). A root
-    # 0755 file is still executable by the service user, which is all
-    # the wrapper's `[ ! -x "$RUNNER" ]` guard needs.
+    # Created as ROOT with absolute paths. This used to be forced:
+    # /home/jonathan/Repos was pre-created root-owned by the microvm
+    # share plumbing, so jonathan could not mkdir under it (verified via
+    # driverInteractive: "mkdir: cannot create directory ... Permission
+    # denied"). tests/lib/common.nix now creates that tree explicitly as
+    # jonathan and keeps the microvms from booting, so the permission
+    # wall is gone — but root still works, and a root 0755 file is still
+    # executable by the service user, which is all the wrapper's
+    # `[ ! -x "$RUNNER" ]` guard needs.
     dellan.succeed(
         "mkdir -p /home/jonathan/Repos/sota-watch/runner && "
         "printf '#!/bin/sh\\nexit 1\\n' > /home/jonathan/Repos/sota-watch/runner/run-watch.sh && "

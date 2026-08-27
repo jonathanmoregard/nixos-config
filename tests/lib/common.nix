@@ -75,6 +75,66 @@ let
       cores = 4;
       diskSize = 8192;
     };
+
+    # Do not boot the production microvms inside a test VM, and stub the
+    # host paths they share. This node imports hosts/dellan, so without
+    # both halves every full-host lane inherits research-agent and
+    # scraper and tries to run them nested.
+    #
+    # Measured 2026-08-27, in that order, in real (uncached) vm-base runs:
+    #
+    #   1. With neither: virtiofsd EXITS when a share source is missing
+    #      rather than degrading, so the microvm restart-loops. 64
+    #      restarts in one execution, each logging
+    #      `/home/jonathan/Repos/research-agent/reports does not exist`.
+    #      vm-base went ~340s -> ~1840s and CI failed the lane on its
+    #      wall-clock budget with no assertion failing anywhere.
+    #
+    #   2. With the tmpfiles stubs ALONE: the restart loop is gone (2
+    #      start events, zero virtiofsd errors) but the microvm now boots
+    #      far enough to reach research-agent-egress-init, which resolves
+    #      allowlist FQDNs into an nftables set. That unit retries DNS
+    #      forever under TimeoutStartSec=infinity — deliberately, so an
+    #      offline laptop cannot strand the host — and a test VM has no
+    #      egress, so multi-user.target blocks indefinitely. Observed
+    #      hanging past 11min on a single start job. Strictly worse than
+    #      the crash loop, which at least terminated.
+    #
+    # So the property every lane needs is not "make the share exist", it
+    # is "do not boot nested production microvms". The stubs stay because
+    # tests/base.nix builds under /home/jonathan/Repos and expects the
+    # path to be present, and because scraper-microvm.nix shares the
+    # research-agent level too.
+    #
+    # This mirrors tests/microvm.nix, which had both halves from the
+    # start; that is why vm-microvm was immune and why the pattern read
+    # as microvm-lane-specific rather than as a property of every
+    # full-host lane. It also hid behind cachix, which serves a cached
+    # vm-base for any PR that does not perturb the HM closure, so no CI
+    # run had actually EXECUTED the lane since the microvm landed.
+    # Living here, in the node every full-host lane builds on, no future
+    # lane has to remember either half.
+    #
+    # Unit installation and the qemu runner contract are still asserted,
+    # by vm-microvm. Full boot + ssh + egress smoke lives in the
+    # interactive `nix run .#feature-vm`, per the SessionStart HARD RULE.
+    #
+    # All three tmpfiles levels are listed deliberately: tmpfiles creates
+    # missing parents as root, and the jonathan -> root -> jonathan
+    # ownership hop makes it refuse with "unsafe path transition".
+    systemd.tmpfiles.rules = [
+      "d /home/jonathan/Repos 0755 jonathan users -"
+      "d /home/jonathan/Repos/research-agent 0755 jonathan users -"
+      "d /home/jonathan/Repos/research-agent/reports 0755 jonathan users -"
+    ];
+    systemd.services."install-microvm-research-agent".wantedBy =
+      lib.mkForce [ ];
+    systemd.services."microvm@research-agent".wantedBy = lib.mkForce [ ];
+    systemd.services."microvm-virtiofsd@research-agent".wantedBy =
+      lib.mkForce [ ];
+    systemd.services."install-microvm-scraper".wantedBy = lib.mkForce [ ];
+    systemd.services."microvm@scraper".wantedBy = lib.mkForce [ ];
+    systemd.services."microvm-virtiofsd@scraper".wantedBy = lib.mkForce [ ];
   };
 
   # Minimal node — base profile + agenix scaffolding only. Lanes opt in

@@ -229,6 +229,275 @@ let
         return None
 
 
+    # ---- restore notice -----------------------------------------------
+    #
+    # A restored pane resumes a conversation whose PROCESSES are gone.
+    # Background subagents die with the parent; their file edits usually
+    # do not. On 2026-08-25 the same agent was lost twice this way, each
+    # time after it had already staged its work, and the resumed session
+    # went on believing it was still running.
+    #
+    # The notice fires on EVERY restore, unconditionally. The resumed
+    # session cannot tell from its own transcript that it was restarted,
+    # so the restore itself is the thing worth saying; orphans and dirty
+    # state are sections within the message, never conditions on it.
+    #
+    # Completion is decided by a recorded terminal value, never by a
+    # timestamp. Recovery keyed on mtime is defeated by clock movement in
+    # both directions -- a backward step hides in-flight work, a forward
+    # jump makes settled work look fresh -- which is why projects that
+    # started there (hardy #521, SeaweedFS #9944) removed it. A
+    # stop_reason already written to a transcript does not move.
+    #
+    # Measured across 196 agent transcripts on this host: 166 ended
+    # type=assistant with stop_reason end_turn, 19 ended type=assistant
+    # with stop_reason null, 10 ended type=user, 1 ended tool_use. Only
+    # the first shape is a finished agent.
+
+    AGENT_TAIL_BYTES = 262144
+    AGENT_SCAN_BYTES = 4194304
+    RESTORE_BUDGET_S = 3.0
+    MAX_FILES_PER_AGENT = 12
+    EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+    def _last_record(path):
+        """Last complete JSONL record of path, or None when unsure.
+
+        Reads a bounded tail rather than the whole file: these run to
+        hundreds of KB and this happens while panes wait to launch. A
+        record larger than the window comes back unparseable, which the
+        caller treats as unknown rather than as evidence.
+        """
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as fh:
+                want = min(size, AGENT_TAIL_BYTES)
+                fh.seek(size - want)
+                blob = fh.read(want)
+        except OSError:
+            return None
+        lines = [ln for ln in blob.split(b"\n") if ln.strip()]
+        if not lines:
+            return None
+        try:
+            return json.loads(lines[-1].decode("utf-8", "replace"))
+        except ValueError:
+            return None
+
+
+    def _is_orphaned(rec):
+        """True when rec is not a clean end_turn completion."""
+        if not isinstance(rec, dict):
+            return False
+        if rec.get("type") != "assistant":
+            return True
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            return True
+        return msg.get("stop_reason") != "end_turn"
+
+
+    def _edited_paths(path, deadline):
+        """Files this agent's OWN edit tool calls named, first-use order.
+
+        Attribution is exact rather than inferred: the record lives in
+        the agent's own transcript, so a file touched by the main session
+        or by a sibling agent cannot appear here. That is the whole point
+        — a resumed session needs to know which edits are unowned, and a
+        git diff cannot tell it who made them.
+
+        Bash-mediated writes DO NOT appear: in a 40-transcript sample
+        there were 956 Bash calls against 91 edit-tool calls, so shell
+        redirection and `git add` leave nothing to attribute. The per-cwd
+        git summary is what covers those.
+
+        Scans forward with a byte cap and the shared deadline; a
+        transcript too large or too slow yields a short list rather than
+        a late restore.
+        """
+        out = []
+        seen = set()
+        try:
+            with open(path, "r", errors="replace") as fh:
+                read = 0
+                for ln in fh:
+                    read += len(ln)
+                    if read > AGENT_SCAN_BYTES or time.time() > deadline:
+                        break
+                    # Most records are user/tool_result and cannot match.
+                    # Skipping their json.loads is the entire budget:
+                    # 0.05s against a real 800KB transcript.
+                    if '"tool_use"' not in ln:
+                        continue
+                    try:
+                        rec = json.loads(ln)
+                    except ValueError:
+                        continue
+                    msg = rec.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    content = msg.get("content")
+                    if not isinstance(content, list):
+                        continue
+                    for blk in content:
+                        if not isinstance(blk, dict):
+                            continue
+                        if blk.get("type") != "tool_use":
+                            continue
+                        if blk.get("name") not in EDIT_TOOLS:
+                            continue
+                        inp = blk.get("input")
+                        if not isinstance(inp, dict):
+                            continue
+                        fp = inp.get("file_path") or inp.get("notebook_path")
+                        if isinstance(fp, str) and fp and fp not in seen:
+                            seen.add(fp)
+                            out.append(fp)
+        except OSError:
+            return out
+        return out
+
+
+    def _dirty_counts(work_dir, deadline):
+        """(changed, staged) from git porcelain, or None when unknown."""
+        if not work_dir or time.time() > deadline:
+            return None
+        try:
+            r = subprocess.run(
+                ["git", "-C", work_dir, "status", "--porcelain"],
+                capture_output=True, timeout=3, text=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        rows = [x for x in r.stdout.split("\n") if x.strip()]
+        staged = sum(1 for x in rows if x[:1] not in (" ", "?"))
+        return (len(rows), staged)
+
+
+    def _orphans(proj_dir, sid, deadline):
+        """[(name, cwd, branch, [edited paths])] for this session.
+
+        Scoping is by session IDENTITY, not recency: the transcripts live
+        under the spawning session, so agents belonging to other sessions
+        are excluded by construction rather than by an age cap. On this
+        host 19 of 196 transcripts look orphaned, the oldest ~2900h --
+        an age cap would have been the wrong axis and a noisy one.
+        """
+        if not proj_dir or not sid:
+            return []
+        pattern = os.path.join(
+            proj_dir, sid, "subagents", "agent-*.jsonl"
+        )
+        found = []
+        for path in sorted(glob.glob(pattern)):
+            if time.time() > deadline:
+                break
+            rec = _last_record(path)
+            if rec is None or not _is_orphaned(rec):
+                continue
+            name = os.path.basename(path)
+            name = name.removeprefix("agent-").removesuffix(".jsonl")
+            found.append((
+                name, rec.get("cwd"), rec.get("gitBranch"),
+                _edited_paths(path, deadline),
+            ))
+        return found
+
+
+    def restore_notice(proj_dir, sid, cwd=None):
+        """Prompt handed to every restored pane. Never None.
+
+        Unconditional on purpose: the point is to kick the resumed
+        session back into the work, and it has no other way to learn its
+        processes are gone. A notice that only fired on orphans would be
+        absent exactly when the session had to reconstruct state for some
+        other reason.
+        """
+        deadline = time.time() + RESTORE_BUDGET_S
+        found = _orphans(proj_dir, sid, deadline)
+        parts = [
+            "This pane was restored by kitty after the previous Claude "
+            "Code process exited. Any background subagents this session "
+            "started died with it; their file edits did not."
+        ]
+        dirs = []
+        if cwd:
+            dirs.append(cwd)
+        if found:
+            parts.append(
+                str(len(found)) + " subagent(s) have no completion "
+                "record, so they were cut off mid-run rather than "
+                "finishing:"
+            )
+            for name, work_dir, branch, edited in found:
+                line = "  - " + name
+                if work_dir:
+                    line += " (cwd " + work_dir
+                    if branch:
+                        line += ", branch " + branch
+                    line += ")"
+                parts.append(line)
+                if edited:
+                    shown = edited[:MAX_FILES_PER_AGENT]
+                    parts.append(
+                        "      edited " + str(len(edited)) + " file(s):"
+                    )
+                    for fp in shown:
+                        parts.append("        " + fp)
+                    if len(edited) > len(shown):
+                        parts.append(
+                            "        ... and "
+                            + str(len(edited) - len(shown)) + " more"
+                        )
+                else:
+                    parts.append(
+                        "      no edit-tool calls recorded (it may still "
+                        "have written via shell)"
+                    )
+                if work_dir and work_dir not in dirs:
+                    dirs.append(work_dir)
+        else:
+            parts.append("No subagent of this session was left mid-run.")
+        for work_dir in dirs:
+            counts = _dirty_counts(work_dir, deadline)
+            if counts is None:
+                continue
+            changed, staged = counts
+            if not changed:
+                parts.append("  " + work_dir + ": clean tree.")
+                continue
+            parts.append(
+                "  " + work_dir + ": " + str(changed)
+                + " changed file(s), " + str(staged) + " staged. "
+                "Includes anything written via shell, which is not "
+                "attributable to an agent."
+            )
+        parts.append(
+            "Establish current state from the filesystem before "
+            "continuing that work or describing its status, then pick "
+            "the work back up."
+        )
+        return "\n".join(parts)
+
+
+    def _resume_cmd(claude, sid, proj_dir, cwd=None):
+        """Resume command, plus the restore prompt.
+
+        The probe must never cost a restore: recovering the pane layout
+        matters more than delivering the notice, so every failure path
+        returns the plain resume command.
+        """
+        base = [claude, "--resume", sid]
+        try:
+            notice = restore_notice(proj_dir, sid, cwd)
+        except Exception:
+            return base
+        return base + [notice] if notice else base
+
+
     def maybe_resume_claude(cmd, cwd, session_id, claimed_sids):
         """If cmd is the claude-code CLI, rewrite to resume the correct
         session. Prefers the per-pane session_id captured at snapshot
@@ -260,7 +529,7 @@ let
             os.path.join(proj_dir, f"{session_id}.jsonl")
         ):
             claimed_sids.add(session_id)
-            return [cmd[0], "--resume", session_id]
+            return _resume_cmd(cmd[0], session_id, proj_dir, cwd)
         if not proj_dir or not os.path.isdir(proj_dir):
             return cmd
         sessions = [
@@ -276,7 +545,7 @@ let
             if candidate in claimed_sids:
                 continue
             claimed_sids.add(candidate)
-            return [cmd[0], "--resume", candidate]
+            return _resume_cmd(cmd[0], candidate, proj_dir, cwd)
         return cmd
 
 
