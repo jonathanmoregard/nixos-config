@@ -62,36 +62,52 @@ pkgs.runCommand "worktree-sweep-harness"
     git config --global user.email "harness@example.invalid"
     git config --global user.name "harness"
     git config --global init.defaultBranch main
+    # Model production, not a permissive sandbox. home/jonathan.nix sets this,
+    # and it is precisely what broke the sweep once (#184): every
+    # `git -C <bare-repo>` call returns "cannot use bare repository" and the
+    # fail-closed predicates turn the whole run into a silent no-op. Without
+    # this line the harness passes against a bare anchor that cannot work on
+    # the real host — a green gate over a broken workflow.
+    git config --global safe.bareRepository explicit
 
     OLD=$(date -d "10 days ago" +%Y-%m-%dT%H:%M:%S)
     NEW=$(date -d "1 day ago" +%Y-%m-%dT%H:%M:%S)
 
     # --- fixture: bare repo + registered worktrees, real layout ---------
+    # The bare repo stays — it is still the shared object store on the real
+    # host. What changed is the ANCHOR: every command addresses the `main`
+    # worktree instead of the bare directory, because safe.bareRepository
+    # above forbids discovering the latter. Same refs, same worktree list.
     mkfixture() {
       local root="$1"
       local bare="$root/nixos-config"
       local wts="$root/nixos-config-worktrees"
+      local anchor="$wts/main"
       mkdir -p "$root"
       git init -q "$root/seed"
       git -C "$root/seed" commit -q --allow-empty -m init
       git clone -q --bare "$root/seed" "$bare"
       mkdir -p "$wts"
-      git -C "$bare" worktree add -q "$wts/main" main
+      # Bootstrap only. Creating the first worktree is the one operation with
+      # no anchor to use yet, and naming GIT_DIR explicitly is exactly the
+      # escape hatch `explicit` is defined around. Everything after this goes
+      # through $anchor.
+      GIT_DIR="$bare" git worktree add -q "$anchor" main
 
       mkwt() {  # <name> <commit-date>
-        git -C "$bare" worktree add -q -b "feat/$1" "$wts/$1" main
+        git -C "$anchor" worktree add -q -b "feat/$1" "$wts/$1" main
         echo "$1" > "$wts/$1/file.txt"
         git -C "$wts/$1" add file.txt
         GIT_AUTHOR_DATE="$2" GIT_COMMITTER_DATE="$2" \
           git -C "$wts/$1" commit -qm "work on $1"
       }
       mkbranch() {  # <name> <commit-date> — branch with NO worktree
-        git -C "$bare" worktree add -q -b "feat/$1" "$root/tmp-$1" main
+        git -C "$anchor" worktree add -q -b "feat/$1" "$root/tmp-$1" main
         echo "$1" > "$root/tmp-$1/file.txt"
         git -C "$root/tmp-$1" add file.txt
         GIT_AUTHOR_DATE="$2" GIT_COMMITTER_DATE="$2" \
           git -C "$root/tmp-$1" commit -qm "work on $1"
-        git -C "$bare" worktree remove "$root/tmp-$1"
+        git -C "$anchor" worktree remove "$root/tmp-$1"
       }
 
       mkwt merged-old-clean "$OLD"
@@ -138,7 +154,7 @@ pkgs.runCommand "worktree-sweep-harness"
       *)
         # Run 3 sweeps several repos in one invocation, so the tip is
         # resolved from whichever fixture repo knows the branch.
-        dirs="''${FIXTURE_REPO_DIRS:-$FIXTURE_BARE}"
+        dirs="''${FIXTURE_REPO_DIRS:-$FIXTURE_ANCHOR}"
         tip=""
         for r in $(echo "$dirs" | tr ':' ' '); do
           t=$(git -C "$r" rev-parse "refs/heads/$head" 2>/dev/null) || continue
@@ -154,10 +170,14 @@ pkgs.runCommand "worktree-sweep-harness"
     # Run 1: gh healthy — mixed keep/delete decisions
     # =====================================================================
     mkfixture "$PWD/fix1"
-    export FIXTURE_BARE="$PWD/fix1/nixos-config"
+    # Single-repo mode gets the ANCHOR, not the bare dir: under
+    # safe.bareRepository the sweeper cannot operate on the latter at all.
+    # The script documents this input as "a bare repo, or the main checkout's
+    # toplevel"; on this host only the second half is reachable.
+    export FIXTURE_ANCHOR="$PWD/fix1/nixos-config-worktrees/main"
     WTS1="$PWD/fix1/nixos-config-worktrees"
 
-    SWEEP_BARE_REPO="$FIXTURE_BARE" \
+    SWEEP_BARE_REPO="$FIXTURE_ANCHOR" \
     SWEEP_WORKTREES_DIR="$WTS1" \
     SWEEP_GH_BIN="$PWD/bin/gh" \
     SWEEP_EXTRA_LIVE_CWDS="$WTS1/live-cwd" \
@@ -166,7 +186,7 @@ pkgs.runCommand "worktree-sweep-harness"
     echo "=== run 1 decisions ==="
     cat run1.log
 
-    has_branch() { git -C "$FIXTURE_BARE" show-ref --verify -q "refs/heads/$1"; }
+    has_branch() { git -C "$FIXTURE_ANCHOR" show-ref --verify -q "refs/heads/$1"; }
 
     # 1. all predicates hold → worktree AND branch deleted
     [ ! -e "$WTS1/merged-old-clean" ] || fail "merged-old-clean worktree survived"
@@ -234,12 +254,12 @@ pkgs.runCommand "worktree-sweep-harness"
     # Run 2: gh outage — MUST mean zero deletions
     # =====================================================================
     mkfixture "$PWD/fix2"
-    FIX2_BARE="$PWD/fix2/nixos-config"
+    FIX2_ANCHOR="$PWD/fix2/nixos-config-worktrees/main"
     WTS2="$PWD/fix2/nixos-config-worktrees"
 
     GH_STUB_DOWN=1 \
-    FIXTURE_BARE="$FIX2_BARE" \
-    SWEEP_BARE_REPO="$FIX2_BARE" \
+    FIXTURE_ANCHOR="$FIX2_ANCHOR" \
+    SWEEP_BARE_REPO="$FIX2_ANCHOR" \
     SWEEP_WORKTREES_DIR="$WTS2" \
     SWEEP_GH_BIN="$PWD/bin/gh" \
       "$sweep" > run2.log 2>&1 || fail "sweep exited non-zero during gh outage"
@@ -254,7 +274,7 @@ pkgs.runCommand "worktree-sweep-harness"
     for b in main feat/merged-old-clean feat/dirty feat/live-cwd feat/gh-fails \
              feat/unmerged feat/merged-recent feat/tip-mismatch \
              feat/branch-merged-old feat/branch-unmerged feat/branch-recent; do
-      git -C "$FIX2_BARE" show-ref --verify -q "refs/heads/$b" \
+      git -C "$FIX2_ANCHOR" show-ref --verify -q "refs/heads/$b" \
         || fail "gh-down run deleted branch $b"
     done
     grep -q "gh auth unavailable" run2.log \
@@ -308,6 +328,28 @@ pkgs.runCommand "worktree-sweep-harness"
         git -C "$path" commit -qm "work on $branch"
     }
 
+    # A worktree whose OWNER is a bare repo — the ~/Repos/nixos-config shape.
+    # Discovery resolves a linked worktree through --git-common-dir, which for
+    # this layout is the bare directory itself, and safe.bareRepository then
+    # refuses every git call against it. The sweep must skip the repo, and must
+    # report the real reason: `remote get-url` also fails here, so the old code
+    # blamed a missing origin on a repo that demonstrably has one.
+    mkbare3() {  # <worktree-path> <branch> <commit-date>
+      local wtpath="$1" branch="$2" date="$3"
+      local seed="$PWD/fix3/seed-bare" bare="$PWD/fix3/bare-owner.git"
+      git init -q -b main "$seed"
+      git -C "$seed" commit -q --allow-empty -m init
+      git clone -q --bare "$seed" "$bare"
+      # GIT_DIR throughout: every one of these would be refused via `git -C`.
+      GIT_DIR="$bare" git remote set-url origin \
+        "git@github.com:jonathanmoregard/bare-owner.git"
+      GIT_DIR="$bare" git worktree add -q -b "$branch" "$wtpath"
+      echo bare > "$wtpath/file.txt"
+      git -C "$wtpath" add file.txt
+      GIT_AUTHOR_DATE="$date" GIT_COMMITTER_DATE="$date" \
+        git -C "$wtpath" commit -qm "work on $branch"
+    }
+
     mkrepo3 repoA main   "git@github.com:jonathanmoregard/nixos-config.git"
     mkrepo3 repoB master "https://github.com/jonathanmoregard/dotclaude.git"
     mkrepo3 repoC main   "$PWD/fix3/seed-repoC"   # not GitHub → no PR state
@@ -317,6 +359,7 @@ pkgs.runCommand "worktree-sweep-harness"
     mkwt3 repoB feat/b-merged-old "$ROOT3/b-merged-old" "$OLD"
     mkwt3 repoC feat/c-merged-old "$ROOT3/c-merged-old" "$OLD"
     mkstandalone3 "$ROOT3/standalone" feat/d-standalone "$OLD"
+    mkbare3 "$ROOT3/bare-owned" feat/e-bare-owned "$OLD"
 
     FIXTURE_REPO_DIRS="$PWD/fix3/repoA:$PWD/fix3/repoB:$PWD/fix3/repoC:$ROOT3/standalone" \
     SWEEP_ROOTS="$ROOT3" \
@@ -367,6 +410,22 @@ pkgs.runCommand "worktree-sweep-harness"
     grep -qF "outside the swept roots" run3.log \
       || fail "no kept log line for the out-of-root worktree"
 
-    echo "ok: delete fired only on merged+old+clean+no-cwd; every failure mode kept + logged; gh outage = zero deletions; discovery sweeps every repo under the roots and skips the rest"
+    # 18. a bare-owned worktree → repo skipped, nothing deleted, and the
+    #     REASON is accurate. Both halves matter: the skip alone was already
+    #     right, it was the explanation that lied, and a fail-closed path that
+    #     misreports why is how the #184 regression stayed invisible for days.
+    [ -d "$ROOT3/bare-owned" ] || fail "bare-owned worktree was deleted"
+    git -C "$ROOT3/bare-owned" show-ref --verify -q refs/heads/feat/e-bare-owned \
+      || fail "bare-owned worktree's branch was deleted"
+    grep -qF "skipped repo $PWD/fix3/bare-owner.git: git refuses to operate here" run3.log \
+      || fail "bare-owned repo was not skipped with the accurate reason"
+    if grep -qF "skipped repo $PWD/fix3/bare-owner.git: no origin remote" run3.log
+      then fail "bare repo skip still blames a missing origin remote"; fi
+    # The origin genuinely exists — proving the old message was false, not
+    # merely imprecise.
+    GIT_DIR="$PWD/fix3/bare-owner.git" git remote get-url origin >/dev/null \
+      || fail "fixture is wrong: bare-owner has no origin, so the old message would have been true"
+
+    echo "ok: delete fired only on merged+old+clean+no-cwd; every failure mode kept + logged; gh outage = zero deletions; discovery sweeps every repo under the roots and skips the rest; a bare-owned repo is skipped for the reason that is actually true"
     touch $out
   ''
