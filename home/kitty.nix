@@ -229,13 +229,18 @@ let
         return None
 
 
-    # ---- orphaned-subagent probe --------------------------------------
+    # ---- restore notice -----------------------------------------------
     #
     # A restored pane resumes a conversation whose PROCESSES are gone.
     # Background subagents die with the parent; their file edits usually
     # do not. On 2026-08-25 the same agent was lost twice this way, each
     # time after it had already staged its work, and the resumed session
     # went on believing it was still running.
+    #
+    # The notice fires on EVERY restore, unconditionally. The resumed
+    # session cannot tell from its own transcript that it was restarted,
+    # so the restore itself is the thing worth saying; orphans and dirty
+    # state are sections within the message, never conditions on it.
     #
     # Completion is decided by a recorded terminal value, never by a
     # timestamp. Recovery keyed on mtime is defeated by clock movement in
@@ -250,7 +255,10 @@ let
     # the first shape is a finished agent.
 
     AGENT_TAIL_BYTES = 262144
-    ORPHAN_BUDGET_S = 2.0
+    AGENT_SCAN_BYTES = 4194304
+    RESTORE_BUDGET_S = 3.0
+    MAX_FILES_PER_AGENT = 12
+    EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 
 
     def _last_record(path):
@@ -290,6 +298,67 @@ let
         return msg.get("stop_reason") != "end_turn"
 
 
+    def _edited_paths(path, deadline):
+        """Files this agent's OWN edit tool calls named, first-use order.
+
+        Attribution is exact rather than inferred: the record lives in
+        the agent's own transcript, so a file touched by the main session
+        or by a sibling agent cannot appear here. That is the whole point
+        — a resumed session needs to know which edits are unowned, and a
+        git diff cannot tell it who made them.
+
+        Bash-mediated writes DO NOT appear: in a 40-transcript sample
+        there were 956 Bash calls against 91 edit-tool calls, so shell
+        redirection and `git add` leave nothing to attribute. The per-cwd
+        git summary is what covers those.
+
+        Scans forward with a byte cap and the shared deadline; a
+        transcript too large or too slow yields a short list rather than
+        a late restore.
+        """
+        out = []
+        seen = set()
+        try:
+            with open(path, "r", errors="replace") as fh:
+                read = 0
+                for ln in fh:
+                    read += len(ln)
+                    if read > AGENT_SCAN_BYTES or time.time() > deadline:
+                        break
+                    # Most records are user/tool_result and cannot match.
+                    # Skipping their json.loads is the entire budget:
+                    # 0.05s against a real 800KB transcript.
+                    if '"tool_use"' not in ln:
+                        continue
+                    try:
+                        rec = json.loads(ln)
+                    except ValueError:
+                        continue
+                    msg = rec.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    content = msg.get("content")
+                    if not isinstance(content, list):
+                        continue
+                    for blk in content:
+                        if not isinstance(blk, dict):
+                            continue
+                        if blk.get("type") != "tool_use":
+                            continue
+                        if blk.get("name") not in EDIT_TOOLS:
+                            continue
+                        inp = blk.get("input")
+                        if not isinstance(inp, dict):
+                            continue
+                        fp = inp.get("file_path") or inp.get("notebook_path")
+                        if isinstance(fp, str) and fp and fp not in seen:
+                            seen.add(fp)
+                            out.append(fp)
+        except OSError:
+            return out
+        return out
+
+
     def _dirty_counts(work_dir, deadline):
         """(changed, staged) from git porcelain, or None when unknown."""
         if not work_dir or time.time() > deadline:
@@ -308,10 +377,9 @@ let
         return (len(rows), staged)
 
 
-    def orphan_notice(proj_dir, sid):
-        """Prompt describing subagents this session left mid-flight.
+    def _orphans(proj_dir, sid, deadline):
+        """[(name, cwd, branch, [edited paths])] for this session.
 
-        None when there is nothing to report, which is the common case.
         Scoping is by session IDENTITY, not recency: the transcripts live
         under the spawning session, so agents belonging to other sessions
         are excluded by construction rather than by an age cap. On this
@@ -319,8 +387,7 @@ let
         an age cap would have been the wrong axis and a noisy one.
         """
         if not proj_dir or not sid:
-            return None
-        deadline = time.time() + ORPHAN_BUDGET_S
+            return []
         pattern = os.path.join(
             proj_dir, sid, "subagents", "agent-*.jsonl"
         )
@@ -333,48 +400,91 @@ let
                 continue
             name = os.path.basename(path)
             name = name.removeprefix("agent-").removesuffix(".jsonl")
-            found.append((name, rec.get("cwd"), rec.get("gitBranch")))
-        if not found:
-            return None
+            found.append((
+                name, rec.get("cwd"), rec.get("gitBranch"),
+                _edited_paths(path, deadline),
+            ))
+        return found
+
+
+    def restore_notice(proj_dir, sid, cwd=None):
+        """Prompt handed to every restored pane. Never None.
+
+        Unconditional on purpose: the point is to kick the resumed
+        session back into the work, and it has no other way to learn its
+        processes are gone. A notice that only fired on orphans would be
+        absent exactly when the session had to reconstruct state for some
+        other reason.
+        """
+        deadline = time.time() + RESTORE_BUDGET_S
+        found = _orphans(proj_dir, sid, deadline)
         parts = [
             "This pane was restored by kitty after the previous Claude "
-            "Code process exited. " + str(len(found)) + " background "
-            "subagent(s) spawned by this session have no completion "
-            "record, so they were cut off mid-run rather than finishing:"
+            "Code process exited. Any background subagents this session "
+            "started died with it; their file edits did not."
         ]
-        seen_dirs = []
-        for name, work_dir, branch in found:
-            line = "  - " + name
-            if work_dir:
-                line += " (cwd " + work_dir
-                if branch:
-                    line += ", branch " + branch
-                line += ")"
-            parts.append(line)
-            if work_dir and work_dir not in seen_dirs:
-                seen_dirs.append(work_dir)
-        for work_dir in seen_dirs:
+        dirs = []
+        if cwd:
+            dirs.append(cwd)
+        if found:
+            parts.append(
+                str(len(found)) + " subagent(s) have no completion "
+                "record, so they were cut off mid-run rather than "
+                "finishing:"
+            )
+            for name, work_dir, branch, edited in found:
+                line = "  - " + name
+                if work_dir:
+                    line += " (cwd " + work_dir
+                    if branch:
+                        line += ", branch " + branch
+                    line += ")"
+                parts.append(line)
+                if edited:
+                    shown = edited[:MAX_FILES_PER_AGENT]
+                    parts.append(
+                        "      edited " + str(len(edited)) + " file(s):"
+                    )
+                    for fp in shown:
+                        parts.append("        " + fp)
+                    if len(edited) > len(shown):
+                        parts.append(
+                            "        ... and "
+                            + str(len(edited) - len(shown)) + " more"
+                        )
+                else:
+                    parts.append(
+                        "      no edit-tool calls recorded (it may still "
+                        "have written via shell)"
+                    )
+                if work_dir and work_dir not in dirs:
+                    dirs.append(work_dir)
+        else:
+            parts.append("No subagent of this session was left mid-run.")
+        for work_dir in dirs:
             counts = _dirty_counts(work_dir, deadline)
             if counts is None:
                 continue
             changed, staged = counts
             if not changed:
+                parts.append("  " + work_dir + ": clean tree.")
                 continue
             parts.append(
                 "  " + work_dir + ": " + str(changed)
-                + " changed file(s), " + str(staged) + " staged."
+                + " changed file(s), " + str(staged) + " staged. "
+                "Includes anything written via shell, which is not "
+                "attributable to an agent."
             )
         parts.append(
-            "A subagent that died after editing leaves its work on disk "
-            "with no commit and no report. Establish current state from "
-            "the filesystem before continuing that work or describing "
-            "its status."
+            "Establish current state from the filesystem before "
+            "continuing that work or describing its status, then pick "
+            "the work back up."
         )
         return "\n".join(parts)
 
 
-    def _resume_cmd(claude, sid, proj_dir):
-        """Resume command, plus the orphan prompt when there is one.
+    def _resume_cmd(claude, sid, proj_dir, cwd=None):
+        """Resume command, plus the restore prompt.
 
         The probe must never cost a restore: recovering the pane layout
         matters more than delivering the notice, so every failure path
@@ -382,7 +492,7 @@ let
         """
         base = [claude, "--resume", sid]
         try:
-            notice = orphan_notice(proj_dir, sid)
+            notice = restore_notice(proj_dir, sid, cwd)
         except Exception:
             return base
         return base + [notice] if notice else base
@@ -419,7 +529,7 @@ let
             os.path.join(proj_dir, f"{session_id}.jsonl")
         ):
             claimed_sids.add(session_id)
-            return _resume_cmd(cmd[0], session_id, proj_dir)
+            return _resume_cmd(cmd[0], session_id, proj_dir, cwd)
         if not proj_dir or not os.path.isdir(proj_dir):
             return cmd
         sessions = [
@@ -435,7 +545,7 @@ let
             if candidate in claimed_sids:
                 continue
             claimed_sids.add(candidate)
-            return _resume_cmd(cmd[0], candidate, proj_dir)
+            return _resume_cmd(cmd[0], candidate, proj_dir, cwd)
         return cmd
 
 

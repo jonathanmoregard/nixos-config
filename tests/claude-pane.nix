@@ -674,7 +674,13 @@
         "su - jonathan -c 'kitty-restore-session --dump-panes'"
     ))
     cmd_z = resolved_zombie[0]["cmd"]
-    assert cmd_z == ["/home/jonathan/.local/bin/claude", "--resume", zsid], (
+    # Compared on the first three elements: every restore now carries the
+    # notice as a trailing positional prompt, so exact equality would be
+    # asserting the absence of a feature. What this arm is about is WHICH
+    # sid got resolved, and that a dead claude did not become a relaunch
+    # of the orphaned MCP server.
+    assert cmd_z[:3] == ["/home/jonathan/.local/bin/claude", "--resume",
+                         zsid], (
         f"zombie pane restored as {cmd_z!r}; expected claude --resume "
         f"{zsid!r}"
     )
@@ -709,7 +715,9 @@
         "su - jonathan -c 'kitty-restore-session --dump-panes'"
     ))
     cmd_o = resolved_order[0]["cmd"]
-    assert cmd_o == ["/home/jonathan/.local/bin/claude", "--resume", osid], (
+    # First three elements only — see the note on the zombie arm above.
+    assert cmd_o[:3] == ["/home/jonathan/.local/bin/claude", "--resume",
+                         osid], (
         f"claude at a non-zero foreground index was missed; got {cmd_o!r}"
     )
 
@@ -901,7 +909,7 @@
         f"awk replace-then-append race"
     )
 
-    # ── orphaned-subagent notice on restore (home/kitty.nix) ──────────
+    # ── restore notice (home/kitty.nix) ───────────────────────────────
     #
     # A restored pane resumes a conversation whose PROCESSES are gone.
     # Background subagents die with the parent; their file edits usually
@@ -909,6 +917,16 @@
     # spawned and reports the ones with no completion record, so the
     # resumed session does not go on believing an agent is still running
     # and does not re-dispatch work that is already staged on disk.
+    #
+    # The notice fires on EVERY restore, so the arms below assert on its
+    # CONTENT rather than on its presence. "Silent" is not a valid
+    # outcome any more; the discriminating question is whether an agent
+    # is named and whether the files listed under it are its own.
+    #
+    # Attribution comes from each agent's own tool_use records, not from
+    # a git diff — a diff shows that a file changed, never who changed
+    # it, and the whole point is to separate an orphan's unowned work
+    # from the main session's.
     #
     # Completion is decided by a RECORDED TERMINAL VALUE, not a
     # timestamp: mtime-threshold recovery is defeated by clock movement
@@ -932,8 +950,13 @@
             f"su - jonathan -c 'mkdir -p {orphan_proj}/{_sid}/subagents'"
         )
 
-    def _plant(sid, agent, stop_reason, kind="assistant"):
+    def _plant(sid, agent, stop_reason, kind="assistant", edits=()):
         """One-line transcript whose last record has the given shape.
+
+        `edits` plants tool_use blocks naming file_path, which is how the
+        probe attributes edits to the agent that made them — the record
+        lives in that agent's OWN transcript, so a sibling's edits cannot
+        leak in.
 
         Staged through stage_input, i.e. a quoted heredoc, NOT through
         `su -c 'printf ...'`. The obvious spelling nests single quotes
@@ -944,10 +967,19 @@
         the probe.
         """
         msg = "null" if stop_reason is None else f'"{stop_reason}"'
+        content = ""
+        if edits:
+            blocks = ",".join(
+                '{"type":"tool_use","name":"Edit","input":'
+                '{"file_path":"' + p + '"}}'
+                for p in edits
+            )
+            content = f',"content":[{blocks}]'
         rec = (
             f'{{"type":"{kind}","cwd":"/home/jonathan",'
             f'"gitBranch":"master","sessionId":"{sid}",'
-            f'"message":{{"role":"assistant","stop_reason":{msg}}}}}'
+            f'"message":{{"role":"assistant","stop_reason":{msg}'
+            f'{content}}}}}'
         )
         path = f"{orphan_proj}/{sid}/subagents/agent-{agent}.jsonl"
         stage_input(path, rec)
@@ -961,11 +993,14 @@
     # end_turn is the only shape that means "this agent finished".
     _plant(clean_sid, "cleanone", "end_turn")
     _plant(clean_sid, "cleantwo", "end_turn")
-    _plant(orphan_sid, "finished", "end_turn")
-    _plant(orphan_sid, "diedmidrun", None)
+    _plant(orphan_sid, "finished", "end_turn",
+           edits=["/repo/edited-by-finished.txt"])
+    _plant(orphan_sid, "diedmidrun", None,
+           edits=["/repo/edited-by-orphan-one.txt",
+                  "/repo/edited-by-orphan-two.txt"])
 
     def _notice(sid):
-        """Call orphan_notice() inside the deployed script."""
+        """Call restore_notice() inside the deployed script."""
         # An explicit SourceFileLoader is required, not optional:
         # spec_from_file_location() infers the loader from the file
         # EXTENSION, and the deployed script has none (it is
@@ -979,7 +1014,7 @@
             f" loader=L('krs', {krs!r}));"
             "m=u.module_from_spec(s);sys.argv=['x'];"
             "s.loader.exec_module(m);"
-            f"n=m.orphan_notice({orphan_proj!r}, {sid!r});"
+            f"n=m.restore_notice({orphan_proj!r}, {sid!r});"
             "print('NONE' if n is None else n.replace(chr(10), ' | '))"
         )
         return dellan.succeed(
@@ -1003,22 +1038,53 @@
         f"told where to look:\n{got}"
     )
 
-    # THE NEGATIVE CONTROL, and the reason the assertion above is worth
-    # anything: an identical session whose agents all completed must be
-    # SILENT. Without this the probe could report unconditionally and the
-    # positive case would still pass.
-    quiet = _notice(clean_sid)
-    assert quiet == "NONE", (
-        "a session whose subagents all completed still produced a restore "
-        "notice. Every restore would then carry it, which is noise the "
-        f"reader learns to skip:\n{quiet}"
+    # ATTRIBUTION. The orphan's own edits are listed under it, and the
+    # finished sibling's edit is not — the probe reads each agent's own
+    # transcript rather than inferring authorship from a git diff, which
+    # cannot say who made a change.
+    for _f in ("edited-by-orphan-one.txt", "edited-by-orphan-two.txt"):
+        assert _f in got, (
+            f"the notice does not list {_f}, which the orphaned agent "
+            f"recorded editing. Naming the agent without naming its files "
+            f"leaves the reader to diff the tree by hand:\n{got}"
+        )
+    assert "edited-by-finished.txt" not in got, (
+        "the notice listed a file edited by an agent that COMPLETED. "
+        "Attribution that leaks across agents is worse than none: it sends "
+        f"the reader to re-do settled work:\n{got}"
     )
 
-    # Unknown session: silent, and no traceback. The probe runs while panes
-    # wait to launch, so a failure here must never break a restore.
+    # THE NEGATIVE CONTROL, and the reason the assertions above are worth
+    # anything: an identical session whose agents all completed must still
+    # produce a notice (it fires on every restore) but must name NO agent.
+    # Without this the probe could report every agent unconditionally and
+    # the positive case would still pass.
+    quiet = _notice(clean_sid)
+    assert quiet != "NONE", (
+        "a restored pane whose subagents all completed got no notice. The "
+        "notice fires on every restore by design — the resumed session "
+        "cannot otherwise tell its processes are gone:\n"
+        f"{quiet}"
+    )
+    assert "No subagent of this session was left mid-run." in quiet, (
+        "the all-completed session's notice does not say that nothing was "
+        f"left mid-run, so the reader cannot tell the probe ran:\n{quiet}"
+    )
+    for _a in ("cleanone", "cleantwo"):
+        assert _a not in quiet, (
+            f"the probe named {_a}, an agent that ended with stop_reason "
+            "end_turn. Reporting completed agents as lost trains the reader "
+            f"to ignore the notice, which is how a real one gets missed:\n"
+            f"{quiet}"
+        )
+
+    # Unknown session: still a notice, no traceback, and no agent named.
+    # The probe runs while panes wait to launch, so a failure here must
+    # never break a restore.
     unknown = _notice("no-such-session-at-all")
-    assert unknown == "NONE", (
-        f"probing an unknown session should be silent, got:\n{unknown}"
+    assert unknown != "NONE" and "left mid-run" in unknown, (
+        f"probing an unknown session must still yield a notice, got:\n"
+        f"{unknown}"
     )
   '';
 }
