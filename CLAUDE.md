@@ -20,9 +20,11 @@ Linux Mint 22.2 / Cinnamon migration to NixOS, declarative end to end. PRs are C
 **Repo layout:**
 
 ```
-~/Repos/nixos-config/                    ← bare repo (no working tree)
+~/Repos/nixos-config/                    ← bare repo (object store only —
+                                           never address it directly)
 ~/Repos/nixos-config-worktrees/
-    main/                                ← read-only browse worktree
+    main/                                ← browse checkout AND the git
+                                           anchor for every worktree command
     <branch-slug>/                       ← dev worktrees, one per branch
 /etc/nixos/                              ← root-owned clone of origin/main
                                            (auto-pulled + rebuilt by
@@ -31,12 +33,16 @@ Linux Mint 22.2 / Cinnamon migration to NixOS, declarative end to end. PRs are C
 
 You CANNOT edit `~/Repos/nixos-config/` (no working tree). You CANNOT edit `/etc/nixos/` (root-owned, deploy target). Both fail by construction. **Always work in a worktree.**
 
+**The anchor rule.** `safe.bareRepository = "explicit"` (home/jonathan.nix) stops git from *discovering* a bare directory as a starting point, so `git -C ~/Repos/nixos-config …` is refused outright: `fatal: cannot use bare repository … (safe.bareRepository is 'explicit')`. Address `~/Repos/nixos-config-worktrees/main` instead — same refs, same worktree list, through the same bare repo. `ncfg` is that path pre-bound. The one exception is recreating the `main` worktree itself, which has no anchor to use yet; name GIT_DIR explicitly, which is the escape hatch `explicit` is defined around: `GIT_DIR=~/Repos/nixos-config git worktree add ~/Repos/nixos-config-worktrees/main main`.
+
 **Standard flow for any change:**
 
 ```bash
-# 1. Open a worktree
-cd ~/Repos/nixos-config
-git worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
+# 1. Open a worktree. Anchor on the `main` worktree, NOT the bare repo:
+#    safe.bareRepository = explicit refuses `git -C ~/Repos/nixos-config`.
+#    Same refs, same worktree list. `ncfg` is this path pre-bound.
+git -C ~/Repos/nixos-config-worktrees/main \
+    worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
 cd ~/Repos/nixos-config-worktrees/<slug>
 
 # 2. Edit, commit
@@ -57,7 +63,7 @@ gh pr checks <PR_NUMBER>
 #    Desktop notification fires on success/failure.
 
 # 6. Clean up
-git -C ~/Repos/nixos-config worktree remove ~/Repos/nixos-config-worktrees/<slug>
+ncfg worktree remove ~/Repos/nixos-config-worktrees/<slug>
 gh pr view <PR_NUMBER>   # confirm merged
 ```
 

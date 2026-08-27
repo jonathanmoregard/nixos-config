@@ -82,8 +82,27 @@
       # CVE-2024-32002: a crafted submodule can write into .git/hooks
       # during a recursive clone. No repo here uses submodules.
       submodule.recurse = false;
-      # Refuse to operate on a directory that merely looks like a bare
-      # repo unless GIT_DIR says so explicitly.
+      # Refuse to treat a directory as a bare repo unless GIT_DIR names it.
+      # Stops the embedded-bare-repo trick: a hostile repo commits a bare
+      # repo directory inside itself, git discovery picks it up, and an
+      # ordinary `git status` in that tree runs the attacker's hooks,
+      # core.fsmonitor and diff.external.
+      #
+      # The cost is that `git -C ~/Repos/nixos-config ...` is refused, and
+      # that is how this repo's own change flow used to start. #184 shipped
+      # the setting without moving the callers and broke every worktree
+      # operation, which also turned the daily nixos-worktree-sweep into a
+      # silent no-op. The callers now anchor on the `main` worktree instead:
+      # same refs, same worktree list, no discovery of a bare repo requested.
+      # See the `ncfg` helper below, CLAUDE.md, and the nixos-config-dev
+      # skill. The bare repo itself is unchanged and is still the shared
+      # object store.
+      #
+      # `git worktree add` from a linked worktree is the supported path;
+      # GIT_DIR=<bare> remains the escape hatch for the one bootstrap case
+      # (recreating the `main` worktree itself). tests/base.nix asserts the
+      # workflow rather than the setting, so a future change that breaks the
+      # flow fails the gate whatever it is called.
       safe.bareRepository = "explicit";
 
       # Never guess an identity from hostname/username. An agent commit
@@ -236,6 +255,15 @@
       # Use `claudee` to start a fresh session.
       claude()  { clear; command claude --continue "$@"; }
       claudee() { clear; command claude "$@"; }
+
+      # nixos-config git anchor. safe.bareRepository = explicit means
+      # `git -C ~/Repos/nixos-config ...` is refused, so worktree operations
+      # address the `main` browse worktree instead — same refs, same
+      # worktree list. Here so the long path is not muscle memory:
+      #   ncfg worktree add ~/Repos/nixos-config-worktrees/foo -b feat/foo main
+      #   ncfg worktree remove ~/Repos/nixos-config-worktrees/foo
+      #   ncfg worktree list
+      ncfg() { git -C "$HOME/Repos/nixos-config-worktrees/main" "$@"; }
     '';
 
     envExtra = ''

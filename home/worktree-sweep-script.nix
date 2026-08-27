@@ -302,6 +302,20 @@ pkgs.writeShellApplication {
       PROTECTED=(main master)
       wt_branches=()
 
+      # Separate "git will not operate here at all" from "this repo has no
+      # origin". `remote get-url` fails for BOTH, so blaming a missing remote
+      # is wrong whenever the real cause is that git refused the directory.
+      # The live case: safe.bareRepository = explicit (home/jonathan.nix) makes
+      # every `git -C <bare-dir> ...` fail outright, and discovery resolves a
+      # linked worktree to its owner, which for ~/Repos/nixos-config is exactly
+      # that bare dir. Skipping is correct — the repo is swept through its
+      # linked worktrees — but the nightly log said "no origin remote" for a
+      # repo that has one, which misreports a fail-closed path.
+      if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+        log "skipped repo $repo: git refuses to operate here (bare repo under safe.bareRepository, or unreadable) — fail closed"
+        return 0
+      fi
+
       if [ -n "''${SWEEP_REPO_SLUG:-}" ]; then
         SLUG="$SWEEP_REPO_SLUG"
       else
