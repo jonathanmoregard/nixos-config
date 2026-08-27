@@ -993,8 +993,13 @@
     # end_turn is the only shape that means "this agent finished".
     _plant(clean_sid, "cleanone", "end_turn")
     _plant(clean_sid, "cleantwo", "end_turn")
-    _plant(orphan_sid, "finished", "end_turn",
-           edits=["/repo/edited-by-finished.txt"])
+    # Named "sibclean" rather than "finished": the notice's own prose
+    # contains the word finished ("may have finished or failed", about
+    # detached units), so a substring assertion on that name would match
+    # boilerplate instead of a reported agent and pass for the wrong
+    # reason. Fixture names here must not be words the notice can say.
+    _plant(orphan_sid, "sibclean", "end_turn",
+           edits=["/repo/edited-by-sibclean.txt"])
     _plant(orphan_sid, "diedmidrun", None,
            edits=["/repo/edited-by-orphan-one.txt",
                   "/repo/edited-by-orphan-two.txt"])
@@ -1028,7 +1033,7 @@
         "with no completion record. A resumed pane will therefore keep "
         f"believing that agent is still running:\n{got}"
     )
-    assert "finished" not in got, (
+    assert "sibclean" not in got, (
         "the probe reported an agent that ended with stop_reason end_turn. "
         "Reporting completed agents as lost trains the reader to ignore the "
         f"notice, which is how a real one gets missed:\n{got}"
@@ -1048,7 +1053,7 @@
             f"recorded editing. Naming the agent without naming its files "
             f"leaves the reader to diff the tree by hand:\n{got}"
         )
-    assert "edited-by-finished.txt" not in got, (
+    assert "edited-by-sibclean.txt" not in got, (
         "the notice listed a file edited by an agent that COMPLETED. "
         "Attribution that leaks across agents is worse than none: it sends "
         f"the reader to re-do settled work:\n{got}"
@@ -1069,6 +1074,18 @@
     assert "No subagent of this session was left mid-run." in quiet, (
         "the all-completed session's notice does not say that nothing was "
         f"left mid-run, so the reader cannot tell the probe ran:\n{quiet}"
+    )
+    # Detached units are the OPPOSITE case to subagents — they survive the
+    # boundary — so the reminder has to appear even when no agent was
+    # orphaned. Asserted on the all-completed session precisely because
+    # that is the arm where a reader would wrongly conclude "nothing to
+    # check". This fact was the sole unique content of the deleted
+    # SessionStart resume-notice hook.
+    assert "systemctl --user list-units" in quiet, (
+        "the notice does not mention surviving detached systemd-run units. "
+        "Subagents die at this boundary and detached units do not, so a "
+        "notice that only covers the dying half sends the reader to check "
+        f"the wrong things:\n{quiet}"
     )
     for _a in ("cleanone", "cleantwo"):
         assert _a not in quiet, (
