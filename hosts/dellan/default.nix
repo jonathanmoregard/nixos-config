@@ -81,6 +81,19 @@
     # reads its own token from ~/.config/todo/env and gets no secret here.
     ../../modules/nixos/aggregator-ingest-timer.nix
 
+    # `aggregator-schema-health` — hourly user timer comparing the cache's
+    # schema stamp against the MCP reader's requirement and the packaged
+    # writer's version. It exists because the ingest timer above cannot
+    # detect this class of fault by construction: on 2026-08-27 the reader
+    # moved to schema 6 while the pinned writer stayed at 5, so the writer
+    # re-stamped the cache back down every 30 min and EXITED 0 doing it.
+    # OnFailure never fires on a success and the in-process notifier had
+    # nothing to say, so recall was 100% dead for three days in total
+    # silence. Read-only: it never runs the aggregator CLI, because every
+    # subcommand but `embed` calls migrate(), which writes the very stamp
+    # being measured.
+    ../../modules/nixos/aggregator-schema-health.nix
+
     # `claude-egress-observe` — phase 1 of the Claude Code egress
     # control: an nftables OUTPUT rule scoped by cgroup to
     # claude-egress.slice that LOGS every new outbound connection and

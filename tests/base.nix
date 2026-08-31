@@ -1105,6 +1105,191 @@ in
         f"is-enabled={agg_notify_enabled!r}"
     )
 
+    # ── aggregator schema-skew detector (modules/nixos/aggregator-schema-health.nix) ──
+    #
+    # This unit exists because the ingest timer asserted above CANNOT detect
+    # its own most damaging failure. On 2026-08-27 the aggregator's MCP reader
+    # moved to cache schema 6 while the writer pinned in flake.lock stayed at
+    # 5. migrate() ends by stamping PRAGMA user_version with the writer's own
+    # constant, so every 30-minute tick re-stamped the cache back down to 5
+    # and EXITED 0 doing it. OnFailure cannot see a successful run; the
+    # in-process notifier had nothing to say. Recall was 100% dead for three
+    # days and no channel on this host said a word.
+    #
+    # The assertions below are behavioural for the same reason the ingest
+    # ones are: a presence-only check would pass against a detector that
+    # silently reported everything as healthy, which is precisely the state
+    # it exists to prevent. So the real generated script is RUN, against
+    # stub probes that produce each verdict, and its routing is asserted.
+    health_timers = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user list-timers --all'"
+    )
+    assert "aggregator-schema-health.timer" in health_timers, (
+        f"aggregator-schema-health.timer missing from user timers:\n{health_timers}"
+    )
+    for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
+        got = dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"systemctl --user {prop} aggregator-schema-health.timer'"
+        ).strip()
+        assert got == expected, (
+            f"aggregator-schema-health.timer {prop}={got!r}, expected "
+            f"{expected!r} — the detector is not armed, so nothing is "
+            "watching whether recall works"
+        )
+
+    health_unit = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat aggregator-schema-health.service'"
+    )
+    assert "OnFailure=aggregator-schema-health-failure-notify.service" in health_unit, (
+        "the detector lost its own OnFailure edge, so a detector that dies "
+        f"reports nothing — the failure this whole unit is about:\n{health_unit}"
+    )
+    assert "TimeoutStartSec=" in health_unit, (
+        "Type=oneshot disables TimeoutStartSec by default, so without it a "
+        "wedged check holds the unit 'activating' forever and every later "
+        f"tick silently no-ops:\n{health_unit}"
+    )
+    health_notify_enabled = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-enabled aggregator-schema-health-failure-notify.service'"
+    ).strip()
+    assert health_notify_enabled == "static", (
+        "the detector's failure notifier must be OnFailure-only (no "
+        f"[Install]); is-enabled={health_notify_enabled!r}"
+    )
+
+    health_exec = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat aggregator-schema-health.service' "
+        "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
+    ).strip()
+    health_script = dellan.succeed(f"cat {health_exec}")
+
+    # Same blanket ban the ingest wrapper carries, and for a sharper reason
+    # here: this script's whole job is to compare a DEPLOYED writer against a
+    # developer checkout, which makes a literal home path a tempting and
+    # plausible edit. It resolves $HOME at runtime instead.
+    assert "/home/" not in health_script, (
+        "the schema-health script names a home-directory path; it must "
+        f"resolve $HOME at runtime instead:\n{health_script}"
+    )
+
+    # ── The detector must never invoke the thing it is checking ──
+    #
+    # Regression lock, and the subtlest failure available here. The
+    # aggregator CLI calls store.migrate() on every subcommand except
+    # `embed`, and migrate() WRITES PRAGMA user_version. So a probe that
+    # shelled out to `aggregator status` would re-stamp the cache at the
+    # writer's old version — performing the exact damage it was asked to
+    # report on, every hour, while looking like a health check. The probe
+    # reads the cache read-only and reads two source files as text.
+    for forbidden in ["aggregator status", "aggregator query", "aggregator ingest"]:
+        assert forbidden not in health_script, (
+            f"the schema-health script invokes `{forbidden}`, which calls "
+            f"migrate() and re-stamps the cache it is measuring:\n{health_script}"
+        )
+
+    # ── Behavioural: drive the REAL script with stub probes ──
+    #
+    # The VM has no aggregator checkout (asserted above), so the real probe
+    # cannot run here. What CAN be proven is the half that lives in this
+    # repo: that the script routes each verdict to the right announcement,
+    # that a healthy verdict is genuinely silent, and that a verdict it does
+    # not recognise is announced rather than assumed benign.
+    #
+    # notify-send has no daemon to talk to in this VM, so it fails and the
+    # script logs the fallback line. That is deliberate: the journal marker
+    # is emitted FIRST and unconditionally, which is exactly why it — and not
+    # the toast — is what a headless test asserts on.
+    dellan.succeed("mkdir -p /home/jonathan/probe-stubs")
+    for code, needle in [
+        (0, None),
+        (20, "AGGREGATOR RECALL IS DEAD"),
+        (10, "will break on the next ingest tick"),
+        (30, "UNVERIFIED"),
+        # An exit code the script does not know about. A future probe state
+        # must surface as noise, never as silence.
+        (77, "unrecognised status 77"),
+    ]:
+        stub = f"/home/jonathan/probe-stubs/probe{code}.py"
+        dellan.succeed(
+            f"printf 'import sys\\nprint(\"stub verdict {code}\")\\n"
+            f"sys.exit({code})\\n' > {stub}"
+        )
+        dellan.succeed(f"chown jonathan {stub}")
+        # Clear the debounce stamp between cases: it is per-24h and would
+        # otherwise suppress every case after the first, turning four
+        # assertions into one.
+        dellan.succeed(
+            "rm -f /home/jonathan/.local/state/aggregator/schema-skew-notified"
+        )
+        out = dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"AGGREGATOR_SCHEMA_PROBE={stub} {health_exec} 2>&1' || true"
+        )
+        if needle is None:
+            assert out.strip() == "", (
+                "the detector spoke on a HEALTHY verdict. Silence is its only "
+                f"budget; spending it every hour is how it stops being read:\n{out}"
+            )
+        else:
+            assert needle in out, (
+                f"probe exit {code} did not produce its announcement "
+                f"({needle!r}):\n{out}"
+            )
+            assert "stub verdict" in out, (
+                f"the probe's own summary text was dropped from the "
+                f"announcement, leaving a headline with no diagnosis:\n{out}"
+            )
+
+    # ── Silence must mean "verified", never "could not tell" ──
+    #
+    # The probe file absent is the state a tidying edit would most plausibly
+    # turn into an early `exit 0`. It must announce AND exit non-zero, so the
+    # OnFailure edge asserted above fires as a second backstop.
+    dellan.succeed(
+        "rm -f /home/jonathan/.local/state/aggregator/schema-skew-notified"
+    )
+    # `execute`, not `succeed`: a non-zero exit is the ASSERTION here, not a
+    # test failure, and `succeed` would reject the very behaviour being
+    # checked.
+    missing_rc, missing_out = dellan.execute(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        f"AGGREGATOR_SCHEMA_PROBE=/nonexistent/probe.py {health_exec} 2>&1'"
+    )
+    assert "UNVERIFIED" in missing_out, (
+        "a missing probe was not announced — a check that goes quiet when its "
+        f"own machinery breaks reads as good news:\n{missing_out}"
+    )
+    assert missing_rc != 0, (
+        "a missing probe must exit non-zero so the OnFailure edge fires as a "
+        f"second backstop; got rc={missing_rc}:\n{missing_out}"
+    )
+
+    # ── The 24h debounce, and its recovery path ──
+    #
+    # Two halves. The debounce keeps a standing fault (this one is
+    # persistent-until-a-human-acts) from becoming an hourly toast, because a
+    # nagged operator mutes the channel. The recovery half is the one with no
+    # precedent in this repo to copy: OnFailure notifiers never see the
+    # healthy case, so they never clear their stamp. This unit runs on a
+    # timer and does — without which a fault fixed and re-broken inside 24h
+    # would be silently suppressed the second time, and the second time is
+    # the one that proves the fix did not hold.
+    stamp = "/home/jonathan/.local/state/aggregator/schema-skew-notified"
+    dellan.succeed(f"rm -f {stamp}")
+    dellan.succeed("mkdir -p /home/jonathan/.local/state/aggregator")
+    dellan.succeed(f"touch {stamp} && chown jonathan {stamp}")
+    healthy_stub = "/home/jonathan/probe-stubs/probe0.py"
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        f"AGGREGATOR_SCHEMA_PROBE={healthy_stub} {health_exec}'"
+    )
+    dellan.fail(f"test -f {stamp}")
+
     # ── aggregator embed worker (home/aggregator-embed.nix) ────────────────
     #
     # The embed half is imported from the aggregator's own tree rather than
@@ -1156,12 +1341,26 @@ in
         "systemctl --user list-unit-files --no-legend \"aggregator-*.timer\"' "
         "| awk '{print $1}'"
     ).split()))
+    # `aggregator-schema-health.timer` is the third name, dispositioned
+    # deliberately and on the opposite side of the test that this set exists to
+    # apply. Everything above is about keeping a SECOND WRITER off cache.db.
+    # The health timer never writes: it opens the cache `mode=ro` and reads two
+    # source files as text, and it never invokes the aggregator CLI at all —
+    # which matters because every subcommand but `embed` calls migrate(), and
+    # migrate() stamps PRAGMA user_version. modules/nixos/aggregator-schema-health.nix
+    # carries the reasoning; the assertions further up in this file exercise
+    # the script and pin that it names no `aggregator status`.
+    #
+    # A FOURTH name still fails the lane, and should: the question to ask of it
+    # is the same one, "does it write to cache.db", not "is it plausible".
     assert agg_timer_files == [
         "aggregator-embed.timer",
         "aggregator-ingest.timer",
+        "aggregator-schema-health.timer",
     ], (
         "the set of aggregator timers on this host changed. Expected exactly "
-        "the unified ingest runner plus the embed worker; got:\n"
+        "the unified ingest runner, the embed worker, and the read-only "
+        "schema-skew detector; got:\n"
         f"{agg_timer_files}\n"
         "A name MISSING here means a timer this host depends on stopped being "
         "installed. A NEW name is almost certainly an upstream per-source "
@@ -1195,11 +1394,18 @@ in
             f"systemctl --user cat {unit}'"
         ):
             agg_armed.append(unit)
+    # Three armed units now. The health timer is armed on purpose — a detector
+    # that only runs when someone remembers to run it is not a detector — and
+    # its two services are deliberately NOT here: the check service is started
+    # by its timer and the failure-notify service is OnFailure-only, both
+    # asserted `static` above. That asymmetry is the property worth defending,
+    # and it is why this list is about WantedBy rather than about unit count.
     assert agg_armed == [
         "aggregator-embed.timer",
         "aggregator-ingest.timer",
+        "aggregator-schema-health.timer",
     ], (
-        "the set of ARMED aggregator units changed. Only the two timers may "
+        "the set of ARMED aggregator units changed. Only the three timers may "
         f"carry an [Install] WantedBy; got {agg_armed} out of "
         f"{agg_all_units}.\n"
         "A newly armed unit is something an aggregator-src bump added that "
