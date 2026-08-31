@@ -1161,6 +1161,55 @@ in
         f"[Install]); is-enabled={health_notify_enabled!r}"
     )
 
+    # ── The unit must NAME the writer; a PATH search can never find one ──
+    #
+    # Measured on dellan 2026-08-31 09:50, this check had NEVER been able to
+    # pass — not on that run, but on any run since it was deployed. Its
+    # Environment= carried only the NixOS default user-unit PATH (coreutils,
+    # findutils, gnugrep, gnused, systemd) and no `aggregator` has ever been
+    # on it, so the probe's PATH fallback found nothing and every single tick
+    # reported "the aggregator WRITER's schema version could not be determined
+    # (looked at no `aggregator` on PATH)" — while recording Result=success.
+    # A detector structurally incapable of a healthy verdict is worse than an
+    # absent one: it occupies the slot.
+    #
+    # Asserted EQUAL TO `agg_cli` — the store path aggregator-ingest.service
+    # actually execs, pulled out of its wrapper above — rather than merely
+    # "looks like a store path". The writer under test has to be THE writer
+    # that stamps the cache; comparing the reader against some other
+    # aggregator answers a question nobody asked, and does it confidently.
+    mw = _re.search(r'Environment="AGGREGATOR_WRITER_BIN=([^"]*)"', health_unit)
+    health_writer = mw.group(1) if mw else ""
+    assert health_writer == agg_cli, (
+        "aggregator-schema-health.service must name the writer explicitly as "
+        f"AGGREGATOR_WRITER_BIN={agg_cli!r} — the same binary "
+        f"aggregator-ingest.service execs. Got {health_writer!r}. An empty "
+        "value means the probe is back to searching a PATH that has never "
+        "contained an `aggregator`, which is exactly the 2026-08-31 defect:\n"
+        f"{health_unit}"
+    )
+
+    # And the name must RESOLVE, here, to something a schema version can be
+    # read out of. Asserting the variable alone would pass against a store
+    # path with no site-packages behind it — which reports UNVERIFIED in
+    # precisely the same way as no variable at all, i.e. the assertion would
+    # be green on the bug. The probe follows the Nix wrapper chain from the
+    # binary to lib/python3*/site-packages/aggregator/core/store.py; this
+    # walks the same hop and requires the constant to be there.
+    dellan.succeed(f"test -x {health_writer}")
+    writer_schema = dellan.succeed(
+        f"inner=$(grep -o '/nix/store/[^\" ]*/bin/aggregator' {health_writer} "
+        "| tail -1); prefix=$(dirname $(dirname $inner)); "
+        "grep -h '^SCHEMA_VERSION' "
+        "$prefix/lib/python3*/site-packages/aggregator/core/store.py"
+    ).strip()
+    assert writer_schema.startswith("SCHEMA_VERSION"), (
+        "the writer named by aggregator-schema-health.service does not lead "
+        "to a readable SCHEMA_VERSION — the probe would report UNVERIFIED on "
+        f"every run, indistinguishably from having no writer at all. Walked "
+        f"{health_writer}, got {writer_schema!r}"
+    )
+
     health_exec = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user cat aggregator-schema-health.service' "
@@ -1226,9 +1275,21 @@ in
         dellan.succeed(
             "rm -f /home/jonathan/.local/state/aggregator/schema-skew-notified"
         )
-        out = dellan.succeed(
+        # `execute`, not `succeed` with `|| true`: the EXIT CODE is half the
+        # assertion now, and swallowing it is how the original defect passed
+        # review. Until 2026-08-31 every verdict — writer behind, cache dead,
+        # could-not-measure — fell through one `exit 0`, so OnFailure never
+        # fired and systemd recorded green while the check had never once been
+        # able to pass. The probe's code is now the unit's code, verbatim.
+        rc, out = dellan.execute(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-            f"AGGREGATOR_SCHEMA_PROBE={stub} {health_exec} 2>&1' || true"
+            f"AGGREGATOR_SCHEMA_PROBE={stub} {health_exec} 2>&1'"
+        )
+        assert rc == code, (
+            f"probe exit {code} must reach systemd unaltered so OnFailure can "
+            f"see it; the unit exited {rc}. Only a VERIFIED-healthy run may "
+            f"exit 0 — 'unknown schema => warn, never fine' is the rule this "
+            f"whole unit exists to apply:\n{out}"
         )
         if needle is None:
             assert out.strip() == "", (
@@ -1264,9 +1325,100 @@ in
         "a missing probe was not announced — a check that goes quiet when its "
         f"own machinery breaks reads as good news:\n{missing_out}"
     )
-    assert missing_rc != 0, (
-        "a missing probe must exit non-zero so the OnFailure edge fires as a "
-        f"second backstop; got rc={missing_rc}:\n{missing_out}"
+    assert missing_rc == 30, (
+        "a missing probe must exit 30 — the probe's own could-not-measure "
+        "code — so it fails the unit, fires the OnFailure edge, and is "
+        "indistinguishable to a caller from every other could-not-measure. "
+        "Not the ad-hoc 1 this used to be: 1 and 2 are reserved for 'the "
+        f"detector itself crashed'. Got rc={missing_rc}:\n{missing_out}"
+    )
+
+    # ── The OnFailure notifier must not become an hourly siren ──
+    #
+    # Making an unhealthy verdict fail the unit has an obvious opposite
+    # failure: `notify-send -u critical` from OnFailure on every tick is a
+    # channel an operator mutes, and a muted channel is the silence we
+    # started from. Before this change the notifier had NO debounce at all,
+    # so exiting non-zero without fixing it would have made things worse.
+    #
+    # Two suppression grounds, and they are asserted separately because they
+    # cover different cases and a single "it stayed quiet" check would pass
+    # with either one broken.
+    health_notify_exec = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat aggregator-schema-health-failure-notify.service' "
+        "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
+    ).strip()
+    marker = "/home/jonathan/.local/state/aggregator/last-announced-invocation"
+    down_stamp = "/home/jonathan/.local/state/aggregator/detector-down-notified"
+
+    # (1) The check already announced THIS run. It stamps its own
+    # $INVOCATION_ID when it speaks; systemd hands the notifier the triggering
+    # unit's id in $MONITOR_INVOCATION_ID. Matching ids mean the verdict is
+    # already in the journal and already toasted under its own 24h debounce,
+    # so a second critical toast about one fault is pure nag.
+    dellan.succeed(f"rm -f {down_stamp}")
+    dellan.succeed("mkdir -p /home/jonathan/.local/state/aggregator")
+    dellan.succeed(f"echo deadbeef > {marker} && chown jonathan {marker}")
+    dup_out = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        f"MONITOR_INVOCATION_ID=deadbeef MONITOR_SERVICE_RESULT=exit-code "
+        f"MONITOR_EXIT_STATUS=10 {health_notify_exec} 2>&1'"
+    )
+    assert "not raising a second notification" in dup_out, (
+        "the OnFailure notifier re-announced a verdict the check had already "
+        f"announced — one fault, two critical toasts, every hour:\n{dup_out}"
+    )
+    dellan.fail(f"test -f {down_stamp}")
+
+    # (2) The check died WITHOUT announcing — killed, reaped by
+    # TimeoutStartSec, dead before it could speak. This is the only case the
+    # notifier's toast is for, and it must survive. A mismatched marker is
+    # the discriminator, so this run differs from the one above by one byte.
+    #
+    # Deliberately NOT branching on the exit status instead: a script that
+    # dies under `set -e` before announcing also exits non-zero with
+    # result=exit-code, and suppressing there would silence the
+    # detector-is-down report entirely — the one report with no other channel.
+    dellan.succeed(f"echo somethingelse > {marker}")
+    down_out = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        f"MONITOR_INVOCATION_ID=deadbeef MONITOR_SERVICE_RESULT=timeout "
+        f"{health_notify_exec} 2>&1'"
+    )
+    assert "not raising a second notification" not in down_out, (
+        "the notifier suppressed a detector-DOWN report. Nothing else covers "
+        f"this case — the check itself never got to speak:\n{down_out}"
+    )
+    assert "aggregator-schema-health FAILED" in down_out, (
+        f"the detector-down journal marker is missing:\n{down_out}"
+    )
+    # ARMED IF AND ONLY IF DELIVERED. An undelivered popup must not buy a day
+    # of silence — the next failing tick has to try again — and a delivered
+    # one must arm, or the debounce does nothing and the toast goes hourly.
+    # Asserted as an equivalence rather than a fixed expectation because
+    # whether this VM has a notification daemon on the session bus is not a
+    # property this test gets to assume: an earlier revision of these
+    # assertions did assume it, and was wrong.
+    delivered = "notify-send failed" not in down_out
+    stamp_armed = dellan.execute(f"test -f {down_stamp}")[0] == 0
+    assert stamp_armed == delivered, (
+        f"the 24h debounce must be armed exactly when the toast was delivered; "
+        f"delivered={delivered}, armed={stamp_armed}. Arming on a failed send "
+        "buys a day of silence for a warning nobody saw; not arming on a "
+        f"successful one makes a standing fault an hourly toast:\n{down_out}"
+    )
+
+    # (3) ...and when a toast HAS been delivered, the 24h stamp suppresses the
+    # next one, so a detector down for a week reports daily, not hourly.
+    dellan.succeed(f"touch {down_stamp} && chown jonathan {down_stamp}")
+    debounced = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        f"MONITOR_SERVICE_RESULT=timeout {health_notify_exec} 2>&1'"
+    )
+    assert "suppressed — already notified within 24h" in debounced, (
+        "the detector-down notifier has no 24h debounce, so a standing fault "
+        f"becomes an hourly critical toast — a channel that gets muted:\n{debounced}"
     )
 
     # ── The 24h debounce, and its recovery path ──
@@ -1289,6 +1441,23 @@ in
         f"AGGREGATOR_SCHEMA_PROBE={healthy_stub} {health_exec}'"
     )
     dellan.fail(f"test -f {stamp}")
+
+    # BOTH stamps, and the second one is the whole reason recovery lives here.
+    # The detector-down stamp is armed by the OnFailure notifier, which by
+    # construction never sees a healthy run — OnFailure only fires on failure
+    # — so it can never clear its own debounce. That is the gap upstream's
+    # mkFailureNotify has and cannot close. This unit runs on a timer, sees
+    # the healthy case, and clears it; without that, a detector that failed,
+    # was fixed, and broke again inside 24h would be silently suppressed the
+    # second time — and the second time is the one that proves the fix did
+    # not hold.
+    dellan.succeed(f"touch {down_stamp} {marker} && chown jonathan {down_stamp} {marker}")
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        f"AGGREGATOR_SCHEMA_PROBE={healthy_stub} {health_exec}'"
+    )
+    dellan.fail(f"test -f {down_stamp}")
+    dellan.fail(f"test -f {marker}")
 
     # ── aggregator embed worker (home/aggregator-embed.nix) ────────────────
     #
