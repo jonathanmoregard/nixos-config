@@ -95,11 +95,22 @@
 #
 # ── Bumping the aggregator ──
 #
-#   nix flake update aggregator-src   # in a nixos-config worktree
+#   # in a nixos-config worktree: edit the rev in flake.nix's
+#   # `aggregator-src.url`, then
+#   nix flake lock
 #   git add -A && git commit && open a PR
 #
-# The rev in flake.lock is the deployed version, full stop. Nothing else
-# needs editing unless the aggregator changes its Python version.
+# NOT `nix flake update aggregator-src`. That instruction stood here and was
+# wrong: the input is fully pinned (`github:owner/repo/<rev>`), so
+# re-resolving it yields the same rev and the same narHash and the command
+# exits 0 having changed nothing — a bump that looks like it ran and did not.
+# flake.nix carries the same warning at the input; keep the two in step.
+#
+# The rev in flake.lock is the deployed version, full stop, and it is also
+# the SCHEMA VERSION the ingest timer stamps on cache.db — see the note at
+# `aggregator-src` in flake.nix for why a lagging rev kills recall silently.
+# Nothing else needs editing unless the aggregator changes its Python
+# version.
 { pyproject-nix, uv2nix, pyproject-build-systems, src }:
 final: prev:
 let

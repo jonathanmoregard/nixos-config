@@ -64,11 +64,27 @@
     # state before the repo was opened up, and it is kept only as the reason
     # no `access-tokens` line appears here.
     #
+    # THIS REV IS ALSO THE CACHE'S SCHEMA VERSION, and letting it lag is
+    # silent. The rev here is what `aggregator-ingest.timer` runs — the
+    # WRITER — and the writer stamps `PRAGMA user_version` on
+    # ~/.local/share/aggregator/cache.db every 30 minutes. The READER is a
+    # different build: `.mcp.json` launches `aggregator-mcp` with `uv run
+    # --directory ~/Repos/aggregator`, i.e. the live working tree, and the
+    # MCP refuses any cache below its own SCHEMA_VERSION. So when this rev
+    # falls behind the checkout across a schema bump, the writer keeps
+    # re-stamping the OLD version and exiting 0, the reader rejects every
+    # query, and recall is 100% dead with nothing red anywhere. Measured on
+    # 2026-08-30: rev 4cb66f1 was SCHEMA_VERSION = 5 and 34 commits behind a
+    # checkout at 6; the cache sat at user_version = 5 and every
+    # `aggregator_search_memory` call had been failing unnoticed. Fix is
+    # always forward — bump this rev, never teach the reader to accept the
+    # older schema.
+    #
     # The three uv2nix inputs below were already in flake.lock transitively
     # (tts-tool / substack-url-tool / prose-decorate each pull them); the
     # `follows` lines keep them deduplicated to one copy each.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/4cb66f1ac00d57d0d7c9b942a992151ad21f0d52";
+      url = "github:jonathanmoregard/aggregator/efb697856691bf7e6d672a624d14165a2fe0a135";
       flake = false;
     };
 
