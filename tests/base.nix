@@ -467,13 +467,24 @@ in
         "permission-ledger/run-evaluate.sh" in crontab_src
     ), f"permission-ledger run-evaluate.sh reference missing from crontab source:\n{crontab_src}"
 
-    # repo-autosync entries — third instance of the same trap. The
-    # ~/.claude sync was installed with `crontab -` on 2026-08-08 and would
-    # have survived exactly until the next rebuild, like the RSI reviewer
-    # (four months dead) and the permission-ledger evaluator above.
-    assert (
-        "/home/jonathan/.claude/sync-agent.sh" in crontab_src
-    ), f"~/.claude repo-autosync cron entry missing from crontab source:\n{crontab_src}"
+    # ~/.claude must have NO auto-committer. Removed 2026-08-31: the live
+    # checkout is the running configuration, so an unattended 13:47 commit
+    # of whatever a session left half-finished landed on master unreviewed.
+    # Work now happens in worktrees under ~/worktrees/claude-<slug> and
+    # returns via claude-pull.timer, which is fast-forward-only and the only
+    # writer to that checkout.
+    #
+    # Asserted as an ABSENCE on purpose. The three entries above exist
+    # because a `crontab -` install silently died at the next rebuild; this
+    # one is the mirror risk — a re-add would silently restore an unattended
+    # writer to the config the harness reads live.
+    assert not any(
+        "/home/jonathan/.claude/sync-agent.sh" in _cron_command(line)
+        for line in crontab_src.splitlines()
+    ), (
+        "~/.claude must have no auto-commit cron entry — it is read-only, "
+        f"written only by claude-pull:\n{crontab_src}"
+    )
 
     # superpowers is a PUBLIC fork of obra/superpowers and gitignores
     # sync-agent.sh so local automation cannot leak upstream. The in-repo

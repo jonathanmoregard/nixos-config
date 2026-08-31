@@ -174,14 +174,20 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # claude-pull — the pull half of ~/.claude's continuous delivery.
+  # claude-pull — the ONLY writer to ~/.claude, as of 2026-08-31.
   #
-  # ~/.claude had a push side and no pull side: sync-agent.sh (cron,
-  # 13:47) auto-commits and pushes, but nothing brought origin's commits
-  # back down. A PR merged in the GitHub UI therefore never reached the
+  # It began as the pull half of a push/pull pair: sync-agent.sh (cron,
+  # 13:47) auto-committed and pushed, but nothing brought origin's
+  # commits back down, so a PR merged in the GitHub UI never reached the
   # checkout that actually runs the config — skills, hooks and settings
-  # sat at the last local commit until someone pulled by hand — and once
-  # both sides had commits the daily push failed non-fast-forward.
+  # sat at the last local commit until someone pulled by hand.
+  #
+  # The push half is now gone (see the crontab block in
+  # home/jonathan-linux.nix for why). ~/.claude is read-only: work
+  # happens in worktrees under ~/worktrees/claude-<slug> and reaches
+  # master through a PR, and this timer is what brings it back down.
+  # That makes fast-forward-only a load-bearing property rather than a
+  # nicety — nothing local should ever diverge for it to reconcile.
   #
   # Same split as claude-idle-handoff above: the TIMER and SERVICE are
   # declared here so a fresh rebuild re-creates the schedule, while the
