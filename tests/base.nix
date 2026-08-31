@@ -361,6 +361,116 @@ in
     ).strip()
     rsi_cfg_dir = "/home/jonathan/.claude/recursive-self-improvement/config"
 
+    # WHERE the reviewer writes. Until now nothing in this file asserted
+    # on it: the crontab entry above and the components.daily_review gate
+    # below are both indifferent to the destination, so a completely
+    # broken dest= would have sailed through this lane green. ~/.claude is
+    # the live config repo the harness reads, and a nightly writer inside
+    # it dirtied `git status` every morning until PR #202 removed the
+    # auto-committer that papered over it; the state-dir sink is what
+    # actually stops the dirtying. Asserted as the literal absolute path
+    # because it must NOT be reached through the compatibility symlink
+    # under ~/.claude — a writer that depends on a symlink existing is a
+    # writer that fails silently on a machine where it does not.
+    rsi_script = dellan.succeed(f"cat {rsi_bin}")
+    assert (
+        'dest="$HOME/.local/state/claude-proposals/rsi"' in rsi_script
+    ), f"reviewer must write proposals to the state-dir sink:\n{rsi_script}"
+    # The negative half, and it is the one that has teeth: re-adding the
+    # legacy write target — in code OR in a comment quoting it — fails
+    # the gate rather than silently resuming the nightly dirtying.
+    assert "recursive-self-improvement/proposals" not in rsi_script, (
+        "the reviewer must not reference the legacy in-repo proposals "
+        f"path as a write target:\n{rsi_script}"
+    )
+
+    # The two assertions above cover the WRAPPER, and the sink it pipes
+    # into is a different store path — so on their own they are the
+    # render-and-grep anti-pattern that let PR #57 merge broken. Exercise
+    # the real sink binary the way the wrapper calls it: <root>/rsi as
+    # dest, dedup ledger at <root>/.index.jsonl.
+    # `:` excluded from the character classes on purpose: the sink is
+    # named inside the wrapper's `export PATH="a/bin:b/bin:..."` line, so
+    # a class that admits colons swallows the whole PATH and yields an
+    # unrunnable command.
+    sink_bin = dellan.succeed(
+        "grep -o '/nix/store/[^:\"]*rsi-proposal-sink[^:\"]*/bin' "
+        f"{rsi_bin} | head -1"
+    ).strip() + "/rsi-proposal-sink"
+    sink_root = dellan.succeed("mktemp -d").strip()
+    # Night one. Deliberately arrives already REJECTED: a ledger that
+    # only records pending proposals lets every rejected one regenerate
+    # forever, which is the failure the ledger exists to prevent.
+    dellan.succeed(
+        "cat > %s/night1.txt <<'PROBE_EOF'\n"
+        "===PROPOSAL: 2026-08-31-gate-probe.md===\n"
+        "---\n"
+        "status: rejected\n"
+        "date: 2026-08-31\n"
+        "source_sessions:\n"
+        "  - 11112222-3333-4444-5555-666677778888\n"
+        "---\n"
+        "\n"
+        "## Problem\n"
+        "The reviewer used to write proposals into the live config repo.\n"
+        "===END PROPOSAL===\n"
+        "PROBE_EOF\n" % sink_root
+    )
+    night1 = dellan.succeed(
+        f"{sink_bin} {sink_root}/rsi < {sink_root}/night1.txt"
+    )
+    assert "sink: wrote 2026-08-31-gate-probe.md" in night1, (
+        f"the sink must publish a fresh proposal:\n{night1}"
+    )
+    ledger = dellan.succeed(f"cat {sink_root}/.index.jsonl").strip()
+    for key in [
+        '"file": "2026-08-31-gate-probe.md"',
+        '"status": "rejected"',
+        '"session": "11112222-3333-4444-5555-666677778888"',
+        '"evidence": "The reviewer used to write proposals',
+    ]:
+        assert key in ledger, (
+            f"the ledger line must carry {key} — evidence is a verbatim "
+            "excerpt because Claude Code keys project storage on a slug "
+            "derived from the literal cwd, so a moved repo orphans a "
+            f"transcript path while the excerpt survives:\n{ledger}"
+        )
+    # The human drains the rejected proposal away, so the filename guard
+    # can no longer help. Only the ledger can.
+    dellan.succeed(f"rm -f {sink_root}/rsi/2026-08-31-gate-probe.md")
+    # Night two: same observation, fresh date prefix, fresh frontmatter
+    # date, an intake-gate annotation block, one word emphasised. All of
+    # that must be normalised away, leaving the same content id.
+    dellan.succeed(
+        "cat > %s/night2.txt <<'PROBE_EOF'\n"
+        "===PROPOSAL: 2026-09-01-gate-probe.md===\n"
+        "---\n"
+        "status: pending\n"
+        "date: 2026-09-01\n"
+        "source_sessions:\n"
+        "  - 11112222-3333-4444-5555-666677778888\n"
+        "gate:\n"
+        "  verdict: sharp\n"
+        "  date: \"2026-09-01\"\n"
+        "---\n"
+        "\n"
+        "## Problem\n"
+        "The reviewer **used** to write proposals into the live config "
+        "repo.\n"
+        "===END PROPOSAL===\n"
+        "PROBE_EOF\n" % sink_root
+    )
+    night2 = dellan.succeed(
+        f"{sink_bin} {sink_root}/rsi < {sink_root}/night2.txt"
+    )
+    assert "skipped duplicate" in night2 and "(rejected)" in night2, (
+        "a proposal already ruled on must be skipped by content id at "
+        f"ANY status, rejected included:\n{night2}"
+    )
+    assert "sink: done, 0 proposal(s) written" in night2, (
+        f"nothing may be written on the duplicate night:\n{night2}"
+    )
+
     def run_rsi(expect_ok=True):
         cmd = f"su - jonathan -c {rsi_bin} 2>&1"
         return dellan.succeed(cmd) if expect_ok else dellan.fail(cmd)
