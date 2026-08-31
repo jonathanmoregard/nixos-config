@@ -2045,6 +2045,100 @@ in
             f"claude-pull.service lost '{marker}':\n{pull_service}"
         )
 
+    # claude-marketplace-pull — the same puller, second target.
+    #
+    # ~/.claude/plugins/marketplaces/jonathanmoregard is an INDEPENDENT nested
+    # checkout: `plugins/` is gitignored in ~/.claude, so claude-pull.timer
+    # above never touched it however often it ran. It is also the tree the
+    # harness actually resolves plugins from, which is why it going stale is
+    # worse than ~/.claude going stale — measured 2026-08-31 at 35 commits
+    # behind origin, meaning every session in that window served skills,
+    # commands and agents from an old tree while reporting success.
+    #
+    # A sibling unit rather than a loop inside claude-pull.sh, because the two
+    # repos are independent failure domains: `set -euo pipefail` plus the
+    # script's `exit 1` on any unresolvable state means one target's problem
+    # would abort the other's pull, and systemd could no longer say WHICH repo
+    # is red. Reusing the script through CLAUDE_PULL_REPO keeps a single
+    # implementation of the careful part (bounded fetch, fast-forward-only,
+    # lock sharing with sync-agent.sh, alert debounce).
+    assert "claude-marketplace-pull.timer" in timers, (
+        f"claude-marketplace-pull.timer missing from user timer list:\n{timers}"
+    )
+    mkt_timer = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-marketplace-pull.timer'"
+    )
+    for marker in [
+        "OnCalendar=*:5/10",
+        "Persistent=true",
+        "Unit=claude-marketplace-pull.service",
+    ]:
+        assert marker in mkt_timer, (
+            f"claude-marketplace-pull.timer lost '{marker}':\n{mkt_timer}"
+        )
+    for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
+        got = dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"systemctl --user {prop} claude-marketplace-pull.timer'"
+        ).strip()
+        assert got == expected, (
+            f"claude-marketplace-pull.timer {prop}={got!r}, expected "
+            f"{expected!r} — the marketplace clone would silently go stale "
+            f"again, and every plugin in it with it"
+        )
+    mkt_service = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-marketplace-pull.service'"
+    )
+    for marker in [
+        "Type=oneshot",
+        "ExecStart=%h/.claude/scripts/claude-pull.sh",
+        "TimeoutStartSec=",
+    ]:
+        assert marker in mkt_service, (
+            f"claude-marketplace-pull.service lost '{marker}':\n{mkt_service}"
+        )
+
+    # The target, and the reason this assertion is specific rather than a
+    # substring check on the directory name.
+    #
+    # `%h` is expanded in ExecStart= and NOT in Environment=. Measured on this
+    # host before writing this:
+    #
+    #     $ systemd-run --user --wait --pipe -p 'Environment=PROBE=%h/marker' \
+    #           /bin/sh -c 'echo "EXPANDED: $PROBE"'
+    #     EXPANDED: %h/marker
+    #
+    # So the obvious spelling, copied from the ExecStart line two units up,
+    # hands the script a RELATIVE path named "%h" and it pulls a directory
+    # that does not exist — the exact silent staleness this unit exists to
+    # end, reintroduced by a specifier that looks right. The path is therefore
+    # interpolated at build time from config.home.homeDirectory, and this
+    # asserts both halves: the real absolute path is present, and no unexpanded
+    # specifier survives anywhere in the unit's environment block.
+    mkt_env = [
+        line for line in mkt_service.splitlines() if line.startswith("Environment=")
+    ]
+    assert mkt_env, (
+        f"claude-marketplace-pull.service has no Environment= line, so the "
+        f"script would default to pulling ~/.claude instead of the "
+        f"marketplace clone:\n{mkt_service}"
+    )
+    assert any(
+        "CLAUDE_PULL_REPO=/home/jonathan/.claude/plugins/marketplaces/jonathanmoregard"
+        in line
+        for line in mkt_env
+    ), (
+        f"claude-marketplace-pull.service does not point CLAUDE_PULL_REPO at "
+        f"the marketplace clone by absolute path:\n{mkt_env}"
+    )
+    assert not any("%h" in line for line in mkt_env), (
+        f"claude-marketplace-pull.service leaves an unexpanded %h in "
+        f"Environment= — systemd does not expand specifiers there, so the "
+        f"script would receive a relative path and pull nothing:\n{mkt_env}"
+    )
+
     # sota-watch-refresh-roster — parallel unit + timer that refreshes
     # the AI power-users roster from the source Google Sheet ahead of
     # the research runner. Same guard-path shape as sota-watch: missing
