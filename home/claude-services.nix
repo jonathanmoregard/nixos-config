@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ config, pkgs, ... }:
 # Claude-related user services. Captured from live host on 2026-04-27 — these
 # units were installed imperatively (~/.config/systemd/user/) and would be
 # lost on a fresh rebuild without this declarative copy.
@@ -230,6 +230,88 @@ in
       AccuracySec = "1min";
       RandomizedDelaySec = "1min";
       Unit = "claude-pull.service";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # claude-marketplace-pull — the same puller, second target.
+  #
+  # ~/.claude/plugins/marketplaces/jonathanmoregard is an INDEPENDENT nested
+  # git checkout: `plugins/` is gitignored in ~/.claude, so claude-pull above
+  # never touched it however often it ran. It is also the tree the harness
+  # actually resolves plugins from, which makes it going stale worse than
+  # ~/.claude going stale — measured 2026-08-31 at 35 commits behind origin,
+  # meaning every session in that window served skills, commands and agents
+  # from an old tree while reporting success. Merged plugin work simply never
+  # reached the running harness.
+  #
+  # A SIBLING UNIT, not a loop inside claude-pull.sh. The script is
+  # `set -euo pipefail` and exits 1 on any state it will not resolve by force,
+  # so a single unit iterating over both repos would let one target's problem
+  # abort the other's pull — and systemd could no longer say which repo is red,
+  # nor could `journalctl --user -u <unit>` separate them. Two units, two
+  # failure domains, one implementation of the careful part: bounded fetch,
+  # fast-forward-only, the lock shared with sync-agent.sh, alert debounce.
+  # CLAUDE_PULL_REPO is the seam the script already exposes for exactly this.
+  #
+  # Fast-forward-only is load-bearing here for a reason ~/.claude does not
+  # have: this clone deliberately carries a local dev overlay (an untracked
+  # symlink to a live superpowers checkout). `git pull --ff-only` refuses when
+  # local work is in the way and changes nothing, which is the correct outcome
+  # — the overlay outranks an automated update. That refusal is REPORTED, never
+  # forced: never a reset, never a stash. The report reaches a Claude session
+  # through hooks/claude-pull-health.py in the ~/.claude repo, which reads the
+  # status records this script writes; a desktop toast alone would leave every
+  # session blind to it, which is the failure this whole pair of changes ends.
+  systemd.user.services.claude-marketplace-pull = {
+    Unit = {
+      Description = "Fast-forward the Claude plugin marketplace clone to origin";
+      After = [ "default.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # %h expands to $HOME under home-manager's systemd --user.
+      ExecStart = "%h/.claude/scripts/claude-pull.sh";
+      # ABSOLUTE path, interpolated at build time, NOT "%h/...". systemd
+      # expands specifiers in ExecStart= but NOT in Environment=. Measured on
+      # this host before writing this line:
+      #
+      #   $ systemd-run --user --wait --pipe -p 'Environment=PROBE=%h/marker' \
+      #         /bin/sh -c 'echo "EXPANDED: $PROBE"'
+      #   EXPANDED: %h/marker
+      #
+      # Copying the ExecStart spelling here would hand the script a relative
+      # path literally named "%h", it would pull a directory that does not
+      # exist, and the marketplace clone would keep silently rotting — the
+      # exact failure this unit exists to end, reintroduced by a specifier that
+      # looks right. tests/base.nix asserts the absolute path AND the absence
+      # of any surviving "%h" in this unit's environment block.
+      Environment = [
+        "CLAUDE_PULL_REPO=${config.home.homeDirectory}/.claude/plugins/marketplaces/jonathanmoregard"
+      ];
+      # Background maintenance — never compete with an interactive session.
+      Nice = 10;
+      IOSchedulingClass = "idle";
+      # The script bounds its own fetch at 60s; this is the backstop for a
+      # hang anywhere else in the run.
+      TimeoutStartSec = 180;
+    };
+  };
+
+  systemd.user.timers.claude-marketplace-pull = {
+    Unit.Description = "Poll origin for merged marketplace PRs every 10 minutes";
+    Timer = {
+      # Same cadence as claude-pull and the same reason for OnCalendar over
+      # OnUnitActiveSec (Persistent= only applies to calendar timers, and this
+      # is a laptop that suspends). Offset five minutes so the two pullers do
+      # not fetch GitHub in the same breath on every tick — they share no lock,
+      # being different repos, so the stagger is about network and wakeups
+      # rather than correctness.
+      OnCalendar = "*:5/10";
+      Persistent = true;
+      AccuracySec = "1min";
+      RandomizedDelaySec = "1min";
+      Unit = "claude-marketplace-pull.service";
     };
     Install.WantedBy = [ "timers.target" ];
   };
