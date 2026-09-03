@@ -80,11 +80,23 @@
     # always forward — bump this rev, never teach the reader to accept the
     # older schema.
     #
+    # As of rev 9d4e902 that failure mode is no longer SILENT — it is refused.
+    # `migrate()` and `rebuild_all()` will not lower `PRAGMA user_version`;
+    # meeting a cache stamped above their own SCHEMA_VERSION they raise
+    # `SchemaAheadError` and write nothing, so a lagging rev now fails the
+    # ingest unit visibly instead of re-stamping the cache down and exiting 0.
+    # The remedy is unchanged and still forward-only (bump this rev); what
+    # changed is that neglecting it goes red instead of going quiet. Both revs
+    # either side of this bump are SCHEMA_VERSION = 6, so this particular bump
+    # is not itself a schema move — it carries the refusal, the every-tick
+    # `database is locked` fix between the ingest and embed timers, and
+    # `aggregator/health/schema_probe.py`, the probe that reports the skew.
+    #
     # The three uv2nix inputs below were already in flake.lock transitively
     # (tts-tool / substack-url-tool / prose-decorate each pull them); the
     # `follows` lines keep them deduplicated to one copy each.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/efb697856691bf7e6d672a624d14165a2fe0a135";
+      url = "github:jonathanmoregard/aggregator/9d4e9022fd0b788b4684ba66c16b5c9445f3faa4";
       flake = false;
     };
 
