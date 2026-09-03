@@ -40,13 +40,18 @@ let
   # and persists them. Proposer emits, pipeline persists.
   #
   # The sink enforces: basename-only *.md filenames (no traversal), no
-  # overwrite of existing proposals, 64 KiB body cap, 10 proposals per
-  # run. Model output is downstream of untrusted transcript content, so
-  # every one of these is a security boundary, not tidiness.
+  # overwrite of existing proposals, content-id dedup against the sink's
+  # ledger, atomic publish, 64 KiB body cap, 10 proposals per run. Model
+  # output is downstream of untrusted transcript content, so every one of
+  # these is a security boundary, not tidiness.
   rsiProposalSink = pkgs.writers.writePython3Bin "rsi-proposal-sink" { } ''
+    import datetime
+    import hashlib
+    import json
     import os
     import re
     import sys
+    import tempfile
     from pathlib import Path
 
     # Exit codes: 0 clean; 2 anomaly (reject/truncation/missing-END) so
@@ -57,8 +62,18 @@ let
     # crash the sink on non-ASCII prose.
     sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     dest = Path(sys.argv[1])
-    # mode applies to the LEAF only (parents get umask); fine here, the
-    # parent chain lives under ~/.claude which is already 0700.
+    # The dedup ledger belongs to the SINK ROOT, not to one category:
+    # production hands us <root>/rsi and every category subdir shares
+    # <root>/.index.jsonl. Derived from dest rather than taken as a
+    # second argument so exactly one place decides where it lives.
+    index_path = dest.parent / ".index.jsonl"
+    # mode applies to the LEAF only, and only when this call is the one
+    # that creates it — the wrapper's `mkdir -p` usually gets there first
+    # and umask wins. The parent chain is ~/.local/state, not the 0700
+    # ~/.claude this used to live under, so the directory mode is no
+    # longer the boundary: the 0600 the files below are created with is,
+    # and it is what keeps model output shaped by untrusted transcript
+    # material out of other users' reach.
     dest.mkdir(parents=True, exist_ok=True, mode=0o700)
     # 2 MiB stdin cap: 10 proposals x 64 KiB bodies + delimiter/prose
     # slack. A runaway model can't OOM the sink or the scan.
@@ -97,6 +112,110 @@ let
     if name is not None:
         print("sink: rejected %r (missing END marker)" % name)
         anomalies += 1
+
+    # --- content-derived identity -----------------------------------
+    # A proposal's identity is derived from its CONTENT, not from its
+    # filename.
+    # The reviewer re-derives the same observation on a later night under
+    # a fresh YYYY-MM-DD- prefix, so a filename-keyed guard lets every
+    # rejected proposal come back forever and the queue never converges
+    # (Renovate's documented failure mode). Normalization, in order:
+    #   1. the YAML frontmatter is dropped WHOLE — it carries the date,
+    #      the status, source-session ids and the intake gate's
+    #      annotation block, every one of which moves between nights for
+    #      the same underlying observation;
+    #   2. the title is the filename minus its YYYY-MM-DD- prefix and
+    #      .md suffix, i.e. the slug the model chose for the
+    #      observation;
+    #   3. the body is lowercased, every character outside [a-z0-9 ] is
+    #      dropped so markdown emphasis, punctuation and list markers
+    #      cannot move the id, and whitespace runs collapse to one
+    #      space.
+    # Property that matters, and the only one claimed: regenerating the
+    # SAME proposal yields the same id, so the ledger lookup below
+    # catches it. What this deliberately does NOT claim is robustness to
+    # re-worded prose — it is a hash, so a model that restates the same
+    # observation in different sentences produces a different id and the
+    # proposal comes back. Two things cover that residue: the filename
+    # guard below (the model reuses slugs), and prompt.md telling the
+    # reviewer to read the existing proposals of every status before
+    # proposing. Closing it properly needs similarity matching, which is
+    # a scoring change and does not belong in a relocation.
+    fm_re = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
+    date_prefix = re.compile(r"^\d{4}-\d{2}-\d{2}-")
+    problem_re = re.compile(
+        r"^#+[ \t]*Problem[ \t]*\n(.*?)(?=\n#|\Z)",
+        re.DOTALL | re.MULTILINE | re.IGNORECASE,
+    )
+    session_re = re.compile(
+        r"^source_sessions:[ \t]*\n[ \t]*-[ \t]*(\S+)", re.MULTILINE
+    )
+
+
+    def split_fm(text):
+        m = fm_re.match(text)
+        return (m.group(0), text[m.end():]) if m else ("", text)
+
+
+    def fm_field(fm, key):
+        pat = r"^%s:[ \t]*(.*?)[ \t]*$" % re.escape(key)
+        m = re.search(pat, fm, re.MULTILINE)
+        return m.group(1).strip().strip("\"'") if m else ""
+
+
+    def content_id(fname, text):
+        stem = fname[:-3] if fname.endswith(".md") else fname
+        title = date_prefix.sub("", stem)
+        norm = re.sub(r"[^a-z0-9 ]+", " ", split_fm(text)[1].lower())
+        payload = "%s\n\n%s" % (title, " ".join(norm.split()))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+    def evidence(text):
+        # A verbatim excerpt, never a transcript path: Claude Code keys
+        # project storage on a slug derived from the literal working
+        # directory string, so a moved or renamed repo orphans the path
+        # while the excerpt stays readable forever.
+        body = split_fm(text)[1]
+        m = problem_re.search(body)
+        return " ".join((m.group(1) if m else body).split())[:240]
+
+
+    # Existing ledger, read once. A torn or hand-edited line must not
+    # blind the whole dedup pass, so it is counted and skipped.
+    seen = {}
+    try:
+        with open(index_path, encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                if not ln.strip():
+                    continue
+                try:
+                    row = json.loads(ln)
+                except ValueError:
+                    print("sink: WARNING unparseable ledger line ignored")
+                    anomalies += 1
+                    continue
+                if isinstance(row, dict) and row.get("id"):
+                    seen[row["id"]] = row.get("status") or "unknown"
+    except FileNotFoundError:
+        pass
+    # O_APPEND makes "seek to end, then write" a single atomic step in
+    # the kernel, and each record below goes out as exactly one complete
+    # line in one os.write(), so a concurrent writer cannot interleave
+    # half a record into another's. That is why there is no lockfile: a
+    # stale lock would silently disable dedup, which is the one failure
+    # this ledger exists to prevent.
+    index_fd = None
+    try:
+        index_fd = os.open(
+            index_path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+    except OSError as exc:
+        print("sink: WARNING ledger unwritable (%s): %s" % (index_path, exc))
+        anomalies += 1
+
     written = 0
     for fname, body_s in blocks:
         if written >= 10:
@@ -112,20 +231,113 @@ let
             print("sink: rejected oversized body for %s" % fname)
             anomalies += 1
             continue
-        # O_EXCL: atomic create-or-skip, no exists()/write TOCTOU window;
-        # 0600 because content is model output shaped by untrusted
-        # transcript material.
-        try:
-            fd = os.open(
-                dest / fname,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
-        except FileExistsError:
-            print("sink: skipped existing %s" % fname)
+        cid = content_id(fname, body_s)
+        if cid in seen:
+            # The enforcement half of the ledger, and it deliberately
+            # ignores status: an id at ANY status — rejected and
+            # implemented included — means this observation has already
+            # been raised once and must not be raised again.
+            # The status in the message is the value recorded when the
+            # proposal was first written, which is whatever the model
+            # put in frontmatter (in practice always "pending"). Keeping
+            # it current when a human rejects or implements belongs to
+            # the drain, not to this writer — so read it as provenance,
+            # not as the human's ruling. The skip never depends on it.
+            print("sink: skipped duplicate %s (%s)" % (cid, seen[cid]))
             continue
-        with os.fdopen(fd, "wb") as f:
-            f.write(body)
+        # Atomicity and create-or-skip in ONE step. The body goes to a
+        # dotfile tmp beside its destination and is fsynced FIRST, then
+        # published under its real name with link(2), which fails EEXIST
+        # rather than clobbering. os.replace() cannot be used here:
+        # rename(2) overwrites silently, so buying atomicity that way
+        # would sell the skip-existing guard. Consequence: a crash before
+        # the link leaves only a dotfile the *.md readers ignore, a crash
+        # after it leaves a complete proposal, and there is no window in
+        # which a truncated .md is visible to triage. The directory entry
+        # is deliberately not fsynced — a power cut may lose a proposal,
+        # which is fine because it regenerates, but it can never expose a
+        # half-written one, which is not.
+        #
+        # mkstemp, not a pid-suffixed name: a run killed mid-write leaves
+        # its tmp behind (that is the point — no finally block runs), and
+        # a pid-derived name would collide with that leftover after pid
+        # reuse and crash the next night's sink outright. mkstemp also
+        # creates 0600. Leftovers are dotfiles, so every *.md reader
+        # ignores them; they are left in place rather than swept, because
+        # a sweeper deleting files in a data directory is a worse risk
+        # than the tidiness it buys.
+        #
+        # Every I/O failure below is contained to the one proposal it
+        # belongs to. An hour of headless Opus already went into this
+        # batch, so a single ENOSPC or EIO must cost one proposal, not
+        # the other nine — the pre-containment code let one OSError
+        # unwind the whole loop and drop the night on the floor.
+        try:
+            fd, tmp_s = tempfile.mkstemp(
+                prefix=".%s.tmp-" % fname, dir=str(dest)
+            )
+        except OSError as exc:
+            print("sink: could not publish %s: %s" % (fname, exc))
+            anomalies += 1
+            continue
+        tmp = Path(tmp_s)
+        published = False
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            os.link(tmp, dest / fname)
+            published = True
+        except FileExistsError:
+            # Second line of defence, kept: a filename can collide with
+            # a proposal this ledger never saw (pre-ledger files, a
+            # hand-written one, a drained-and-restored one). Must stay
+            # ahead of the OSError arm below — it is a subclass.
+            print("sink: skipped existing %s" % fname)
+        except OSError as exc:
+            print("sink: could not publish %s: %s" % (fname, exc))
+            anomalies += 1
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        if not published:
+            continue
+        fm = split_fm(body_s)[0]
+        record = {
+            "id": cid,
+            "file": fname,
+            "date": (
+                fm_field(fm, "date")
+                or datetime.date.today().isoformat()
+            ),
+            # Recorded whatever the status is. A rejected proposal
+            # missing from the ledger regenerates every single night.
+            "status": fm_field(fm, "status") or "unknown",
+            "session": (
+                session_re.search(fm).group(1)
+                if session_re.search(fm) else ""
+            ),
+            "evidence": evidence(body_s),
+        }
+        seen[cid] = record["status"]
+        if index_fd is not None:
+            line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+            try:
+                os.write(index_fd, (line + "\n").encode("utf-8"))
+            except OSError as exc:
+                # Ledger append comes AFTER the publish on purpose: the
+                # other order would suppress a proposal that then failed
+                # to appear. The cost of this order is that a lost line
+                # means one regeneration next night; the cost of the
+                # other is a proposal silently dead forever.
+                print(
+                    "sink: could not record %s in the ledger: %s"
+                    % (fname, exc)
+                )
+                anomalies += 1
         written += 1
         print("sink: wrote %s" % fname)
     print("sink: done, %d proposal(s) written" % written)
@@ -139,7 +351,15 @@ let
     runtimeInputs = [ rsiProposalSink pkgs.coreutils pkgs.jq ];
     text = ''
       prompt_file="$HOME/.claude/recursive-self-improvement/config/prompt.md"
-      dest="$HOME/.claude/recursive-self-improvement/proposals"
+      # Proposals land in the state-dir sink, NOT in ~/.claude. ~/.claude
+      # is the live config repo the harness reads; a nightly writer inside
+      # it dirtied `git status` every morning until PR #202 removed the
+      # auto-committer that papered over it, and this line is what
+      # actually stops the dirtying. Spelled out in full rather than
+      # resolved through the compatibility symlink under ~/.claude: a
+      # writer that depends on a symlink existing is a writer that fails
+      # silently on a fresh machine, where it does not.
+      dest="$HOME/.local/state/claude-proposals/rsi"
       config_file="$HOME/.claude/recursive-self-improvement/config/config.json"
       # Component gate, and it runs FIRST — before the claude lookup, before
       # the prompt read, before anything that could fail for an unrelated
@@ -186,6 +406,19 @@ let
         echo "rsi-daily-review: $prompt_file is ''${psize}B (>100KiB cap); refusing (ARG_MAX)" >&2
         exit 1
       fi
+      # Create the sink up front, before the hour-long model call rather
+      # than after it: on a fresh machine the state dir does not exist,
+      # and discovering that at the sink step would throw away the run.
+      # The python sink mkdir()s too — this is the cheap early failure.
+      # Deliberately no `-m 700`: with -p that mode reaches only the
+      # deepest component (shellcheck SC2174), the sink root above it
+      # already exists at the umask default, and `install -d` would chmod
+      # every existing ancestor up to ~/.local. The 0600 file mode the
+      # sink sets is the boundary that actually matters for content.
+      mkdir -p "$dest" || {
+        echo "rsi-daily-review: cannot create proposal sink $dest" >&2
+        exit 1
+      }
       # Derive XDG_RUNTIME_DIR up front (cron doesn't set it): mktemp
       # below and the bus check both depend on it — deriving it late
       # would silently send mktemp to /tmp on every cron run.
@@ -246,8 +479,19 @@ let
       sink_rc=0
       rsi-proposal-sink "$dest" < "$raw" || sink_rc=$?
       if [ "$sink_rc" -ne 0 ]; then
-        keep="$HOME/.claude/logs/rsi-raw-failed-$(date +%Y%m%dT%H%M%S).txt"
-        cp "$raw" "$keep" || echo "rsi-daily-review: could not preserve raw output to $keep" >&2
+        # Forensics land in the state dir, not ~/.claude/logs. That
+        # directory's .gitignore covers logs/*.log and nothing else, so
+        # the old .txt name left an UNTRACKED file in the live config
+        # repo on every anomaly night — the same dirtying this whole
+        # change exists to stop, just on a rarer schedule. Moving it out
+        # of the repo entirely beats renaming it to .log: the content is
+        # raw model output derived from untrusted transcripts and has no
+        # business inside the config the harness reads.
+        keep_dir="$HOME/.local/state/rsi-daily-review"
+        keep="$keep_dir/rsi-raw-failed-$(date +%Y%m%dT%H%M%S).txt"
+        mkdir -p "$keep_dir" \
+          && cp "$raw" "$keep" \
+          || echo "rsi-daily-review: could not preserve raw output to $keep" >&2
         if [ "$sink_rc" -eq 2 ]; then
           # Anomalies (rejects/truncation/missing-END) but the run itself
           # succeeded — keep forensics, don't fail the cron entry.
