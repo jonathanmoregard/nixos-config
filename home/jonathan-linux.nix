@@ -330,11 +330,25 @@ in
     # not live inside; nothing needs to exist in the public tree.
     37 15 * * * SYNC_REPO=/home/jonathan/Repos/superpowers /home/jonathan/.claude/skills/repo-autosync/sync-agent.sh >> /home/jonathan/Repos/superpowers/sync.log 2>&1
     11 16 * * * /home/jonathan/Repos/aggregator/sync-agent.sh >> /home/jonathan/Repos/aggregator/sync.log 2>&1
-    # ~/.claude auto-commit + push. Declared here rather than via
-    # `crontab -` because installCrontab rewrites the live crontab on
-    # every rebuild — the same trap that killed the RSI reviewer for four
-    # months and swallowed the permission-ledger entry.
-    47 13 * * * /home/jonathan/.claude/sync-agent.sh >> /home/jonathan/.claude/sync.log 2>&1
+    # ~/.claude auto-commit + push: REMOVED 2026-08-31, deliberately.
+    #
+    # It ran `47 13 * * * ~/.claude/sync-agent.sh`, spawning an agent to
+    # commit and push whatever happened to be in the live checkout. That
+    # makes ~/.claude a writable working tree with an unattended author,
+    # and the working tree IS the running configuration — the harness
+    # reads settings.json, hooks/* and skills/* from it live. Whatever a
+    # session left half-finished at 13:47 became a commit on master with
+    # nobody reviewing it.
+    #
+    # ~/.claude is now read-only: work happens in worktrees under
+    # ~/worktrees/claude-<slug>, reaches master through a PR, and comes
+    # back down via claude-pull.timer (see home/claude-services.nix),
+    # which is fast-forward-only and is now the ONLY writer to that
+    # checkout. Nothing replaces the push half, because there is no
+    # longer meant to be one.
+    #
+    # Deliberately not commented-out-in-place: a dormant cron line is an
+    # invitation to re-enable without re-reading why it went.
     # Recursive Self-Improvement daily reviewer. The plugin's install.sh
     # tries to install this via `crontab -e`, which loses on every
     # nixos-rebuild switch (activation hook `installCrontab` below
