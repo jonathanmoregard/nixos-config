@@ -361,6 +361,116 @@ in
     ).strip()
     rsi_cfg_dir = "/home/jonathan/.claude/recursive-self-improvement/config"
 
+    # WHERE the reviewer writes. Until now nothing in this file asserted
+    # on it: the crontab entry above and the components.daily_review gate
+    # below are both indifferent to the destination, so a completely
+    # broken dest= would have sailed through this lane green. ~/.claude is
+    # the live config repo the harness reads, and a nightly writer inside
+    # it dirtied `git status` every morning until PR #202 removed the
+    # auto-committer that papered over it; the state-dir sink is what
+    # actually stops the dirtying. Asserted as the literal absolute path
+    # because it must NOT be reached through the compatibility symlink
+    # under ~/.claude — a writer that depends on a symlink existing is a
+    # writer that fails silently on a machine where it does not.
+    rsi_script = dellan.succeed(f"cat {rsi_bin}")
+    assert (
+        'dest="$HOME/.local/state/claude-proposals/rsi"' in rsi_script
+    ), f"reviewer must write proposals to the state-dir sink:\n{rsi_script}"
+    # The negative half, and it is the one that has teeth: re-adding the
+    # legacy write target — in code OR in a comment quoting it — fails
+    # the gate rather than silently resuming the nightly dirtying.
+    assert "recursive-self-improvement/proposals" not in rsi_script, (
+        "the reviewer must not reference the legacy in-repo proposals "
+        f"path as a write target:\n{rsi_script}"
+    )
+
+    # The two assertions above cover the WRAPPER, and the sink it pipes
+    # into is a different store path — so on their own they are the
+    # render-and-grep anti-pattern that let PR #57 merge broken. Exercise
+    # the real sink binary the way the wrapper calls it: <root>/rsi as
+    # dest, dedup ledger at <root>/.index.jsonl.
+    # `:` excluded from the character classes on purpose: the sink is
+    # named inside the wrapper's `export PATH="a/bin:b/bin:..."` line, so
+    # a class that admits colons swallows the whole PATH and yields an
+    # unrunnable command.
+    sink_bin = dellan.succeed(
+        "grep -o '/nix/store/[^:\"]*rsi-proposal-sink[^:\"]*/bin' "
+        f"{rsi_bin} | head -1"
+    ).strip() + "/rsi-proposal-sink"
+    sink_root = dellan.succeed("mktemp -d").strip()
+    # Night one. Deliberately arrives already REJECTED: a ledger that
+    # only records pending proposals lets every rejected one regenerate
+    # forever, which is the failure the ledger exists to prevent.
+    dellan.succeed(
+        "cat > %s/night1.txt <<'PROBE_EOF'\n"
+        "===PROPOSAL: 2026-08-31-gate-probe.md===\n"
+        "---\n"
+        "status: rejected\n"
+        "date: 2026-08-31\n"
+        "source_sessions:\n"
+        "  - 11112222-3333-4444-5555-666677778888\n"
+        "---\n"
+        "\n"
+        "## Problem\n"
+        "The reviewer used to write proposals into the live config repo.\n"
+        "===END PROPOSAL===\n"
+        "PROBE_EOF\n" % sink_root
+    )
+    night1 = dellan.succeed(
+        f"{sink_bin} {sink_root}/rsi < {sink_root}/night1.txt"
+    )
+    assert "sink: wrote 2026-08-31-gate-probe.md" in night1, (
+        f"the sink must publish a fresh proposal:\n{night1}"
+    )
+    ledger = dellan.succeed(f"cat {sink_root}/.index.jsonl").strip()
+    for key in [
+        '"file": "2026-08-31-gate-probe.md"',
+        '"status": "rejected"',
+        '"session": "11112222-3333-4444-5555-666677778888"',
+        '"evidence": "The reviewer used to write proposals',
+    ]:
+        assert key in ledger, (
+            f"the ledger line must carry {key} — evidence is a verbatim "
+            "excerpt because Claude Code keys project storage on a slug "
+            "derived from the literal cwd, so a moved repo orphans a "
+            f"transcript path while the excerpt survives:\n{ledger}"
+        )
+    # The human drains the rejected proposal away, so the filename guard
+    # can no longer help. Only the ledger can.
+    dellan.succeed(f"rm -f {sink_root}/rsi/2026-08-31-gate-probe.md")
+    # Night two: same observation, fresh date prefix, fresh frontmatter
+    # date, an intake-gate annotation block, one word emphasised. All of
+    # that must be normalised away, leaving the same content id.
+    dellan.succeed(
+        "cat > %s/night2.txt <<'PROBE_EOF'\n"
+        "===PROPOSAL: 2026-09-01-gate-probe.md===\n"
+        "---\n"
+        "status: pending\n"
+        "date: 2026-09-01\n"
+        "source_sessions:\n"
+        "  - 11112222-3333-4444-5555-666677778888\n"
+        "gate:\n"
+        "  verdict: sharp\n"
+        "  date: \"2026-09-01\"\n"
+        "---\n"
+        "\n"
+        "## Problem\n"
+        "The reviewer **used** to write proposals into the live config "
+        "repo.\n"
+        "===END PROPOSAL===\n"
+        "PROBE_EOF\n" % sink_root
+    )
+    night2 = dellan.succeed(
+        f"{sink_bin} {sink_root}/rsi < {sink_root}/night2.txt"
+    )
+    assert "skipped duplicate" in night2 and "(rejected)" in night2, (
+        "a proposal already ruled on must be skipped by content id at "
+        f"ANY status, rejected included:\n{night2}"
+    )
+    assert "sink: done, 0 proposal(s) written" in night2, (
+        f"nothing may be written on the duplicate night:\n{night2}"
+    )
+
     def run_rsi(expect_ok=True):
         cmd = f"su - jonathan -c {rsi_bin} 2>&1"
         return dellan.succeed(cmd) if expect_ok else dellan.fail(cmd)
@@ -2103,6 +2213,100 @@ in
         assert marker in pull_service, (
             f"claude-pull.service lost '{marker}':\n{pull_service}"
         )
+
+    # claude-marketplace-pull — the same puller, second target.
+    #
+    # ~/.claude/plugins/marketplaces/jonathanmoregard is an INDEPENDENT nested
+    # checkout: `plugins/` is gitignored in ~/.claude, so claude-pull.timer
+    # above never touched it however often it ran. It is also the tree the
+    # harness actually resolves plugins from, which is why it going stale is
+    # worse than ~/.claude going stale — measured 2026-08-31 at 35 commits
+    # behind origin, meaning every session in that window served skills,
+    # commands and agents from an old tree while reporting success.
+    #
+    # A sibling unit rather than a loop inside claude-pull.sh, because the two
+    # repos are independent failure domains: `set -euo pipefail` plus the
+    # script's `exit 1` on any unresolvable state means one target's problem
+    # would abort the other's pull, and systemd could no longer say WHICH repo
+    # is red. Reusing the script through CLAUDE_PULL_REPO keeps a single
+    # implementation of the careful part (bounded fetch, fast-forward-only,
+    # lock sharing with sync-agent.sh, alert debounce).
+    assert "claude-marketplace-pull.timer" in timers, (
+        f"claude-marketplace-pull.timer missing from user timer list:\n{timers}"
+    )
+    mkt_timer = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-marketplace-pull.timer'"
+    )
+    for marker in [
+        "OnCalendar=*:5/10",
+        "Persistent=true",
+        "Unit=claude-marketplace-pull.service",
+    ]:
+        assert marker in mkt_timer, (
+            f"claude-marketplace-pull.timer lost '{marker}':\n{mkt_timer}"
+        )
+    for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
+        got = dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"systemctl --user {prop} claude-marketplace-pull.timer'"
+        ).strip()
+        assert got == expected, (
+            f"claude-marketplace-pull.timer {prop}={got!r}, expected "
+            f"{expected!r} — the marketplace clone would silently go stale "
+            f"again, and every plugin in it with it"
+        )
+    mkt_service = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-marketplace-pull.service'"
+    )
+    for marker in [
+        "Type=oneshot",
+        "ExecStart=%h/.claude/scripts/claude-pull.sh",
+        "TimeoutStartSec=",
+    ]:
+        assert marker in mkt_service, (
+            f"claude-marketplace-pull.service lost '{marker}':\n{mkt_service}"
+        )
+
+    # The target, and the reason this assertion is specific rather than a
+    # substring check on the directory name.
+    #
+    # `%h` is expanded in ExecStart= and NOT in Environment=. Measured on this
+    # host before writing this:
+    #
+    #     $ systemd-run --user --wait --pipe -p 'Environment=PROBE=%h/marker' \
+    #           /bin/sh -c 'echo "EXPANDED: $PROBE"'
+    #     EXPANDED: %h/marker
+    #
+    # So the obvious spelling, copied from the ExecStart line two units up,
+    # hands the script a RELATIVE path named "%h" and it pulls a directory
+    # that does not exist — the exact silent staleness this unit exists to
+    # end, reintroduced by a specifier that looks right. The path is therefore
+    # interpolated at build time from config.home.homeDirectory, and this
+    # asserts both halves: the real absolute path is present, and no unexpanded
+    # specifier survives anywhere in the unit's environment block.
+    mkt_env = [
+        line for line in mkt_service.splitlines() if line.startswith("Environment=")
+    ]
+    assert mkt_env, (
+        f"claude-marketplace-pull.service has no Environment= line, so the "
+        f"script would default to pulling ~/.claude instead of the "
+        f"marketplace clone:\n{mkt_service}"
+    )
+    assert any(
+        "CLAUDE_PULL_REPO=/home/jonathan/.claude/plugins/marketplaces/jonathanmoregard"
+        in line
+        for line in mkt_env
+    ), (
+        f"claude-marketplace-pull.service does not point CLAUDE_PULL_REPO at "
+        f"the marketplace clone by absolute path:\n{mkt_env}"
+    )
+    assert not any("%h" in line for line in mkt_env), (
+        f"claude-marketplace-pull.service leaves an unexpanded %h in "
+        f"Environment= — systemd does not expand specifiers there, so the "
+        f"script would receive a relative path and pull nothing:\n{mkt_env}"
+    )
 
     # sota-watch-refresh-roster — parallel unit + timer that refreshes
     # the AI power-users roster from the source Google Sheet ahead of
