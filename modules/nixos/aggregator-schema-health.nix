@@ -81,6 +81,103 @@
 # requirement it reports, and if that tree is missing the probe says so rather
 # than guessing.
 #
+# ── How the WRITER is named, and why it is NOT looked up on PATH ──
+#
+# Measured on dellan 2026-08-31 09:50, this unit had NEVER been able to pass,
+# on any run, on any machine state:
+#
+#   aggregator schema health: aggregator recall health UNVERIFIED
+#   the aggregator WRITER's schema version could not be determined (looked at
+#   no `aggregator` on PATH).
+#
+# A systemd unit starts from a near-empty environment. This unit's PATH is the
+# NixOS default for user units — coreutils, findutils, gnugrep, gnused,
+# systemd — and no `aggregator` has ever been on it. The probe falls back to a
+# PATH search when it is not told which writer to look at, that search found
+# nothing every single time, and the whole check therefore reported UNVERIFIED
+# by construction. A detector that is structurally incapable of a healthy
+# verdict is worse than no detector: it occupies the slot.
+#
+# So the writer is NAMED, as `${pkgs.aggregator}/bin/aggregator`, via the
+# probe's own AGGREGATOR_WRITER_BIN override. Three candidates were weighed:
+#
+#   * `/etc/profiles/per-user/jonathan/bin/aggregator` hard-coded — spells a
+#     username, so it is wrong for any other user and wrong on a fresh machine
+#     until that user's profile has been populated at least once. It is also a
+#     DIFFERENT FACT from the one that matters: the profile entry is what a
+#     human types, not what stamps the cache.
+#   * putting the profile directory on PATH — keeps the ambient dependency and
+#     makes it worse, because it turns a deterministic answer into a search. With
+#     two aggregators reachable the search order silently decides which one gets
+#     called "the writer", and a detector that reports a WRONG number is strictly
+#     worse than one that reports a missing one.
+#   * naming the derivation — chosen. `aggregator-ingest-timer.nix` execs
+#     `lib.getExe pkgs.aggregator`; this is the same expression, so the probe
+#     measures the writer that actually stamps the cache BY CONSTRUCTION rather
+#     than by coincidence. Being in this unit's own closure, it cannot be missing
+#     while the unit exists — the same argument the ingest timer makes when it
+#     drops its checkout guard — which holds on a fresh machine and across every
+#     rebuild, with no activation ordering to get right.
+#
+# THIS IS NOT the "take it from ${aggregator-src}" alternative rejected above,
+# though it looks identical at a glance. That rejection is about where the
+# PROBE — the predicate, the thing that decides — comes from; a predicate
+# shipped from the writer's pin goes stale with the writer and is blind to
+# exactly this class of skew. What is taken from the pin here is the SUBJECT
+# being measured, and the subject must be the pin: measuring anything else
+# measures a writer that is not the one stamping the cache.
+#
+# ── Exit semantics: UNVERIFIED is a FAILURE, not a success ──
+#
+# The same 2026-08-31 run recorded `ExecMainStatus=0`, `Result=success`. Every
+# probe verdict — writer behind, cache dead, could-not-measure — fell through
+# to one `exit 0`. So `OnFailure=` never fired, systemd recorded three days of
+# green, and paired with the 24h toast debounce a permanently broken detector
+# was completely silent. That is the identical shape of the incident this unit
+# was built to catch, reproduced inside the catcher.
+#
+# The probe's exit code is now the UNIT's exit code, passed through verbatim:
+# 0 fine, 10 writer behind, 20 recall dead, 30 could not measure. Only a
+# VERIFIED-healthy run exits 0, which is the "unknown schema => warn, never
+# 'fine'" rule this system already follows, expressed where systemd can see it.
+# Passing the code through rather than collapsing to `exit 1` also carries the
+# verdict to the OnFailure unit in $MONITOR_EXIT_STATUS and to an operator in
+# `systemctl show -p ExecMainStatus`, with no journal parsing — and it keeps 1
+# and 2 free to mean "the detector itself is broken", which is the convention
+# schema_probe.py's own exit-code table states.
+#
+# ── ...without becoming an hourly OnFailure siren ──
+#
+# The opposite failure is real: an hourly `notify-send -u critical` from
+# OnFailure is a channel an operator mutes, and a muted channel is the silence
+# we started from. Two things are deliberately NOT the same kind of signal:
+#
+#   * the unit's FAILED STATE is a level. It costs nothing to be permanent, it
+#     is exactly the durable machine-readable signal that was missing, and it
+#     is not debounced.
+#   * the TOAST is an edge, and it is what would spam. Before this change the
+#     OnFailure notifier had no debounce at all, so simply exiting non-zero
+#     would have made things worse, not better.
+#
+# So the notifier now suppresses on two grounds. First, it is verdict-aware:
+# the health script stamps its own $INVOCATION_ID whenever it announces, and
+# the notifier compares that against $MONITOR_INVOCATION_ID (systemd sets it
+# for OnFailure= units; verified on dellan — the two ids match exactly). If the
+# check already spoke about this very run, the notifier journals one line and
+# does NOT re-toast the same fault; its reason to exist is the case where the
+# check was killed, timed out, or died before saying anything. Second, that
+# remaining case carries its own 24h stamp, so even a detector that is down for
+# a week toasts once a day. Both fail OPEN — an absent or unreadable marker
+# toasts — because an undelivered warning is recoverable and a suppressed one
+# is the whole incident.
+#
+# Net per standing fault: one toast per 24h, unchanged; plus a unit that stays
+# `failed` and a journal line every tick, which are the channels that were
+# missing. And the toast is not the only reader — a Claude session learns the
+# same verdict from the SessionStart hook that runs this same probe, so a
+# background failure reaches the agent that can fix it without a human relaying
+# it.
+#
 # NOTHING BELOW MAY SPELL A PATH UNDER THE HOME DIRECTORY. tests/base.nix greps
 # the generated script text for `/home/`, deliberately without parsing shell
 # syntax, and asserts the ingest wrapper is free of it. This script resolves
@@ -126,9 +223,21 @@ let
   # packaging change closed for the ingest timer.
   pythonBin = "${pkgs.python3}/bin/python3";
 
+  # The WRITER under test: the exact derivation aggregator-ingest.service
+  # execs (`lib.getExe pkgs.aggregator` in aggregator-ingest-timer.nix), not
+  # whatever a PATH search happens to turn up. See the header section on how
+  # the writer is named for why this is a store path and not a profile entry.
+  writerBin = lib.getExe pkgs.aggregator;
+
   healthScript = pkgs.writeShellApplication {
     name = "aggregator-schema-health";
-    runtimeInputs = [ pkgs.coreutils pkgs.libnotify pkgs.python3 ];
+    # findutils is NOT optional and was NOT here: the debounce below calls
+    # `find`, which lives in findutils, never in coreutils. It resolved only
+    # because the NixOS default user-unit PATH happens to carry findutils and
+    # writeShellApplication appends that PATH rather than replacing it — i.e.
+    # by luck, through the same ambient channel that left the writer
+    # unresolvable. Named explicitly so it cannot go the same way.
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.libnotify pkgs.python3 ];
     text = ''
       set -uo pipefail
 
@@ -138,6 +247,13 @@ let
       # ~/.claude.json. This path only has to find the probe FILE.
       state_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/aggregator"
       stamp="$state_dir/schema-skew-notified"
+      # The OnFailure notifier's own 24h stamp, cleared here on recovery —
+      # see clear_stamps().
+      down_stamp="$state_dir/detector-down-notified"
+      # Written whenever this script ANNOUNCES, so the OnFailure notifier can
+      # tell "the check spoke and then failed on its verdict" from "the check
+      # died without saying anything" — the only case its toast is for.
+      spoke_marker="$state_dir/last-announced-invocation"
       probe="''${AGGREGATOR_SCHEMA_PROBE:-$HOME/Repos/aggregator/aggregator/health/schema_probe.py}"
 
       notify() {
@@ -147,6 +263,13 @@ let
         # without a notification daemon.
         echo "aggregator schema health: $1"
         echo "$2"
+
+        # Recorded here, NOT after the toast: "announced" means the journal
+        # has it, which is the channel that cannot fail. A verdict whose toast
+        # was debounced away has still been announced, and the OnFailure
+        # notifier must not toast about it a second time.
+        mkdir -p "$state_dir" || true
+        printf '%s\n' "''${INVOCATION_ID:-none}" > "$spoke_marker" || true
 
         # Debounce. Fails OPEN on an unreadable stamp — if we cannot tell
         # whether we already spoke, speak. A missed toast is recoverable; a
@@ -171,9 +294,16 @@ let
         # swallowed: a check that goes quiet when it cannot run is
         # indistinguishable from one reporting good news, and exiting
         # non-zero routes it into OnFailure as a second backstop.
+        #
+        # Exit 30, the probe's own UNKNOWN code, and not the ad-hoc 1 this
+        # used to be: "the probe file is absent" IS could-not-measure, so it
+        # should be indistinguishable from every other could-not-measure to
+        # anything reading the exit status. It also leaves 1 and 2 meaning
+        # "the detector itself crashed", which is the distinction
+        # schema_probe.py's exit-code table is built around.
         notify "aggregator recall health UNVERIFIED" \
           "The schema-skew probe is missing at $probe, so whether aggregator recall works is unknown. It ships in the aggregator repo at aggregator/health/schema_probe.py."
-        exit 1
+        exit 30
       fi
 
       # The probe's exit code IS the verdict: 0 fine, 10 writer behind
@@ -189,11 +319,15 @@ let
       set -e
 
       if [ "$rc" -eq 0 ]; then
-        # Healthy. Silent by design — a detector that speaks every hour is one
-        # nobody reads on the hour it matters. Clear the debounce so the NEXT
-        # incident is announced immediately rather than being suppressed by a
-        # stamp left over from the last one.
-        rm -f "$stamp" || true
+        # Healthy — and VERIFIED healthy, which after this change is the only
+        # thing that exits 0. Silent by design: a detector that speaks every
+        # hour is one nobody reads on the hour it matters. Clear both debounce
+        # stamps so the NEXT incident is announced immediately rather than
+        # being suppressed by one left over from the last. The detector-down
+        # stamp is cleared from HERE because its own notifier never sees a
+        # healthy run — OnFailure only ever fires on failure — which is the
+        # gap mkFailureNotify has upstream and this unit can close.
+        rm -f "$stamp" "$down_stamp" "$spoke_marker" || true
         exit 0
       fi
 
@@ -208,23 +342,79 @@ let
       esac
 
       notify "$headline" "$summary"
-      exit 0
+
+      # THE VERDICT IS THE EXIT STATUS. This was `exit 0`, which is how a
+      # detector that had never once been able to pass still recorded
+      # Result=success on every run for a day and never fired OnFailure. An
+      # UNVERIFIED or unhealthy result must be distinguishable to systemd from
+      # a verified-healthy one, and this is where that happens.
+      exit "$rc"
     '';
   };
 
   # Backstop for the detector itself dying — python missing from the closure,
-  # the script unable to start at all. Same shape as the ingest timer's
-  # notifier, and reachable ONLY through OnFailure (no wantedBy, so it is
+  # the script killed, the run reaped by TimeoutStartSec, the script unable to
+  # start at all. Reachable ONLY through OnFailure (no wantedBy, so it is
   # `static` and nothing can pull it in on its own).
+  #
+  # Now that an unhealthy VERDICT also fails the unit, this script runs in two
+  # situations that want opposite treatment, and telling them apart is its main
+  # job. See the header's OnFailure-siren section.
   healthFailureNotifyScript =
     pkgs.writeShellScript "aggregator-schema-health-failure-notify" ''
       set -uo pipefail
 
-      echo "aggregator-schema-health FAILED to run — the recall detector is itself down; inspect: journalctl --user -u aggregator-schema-health.service -n 100"
-      if ! ${notifyCommand} -u critical -a aggregator \
+      echo "aggregator-schema-health FAILED (result=''${MONITOR_SERVICE_RESULT:-unknown} status=''${MONITOR_EXIT_STATUS:-unknown}) — inspect: journalctl --user -u aggregator-schema-health.service -n 100"
+
+      state_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/aggregator"
+      spoke_marker="$state_dir/last-announced-invocation"
+      down_stamp="$state_dir/detector-down-notified"
+
+      # (1) Did the check already speak about THIS run? It stamps its own
+      # $INVOCATION_ID whenever it announces, and systemd hands us the
+      # triggering unit's invocation id in $MONITOR_INVOCATION_ID (verified on
+      # dellan: the two ids are byte-identical). Matching ids mean the verdict
+      # is already in the journal and already toasted under its own 24h
+      # debounce, so a second critical toast about the same fault would be pure
+      # nag — and nag is what gets a channel muted.
+      #
+      # Exact rather than heuristic on purpose. Branching on the exit status
+      # instead would misread the one case that matters most: a script that
+      # dies under `set -e` BEFORE announcing also exits non-zero with
+      # result=exit-code, and suppressing the toast there would silence the
+      # detector-is-down report entirely.
+      #
+      # Fails OPEN in every direction — unset id, unreadable marker, no match —
+      # because an extra toast is recoverable and a swallowed one is the
+      # incident.
+      spoke=""
+      if [ -n "''${MONITOR_INVOCATION_ID:-}" ] && [ -r "$spoke_marker" ]; then
+        spoke="$(cat "$spoke_marker" 2>/dev/null)" || spoke=""
+      fi
+      if [ -n "$spoke" ] && [ "$spoke" = "''${MONITOR_INVOCATION_ID:-}" ]; then
+        echo "the check announced its own verdict for this run (invocation $spoke) — already in the journal above and toasted under its own 24h debounce; not raising a second notification"
+        exit 0
+      fi
+
+      # (2) The check died without saying anything. This IS the case worth a
+      # toast, and it gets its own 24h debounce so a detector that is down for
+      # a week reports once a day rather than every hour. Cleared by the health
+      # script on the next verified-healthy run, which is the recovery path
+      # OnFailure notifiers structurally cannot have.
+      if [ -n "$(${pkgs.findutils}/bin/find "$down_stamp" -mmin -1440 2>/dev/null)" ]; then
+        echo "desktop notification suppressed — already notified within 24h (stamp: $down_stamp). Failure is in the journal above."
+        exit 0
+      fi
+
+      if ${notifyCommand} -u critical -a aggregator \
         "aggregator recall detector FAILED" \
         "aggregator-schema-health could not complete, so nothing is currently watching whether recall works. Inspect: journalctl --user -u aggregator-schema-health.service -n 100"; then
-        echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only"
+        ${pkgs.coreutils}/bin/mkdir -p "$state_dir" 2>/dev/null
+        ${pkgs.coreutils}/bin/touch "$down_stamp" 2>/dev/null
+      else
+        # Not arming the debounce on an undelivered popup: a toast nobody saw
+        # must not buy a day of silence, so the next failing tick tries again.
+        echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only. NOT arming the 24h debounce."
       fi
     '';
 in
@@ -232,6 +422,16 @@ in
   systemd.user.services.aggregator-schema-health = {
     description = "Aggregator: cache/reader/writer schema-skew check";
     unitConfig.OnFailure = "aggregator-schema-health-failure-notify.service";
+    environment = {
+      # Names the writer instead of leaving the probe to search a PATH that
+      # has never contained it — the defect measured 2026-08-31 that made a
+      # healthy verdict unreachable on every run. Set on the UNIT rather than
+      # exported inside the script so `systemctl --user show -p Environment`
+      # is the single place an operator (and tests/base.nix) reads which
+      # writer is under test. See the header for why this derivation and not
+      # a profile path.
+      AGGREGATOR_WRITER_BIN = writerBin;
+    };
     serviceConfig = {
       Type = "oneshot";
       ExecStart = "${healthScript}/bin/aggregator-schema-health";
