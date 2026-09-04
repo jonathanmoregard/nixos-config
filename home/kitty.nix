@@ -1410,11 +1410,18 @@ let
 
 
     def _load(path):
+        """The current snapshot, or None when there isn't a usable one.
+
+        A truncated or hand-mangled snapshot.json reads as "no prior
+        good": committing over it is right, and it must not take the
+        save timer down with a traceback every 60 seconds.
+        """
         try:
             with open(path) as fh:
-                return json.load(fh)
+                data = json.load(fh)
         except (OSError, ValueError):
             return None
+        return data if isinstance(data, list) else None
 
 
     def _history_names(hdir):
@@ -1444,6 +1451,9 @@ let
         Not writing is what keeps the age growing: preserving leaves
         snapshot.json's mtime alone, so the window cannot renew itself.
         """
+        # Below the smallest recoverable topology there is nothing to
+        # protect, so the same input that keeps such a snapshot out of
+        # the history also switches the guard off.
         if prev_count < HISTORY_MIN_PANES:
             return False
         if new_count * COLLAPSE_DIVISOR > prev_count:
