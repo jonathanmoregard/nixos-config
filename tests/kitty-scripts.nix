@@ -559,6 +559,18 @@ let
         grid(2, first_win=3, first_grp=201, tid=2, focused=False),
     ])]
 
+    # The same six stacked panes, but the user has alt-tabbed to a
+    # SECOND kitty OS window since the plan was built. Serving this
+    # from the middle of a reflow models exactly that race:
+    # `detach-window --target-tab new` creates its tab in whatever OS
+    # window is current WHEN IT RUNS (boss.py:3325 ->
+    # current_os_window()), so carrying on here scatters the panes
+    # into a window the plan never looked at.
+    cases["race-after"] = [
+        osw(1, [column(6)], focused=False),
+        osw(2, [column(2, first_win=201, first_grp=401)], focused=True),
+    ]
+
     # `kitty @ ls` returns a LIST of OS windows. Reflow must scope to
     # exactly one — here the focused one, whose panes are 201..203.
     cases["two-os-windows"] = [
@@ -581,6 +593,8 @@ pkgs.runCommand "kitty-scripts-harness"
       pkgs.gnugrep
       pkgs.gnused
       pkgs.jq
+      # flock, for the concurrent-reflow assertion (E11).
+      pkgs.util-linux
     ];
   } ''
     set -euo pipefail
@@ -718,9 +732,18 @@ pkgs.runCommand "kitty-scripts-harness"
     #!/bin/sh
     # argv is always: @ --to <sock> <subcommand> [args...]
     if [ "$4" = "ls" ]; then
-      cat "$LS_JSON"
+      if [ -n "''${LS_JSON_2:-}" ] && [ -f "''${LS_SWITCHED:-/nonexistent}" ]; then
+        cat "$LS_JSON_2"
+      else
+        cat "$LS_JSON"
+      fi
       exit 0
     fi
+    # A non-ls command means kitty has actually been driven. When the
+    # caller armed LS_SWITCHED that is the moment the modelled user
+    # alt-tabs to another kitty OS window, so every later `ls` reports
+    # a different one as focused.
+    if [ -n "''${LS_SWITCHED:-}" ]; then : > "$LS_SWITCHED"; fi
     shift 3
     printf '%s\n' "$*" >> "$KITTY_CMD_LOG"
     exit 0
@@ -1122,19 +1145,24 @@ pkgs.runCommand "kitty-scripts-harness"
     # (splits.py:780) reads the tab's active group — not the
     # command's --match — so the focus before each rotate is load
     # bearing too.
-    C1='[["detach-new",1],["layout-splits",1],
+    # Each chunk opens by focusing its own anchor. That focus is not
+    # cosmetic: `--target-tab new` creates its tab in the CURRENT OS
+    # window, and focusing a window in the planned one is what makes
+    # the planned one current (rc/focus_window.py ->
+    # set_active_window(switch_os_window_if_needed=True)).
+    C1='[["focus",1],["detach-new",1],["layout-splits",1],
          ["focus",1],["detach-to",2,1],
          ["focus",1],["detach-to",3,1],["focus",3],["rotate"],
          ["focus",2],["detach-to",4,1],["focus",4],["rotate"],
          ["focus",1],["equalize"]]'
     # Spill tails: n%4 of 2, 1 and 3 panes in the second tab, each in
     # its own canonical form, then focus back where the user was.
-    T6='[["detach-new",5],["layout-splits",5],
+    T6='[["focus",5],["detach-new",5],["layout-splits",5],
          ["focus",5],["detach-to",6,5],
          ["focus",5],["equalize"],["focus",1]]'
-    T5='[["detach-new",5],["layout-splits",5],
+    T5='[["focus",5],["detach-new",5],["layout-splits",5],
          ["focus",5],["equalize"],["focus",1]]'
-    T7='[["detach-new",5],["layout-splits",5],
+    T7='[["focus",5],["detach-new",5],["layout-splits",5],
          ["focus",5],["detach-to",6,5],
          ["focus",5],["detach-to",7,5],["focus",7],["rotate"],
          ["focus",5],["equalize"],["focus",1]]'
@@ -1214,6 +1242,77 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(E9): reflow does not restore the originally-focused"
       echo "  window."
       exit 1; }
+
+    # E10 — reflow must stay bound to the OS window it PLANNED
+    # against. `detach-window --target-tab new` builds its tab in
+    # whatever OS window is current when it runs (boss.py:3325 ->
+    # current_os_window()), and `action layout_action rotate|equalize`
+    # hits the ambient active window (rc/action.py sends its --match
+    # as `match_window`, which windows_for_match_payload never reads,
+    # so it falls through to boss.active_window). If the user alt-tabs
+    # to a second kitty OS window mid-reflow, or a second reflow
+    # races, the panes scatter into a window nobody planned for and an
+    # untouched tab's pair gets flipped.
+    #
+    # The fake kitty starts serving a payload in which a DIFFERENT OS
+    # window is focused the moment reflow drives its first command.
+    # Refusing loudly is the requirement; carrying on is not.
+    (
+      export LS_JSON="$PWD/reflow/stacked-6.json"
+      export LS_JSON_2="$PWD/reflow/race-after.json"
+      export LS_SWITCHED="$PWD/state/race-switched"
+      export KITTY_CMD_LOG="$PWD/state/reflow-race.log"
+      rm -f "$LS_SWITCHED"
+      : > "$KITTY_CMD_LOG"
+      rc=0
+      kitty-panes-reflow 2> "$PWD/state/reflow-race.err" || rc=$?
+      echo "--- reflow race: rc=$rc ---"
+      cat "$PWD/state/reflow-race.err"
+      echo "--- commands issued ---"
+      cat "$KITTY_CMD_LOG"
+      [ "$rc" -ne 0 ] || {
+        echo "FAIL(E10): reflow reported success after the OS window it"
+        echo "  planned against stopped being the current one."
+        exit 1; }
+      if grep -q 'detach-window' "$KITTY_CMD_LOG"; then
+        echo "FAIL(E10): reflow detached a pane while a DIFFERENT OS"
+        echo "  window was current, so the pane landed in a window the"
+        echo "  plan never looked at. Failing loudly beats scattering."
+        exit 1
+      fi
+      grep -qi 'os window' "$PWD/state/reflow-race.err" || {
+        echo "FAIL(E10): the refusal does not say which OS window went"
+        echo "  away; the user has to be able to tell this apart from a"
+        echo "  crash."
+        exit 1; }
+    ) || exit 1
+
+    # E11 — two reflows must not interleave. Each plans against a
+    # topology the other is halfway through rebuilding, and both drive
+    # the same ambient focus. The lock is held for the whole run, so a
+    # second invocation refuses instead of issuing a single command.
+    lockdir="$XDG_CACHE_HOME/kitty-session"
+    mkdir -p "$lockdir"
+    (
+      export LS_JSON="$PWD/reflow/stacked-6.json"
+      export KITTY_CMD_LOG="$PWD/state/reflow-locked.log"
+      : > "$KITTY_CMD_LOG"
+      rc=0
+      flock -x "$lockdir/reflow.lock" kitty-panes-reflow \
+        2> "$PWD/state/reflow-locked.err" || rc=$?
+      echo "--- reflow under a held lock: rc=$rc ---"
+      cat "$PWD/state/reflow-locked.err"
+      [ "$rc" -ne 0 ] || {
+        echo "FAIL(E11): a second concurrent reflow ran anyway; two of"
+        echo "  them interleaving rebuild each other's half-finished"
+        echo "  tabs."
+        exit 1; }
+      [ ! -s "$KITTY_CMD_LOG" ] || {
+        cat "$KITTY_CMD_LOG"
+        echo "FAIL(E11): the refusal came after commands had already"
+        echo "  been issued."
+        exit 1; }
+    ) || exit 1
 
     # --- Phase F: a restored claude pane lands in claude-egress.slice --
     #

@@ -558,6 +558,7 @@ let
 
     Usage: kitty-panes-reflow [--plan]
     """
+    import fcntl
     import glob
     import json
     import os
@@ -834,7 +835,14 @@ let
         identifier that survives the whole sequence.
         """
         ul = chunk[0]["window"]
-        steps = [["detach-new", ul], ["layout-splits", ul]]
+        # Focus the anchor BEFORE detaching it. `--target-tab new`
+        # builds its tab in whatever OS window is current when it runs
+        # (boss.py:3325 -> current_os_window()), and focusing a window
+        # is what makes that window's OS window current
+        # (rc/focus_window.py -> set_active_window(
+        # switch_os_window_if_needed=True)). Without it the first
+        # detach of every chunk is a bet on ambient focus.
+        steps = [["focus", ul], ["detach-new", ul], ["layout-splits", ul]]
         if len(chunk) > 1:
             steps += [["focus", ul], ["detach-to", chunk[1]["window"], ul]]
         if len(chunk) > 2:
@@ -878,47 +886,136 @@ let
         return {"os_window": osw.get("id"), "noop": False, "steps": steps}
 
 
-    def tab_of(sock, wid):
-        """Id of the tab currently holding window `wid`."""
+    def locate(sock, wid):
+        """(tab id, OS window id) currently holding window `wid`."""
         for osw in ls(sock):
             for tab in osw.get("tabs", []):
                 for w in tab.get("windows", []):
                     if w.get("id") == wid:
-                        return tab.get("id")
-        return None
+                        return tab.get("id"), osw.get("id")
+        return None, None
 
 
-    def _resolve_tab(sock, anchor):
-        tab = tab_of(sock, anchor)
+    def _resolve_tab(sock, anchor, target):
+        tab, oswid = locate(sock, anchor)
         if tab is None:
             raise SystemExit(
                 "kitty-panes-reflow: anchor window %s disappeared "
                 "mid-reflow" % anchor
             )
+        if oswid != target:
+            raise SystemExit(
+                "kitty-panes-reflow: anchor window %s now lives in OS "
+                "window %s, not the %s this reflow planned against; "
+                "stopping rather than rebuilding a window nobody asked "
+                "about" % (anchor, oswid, target)
+            )
         return tab
 
 
-    def execute(sock, steps):
+    def _require_os_window(sock, target):
+        """Refuse unless the OS window kitty will act on is the one
+        this reflow planned against.
+
+        Two of the steps read AMBIENT state rather than their
+        arguments. `detach-window --target-tab new` builds its tab in
+        current_os_window() (boss.py:3325), and `action layout_action`
+        lands on boss.active_window — `kitty @ action` cannot be
+        pinned with --match, because rc/action.py sends the option as
+        `match_window` while windows_for_match_payload only ever reads
+        `match` (rc/base.py:381), so the flag is accepted and ignored.
+        Every plan step is therefore preceded by a focus-window that
+        MAKES the planned OS window current, and this checks that the
+        focus actually took before the ambient command fires.
+        A user alt-tabbing to a second kitty window, or a second
+        reflow racing, is what it catches.
+
+        Checked immediately before each ambient command rather than
+        once up front: that is the only placement where it means
+        anything, since focus can move between any two steps.
+        """
+        osw = pick_os_window(ls(sock))
+        cur = osw.get("id") if osw else None
+        if cur != target:
+            raise SystemExit(
+                "kitty-panes-reflow: OS window %s is current, not the "
+                "%s this reflow planned against (another kitty window "
+                "took focus, or the planned one is gone). Stopping: "
+                "the layout is part-rebuilt, run it again to converge."
+                % (cur, target)
+            )
+
+
+    def execute(sock, target, steps):
         for step in steps:
             op = step[0]
             if op == "focus":
                 rc(sock, "focus-window", "--match=id:%d" % step[1])
             elif op == "detach-new":
+                _require_os_window(sock, target)
                 rc(sock, "detach-window", "--match=id:%d" % step[1],
                    "--target-tab", "new")
+                # And the tab it made really is in the planned window.
+                _resolve_tab(sock, step[1], target)
             elif op == "detach-to":
-                tab = _resolve_tab(sock, step[2])
+                tab = _resolve_tab(sock, step[2], target)
                 rc(sock, "detach-window", "--match=id:%d" % step[1],
                    "--target-tab", "id:%d" % tab)
             elif op == "layout-splits":
-                tab = _resolve_tab(sock, step[1])
+                tab = _resolve_tab(sock, step[1], target)
                 rc(sock, "goto-layout", "--match=id:%d" % tab, "splits")
             elif op == "rotate":
+                _require_os_window(sock, target)
                 rc(sock, "action", "layout_action", "rotate", "90")
             elif op == "equalize":
+                _require_os_window(sock, target)
                 rc(sock, "action", "layout_action", "equalize")
             else:
                 raise SystemExit("unknown reflow step: " + repr(step))
+
+
+    def lock_path():
+        return os.path.join(
+            os.environ.get(
+                "XDG_CACHE_HOME",
+                os.path.join(os.path.expanduser("~"), ".cache"),
+            ),
+            "kitty-session",
+            "reflow.lock",
+        )
+
+
+    def take_lock():
+        """Hold the reflow lock, or refuse to start.
+
+        Two reflows interleaving would each plan against a topology
+        the other is halfway through rebuilding, and both drive the
+        same ambient focus that _require_os_window() is checking.
+        Advisory flock, so a crashed run releases it with its process
+        and there is no stale-lock age to guess at — and no timeout,
+        so no tuned number enters the design.
+
+        The handle is returned because closing it releases the lock:
+        without a live reference CPython would drop it immediately.
+        """
+        path = lock_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fh = open(path, "w")
+        except OSError:
+            # Nowhere to put a lock is not a reason to refuse the
+            # reflow; it only means concurrent runs are unguarded.
+            return None
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            raise SystemExit(
+                "kitty-panes-reflow: another reflow is already running; "
+                "two of them interleaving would each rebuild the "
+                "other's half-finished tabs"
+            )
+        return fh
 
 
     def main():
@@ -944,6 +1041,13 @@ let
             json.dump(plan, sys.stdout)
             return
 
+        # Before anything reaches the wire, and never on the --plan
+        # path above, which is a pure function of stdin.
+        lock = take_lock()
+        if lock is not None:
+            lock.write("%d\n" % os.getpid())
+            lock.flush()
+
         sock = find_socket()
         if not sock:
             print("no live kitty", file=sys.stderr)
@@ -963,7 +1067,7 @@ let
             print("layout is already canonical")
             return
         try:
-            execute(sock, plan["steps"])
+            execute(sock, plan["os_window"], plan["steps"])
         except subprocess.CalledProcessError as err:
             # A pane closed between the plan and the step that moves
             # it, or kitty refused the command. Say so instead of
