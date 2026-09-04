@@ -1996,6 +1996,117 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "  fails to start."
       exit 1; }
 
+    # --- Phase L: a command a session line cannot carry is not lost ---
+    #
+    # line_argv() keeps the leading run of pane 0's argv that is free of
+    # str.splitlines() breaks. If the FIRST element holds one — a
+    # directory name may contain any byte but '/' and NUL — it keeps
+    # NOTHING, and emit_stub used to write `<self> --exec-pane0` with
+    # nothing after it: the exact pre-2026-09-04 shape whose recorded
+    # cmdline points back at the launcher. Guard J4 turns that into a
+    # shell, so it is not a loop — it is worse behaved than a loop in
+    # one way, because pane 0 then comes up as a bare shell while
+    # pane0-launch.json still holds the real argv, and the only trace is
+    # a line in kitty's log.
+    #
+    # Measured on the built derivation before the fix:
+    #
+    #   --- stub ---
+    #   launch --cwd /work --title pane0 <...>/kitty-restore-session \
+    #     --exec-pane0
+    #   --- pane0-launch.json ---
+    #   {"cmd": ["/opt/we\nird/bin/tool", "--flag"], ...}
+    #   $ kitty-restore-session --exec-pane0
+    #   --exec-pane0 with no command after it. Opening a shell ...
+    mkdir -p lbreak/kitty-session
+    jq -n '
+      [{tabs:[{layout:"splits",windows:[
+        {id: 1, cwd: "/work", title: "pane0",
+         cmdline: ["/opt/we\nird/bin/tool", "--flag"],
+         foreground_processes: [{cmdline: ["/opt/we\nird/bin/tool",
+                                           "--flag"]}]},
+        {id: 2, cwd: "/work", title: "pane1",
+         cmdline: ["/bin/sh"],
+         foreground_processes: [{cmdline: ["/bin/sh"]}]}
+      ]}]}]' > lbreak/kitty-session/snapshot.json
+    (
+      export XDG_CACHE_HOME="$PWD/lbreak"
+      export KITTY_STUB_PATH="$PWD/state/stub-lbreak"
+      kitty-restore-session --emit-stub 2> "$PWD/state/lbreak-emit.err"
+    ) || { echo "FAIL(L1): --emit-stub failed outright"; exit 1; }
+    echo "--- unrepresentable-argv stub ---"; cat state/stub-lbreak
+    echo "--- what it said ---"; cat state/lbreak-emit.err
+
+    # L1 — the launcher is never emitted bare.
+    if grep -q -- '--exec-pane0' state/stub-lbreak; then
+      grep -qE -- '--exec-pane0 [^ ]' state/stub-lbreak || {
+        echo "FAIL(L1): the stub carries the pane-0 launcher with NO"
+        echo "  argv after it. That record is what pointed pane 0's"
+        echo "  cmdline back at the launcher; the exec-time guard turns"
+        echo "  it into a bare shell and the user's command is gone."
+        exit 1; }
+    fi
+    python3 ${mkLineCheck} state/stub-lbreak 1 || {
+      echo "FAIL(L1): the stub is not a single line."; exit 1; }
+
+    # L2 — and the command is not LOST. It cannot ride a session-file
+    # line, so restore has to hand it to kitty-pane-add, where the argv
+    # travels as a list and no line orientation applies.
+    (
+      export XDG_CACHE_HOME="$PWD/lbreak"
+      export LS_JSON="$PWD/grid/two-real.json"
+      export KITTY_CMD_LOG="$PWD/state/lbreak-restore.log"
+      : > "$KITTY_CMD_LOG"
+      kitty-restore-session
+      echo "--- restore issued (unrepresentable pane 0) ---"
+      cat "$KITTY_CMD_LOG"
+      grep -q 'ird/bin/tool' "$KITTY_CMD_LOG" || {
+        echo "FAIL(L2): pane 0's command never reached kitty. The stub"
+        echo "  could not carry it and nothing else picked it up, so a"
+        echo "  restore silently replaced the user's pane 0 with a"
+        echo "  shell."
+        exit 1; }
+      [ "$(grep -c '^launch ' "$KITTY_CMD_LOG")" -eq 2 ] || {
+        echo "FAIL(L2): expected one launch per pane (pane 0 included,"
+        echo "  because the stub did not start it)."
+        exit 1; }
+    ) || exit 1
+
+    # L3 — control: with a representable pane 0 NOTHING changes. The
+    # stub carries the launcher, and restore still skips pane 0 rather
+    # than opening a second copy of it next to the one kitty made.
+    mkdir -p lok/kitty-session
+    jq -n '
+      [{tabs:[{layout:"splits",windows:[
+        {id: 1, cwd: "/work", title: "pane0",
+         cmdline: ["/usr/bin/tool", "--flag"],
+         foreground_processes: [{cmdline: ["/usr/bin/tool", "--flag"]}]},
+        {id: 2, cwd: "/work", title: "pane1",
+         cmdline: ["/bin/sh"],
+         foreground_processes: [{cmdline: ["/bin/sh"]}]}
+      ]}]}]' > lok/kitty-session/snapshot.json
+    (
+      export XDG_CACHE_HOME="$PWD/lok"
+      export KITTY_STUB_PATH="$PWD/state/stub-lok"
+      export LS_JSON="$PWD/grid/two-real.json"
+      export KITTY_CMD_LOG="$PWD/state/lok-restore.log"
+      kitty-restore-session --emit-stub
+      echo "--- representable-argv stub ---"; cat state/stub-lok
+      grep -qE -- '--exec-pane0 [^ ]' state/stub-lok || {
+        echo "FAIL(L3): a perfectly representable pane-0 argv stopped"
+        echo "  riding the launch line."
+        exit 1; }
+      : > "$KITTY_CMD_LOG"
+      kitty-restore-session
+      echo "--- restore issued (representable pane 0) ---"
+      cat "$KITTY_CMD_LOG"
+      [ "$(grep -c '^launch ' "$KITTY_CMD_LOG")" -eq 1 ] || {
+        echo "FAIL(L3): restore re-added pane 0 even though the stub had"
+        echo "  already started it, so every restore would grow an extra"
+        echo "  pane."
+        exit 1; }
+    ) || exit 1
+
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"
     echo "    survives a relaunch burst, reflow is a true no-op on a"

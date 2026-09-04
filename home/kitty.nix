@@ -1905,6 +1905,35 @@ let
         return out
 
 
+    def stub_carries_pane0(pane):
+        """True when the stub's launch line starts pane 0's OWN command.
+
+        False in exactly one case: the pane has a command whose FIRST
+        element holds a line break, so line_argv() keeps nothing and
+        there is no argv to put after the flag. A directory name may
+        contain any byte but '/' and NUL, so a binary under such a path
+        reaches here.
+
+        emit_stub() then declines to write the launcher at all -- a
+        `<self> --exec-pane0` with nothing after it is the exact
+        pre-2026-09-04 shape whose recorded cmdline pointed back at the
+        launcher -- and pane 0 comes up as kitty's default shell. That
+        would SILENTLY drop the user's command, so main() consults the
+        same predicate and restores pane 0 through kitty-pane-add like
+        any other pane, where the argv travels as a list and no line
+        orientation applies.
+
+        A pure function of the snapshot, so the two processes (the
+        wrapper's --emit-stub, then the restore) agree without any
+        shared state: they already both call load_panes().
+
+        A pane with NO recorded command is True, not False: nothing was
+        lost, so re-adding it would only open a second empty shell.
+        """
+        cmd = slice_launch(pane["cmd"])
+        return not cmd or bool(line_argv(cmd))
+
+
     def emit_stub():
         """Write kitty's --session stub: pane 0, exactly one line.
 
@@ -1931,14 +1960,31 @@ let
             parts += ["--cwd", session_token(p["cwd"])]
         if p["title"]:
             parts += ["--title", session_token(p["title"])]
-        if cmd:
+        carried = line_argv(cmd)
+        if cmd and carried:
             _write_atomic(pane0_path(), json.dumps({
                 "cwd": p["cwd"],
                 "title": p["title"],
                 "cmd": cmd,
             }))
             parts += [session_token(_self_exe()), PANE0_FLAG]
-            parts += [session_token(a) for a in line_argv(cmd)]
+            parts += [session_token(a) for a in carried]
+        elif cmd:
+            # The launcher is NEVER emitted bare. `<self> --exec-pane0`
+            # with nothing after it is the pre-2026-09-04 shape: the
+            # exec-time guard turns it into a shell, so the user's
+            # command would vanish with only a line in kitty's log to
+            # say so. main() sees the same thing through
+            # stub_carries_pane0() and restores this pane over the
+            # remote-control path instead, where the argv travels as a
+            # list.
+            print(
+                "kitty-restore-session: pane 0's command starts with a "
+                "line break (" + repr(cmd[0]) + "), which a session file "
+                "cannot carry. Starting pane 0 as a plain shell and "
+                "restoring the command as an extra pane instead.",
+                file=sys.stderr,
+            )
         # else: no command was recorded for this pane at all, so there
         # is nothing for --exec-pane0 to become. A bare `launch` lets
         # kitty open its default shell, which is the same outcome the
@@ -2072,9 +2118,16 @@ let
             return
 
         panes = load_panes()
-        if len(panes) <= 1:
-            # Pane 0 is already created via kitty's --session stub; if
-            # that's all there is, we're done.
+        if not panes:
+            return
+        # Skip pane[0] — kitty already created it from the --session
+        # stub — UNLESS the stub could not carry its command (see
+        # stub_carries_pane0). Then pane 0 came up as a plain shell and
+        # its real command has to be restored the ordinary way, or it is
+        # lost with nothing but a line in kitty's log to show for it.
+        first = 1 if stub_carries_pane0(panes[0]) else 0
+        if len(panes) <= first:
+            # Everything there is to restore is already on screen.
             return
 
         sock = find_socket()
@@ -2082,8 +2135,7 @@ let
             print("kitty socket never appeared", file=sys.stderr)
             sys.exit(1)
 
-        # Skip pane[0] — kitty already created it from the --session stub.
-        for p in panes[1:]:
+        for p in panes[first:]:
             argv = ["kitty-pane-add"]
             if p["cwd"]:
                 argv += ["--cwd", p["cwd"]]
