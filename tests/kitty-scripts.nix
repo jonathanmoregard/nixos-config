@@ -197,6 +197,13 @@ let
   # Snapshot generator for the retention phase: N real panes, plus an
   # optional kitty-internal overlay so the phase can prove the pane
   # count that drives retention is the REAL one.
+  #
+  # Usage: mkSnapshot <n> <path> [internal|-] [marker]
+  #
+  # `marker` is stamped into every pane's cwd so two snapshots can share
+  # a pane COUNT while differing in CONTENT. Retention keyed on the
+  # count alone cannot tell those apart, which is how a days-old
+  # same-size history entry ends up shadowing the live one (phase D10).
   mkSnapshot = pkgs.writeText "kitty-scripts-snapshot.py" ''
     import json
     import sys
@@ -204,12 +211,13 @@ let
     n = int(sys.argv[1])
     path = sys.argv[2]
     internal = len(sys.argv) > 3 and sys.argv[3] == "internal"
+    marker = sys.argv[4] if len(sys.argv) > 4 else "generic"
 
     wins = []
     for i in range(n):
         wins.append({
             "id": i + 1,
-            "cwd": "/tmp",
+            "cwd": "/tmp/" + marker,
             "title": "pane%d" % (i + 1),
             "cmdline": ["/bin/sh"],
             "foreground_processes": [{"cmdline": ["/bin/sh"]}],
@@ -765,6 +773,73 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(D8): the OLDEST rotation survived the prune"
       exit 1
     fi
+
+    # D10 — the history must keep the FRESHEST snapshot of a topology
+    # size, not the first one it ever saw at that size.
+    #
+    # D5 and D6 above both use identical fixtures on either side of the
+    # comparison, so neither can see this: a ring keyed on pane count
+    # alone treats "6 panes" as one thing, and a 6-pane entry rotated in
+    # days ago makes today's 6-pane snapshot look like a duplicate. It
+    # is not — it is the only copy holding the CURRENT session ids, and
+    # it is the one the incident replay destroys:
+    #
+    #   1. a 6-pane snapshot rotates into history (stale sids);
+    #   2. the session goes on running, snapshot.json is replaced by a
+    #      fresh 6-pane one (live sids) — same count, so no rotation;
+    #   3. kitty dies, the restore comes back with one pane. The
+    #      collapse guard refuses it while it is fresh...
+    #   4. ...and stops refusing once the broken state has outlived the
+    #      grace window, at which point the fresh 6-pane snapshot is
+    #      overwritten. If the rotation on the way out is skipped as a
+    #      duplicate, the live state is gone and only the stale copy
+    #      remains — the exact loss the ring exists to prevent.
+    mkdir -p sess2
+    python3 ${mkSnapshot} 6 cands/stale6.json - stale
+    python3 ${mkSnapshot} 6 cands/fresh6.json - fresh
+    python3 ${mkSnapshot} 1 cands/one.json - post-crash
+    commit2_rc() { # <candidate>
+      local rc=0
+      kitty-session-commit "$PWD/sess2" < "$1" || rc=$?
+      echo "$rc"
+    }
+    markers() { # <snapshot> -> the distinct cwd markers it holds
+      jq -r '[.[].tabs[].windows[].cwd] | unique | join(",")' "$1"
+    }
+
+    [ "$(commit2_rc cands/stale6.json)" -eq 0 ] || {
+      echo "FAIL(D10): first snapshot refused"; exit 1; }
+    [ "$(commit2_rc cands/fresh6.json)" -eq 0 ] || {
+      echo "FAIL(D10): a same-size snapshot was refused"; exit 1; }
+    [ "$(commit2_rc cands/one.json)" -eq 3 ] || {
+      echo "FAIL(D10): the collapse guard did not refuse 6 -> 1"; exit 1; }
+    touch -d "@$(( $(date +%s) - GRACE - 60 ))" sess2/snapshot.json
+    [ "$(commit2_rc cands/one.json)" -eq 0 ] || {
+      echo "FAIL(D10): a collapse past the grace window was still refused"
+      exit 1; }
+    echo "--- sess2/history after the replay ---"
+    : > state/hist-markers
+    for f in sess2/history/*.json; do
+      echo "  $(basename "$f") -> $(markers "$f")"
+      markers "$f" >> state/hist-markers
+    done
+    if ! grep -q 'fresh' state/hist-markers; then
+      echo "FAIL(D10): the 6-pane snapshot that was live when kitty died"
+      echo "  was destroyed without being rotated, because an older"
+      echo "  entry happened to share its pane count. History keeps only"
+      echo "  the stale copy, so the session ids needed to restore the"
+      echo "  panes are unrecoverable — this is the 2026-09-04 loss with"
+      echo "  the ring in place."
+      exit 1
+    fi
+    # One slot per topology size: the fresh entry REPLACED the stale one
+    # rather than being appended beside it, so a session that churns
+    # between two sizes cannot flush the ring.
+    [ "$(ls sess2/history | wc -l)" -eq 1 ] || {
+      ls -la sess2/history
+      echo "FAIL(D10): history holds more than one entry for a single"
+      echo "  topology size; the ring is a slot per size, not a log."
+      exit 1; }
 
     # D9 — drift gate: the deployed save script actually routes through
     # kitty-session-commit, and still gates on the enricher's exit code

@@ -1804,9 +1804,10 @@ let
   #   panes one at a time never trips it.
   collapseDivisor = 2;
   # historyBurstsCovered — how many independent bad episodes the
-  #   history has to outlive. A rotation happens only when the real
-  #   pane count CHANGES, so an episode contributes at most
-  #   failedRelaunchBurst entries. Product: 12 files, ~20KB each.
+  #   history has to outlive. The ring holds one entry per DISTINCT
+  #   pane count (the newest snapshot at that size), so an episode
+  #   contributes at most failedRelaunchBurst slots — one per failed
+  #   relaunch. Product: 12 slots, ~20KB each.
   historyBurstsCovered = 4;
   snapshotHistoryKeep = failedRelaunchBurst * historyBurstsCovered;
   # historyMinPanes — the smallest topology worth recovering. A
@@ -1893,11 +1894,17 @@ let
         return sorted(n for n in names if HISTORY_RE.match(n))
 
 
-    def _newest_history_panes(hdir):
-        names = _history_names(hdir)
-        if not names:
-            return None
-        return int(HISTORY_RE.match(names[-1]).group(1))
+    def _entry_for_panes(hdir, count, skip=None):
+        """The history entry currently holding a `count`-pane topology.
+
+        At most one exists: rotate() below keeps the ring as one SLOT
+        per distinct pane count, so the count is the slot key.
+        """
+        suffix = "-%dp.json" % count
+        for name in _history_names(hdir):
+            if name != skip and name.endswith(suffix):
+                return name
+        return None
 
 
     def collapsed(prev_count, new_count, snap_path):
@@ -1927,14 +1934,29 @@ let
 
 
     def rotate(dirpath, snap_path, prev_count):
-        """Copy the outgoing snapshot into history/, newest last.
+        """Keep the outgoing snapshot as its topology size's entry.
 
-        Two rules keep the ring recoverable rather than merely full:
-        a snapshot below HISTORY_MIN_PANES never enters it, so a
-        degenerate state cannot evict a good one; and an entry is a
-        DISTINCT pane count rather than a tick, so a session sitting at
-        one size cannot flush the history out by waiting — which a 60s
-        timer would otherwise do in HISTORY_KEEP minutes.
+        The ring is one SLOT PER DISTINCT PANE COUNT, each holding the
+        FRESHEST snapshot seen at that size. Three properties follow,
+        and all three are load bearing:
+
+        * Bounded churn. A session sitting at one size (or oscillating
+          between two) replaces its own slot every tick instead of
+          appending, so it cannot flush the recoverable topologies out
+          by waiting — which a 60s timer would otherwise do in
+          HISTORY_KEEP minutes.
+        * Nothing recoverable is discarded on the way out. Keying on
+          "has the count CHANGED since the last rotation" instead was
+          the 2026-09-04 loss in miniature: a 6-pane entry rotated in
+          days ago made today's 6-pane snapshot look like a duplicate,
+          so when the post-crash collapse finally outlived the grace
+          window it overwrote the only copy carrying live session ids
+          and left the stale one behind. Same count is not same state.
+        * A snapshot below HISTORY_MIN_PANES never enters the ring at
+          all, so a degenerate state cannot evict a good one.
+
+        Write-then-unlink, never the reverse: a failed copy must not be
+        able to leave a size with no entry at all.
         """
         if prev_count < HISTORY_MIN_PANES:
             return
@@ -1943,13 +1965,17 @@ let
             os.makedirs(hdir, exist_ok=True)
         except OSError:
             return
-        if _newest_history_panes(hdir) == prev_count:
-            return
         name = "snapshot-%.6f-%dp.json" % (time.time(), prev_count)
         try:
             shutil.copyfile(snap_path, os.path.join(hdir, name))
         except OSError:
             return
+        stale = _entry_for_panes(hdir, prev_count, skip=name)
+        if stale is not None:
+            try:
+                os.unlink(os.path.join(hdir, stale))
+            except OSError:
+                pass
         sys.stderr.write(
             "kitty-session-commit: rotated %d-pane snapshot to %s\n"
             % (prev_count, name)
