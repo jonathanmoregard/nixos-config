@@ -2308,6 +2308,116 @@ in
         f"script would receive a relative path and pull nothing:\n{mkt_env}"
     )
 
+    # claude-proposals-push — the same split, the other direction.
+    #
+    # ~/.local/state/claude-proposals is the RSI proposals sink: the nightly
+    # reviewer writes into it at 03:20, the intake gate annotates it, and
+    # /review-improvements edits it. Until 2026-09-03 it had no remote at all,
+    # so every proposal ever generated on this machine existed on exactly one
+    # disk. It now has a private GitHub origin, and this timer is what keeps it
+    # there — nothing else pushes it unattended (rsi-daily-review only writes
+    # files; push-proposals.sh only runs from an interactive session).
+    #
+    # Timer + unit are nix-managed so a fresh host re-creates the schedule; the
+    # script (~/.claude/scripts/claude-proposals-push.sh) lives in the ~/.claude
+    # repo for the same reason claude-pull.sh does, and is therefore outside the
+    # VM closure. Its behaviour — the mandatory gitleaks gate, the shared intake
+    # lock, the never-force divergence refusal — is covered by
+    # tests/test_claude_proposals_push.sh in that repo. What THIS lane can prove
+    # is the schedule, the ExecStart, and the one piece of the leak gate that is
+    # a property of the unit rather than of the script: that gitleaks is
+    # reachable at all.
+    assert "claude-proposals-push.timer" in timers, (
+        f"claude-proposals-push.timer missing from user timer list:\n{timers}"
+    )
+    sink_timer = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-proposals-push.timer'"
+    )
+    for marker in [
+        "OnCalendar=*:7/15",
+        "Persistent=true",
+        "Unit=claude-proposals-push.service",
+    ]:
+        assert marker in sink_timer, (
+            f"claude-proposals-push.timer lost '{marker}':\n{sink_timer}"
+        )
+    # Persistent= is the load-bearing half here, more than for the pullers. The
+    # reviewer writes at 03:20 and this is a laptop that is usually asleep at
+    # 03:20; without catch-up the night's proposals wait for the next time the
+    # machine happens to be awake on a :07/:22/:37/:52 boundary.
+    for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
+        got = dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"systemctl --user {prop} claude-proposals-push.timer'"
+        ).strip()
+        assert got == expected, (
+            f"claude-proposals-push.timer {prop}={got!r}, expected {expected!r} "
+            f"— the proposals sink would stop being backed up off this machine, "
+            f"silently, which is the state this unit exists to end"
+        )
+    sink_service = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat claude-proposals-push.service'"
+    )
+    for marker in [
+        "Type=oneshot",
+        "ExecStart=%h/.claude/scripts/claude-proposals-push.sh",
+        "TimeoutStartSec=",
+    ]:
+        assert marker in sink_service, (
+            f"claude-proposals-push.service lost '{marker}':\n{sink_service}"
+        )
+
+    # THE LEAK GATE'S ONE UNIT-LEVEL DEPENDENCY.
+    #
+    # The script refuses to push when it cannot scan, which is correct and also
+    # means a unit that cannot find gitleaks is a unit that never pushes —
+    # failing closed, but permanently and for a reason nobody would guess from
+    # the journal line. A systemd user unit does NOT inherit the login shell's
+    # PATH, and gitleaks lives in the per-user nix profile rather than in
+    # /run/current-system/sw/bin, so `command -v gitleaks` inside the unit is
+    # not something to leave to chance. GITLEAKS= pins the store path at build
+    # time.
+    #
+    # And it must be a real absolute path: systemd expands specifiers in
+    # ExecStart= but NOT in Environment=, the trap claude-marketplace-pull.service
+    # above documents having fallen into. A "%h"-flavoured GITLEAKS would hand
+    # the script a relative path, `scan` would fail on every tick, and the sink
+    # would stop being backed up while the timer reported itself healthy.
+    sink_env = [
+        line for line in sink_service.splitlines() if line.startswith("Environment=")
+    ]
+    assert sink_env, (
+        f"claude-proposals-push.service has no Environment= line, so the script "
+        f"has to find gitleaks on a systemd user unit's PATH — which does not "
+        f"carry the per-user nix profile:\n{sink_service}"
+    )
+    gitleaks_env = [line for line in sink_env if "GITLEAKS=" in line]
+    assert gitleaks_env, (
+        f"claude-proposals-push.service does not pin GITLEAKS=, so an "
+        f"unattended push would depend on the unit's PATH happening to carry "
+        f"gitleaks:\n{sink_env}"
+    )
+    assert any("GITLEAKS=/nix/store/" in line for line in gitleaks_env), (
+        f"claude-proposals-push.service's GITLEAKS= is not an absolute nix "
+        f"store path:\n{gitleaks_env}"
+    )
+    assert not any("%h" in line for line in sink_env), (
+        f"claude-proposals-push.service leaves an unexpanded %h in "
+        f"Environment= — systemd does not expand specifiers there, so the "
+        f"script would get a relative path, fail its leak scan on every tick, "
+        f"and never push:\n{sink_env}"
+    )
+    # The pinned binary must actually be there and runnable. A store path that
+    # evaluates but is not in the VM's closure is the same outage as no path at
+    # all, and it is invisible until the first tick.
+    gitleaks_path = (
+        gitleaks_env[0].split("GITLEAKS=", 1)[1].strip().strip('"').split()[0]
+    )
+    dellan.succeed(f"test -x {gitleaks_path}")
+    dellan.succeed(f"{gitleaks_path} version")
+
     # sota-watch-refresh-roster — parallel unit + timer that refreshes
     # the AI power-users roster from the source Google Sheet ahead of
     # the research runner. Same guard-path shape as sota-watch: missing
