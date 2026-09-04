@@ -149,6 +149,9 @@ in
     })
   ];
   testScript = ''
+    import json
+    import shlex
+
     dellan.wait_for_unit("multi-user.target")
     dellan.wait_for_unit("home-manager-jonathan.service")
     dellan.wait_for_unit("default.target", "jonathan")
@@ -411,6 +414,38 @@ in
         "jq -e '[.[].tabs[].windows[]] | length == 4'",
         timeout=15,
     )
+    # Pane 0 gets a command of its OWN before the save. Left as the
+    # login shell it is byte-identical to what the exec-time refusal
+    # opens (`os.environ["SHELL"]`, also
+    # /run/current-system/sw/bin/zsh), so phase 5b below could not tell
+    # "pane 0 became its recorded command" from "--exec-pane0 refused
+    # and handed the user a shell" — and an assertion that cannot tell
+    # those apart is not asserting the thing it is named after.
+    # `exec` replaces the shell in place, so the window keeps its pid
+    # and phase 6's respawn comparison is unaffected.
+    pane0_magic = "44444"
+    dellan.succeed(
+        "su jonathan -c '" + sock_cmd
+        + ' send-text --match id:1 "exec ' + sleep_bin + " "
+        + pane0_magic + '\\n"' + "'"
+    )
+    # Sent ONCE: the pty buffers input, so text written before the shell
+    # starts reading is not lost. The wait is long because pane 0 holds
+    # the FIRST interactive zsh in a cold VM, which pays for compinit
+    # and the whole rc chain before it runs anything — measured at 77s
+    # on a green run in tests/claude-egress.nix, which warms it for the
+    # same reason. A 15s cap timed out here at 16.5s with the text still
+    # queued.
+    dellan.wait_until_succeeds(
+        "su jonathan -c '" + sock_cmd + " ls' | "
+        "jq -e '[.[].tabs[].windows[].cmdline | join(\" \")] | "
+        'any(. == "' + sleep_bin + " " + pane0_magic + "\")'",
+        timeout=300,
+    )
+    print("[diag] pane 0 after exec:\n" + dellan.succeed(
+        "su jonathan -c '" + sock_cmd + " ls' | "
+        "jq -c '[.[].tabs[].windows[] | {id, cmdline}]'"
+    ))
     dellan.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/ls-before.json'")
     print("[diag] before save:\n" + dellan.succeed("cat /tmp/ls-before.json"))
 
@@ -584,15 +619,47 @@ in
     # dead-process half against the scripts; this is the real-kitty
     # half.
     stub = "/home/jonathan/.cache/kitty-session/stub-session"
-    print("[diag] stub:\n" + dellan.succeed(f"cat {stub}"))
-    dellan.succeed(f"grep -qE -- '--exec-pane0 [^ ]' {stub}")
-    print("[diag] pane-0 cmdline:\n" + dellan.succeed(
+    stub_line = dellan.succeed(f"cat {stub}").strip()
+    print("[diag] stub:\n" + stub_line)
+    # kitty session-parses the line with shlex (kitty/session.py), so
+    # shlex is also how the argv it hands pane 0 is read back out.
+    stub_toks = shlex.split(stub_line)
+    assert "--exec-pane0" in stub_toks, (
+        "the stub does not launch pane 0 through --exec-pane0:\n" + stub_line
+    )
+    pane0_argv = stub_toks[stub_toks.index("--exec-pane0") + 1:]
+    assert pane0_argv, (
+        "the stub named NO argv after --exec-pane0. That is the shape "
+        "whose recorded cmdline pointed back at the launcher, and pane 0 "
+        "opens a bare shell instead of its own command:\n" + stub_line
+    )
+    cmdlines = json.loads(dellan.succeed(
         "jq -c '[.[].tabs[].windows[].cmdline]' /tmp/ls-after.json"
     ))
-    dellan.succeed(
-        "jq -e '[.[].tabs[].windows[].cmdline | "
-        'select(index("--exec-pane0")) | length] | '
-        "all(. > 2)' /tmp/ls-after.json"
+    print("[diag] pane-0 argv: " + json.dumps(pane0_argv))
+    print("[diag] live cmdlines: " + json.dumps(cmdlines))
+    # The assertion this replaced was `[cmdline | select(index(
+    # "--exec-pane0")) | length] | all(. > 2)`, and it could not fail:
+    # execvp KEEPS the pid, so child.cmdline (kitty/child.py:593-596)
+    # reports the EXEC'D command and no live window's cmdline ever holds
+    # the flag. The select() yielded [] and all([]) is true. The green
+    # run's own diagnostic said so:
+    #   [["/run/current-system/sw/bin/zsh"],[".../sleep","11111"], ...]
+    #
+    # What is actually worth asserting is the positive: pane 0 IS running
+    # the argv the stub named. That fails if --exec-pane0 refused (the
+    # window would show $SHELL — distinguishable now that pane 0 carries
+    # a sleep of its own), if the exec never happened (the launcher argv
+    # would still be there), or if the argv was truncated in transit.
+    assert pane0_argv in cmdlines, (
+        "no window is running pane 0's recorded command "
+        f"{pane0_argv}; live cmdlines are {cmdlines}. --exec-pane0 either "
+        "refused and opened a shell, or never exec'd at all."
+    )
+    assert not [c for c in cmdlines if len(c) > 1 and c[1] == "--exec-pane0"], (
+        f"a window is still running the pane-0 launcher: {cmdlines}. The "
+        "next snapshot would record that as pane 0's command, and the "
+        "restore after it would exec the launcher again."
     )
 
     # === Phase 6: kitty-panes-reflow ===
