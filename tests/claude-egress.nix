@@ -482,6 +482,44 @@ in
         False, "-- ends option scanning",
     )
 
+    # ── --fork-session is a MODIFIER, not a session selector ──────────
+    # `claude --help` (2.1.260): "When resuming, create a new session ID
+    # instead of reusing the original (use with --resume or --continue)".
+    # It cannot select a session on its own, so treating it as a selector
+    # made bare `claude --fork-session` suppress --continue and silently
+    # open a FRESH session — the fork workflow lost, the same class of
+    # bug as the one the predicate exists to fix. Bare, it must expand to
+    # `--continue --fork-session`: fork the most recent conversation.
+    argv_case(
+        "claude --fork-session --version",
+        "argv: --continue --fork-session --version",
+        False, "bare --fork-session forks the most recent session",
+    )
+    # …and combined with a real selector it must still not gain one.
+    argv_case(
+        f"claude --fork-session --resume {SID}",
+        f"argv: --fork-session --resume {SID}",
+        True, "--fork-session --resume <sid> passthrough",
+    )
+    argv_case(
+        f"claude --fork-session -r {SID}",
+        f"argv: --fork-session -r {SID}",
+        True, "--fork-session -r <sid> passthrough",
+    )
+    # Control 3: `-f` has no short form in the CLI and is not in the
+    # `-*[crp]*` class, so dropping --fork-session must not have shifted
+    # the short-cluster catch-all either way.
+    argv_case(
+        "claude -f --version",
+        "argv: --continue -f --version",
+        False, "-f is not a session-selecting short cluster",
+    )
+    argv_case(
+        "claude -fc --version",
+        "argv: -fc --version",
+        True, "a short cluster containing c still selects",
+    )
+
     # Degradation path: with no user bus reachable the launcher must warn
     # and STILL start the tool. Observation degrades; the tool never
     # fails to start.

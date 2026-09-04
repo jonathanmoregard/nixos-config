@@ -264,11 +264,28 @@
       # up with three distinct kitty window ids mapped to one session id.
       #
       # The flag set was read off `claude --help` (v2.1.260), not guessed:
-      # -c/--continue, -r/--resume, --session-id, --fork-session,
-      # -p/--print, plus the three whose help text literally says
-      # "Resume …"/"attach to an existing" — --from-pr, --teleport,
-      # --cloud. -p/--print counts because it is non-interactive: silently
-      # continuing a prior conversation changes what a scripted call means.
+      # -c/--continue, -r/--resume, --session-id, -p/--print, plus the
+      # three whose help text literally says "Resume …"/"attach to an
+      # existing" — --from-pr, --teleport, --cloud. -p/--print counts
+      # because it is non-interactive: silently continuing a prior
+      # conversation changes what a scripted call means.
+      #
+      # MODIFIERS are deliberately absent, however session-ish they read.
+      # A modifier shapes a session the caller selected some other way; it
+      # cannot select one itself, so suppressing --continue for it leaves
+      # the caller with nothing selected at all.
+      #   --fork-session — help: "When resuming, create a new session ID
+      #     instead of reusing the original (use with --resume or
+      #     --continue)". Listing it here made bare `claude --fork-session`
+      #     expand to itself, which by that same help text has nothing to
+      #     fork and silently opens a fresh session instead. Absent, it
+      #     expands to `--continue --fork-session` — fork the most recent
+      #     conversation, which is the workflow. `--fork-session --resume
+      #     <sid>` and `--fork-session -r <sid>` are unaffected either
+      #     way: --resume/-r already trip the predicate.
+      #   --bg/--background — starts the session in the background;
+      #     `--continue --bg` reads as "continue the most recent one in
+      #     the background", so the default still applies.
       #
       # Two argument shapes a naive scan misses, both verified against the
       # real binary rather than assumed:
@@ -295,7 +312,7 @@
         for arg in "$@"; do
           case "$arg" in
             --)                                             return 1 ;;
-            --continue|--fork-session|--print)               return 0 ;;
+            --continue|--print)                             return 0 ;;
             --resume|--resume=*|--session-id|--session-id=*) return 0 ;;
             --from-pr|--from-pr=*|--teleport|--teleport=*)   return 0 ;;
             --cloud|--cloud=*)                               return 0 ;;
