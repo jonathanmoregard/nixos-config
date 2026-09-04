@@ -11,19 +11,37 @@ let
   #
   # Requires `import os` in the consuming script.
   kittyInternalWindowPy = ''
-    # kitty spawns its own UI as `<kitten-exe> <name> ...` — boss.py
-    # builds the config-error overlay as
-    # `[kitten_exe(), '__show_error__', '--title', title]` and the
-    # close-confirmation dialog via `run_kitten_with_metadata('ask',
-    # ...)`. Dunder names are kitty-private by convention: they are not
-    # in `kitten --help` and a user cannot mean to run one. `ask` is the
-    # one public-named kitten kitty spawns on the user's behalf.
+    # kitty stamps KITTEN_RUNNING_AS_UI=1 into the environment of every
+    # window it spawns AS ITS OWN UI. There are exactly two such places
+    # in 0.48.2 — run_kitten_with_metadata (boss.py:2359), which is how
+    # `ask`, `hints`, `unicode_input`, `command-palette`, `choose-files`
+    # and the rest of the wrapped kittens are opened, and
+    # create_special_window_for_show_error (boss.py:2487), the
+    # `__show_error__` config-error overlay. `kitty @ ls` reports the
+    # variable: measured 2026-09-04 against real kitty 0.48.2 under
+    # Xvfb, the hints / unicode_input / command-palette overlays each
+    # came back with env.KITTEN_RUNNING_AS_UI == "1" and the user's own
+    # shell pane with none. (`ls` strips env vars COMMON to every
+    # window, which this never is: an overlay always accompanies the
+    # real pane it covers.)
     #
-    # Public kittens the user CAN mean (`kitten diff`, `kitten icat`,
-    # `kitten ssh`, and the `kitten run-shell` wrapper kitty puts around
-    # every shell-integration pane) are deliberately NOT filtered —
-    # dropping a real pane is the mirror-image bug and just as bad.
-    INTERNAL_KITTENS = ("ask",)
+    # This env marker, not a name list, is the rule — and the reason is
+    # that names do not carry the distinction. kitty's
+    # wrapped_kitten_names() is ['ask', 'choose-files', 'clipboard',
+    # 'command-palette', 'diff', 'hints', 'hyperlinked_grep', 'icat',
+    # 'query_terminal', 'show_key', 'ssh', 'themes', 'transfer',
+    # 'unicode_input'], so `diff`, `icat` and `ssh` — the ones the user
+    # runs on purpose — sit in the very same set as `hints`. What
+    # separates them is WHO SPAWNED IT, and the marker is kitty's own
+    # record of exactly that: a `kitten diff` the user typed carries no
+    # marker and stays a real pane, which is the mirror-image bug this
+    # has to keep avoiding.
+    #
+    # (An earlier version of this comment claimed `ask` was "the one
+    # public-named kitten kitty spawns on the user's behalf". It is
+    # not, and that premise is what let four more overlay kinds
+    # through.)
+    UI_KITTEN_ENV = "KITTEN_RUNNING_AS_UI"
 
 
     def _kitten_subcommand(cmdline):
@@ -43,23 +61,53 @@ let
         return None
 
 
+    def _is_kitten_runner(cmdline):
+        """True for kitty's Python kitten-runner spawn shape.
+
+        A kitten kitty ships no wrapped binary for takes the other
+        branch of the same `if` (boss.py:2364) and gets NO env marker:
+        `kitty +runpy 'from kittens.runner import main; main()'
+        <config-dir> <kitten> ...`. `resize_window` is the one
+        reachable from a default binding; measured verbatim in the
+        same Xvfb run. Structural rather than a name — nobody types
+        +runpy.
+        """
+        return (
+            len(cmdline) > 2
+            and os.path.basename(cmdline[0]) == "kitty"
+            and cmdline[1] == "+runpy"
+            and "kittens.runner" in cmdline[2]
+        )
+
+
     def is_internal_window(cmdline):
-        """True for a cmdline kitty spawned as its own chrome."""
+        """True for a cmdline kitty spawned as its own chrome.
+
+        The cmdline-only fallback, for the places no environment is
+        available: kitty's `foreground_processes` entries carry a
+        cmdline and nothing else. Dunder names are kitty-private by
+        convention — not in `kitten --help`, and a user cannot mean to
+        run one.
+        """
+        if _is_kitten_runner(cmdline):
+            return True
         sub = _kitten_subcommand(cmdline)
         if sub is None:
             return False
-        if sub in INTERNAL_KITTENS:
-            return True
         return len(sub) > 4 and sub.startswith("__") and sub.endswith("__")
 
 
     def window_is_internal(win):
         """True for a `kitty @ ls` window that is kitty's own chrome.
 
-        Checks what kitty LAUNCHED the window with first: that survives
-        the death of the process, which is the same reason pane_cmd
-        prefers it.
+        Env marker first — it is kitty's own record of having spawned
+        the window itself, and it is the only signal that separates a
+        `hints` overlay from a `kitten diff` the user ran. Then the
+        cmdline shapes, which survive the death of the process the
+        same way pane_cmd's preference for `cmdline` does.
         """
+        if (win.get("env") or {}).get(UI_KITTEN_ENV) == "1":
+            return True
         if is_internal_window(win.get("cmdline") or []):
             return True
         fg = win.get("foreground_processes") or []

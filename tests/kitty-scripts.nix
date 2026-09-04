@@ -223,13 +223,23 @@ let
     out = sys.argv[1]
 
 
-    def win(wid, cmdline):
+    def win(wid, cmdline, ui=False):
+        # `ui` models the env marker kitty puts on every window it
+        # spawns as its OWN UI (boss.py:2359 and :2487). Measured
+        # against real kitty 0.48.2 under Xvfb on 2026-09-04: the
+        # hints / unicode_input / command-palette overlays each came
+        # back from `kitty @ ls` with env.KITTEN_RUNNING_AS_UI == "1",
+        # the user's shell pane with none.
+        env = {"PWD": "/tmp"}
+        if ui:
+            env["KITTEN_RUNNING_AS_UI"] = "1"
         return {
             "id": wid,
             "is_focused": wid == 1,
             "cwd": "/tmp",
             "title": "w%d" % wid,
             "cmdline": cmdline,
+            "env": env,
             "foreground_processes": [{"cmdline": cmdline}],
         }
 
@@ -255,7 +265,41 @@ let
         # 1 real pane + the close-confirmation dialog.
         "ask-dialog": tab([
             win(1, SHELL),
-            win(7, [KITTEN, "ask", "--type=yesno", "--message", "close?"]),
+            win(7, [KITTEN, "ask", "--type=yesno", "--message", "close?"],
+                ui=True),
+        ]),
+        # The overlays kitty opens from its own default bindings:
+        # `hints` (boss.py:2649), `unicode_input` (:2424) and
+        # `command-palette` (:2432) all reach
+        # run_kitten_with_metadata (:2358) and come back as
+        # `kitten <name>`. None is dunder-named and none is `ask`, so
+        # a rule built on either misses all three, and a snapshot
+        # taken while one is open counts it as a pane.
+        "hints-overlay": tab([
+            win(1, SHELL),
+            win(8, [KITTEN, "hints"], ui=True),
+        ]),
+        "unicode-input-overlay": tab([
+            win(1, SHELL),
+            win(9, [KITTEN, "unicode_input"], ui=True),
+        ]),
+        "command-palette-overlay": tab([
+            win(1, SHELL),
+            win(10, [KITTEN, "command-palette"], ui=True),
+        ]),
+        # `resize_window` (boss.py:1803) is NOT one of kitty's wrapped
+        # kittens, so it takes the OTHER branch of the same `if`
+        # (:2364): `kitty +runpy 'from kittens.runner import main;
+        # main()' <config-dir> <kitten> ...`, and kitty sets no env
+        # marker on it at all. Measured shape, verbatim.
+        "resize-window-overlay": tab([
+            win(1, SHELL),
+            win(11, [
+                "/nix/store/fake-kitty/bin/kitty", "+runpy",
+                "from kittens.runner import main; main()",
+                "/home/jonathan/.config/kitty", "resize_window",
+                "--horizontal-increment=2", "--vertical-increment=2",
+            ]),
         ]),
         # Control: two genuine panes, no internals.
         "two-real": tab([win(1, SHELL), win(2, SHELL)]),
@@ -695,7 +739,15 @@ pkgs.runCommand "kitty-scripts-harness"
 
     # 1 real pane + an internal overlay must dispatch as ONE pane:
     # a plain vsplit, no focus-window hop.
-    for case in error-overlay ask-dialog; do
+    #
+    # The overlay class is not `__show_error__` plus `ask`: kitty
+    # opens `hints`, `unicode_input` and `command-palette` from its
+    # own default bindings through the same call, and `resize_window`
+    # through the +runpy branch of it. Each of those is a window a
+    # snapshot can capture and a restore can bring back as a pane.
+    for case in error-overlay ask-dialog hints-overlay \
+                unicode-input-overlay command-palette-overlay \
+                resize-window-overlay; do
       pane_add "$case"
       grep -q '^launch --location=vsplit' "$PWD/state/$case.log" || {
         echo "FAIL(C/$case): expected the 1-real-pane branch (vsplit);"
