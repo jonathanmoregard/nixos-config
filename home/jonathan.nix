@@ -253,7 +253,67 @@
 
       # claude wrapper: clear + resume most recent session by default.
       # Use `claudee` to start a fresh session.
-      claude()  { clear; command claude --continue "$@"; }
+      #
+      # `--continue` is injected ONLY when the caller selected no session
+      # themselves. `--continue` means "the most recent conversation in
+      # this directory" and it OVERRIDES an explicit `--resume <sid>`, so
+      # the old unconditional prepend silently opened the wrong transcript.
+      # Observed 2026-09-04 during an incident recovery: two
+      # `claude --resume <sid>` invocations both reattached to the session
+      # already running, and ~/.cache/kitty-session/pane-sessions.tsv ended
+      # up with three distinct kitty window ids mapped to one session id.
+      #
+      # The flag set was read off `claude --help` (v2.1.260), not guessed:
+      # -c/--continue, -r/--resume, --session-id, --fork-session,
+      # -p/--print, plus the three whose help text literally says
+      # "Resume …"/"attach to an existing" — --from-pr, --teleport,
+      # --cloud. -p/--print counts because it is non-interactive: silently
+      # continuing a prior conversation changes what a scripted call means.
+      #
+      # Two argument shapes a naive scan misses, both verified against the
+      # real binary rather than assumed:
+      #   claude --resume=<sid>   commander accepts --long=VALUE
+      #   claude -r<sid> / -cv    attached short values, and clustered
+      #                           short booleans (-cv behaves as -c -v)
+      # so any word starting with a single `-` that contains c, r or p
+      # counts. A cluster like `-dp` (debug filter "p") false-positives;
+      # the cost is a fresh session instead of a resumed one, which is the
+      # harmless direction. The reverse — resuming a session the user did
+      # not ask for — is the bug being fixed, so the scan deliberately
+      # fails toward "do not inject".
+      #
+      # `--` ends the option list: everything after it is prompt text and
+      # must not be scanned, so `claude -- --resume x` still gets
+      # --continue and passes "--resume x" through as the prompt.
+      #
+      # Kept as a standalone helper because home/claude-egress-slice.nix
+      # redefines claude() through `programs.zsh.initContent = mkAfter`
+      # (its later definition wins) and calls this same predicate, so the
+      # two wrappers cannot drift apart.
+      _claude_selects_session() {
+        local arg
+        for arg in "$@"; do
+          case "$arg" in
+            --)                                             return 1 ;;
+            --continue|--fork-session|--print)               return 0 ;;
+            --resume|--resume=*|--session-id|--session-id=*) return 0 ;;
+            --from-pr|--from-pr=*|--teleport|--teleport=*)   return 0 ;;
+            --cloud|--cloud=*)                               return 0 ;;
+            --*)                                                      ;;
+            -*[crp]*)                                        return 0 ;;
+          esac
+        done
+        return 1
+      }
+
+      claude() {
+        clear
+        if _claude_selects_session "$@"; then
+          command claude "$@"
+        else
+          command claude --continue "$@"
+        fi
+      }
       claudee() { clear; command claude "$@"; }
 
       # nixos-config git anchor. safe.bareRepository = explicit means
