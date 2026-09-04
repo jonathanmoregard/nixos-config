@@ -43,6 +43,17 @@ let
     # through.)
     UI_KITTEN_ENV = "KITTEN_RUNNING_AS_UI"
 
+    # And this module's OWN chrome: the overlay kitty-panes-reflow opens
+    # to tell the user why it refused (its only other output goes to
+    # kitty's log, where nobody reads it). Same class as kitty's own
+    # overlays and treated the same way — it is not a pane the user
+    # works in, so it must not take a grid slot, must not be counted by
+    # the 2x2 dispatch, and must not come back as a pane after a
+    # restore. Marked with our own variable rather than by writing
+    # kitty's: KITTEN_RUNNING_AS_UI is kitty's record of what KITTY
+    # spawned, and setting it ourselves would make that record a lie.
+    OWN_UI_ENV = "KITTY_SESSION_UI"
+
 
     def _kitten_subcommand(cmdline):
         """The kitten sub-command name, or None when not a kitten call.
@@ -100,13 +111,15 @@ let
     def window_is_internal(win):
         """True for a `kitty @ ls` window that is kitty's own chrome.
 
-        Env marker first — it is kitty's own record of having spawned
-        the window itself, and it is the only signal that separates a
-        `hints` overlay from a `kitten diff` the user ran. Then the
+        Env markers first — kitty's own record of having spawned the
+        window itself, which is the only signal that separates a
+        `hints` overlay from a `kitten diff` the user ran, and ours for
+        the windows this module opens to talk to the user. Then the
         cmdline shapes, which survive the death of the process the
         same way pane_cmd's preference for `cmdline` does.
         """
-        if (win.get("env") or {}).get(UI_KITTEN_ENV) == "1":
+        env = win.get("env") or {}
+        if env.get(UI_KITTEN_ENV) == "1" or env.get(OWN_UI_ENV) == "1":
             return True
         if is_internal_window(win.get("cmdline") or []):
             return True
@@ -675,6 +688,22 @@ let
     # rewriting both of them, not editing this number.
     PANES_PER_TAB = 4
 
+    # What the notice overlay runs. sys.executable rather than a shell:
+    # the overlay is spawned BY KITTY, whose PATH is the desktop
+    # session's and not this script's, and this interpreter is already
+    # in the closure and already an absolute path. It prints the
+    # message and waits for one line, so Enter dismisses the window and
+    # nothing is left behind -- unlike `launch --hold`, which follows
+    # the command with a shell the user then has to close.
+    NOTICE_PY = (
+        "import sys\n"
+        "print(sys.argv[1])\n"
+        "try:\n"
+        "    input()\n"
+        "except BaseException:\n"
+        "    pass\n"
+    )
+
 
     def _answers(sock):
         """True when a live kitty is listening on `sock`."""
@@ -702,6 +731,60 @@ let
             if _answers("unix:" + f):
                 return "unix:" + f
         return None
+
+
+    # The socket, once found, so a refusal raised deep in the plan can
+    # still be shown to the user. None on the --plan path, which never
+    # talks to a kitty at all.
+    SOCK = None
+
+    NOTICE_TITLE = "kitty-panes-reflow"
+
+
+    def surface(msg):
+        """Put `msg` where the user will actually see it.
+
+        The only invocation the user makes is the ctrl+shift+r binding,
+        which runs this command through `launch --type=background` --
+        and kitty gives such a process no window and no pty. It is
+        spawned with kitty's OWN stdout and stderr
+        (boss.run_background_process, boss.py:2913 Popen with
+        stdout/stderr defaulted), so everything printed goes to kitty's
+        log. Measured under Xvfb against kitty 0.48.2: a background
+        launch printing to both streams left the text in kitty's stderr
+        log and in NO window -- `kitty @ get-text` over every window
+        found none of it. Every refusal was therefore inaudible on the
+        one path that matters, and a part-rebuilt layout came with no
+        way to know why or what to do.
+
+        An overlay over the window the user is looking at, so it lands
+        where their eyes are even when the refusal is precisely that a
+        DIFFERENT OS window took focus. It is marked as this module's
+        own chrome (OWN_UI_ENV), so no snapshot restores it as a pane
+        and no later reflow gives it a grid slot -- the same treatment
+        kitty's own overlays get. Dismissed with Enter, so it does not
+        leave a shell behind the way `launch --hold` would.
+
+        Best-effort by construction: a refusal that cannot be shown is
+        still printed and still a refusal.
+        """
+        if not SOCK:
+            return
+        body = msg + "\n\n[press Enter to dismiss]"
+        try:
+            subprocess.run(
+                [
+                    "kitty", "@", "--to", SOCK, "launch",
+                    "--type=overlay", "--title", NOTICE_TITLE,
+                    "--env", OWN_UI_ENV + "=1",
+                    # `--` because the message is data: a line starting
+                    # with a dash must not be read as an option.
+                    "--", sys.executable, "-c", NOTICE_PY, body,
+                ],
+                check=False, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
     def ls(sock):
@@ -1117,7 +1200,7 @@ let
         return fh
 
 
-    def main():
+    def run():
         if "--plan" in sys.argv:
             # Test-only seam, same role as kitty-restore-session's
             # --dump-panes: render the plan from a `kitty @ ls`
@@ -1140,46 +1223,70 @@ let
             json.dump(plan, sys.stdout)
             return
 
-        # Before anything reaches the wire, and never on the --plan
-        # path above, which is a pure function of stdin.
+        # Locating the kitty comes first only so that a refusal has
+        # somewhere to be SHOWN (surface() needs the socket, and the
+        # lock refusal is one of the refusals). It reaches the wire
+        # with `ls` and nothing else; the lock still precedes every
+        # command that MOVES anything, which is what it is for.
+        global SOCK
+        SOCK = find_socket()
+        if not SOCK:
+            # Nothing to reflow and nowhere to say so. stderr only.
+            print("no live kitty", file=sys.stderr)
+            sys.exit(1)
+
         lock = take_lock()
         if lock is not None:
             lock.write("%d\n" % os.getpid())
             lock.flush()
 
-        sock = find_socket()
-        if not sock:
-            print("no live kitty", file=sys.stderr)
-            sys.exit(1)
-        plan = build_plan(ls(sock))
+        plan = build_plan(ls(SOCK))
         if plan is None:
-            print(
-                "several OS windows and none is focused; refusing to "
-                "guess which one to reflow",
-                file=sys.stderr,
+            raise SystemExit(
+                "kitty-panes-reflow: several kitty OS windows are open "
+                "and none of them is focused, so there is no way to "
+                "tell which one to reflow. Focus the one you mean and "
+                "run it again."
             )
-            sys.exit(1)
         if plan["noop"]:
             # Nothing is issued: no detach, no focus change, no
             # visible churn. This command is meant to be safe to fire
-            # on a hunch.
+            # on a hunch -- and for the same reason it is not
+            # surfaced: an overlay every time would make the hunch
+            # expensive.
             print("layout is already canonical")
             return
         try:
-            execute(sock, plan["os_window"], plan["steps"])
+            execute(SOCK, plan["os_window"], plan["steps"])
         except subprocess.CalledProcessError as err:
             # A pane closed between the plan and the step that moves
             # it, or kitty refused the command. Say so instead of
             # emitting a traceback: the layout is now part-rebuilt,
             # and a second run converges on it from wherever it
             # stopped.
-            print(
+            raise SystemExit(
                 "kitty-panes-reflow: `%s` failed (rc %d); the layout is "
                 "part-rebuilt, run it again"
-                % (" ".join(err.cmd), err.returncode),
-                file=sys.stderr,
+                % (" ".join(err.cmd), err.returncode)
             )
-            sys.exit(1)
+
+
+    def main():
+        """Every refusal reaches the user, whatever raised it.
+
+        The refusals are raised deep -- _require_os_window() and
+        _resolve_tab() fire between two remote-control commands, from
+        inside execute() -- and each one leaves the layout in a state
+        the user has to be told about. Catching SystemExit here, rather
+        than surfacing at each site, is what keeps that guarantee from
+        depending on whoever adds the next refusal remembering to.
+        """
+        try:
+            run()
+        except SystemExit as exc:
+            if isinstance(exc.code, str):
+                surface(exc.code)
+            raise
 
 
     if __name__ == "__main__":

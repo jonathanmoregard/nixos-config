@@ -1330,6 +1330,32 @@ pkgs.runCommand "kitty-scripts-harness"
         echo "  away; the user has to be able to tell this apart from a"
         echo "  crash."
         exit 1; }
+
+      # E10b — and the user actually HEARS it. The only invocation
+      # they make is the ctrl+shift+r binding, which runs reflow
+      # through `launch --type=background`: kitty spawns such a
+      # process with its OWN stdout and stderr
+      # (boss.run_background_process), so stderr goes to kitty's log
+      # and into no window at all. Measured under Xvfb against kitty
+      # 0.48.2 -- a background launch printing to both streams left
+      # the text in kitty's stderr log, and `kitty @ get-text` over
+      # every window found none of it. A refusal nobody can hear
+      # leaves a visibly half-rebuilt layout and no way to know why.
+      grep -q 'launch --type=overlay' "$KITTY_CMD_LOG" || {
+        echo "FAIL(E10b): the refusal went to stderr only, which on the"
+        echo "  ctrl+shift+r path is kitty's log. The user is left with"
+        echo "  a part-rebuilt layout and no message."
+        exit 1; }
+      grep -qi 'part-rebuilt, run it again' "$KITTY_CMD_LOG" || {
+        echo "FAIL(E10b): the overlay does not carry the refusal text,"
+        echo "  so it says nothing about what happened or what to do."
+        exit 1; }
+      grep -q 'KITTY_SESSION_UI=1' "$KITTY_CMD_LOG" || {
+        echo "FAIL(E10b): the notice overlay is not marked as this"
+        echo "  module's own chrome, so a snapshot taken while it is up"
+        echo "  restores it as a pane and the next reflow gives it a"
+        echo "  grid slot."
+        exit 1; }
     ) || exit 1
 
     # E11 — two reflows must not interleave. Each plans against a
@@ -1352,10 +1378,21 @@ pkgs.runCommand "kitty-scripts-harness"
         echo "  them interleaving rebuild each other's half-finished"
         echo "  tabs."
         exit 1; }
-      [ ! -s "$KITTY_CMD_LOG" ] || {
-        cat "$KITTY_CMD_LOG"
-        echo "FAIL(E11): the refusal came after commands had already"
-        echo "  been issued."
+      cat "$KITTY_CMD_LOG"
+      if grep -qE '^(detach-window|focus-window|goto-layout|action)' \
+           "$KITTY_CMD_LOG"; then
+        echo "FAIL(E11): the refusal came after commands that MOVE"
+        echo "  something had already been issued."
+        exit 1
+      fi
+      # The one command it may issue is the notice itself: a refusal
+      # the user cannot hear is the E10b failure in another costume.
+      grep -q 'launch --type=overlay' "$KITTY_CMD_LOG" || {
+        echo "FAIL(E11): the lock refusal is invisible on the"
+        echo "  ctrl+shift+r path, where stderr goes to kitty's log."
+        exit 1; }
+      grep -qi 'another reflow is already running' "$KITTY_CMD_LOG" || {
+        echo "FAIL(E11): the overlay does not say WHY reflow refused."
         exit 1; }
     ) || exit 1
 
