@@ -1474,16 +1474,6 @@ let
     # submissions -- mangling the one message whose job is to be read
     # exactly.
 
-    # Where kitty's `--session` stub is written. Overridable so a test
-    # can drive emit_stub without touching the LIVE session's file --
-    # /tmp/kitty-stub-session belongs to the running kitty. The wrapper
-    # in home/kitty.nix reads the same variable with the same default,
-    # so writer and reader cannot drift.
-    STUB_PATH = os.environ.get(
-        "KITTY_STUB_PATH", "/tmp/kitty-stub-session"
-    )
-
-
     def cache_dir():
         base = os.environ.get(
             "XDG_CACHE_HOME",
@@ -1494,6 +1484,25 @@ let
 
     def pane0_path():
         return os.path.join(cache_dir(), "pane0-launch.json")
+
+
+    def stub_path():
+        """Where kitty's `--session` stub is written.
+
+        In the user's own cache dir, beside pane0-launch.json, NOT at
+        a fixed name in world-writable /tmp. kitty runs the launch
+        directives in this file, so it is a program: a predictable
+        /tmp path let anyone on the host pre-create it, or plant a
+        symlink at the name _write_atomic writes through.
+
+        Still overridable, so a test can drive emit_stub without going
+        near the live session's stub. The wrapper in home/kitty.nix
+        reads the same variable with the same default, and
+        tests/kitty-scripts.nix phase H2 asserts the two agree.
+        """
+        return os.environ.get(
+            "KITTY_STUB_PATH", os.path.join(cache_dir(), "stub-session")
+        )
 
 
     def _self_exe():
@@ -1589,8 +1598,23 @@ let
 
 
     def _write_atomic(path, text):
+        """Replace `path` with `text`, refusing to write through a
+        symlink.
+
+        O_NOFOLLOW on the temp file, because `path + ".tmp"` is the
+        name an attacker gets to plant at: open('w') would truncate
+        whatever the link pointed at and then os.replace would move
+        the LINK into place, leaving kitty executing a file somebody
+        else still owns. 0600 because these hold the user's cwds,
+        window titles, argv and claude session ids.
+        """
         tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        )
+        with os.fdopen(fd, "w") as fh:
             fh.write(text)
         os.replace(tmp, path)
 
@@ -1632,7 +1656,7 @@ let
         # treats a missing stub as "launch plain kitty".
         if LINEBREAKS.search(line):
             raise ValueError("stub line is not single-line: " + repr(line))
-        _write_atomic(STUB_PATH, line + "\n")
+        _write_atomic(stub_path(), line + "\n")
 
 
     def exec_pane0():
@@ -2502,7 +2526,12 @@ let
       if [ "\$sockets_seen" -eq 0 ]; then
         rm -f "\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/pane-sessions.tsv"
       fi
-      stub="\''${KITTY_STUB_PATH:-/tmp/kitty-stub-session}"
+      # Same variable, same default, as kitty-restore-session's
+      # stub_path(). The user's own cache dir, not a fixed name in
+      # world-writable /tmp: kitty EXECUTES the launch directives in
+      # this file. tests/kitty-scripts.nix phase H2 asserts writer and
+      # reader still agree.
+      stub="\''${KITTY_STUB_PATH:-\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/stub-session}"
       if [ -s "\$snap" ] && [ "\$live" -eq 0 ]; then
         # Write a stub session file containing just pane 0; this makes
         # kitty start directly into our restored topology with no extra

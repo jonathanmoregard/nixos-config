@@ -50,6 +50,9 @@ let
       "kitty-session-commit"
       "kitty-session-save"
       "kitty-panes-reflow"
+      # The session-restoring `kitty` wrapper itself, so the stub path
+      # it READS can be checked against the one the writer emits.
+      "kitty-with-session"
     ];
   };
 
@@ -1555,6 +1558,72 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(G5): a clean save failed."; exit 1; }
     [ -s gsave/happy/kitty-session/last.session ] || {
       echo "FAIL(G5): last.session was not regenerated after a commit."
+      exit 1; }
+
+    # --- Phase H: the stub kitty EXECUTES is not left in /tmp -------
+    #
+    # kitty runs the launch directives in the stub, so the stub is a
+    # program. Its default path was /tmp/kitty-stub-session — a fixed
+    # name in a world-writable directory — and _write_atomic used
+    # open('w'), which follows a symlink planted at the path it is
+    # about to write. Cheap to close, and the file is executed.
+    mkdir -p hstub
+    (
+      export XDG_CACHE_HOME="$PWD/hstub"
+      unset KITTY_STUB_PATH
+      mkdir -p "$XDG_CACHE_HOME/kitty-session"
+      cp "$PWD/fx/home/.cache/kitty-session/snapshot.json" \
+         "$XDG_CACHE_HOME/kitty-session/snapshot.json"
+      kitty-restore-session --emit-stub
+    ) || { echo "FAIL(H1): --emit-stub failed with the default path"
+           exit 1; }
+    [ -s hstub/kitty-session/stub-session ] || {
+      ls -la hstub/kitty-session 2>&1 || true
+      echo "FAIL(H1): the default stub is not written under the user's"
+      echo "  own cache dir. A predictable name in world-writable /tmp"
+      echo "  is a file kitty then executes."
+      exit 1; }
+    # The sandbox's /tmp is private and starts empty (verified), so
+    # this says the default really moved, not that something cleaned up.
+    [ ! -e /tmp/kitty-stub-session ] || {
+      echo "FAIL(H1): a stub was still written to /tmp."; exit 1; }
+
+    # H2 — writer and reader must agree. The wrapper is what hands the
+    # path to kitty; a default that drifts means kitty is fed a stale
+    # stub describing a different session, or none at all.
+    # PATH puts the harness's fake kitty first, so name the wrapper by
+    # the package under test rather than by lookup.
+    wrapper_bin="$(dirname "$(command -v kitty-restore-session)")/kitty"
+    grep -q 'kitty-session/stub-session' "$wrapper_bin" || {
+      grep -n 'stub=' "$wrapper_bin" || true
+      echo "FAIL(H2): the kitty wrapper still looks for the stub in the"
+      echo "  old location, so the writer and the reader disagree."
+      exit 1; }
+
+    # H3 — and the write itself does not follow a symlink. _write_atomic
+    # writes <path>.tmp and renames, so <path>.tmp is the plantable
+    # name; following it truncates whatever it points at and then
+    # renames the LINK into place, leaving kitty executing a file an
+    # attacker still owns.
+    mkdir -p hlink/kitty-session
+    echo "canary contents" > hlink/canary
+    ln -sfn "$PWD/hlink/canary" "$PWD/hlink/stub-session.tmp"
+    (
+      export XDG_CACHE_HOME="$PWD/hlink"
+      export KITTY_STUB_PATH="$PWD/hlink/stub-session"
+      cp "$PWD/fx/home/.cache/kitty-session/snapshot.json" \
+         "$XDG_CACHE_HOME/kitty-session/snapshot.json"
+      kitty-restore-session --emit-stub
+    ) 2> state/hlink.err || true
+    # The refusal surfaces as an ELOOP from os.open — that traceback
+    # is the assertion passing, not a fault. The wrapper already
+    # treats a failed --emit-stub as "launch plain kitty", which is
+    # the right outcome for a stub path someone else is holding.
+    echo "--- symlink attempt stderr ---"; cat state/hlink.err
+    [ "$(cat hlink/canary)" = "canary contents" ] || {
+      echo "canary now: $(cat hlink/canary)"
+      echo "FAIL(H3): the stub writer followed a planted symlink and"
+      echo "  overwrote the file it pointed at."
       exit 1; }
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
