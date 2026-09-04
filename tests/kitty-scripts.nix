@@ -1423,15 +1423,19 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "  so the restored session runs outside claude-egress.slice"
       echo "  while looking identical to a confined one."
       exit 1; }
-    jq -e '.cmd[1:3] == ["-i","-c"]' "$pane0_json" > /dev/null || {
-      echo "FAIL(F1): the launcher shell is not interactive; ~/.zshrc is"
-      echo "  what defines _claude_slice, and only -i sources it."
+    jq -e '.cmd[1] == "-c"' "$pane0_json" > /dev/null || {
+      echo "FAIL(F1): the launcher shell does not run a command string."
       exit 1; }
-    jq -e '.cmd[3] | test("_claude_slice")' "$pane0_json" > /dev/null || {
+    jq -e '.cmd[2] | test("source .*zshrc")' "$pane0_json" > /dev/null || {
+      echo "FAIL(F1): the launcher never reads the rc that defines"
+      echo "  _claude_slice, so every restored claude pane would take"
+      echo "  the unobserved fallback."
+      exit 1; }
+    jq -e '.cmd[2] | test("_claude_slice")' "$pane0_json" > /dev/null || {
       echo "FAIL(F1): the launcher does not call _claude_slice — the"
       echo "  single definition of the slice policy."
       exit 1; }
-    jq -e '.cmd[4] | endswith("/claude")' "$pane0_json" > /dev/null || {
+    jq -e '.cmd[3] | endswith("/claude")' "$pane0_json" > /dev/null || {
       echo "FAIL(F1): the recorded claude path is not passed through as"
       echo "  \$0, so the fallback branch has nothing to exec."
       exit 1; }
@@ -1922,6 +1926,75 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "  pane's command."
       exit 1
     fi
+
+    # --- Phase K: the rc cannot swallow the pane -------------------
+    #
+    # The launcher's whole job is to reach _claude_slice, which lives in
+    # the user's zsh rc. `zsh -i -c CMD` reads that rc — and an rc that
+    # `exec`s or `exit`s FOR INTERACTIVE SHELLS (a tmux auto-attach line
+    # is the classic) then never reaches CMD at all. For panes 1..N that
+    # loses a pane; for pane 0 it loses everything, because pane 0 is
+    # the stub's ONLY window and kitty exits with it. That is the
+    # no-terminal class this module already had to fix once.
+    #
+    # Driven through the launcher the WRITER emitted — shell, flag and
+    # command string all read out of pane0-launch.json — so this cannot
+    # pass against a launcher shape restore no longer uses.
+    slice_sh=$(jq -r '.cmd[0]' "$pane0_json")
+    slice_flag=$(jq -r '.cmd[1]' "$pane0_json")
+    jq -r '.cmd[2]' "$pane0_json" > state/slice-script
+    mkdir -p krc
+    cat > krc/.zshrc <<'RC'
+    _claude_slice() { print "SLICE-RAN: $*"; }
+    if [[ -o interactive ]]; then
+      exec true
+    fi
+    RC
+    krc_out=$(
+      HOME="$PWD/krc" ZDOTDIR="$PWD/krc" \
+        "$slice_sh" "$slice_flag" "$(cat state/slice-script)" \
+        /nonexistent-claude --resume K1 2>&1
+    ) || true
+    echo "--- launcher under an rc that execs when interactive ---"
+    printf '%s\n' "$krc_out"
+    case "$krc_out" in
+      *SLICE-RAN*) ;;
+      *)
+        echo "FAIL(K1): the rc pre-empted the launcher, so the pane's"
+        echo "  command never ran. In pane 0 that closes kitty outright:"
+        echo "  no terminal, no session, nothing to retry from."
+        exit 1;;
+    esac
+
+    # K2 — control: a rc that defines nothing still degrades LOUDLY and
+    # still starts the session (the established trade-off). Same rc
+    # directory minus the definition, so K1 cannot be passing because
+    # the launcher stopped consulting the rc at all.
+    mkdir -p krc2
+    cat > krc2/.zshrc <<'RC'
+    typeset -g KRC2_SOURCED=1
+    RC
+    rm -f "$ORPHAN_RAN"
+    krc2_out=$(
+      HOME="$PWD/krc2" ZDOTDIR="$PWD/krc2" \
+        "$slice_sh" "$slice_flag" "$(cat state/slice-script)" \
+        "$PWD/fakebin/orphan-mcp" 2>&1
+    ) || true
+    echo "--- launcher under an rc with no _claude_slice ---"
+    printf '%s\n' "$krc2_out"
+    case "$krc2_out" in
+      *"claude-egress: UNOBSERVED"*) ;;
+      *)
+        echo "FAIL(K2): an rc that does not define _claude_slice went"
+        echo "  through silently. An unobserved session that looks"
+        echo "  observed is the failure this guards."
+        exit 1;;
+    esac
+    [ -f "$ORPHAN_RAN" ] || {
+      echo "FAIL(K2): the fallback said UNOBSERVED and then did not"
+      echo "  start the session. Observation degrades; the tool never"
+      echo "  fails to start."
+      exit 1; }
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"

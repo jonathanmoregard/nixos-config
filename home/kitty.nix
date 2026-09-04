@@ -288,9 +288,40 @@ let
   # one the user's own `claude` goes through; the first time the two
   # disagreed, the restore path would be the one nobody was looking at.
   # `_claude_slice` is a shell FUNCTION (that file explains why it cannot
-  # be a PATH wrapper), so reaching it means an interactive zsh —
-  # the same way tests/claude-egress.nix drives the real generated
-  # zshrc.
+  # be a PATH wrapper), so reaching it means a zsh that has read the
+  # user's rc — the same rc tests/claude-egress.nix drives.
+  #
+  # ── Why the rc is SOURCED and the shell is not interactive ────────────
+  #
+  # `zsh -i -c CMD` was the obvious way to get the rc read, and it has a
+  # failure mode with no floor: an rc that `exec`s or `exit`s FOR
+  # INTERACTIVE SHELLS — a tmux auto-attach line is the classic — never
+  # reaches CMD at all. For panes 1..N that loses a pane. For pane 0 it
+  # loses everything: pane 0 is the stub's ONLY window, so its immediate
+  # exit takes kitty down with it, which is the no-terminal class this
+  # module already had to fix once.
+  #
+  # Sourcing the rc from a NON-interactive shell reaches the same single
+  # definition without ever entering an interactive-guarded branch.
+  # Measured against zsh 5.9 with four rcs (2026-09-04), launcher output
+  # per rc, `-i -c` vs `-c` + source:
+  #
+  #   rc that execs when interactive   nothing ran   | _claude_slice ran
+  #   rc that exits when interactive   nothing ran   | _claude_slice ran
+  #   rc with a parse error            loud fallback | loud fallback
+  #   rc that does not exist           loud fallback | loud fallback
+  #
+  # so it strictly dominates: the hazard class goes, and both existing
+  # degradations are unchanged (zsh's `source` of a missing file returns
+  # non-zero without exiting the shell, unlike POSIX `.`). `~/.zshenv` is
+  # read by every zsh, interactive or not, so ZDOTDIR is already correct
+  # when the path below is expanded, and the PATH the native Claude Code
+  # installer relies on is identical either way — verified on the
+  # deployed rc: `whence -p claude` gives ~/.local/bin/claude under both.
+  #
+  # What is left is an rc that execs or exits UNCONDITIONALLY. No
+  # launcher shape survives that, and neither does the user's own
+  # terminal, so it is not a hazard this module can be the one to carry.
   #
   # The launcher is handed the recorded claude path as `$0`, so the
   # fallback branch still starts the user's session when the function is
@@ -302,12 +333,13 @@ let
     # The zsh that owns the definition, by store path rather than
     # $SHELL: restore runs from a background process where $SHELL may
     # be unset, and this is the same zsh home-manager writes ~/.zshrc
-    # for. `-i` is what sources that rc and therefore what defines
-    # _claude_slice; `-c` runs the launcher and exits, so the pane's
-    # lifetime is still claude's.
+    # for. `-c` runs the launcher and exits, so the pane's lifetime is
+    # still claude's; the rc is sourced explicitly rather than by way
+    # of `-i`, for the reason set out above this string.
     SLICE_SHELL = "${pkgs.zsh}/bin/zsh"
     SLICE_MARK = "_claude_slice"
     SLICE_SCRIPT = (
+        'source ''${ZDOTDIR:-$HOME}/.zshrc; '
         'if typeset -f _claude_slice >/dev/null; then '
         '_claude_slice "$@"; '
         'else '
@@ -339,12 +371,12 @@ let
         """
         cmdline = cmdline or []
         if (
-            len(cmdline) > 4
+            len(cmdline) > 3
             and os.path.basename(cmdline[0]) == "zsh"
-            and cmdline[1:3] == ["-i", "-c"]
-            and SLICE_MARK in cmdline[3]
+            and cmdline[1] == "-c"
+            and SLICE_MARK in cmdline[2]
         ):
-            return cmdline[4:]
+            return cmdline[3:]
         return cmdline
 
 
@@ -380,7 +412,7 @@ let
             # recorded; that one never does, because handing a pane
             # back the launcher AS its command is the exec loop.
             return unwrap_pane0(cmdline)
-        return [SLICE_SHELL, "-i", "-c", SLICE_SCRIPT] + inner
+        return [SLICE_SHELL, "-c", SLICE_SCRIPT] + inner
   '';
 
   # Convert `kitty @ ls` JSON snapshot → kitty session-file format
