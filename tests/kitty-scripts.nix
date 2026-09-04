@@ -25,7 +25,7 @@
 #      became unrecoverable.
 #
 # Run: nix build .#checks.x86_64-linux.kitty-scripts -L
-{ pkgs, hmPackages }:
+{ pkgs, hmPackages, deployedZshrc, deployedZshenv }:
 
 let
   lib = pkgs.lib;
@@ -2058,6 +2058,102 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(K2): the fallback said UNOBSERVED and then did not"
       echo "  start the session. Observation degrades; the tool never"
       echo "  fails to start."
+      exit 1; }
+
+    # --- Phase K3: the launcher against the rc dellan really ships ---
+    #
+    # K1/K2 drive two-line synthetic rcs, which prove the launcher's
+    # own branches and nothing about the file it actually sources. The
+    # deployed ~/.zshrc loads oh-my-zsh, powerlevel10k, autosuggestions
+    # and syntax-highlighting BEFORE `_claude_slice` — exactly the kind
+    # of interactive-oriented init that can behave differently in a
+    # NON-interactive shell, which is the shell the launcher now uses.
+    # If any of it stopped defining `_claude_slice` there, every
+    # restored Claude Code pane would take the fallback and run
+    # UNOBSERVED, and no lane would notice.
+    #
+    # `deployedZshrc`/`deployedZshenv` are the store paths
+    # home-manager writes for dellan, so this cannot pass against a
+    # stand-in. `.zshenv` has to come too: it is read by every zsh,
+    # interactive or not, and is where ZSH, ZSH_CACHE_DIR and the
+    # `$HOME/.local/bin`-first PATH that resolves `claude` come from.
+    mkdir -p krc3/.local/bin
+    install -m 644 ${deployedZshrc} krc3/.zshrc
+    install -m 644 ${deployedZshenv} krc3/.zshenv
+    # Drift gate: if the pair ever stops being the heavyweight rc this
+    # phase exists to exercise, fail rather than pass against a stub.
+    grep -q 'oh-my-zsh' krc3/.zshrc || {
+      echo "FAIL(K3): the rc under test does not load oh-my-zsh, so it"
+      echo "  is not the deployed one and this phase proves nothing."
+      exit 1; }
+    grep -q '_claude_slice' krc3/.zshrc || {
+      echo "FAIL(K3): the deployed rc no longer defines _claude_slice at"
+      echo "  all. Every restored claude pane would run outside"
+      echo "  claude-egress.slice."
+      exit 1; }
+    # The native-installer path the launcher resolves through
+    # `whence -p claude`. ARGV_OUT is how the fake records that it ran.
+    cp fakebin/claude krc3/.local/bin/claude
+    chmod +x krc3/.local/bin/claude
+    export ARGV_OUT="$PWD/state/k3-argv"
+
+    k3_run() { # <rc-dir> -> launcher output on stdout+stderr
+      rm -f "$ARGV_OUT"
+      HOME="$PWD/$1" ZDOTDIR="$PWD/$1" \
+        "$slice_sh" "$slice_flag" "$(cat state/slice-script)" \
+        "$PWD/$1/.local/bin/claude" --resume K3 2>&1 || true
+    }
+
+    k3_out=$(k3_run krc3)
+    echo "--- launcher under the DEPLOYED rc ---"
+    printf '%s\n' "$k3_out"
+    case "$k3_out" in
+      *"_claude_slice is not defined in this shell"*)
+        echo "FAIL(K3): sourcing the deployed rc from a NON-interactive"
+        echo "  zsh left _claude_slice undefined, so the launcher took"
+        echo "  the fallback. Every restored Claude Code pane then runs"
+        echo "  outside claude-egress.slice while looking identical to a"
+        echo "  confined one — the nftables rule is bound to that"
+        echo "  cgroup's inode, so the egress report just under-counts."
+        exit 1;;
+    esac
+    [ -f "$ARGV_OUT" ] || {
+      echo "FAIL(K3): the launcher reached _claude_slice under the"
+      echo "  deployed rc and then never started the session."
+      exit 1; }
+    grep -q -- '--resume' "$ARGV_OUT" || {
+      cat "$ARGV_OUT"
+      echo "FAIL(K3): the argv did not survive the trip through the"
+      echo "  deployed rc."
+      exit 1; }
+
+    # K4 — control, so K3 cannot be passing because the probe is blind.
+    # The SAME deployed rc, with one line appended that models the
+    # regression class K3 is here for: an rc whose definitions do not
+    # survive a non-interactive source. The launcher must SAY so.
+    mkdir -p krc4/.local/bin
+    cp krc3/.zshenv krc4/.zshenv
+    cp krc3/.zshrc krc4/.zshrc
+    chmod u+w krc4/.zshrc
+    printf '%s\n' \
+      'if [[ ! -o interactive ]]; then unfunction _claude_slice 2>/dev/null; fi' \
+      >> krc4/.zshrc
+    cp fakebin/claude krc4/.local/bin/claude
+    chmod +x krc4/.local/bin/claude
+    k4_out=$(k3_run krc4)
+    echo "--- launcher under the deployed rc, interactive-only slice ---"
+    printf '%s\n' "$k4_out"
+    case "$k4_out" in
+      *"_claude_slice is not defined in this shell"*) ;;
+      *)
+        echo "FAIL(K4): an rc that leaves _claude_slice undefined in a"
+        echo "  non-interactive shell went through SILENTLY, so K3 above"
+        echo "  cannot fail either and neither is asserting anything."
+        exit 1;;
+    esac
+    [ -f "$ARGV_OUT" ] || {
+      echo "FAIL(K4): the fallback announced UNOBSERVED and then did not"
+      echo "  start the session."
       exit 1; }
 
     # --- Phase L: a command a session line cannot carry is not lost ---

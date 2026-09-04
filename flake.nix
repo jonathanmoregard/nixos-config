@@ -307,6 +307,21 @@
           # Drift gate: exercises the packages dellan installs.
           hmPackages = self.nixosConfigurations.dellan.config
             .home-manager.users.jonathan.home.packages;
+          # The rc pair dellan really deploys — omz, p10k, autosuggest,
+          # syntax-highlighting and `_claude_slice`, in that order.
+          # The restored-claude launcher sources this file from a
+          # NON-interactive zsh, so phase L drives it rather than a
+          # synthetic stand-in; a rc change that stops defining
+          # `_claude_slice` in that shell fails the lane instead of
+          # silently un-confining every restored Claude Code pane.
+          deployedZshrc = self.nixosConfigurations.dellan.config
+            .home-manager.users.jonathan.home.file."./.zshrc".source;
+          # Read by EVERY zsh, interactive or not, and where ZSH /
+          # ZSH_CACHE_DIR / the PATH the launcher resolves `claude` on
+          # come from — so the rc above only behaves like the deployed
+          # one with it in place.
+          deployedZshenv = self.nixosConfigurations.dellan.config
+            .home-manager.users.jonathan.home.file."./.zshenv".source;
         };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
         # credential whose real home is elsewhere (see the test's header for
