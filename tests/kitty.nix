@@ -563,6 +563,38 @@ in
         "/tmp/ls-after.json"
     )
 
+    # --- Phase 5b: what a LATER snapshot can record for pane 0.
+    #
+    # `window.cmdline` is `Child.cmdline` (kitty/child.py:593-598): the
+    # live /proc/<pid>/cmdline, falling back to the argv kitty SPAWNED
+    # when that process is gone. Pane 0 is spawned as
+    # `kitty-restore-session --exec-pane0 <argv...>`, so while it lives
+    # the readout is whatever --exec-pane0 became — asserted below — but
+    # the moment pane 0's own process dies with the pty still held open
+    # (the documented zombie case: claude gone, an orphaned stdio MCP
+    # server holding it), kitty answers with that spawn argv instead.
+    # While the launch line carried no argv, that fallback WAS the
+    # stub's own launch line, so the next snapshot recorded it as pane
+    # 0's command and the restore after that exec'd the launcher, which
+    # re-read the same record and exec'd it again: a tight loop at 100%
+    # CPU with the session gone.
+    #
+    # The stub is therefore the artifact to assert on — it is what
+    # decides the fallback. tests/kitty-scripts.nix phase J drives the
+    # dead-process half against the scripts; this is the real-kitty
+    # half.
+    stub = "/home/jonathan/.cache/kitty-session/stub-session"
+    print("[diag] stub:\n" + dellan.succeed(f"cat {stub}"))
+    dellan.succeed(f"grep -qE -- '--exec-pane0 [^ ]' {stub}")
+    print("[diag] pane-0 cmdline:\n" + dellan.succeed(
+        "jq -c '[.[].tabs[].windows[].cmdline]' /tmp/ls-after.json"
+    ))
+    dellan.succeed(
+        "jq -e '[.[].tabs[].windows[].cmdline | "
+        'select(index("--exec-pane0")) | length] | '
+        "all(. > 2)' /tmp/ls-after.json"
+    )
+
     # === Phase 6: kitty-panes-reflow ===
     #
     # Reflow moves the panes a running kitty ALREADY has into that same
@@ -581,7 +613,19 @@ in
     )
 
     def reflow_state(path):
-        """(group ids per tab, focused window, window->pids) from ls."""
+        """(group ids per tab, focused window, window->pid) from ls.
+
+        `window.pid` — kitty's `child.pid`, the process it forked for
+        that window — is what answers "was this pane respawned": a
+        `detach-window` re-parent keeps it, a `launch` cannot. NOT
+        `foreground_processes`, which kitty derives live from the pty's
+        foreground process GROUP and which can come back empty between
+        two `ls` calls a second apart while the pane is perfectly
+        alive. Measured on this lane: window 1 reported pid 1678 in one
+        readout and [] in the next, same process still attached, same
+        tree that had passed the phase a run earlier. Comparing that
+        field failed the lane for a race rather than for a regression.
+        """
         dellan.succeed(f"su jonathan -c '{sock_cmd} ls > {path}'")
         groups = dellan.succeed(
             f"jq -cS '[.[].tabs[] | {{tab: .id, g: [.groups[].id]}}]' {path}"
@@ -591,9 +635,8 @@ in
             f"select(.is_focused) | .id]' {path}"
         ).strip()
         pids = dellan.succeed(
-            "jq -cS '[.[].tabs[].windows[] | {id: .id, "
-            "pids: [.foreground_processes[].pid]}] | sort_by(.id)' "
-            f"{path}"
+            "jq -cS '[.[].tabs[].windows[] | {id: .id, pid: .pid}] "
+            f"| sort_by(.id)' {path}"
         ).strip()
         return groups, focus, pids
 
@@ -723,6 +766,78 @@ in
     assert settled_before == settled_after, (
         "reflow does not recognise its own output as canonical.\n"
         f"before: {settled_before}\nafter:  {settled_after}"
+    )
+
+    # --- 6e: a refusal has to reach the user. The only invocation the
+    # user makes is the ctrl+shift+r binding, which is `launch
+    # --type=background` — and kitty spawns such a process with its OWN
+    # stdout and stderr, so everything it prints goes to kitty's log and
+    # into no window at all. Driven here exactly the way the binding
+    # does it, with the reflow lock held so the refusal is a certainty.
+    dellan.succeed(
+        "su jonathan -c 'flock -x /home/jonathan/.cache/kitty-session/"
+        "reflow.lock sleep 30 >/dev/null 2>&1 &'"
+    )
+    dellan.sleep(2)
+    dellan.succeed(
+        f"su jonathan -c '{sock_cmd} launch --type=background -- "
+        "/etc/profiles/per-user/jonathan/bin/kitty-panes-reflow'"
+    )
+    dellan.sleep(3)
+    dellan.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-notice.json'")
+    print("[diag] with the notice up:\n" + dellan.succeed(
+        "jq -c '[.[].tabs[] | {g: [.groups[] | {id, windows}], "
+        "w: [.windows[] | {id, title, ui: .env.KITTY_SESSION_UI}]}]' "
+        "/tmp/reflow-notice.json"
+    ))
+    dellan.succeed(
+        "jq -e '[.[].tabs[].windows[] | "
+        'select(.title == "kitty-panes-reflow")] | length == 1\' '
+        "/tmp/reflow-notice.json"
+    )
+    # Marked as this module's own chrome, so a snapshot taken while it
+    # is up does not restore it as a pane.
+    dellan.succeed(
+        "jq -e '[.[].tabs[].windows[] | "
+        'select(.title == "kitty-panes-reflow") | '
+        ".env.KITTY_SESSION_UI] == [\"1\"]' /tmp/reflow-notice.json"
+    )
+    notice_text = dellan.succeed(
+        f"su jonathan -c '{sock_cmd} get-text "
+        "--match title:kitty-panes-reflow'"
+    )
+    print("[diag] notice text:\n" + notice_text)
+    assert "another reflow is already running" in notice_text, (
+        "the notice overlay does not carry the refusal, so the user is "
+        "left with an unexplained non-event.\n" + notice_text
+    )
+    assert "press Enter to dismiss" in notice_text, (
+        "the notice does not say how to get rid of it."
+    )
+
+    # And it takes no grid slot: it is an overlay in its base window's
+    # group, and window_is_internal() filters it, so a reflow run while
+    # it is up still sees the layout as canonical and does nothing.
+    # Wait the holder out rather than killing it: `flock` keeps the
+    # locked fd open in the child it execs, so killing the pid the
+    # shell reports leaves the lock held, and `pkill -f` matches the
+    # driver's own shell running the pattern and kills that instead
+    # (measured: exit 143). Probing the lock itself needs no pid and no
+    # guess at how long anything takes.
+    dellan.wait_until_succeeds(
+        "flock -n -x /home/jonathan/.cache/kitty-session/reflow.lock "
+        "true",
+        timeout=60,
+    )
+    dellan.sleep(1)
+    notice_before = reflow_state("/tmp/reflow-notice-before.json")
+    dellan.succeed("su jonathan -c kitty-panes-reflow")
+    dellan.sleep(1)
+    notice_after = reflow_state("/tmp/reflow-notice-after.json")
+    assert notice_before == notice_after, (
+        "a reflow notice window was counted as a pane, so reflow tore "
+        "up a canonical layout to make room for kitty chrome.\n"
+        f"before: {notice_before}\nafter:  {notice_after}"
     )
   '';
 }
