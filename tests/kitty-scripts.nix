@@ -1448,6 +1448,115 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "  multi-line, which kitty refuses outright."
       exit 1; }
 
+    # --- Phase G: a save that cannot commit must not stay green -----
+    #
+    # kitty-session-save exited 0 for every kitty-session-commit rc, and
+    # only rc 0 regenerated last.session. A persistently crashing commit
+    # therefore stopped snapshots updating FOREVER while the systemd
+    # unit stayed green — and the staleness only surfaced at the next
+    # crash, restoring state from whenever the breakage started.
+    #
+    # rc 3 (the collapse guard refusing) and enrich rc 2 (the
+    # partial-snapshot guard) are DESIGNED outcomes and have to stay
+    # silent; the timer fires every 60s and a guard doing its job is not
+    # news. Anything else is a bug, and it surfaces the systemd way: a
+    # message on stderr and a non-zero exit, which puts the unit in
+    # `systemctl --user --failed`. Deliberately NOT a desktop
+    # notification — at one tick a minute that would be unusable, and
+    # the failed unit is already where a user looks.
+    #
+    # kitty-session-save is a writeShellApplication, so its PATH is
+    # pinned to its runtimeInputs and no directory can shadow them.
+    # Exported bash FUNCTIONS can — bash resolves a function ahead of
+    # PATH — so the script under test is the one dellan installs, byte
+    # for byte, with only the exit codes of the three programs it calls
+    # chosen by the test.
+    save_bin=$(command -v kitty-session-save)
+    mkdir -p gsave
+    save_case() { # <label> <enrich-rc> <commit-rc>
+      (
+        export XDG_CACHE_HOME="$PWD/gsave/$1"
+        mkdir -p "$XDG_CACHE_HOME/kitty-session"
+        : > "$XDG_CACHE_HOME/kitty-session/snapshot.json"
+        export KITTY_LISTEN_ON="unix:/nonexistent-fake"
+        export G_ENRICH_RC="$2" G_COMMIT_RC="$3"
+        kitty() { printf '[]\n'; }
+        kitty-session-enrich() { printf '[]\n'; return "$G_ENRICH_RC"; }
+        kitty-session-commit() { return "$G_COMMIT_RC"; }
+        kitty-session-convert() { printf 'layout splits\n'; }
+        export -f kitty kitty-session-enrich kitty-session-commit \
+                  kitty-session-convert
+        rc=0
+        bash "$save_bin" > "$PWD/gsave/$1.out" \
+          2> "$PWD/gsave/$1.err" || rc=$?
+        echo "$rc"
+      )
+    }
+    show_case() { # <label>
+      echo "--- save($1) stderr ---"
+      cat "gsave/$1.err"
+    }
+
+    # G1 — control: the collapse guard refusing is a normal outcome.
+    # Exit 0, nothing on stderr, and last.session left in step with the
+    # snapshot it was rendered from.
+    g1=$(save_case guard-refused 0 3); show_case guard-refused
+    [ "$g1" -eq 0 ] || {
+      echo "FAIL(G1): a collapse-guard refusal (rc 3) failed the save"
+      echo "  unit; it is the guard working, not a fault."
+      exit 1; }
+    [ ! -s gsave/guard-refused.err ] || {
+      echo "FAIL(G1): rc 3 wrote to stderr. At one tick a minute a"
+      echo "  working guard would fill the journal."
+      exit 1; }
+    [ ! -e gsave/guard-refused/kitty-session/last.session ] || {
+      echo "FAIL(G1): last.session was regenerated from a snapshot the"
+      echo "  guard refused to write."
+      exit 1; }
+
+    # G2 — the finding: any OTHER commit rc means snapshots have
+    # silently stopped updating, and must not leave the unit green.
+    g2=$(save_case commit-crashed 0 1); show_case commit-crashed
+    [ "$g2" -ne 0 ] || {
+      echo "FAIL(G2): kitty-session-commit crashed and the save unit"
+      echo "  still reported success. Snapshots stop updating forever"
+      echo "  and nothing says so until the next crash restores stale"
+      echo "  state."
+      exit 1; }
+    grep -qi 'commit' gsave/commit-crashed.err || {
+      echo "FAIL(G2): the failure is not named on stderr, so the"
+      echo "  journal entry cannot be acted on."
+      exit 1; }
+
+    # G3 — control: the enricher's partial-snapshot guard (rc 2) is
+    # also a designed outcome and stays quiet.
+    g3=$(save_case enrich-partial 2 0); show_case enrich-partial
+    [ "$g3" -eq 0 ] || {
+      echo "FAIL(G3): the partial-snapshot guard (rc 2) failed the save"
+      echo "  unit."
+      exit 1; }
+    [ ! -s gsave/enrich-partial.err ] || {
+      echo "FAIL(G3): rc 2 wrote to stderr."; exit 1; }
+
+    # G4 — and the same rule for an enricher that crashed.
+    g4=$(save_case enrich-crashed 1 0); show_case enrich-crashed
+    [ "$g4" -ne 0 ] || {
+      echo "FAIL(G4): kitty-session-enrich crashed and the save unit"
+      echo "  still reported success."
+      exit 1; }
+    grep -qi 'enrich' gsave/enrich-crashed.err || {
+      echo "FAIL(G4): the enricher failure is not named on stderr."
+      exit 1; }
+
+    # G5 — control: the happy path still commits and re-renders
+    # last.session, so G2/G4 are not passing by breaking the save.
+    g5=$(save_case happy 0 0); show_case happy
+    [ "$g5" -eq 0 ] || {
+      echo "FAIL(G5): a clean save failed."; exit 1; }
+    [ -s gsave/happy/kitty-session/last.session ] || {
+      echo "FAIL(G5): last.session was not regenerated after a commit."
+      exit 1; }
+
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"
     echo "    survives a relaunch burst, reflow is a true no-op on a"

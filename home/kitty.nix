@@ -2369,14 +2369,38 @@ let
       #        would fall back to latest-by-mtime on restore and collide
       #        with a sibling. Preserve the prior good snapshot.json
       #        instead of overwriting it with the dangerous partial.
-      #   any other non-zero — enricher crashed; preserve prior good.
+      #   any other non-zero — enricher crashed; preserve prior good
+      #        AND fail the unit, see the surfacing rule below.
+      #
+      # Surfacing rule for every gate below, stated once. Two of these
+      # exit codes are DESIGNED outcomes of a guard doing its job: they
+      # happen on an ordinary day and must stay silent, because the
+      # timer fires every 60s and a guard that logs is a guard that
+      # gets muted. Every OTHER non-zero is a crash, and the failure it
+      # produces is invisible without help: snapshots simply stop
+      # updating, forever, and nobody finds out until the next kitty
+      # crash restores state from whenever the breakage began.
+      #
+      # So an unexpected rc is written to stderr and PROPAGATED, which
+      # puts kitty-session-save into `systemctl --user --failed`.
+      # Deliberately not a desktop notification: at one tick a minute a
+      # persistent fault would be unusable as a popup, and the failed
+      # unit is already the place a user looks for "is anything
+      # broken". journald collapses the repeats.
       set +e
       printf '%s\n' "$json" | kitty-session-enrich > "$dir/candidate.json.tmp"
       enrich_rc=$?
       set -e
-      if [ "$enrich_rc" -ne 0 ]; then
+      if [ "$enrich_rc" -eq 2 ]; then
         rm -f "$dir/candidate.json.tmp"
         exit 0
+      fi
+      if [ "$enrich_rc" -ne 0 ]; then
+        rm -f "$dir/candidate.json.tmp"
+        echo "kitty-session-save: kitty-session-enrich exited" \
+             "$enrich_rc (expected 0, or 2 for the partial-snapshot" \
+             "guard); snapshot.json is NOT being updated" >&2
+        exit "$enrich_rc"
       fi
 
       # Retention gate. kitty-session-commit decides whether the
@@ -2387,7 +2411,8 @@ let
       #   3  — refused, prior good snapshot preserved. NOT an error: it
       #        is the guard doing its job, and last.session must stay in
       #        step with the snapshot it was rendered from.
-      #   any other non-zero — commit crashed; leave everything alone.
+      #   any other non-zero — commit crashed; leave everything alone
+      #        AND fail the unit, see the surfacing rule above.
       #
       # This is a SECOND gate, not a replacement for the enricher's:
       # rc 2 above (partial snapshot, same-cwd claude panes with a
@@ -2397,10 +2422,23 @@ let
       commit_rc=$?
       set -e
       rm -f "$dir/candidate.json.tmp"
-      if [ "$commit_rc" -eq 0 ]; then
-        kitty-session-convert < "$dir/snapshot.json" > "$dir/last.session.tmp"
-        mv "$dir/last.session.tmp" "$dir/last.session"
-      fi
+      case "$commit_rc" in
+        0)
+          kitty-session-convert < "$dir/snapshot.json" \
+            > "$dir/last.session.tmp"
+          mv "$dir/last.session.tmp" "$dir/last.session"
+          ;;
+        3)
+          # The collapse guard refused. Designed, and silent by
+          # design — see the surfacing rule above.
+          ;;
+        *)
+          echo "kitty-session-save: kitty-session-commit exited" \
+               "$commit_rc (expected 0, or 3 for the collapse guard);" \
+               "snapshot.json is NOT being updated" >&2
+          exit "$commit_rc"
+          ;;
+      esac
     '';
   };
 
