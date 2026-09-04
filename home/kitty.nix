@@ -68,6 +68,40 @@ let
         )
   '';
 
+  # Shared Python: quote one value for a kitty session file. Used by
+  # every writer of one — kitty-session-convert (last.session) and
+  # kitty-restore-session (the --session stub) — because a session file
+  # only has to be corrupted by ONE of them to be refused.
+  #
+  # Requires `import re` and `import shlex` in the consuming script.
+  kittySessionTokenPy = ''
+    # A kitty session file is LINE-ORIENTED: kitty/session.py does
+    # `for line in raw.splitlines()` and then shlex-splits the rest of
+    # that ONE line. shlex.quote does NOT make a newline safe there --
+    # it keeps real newlines inside the quotes -- so a multi-line argv
+    # element turns one `launch` into as many directives as the value
+    # has lines. The restore notice is exactly such a value, and
+    # kitty-pane-add hands it to every claude pane, so it comes back in
+    # the pane's live cmdline on the next snapshot too.
+    #
+    # Measured 2026-09-04 against real kitty 0.48.2 under Xvfb: fed a
+    # 12-line session file, kitty opened `kitten __show_error__ --title
+    # 'The startup session was invalid'` and never started the user's
+    # claude. Fed the single-line one, it opened exactly one window.
+    #
+    # Line breaks are removed BEFORE quoting because quoting preserves
+    # them. \x1c-\x1e and the Unicode separators are in the class
+    # because str.splitlines() treats them as breaks even though
+    # kitty's parser does not -- a value that is one line for kitty and
+    # two for anything reading the file back is still a trap.
+    LINEBREAKS = re.compile("[\\r\\n\\v\\f\\x1c-\\x1e\\u2028\\u2029]")
+
+
+    def session_token(value):
+        """One quoted token that cannot break a session-file line."""
+        return shlex.quote(LINEBREAKS.sub(" ", value))
+  '';
+
   # Convert `kitty @ ls` JSON snapshot → kitty session-file format
   # (https://sw.kovidgoyal.net/kitty/overview/#startup-sessions).
   # Restores OS-window/tab/window topology, layouts, cwds, titles. Does
@@ -76,9 +110,12 @@ let
   kittySessionConvert = pkgs.writers.writePython3Bin "kitty-session-convert" {} ''
     import json
     import os
+    import re
     import shlex
     import sys
 
+
+    ${kittySessionTokenPy}
 
     ${kittyInternalWindowPy}
 
@@ -140,12 +177,12 @@ let
                 parts = ["launch"]
                 if cwd:
                     parts.append("--cwd")
-                    parts.append(shlex.quote(cwd))
+                    parts.append(session_token(cwd))
                 if wtitle:
                     parts.append("--title")
-                    parts.append(shlex.quote(wtitle))
+                    parts.append(session_token(wtitle))
                 if cmdline:
-                    parts.extend(shlex.quote(a) for a in cmdline)
+                    parts.extend(session_token(a) for a in cmdline)
                 out.append(" ".join(parts))
     sys.stdout.write("\n".join(out) + "\n")
   '';
@@ -324,6 +361,8 @@ let
     import sys
     import time
 
+
+    ${kittySessionTokenPy}
 
     ${kittyInternalWindowPy}
 
@@ -670,18 +709,11 @@ let
 
     # ---- pane-0 transport ----------------------------------------------
     #
-    # A kitty session file is LINE-ORIENTED: kitty/session.py does
-    # `for line in raw.splitlines()` and then shlex-splits the rest of
-    # that ONE line. shlex.quote does not make a newline safe there --
-    # it keeps real newlines inside the quotes -- so a multi-line argv
-    # element turns a single `launch` into as many directives as the
-    # value has lines. Measured 2026-09-04 against kitty 0.48.2: a stub
-    # carrying a real restore notice was 75 lines; kitty failed the
-    # unterminated launch, opened a `kitten __show_error__` overlay
-    # instead of the user's claude, and that extra window then shifted
-    # kitty-pane-add's grid dispatch by a whole step.
-    #
-    # So NO pane-0 argv travels through the session file. The stub's
+    # session_token() above keeps every value that DOES go into the stub
+    # on one line, but flattening the restore notice would gut it: the
+    # orphan block is one line per subagent and one per edited file, and
+    # a wall of run-together text is not the message. So NO pane-0 argv
+    # travels through the session file at all. The stub's launch
     # command is this very script in --exec-pane0 mode; the real argv,
     # restore notice included, travels in JSON (where newlines are
     # escaped by construction) and --exec-pane0 execs it. Pane 0 then
@@ -704,13 +736,6 @@ let
         "KITTY_STUB_PATH", "/tmp/kitty-stub-session"
     )
 
-    # Characters that would end a line in a kitty session file, or in
-    # anything else that reads it back. \x1c-\x1e and the Unicode line
-    # separators are here because str.splitlines() treats them as line
-    # breaks even though kitty's parser does not -- a value that stays
-    # one line for kitty but two for a reader is still a trap.
-    LINEBREAKS = re.compile("[\\r\\n\\v\\f\\x1c-\\x1e\\u2028\\u2029]")
-
 
     def cache_dir():
         base = os.environ.get(
@@ -722,16 +747,6 @@ let
 
     def pane0_path():
         return os.path.join(cache_dir(), "pane0-launch.json")
-
-
-    def _stub_token(value):
-        """One shell-quoted session-file token that cannot break a line.
-
-        Every piece of snapshot-derived text that enters the stub goes
-        through here, and nothing else writes to it. Line breaks are
-        removed BEFORE quoting because shlex.quote preserves them.
-        """
-        return shlex.quote(LINEBREAKS.sub(" ", value))
 
 
     def _self_exe():
@@ -860,10 +875,10 @@ let
         }))
         parts = ["launch"]
         if p["cwd"]:
-            parts += ["--cwd", _stub_token(p["cwd"])]
+            parts += ["--cwd", session_token(p["cwd"])]
         if p["title"]:
-            parts += ["--title", _stub_token(p["title"])]
-        parts += [_stub_token(_self_exe()), "--exec-pane0"]
+            parts += ["--title", session_token(p["title"])]
+        parts += [session_token(_self_exe()), "--exec-pane0"]
         line = " ".join(parts)
         # Invariant, not a cleanup. Every token above is line-break-free
         # by construction, so this can only fire if a later edit adds an

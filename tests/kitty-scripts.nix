@@ -178,6 +178,15 @@ let
             win(1, SHELL),
             win(2, [KITTEN, "diff", "a", "b"]),
         ]),
+        # A live claude pane whose argv HOLDS a restore notice. Panes
+        # 1..N are launched that way by kitty-pane-add, so kitty reports
+        # a multi-line cmdline for them and last.session inherits it.
+        "multiline-cmd": tab([
+            win(1, [
+                "/opt/bin/claude", "--resume", "abc",
+                "first line\nsecond line\nthird line",
+            ]),
+        ]),
     }
     for name, data in cases.items():
         with open(os.path.join(out, name + ".json"), "w") as fh:
@@ -376,6 +385,22 @@ pkgs.runCommand "kitty-scripts-harness"
       exit 1
     fi
     [ "$(grep -c '^launch' state/error.session)" -eq 1 ] || {
+      echo "FAIL(C/convert): expected exactly one launch directive"
+      exit 1; }
+
+    # last.session is a session file too, and a claude pane's live argv
+    # carries the restore notice kitty-pane-add handed it — so convert
+    # can emit the same multi-line directive that broke the stub.
+    kitty-session-convert < grid/multiline-cmd.json > state/multi.session
+    echo "--- converted multiline-cmd ---"; cat state/multi.session
+    [ "$(wc -l < state/multi.session)" -eq 2 ] || {
+      echo "FAIL(C/convert): last.session has"
+      echo "  $(wc -l < state/multi.session) lines for one layout + one"
+      echo "  pane. A pane whose argv holds the restore notice renders"
+      echo "  as a multi-line launch directive, i.e. a session file"
+      echo "  kitty refuses with 'The startup session was invalid'."
+      exit 1; }
+    [ "$(grep -c '^launch' state/multi.session)" -eq 1 ] || {
       echo "FAIL(C/convert): expected exactly one launch directive"
       exit 1; }
 
