@@ -90,11 +90,30 @@ let
     # claude. Fed the single-line one, it opened exactly one window.
     #
     # Line breaks are removed BEFORE quoting because quoting preserves
-    # them. \x1c-\x1e and the Unicode separators are in the class
-    # because str.splitlines() treats them as breaks even though
-    # kitty's parser does not -- a value that is one line for kitty and
-    # two for anything reading the file back is still a trap.
-    LINEBREAKS = re.compile("[\\r\\n\\v\\f\\x1c-\\x1e\\u2028\\u2029]")
+    # them.
+    #
+    # The character class is DEFINED BY str.splitlines() -- it is not a
+    # judgement call about which breaks matter. kitty's session reader
+    # is literally `for line in raw.splitlines()`
+    # (kitty/session.py:249), so whatever CPython splits on is what
+    # kitty splits on, and anything CPython splits on that survives
+    # into a token turns one `launch` into several directives. The full
+    # set, enumerated from CPython (`len(("a"+c+"b").splitlines()) > 1`
+    # over every code point) rather than remembered:
+    #
+    #   \n LF  \v VT  \f FF  \r CR  \x1c FS  \x1d GS  \x1e RS
+    #   \x85 NEL    LINE SEPARATOR    PARAGRAPH SEPARATOR
+    #
+    # \x85 was missing until 2026-09-04. It is reachable: a directory
+    # name may hold any byte but '/' and NUL, so a cwd carrying a NEL
+    # produced a stub that `wc -l` called one line and kitty parsed as
+    # three -- and the emit_stub invariant below, sharing this same
+    # class, could not see it either. tests/kitty-scripts.nix phase A2
+    # re-derives the alphabet from CPython on every build so the two
+    # cannot drift apart again.
+    LINEBREAKS = re.compile(
+        "[\\r\\n\\v\\f\\x1c-\\x1e\\x85\\u2028\\u2029]"
+    )
 
 
     def session_token(value):

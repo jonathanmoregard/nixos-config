@@ -124,6 +124,80 @@ let
     sys.stdout.write(sid)
   '';
 
+  # Count a session file's directives the way kitty's own parser does.
+  #
+  # kitty/session.py:249 is `for line in raw.splitlines()`, so the
+  # parser's notion of a line break IS str.splitlines()'s: it breaks on
+  # ten code points, not just \n. `wc -l` sees only \n and therefore
+  # cannot see U+0085, U+2028/9 or \x1c-\x1e — which is exactly how a
+  # sanitiser that misses one of them passes a wc -l assertion while
+  # kitty still mis-parses the file into extra windows.
+  mkLineCheck = pkgs.writeText "kitty-scripts-linecheck.py" ''
+    import sys
+
+    path = sys.argv[1]
+    want = int(sys.argv[2])
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        raw = fh.read()
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    sys.stdout.write(
+        "%s: wc -l says %d, str.splitlines() says %d\n"
+        % (path, raw.count("\n"), len(lines))
+    )
+    for ln in lines:
+        sys.stdout.write("  " + repr(ln) + "\n")
+    if len(lines) != want:
+        sys.stderr.write(
+            "FAIL: kitty parses %s as %d session-file directive(s), want "
+            "%d. A value carrying a line break str.splitlines() honours "
+            "turns one `launch` into several lines, and kitty answers "
+            "with `kitten __show_error__` instead of the user's pane.\n"
+            % (path, len(lines), want)
+        )
+        sys.exit(1)
+  '';
+
+  # One snapshot per code point str.splitlines() treats as a line
+  # break, plus one carrying all of them at once. Each puts the
+  # character everywhere a session file will quote it: the pane's cwd,
+  # its title and its argv. A path component may hold any byte but '/'
+  # and NUL, so every one of these is a legal cwd.
+  mkBreakFixtures = pkgs.writeText "kitty-scripts-breaks.py" ''
+    import json
+    import os
+    import sys
+
+    out = sys.argv[1]
+
+    # kitty reads a session file with `for line in raw.splitlines()`
+    # (kitty/session.py:249), so str.splitlines() IS kitty's line-break
+    # definition. Ask CPython which characters those are rather than
+    # believing a list in a comment -- a transcribed list is exactly
+    # what left U+0085 out of the sanitiser in the first place.
+    BREAKS = [
+        c for c in map(chr, range(0x110000))
+        if len(("a" + c + "b").splitlines()) > 1
+    ]
+
+    cases = [("U+%04X" % ord(c), c) for c in BREAKS]
+    cases.append(("ALL", "".join(BREAKS)))
+
+    for label, ch in cases:
+        sess = os.path.join(out, label, "kitty-session")
+        os.makedirs(sess, exist_ok=True)
+        cmd = ["/bin/sh", "-c", "echo" + ch + "hi"]
+        snap = [{"tabs": [{"layout": "splits", "windows": [{
+            "id": 1,
+            "cwd": "/tmp/we" + ch + "ird",
+            "title": "pane" + ch + "title",
+            "cmdline": cmd,
+            "foreground_processes": [{"cmdline": cmd}],
+        }]}]}]
+        with open(os.path.join(sess, "snapshot.json"), "w") as fh:
+            json.dump(snap, fh)
+        sys.stdout.write(label + "\n")
+  '';
+
   # `kitty @ ls` payloads for the grid-dispatch phase. Each is one tab
   # whose window list mixes real panes with the kitty-internal overlay
   # windows kitty spawns on its own behalf (boss.py builds them as
@@ -505,6 +579,51 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(A): fixture notice is single-line — phase A would pass"
       echo "  vacuously."
       exit 1; }
+
+    # --- Phase A2: the sanitiser's alphabet is kitty's, not wc's ---
+    #
+    # Phase A counts with `wc -l`, which sees U+000A and nothing else.
+    # kitty does not: kitty/session.py:249 is `for line in
+    # raw.splitlines()`, and str.splitlines() breaks on TEN code points.
+    # A sanitiser missing any of them writes a stub that is one line to
+    # `wc` and several to kitty — and the writer's own single-line
+    # invariant, sharing the same character class, cannot see it either.
+    #
+    # The alphabet is enumerated from CPython at fixture-build time, so
+    # this phase covers whatever str.splitlines() actually breaks on
+    # rather than whatever a comment claims it does.
+    mkdir -p breaks
+    python3 ${mkBreakFixtures} "$PWD/breaks" > state/break-labels
+    echo "str.splitlines() breaks on:" \
+      "$(tr '\n' ' ' < state/break-labels)"
+    [ "$(wc -l < state/break-labels)" -ge 2 ] || {
+      echo "FAIL(A2): the line-break alphabet came back empty; every"
+      echo "  assertion below would pass vacuously."
+      exit 1; }
+    while read -r label; do
+      (
+        export XDG_CACHE_HOME="$PWD/breaks/$label"
+        export KITTY_STUB_PATH="$PWD/state/stub-$label"
+        kitty-restore-session --emit-stub
+      ) || {
+        echo "FAIL(A2/$label): --emit-stub failed outright"; exit 1; }
+      python3 ${mkLineCheck} "$PWD/state/stub-$label" 1 || {
+        echo "FAIL(A2/$label): a $label in the pane's cwd/title survived"
+        echo "  into the --session stub, so kitty parses one launch"
+        echo "  directive as several and answers with an error overlay"
+        echo "  instead of the user's pane."
+        exit 1; }
+      # last.session is a session file too, and convert quotes the same
+      # values plus the pane's argv.
+      kitty-session-convert \
+        < "$PWD/breaks/$label/kitty-session/snapshot.json" \
+        > "$PWD/state/conv-$label.session"
+      python3 ${mkLineCheck} "$PWD/state/conv-$label.session" 2 || {
+        echo "FAIL(A2/$label): last.session renders one pane as more"
+        echo "  than a layout plus a launch — kitty refuses the file"
+        echo "  with 'The startup session was invalid'."
+        exit 1; }
+    done < state/break-labels
 
     # --- Phase B: pane 0 still receives the notice, as argv ---
     export ARGV_OUT="$PWD/state/pane0-argv"
