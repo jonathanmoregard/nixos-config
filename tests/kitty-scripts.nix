@@ -120,6 +120,67 @@ let
         json.dump(snap, fh)
     sys.stdout.write(sid)
   '';
+
+  # `kitty @ ls` payloads for the grid-dispatch phase. Each is one tab
+  # whose window list mixes real panes with the kitty-internal overlay
+  # windows kitty spawns on its own behalf (boss.py builds them as
+  # `[kitten_exe(), '__show_error__', ...]` and
+  # `run_kitten_with_metadata('ask', ...)`).
+  mkGridFixtures = pkgs.writeText "kitty-scripts-grid.py" ''
+    import json
+    import os
+    import sys
+
+    out = sys.argv[1]
+
+
+    def win(wid, cmdline):
+        return {
+            "id": wid,
+            "is_focused": wid == 1,
+            "cwd": "/tmp",
+            "title": "w%d" % wid,
+            "cmdline": cmdline,
+            "foreground_processes": [{"cmdline": cmdline}],
+        }
+
+
+    def tab(windows):
+        return [{"tabs": [{
+            "is_focused": True,
+            "layout": "splits",
+            "windows": windows,
+        }]}]
+
+
+    KITTEN = "/nix/store/fake-kitty/bin/kitten"
+    SHELL = ["/run/current-system/sw/bin/zsh"]
+
+    cases = {
+        # 1 real pane + kitty's config-error overlay. The overlay is
+        # what kitty opened when it choked on the 75-line stub.
+        "error-overlay": tab([
+            win(1, SHELL),
+            win(5, [KITTEN, "__show_error__", "--title", "Errors"]),
+        ]),
+        # 1 real pane + the close-confirmation dialog.
+        "ask-dialog": tab([
+            win(1, SHELL),
+            win(7, [KITTEN, "ask", "--type=yesno", "--message", "close?"]),
+        ]),
+        # Control: two genuine panes, no internals.
+        "two-real": tab([win(1, SHELL), win(2, SHELL)]),
+        # Control: a PUBLIC kitten the user ran themselves is a real
+        # pane and must still be counted. Over-filtering is its own bug.
+        "user-kitten": tab([
+            win(1, SHELL),
+            win(2, [KITTEN, "diff", "a", "b"]),
+        ]),
+    }
+    for name, data in cases.items():
+        with open(os.path.join(out, name + ".json"), "w") as fh:
+            json.dump(data, fh)
+  '';
 in
 pkgs.runCommand "kitty-scripts-harness"
   {
@@ -204,6 +265,85 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "  line-oriented session file."
       exit 1; }
 
-    echo "ok: stub is single-line and pane 0 still gets the full notice"
+    # --- Phase C: grid dispatch counts real panes only ---
+    #
+    # kitty-pane-add picks vsplit / hsplit-left / hsplit-right / new-tab
+    # from the number of windows in the active tab, assuming that number
+    # starts at 1. An `__show_error__` overlay makes it start at 2, and
+    # every subsequent pane lands in one column — the user-visible
+    # "stacked instead of a 2x2 grid".
+    #
+    # Never uses /tmp/kitty.sock-*: those belong to the user's live
+    # kitty. KITTY_LISTEN_ON points kitty-pane-add at the fake instead.
+    mkdir -p grid
+    python3 ${mkGridFixtures} "$PWD/grid"
+    cat > fakebin/kitty <<'STUB'
+    #!/bin/sh
+    # argv is always: @ --to <sock> <subcommand> [args...]
+    if [ "$4" = "ls" ]; then
+      cat "$LS_JSON"
+      exit 0
+    fi
+    shift 3
+    printf '%s\n' "$*" >> "$KITTY_CMD_LOG"
+    exit 0
+    STUB
+    chmod +x fakebin/kitty
+    export KITTY_LISTEN_ON="unix:/nonexistent-socket-handled-by-fake"
+
+    pane_add() { # <fixture-name>
+      export LS_JSON="$PWD/grid/$1.json"
+      export KITTY_CMD_LOG="$PWD/state/$1.log"
+      : > "$KITTY_CMD_LOG"
+      kitty-pane-add --cwd /tmp -- /bin/sh
+      echo "--- kitty-pane-add($1) issued ---"
+      cat "$KITTY_CMD_LOG"
+    }
+
+    # 1 real pane + an internal overlay must dispatch as ONE pane:
+    # a plain vsplit, no focus-window hop.
+    for case in error-overlay ask-dialog; do
+      pane_add "$case"
+      grep -q '^launch --location=vsplit' "$PWD/state/$case.log" || {
+        echo "FAIL(C/$case): expected the 1-real-pane branch (vsplit);"
+        echo "  a kitty-internal window was counted as a user pane and"
+        echo "  shifted the 2x2 grid dispatch by a step."
+        exit 1; }
+      if grep -q 'focus-window' "$PWD/state/$case.log"; then
+        echo "FAIL(C/$case): focused a sibling that does not exist"
+        exit 1
+      fi
+    done
+
+    # Controls: two genuine panes — including a public kitten the user
+    # ran themselves — must still take the 2-pane branch.
+    for case in two-real user-kitten; do
+      pane_add "$case"
+      grep -q '^focus-window --match=id:1' "$PWD/state/$case.log" || {
+        echo "FAIL(C/$case): 2-real-pane branch lost — over-filtering"
+        echo "  real panes is the mirror-image bug."
+        exit 1; }
+      grep -q '^launch --location=hsplit' "$PWD/state/$case.log" || {
+        echo "FAIL(C/$case): expected hsplit on the left column"
+        exit 1; }
+    done
+
+    # And the same class of window must not reach a restored session:
+    # kitty-session-convert would otherwise write `launch kitten
+    # __show_error__ ...` into last.session and re-open the overlay.
+    kitty-session-convert < grid/error-overlay.json > state/error.session
+    echo "--- converted error-overlay ---"; cat state/error.session
+    if grep -q '__show_error__' state/error.session; then
+      echo "FAIL(C/convert): an internal overlay window was written into"
+      echo "  the session file; restoring it re-opens kitty's own error"
+      echo "  window as if the user had asked for it."
+      exit 1
+    fi
+    [ "$(grep -c '^launch' state/error.session)" -eq 1 ] || {
+      echo "FAIL(C/convert): expected exactly one launch directive"
+      exit 1; }
+
+    echo "ok: stub is single-line, pane 0 keeps its notice, grid"
+    echo "    dispatch and session convert count real panes only"
     touch $out
   ''

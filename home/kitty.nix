@@ -1,5 +1,73 @@
 { pkgs, lib, ... }:
 let
+  # Shared Python: is this `kitty @ ls` window one of kitty's OWN
+  # windows rather than a user pane? Interpolated verbatim into every
+  # script that has to answer the question, because answering it
+  # differently in different places is what the 2026-09-04 incident
+  # was made of — kitty-session-convert and kitty-restore-session each
+  # skipped `kitten ask` while kitty-pane-add skipped nothing, so an
+  # error overlay left the two restore paths disagreeing about how
+  # many panes existed.
+  #
+  # Requires `import os` in the consuming script.
+  kittyInternalWindowPy = ''
+    # kitty spawns its own UI as `<kitten-exe> <name> ...` — boss.py
+    # builds the config-error overlay as
+    # `[kitten_exe(), '__show_error__', '--title', title]` and the
+    # close-confirmation dialog via `run_kitten_with_metadata('ask',
+    # ...)`. Dunder names are kitty-private by convention: they are not
+    # in `kitten --help` and a user cannot mean to run one. `ask` is the
+    # one public-named kitten kitty spawns on the user's behalf.
+    #
+    # Public kittens the user CAN mean (`kitten diff`, `kitten icat`,
+    # `kitten ssh`, and the `kitten run-shell` wrapper kitty puts around
+    # every shell-integration pane) are deliberately NOT filtered —
+    # dropping a real pane is the mirror-image bug and just as bad.
+    INTERNAL_KITTENS = ("ask",)
+
+
+    def _kitten_subcommand(cmdline):
+        """The kitten sub-command name, or None when not a kitten call.
+
+        Both spellings: kitty >= 0.42 execs `kitten <name>`, older
+        builds (and anything restored from an old snapshot) used
+        `kitty +kitten <name>`.
+        """
+        if not cmdline:
+            return None
+        exe = os.path.basename(cmdline[0])
+        if exe == "kitten" and len(cmdline) > 1:
+            return cmdline[1]
+        if exe == "kitty" and len(cmdline) > 2 and cmdline[1] == "+kitten":
+            return cmdline[2]
+        return None
+
+
+    def is_internal_window(cmdline):
+        """True for a cmdline kitty spawned as its own chrome."""
+        sub = _kitten_subcommand(cmdline)
+        if sub is None:
+            return False
+        if sub in INTERNAL_KITTENS:
+            return True
+        return len(sub) > 4 and sub.startswith("__") and sub.endswith("__")
+
+
+    def window_is_internal(win):
+        """True for a `kitty @ ls` window that is kitty's own chrome.
+
+        Checks what kitty LAUNCHED the window with first: that survives
+        the death of the process, which is the same reason pane_cmd
+        prefers it.
+        """
+        if is_internal_window(win.get("cmdline") or []):
+            return True
+        fg = win.get("foreground_processes") or []
+        return any(
+            is_internal_window(fp.get("cmdline") or []) for fp in fg
+        )
+  '';
+
   # Convert `kitty @ ls` JSON snapshot → kitty session-file format
   # (https://sw.kovidgoyal.net/kitty/overview/#startup-sessions).
   # Restores OS-window/tab/window topology, layouts, cwds, titles. Does
@@ -11,6 +79,8 @@ let
     import shlex
     import sys
 
+
+    ${kittyInternalWindowPy}
 
     def _is_claude(cmdline):
         """True when cmdline[0] is the claude-code CLI."""
@@ -57,15 +127,16 @@ let
             # directive — `cd` between launches can confuse kitty into
             # opening extra OS windows under `--session`.
             for win in tab.get("windows", []):
+                # Skip kitty's own chrome (the `kitten ask` close
+                # confirmation, the `__show_error__` config-error
+                # overlay). Restoring one re-shows a dialog nobody
+                # asked for, and it inflates the pane count every
+                # other script derives its behaviour from.
+                if window_is_internal(win):
+                    continue
                 cwd = win.get("cwd")
                 wtitle = win.get("title", "")
                 cmdline = pane_cmd(win)
-                # Skip transient kitty internals (e.g. the `kitten ask`
-                # confirmation dialog tab that kitty spawns when the user
-                # clicks X with running processes — restoring it
-                # re-shows the prompt on next launch).
-                if any("kitten" in a for a in cmdline) and "ask" in cmdline:
-                    continue
                 parts = ["launch"]
                 if cwd:
                     parts.append("--cwd")
@@ -93,17 +164,38 @@ let
     """
     import glob
     import json
+    import os
     import subprocess
     import sys
 
 
+    ${kittyInternalWindowPy}
+
+    def _answers(sock):
+        """True when a live kitty is listening on `sock`."""
+        r = subprocess.run(
+            ["kitty", "@", "--to", sock, "ls"],
+            capture_output=True, timeout=3,
+        )
+        return r.returncode == 0
+
+
     def find_socket():
+        """Locate the kitty to talk to, preferring the one that spawned us.
+
+        kitty exports KITTY_LISTEN_ON into every window it launches, so
+        the ctrl+n binding (`launch --type=background kitty-pane-add`)
+        already knows the right socket. The glob is the fallback for
+        invocations from outside kitty, and it only ever knew about the
+        `unix:/tmp/kitty.sock` default -- it finds nothing if listen_on
+        is ever moved. Both candidates are still probed, so a stale
+        KITTY_LISTEN_ON falls through to the glob instead of failing.
+        """
+        env_sock = os.environ.get("KITTY_LISTEN_ON")
+        if env_sock and _answers(env_sock):
+            return env_sock
         for f in sorted(glob.glob("/tmp/kitty.sock-*")):
-            r = subprocess.run(
-                ["kitty", "@", "--to", f"unix:{f}", "ls"],
-                capture_output=True, timeout=3,
-            )
-            if r.returncode == 0:
+            if _answers(f"unix:{f}"):
                 return f"unix:{f}"
         return None
 
@@ -160,11 +252,28 @@ let
             print("no tab", file=sys.stderr)
             sys.exit(1)
 
-        # Inherit cwd from the focused window if --cwd wasn't given.
-        if cwd is None and focused_win is not None:
+        # Inherit cwd from the focused window if --cwd wasn't given —
+        # but not from an overlay kitty focused on its own (its cwd is
+        # wherever kitty happened to be, not where the user is).
+        if (
+            cwd is None
+            and focused_win is not None
+            and not window_is_internal(focused_win)
+        ):
             cwd = focused_win.get("cwd")
 
-        windows = active_tab.get("windows", [])
+        # Count REAL panes only. kitty's own overlay windows (config
+        # error, close confirmation) live in the same tab and are
+        # indistinguishable from panes in `kitty @ ls`; counting one
+        # shifts the whole vsplit/hsplit/new-tab sequence by a step and
+        # every added pane lands in a single column instead of the 2x2
+        # grid. Reproduced 2026-09-04: a mis-parsed session stub left an
+        # `__show_error__` window behind and the restored session came
+        # back stacked.
+        windows = [
+            w for w in active_tab.get("windows", [])
+            if not window_is_internal(w)
+        ]
         count = len(windows)
 
         common = []
@@ -215,6 +324,8 @@ let
     import sys
     import time
 
+
+    ${kittyInternalWindowPy}
 
     def find_socket(timeout=30):
         deadline = time.time() + timeout
@@ -701,12 +812,16 @@ let
         for osw in snap:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
-                    cmd = pane_cmd(win)
-                    # Skip kitty's transient `kitten ask` confirmation
-                    # dialogs (saved if a snapshot fires while the
-                    # close-confirmation tab is open).
-                    if any("kitten" in a for a in cmd) and "ask" in cmd:
+                    # Skip kitty's own chrome — the `kitten ask`
+                    # close-confirmation dialog (saved if a snapshot
+                    # tick fires while it is open) and the
+                    # `__show_error__` config-error overlay. Same
+                    # predicate kitty-pane-add and
+                    # kitty-session-convert use, so the three cannot
+                    # disagree about how many panes there are.
+                    if window_is_internal(win):
                         continue
+                    cmd = pane_cmd(win)
                     cwd = win.get("cwd")
                     sid = win.get("claude_session_id")
                     cmd = maybe_resume_claude(cmd, cwd, sid, claimed_sids)
@@ -1057,6 +1172,14 @@ let
         caller uses this to decide whether to overwrite snapshot.json
         or preserve the prior good one.
         """
+        # Audited 2026-09-04 against the internal-window class that
+        # broke kitty-pane-add (`kitten __show_error__`, `kitten ask`):
+        # this function needs no such filter and deliberately has none.
+        # `live` only decides which TSV rows to prune, and a TSV row
+        # exists only for a window whose claude ran the SessionStart
+        # hook, so an overlay's id can never be in it. The collision
+        # check keys off has_claude, which an overlay never satisfies.
+        # Adding a filter here would be dead code, not defence.
         tsv = load_tsv()
         live = set()
         claude_panes_by_cwd = {}
