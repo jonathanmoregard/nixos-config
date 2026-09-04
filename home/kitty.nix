@@ -708,6 +708,7 @@ let
     import os
     import subprocess
     import sys
+    import traceback
 
 
     ${kittyInternalWindowPy}
@@ -1304,7 +1305,7 @@ let
 
 
     def main():
-        """Every refusal reaches the user, whatever raised it.
+        """Every stop reaches the user, whatever raised it.
 
         The refusals are raised deep -- _require_os_window() and
         _resolve_tab() fire between two remote-control commands, from
@@ -1312,6 +1313,19 @@ let
         the user has to be told about. Catching SystemExit here, rather
         than surfacing at each site, is what keeps that guarantee from
         depending on whoever adds the next refusal remembering to.
+
+        The same argument applies to the exceptions nobody wrote a
+        refusal for. execute() re-reads `kitty @ ls` between steps, so a
+        kitty that answers with something json.loads() rejects raises
+        JSONDecodeError from the middle of a half-rebuilt layout -- and
+        a bare traceback on stderr goes to kitty's log, which is exactly
+        the inaudible place surface() exists to get out of. So: same
+        treatment, one line the user can act on, with the traceback
+        still printed for whoever reads the log afterwards.
+
+        Deliberately `Exception`, not `BaseException`: a ctrl-c or a
+        SIGTERM is the user stopping this themselves, and does not need
+        an overlay explaining itself back to them.
         """
         try:
             run()
@@ -1319,6 +1333,14 @@ let
             if isinstance(exc.code, str):
                 surface(exc.code)
             raise
+        except Exception as exc:
+            traceback.print_exc()
+            surface(
+                "kitty-panes-reflow: stopped on an unexpected error "
+                "(%s: %s); the layout may be part-rebuilt, run it again "
+                "to converge." % (type(exc).__name__, exc)
+            )
+            raise SystemExit(1)
 
 
     if __name__ == "__main__":

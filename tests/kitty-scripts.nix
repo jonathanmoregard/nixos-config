@@ -1396,6 +1396,70 @@ pkgs.runCommand "kitty-scripts-harness"
         exit 1; }
     ) || exit 1
 
+    # E12 — and a stop NOBODY wrote a refusal for gets the same
+    # treatment. execute() re-reads `kitty @ ls` between steps
+    # (_resolve_tab, _require_os_window), so a kitty that answers with
+    # anything json.loads() rejects raises JSONDecodeError from the
+    # MIDDLE of a rebuild. Only SystemExit was surfaced, so that landed
+    # as a bare traceback on stderr -- which on the ctrl+shift+r path is
+    # kitty's log -- leaving a half-rebuilt layout and a stolen focus
+    # with no message at all. Same inaudibility class as E10b, reached
+    # by a different exception.
+    #
+    # Measured on the built derivation before the fix, with the fake
+    # kitty answering `ls` with `kitty: connection refused` from the
+    # first non-ls command onward:
+    #
+    #   $ kitty-panes-reflow
+    #   json.decoder.JSONDecodeError: Expecting value: line 1 column 1
+    #   rc=1
+    #   --- commands issued ---
+    #   focus-window --match=id:1      <- focus moved, nothing surfaced
+    printf '%s\n' 'kitty: connection refused' > "$PWD/state/broken-ls"
+    (
+      export LS_JSON="$PWD/reflow/stacked-6.json"
+      export LS_JSON_2="$PWD/state/broken-ls"
+      export LS_SWITCHED="$PWD/state/broken-switched"
+      export KITTY_CMD_LOG="$PWD/state/reflow-broken.log"
+      rm -f "$LS_SWITCHED"
+      : > "$KITTY_CMD_LOG"
+      rc=0
+      kitty-panes-reflow 2> "$PWD/state/reflow-broken.err" || rc=$?
+      echo "--- reflow against an unparseable ls: rc=$rc ---"
+      tail -3 "$PWD/state/reflow-broken.err"
+      echo "--- commands issued ---"
+      cat "$KITTY_CMD_LOG"
+      [ "$rc" -ne 0 ] || {
+        echo "FAIL(E12): reflow reported success after dying mid-rebuild."
+        exit 1; }
+      grep -q 'launch --type=overlay' "$KITTY_CMD_LOG" || {
+        echo "FAIL(E12): an unexpected exception left the user with a"
+        echo "  part-rebuilt layout and nothing but a traceback in"
+        echo "  kitty's log. Only the refusals anyone thought to write a"
+        echo "  SystemExit for were audible."
+        exit 1; }
+      grep -q 'JSONDecodeError' "$KITTY_CMD_LOG" || {
+        echo "FAIL(E12): the overlay does not name what went wrong, so"
+        echo "  the user cannot tell a broken kitty from a bug here."
+        exit 1; }
+      grep -qi 'part-rebuilt' "$KITTY_CMD_LOG" || {
+        echo "FAIL(E12): the overlay does not say the layout is"
+        echo "  part-rebuilt, which is the one thing the user has to act"
+        echo "  on."
+        exit 1; }
+      grep -q 'KITTY_SESSION_UI=1' "$KITTY_CMD_LOG" || {
+        echo "FAIL(E12): the notice overlay is not marked as this"
+        echo "  module's own chrome, so a snapshot taken while it is up"
+        echo "  restores it as a pane."
+        exit 1; }
+      # The log keeps the detail: an overlay is one line, and whoever
+      # debugs this afterwards needs the frames.
+      grep -q 'Traceback' "$PWD/state/reflow-broken.err" || {
+        echo "FAIL(E12): surfacing the error swallowed the traceback, so"
+        echo "  there is nothing left to debug from."
+        exit 1; }
+    ) || exit 1
+
     # --- Phase F: a restored claude pane lands in claude-egress.slice --
     #
     # The slice is a SECURITY CONTROL: modules/nixos/
