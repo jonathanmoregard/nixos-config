@@ -2852,6 +2852,23 @@ in
   # Final snapshot at logout. Bound to graphical-session.target so ExecStop
   # fires when the desktop session ends, capturing state newer than the
   # last 60s timer tick.
+  #
+  # Known and ACCEPTED race: this runs while kitty is being torn down,
+  # so `kitty @ ls` can answer after some panes have already gone. A
+  # drop that is not a halving (6 -> 4, say) is below the collapse
+  # guard's divisor and commits, replacing a good snapshot with a
+  # partial one.
+  #
+  # Deliberately not fixed. Every fix that distinguishes "two panes died
+  # during teardown" from "the user closed two panes and logged out"
+  # needs a threshold — a settling delay, a smaller divisor, a
+  # logout-specific pane floor — and a tuned number driving the design
+  # is what this module spent the retention section avoiding. The state
+  # is not lost either way: the history ring keeps the freshest snapshot
+  # at each distinct pane count, and rotation is unconditional for a
+  # size, so the outgoing 6-pane snapshot is retained as the logout save
+  # replaces it. Recovery is `cp history/snapshot-*-6p.json
+  # snapshot.json`, which is exactly what the ring is for.
   systemd.user.services.kitty-session-save-on-logout = {
     Unit = {
       Description = "Snapshot kitty session at logout";
