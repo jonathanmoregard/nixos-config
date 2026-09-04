@@ -210,6 +210,7 @@ let
     import os
     import re
     import shlex
+    import shutil
     import subprocess
     import sys
     import time
@@ -556,7 +557,85 @@ let
         return cmd
 
 
-    STUB_PATH = "/tmp/kitty-stub-session"
+    # ---- pane-0 transport ----------------------------------------------
+    #
+    # A kitty session file is LINE-ORIENTED: kitty/session.py does
+    # `for line in raw.splitlines()` and then shlex-splits the rest of
+    # that ONE line. shlex.quote does not make a newline safe there --
+    # it keeps real newlines inside the quotes -- so a multi-line argv
+    # element turns a single `launch` into as many directives as the
+    # value has lines. Measured 2026-09-04 against kitty 0.48.2: a stub
+    # carrying a real restore notice was 75 lines; kitty failed the
+    # unterminated launch, opened a `kitten __show_error__` overlay
+    # instead of the user's claude, and that extra window then shifted
+    # kitty-pane-add's grid dispatch by a whole step.
+    #
+    # So NO pane-0 argv travels through the session file. The stub's
+    # command is this very script in --exec-pane0 mode; the real argv,
+    # restore notice included, travels in JSON (where newlines are
+    # escaped by construction) and --exec-pane0 execs it. Pane 0 then
+    # receives the notice as an argv element by exactly the mechanism
+    # panes 1..N get it -- kitty-pane-add's `-- <cmd> <notice>` -- which
+    # is why there is no second notice-delivery path to keep in sync.
+    #
+    # The considered alternative was `kitty @ send-text` once the socket
+    # is up. Rejected: it types into whatever the pane is showing, so it
+    # races claude's TUI coming up and the notice's own newlines read as
+    # submissions -- mangling the one message whose job is to be read
+    # exactly.
+
+    # Where kitty's `--session` stub is written. Overridable so a test
+    # can drive emit_stub without touching the LIVE session's file --
+    # /tmp/kitty-stub-session belongs to the running kitty. The wrapper
+    # in home/kitty.nix reads the same variable with the same default,
+    # so writer and reader cannot drift.
+    STUB_PATH = os.environ.get(
+        "KITTY_STUB_PATH", "/tmp/kitty-stub-session"
+    )
+
+    # Characters that would end a line in a kitty session file, or in
+    # anything else that reads it back. \x1c-\x1e and the Unicode line
+    # separators are here because str.splitlines() treats them as line
+    # breaks even though kitty's parser does not -- a value that stays
+    # one line for kitty but two for a reader is still a trap.
+    LINEBREAKS = re.compile("[\\r\\n\\v\\f\\x1c-\\x1e\\u2028\\u2029]")
+
+
+    def cache_dir():
+        base = os.environ.get(
+            "XDG_CACHE_HOME",
+            os.path.join(os.path.expanduser("~"), ".cache"),
+        )
+        return os.path.join(base, "kitty-session")
+
+
+    def pane0_path():
+        return os.path.join(cache_dir(), "pane0-launch.json")
+
+
+    def _stub_token(value):
+        """One shell-quoted session-file token that cannot break a line.
+
+        Every piece of snapshot-derived text that enters the stub goes
+        through here, and nothing else writes to it. Line breaks are
+        removed BEFORE quoting because shlex.quote preserves them.
+        """
+        return shlex.quote(LINEBREAKS.sub(" ", value))
+
+
+    def _self_exe():
+        """Absolute path to this script, for the stub's launch line.
+
+        kitty parses the session file before any login shell has run,
+        so a bare name is not guaranteed to resolve. argv[0] is the
+        store path the wrapper invoked; PATH lookup is the fallback.
+        """
+        cand = sys.argv[0]
+        if cand and os.sep in cand:
+            return os.path.realpath(cand)
+        return (
+            shutil.which("kitty-restore-session") or "kitty-restore-session"
+        )
 
 
     def _is_claude(cmdline):
@@ -603,11 +682,7 @@ let
 
 
     def load_panes():
-        cache = os.environ.get(
-            "XDG_CACHE_HOME",
-            os.path.join(os.path.expanduser("~"), ".cache"),
-        )
-        snap_path = os.path.join(cache, "kitty-session", "snapshot.json")
+        snap_path = os.path.join(cache_dir(), "snapshot.json")
         if not os.path.exists(snap_path) or os.path.getsize(snap_path) == 0:
             return []
         with open(snap_path) as fh:
@@ -643,28 +718,85 @@ let
         return panes
 
 
+    def _write_atomic(path, text):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+
+
     def emit_stub():
-        """Write a kitty session file with only pane 0's launch directive.
-        Kitty starts directly into this single window (no default extra),
-        avoiding a close-window prompt on the spurious startup shell."""
+        """Write kitty's --session stub: pane 0, exactly one line.
+
+        Kitty starts directly into this single window (no default
+        extra), avoiding a close-window prompt on a spurious startup
+        shell. Pane 0's real argv goes to pane0_path() and is executed
+        by --exec-pane0; see the pane-0 transport note above for why it
+        cannot travel in the session file.
+        """
         panes = load_panes()
         if not panes:
             return
         p = panes[0]
+        _write_atomic(pane0_path(), json.dumps({
+            "cwd": p["cwd"],
+            "title": p["title"],
+            "cmd": p["cmd"],
+        }))
         parts = ["launch"]
         if p["cwd"]:
-            parts += ["--cwd", shlex.quote(p["cwd"])]
+            parts += ["--cwd", _stub_token(p["cwd"])]
         if p["title"]:
-            parts += ["--title", shlex.quote(p["title"])]
-        if p["cmd"]:
-            parts += [shlex.quote(a) for a in p["cmd"]]
-        with open(STUB_PATH, "w") as fh:
-            fh.write(" ".join(parts) + "\n")
+            parts += ["--title", _stub_token(p["title"])]
+        parts += [_stub_token(_self_exe()), "--exec-pane0"]
+        line = " ".join(parts)
+        # Invariant, not a cleanup. Every token above is line-break-free
+        # by construction, so this can only fire if a later edit adds an
+        # unsanitised one -- and then refusing to write beats handing
+        # kitty a stub it will mis-parse into extra windows. The wrapper
+        # treats a missing stub as "launch plain kitty".
+        if LINEBREAKS.search(line):
+            raise ValueError("stub line is not single-line: " + repr(line))
+        _write_atomic(STUB_PATH, line + "\n")
+
+
+    def exec_pane0():
+        """Become pane 0's real command, inside the window kitty made.
+
+        Reached only from the stub's launch line. The argv -- restore
+        notice included -- comes from pane0_path(), so a multi-line
+        notice reaches pane 0 as a single argv element exactly as it
+        reaches panes 1..N through kitty-pane-add.
+        """
+        cmd = None
+        try:
+            with open(pane0_path()) as fh:
+                rec = json.load(fh)
+            if isinstance(rec, dict):
+                cmd = rec.get("cmd")
+        except (OSError, ValueError):
+            cmd = None
+        if not (
+            isinstance(cmd, list)
+            and cmd
+            and all(isinstance(a, str) for a in cmd)
+        ):
+            # No usable record: hand the user a shell rather than let
+            # kitty close an empty pane out from under them.
+            cmd = [os.environ.get("SHELL") or "/bin/sh"]
+        try:
+            os.execvp(cmd[0], cmd)
+        except OSError:
+            os.execvp("/bin/sh", ["/bin/sh"])
 
 
     def main():
         if "--emit-stub" in sys.argv:
             emit_stub()
+            return
+
+        if "--exec-pane0" in sys.argv:
+            exec_pane0()
             return
 
         if "--dump-panes" in sys.argv:
@@ -1160,15 +1292,27 @@ let
       if [ "\$sockets_seen" -eq 0 ]; then
         rm -f "\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/pane-sessions.tsv"
       fi
+      stub="\''${KITTY_STUB_PATH:-/tmp/kitty-stub-session}"
       if [ -s "\$snap" ] && [ "\$live" -eq 0 ]; then
         # Write a stub session file containing just pane 0; this makes
         # kitty start directly into our restored topology with no extra
         # default-startup window to clean up. Restore-session, running
         # in the background, fills in panes 1..N once kitty's socket is up.
-        ${kittyRestoreSession}/bin/kitty-restore-session --emit-stub
-        ( ${kittyRestoreSession}/bin/kitty-restore-session \
-            >/tmp/kitty-restore.log 2>&1 & )
-        exec ${pkgs.kitty}/bin/kitty --session /tmp/kitty-stub-session "\$@"
+        #
+        # emit-stub is NOT allowed to take kitty down with it. Under
+        # \`set -e\` a non-zero exit here (or a stale file left by an
+        # earlier run) used to mean either no terminal at all or kitty
+        # being handed a session file describing the wrong session.
+        # Remove the old file first, run the writer inside an \`if\` so
+        # errexit does not fire, and fall through to a plain kitty when
+        # it produced nothing.
+        rm -f "\$stub"
+        if ${kittyRestoreSession}/bin/kitty-restore-session --emit-stub \
+             && [ -s "\$stub" ]; then
+          ( ${kittyRestoreSession}/bin/kitty-restore-session \
+              >/tmp/kitty-restore.log 2>&1 & )
+          exec ${pkgs.kitty}/bin/kitty --session "\$stub" "\$@"
+        fi
       fi
       exec ${pkgs.kitty}/bin/kitty -1 "\$@"
       EOF

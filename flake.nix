@@ -296,6 +296,18 @@
             .home-manager.users.jonathan
             .systemd.user.services.worktree-sweep.Service.ExecStart;
         };
+        # Not a VM lane: runtime-invocation harness for the kitty
+        # session save/restore scripts (home/kitty.nix) — single-line
+        # session stub, pane-0 notice delivery, grid dispatch against
+        # kitty-internal windows, and snapshot rotation/collapse
+        # arithmetic. Boots nothing; seconds. The VM lane vm-kitty
+        # still owns the real-X topology proof.
+        kitty-scripts = import ./tests/kitty-scripts.nix {
+          pkgs = pkgsLinux;
+          # Drift gate: exercises the packages dellan installs.
+          hmPackages = self.nixosConfigurations.dellan.config
+            .home-manager.users.jonathan.home.packages;
+        };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
         # credential whose real home is elsewhere (see the test's header for
         # why this is not a VM assertion). Pure eval; instant.
