@@ -325,8 +325,17 @@ let
         # Use insertion order via window ID (kitty auto-increments).
         # Smallest id = original full-height "left" pane; second-smallest
         # = result of vsplit, i.e. full-height "right" pane.
-        # `kitty @ ls` JSON doesn't expose at_x/at_y so we can't infer
-        # geometry directly.
+        #
+        # Insertion order rather than geometry because CREATING the
+        # next pane only needs to know which existing pane to split.
+        # An earlier comment here claimed geometry was unavailable at
+        # all; that is wrong and it misled the reflow work. Pixel
+        # coordinates really are absent (window.py:2272 as_dict has no
+        # at_x/at_y), but the full split TREE is not: `kitty @ ls`
+        # carries `tabs[].layout_state.pairs` (tabs.py:1461 ->
+        # layout/splits.py:959) plus `tabs[].groups`. That is what
+        # kitty-panes-reflow below reads to decide whether an existing
+        # layout is already the canonical grid.
         sorted_ids = sorted(w["id"] for w in windows)
         if count == 0:
             run("launch", *common, *cmd)
@@ -340,6 +349,458 @@ let
             run("launch", "--location=hsplit", *common, *cmd)
         else:
             run("launch", "--type=tab", *common, *cmd)
+
+
+    if __name__ == "__main__":
+        main()
+  '';
+
+  # Rearrange the panes a RUNNING kitty already has into the same
+  # canonical grid kitty-pane-add CREATES, without killing or
+  # respawning anything: every pane may be a long-lived `claude`
+  # session, so the only acceptable primitive is one that RE-PARENTS a
+  # window. `kitty @ detach-window` is that primitive; `launch` is not.
+  #
+  # Why detach-and-rebuild rather than driving the existing tree in
+  # place: no remote-control primitive can put a window at a CHOSEN
+  # INTERIOR slot of an arbitrary splits tree.
+  # `layout_action move_to_screen_edge` only re-roots outside-in
+  # (layout/splits.py:799 sets new_root=(win, whole_old_tree)),
+  # `layout_action rotate` only flips the pair holding the active
+  # window (splits.py:780), and `action move_window` is a pure SWAP of
+  # two existing leaves (window_list.py:517) which never changes the
+  # tree SHAPE. `_insert_window_in_direction` (boss.py:3368) is the
+  # primitive that would do it and is reachable only from mouse
+  # drag-and-drop (tabs.py:2101). Rebuilding into fresh EMPTY tabs is
+  # therefore the only sequence whose result is deterministic.
+  #
+  # Verified against kitty 0.48.2 by driving a real kitty under Xvfb:
+  # six stacked panes came back as 2x2 + 2 with all six PIDs
+  # byte-identical before and after.
+  kittyPanesReflow = pkgs.writers.writePython3Bin "kitty-panes-reflow" {} ''
+    """Reflow a running kitty's panes into the canonical 2x2 grid.
+
+    Usage: kitty-panes-reflow [--plan]
+    """
+    import glob
+    import json
+    import os
+    import subprocess
+    import sys
+
+
+    ${kittyInternalWindowPy}
+
+    # Panes per tab in the canonical grid. Not a tunable: it IS the
+    # 2x2 shape kitty-pane-add creates (pane 1 full, pane 2 vsplit,
+    # pane 3 hsplit on the left, pane 4 hsplit on the right, pane 5+
+    # a new tab), and canonical_pairs()/plan_chunk() below are written
+    # for exactly those four slots. Wanting a different grid means
+    # rewriting both of them, not editing this number.
+    PANES_PER_TAB = 4
+
+
+    def _answers(sock):
+        """True when a live kitty is listening on `sock`."""
+        r = subprocess.run(
+            ["kitty", "@", "--to", sock, "ls"],
+            capture_output=True, timeout=3,
+        )
+        return r.returncode == 0
+
+
+    def find_socket():
+        """The kitty to reflow. KITTY_LISTEN_ON wins outright.
+
+        Deliberately unlike kitty-pane-add: a stale KITTY_LISTEN_ON
+        does NOT fall through to the /tmp/kitty.sock-* glob. Adding a
+        pane to the wrong kitty is a nuisance; rearranging every pane
+        of the wrong kitty is destruction, and the glob is precisely
+        the path by which a test harness would reach the user's live
+        session.
+        """
+        env_sock = os.environ.get("KITTY_LISTEN_ON")
+        if env_sock:
+            return env_sock if _answers(env_sock) else None
+        for f in sorted(glob.glob("/tmp/kitty.sock-*")):
+            if _answers("unix:" + f):
+                return "unix:" + f
+        return None
+
+
+    def ls(sock):
+        out = subprocess.check_output(
+            ["kitty", "@", "--to", sock, "ls"], text=True,
+        )
+        return json.loads(out)
+
+
+    def rc(sock, *args):
+        subprocess.run(["kitty", "@", "--to", sock, *args], check=True)
+
+
+    def tab_panes(tab):
+        """The tab's real panes, one per window GROUP, in group order.
+
+        A pane is a GROUP, not a window. kitty puts an overlay into
+        the SAME group as the window it covers -- the config-error
+        window is built with overlay_for=<window id>
+        (boss.py:2485-2494) and the close-confirmation `ask` kitten
+        likewise -- and the splits tree is keyed by group id
+        (tabs.py:1465 list_groups). So an overlay can never occupy a
+        grid slot of its own, and a group holding nothing but kitty's
+        own chrome is not a pane at all and is left exactly where it
+        is. Same window_is_internal() predicate kitty-pane-add,
+        kitty-session-convert and kitty-session-commit use, so none of
+        the four can disagree about what a pane is.
+
+        Falls back to one-pane-per-window for a payload with no
+        `groups` key.
+        """
+        by_id = {w.get("id"): w for w in tab.get("windows", [])}
+        panes = []
+        groups = tab.get("groups")
+        if groups:
+            for g in groups:
+                real = [
+                    by_id[i] for i in g.get("windows", [])
+                    if i in by_id and not window_is_internal(by_id[i])
+                ]
+                if real:
+                    panes.append(
+                        {"group": g.get("id"), "window": real[0]["id"]}
+                    )
+            return panes
+        for w in tab.get("windows", []):
+            if not window_is_internal(w):
+                panes.append({"group": None, "window": w.get("id")})
+        return panes
+
+
+    def canonical_pairs(gids):
+        """kitty's serialized splits tree for `gids` in slot order.
+
+        Slot order is creation order: upper-left, upper-right,
+        lower-left, lower-right. `horizontal` shows up only on the
+        vertically-split pairs because Pair.serialize emits the key
+        only when it is False (layout/splits.py:42-45) -- a tree
+        compared against one that spells out `"horizontal": true`
+        would never match anything kitty reports.
+        """
+        n = len(gids)
+        if n <= 1:
+            return {"one": gids[0]} if gids else {}
+        if n == 2:
+            return {"one": gids[0], "two": gids[1]}
+        left = {"horizontal": False, "one": gids[0], "two": gids[2]}
+        if n == 3:
+            return {"one": left, "two": gids[1]}
+        return {
+            "one": left,
+            "two": {"horizontal": False, "one": gids[1], "two": gids[3]},
+        }
+
+
+    def tree_shape(node):
+        """A serialized Pair tree with its leaf identities erased.
+
+        Leaf identity is dropped on purpose: reflow's contract is the
+        GRID, not which pane sits in which cell, so a tab that already
+        has the canonical shape must not be torn down merely to
+        reorder it. `bias` is ignored for the same reason -- kitty
+        serializes it only when the user has dragged a divider off
+        centre (splits.py:46-47), and rebuilding would silently undo
+        that.
+        """
+        if node is None:
+            return None
+        if not isinstance(node, dict):
+            return "pane"
+        return (
+            bool(node.get("horizontal", True)),
+            tree_shape(node.get("one")),
+            tree_shape(node.get("two")),
+        )
+
+
+    def tree_leaves(node):
+        if node is None:
+            return []
+        if not isinstance(node, dict):
+            return [node]
+        return tree_leaves(node.get("one")) + tree_leaves(node.get("two"))
+
+
+    def tab_is_canonical(tab, panes):
+        """True when this tab already holds the canonical grid."""
+        if tab.get("layout") != "splits":
+            # `stack` (and anything else) serializes no `pairs` at
+            # all, so there is nothing to compare and the tab has to
+            # be rebuilt into a splits one.
+            return False
+        pairs = (tab.get("layout_state") or {}).get("pairs")
+        if not isinstance(pairs, dict):
+            return False
+        gids = [p["group"] for p in panes]
+        if None in gids:
+            return False
+        if sorted(tree_leaves(pairs)) != sorted(gids):
+            # A slot is held by something that is not one of this
+            # tab's panes -- e.g. a kitten kitty opened as a window of
+            # its own rather than as an overlay. Not the canonical
+            # grid; reflow rebuilds around it and leaves it put.
+            return False
+        if len(gids) == 1:
+            # A lone pane looks identical in either slot of the root
+            # pair, so `{"two": g}` counts as canonical too: detaching
+            # it into a fresh tab would be pure churn.
+            return True
+        return tree_shape(pairs) == tree_shape(canonical_pairs(gids))
+
+
+    def pick_os_window(data):
+        """The single OS window to reflow, or None when unsure.
+
+        `kitty @ ls` returns a LIST of OS windows (boss.py:509
+        list_os_windows) and `detach-window --target-tab new` creates
+        its tab in the CURRENT one (boss.py:3338 ->
+        current_os_window()), so reflowing a non-focused OS window
+        would scatter its panes into the focused one. Refusing beats
+        guessing. `is_focused` is empty when no window manager has
+        assigned focus (a bare X server, e.g. under Xvfb), hence the
+        is_active / last_focused fallbacks before the single-window
+        one.
+        """
+        for key in ("is_focused", "is_active", "last_focused"):
+            for osw in data:
+                if osw.get(key):
+                    return osw
+        return data[0] if len(data) == 1 else None
+
+
+    def focused_window(osw):
+        """Id of the window the user is actually sitting in.
+
+        Not a scan for `is_focused` over every window: kitty sets that
+        flag on the active window of EVERY tab of the focused OS
+        window (tabs.py:1064 -- `w is active_window` of its own tab,
+        and the OS window is focused), so a naive scan picks whichever
+        tab happens to come last.
+        """
+        tabs = osw.get("tabs", [])
+        tab = next((t for t in tabs if t.get("is_focused")), None)
+        if tab is None:
+            tab = next((t for t in tabs if t.get("is_active")), None)
+        if tab is None:
+            return None
+        for w in tab.get("windows", []):
+            if w.get("is_focused") or w.get("is_active"):
+                return w.get("id")
+        return None
+
+
+    def collect(osw):
+        """[(tab, panes)] for every tab of `osw` holding a real pane."""
+        out = []
+        for tab in osw.get("tabs", []):
+            panes = tab_panes(tab)
+            if panes:
+                out.append((tab, panes))
+        return out
+
+
+    def is_canonical(osw):
+        """True when this OS window needs no work at all.
+
+        Two conditions. The panes have to be DISTRIBUTED canonically
+        --- full tabs of PANES_PER_TAB with the remainder last --- and
+        each tab has to hold the canonical shape for its own count.
+        Tabs holding no real pane are skipped rather than counted,
+        which is what makes a second run after a reflow that left a
+        chrome-only tab behind settle instead of oscillating.
+        """
+        entries = collect(osw)
+        total = sum(len(p) for _, p in entries)
+        if total == 0:
+            return True
+        full, rest = divmod(total, PANES_PER_TAB)
+        want = [PANES_PER_TAB] * full + ([rest] if rest else [])
+        if [len(p) for _, p in entries] != want:
+            return False
+        return all(tab_is_canonical(t, p) for t, p in entries)
+
+
+    def plan_chunk(chunk):
+        """Steps that rebuild one canonical tab out of `chunk`.
+
+        Transcribed from the sequence measured against kitty 0.48.2.
+        Every step RE-PARENTS an existing window, so no pane's process
+        is ever killed or respawned:
+
+          * `--target-tab new` makes an EMPTY tab -- new_tab(
+            empty_tab=True), boss.py:3338 -- and moves the anchor into
+            it. No shell is spawned.
+          * `--target-tab id:T` is NOT an append. attach_windows ->
+            Tab._add_window(location=None) ->
+            add_non_overlay_window (layout/splits.py:629) splits along
+            the default axis, anchored on the TARGET TAB'S ACTIVE
+            window. That is why every detach is preceded by an
+            explicit focus-window naming its anchor.
+          * `layout_action rotate 90` flips `horizontal` on the pair
+            holding the ACTIVE window (splits.py:780-798), turning the
+            vsplit that was just made into the hsplit the lower row
+            needs. It reads the tab's active group, NOT the command's
+            --match, so the focus step before it is load bearing.
+
+        Anchor windows, not tab ids: `--target-tab new` allocates an
+        id that cannot be known when the plan is built, and kitty
+        reallocates GROUP ids on every attach. Window ids are the only
+        identifier that survives the whole sequence.
+        """
+        ul = chunk[0]["window"]
+        steps = [["detach-new", ul], ["layout-splits", ul]]
+        if len(chunk) > 1:
+            steps += [["focus", ul], ["detach-to", chunk[1]["window"], ul]]
+        if len(chunk) > 2:
+            ll = chunk[2]["window"]
+            steps += [
+                ["focus", ul], ["detach-to", ll, ul],
+                ["focus", ll], ["rotate"],
+            ]
+        if len(chunk) > 3:
+            lr = chunk[3]["window"]
+            steps += [
+                ["focus", chunk[1]["window"]], ["detach-to", lr, ul],
+                ["focus", lr], ["rotate"],
+            ]
+        # Leave the rebuilt tab level. kitty serializes a non-central
+        # `bias` and tree_shape() deliberately ignores it, so without
+        # this a rebuilt tab could come back visibly lopsided and no
+        # later run would ever notice.
+        steps += [["focus", ul], ["equalize"]]
+        return steps
+
+
+    def build_plan(data):
+        """{os_window, noop, steps} for a `kitty @ ls` payload."""
+        osw = pick_os_window(data)
+        if osw is None:
+            return None
+        if is_canonical(osw):
+            return {"os_window": osw.get("id"), "noop": True, "steps": []}
+        panes = [p for _, ps in collect(osw) for p in ps]
+        steps = []
+        for i in range(0, len(panes), PANES_PER_TAB):
+            steps += plan_chunk(panes[i:i + PANES_PER_TAB])
+        focused = focused_window(osw)
+        if focused is not None:
+            # Every detach ends with target_tab.make_active()
+            # (boss.py:3352) and every anchor focus moves the cursor,
+            # so reflow finishes somewhere arbitrary unless it puts
+            # the user back.
+            steps.append(["focus", focused])
+        return {"os_window": osw.get("id"), "noop": False, "steps": steps}
+
+
+    def tab_of(sock, wid):
+        """Id of the tab currently holding window `wid`."""
+        for osw in ls(sock):
+            for tab in osw.get("tabs", []):
+                for w in tab.get("windows", []):
+                    if w.get("id") == wid:
+                        return tab.get("id")
+        return None
+
+
+    def _resolve_tab(sock, anchor):
+        tab = tab_of(sock, anchor)
+        if tab is None:
+            raise SystemExit(
+                "kitty-panes-reflow: anchor window %s disappeared "
+                "mid-reflow" % anchor
+            )
+        return tab
+
+
+    def execute(sock, steps):
+        for step in steps:
+            op = step[0]
+            if op == "focus":
+                rc(sock, "focus-window", "--match=id:%d" % step[1])
+            elif op == "detach-new":
+                rc(sock, "detach-window", "--match=id:%d" % step[1],
+                   "--target-tab", "new")
+            elif op == "detach-to":
+                tab = _resolve_tab(sock, step[2])
+                rc(sock, "detach-window", "--match=id:%d" % step[1],
+                   "--target-tab", "id:%d" % tab)
+            elif op == "layout-splits":
+                tab = _resolve_tab(sock, step[1])
+                rc(sock, "goto-layout", "--match=id:%d" % tab, "splits")
+            elif op == "rotate":
+                rc(sock, "action", "layout_action", "rotate", "90")
+            elif op == "equalize":
+                rc(sock, "action", "layout_action", "equalize")
+            else:
+                raise SystemExit("unknown reflow step: " + repr(step))
+
+
+    def main():
+        if "--plan" in sys.argv:
+            # Test-only seam, same role as kitty-restore-session's
+            # --dump-panes: render the plan from a `kitty @ ls`
+            # payload on stdin without talking to any kitty. It is how
+            # the grid arithmetic is asserted with no terminal at all,
+            # and it is why the fast check never has to go looking for
+            # a socket -- /tmp/kitty.sock-* belongs to the user's live
+            # session.
+            try:
+                data = json.load(sys.stdin)
+            except ValueError:
+                print("--plan: stdin is not `kitty @ ls` JSON",
+                      file=sys.stderr)
+                sys.exit(1)
+            plan = build_plan(data)
+            if plan is None:
+                print("--plan: cannot tell which OS window to reflow",
+                      file=sys.stderr)
+                sys.exit(1)
+            json.dump(plan, sys.stdout)
+            return
+
+        sock = find_socket()
+        if not sock:
+            print("no live kitty", file=sys.stderr)
+            sys.exit(1)
+        plan = build_plan(ls(sock))
+        if plan is None:
+            print(
+                "several OS windows and none is focused; refusing to "
+                "guess which one to reflow",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if plan["noop"]:
+            # Nothing is issued: no detach, no focus change, no
+            # visible churn. This command is meant to be safe to fire
+            # on a hunch.
+            print("layout is already canonical")
+            return
+        try:
+            execute(sock, plan["steps"])
+        except subprocess.CalledProcessError as err:
+            # A pane closed between the plan and the step that moves
+            # it, or kitty refused the command. Say so instead of
+            # emitting a traceback: the layout is now part-rebuilt,
+            # and a second run converges on it from wherever it
+            # stopped.
+            print(
+                "kitty-panes-reflow: `%s` failed (rc %d); the layout is "
+                "part-rebuilt, run it again"
+                % (" ".join(err.cmd), err.returncode),
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
 
     if __name__ == "__main__":
@@ -1567,8 +2028,9 @@ let
       dir="''${XDG_CACHE_HOME:-$HOME/.cache}/kitty-session"
       mkdir -p "$dir"
 
-      # Discover live kitty socket. Under `kitty -1` the listen_on path has
-      # `-{pid}` appended, so glob and pick the first live socket file.
+      # Discover live kitty socket. kitty appends `-{pid}` to the
+      # configured listen_on path on every launch (not only under `-1`),
+      # so glob and pick the first live socket file.
       sock=""
       if [ -n "''${KITTY_LISTEN_ON:-}" ]; then
         sock="$KITTY_LISTEN_ON"
@@ -1728,6 +2190,7 @@ in
     kittySessionSave
     kittyCopyUnwrap
     claudeKittyPaneRecord
+    kittyPanesReflow
     # WIP, not yet wired in (see wrapper above):
     kittyPaneAdd
     kittyRestoreSession
@@ -1750,8 +2213,12 @@ in
 
     # Remote control — JSON-over-Unix-socket for scripts / future MCP server
     # exposing pane management (`kitty @ ls`, launch, send-text, focus, ...).
-    # Kitty appends `-{pid}` under `-1` regardless of socket type; the save
-    # script globs `/tmp/kitty.sock-*` to find the live one.
+    # Kitty appends `-{pid}` to this path on EVERY launch, not only under
+    # `-1` (measured 2026-09-04: a plain `kitty --config` with
+    # `listen_on unix:/tmp/kreflow2-sock` created
+    # `/tmp/kreflow2-sock-2094322`). Nothing may assume the bare path
+    # exists; the save script globs `/tmp/kitty.sock-*` to find the live
+    # one, and kitty exports the resolved path as KITTY_LISTEN_ON.
     allow_remote_control yes
     listen_on unix:/tmp/kitty.sock
 
@@ -1871,6 +2338,22 @@ in
     map ctrl+< launch --location=vsplit --cwd=current
     # Add new pane via the 2x2-grid pattern (kitty-pane-add).
     map ctrl+n launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
+    # Rearrange the panes this kitty ALREADY has into that same grid,
+    # re-parenting them rather than respawning them (kitty-panes-reflow).
+    # A no-op when the layout is already canonical, so it is safe to
+    # fire on a hunch.
+    #
+    # ctrl+shift+r, not a plain ctrl+<char>: every ctrl+<letter> worth
+    # having is a readline binding, and reflow is a rarely-used
+    # deliberate gesture rather than a per-minute one like ctrl+n. It
+    # is free in kitty 0.48.2 (no default binds it — kitty reloads its
+    # config on ctrl+shift+f5) and it does NOT shadow the shell's
+    # ctrl+r reverse-i-search, because kitty matches the exact modifier
+    # set and passes plain ctrl+r straight through. It also sits in the
+    # same ctrl+shift namespace as the copy binds below. `r` is a
+    # literal character, so the libxkbcommon problem noted on ctrl+<
+    # above does not apply.
+    map ctrl+shift+r launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-panes-reflow
     # New tab inheriting cwd of current window.
     map ctrl+t new_tab_with_cwd
 
