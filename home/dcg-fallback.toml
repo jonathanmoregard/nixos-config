@@ -34,6 +34,24 @@
 [general]
 verbose = false
 
+# dcg's evaluation deadline. Upstream default is 1000ms, and a command that
+# misses it is NOT evaluated: dcg renders `permissionDecision: "ask"` (its
+# "no verdict, a human decides" answer, src/hook.rs write_indeterminate_to)
+# and ~/.claude/hooks/bash-guard.py blocks on that. A block for "the box was
+# busy" is a false refusal of legitimate work.
+#
+# Measured on dellan 2026-09-04: eight ordinary commands were refused that
+# way in one morning while a runaway embedding service saturated the CPU;
+# the same commands re-measured at 45-170ms once the box was idle. 2000ms is
+# ~12x the slowest idle measurement and stays inside the guard's own ladder
+# (DCG_TIMEOUT_S=5, GUARD_DEADLINE_S=6), so the hook call plus the
+# `dcg config` health check still fit.
+#
+# Kept in step with ~/.claude/dcg.toml, which is what a host with a checkout
+# actually reads. This seed is what a host WITHOUT one gets, and a fresh host
+# should not have a tighter deadline than an established one.
+hook_timeout_ms = 2000
+
 # DO NOT RE-ENABLE, and do not drop this key when editing the seed. Upstream
 # defaults it to true, and true means dcg REWRITES ~/.claude/settings.json
 # from inside the hook path.
