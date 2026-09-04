@@ -47,6 +47,8 @@ let
       "kitty-pane-add"
       "kitty-session-convert"
       "kitty-session-enrich"
+      "kitty-session-commit"
+      "kitty-session-save"
     ];
   };
 
@@ -181,6 +183,39 @@ let
         with open(os.path.join(out, name + ".json"), "w") as fh:
             json.dump(data, fh)
   '';
+
+  # Snapshot generator for the retention phase: N real panes, plus an
+  # optional kitty-internal overlay so the phase can prove the pane
+  # count that drives retention is the REAL one.
+  mkSnapshot = pkgs.writeText "kitty-scripts-snapshot.py" ''
+    import json
+    import sys
+
+    n = int(sys.argv[1])
+    path = sys.argv[2]
+    internal = len(sys.argv) > 3 and sys.argv[3] == "internal"
+
+    wins = []
+    for i in range(n):
+        wins.append({
+            "id": i + 1,
+            "cwd": "/tmp",
+            "title": "pane%d" % (i + 1),
+            "cmdline": ["/bin/sh"],
+            "foreground_processes": [{"cmdline": ["/bin/sh"]}],
+        })
+    if internal:
+        overlay = ["/nix/store/fake/bin/kitten", "__show_error__", "-t", "E"]
+        wins.append({
+            "id": 900,
+            "cwd": "/tmp",
+            "title": "error overlay",
+            "cmdline": overlay,
+            "foreground_processes": [{"cmdline": overlay}],
+        })
+    with open(path, "w") as fh:
+        json.dump([{"tabs": [{"layout": "splits", "windows": wins}]}], fh)
+  '';
 in
 pkgs.runCommand "kitty-scripts-harness"
   {
@@ -189,6 +224,7 @@ pkgs.runCommand "kitty-scripts-harness"
       pkgs.python3
       pkgs.coreutils
       pkgs.gnugrep
+      pkgs.gnused
       pkgs.jq
     ];
   } ''
@@ -343,7 +379,177 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(C/convert): expected exactly one launch directive"
       exit 1; }
 
-    echo "ok: stub is single-line, pane 0 keeps its notice, grid"
-    echo "    dispatch and session convert count real panes only"
+    # --- Phase D: snapshot retention ---
+    #
+    # The 60s save timer had no rotation and no guard, so within
+    # minutes of the bad restore the degraded topology overwrote the
+    # good 6-pane snapshot, and then the single surviving pane
+    # overwrote that. By the third relaunch load_panes() returned one
+    # pane, hit `len(panes) <= 1`, and returned early: "nothing
+    # opened", with the good state unrecoverable.
+    #
+    # Thresholds are READ OUT of the deployed script rather than
+    # transcribed here, so this phase tests the shipped inputs and
+    # fails if they are renamed away.
+    commit_bin=$(command -v kitty-session-commit)
+    KEEP=$(sed -n 's/^HISTORY_KEEP = \([0-9]*\)$/\1/p' "$commit_bin")
+    GRACE=$(sed -n 's/^COLLAPSE_GRACE_S = \([0-9]*\)$/\1/p' "$commit_bin")
+    MINP=$(sed -n 's/^HISTORY_MIN_PANES = \([0-9]*\)$/\1/p' "$commit_bin")
+    echo "retention inputs: KEEP=$KEEP GRACE=$GRACE MIN_PANES=$MINP"
+    for v in "$KEEP" "$GRACE" "$MINP"; do
+      [ -n "$v" ] || {
+        echo "FAIL(D): a retention input is missing from the deployed"
+        echo "  kitty-session-commit — the numbers below would be"
+        echo "  asserting against nothing."
+        exit 1; }
+    done
+
+    mkdir -p sess cands
+    for n in 1 3 5 6; do
+      python3 ${mkSnapshot} "$n" "cands/c$n.json"
+    done
+    python3 ${mkSnapshot} 3 "cands/c3-plus-overlay.json" internal
+
+    commit_rc() { # <candidate>
+      local rc=0
+      kitty-session-commit "$PWD/sess" < "$1" || rc=$?
+      echo "$rc"
+    }
+    real_panes() { # <snapshot>
+      jq '[.[].tabs[].windows[]] | length' "$1"
+    }
+    age_out() { # push snapshot.json's mtime past the grace window
+      touch -d "@$(( $(date +%s) - GRACE - 60 ))" sess/snapshot.json
+    }
+    # Name-based, not glob-based: stdenv runs with nullglob, so an
+    # unmatched `ls history/*-1p.json` silently lists the whole
+    # directory and reads as a match.
+    have_hist() { # <pane-count>
+      ls sess/history 2>/dev/null | grep -q -- "-$1p\.json\$"
+    }
+
+    # D1 — first snapshot commits, nothing to rotate yet.
+    [ "$(commit_rc cands/c6.json)" -eq 0 ] || {
+      echo "FAIL(D1): first snapshot refused"; exit 1; }
+    [ "$(real_panes sess/snapshot.json)" -eq 6 ] || {
+      echo "FAIL(D1): committed snapshot is not the candidate"; exit 1; }
+
+    # D2 — the incident: a 1-pane snapshot arriving one tick after a
+    # 6-pane one must NOT overwrite it.
+    [ "$(commit_rc cands/c1.json)" -eq 3 ] || {
+      echo "FAIL(D2): a 6-pane snapshot was overwritten by a 1-pane one"
+      echo "  within the grace window — this is the 2026-09-04 loss."
+      exit 1; }
+    [ "$(real_panes sess/snapshot.json)" -eq 6 ] || {
+      echo "FAIL(D2): prior good snapshot was not preserved"; exit 1; }
+
+    # D3 — the guard counts REAL panes. 3 real + 1 error overlay is a
+    # collapse from 6; counting the overlay would make it 4 and let the
+    # degraded snapshot through.
+    [ "$(commit_rc cands/c3-plus-overlay.json)" -eq 3 ] || {
+      echo "FAIL(D3): a kitty overlay window padded the pane count and"
+      echo "  disarmed the collapse guard."
+      exit 1; }
+    [ "$(real_panes sess/snapshot.json)" -eq 6 ] || {
+      echo "FAIL(D3): prior good snapshot was not preserved"; exit 1; }
+
+    # D4 — an ordinary shrink (6 -> 5) is not a collapse; it commits and
+    # rotates the outgoing 6-pane snapshot into history.
+    [ "$(commit_rc cands/c5.json)" -eq 0 ] || {
+      echo "FAIL(D4): a normal one-pane close was treated as a crash"
+      exit 1; }
+    [ "$(real_panes sess/snapshot.json)" -eq 5 ] || {
+      echo "FAIL(D4): candidate was not committed"; exit 1; }
+    have_hist 6 || {
+      ls -la sess/history 2>&1 || true
+      echo "FAIL(D4): the outgoing 6-pane snapshot was not retained"
+      exit 1; }
+
+    # D5 — history holds distinct topologies, not ticks. A session that
+    # sits at the same size cannot flush the good history out by
+    # waiting, which is what a 60s timer would otherwise do.
+    [ "$(commit_rc cands/c5.json)" -eq 0 ] || exit 1
+    before=$(ls sess/history | wc -l)
+    [ "$(commit_rc cands/c5.json)" -eq 0 ] || exit 1
+    [ "$(commit_rc cands/c5.json)" -eq 0 ] || exit 1
+    after=$(ls sess/history | wc -l)
+    [ "$before" -eq "$after" ] || {
+      ls -la sess/history
+      echo "FAIL(D5): repeated identical topologies each pushed a"
+      echo "  history entry ($before -> $after); a stuck bad state"
+      echo "  would evict every good one inside KEEP ticks."
+      exit 1; }
+
+    # D6 — once the collapse has outlived the grace window it is
+    # believed: the user really did close those panes.
+    age_out
+    [ "$(commit_rc cands/c1.json)" -eq 0 ] || {
+      echo "FAIL(D6): a collapse that persisted past the grace window"
+      echo "  was still refused — snapshot.json would never catch up."
+      exit 1; }
+    [ "$(real_panes sess/snapshot.json)" -eq 1 ] || {
+      echo "FAIL(D6): candidate was not committed"; exit 1; }
+
+    # D7 — a degenerate snapshot never enters history, so it can never
+    # evict a good one.
+    age_out
+    [ "$(commit_rc cands/c1.json)" -eq 0 ] || exit 1
+    if have_hist 1; then
+      ls -la sess/history
+      echo "FAIL(D7): a 1-pane snapshot was rotated into history; with"
+      echo "  a 60s timer that alone would evict the recoverable"
+      echo "  topologies inside KEEP ticks."
+      exit 1
+    fi
+    for f in sess/history/*.json; do
+      n=$(echo "$f" | sed 's/.*-\([0-9]*\)p\.json$/\1/')
+      [ "$n" -ge "$MINP" ] || {
+        echo "FAIL(D7): history holds a $n-pane snapshot, below the"
+        echo "  declared HISTORY_MIN_PANES=$MINP"
+        exit 1; }
+    done
+
+    # D8 — history is bounded at the declared depth, keeping the newest.
+    # Only growth, so the collapse guard never fires and every commit
+    # rotates a distinct count.
+    top=$(( KEEP + 8 ))
+    for n in $(seq 2 "$top"); do
+      python3 ${mkSnapshot} "$n" "cands/grow.json"
+      [ "$(commit_rc cands/grow.json)" -eq 0 ] || {
+        echo "FAIL(D8): growth to $n panes was refused"; exit 1; }
+    done
+    got=$(ls sess/history | wc -l)
+    [ "$got" -eq "$KEEP" ] || {
+      ls -la sess/history
+      echo "FAIL(D8): history holds $got entries, declared depth is $KEEP"
+      exit 1; }
+    have_hist "$(( top - 1 ))" || {
+      ls -la sess/history
+      echo "FAIL(D8): the newest rotation was pruned instead of the oldest"
+      exit 1; }
+    if have_hist 2; then
+      ls -la sess/history
+      echo "FAIL(D8): the OLDEST rotation survived the prune"
+      exit 1
+    fi
+
+    # D9 — drift gate: the deployed save script actually routes through
+    # kitty-session-commit, and still gates on the enricher's exit code
+    # (the partial-snapshot / same-cwd-collision guard this must not
+    # weaken).
+    save_bin=$(command -v kitty-session-save)
+    grep -q 'kitty-session-commit' "$save_bin" || {
+      echo "FAIL(D9): kitty-session-save does not call"
+      echo "  kitty-session-commit — every assertion above is testing a"
+      echo "  script nothing runs."
+      exit 1; }
+    grep -q 'enrich_rc' "$save_bin" || {
+      echo "FAIL(D9): the enricher exit-code gate (partial-snapshot"
+      echo "  collision guard) is gone from kitty-session-save."
+      exit 1; }
+
+    echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
+    echo "    session convert count real panes only, snapshot rotation"
+    echo "    survives a relaunch burst"
     touch $out
   ''

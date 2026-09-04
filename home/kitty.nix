@@ -1301,10 +1301,241 @@ let
     sys.stdout.write(unwrap(sys.stdin.read()))
   '';
 
+  # ---- snapshot retention: named inputs, derived thresholds ---------
+  #
+  # Every number below is an INPUT with a reason. The two thresholds
+  # the code actually reads are PRODUCTS of them, so tuning happens by
+  # changing a reason rather than by nudging a constant until the
+  # symptom stops.
+  #
+  # saveIntervalSeconds — how often kitty-session-save.timer fires. The
+  #   timer and the collapse guard read this same binding, so they
+  #   cannot drift apart.
+  saveIntervalSeconds = 60;
+  # failedRelaunchBurst — how many relaunches one bad-restore episode
+  #   produces before a human intervenes. Three, observed 2026-09-04:
+  #   kitty died holding 6 panes, each of three relaunches re-saved a
+  #   degraded topology, and the third left one pane, at which point
+  #   restore hit `len(panes) <= 1` and opened nothing.
+  failedRelaunchBurst = 3;
+  # A pane-count collapse is only believed once it has SURVIVED a whole
+  # relaunch burst — each failed relaunch can persist at most one
+  # degraded snapshot, one tick apart. Product: 180s.
+  collapseGraceSeconds = failedRelaunchBurst * saveIntervalSeconds;
+  # collapseDivisor — what makes a drop "sharp": losing at least this
+  #   fraction of the panes between two consecutive ticks. Halving is
+  #   not something a user does by hand inside one tick, and closing
+  #   panes one at a time never trips it.
+  collapseDivisor = 2;
+  # historyBurstsCovered — how many independent bad episodes the
+  #   history has to outlive. A rotation happens only when the real
+  #   pane count CHANGES, so an episode contributes at most
+  #   failedRelaunchBurst entries. Product: 12 files, ~20KB each.
+  historyBurstsCovered = 4;
+  snapshotHistoryKeep = failedRelaunchBurst * historyBurstsCovered;
+  # historyMinPanes — the smallest topology worth recovering. A
+  #   snapshot at or below one pane carries nothing a human would
+  #   restore, so it never enters the ring and therefore can never
+  #   evict one that does.
+  historyMinPanes = 2;
+
+  # Decide whether a freshly-enriched snapshot may replace the current
+  # one, and keep a bounded history of the good ones. Split out of
+  # kitty-session-save so this arithmetic is testable without a kitty:
+  # the save wrapper's PATH is pinned to its runtimeInputs, so a test
+  # cannot stand in for `kitty @ ls` there.
+  #
+  # Exit codes:
+  #   0 — candidate committed as the new snapshot.json.
+  #   3 — candidate refused; the prior good snapshot is preserved.
+  #   1 — bad usage / unreadable candidate.
+  kittySessionCommit = pkgs.writers.writePython3Bin "kitty-session-commit" {} ''
+    """Commit a kitty snapshot, or preserve the prior good one.
+
+    Usage: kitty-session-commit <cache-dir>   (candidate JSON on stdin)
+    """
+    import json
+    import os
+    import re
+    import shutil
+    import sys
+    import time
+
+
+    ${kittyInternalWindowPy}
+
+    # Retention inputs, injected from home/kitty.nix where each one is
+    # stated with its reason. Named here so the values a test asserts
+    # against are read out of the deployed script rather than
+    # transcribed into the test.
+    SAVE_INTERVAL_S = ${toString saveIntervalSeconds}
+    FAILED_RELAUNCH_BURST = ${toString failedRelaunchBurst}
+    COLLAPSE_GRACE_S = ${toString collapseGraceSeconds}
+    COLLAPSE_DIVISOR = ${toString collapseDivisor}
+    HISTORY_KEEP = ${toString snapshotHistoryKeep}
+    HISTORY_MIN_PANES = ${toString historyMinPanes}
+
+    HISTORY_RE = re.compile(r"^snapshot-\d+\.\d+-(\d+)p\.json$")
+
+
+    def real_pane_count(data):
+        """Panes a human would recognise as theirs.
+
+        Excludes kitty's own overlay windows for the same reason
+        kitty-pane-add does: an error overlay padding the count is
+        exactly what would disarm the collapse guard below.
+        """
+        n = 0
+        for osw in data:
+            for tab in osw.get("tabs", []):
+                for win in tab.get("windows", []):
+                    if not window_is_internal(win):
+                        n += 1
+        return n
+
+
+    def _load(path):
+        try:
+            with open(path) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+
+    def _history_names(hdir):
+        try:
+            names = os.listdir(hdir)
+        except OSError:
+            return []
+        return sorted(n for n in names if HISTORY_RE.match(n))
+
+
+    def _newest_history_panes(hdir):
+        names = _history_names(hdir)
+        if not names:
+            return None
+        return int(HISTORY_RE.match(names[-1]).group(1))
+
+
+    def collapsed(prev_count, new_count, snap_path):
+        """True when the pane count fell off a cliff, recently.
+
+        Two conditions, both needed. The DROP has to be sharp
+        (COLLAPSE_DIVISOR), which a user closing panes one at a time
+        never produces between two ticks. And the prior snapshot has to
+        be YOUNGER than the grace window, because a crash-and-relaunch
+        burst resolves inside it while a deliberate close does not — so
+        a real shrink is accepted a few minutes late instead of never.
+        Not writing is what keeps the age growing: preserving leaves
+        snapshot.json's mtime alone, so the window cannot renew itself.
+        """
+        if prev_count < HISTORY_MIN_PANES:
+            return False
+        if new_count * COLLAPSE_DIVISOR > prev_count:
+            return False
+        try:
+            age = time.time() - os.path.getmtime(snap_path)
+        except OSError:
+            return False
+        return age < COLLAPSE_GRACE_S
+
+
+    def rotate(dirpath, snap_path, prev_count):
+        """Copy the outgoing snapshot into history/, newest last.
+
+        Two rules keep the ring recoverable rather than merely full:
+        a snapshot below HISTORY_MIN_PANES never enters it, so a
+        degenerate state cannot evict a good one; and an entry is a
+        DISTINCT pane count rather than a tick, so a session sitting at
+        one size cannot flush the history out by waiting — which a 60s
+        timer would otherwise do in HISTORY_KEEP minutes.
+        """
+        if prev_count < HISTORY_MIN_PANES:
+            return
+        hdir = os.path.join(dirpath, "history")
+        try:
+            os.makedirs(hdir, exist_ok=True)
+        except OSError:
+            return
+        if _newest_history_panes(hdir) == prev_count:
+            return
+        name = "snapshot-%.6f-%dp.json" % (time.time(), prev_count)
+        try:
+            shutil.copyfile(snap_path, os.path.join(hdir, name))
+        except OSError:
+            return
+        sys.stderr.write(
+            "kitty-session-commit: rotated %d-pane snapshot to %s\n"
+            % (prev_count, name)
+        )
+        prune(hdir)
+
+
+    def prune(hdir):
+        names = _history_names(hdir)
+        for name in names[:max(len(names) - HISTORY_KEEP, 0)]:
+            try:
+                os.unlink(os.path.join(hdir, name))
+            except OSError:
+                pass
+
+
+    def _write_atomic(path, text):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+
+
+    def main():
+        if len(sys.argv) < 2:
+            sys.stderr.write("usage: kitty-session-commit <cache-dir>\n")
+            sys.exit(1)
+        dirpath = sys.argv[1]
+        try:
+            cand = json.load(sys.stdin)
+        except ValueError:
+            sys.stderr.write("kitty-session-commit: candidate is not JSON\n")
+            sys.exit(1)
+        if not isinstance(cand, list):
+            sys.stderr.write("kitty-session-commit: candidate is not a list\n")
+            sys.exit(1)
+
+        snap_path = os.path.join(dirpath, "snapshot.json")
+        prev = _load(snap_path)
+        new_count = real_pane_count(cand)
+        prev_count = real_pane_count(prev) if prev is not None else 0
+
+        if prev is not None and collapsed(prev_count, new_count, snap_path):
+            sys.stderr.write(
+                "kitty-session-commit: refusing %d-pane snapshot over a "
+                "%d-pane one saved %ds ago; preserving prior good\n"
+                % (
+                    new_count, prev_count,
+                    int(time.time() - os.path.getmtime(snap_path)),
+                )
+            )
+            sys.exit(3)
+
+        if prev is not None:
+            rotate(dirpath, snap_path, prev_count)
+        _write_atomic(snap_path, json.dumps(cand))
+
+
+    if __name__ == "__main__":
+        main()
+  '';
+
   # Snapshot current kitty state. No-op if no kitty is listening.
   kittySessionSave = pkgs.writeShellApplication {
     name = "kitty-session-save";
-    runtimeInputs = [ pkgs.kitty kittySessionConvert kittySessionEnrich pkgs.coreutils ];
+    runtimeInputs = [
+      pkgs.kitty
+      kittySessionConvert
+      kittySessionEnrich
+      kittySessionCommit
+      pkgs.coreutils
+    ];
     text = ''
       set -euo pipefail
 
@@ -1342,15 +1573,35 @@ let
       #        instead of overwriting it with the dangerous partial.
       #   any other non-zero — enricher crashed; preserve prior good.
       set +e
-      printf '%s\n' "$json" | kitty-session-enrich > "$dir/snapshot.json.tmp"
+      printf '%s\n' "$json" | kitty-session-enrich > "$dir/candidate.json.tmp"
       enrich_rc=$?
       set -e
-      if [ "$enrich_rc" -eq 0 ]; then
-        mv "$dir/snapshot.json.tmp" "$dir/snapshot.json"
+      if [ "$enrich_rc" -ne 0 ]; then
+        rm -f "$dir/candidate.json.tmp"
+        exit 0
+      fi
+
+      # Retention gate. kitty-session-commit decides whether the
+      # candidate may replace snapshot.json and keeps a bounded history
+      # of the good ones (thresholds and their rationale live in
+      # home/kitty.nix). Exit codes:
+      #   0  — committed; last.session is regenerated to match.
+      #   3  — refused, prior good snapshot preserved. NOT an error: it
+      #        is the guard doing its job, and last.session must stay in
+      #        step with the snapshot it was rendered from.
+      #   any other non-zero — commit crashed; leave everything alone.
+      #
+      # This is a SECOND gate, not a replacement for the enricher's:
+      # rc 2 above (partial snapshot, same-cwd claude panes with a
+      # missing TSV row) still short-circuits before we get here.
+      set +e
+      kitty-session-commit "$dir" < "$dir/candidate.json.tmp"
+      commit_rc=$?
+      set -e
+      rm -f "$dir/candidate.json.tmp"
+      if [ "$commit_rc" -eq 0 ]; then
         kitty-session-convert < "$dir/snapshot.json" > "$dir/last.session.tmp"
         mv "$dir/last.session.tmp" "$dir/last.session"
-      else
-        rm -f "$dir/snapshot.json.tmp"
       fi
     '';
   };
@@ -1448,6 +1699,7 @@ in
     kittyWithSession
     kittySessionConvert
     kittySessionEnrich
+    kittySessionCommit
     kittySessionSave
     kittyCopyUnwrap
     claudeKittyPaneRecord
@@ -1643,7 +1895,10 @@ in
     Unit.Description = "Snapshot kitty session every minute";
     Timer = {
       OnBootSec = "30s";
-      OnUnitActiveSec = "60s";
+      # Same binding the collapse guard's grace window is derived from
+      # (see "snapshot retention" in the let block above), so the two
+      # cannot drift apart.
+      OnUnitActiveSec = "${toString saveIntervalSeconds}s";
       AccuracySec = "10s";
     };
     Install.WantedBy = [ "timers.target" ];
