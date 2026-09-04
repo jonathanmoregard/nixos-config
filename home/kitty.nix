@@ -121,6 +121,115 @@ let
         return shlex.quote(LINEBREAKS.sub(" ", value))
   '';
 
+  # Shared Python: keep a RESTORED Claude Code pane inside
+  # claude-egress.slice, and let every consumer see through the launcher
+  # that puts it there.
+  #
+  # Requires `import os` in the consuming script.
+  #
+  # ── Why this exists ───────────────────────────────────────────────────
+  #
+  # The slice is a security control, not bookkeeping:
+  # modules/nixos/claude-egress-observe.nix binds an nftables rule to
+  # that cgroup's INODE, so a Claude Code running outside it is
+  # unobserved while looking identical to an observed one. Restore
+  # launches claude two ways — `kitty @ launch -- claude …` for panes
+  # 1..N and an execvp for pane 0 — and both spawn children of kitty,
+  # which lives in the desktop session's own scope. Every restored
+  # session was therefore unconfined, silently, with the user's egress
+  # report under-counting rather than warning.
+  #
+  # ── Why a zsh round-trip and not systemd-run inline ───────────────────
+  #
+  # The policy — resolve the binary at CALL time (the native installer
+  # self-updates), probe that a scope in the slice can start before
+  # committing the real invocation, and degrade LOUDLY rather than
+  # silently when there is no user bus — lives exactly once, in
+  # `_claude_slice` (home/claude-egress-slice.nix). Re-deriving it here
+  # would be a second copy of a security control, free to drift from the
+  # one the user's own `claude` goes through; the first time the two
+  # disagreed, the restore path would be the one nobody was looking at.
+  # `_claude_slice` is a shell FUNCTION (that file explains why it cannot
+  # be a PATH wrapper), so reaching it means an interactive zsh —
+  # the same way tests/claude-egress.nix drives the real generated
+  # zshrc.
+  #
+  # The launcher is handed the recorded claude path as `$0`, so the
+  # fallback branch still starts the user's session when the function is
+  # missing — the established trade-off from claude-egress-slice.nix is
+  # "observation degrades, the tool never fails to start", and a restore
+  # that opened no pane would be a worse outcome than an announced
+  # unobserved one.
+  claudeSliceLaunchPy = ''
+    # The zsh that owns the definition, by store path rather than
+    # $SHELL: restore runs from a background process where $SHELL may
+    # be unset, and this is the same zsh home-manager writes ~/.zshrc
+    # for. `-i` is what sources that rc and therefore what defines
+    # _claude_slice; `-c` runs the launcher and exits, so the pane's
+    # lifetime is still claude's.
+    SLICE_SHELL = "${pkgs.zsh}/bin/zsh"
+    SLICE_MARK = "_claude_slice"
+    SLICE_SCRIPT = (
+        'if typeset -f _claude_slice >/dev/null; then '
+        '_claude_slice "$@"; '
+        'else '
+        "print -ru2 -- 'claude-egress: UNOBSERVED "
+        "(_claude_slice is not defined in this shell, so this restored "
+        "pane runs Claude Code outside claude-egress.slice)'; "
+        'exec "$0" "$@"; '
+        'fi'
+    )
+
+
+    def _is_claude_exe(cmdline):
+        """True when cmdline[0] is the claude-code CLI itself."""
+        if not cmdline:
+            return False
+        return os.path.basename(cmdline[0]) == "claude"
+
+
+    def unwrap_slice(cmdline):
+        """The claude argv inside a slice launcher, else cmdline.
+
+        Every "is this a claude pane" question has to see through the
+        launcher. kitty records `window.cmdline` as what it spawned,
+        which after a restore is the zsh launcher rather than claude —
+        and that field is precisely what identifies a ZOMBIE pane
+        (claude gone, an orphaned stdio MCP server still holding the
+        pty). Without this, one restore would strip a pane of its
+        claude identity and the next would relaunch the orphan.
+        """
+        cmdline = cmdline or []
+        if (
+            len(cmdline) > 4
+            and os.path.basename(cmdline[0]) == "zsh"
+            and cmdline[1:3] == ["-i", "-c"]
+            and SLICE_MARK in cmdline[3]
+        ):
+            return cmdline[4:]
+        return cmdline
+
+
+    def _is_claude(cmdline):
+        """True when this pane's command is claude, wrapped or not."""
+        return _is_claude_exe(unwrap_slice(cmdline))
+
+
+    def slice_launch(cmdline):
+        """How a claude pane must actually be spawned.
+
+        Unwraps first, so wrapping is idempotent: a snapshot taken
+        after a restore already holds a wrapped cmdline and must not
+        grow a second launcher on the next one. Non-claude panes are
+        returned untouched — the slice is for Claude Code, and putting
+        a shell in it would make the egress report meaningless.
+        """
+        inner = unwrap_slice(cmdline)
+        if not _is_claude_exe(inner):
+            return cmdline
+        return [SLICE_SHELL, "-i", "-c", SLICE_SCRIPT] + inner
+  '';
+
   # Convert `kitty @ ls` JSON snapshot → kitty session-file format
   # (https://sw.kovidgoyal.net/kitty/overview/#startup-sessions).
   # Restores OS-window/tab/window topology, layouts, cwds, titles. Does
@@ -138,12 +247,7 @@ let
 
     ${kittyInternalWindowPy}
 
-    def _is_claude(cmdline):
-        """True when cmdline[0] is the claude-code CLI."""
-        if not cmdline:
-            return False
-        return os.path.basename(cmdline[0]) == "claude"
-
+    ${claudeSliceLaunchPy}
 
     def pane_cmd(win):
         """The command this pane should be recorded as running.
@@ -192,7 +296,12 @@ let
                     continue
                 cwd = win.get("cwd")
                 wtitle = win.get("title", "")
-                cmdline = pane_cmd(win)
+                # The session file has to be an honest rendering of what
+                # restore does, and what restore does with a claude pane
+                # is put it in claude-egress.slice. A last.session that
+                # launched a bare `claude` would hand anyone who fed it
+                # to `kitty --session` an unobserved session.
+                cmdline = slice_launch(pane_cmd(win))
                 parts = ["launch"]
                 if cwd:
                     parts.append("--cwd")
@@ -846,6 +955,8 @@ let
 
     ${kittyInternalWindowPy}
 
+    ${claudeSliceLaunchPy}
+
     def find_socket(timeout=30):
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -1157,8 +1268,12 @@ let
 
         Mutates `claimed_sids` with the sid this pane ends up using.
         """
-        if not cmd or os.path.basename(cmd[0]) != "claude":
+        # Unwrap first: a snapshot taken after a restore records the
+        # claude-egress launcher as the pane's command, and the session
+        # to resume is decided by the claude argv inside it.
+        if not _is_claude(cmd):
             return cmd
+        cmd = unwrap_slice(cmd)
         proj_dir = None
         if cwd:
             encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
@@ -1242,13 +1357,6 @@ let
         return (
             shutil.which("kitty-restore-session") or "kitty-restore-session"
         )
-
-
-    def _is_claude(cmdline):
-        """True when cmdline[0] is the claude-code CLI."""
-        if not cmdline:
-            return False
-        return os.path.basename(cmdline[0]) == "claude"
 
 
     def pane_cmd(win):
@@ -1348,10 +1456,15 @@ let
         if not panes:
             return
         p = panes[0]
+        # slice_launch() here and at the kitty-pane-add loop in main(),
+        # NOT inside load_panes(): --dump-panes stays a readout of WHICH
+        # session each pane resolved to, which is what tests assert on,
+        # while the two places that actually start a process are the two
+        # that put it in the slice.
         _write_atomic(pane0_path(), json.dumps({
             "cwd": p["cwd"],
             "title": p["title"],
-            "cmd": p["cmd"],
+            "cmd": slice_launch(p["cmd"]),
         }))
         parts = ["launch"]
         if p["cwd"]:
@@ -1436,7 +1549,7 @@ let
             if p["title"]:
                 argv += ["--title", p["title"]]
             if p["cmd"]:
-                argv += ["--", *p["cmd"]]
+                argv += ["--", *slice_launch(p["cmd"])]
             subprocess.run(argv, check=False)
 
 
@@ -1579,12 +1692,7 @@ let
     )
 
 
-    def _is_claude(cmdline):
-        """True when cmdline[0] is the claude-code CLI."""
-        if not cmdline:
-            return False
-        return os.path.basename(cmdline[0]) == "claude"
-
+    ${claudeSliceLaunchPy}
 
     def load_tsv():
         """Return {window_id: session_id}. Malformed lines ignored."""
@@ -1707,6 +1815,12 @@ let
                     # It stays FALSE for a pane the user launched as a
                     # shell and then quit claude inside — that window's
                     # cmdline is the shell, so no resurrection.
+                    #
+                    # After a restore that cmdline is the claude-egress
+                    # launcher rather than claude itself, which is why
+                    # _is_claude() unwraps: without it the FIRST restore
+                    # would strip every pane of its claude identity and
+                    # the second would relaunch the orphan.
                     has_claude = _is_claude(win.get("cmdline")) or any(
                         _is_claude(fp.get("cmdline")) for fp in fg
                     )

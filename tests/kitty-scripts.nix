@@ -118,6 +118,18 @@ let
             "cmdline": ["/bin/sh"],
             "foreground_processes": [{"cmdline": ["/bin/sh"]}],
         },
+        # A second claude pane, so the restore path's panes-1..N loop
+        # has a claude in it and phase F can watch how it is launched.
+        # Its sid is already claimed by pane 0, so the collision guard
+        # leaves it a bare `claude` -- still a claude pane, and it must
+        # still land in claude-egress.slice.
+        {
+            "id": 3,
+            "cwd": work,
+            "title": "second claude pane",
+            "cmdline": [claude],
+            "foreground_processes": [{"cmdline": [claude]}],
+        },
     ]}]}]
     with open(os.path.join(sess, "snapshot.json"), "w") as fh:
         json.dump(snap, fh)
@@ -627,7 +639,8 @@ pkgs.runCommand "kitty-scripts-harness"
 
     # --- Phase B: pane 0 still receives the notice, as argv ---
     export ARGV_OUT="$PWD/state/pane0-argv"
-    kitty-restore-session --exec-pane0
+    kitty-restore-session --exec-pane0 2> state/pane0-stderr
+    echo "--- pane0 stderr ---"; cat state/pane0-stderr
     [ -s "$ARGV_OUT" ] || {
       echo "FAIL(B): pane 0's command never ran / recorded no argv"; exit 1; }
     echo "--- pane0 argv ---"; cat "$ARGV_OUT"; echo "--- end argv ---"
@@ -1148,6 +1161,140 @@ pkgs.runCommand "kitty-scripts-harness"
       "$PWD/state/plan-two-os-windows.json" > /dev/null || {
       echo "FAIL(E9): reflow does not restore the originally-focused"
       echo "  window."
+      exit 1; }
+
+    # --- Phase F: a restored claude pane lands in claude-egress.slice --
+    #
+    # The slice is a SECURITY CONTROL: modules/nixos/
+    # claude-egress-observe.nix binds an nftables rule to that cgroup's
+    # inode, so a Claude Code running outside it is unobserved while
+    # looking exactly like an observed one. Restore starts claude two
+    # ways -- an execvp for pane 0 and `kitty @ launch --` for panes
+    # 1..N -- and both spawn children of kitty, which lives in the
+    # desktop session's own scope. Every restored session was therefore
+    # silently unconfined, and the user's egress report under-counted
+    # rather than warning.
+    #
+    # The policy itself (resolve the binary at call time, probe the
+    # scope, degrade LOUDLY) lives once, in `_claude_slice` from
+    # home/claude-egress-slice.nix. These assertions are about the
+    # restore path REACHING it, and about the recorded claude argv
+    # surviving the trip intact.
+
+    # F1 — pane 0's recorded launch argv is the slice launcher, with
+    # the resolved claude argv (notice included) inside it.
+    pane0_json="$XDG_CACHE_HOME/kitty-session/pane0-launch.json"
+    echo "--- pane0-launch.json ---"; cat "$pane0_json"; echo
+    jq -e '.cmd[0] | endswith("/zsh")' "$pane0_json" > /dev/null || {
+      echo "FAIL(F1): pane 0 is launched by execvp'ing claude directly,"
+      echo "  so the restored session runs outside claude-egress.slice"
+      echo "  while looking identical to a confined one."
+      exit 1; }
+    jq -e '.cmd[1:3] == ["-i","-c"]' "$pane0_json" > /dev/null || {
+      echo "FAIL(F1): the launcher shell is not interactive; ~/.zshrc is"
+      echo "  what defines _claude_slice, and only -i sources it."
+      exit 1; }
+    jq -e '.cmd[3] | test("_claude_slice")' "$pane0_json" > /dev/null || {
+      echo "FAIL(F1): the launcher does not call _claude_slice — the"
+      echo "  single definition of the slice policy."
+      exit 1; }
+    jq -e '.cmd[4] | endswith("/claude")' "$pane0_json" > /dev/null || {
+      echo "FAIL(F1): the recorded claude path is not passed through as"
+      echo "  \$0, so the fallback branch has nothing to exec."
+      exit 1; }
+    jq -e '.cmd | map(select(test("restored by kitty"))) | length == 1' \
+      "$pane0_json" > /dev/null || {
+      echo "FAIL(F1): the restore notice did not survive being wrapped."
+      exit 1; }
+    jq -e '.cmd | index("--resume") != null' "$pane0_json" > /dev/null || {
+      echo "FAIL(F1): the resume argv did not survive being wrapped."
+      exit 1; }
+
+    # F2 — and the fallback is LOUD. Nothing defines _claude_slice in
+    # this sandbox, so --exec-pane0 above took the degraded branch: it
+    # must have SAID it was unobserved and still started the session
+    # (phase B already asserted the argv it started with).
+    grep -q 'claude-egress: UNOBSERVED' state/pane0-stderr || {
+      echo "FAIL(F2): the launcher fell back to running claude outside"
+      echo "  the slice without saying so. A session that is unobserved"
+      echo "  but looks observed is the whole failure this guards."
+      exit 1; }
+
+    # F3 — panes 1..N take the same path. The restore loop hands each
+    # one to kitty-pane-add, so the wrapper has to be in the argv that
+    # reaches `kitty @ launch --`.
+    #
+    # kitty-restore-session finds its kitty by globbing
+    # /tmp/kitty.sock-* — it runs before kitty exists, so it has no
+    # KITTY_LISTEN_ON to prefer. The stdenv build sandbox has its own
+    # private, EMPTY /tmp (verified: `ls -la /tmp` inside a sandboxed
+    # derivation lists nothing), so planting a stand-in there cannot
+    # reach the user's live session sockets.
+    : > /tmp/kitty.sock-1
+    export LS_JSON="$PWD/grid/two-real.json"
+    export KITTY_CMD_LOG="$PWD/state/restore-launch.log"
+    : > "$KITTY_CMD_LOG"
+    kitty-restore-session
+    echo "--- restore issued ---"; cat "$KITTY_CMD_LOG"
+    grep -q '^launch .*_claude_slice' "$KITTY_CMD_LOG" || {
+      echo "FAIL(F3): a restored claude pane was launched as a bare"
+      echo "  claude, so panes 1..N run outside claude-egress.slice."
+      exit 1; }
+    # Control: the shell pane in the same restore is NOT wrapped. The
+    # slice is for Claude Code; putting a shell in it would make the
+    # egress report meaningless.
+    [ "$(grep -c '^launch .*_claude_slice' "$KITTY_CMD_LOG")" -eq 1 ] || {
+      echo "FAIL(F3): the wrapper was applied to something that is not"
+      echo "  claude — over-wrapping poisons the observed cgroup."
+      exit 1; }
+
+    # F4 — every consumer must see THROUGH the launcher. kitty records
+    # `window.cmdline` as what it spawned, which after a restore is the
+    # launcher; that field is exactly what identifies a ZOMBIE pane
+    # (claude gone, an orphaned stdio MCP server still holding the
+    # pty). If the enricher stops recognising it, the first restore
+    # strips the pane of its claude identity and the second relaunches
+    # the orphan.
+    #
+    # The wrapper argv is taken from pane0-launch.json rather than
+    # transcribed, so this cannot pass against a launcher shape the
+    # writer no longer emits.
+    ZSID="99999999-8888-7777-6666-555555555555"
+    printf '%s\t%s\t%s\t%s\n' 501 "$ZSID" /tmp 0 > state/zombie.tsv
+    jq -c --arg sid "$ZSID" '
+      [{tabs: [{windows: [{
+         id: 501, cwd: "/tmp", title: "zombie",
+         cmdline: .cmd,
+         foreground_processes: [{cmdline: ["/nix/store/x/bin/node",
+                                           "mcp-server"]}]
+       }]}]}]' "$pane0_json" > state/zombie-ls.json
+    KITTY_ENRICH_TEST=1 KITTY_ENRICH_TSV="$PWD/state/zombie.tsv" \
+      kitty-session-enrich < state/zombie-ls.json > state/zombie-out.json
+    echo "--- enriched zombie ---"; cat state/zombie-out.json; echo
+    jq -e --arg sid "$ZSID" \
+      '.[0].tabs[0].windows[0].claude_session_id == $sid' \
+      state/zombie-out.json > /dev/null || {
+      echo "FAIL(F4): a pane whose window cmdline is the claude-egress"
+      echo "  launcher was not recognised as a claude pane, so it lost"
+      echo "  its session id and the next restore would relaunch the"
+      echo "  orphaned MCP server instead."
+      exit 1; }
+
+    # F5 — last.session is a session file a human can feed back to
+    # `kitty --session`, so it has to be an honest rendering of what
+    # restore does. A bare `launch claude` there hands whoever uses it
+    # an unobserved session. Still exactly one directive per pane.
+    kitty-session-convert < state/zombie-ls.json > state/zombie.session
+    echo "--- converted zombie ---"; cat state/zombie.session
+    grep -q '^launch .*_claude_slice' state/zombie.session || {
+      echo "FAIL(F5): last.session renders a claude pane as an"
+      echo "  unconfined launch."
+      exit 1; }
+    # One directive: the fixture's tab carries no `layout`, so the
+    # launch line is all convert emits for it.
+    python3 ${mkLineCheck} state/zombie.session 1 || {
+      echo "FAIL(F5): wrapping a claude pane made last.session"
+      echo "  multi-line, which kitty refuses outright."
       exit 1; }
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
