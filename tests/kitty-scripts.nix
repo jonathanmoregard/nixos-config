@@ -172,6 +172,43 @@ let
         sys.exit(1)
   '';
 
+  # Become pane 0 exactly the way kitty does: shlex-split the stub's
+  # single `launch` line the same way kitty/session.py does, take the
+  # argv from the executable that precedes --exec-pane0, and execvp it.
+  #
+  # execvp, not subprocess: the process under test then IS this process,
+  # so a `timeout` around the harness's python kills the thing that is
+  # looping instead of orphaning it.
+  mkStubExec = pkgs.writeText "kitty-scripts-stub-exec.py" ''
+    import os
+    import shlex
+    import sys
+
+    toks = shlex.split(open(sys.argv[1]).read())
+    if "--exec-pane0" not in toks:
+        sys.stderr.write(
+            "stub line has no --exec-pane0 launcher: %r\n" % (toks,)
+        )
+        sys.exit(2)
+    argv = toks[toks.index("--exec-pane0") - 1:]
+    sys.stderr.write("stub argv: %r\n" % (argv,))
+    os.execvp(argv[0], argv)
+  '';
+
+  # The same argv as JSON, so an assertion can inspect what kitty will
+  # record as pane 0's `window.cmdline` after the restore.
+  mkStubArgv = pkgs.writeText "kitty-scripts-stub-argv.py" ''
+    import json
+    import shlex
+    import sys
+
+    toks = shlex.split(open(sys.argv[1]).read())
+    if "--exec-pane0" not in toks:
+        json.dump([], sys.stdout)
+    else:
+        json.dump(toks[toks.index("--exec-pane0") - 1:], sys.stdout)
+  '';
+
   # One snapshot per code point str.splitlines() treats as a line
   # break, plus one carrying all of them at once. Each puts the
   # character everywhere a session file will quote it: the pane's cwd,
@@ -699,8 +736,13 @@ pkgs.runCommand "kitty-scripts-harness"
     done < state/break-labels
 
     # --- Phase B: pane 0 still receives the notice, as argv ---
+    #
+    # Driven through the STUB rather than by calling --exec-pane0 bare:
+    # the argv kitty parses off the launch line is half of what decides
+    # what pane 0 becomes (phase J), so a test that skips the line is
+    # testing a call nothing makes.
     export ARGV_OUT="$PWD/state/pane0-argv"
-    kitty-restore-session --exec-pane0 2> state/pane0-stderr
+    python3 ${mkStubExec} "$KITTY_STUB_PATH" 2> state/pane0-stderr
     echo "--- pane0 stderr ---"; cat state/pane0-stderr
     [ -s "$ARGV_OUT" ] || {
       echo "FAIL(B): pane 0's command never ran / recorded no argv"; exit 1; }
@@ -1665,6 +1707,184 @@ pkgs.runCommand "kitty-scripts-harness"
     ) || { echo "FAIL(I): the save wrapper failed on a fresh cache dir"
            exit 1; }
     mode_is imode/kitty-session 700
+
+    # --- Phase J: the pane-0 launcher is never a pane's command ------
+    #
+    # `--exec-pane0` is a LAUNCHER, not a command. kitty records a
+    # window's cmdline as what it SPAWNED, so after a restore pane 0's
+    # cmdline is that launcher, and the next snapshot reads it back.
+    # While the launch line carried no argv after the flag, that record
+    # was `[kitty-restore-session, --exec-pane0]` — the stub's own
+    # launch line, stored as pane 0's command. Measured on the built
+    # derivation before the fix, from a snapshot whose pane 0 was a
+    # zombie claude (and identically from one whose pane 0 was an
+    # ordinary shell, since both fall past the foreground-claude arm
+    # onto window.cmdline):
+    #
+    #   $ timeout 3 kitty-restore-session --exec-pane0
+    #   rc=124 after 3s          <- killed; no output, 100% CPU
+    #
+    # and the same record restored into pane N would have re-read
+    # pane0-launch.json and duplicated pane 0's `claude --resume <sid>`
+    # onto a second pane — the corruption claimed_sids exists to stop.
+    rs_exe=$(command -v kitty-restore-session)
+    mkdir -p jloop/kitty-session
+
+    # An orphaned stdio MCP server: what is left holding the pty in the
+    # zombie case, and the only thing a poisoned record leaves to fall
+    # back to.
+    cat > fakebin/orphan-mcp <<'STUB'
+    #!/bin/sh
+    : > "$ORPHAN_RAN"
+    exit 0
+    STUB
+    chmod +x fakebin/orphan-mcp
+    export ORPHAN_RAN="$PWD/state/orphan-ran"
+
+    # J1 — a snapshot ALREADY carrying the poisoned record (every
+    # snapshot taken after a pre-fix restore does) must not produce a
+    # stub that points back at the launcher.
+    jq -n --arg rs "$rs_exe" --arg orphan "$PWD/fakebin/orphan-mcp" '
+      [{tabs:[{layout:"splits",windows:[{
+         id: 1, cwd: "/tmp", title: "zombie pane 0",
+         cmdline: [$rs, "--exec-pane0"],
+         foreground_processes: [{cmdline: [$orphan]}]
+       }]}]}]' > jloop/kitty-session/snapshot.json
+    (
+      export XDG_CACHE_HOME="$PWD/jloop"
+      export KITTY_STUB_PATH="$PWD/state/stub-jloop"
+      kitty-restore-session --emit-stub
+    ) || { echo "FAIL(J1): --emit-stub failed on the poisoned snapshot"
+           exit 1; }
+    echo "--- poisoned-record stub ---"; cat state/stub-jloop
+    echo "--- poisoned-record pane0-launch.json ---"
+    cat jloop/kitty-session/pane0-launch.json; echo
+    jq -e '.cmd | (length < 2 or .[1] != "--exec-pane0")' \
+      jloop/kitty-session/pane0-launch.json > /dev/null || {
+      echo "FAIL(J1): pane 0's recorded command IS the pane-0 launcher."
+      echo "  --exec-pane0 reads this file and execs it, which lands"
+      echo "  back here: an exec loop at 100% CPU, session lost, and"
+      echo "  nothing the user can do about it."
+      exit 1; }
+    # The pane's live foreground process is all a poisoned record leaves
+    # to go on, and it is the right answer for the ordinary case (pane 0
+    # is a shell). Assert it, so "not the launcher" cannot be satisfied
+    # by dropping the pane instead.
+    jq -e --arg orphan "$PWD/fakebin/orphan-mcp" '.cmd == [$orphan]' \
+      jloop/kitty-session/pane0-launch.json > /dev/null || {
+      echo "FAIL(J1): the launcher was stripped but nothing took its"
+      echo "  place; pane 0 came back as neither its command nor what"
+      echo "  is actually running in it."
+      exit 1; }
+
+    # J2 — and executing that stub the way kitty does TERMINATES.
+    rm -f "$ORPHAN_RAN"
+    jrc=0
+    timeout 10 python3 ${mkStubExec} state/stub-jloop </dev/null \
+      > state/jloop.out 2> state/jloop.err || jrc=$?
+    echo "--- poisoned-record exec: rc=$jrc ---"; cat state/jloop.err
+    [ "$jrc" -ne 124 ] || {
+      echo "FAIL(J2): pane 0 never stopped exec'ing itself — the timeout"
+      echo "  killed it. This is the loop: 100% CPU, no pane, and the"
+      echo "  snapshot that would restore the session is the one feeding"
+      echo "  the loop."
+      exit 1; }
+    [ -f "$ORPHAN_RAN" ] || {
+      echo "FAIL(J2): pane 0 exec'd something other than the command the"
+      echo "  stub named."
+      exit 1; }
+
+    # J3 — the round trip that MATTERS: what kitty records for a pane 0
+    # the current stub launched. The argv on the launch line is what
+    # `window.cmdline` becomes, so it has to unwrap back to claude —
+    # otherwise a zombie pane 0 (claude gone, MCP orphan holding the
+    # pty) loses its identity and its sid, which is precisely the case
+    # window.cmdline is read for.
+    python3 ${mkStubArgv} "$KITTY_STUB_PATH" > state/stub-argv.json
+    echo "--- what kitty will record for pane 0 ---"
+    cat state/stub-argv.json; echo
+    jq -e '.[1] == "--exec-pane0" and (.[2] | endswith("/zsh"))' \
+      state/stub-argv.json > /dev/null || {
+      echo "FAIL(J3): the stub's launch line carries no argv after the"
+      echo "  flag, so kitty records pane 0 as the launcher itself."
+      exit 1; }
+    mkdir -p jzombie/kitty-session
+    jq -n --slurpfile argv state/stub-argv.json \
+       --arg cwd "$PWD/fx/work" --arg sid "$SID" \
+       --arg orphan "$PWD/fakebin/orphan-mcp" '
+      [{tabs:[{layout:"splits",windows:[{
+         id: 1, cwd: $cwd, title: "restored claude pane",
+         cmdline: $argv[0],
+         claude_session_id: $sid,
+         foreground_processes: [{cmdline: [$orphan]}]
+       }]}]}]' > jzombie/kitty-session/snapshot.json
+    (
+      export XDG_CACHE_HOME="$PWD/jzombie"
+      kitty-restore-session --dump-panes
+    ) > state/jzombie-panes.json
+    echo "--- zombie pane 0, one restore later ---"
+    cat state/jzombie-panes.json; echo
+    jq -e --arg sid "$SID" '
+      .[0].cmd as $c
+      | ($c[0] | endswith("/claude")) and $c[1] == "--resume"
+        and $c[2] == $sid' state/jzombie-panes.json > /dev/null || {
+      echo "FAIL(J3): a zombie pane 0 launched by the current stub did"
+      echo "  not come back as its own claude session. The pane-0"
+      echo "  launcher has to be transparent to every consumer, exactly"
+      echo "  as the claude-egress one is."
+      exit 1; }
+
+    # J4 — a bare --exec-pane0 must not adopt whatever pane 0 was last
+    # recorded as. That call is the shape a pane restored from a
+    # poisoned snapshot runs, and pane0-launch.json holds pane 0's
+    # `claude --resume <sid>`: adopting it puts two panes on one
+    # session, which corrupts both.
+    export ARGV_OUT="$PWD/state/jbare-argv"
+    rm -f "$ARGV_OUT"
+    jrc=0
+    timeout 10 kitty-restore-session --exec-pane0 </dev/null \
+      > state/jbare.out 2> state/jbare.err || jrc=$?
+    echo "--- bare --exec-pane0: rc=$jrc ---"; cat state/jbare.err
+    [ "$jrc" -ne 124 ] || {
+      echo "FAIL(J4): a bare --exec-pane0 never terminated."; exit 1; }
+    [ ! -f "$ARGV_OUT" ] || {
+      cat "$ARGV_OUT"
+      echo "FAIL(J4): a launcher invocation that names no command still"
+      echo "  started pane 0's claude session. A second pane on one"
+      echo "  session corrupts it for both."
+      exit 1; }
+
+    # J5 — and the guard is not just an argv shape. Anything that leads
+    # back into --exec-pane0 within the same process is a loop, however
+    # it got there; the marker survives execvp because the pid does.
+    cat > fakebin/pane0-relaunch <<STUB
+    #!/bin/sh
+    exec $rs_exe --exec-pane0 $PWD/fakebin/pane0-relaunch
+    STUB
+    chmod +x fakebin/pane0-relaunch
+    jrc=0
+    timeout 10 kitty-restore-session --exec-pane0 \
+      "$PWD/fakebin/pane0-relaunch" </dev/null \
+      > state/jindirect.out 2> state/jindirect.err || jrc=$?
+    echo "--- indirect loop: rc=$jrc ---"; cat state/jindirect.err
+    [ "$jrc" -ne 124 ] || {
+      echo "FAIL(J5): pane 0's command led back into --exec-pane0 and"
+      echo "  the launcher went round again. An exec loop has to be"
+      echo "  structurally impossible, not merely unlikely."
+      exit 1; }
+
+    # J6 — last.session is a session file a human can feed straight back
+    # to `kitty --session`, so the launcher must not be rendered into it
+    # either: doing that hands kitty the same loop from a file the user
+    # was told to trust.
+    kitty-session-convert < jloop/kitty-session/snapshot.json \
+      > state/jconv.session
+    echo "--- converted poisoned record ---"; cat state/jconv.session
+    if grep -q -- '--exec-pane0' state/jconv.session; then
+      echo "FAIL(J6): last.session launches the pane-0 launcher as a"
+      echo "  pane's command."
+      exit 1
+    fi
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"

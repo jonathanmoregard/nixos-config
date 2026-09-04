@@ -169,11 +169,88 @@ let
         return shlex.quote(LINEBREAKS.sub(" ", value))
   '';
 
+  # Shared Python: see through the pane-0 launcher, the OTHER launch
+  # indirection this module inserts between kitty and a pane's real
+  # command.
+  #
+  # Needs no imports.
+  #
+  # ── Why this exists ───────────────────────────────────────────────────
+  #
+  # Pane 0's real command cannot travel in kitty's `--session` stub: the
+  # restore notice is multi-line and a session file is line-oriented
+  # (kittySessionTokenPy above). So the stub launches THIS script in
+  # --exec-pane0 mode, with the line-carriable part of the argv after
+  # the flag, and --exec-pane0 puts the notice back from JSON before
+  # exec'ing it.
+  #
+  # kitty records a window's cmdline as WHAT IT SPAWNED, so after a
+  # restore pane 0's `window.cmdline` is that launcher — and the next
+  # snapshot reads it back. Until 2026-09-04 the launch line carried no
+  # argv at all, so the snapshot recorded pane 0 as
+  # `[kitty-restore-session, --exec-pane0]`: the stub's own launch line,
+  # as pane 0's command. The next restore then wrote that back into
+  # pane0-launch.json and --exec-pane0 execvp'd ITSELF, which re-read
+  # the same record and exec'd it again — a tight loop at 100% CPU with
+  # the session lost. Measured on the built derivation before the fix:
+  # `timeout 3 kitty-restore-session --exec-pane0` returned rc 124 with
+  # no output, for a pane 0 that was EITHER a zombie claude (orphaned
+  # MCP server holding the pty) OR — the wider case — any ordinary
+  # shell pane, since both fall past the `claude in foreground_processes`
+  # arm onto `window.cmdline`.
+  #
+  # The same class already bit unwrap_slice() one snippet below: a
+  # launcher the snapshotter cannot see through is a launcher that gets
+  # recorded as the command. Hence the same shape of answer — the
+  # indirection is transparent to every reader of `window.cmdline`.
+  kittyPane0LaunchPy = ''
+    PANE0_FLAG = "--exec-pane0"
+
+    # Set to the exec'ing process's pid just before --exec-pane0 hands
+    # the pane over. execvp keeps the pid, so seeing our OWN pid here
+    # means this process has already been through --exec-pane0 once and
+    # something led it back: that is an exec loop, whatever argv shape
+    # produced it, and it is refused. The pid, not a bare "1", is what
+    # keeps a kitty the user starts FROM a restored pane (a different
+    # process, inheriting the variable) out of the guard.
+    PANE0_EXEC_ENV = "KITTY_PANE0_EXEC"
+
+
+    def is_pane0_launcher(cmdline):
+        """True when running `cmdline` would re-enter --exec-pane0.
+
+        Recognised by the flag in argv position 1, not by the script's
+        name: the name is a store path in production and whatever a
+        test copied it to elsewhere. Over-matching is the safe
+        direction — a real command that happened to be
+        `<anything> --exec-pane0 ...` loses nothing but a launcher this
+        module put there.
+        """
+        cmdline = cmdline or []
+        return len(cmdline) >= 2 and cmdline[1] == PANE0_FLAG
+
+
+    def unwrap_pane0(cmdline):
+        """The real argv inside the pane-0 launcher, else cmdline.
+
+        Empty for a launcher recorded in the pre-2026-09-04 shape
+        (`[kitty-restore-session, --exec-pane0]`, nothing after it),
+        which is how a snapshot already carrying the self-referential
+        record is defused: pane_cmd() falls through it to the pane's
+        live foreground process instead of restoring the launcher.
+        """
+        cmdline = cmdline or []
+        if is_pane0_launcher(cmdline):
+            return cmdline[2:]
+        return cmdline
+  '';
+
   # Shared Python: keep a RESTORED Claude Code pane inside
   # claude-egress.slice, and let every consumer see through the launcher
   # that puts it there.
   #
-  # Requires `import os` in the consuming script.
+  # Requires `import os` in the consuming script, and kittyPane0LaunchPy
+  # interpolated ABOVE it (unwrap_launchers walks both launchers).
   #
   # ── Why this exists ───────────────────────────────────────────────────
   #
@@ -258,9 +335,21 @@ let
         return cmdline
 
 
+    def unwrap_launchers(cmdline):
+        """The pane's own argv under every launcher this module adds.
+
+        Pane 0 is reached through BOTH of them: kitty spawns the
+        --exec-pane0 launcher, whose argv is the slice launcher, whose
+        argv is claude. Anything that asks "is this a claude pane" of a
+        `window.cmdline` has to strip both, in that order, or a
+        restored pane 0 loses its identity on the next snapshot.
+        """
+        return unwrap_slice(unwrap_pane0(cmdline))
+
+
     def _is_claude(cmdline):
         """True when this pane's command is claude, wrapped or not."""
-        return _is_claude_exe(unwrap_slice(cmdline))
+        return _is_claude_exe(unwrap_launchers(cmdline))
 
 
     def slice_launch(cmdline):
@@ -272,9 +361,12 @@ let
         returned untouched — the slice is for Claude Code, and putting
         a shell in it would make the egress report meaningless.
         """
-        inner = unwrap_slice(cmdline)
+        inner = unwrap_launchers(cmdline)
         if not _is_claude_exe(inner):
-            return cmdline
+            # Everything but the pane-0 launcher comes back exactly as
+            # recorded; that one never does, because handing a pane
+            # back the launcher AS its command is the exec loop.
+            return unwrap_pane0(cmdline)
         return [SLICE_SHELL, "-i", "-c", SLICE_SCRIPT] + inner
   '';
 
@@ -295,23 +387,30 @@ let
 
     ${kittyInternalWindowPy}
 
+    ${kittyPane0LaunchPy}
+
     ${claudeSliceLaunchPy}
 
     def pane_cmd(win):
         """The command this pane should be recorded as running.
 
-        Mirrors kitty-restore-session's picker: a `claude` entry
-        anywhere in the pid-ordered foreground list wins, then the
-        cmdline kitty actually launched the window with, then
-        foreground_processes[0]. Keeps last.session an honest
-        rendering of what restore will do.
+        Mirrors kitty-restore-session's picker, including the
+        pane-0-launcher unwrap: a `claude` entry anywhere in the
+        pid-ordered foreground list wins, then the cmdline kitty
+        actually launched the window with (minus the --exec-pane0
+        launcher, which is this module's own indirection and not a
+        command anybody can run), then foreground_processes[0]. Keeps
+        last.session an honest rendering of what restore will do —
+        and, since a human can feed last.session back to `kitty
+        --session`, keeps the launcher out of a file that would then
+        exec it as pane 0's command.
         """
         fg = win.get("foreground_processes") or []
         for fp in fg:
             cl = fp.get("cmdline") or []
             if _is_claude(cl):
                 return cl
-        wc = win.get("cmdline") or []
+        wc = unwrap_pane0(win.get("cmdline") or [])
         if wc:
             return wc
         return (fg[0].get("cmdline") or []) if fg else []
@@ -1107,6 +1206,8 @@ let
 
     ${kittyInternalWindowPy}
 
+    ${kittyPane0LaunchPy}
+
     ${claudeSliceLaunchPy}
 
     def find_socket(timeout=30):
@@ -1459,14 +1560,26 @@ let
     # session_token() above keeps every value that DOES go into the stub
     # on one line, but flattening the restore notice would gut it: the
     # orphan block is one line per subagent and one per edited file, and
-    # a wall of run-together text is not the message. So NO pane-0 argv
-    # travels through the session file at all. The stub's launch
-    # command is this very script in --exec-pane0 mode; the real argv,
-    # restore notice included, travels in JSON (where newlines are
-    # escaped by construction) and --exec-pane0 execs it. Pane 0 then
-    # receives the notice as an argv element by exactly the mechanism
-    # panes 1..N get it -- kitty-pane-add's `-- <cmd> <notice>` -- which
-    # is why there is no second notice-delivery path to keep in sync.
+    # a wall of run-together text is not the message. So the NOTICE does
+    # not travel through the session file. The stub's launch command is
+    # this very script in --exec-pane0 mode, followed by as much of pane
+    # 0's argv as one line can hold (line_argv(), i.e. everything before
+    # the notice); the full argv, notice included, travels in JSON
+    # (where newlines are escaped by construction) and --exec-pane0
+    # execs it after checking that it extends what the launch line said.
+    # Pane 0 then receives the notice as an argv element by exactly the
+    # mechanism panes 1..N get it -- kitty-pane-add's `-- <cmd>
+    # <notice>` -- which is why there is no second notice-delivery path
+    # to keep in sync.
+    #
+    # The argv on the launch line is not redundant with the JSON. kitty
+    # reports a window's cmdline as what it SPAWNED, and that is what
+    # the next snapshot records as pane 0's command: with only the flag
+    # there, pane 0 was recorded as the launcher itself and the next
+    # restore exec'd it in a loop (kittyPane0LaunchPy). With the argv
+    # there, the record unwraps to the pane's real command, and the
+    # zombie arm of pane_cmd() below keeps working for pane 0 exactly as
+    # it does for panes 1..N.
     #
     # The considered alternative was `kitty @ send-text` once the socket
     # is up. Rejected: it types into whatever the pane is showing, so it
@@ -1544,13 +1657,22 @@ let
              had asked for it.
           4. foreground_processes[0], for kitty builds that do not
              report a per-window `cmdline` at all.
+
+        Arms 2 and 3 read `window.cmdline` — which for a RESTORED pane
+        0 is the --exec-pane0 launcher, this script's own launch line.
+        unwrap_pane0() takes it back off, so what is recorded is the
+        pane's command and never the launcher: without that, arm 3
+        hands the launcher to the next restore as pane 0's command and
+        --exec-pane0 execs itself in a loop. A launcher recorded in the
+        old flagless shape unwraps to nothing and falls through to arm
+        4, which is how an already-poisoned snapshot recovers.
         """
         fg = win.get("foreground_processes") or []
         for fp in fg:
             cl = fp.get("cmdline") or []
             if _is_claude(cl):
                 return cl
-        wc = win.get("cmdline") or []
+        wc = unwrap_pane0(win.get("cmdline") or [])
         if wc:
             return wc
         return (fg[0].get("cmdline") or []) if fg else []
@@ -1622,14 +1744,38 @@ let
         os.replace(tmp, path)
 
 
+    def line_argv(cmd):
+        """The leading run of `cmd` a session-file line can carry.
+
+        Everything up to the first element holding a line break —
+        which in practice is the whole argv minus the restore notice,
+        always its last element and the one value flattening would gut
+        (see the pane-0 transport note above). Every element kept is
+        line-break-free already, so session_token() only quotes it and
+        kitty's own shlex hands the exact bytes back. That exactness is
+        what lets exec_pane0() match the JSON record against what kitty
+        parsed, and what makes the recorded `window.cmdline` of a
+        restored pane 0 a truthful record of its command rather than a
+        pointer back at the launcher.
+        """
+        out = []
+        for a in cmd:
+            if LINEBREAKS.search(a):
+                break
+            out.append(a)
+        return out
+
+
     def emit_stub():
         """Write kitty's --session stub: pane 0, exactly one line.
 
         Kitty starts directly into this single window (no default
         extra), avoiding a close-window prompt on a spurious startup
-        shell. Pane 0's real argv goes to pane0_path() and is executed
-        by --exec-pane0; see the pane-0 transport note above for why it
-        cannot travel in the session file.
+        shell. The launch line runs this script in --exec-pane0 mode
+        with as much of pane 0's argv as one line can hold; the full
+        argv, restore notice included, goes to pane0_path() and is what
+        --exec-pane0 actually execs. See the pane-0 transport note
+        above for why the notice cannot travel in the session file.
         """
         panes = load_panes()
         if not panes:
@@ -1640,17 +1786,24 @@ let
         # session each pane resolved to, which is what tests assert on,
         # while the two places that actually start a process are the two
         # that put it in the slice.
-        _write_atomic(pane0_path(), json.dumps({
-            "cwd": p["cwd"],
-            "title": p["title"],
-            "cmd": slice_launch(p["cmd"]),
-        }))
+        cmd = slice_launch(p["cmd"])
         parts = ["launch"]
         if p["cwd"]:
             parts += ["--cwd", session_token(p["cwd"])]
         if p["title"]:
             parts += ["--title", session_token(p["title"])]
-        parts += [session_token(_self_exe()), "--exec-pane0"]
+        if cmd:
+            _write_atomic(pane0_path(), json.dumps({
+                "cwd": p["cwd"],
+                "title": p["title"],
+                "cmd": cmd,
+            }))
+            parts += [session_token(_self_exe()), PANE0_FLAG]
+            parts += [session_token(a) for a in line_argv(cmd)]
+        # else: no command was recorded for this pane at all, so there
+        # is nothing for --exec-pane0 to become. A bare `launch` lets
+        # kitty open its default shell, which is the same outcome the
+        # exec-time fallback would reach by a longer route.
         line = " ".join(parts)
         # Invariant, not a cleanup. Every token above is line-break-free
         # by construction, so this can only fire if a later edit adds an
@@ -1662,7 +1815,77 @@ let
         _write_atomic(stub_path(), line + "\n")
 
 
-    def exec_pane0():
+    def _pane0_record():
+        """pane0_path()'s argv, or None when it is unusable."""
+        try:
+            with open(pane0_path()) as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        cmd = rec.get("cmd") if isinstance(rec, dict) else None
+        if (
+            isinstance(cmd, list)
+            and cmd
+            and all(isinstance(a, str) for a in cmd)
+        ):
+            return cmd
+        return None
+
+
+    def _pane0_cmd(recorded):
+        """What --exec-pane0 should become, or None for "a shell".
+
+        `recorded` is the argv kitty parsed off the stub's launch line
+        after the flag — which is also what kitty reports as this
+        window's cmdline, so it is authoritative about WHICH pane this
+        is. pane0_path() holds the same argv with the multi-line
+        restore notice still attached, and is used only when it EXTENDS
+        `recorded` exactly. That prefix match is what stops a pane
+        launched with some other command from adopting pane 0's
+        `claude --resume <sid>` and landing two panes on one session,
+        which is the corruption claimed_sids exists to prevent.
+        """
+        if os.environ.get(PANE0_EXEC_ENV) == str(os.getpid()):
+            print(
+                "kitty-restore-session: this process has already been "
+                "through " + PANE0_FLAG + " once, so pane 0's recorded "
+                "command leads back here. Refusing to exec it again "
+                "(that is a loop) and opening a shell instead.",
+                file=sys.stderr,
+            )
+            return None
+        if not recorded:
+            # The stub always names pane 0's argv after the flag, and
+            # the wrapper rewrites the stub with THIS binary immediately
+            # before launching kitty, so nothing legitimate reaches here
+            # bare. What used to is a pane restored from a snapshot that
+            # recorded the launcher itself as its command.
+            print(
+                "kitty-restore-session: " + PANE0_FLAG + " with no "
+                "command after it. Opening a shell rather than adopting "
+                "whatever pane 0 was last recorded as running.",
+                file=sys.stderr,
+            )
+            return None
+        if is_pane0_launcher(recorded):
+            print(
+                "kitty-restore-session: refusing to exec the pane-0 "
+                "launcher as pane 0's command -- that is an exec loop. "
+                "Opening a shell instead.",
+                file=sys.stderr,
+            )
+            return None
+        full = _pane0_record()
+        if (
+            full is not None
+            and not is_pane0_launcher(full)
+            and full[:len(recorded)] == recorded
+        ):
+            return full
+        return recorded
+
+
+    def exec_pane0(recorded):
         """Become pane 0's real command, inside the window kitty made.
 
         Reached only from the stub's launch line. The argv -- restore
@@ -1670,22 +1893,15 @@ let
         notice reaches pane 0 as a single argv element exactly as it
         reaches panes 1..N through kitty-pane-add.
         """
-        cmd = None
-        try:
-            with open(pane0_path()) as fh:
-                rec = json.load(fh)
-            if isinstance(rec, dict):
-                cmd = rec.get("cmd")
-        except (OSError, ValueError):
-            cmd = None
-        if not (
-            isinstance(cmd, list)
-            and cmd
-            and all(isinstance(a, str) for a in cmd)
-        ):
-            # No usable record: hand the user a shell rather than let
-            # kitty close an empty pane out from under them.
+        cmd = _pane0_cmd(recorded)
+        if cmd is None:
+            # Hand the user a shell rather than let kitty close an
+            # empty pane out from under them.
             cmd = [os.environ.get("SHELL") or "/bin/sh"]
+        # Survives the exec, so a second arrival in this same process
+        # is refused above whatever route brought it back. The argv
+        # checks catch the shapes we know; this catches the rest.
+        os.environ[PANE0_EXEC_ENV] = str(os.getpid())
         try:
             os.execvp(cmd[0], cmd)
         except OSError:
@@ -1693,15 +1909,22 @@ let
 
 
     def main():
-        if "--emit-stub" in sys.argv:
+        # Dispatch on argv[1] POSITIONALLY, never `x in sys.argv`:
+        # everything after --exec-pane0 is pane 0's own argv, and a
+        # membership test would let a restore notice that merely
+        # mentions --emit-stub re-enter the writer instead of starting
+        # the pane.
+        mode = sys.argv[1] if len(sys.argv) > 1 else None
+
+        if mode == "--emit-stub":
             emit_stub()
             return
 
-        if "--exec-pane0" in sys.argv:
-            exec_pane0()
+        if mode == PANE0_FLAG:
+            exec_pane0(sys.argv[2:])
             return
 
-        if "--dump-panes" in sys.argv:
+        if mode == "--dump-panes":
             # Test-only: emit resolved panes JSON so assertions can
             # inspect maybe_resume_claude's per-pane outcome (including
             # the same-cwd-collision-avoidance fallback) without having
@@ -1872,6 +2095,8 @@ let
         r"[0-9a-f]{4}-[0-9a-f]{12}$"
     )
 
+
+    ${kittyPane0LaunchPy}
 
     ${claudeSliceLaunchPy}
 
