@@ -1484,7 +1484,11 @@ pkgs.runCommand "kitty-scripts-harness"
         export KITTY_LISTEN_ON="unix:/nonexistent-fake"
         export G_ENRICH_RC="$2" G_COMMIT_RC="$3"
         kitty() { printf '[]\n'; }
-        kitty-session-enrich() { printf '[]\n'; return "$G_ENRICH_RC"; }
+        # Consumes stdin like the real enricher: a stub that exits
+        # without reading gives the wrapper's `printf ... |` a SIGPIPE,
+        # and under pipefail that races into enrich_rc.
+        kitty-session-enrich() { cat >/dev/null; printf '[]\n'
+                                 return "$G_ENRICH_RC"; }
         kitty-session-commit() { return "$G_COMMIT_RC"; }
         kitty-session-convert() { printf 'layout splits\n'; }
         export -f kitty kitty-session-enrich kitty-session-commit \
@@ -1625,6 +1629,42 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(H3): the stub writer followed a planted symlink and"
       echo "  overwrote the file it pointed at."
       exit 1; }
+
+    # --- Phase I: the session state is the user's alone -------------
+    #
+    # snapshot.json, the history ring and pane0-launch.json record
+    # cwds, window titles, argv and claude session ids. There are no
+    # secrets in them — per-pane env in a snapshot is KITTY_WINDOW_ID
+    # and PWD — but they are nobody else's business either, and the
+    # default 0644-in-0755 left them readable by anyone on the host,
+    # contained only by home-manager's homeMode 700.
+    mode_is() { # <path> <mode>
+      local got
+      got=$(stat -c %a "$1")
+      [ "$got" = "$2" ] || {
+        echo "FAIL(I): $1 is mode $got, want $2"
+        exit 1; }
+      echo "  $1 -> $got"
+    }
+    echo "--- session state modes ---"
+    mode_is sess/snapshot.json 600
+    mode_is sess/history 700
+    for f in sess/history/*.json; do mode_is "$f" 600; done
+    mode_is "$XDG_CACHE_HOME/kitty-session/pane0-launch.json" 600
+    mode_is hstub/kitty-session/stub-session 600
+
+    # And the directory the save wrapper creates on a fresh machine.
+    (
+      export XDG_CACHE_HOME="$PWD/imode"
+      export KITTY_LISTEN_ON="unix:/nonexistent-fake"
+      kitty() { printf '[]\n'; }
+      kitty-session-enrich() { cat >/dev/null; printf '[]\n'; }
+      kitty-session-commit() { return 3; }
+      export -f kitty kitty-session-enrich kitty-session-commit
+      bash "$save_bin"
+    ) || { echo "FAIL(I): the save wrapper failed on a fresh cache dir"
+           exit 1; }
+    mode_is imode/kitty-session 700
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"

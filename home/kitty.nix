@@ -1614,6 +1614,9 @@ let
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
             0o600,
         )
+        # Explicitly, not just via the open mode: a temp file left
+        # behind by a crashed run keeps whatever mode it already had.
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as fh:
             fh.write(text)
         os.replace(tmp, path)
@@ -1793,7 +1796,9 @@ let
 
       dir="''${XDG_CACHE_HOME:-$HOME/.cache}/kitty-session"
       tsv="$dir/pane-sessions.tsv"
-      mkdir -p "$dir"
+      # Same 0700 as kitty-session-save: whichever of the two runs
+      # first on a fresh machine must not leave it world-readable.
+      install -d -m 700 "$dir"
 
       # flock guards concurrent SessionStart hooks (e.g. two new claude
       # sessions starting in the same second) AND the enricher's
@@ -2195,6 +2200,25 @@ let
         return data if isinstance(data, list) else None
 
 
+    # These files record the user's cwds, window titles, argv and
+    # claude session ids. No secrets — a snapshot's per-pane env is
+    # KITTY_WINDOW_ID and PWD — but nobody else's business either, and
+    # the default 0644-in-0755 left them readable by anyone on the
+    # host, contained only by home-manager's homeMode 700.
+    STATE_FILE_MODE = 0o600
+    STATE_DIR_MODE = 0o700
+
+
+    def _secure_dir(path):
+        """Create `path` private, and keep it that way."""
+        try:
+            os.makedirs(path, mode=STATE_DIR_MODE, exist_ok=True)
+            os.chmod(path, STATE_DIR_MODE)
+        except OSError:
+            return False
+        return True
+
+
     def _history_names(hdir):
         try:
             names = os.listdir(hdir)
@@ -2270,13 +2294,13 @@ let
         if prev_count < HISTORY_MIN_PANES:
             return
         hdir = os.path.join(dirpath, "history")
-        try:
-            os.makedirs(hdir, exist_ok=True)
-        except OSError:
+        if not _secure_dir(hdir):
             return
         name = "snapshot-%.6f-%dp.json" % (time.time(), prev_count)
         try:
-            shutil.copyfile(snap_path, os.path.join(hdir, name))
+            dest = os.path.join(hdir, name)
+            shutil.copyfile(snap_path, dest)
+            os.chmod(dest, STATE_FILE_MODE)
         except OSError:
             return
         stale = _entry_for_panes(hdir, prev_count, skip=name)
@@ -2302,8 +2326,17 @@ let
 
 
     def _write_atomic(path, text):
+        """Replace `path` with `text`, private and without following a
+        symlink planted at the temp name. Same rule as
+        kitty-restore-session's writer -- see STATE_FILE_MODE above."""
         tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            STATE_FILE_MODE,
+        )
+        os.fchmod(fd, STATE_FILE_MODE)
+        with os.fdopen(fd, "w") as fh:
             fh.write(text)
         os.replace(tmp, path)
 
@@ -2361,7 +2394,11 @@ let
       set -euo pipefail
 
       dir="''${XDG_CACHE_HOME:-$HOME/.cache}/kitty-session"
-      mkdir -p "$dir"
+      # 0700, not the umask default: this directory holds the user's
+      # cwds, window titles, argv and claude session ids, and nothing
+      # in it is anyone else's business. `install -d` also fixes a
+      # directory an older generation created 0755.
+      install -d -m 700 "$dir"
 
       # Discover live kitty socket. kitty appends `-{pid}` to the
       # configured listen_on path on every launch (not only under `-1`),
