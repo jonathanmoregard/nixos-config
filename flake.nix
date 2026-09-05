@@ -256,6 +256,36 @@
         vm-listen-tools = mkLane ./tests/listen-tools.nix;
         vm-android-dev  = mkLane ./tests/android-dev.nix;
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
+        # In ci.yml's vm-minimal matrix, and deliberately absent from
+        # `discover`'s LANES so it never reports "cached" and always
+        # executes — it gates credential handling and the sudo password
+        # rule, and a cache hit skipping it is exactly the silence it
+        # exists to prevent.
+        vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
+
+        # Not a VM lane: an eval-time assertion, because that is when the
+        # fault would land. dellan is the machine holding the root-only
+        # klaffat provisioning credentials, and jonathan's sudo password
+        # is the single gate in front of them — so a published default
+        # like profiles/base.nix' old `initialPassword = "changeme"` must
+        # never apply to this host again. Throwaway hosts (hosts/vm,
+        # tests/lib/common.nix, feature-vm) keep theirs and are not
+        # covered here. `throwIf` rather than a NixOS `assertions` entry:
+        # `virtualisation.vmVariant` re-evaluates the host config through
+        # `extendModules`, and feature-vm.nix legitimately sets
+        # `initialPassword = "featurevm"` in it.
+        dellan-initial-password-null =
+          let
+            ip = self.nixosConfigurations.dellan.config.users.users.jonathan.initialPassword;
+          in
+          nixpkgs.lib.throwIf (ip != null) ''
+            hosts/dellan: users.users.jonathan.initialPassword is ${builtins.toJSON ip}, must be null.
+            dellan holds the root-only klaffat provisioning secrets and jonathan's sudo
+            password is the only gate in front of them; a literal in the config is a
+            world-readable /nix/store fact. Set a real password with `passwd`, or supply
+            `hashedPasswordFile` — do not put a plaintext default back in profiles/base.nix.
+          ''
+            (pkgsLinux.runCommand "dellan-initial-password-null" { } "touch $out");
         # Not a VM lane: runtime-invocation harness for the research-agent
         # guest's egress-init script (offline-resilience contract). Cheap
         # runCommand; seconds, not minutes.
