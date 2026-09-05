@@ -532,6 +532,9 @@ common.mkMinimalTest {
         assert "does not point at the pinned remote" in out, (
             f"unexpected remote-url refusal from {wrapper}: {out!r}"
         )
+    # Literal fixture path inside the throwaway test VM; removing the decoy
+    # repo is what lets a later case re-create it.
+    # arftl-allow: destructive-rm
     machine.succeed("rm -rf /var/lib/klaffat-evil.git")
     as_jonathan_git("remote set-url origin ${originUrl}")
 
