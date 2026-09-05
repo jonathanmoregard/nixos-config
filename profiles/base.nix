@@ -36,9 +36,31 @@
   };
 
   # User account
+  #
+  # NO `initialPassword` here, deliberately. It used to say `changeme`,
+  # and this profile is what dellan — the machine holding the root-only
+  # klaffat provisioning credentials — is built from. Since 2026-09-05
+  # jonathan's sudo password is the ONE gate between an agent running as
+  # jonathan and tokens that create and destroy servers
+  # (`security.sudo.wheelNeedsPassword` below, and
+  # modules/nixos/klaffat-infra.nix), so a published default belongs
+  # nowhere near it.
+  #
+  # What the literal actually did, established from nixpkgs source rather
+  # than assumed: with `users.mutableUsers = true` (dellan's setting)
+  # update-users-groups.pl applies `initialPassword` only in the
+  # `!defined($existing)` branch — at account CREATION — and the shadow
+  # rewrite for an existing entry is gated on `!mutableUsers`. So removing
+  # it changes nothing about the live account, and whether dellan's
+  # password is still `changeme` is a fact only the founder can check.
+  # That check is `pending_for_human.md`, 2026-09-05.
+  #
+  # Throwaway hosts keep theirs: hosts/vm/default.nix sets its own,
+  # tests/lib/common.nix and modules/nixos/feature-vm.nix mkForce theirs.
+  # Those machines are disposable and never hold a real credential.
+  # Enforced by checks.x86_64-linux.dellan-initial-password-null.
   users.users.jonathan = {
     isNormalUser = true;
-    initialPassword = "changeme"; # pragma: allowlist secret
     extraGroups = [ "wheel" "networkmanager" "video" ];
     shell = pkgs.zsh;
     openssh.authorizedKeys.keys = [
