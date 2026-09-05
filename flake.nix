@@ -67,18 +67,21 @@
     # THIS REV IS ALSO THE CACHE'S SCHEMA VERSION, and letting it lag is
     # silent. The rev here is what `aggregator-ingest.timer` runs — the
     # WRITER — and the writer stamps `PRAGMA user_version` on
-    # ~/.local/share/aggregator/cache.db every 30 minutes. The READER is a
-    # different build: `.mcp.json` launches `aggregator-mcp` with `uv run
-    # --directory ~/Repos/aggregator`, i.e. the live working tree, and the
-    # MCP refuses any cache below its own SCHEMA_VERSION. So when this rev
-    # falls behind the checkout across a schema bump, the writer keeps
-    # re-stamping the OLD version and exiting 0, the reader rejects every
-    # query, and recall is 100% dead with nothing red anywhere. Measured on
-    # 2026-08-30: rev 4cb66f1 was SCHEMA_VERSION = 5 and 34 commits behind a
-    # checkout at 6; the cache sat at user_version = 5 and every
-    # `aggregator_search_memory` call had been failing unnoticed. Fix is
-    # always forward — bump this rev, never teach the reader to accept the
-    # older schema.
+    # ~/.local/share/aggregator/cache.db every 30 minutes. The READER was,
+    # until 2026-08-31, a different build: `.mcp.json` launched
+    # `aggregator-mcp` with `uv run --directory ~/Repos/aggregator`, i.e. the
+    # live working tree, and the MCP refuses any cache below its own
+    # SCHEMA_VERSION. So when this rev fell behind the checkout across a
+    # schema bump, the writer kept re-stamping the OLD version and exiting 0,
+    # the reader rejected every query, and recall was 100% dead with nothing
+    # red anywhere. Measured on 2026-08-30: rev 4cb66f1 was SCHEMA_VERSION =
+    # 5 and 34 commits behind a checkout at 6; the cache sat at user_version
+    # = 5 and every `aggregator_search_memory` call had been failing
+    # unnoticed. Fix is always forward — bump this rev, never teach the
+    # reader to accept the older schema. Since 2026-08-31 ~/.claude.json
+    # launches the per-user profile's `aggregator-mcp` — this same package —
+    # so reader and writer now move together; what still moves only on the
+    # first ingest tick after a deploy is the CACHE (see the 9dd36dc note).
     #
     # As of rev 9d4e902 that failure mode is no longer SILENT — it is refused.
     # `migrate()` and `rebuild_all()` will not lower `PRAGMA user_version`;
@@ -87,16 +90,33 @@
     # ingest unit visibly instead of re-stamping the cache down and exiting 0.
     # The remedy is unchanged and still forward-only (bump this rev); what
     # changed is that neglecting it goes red instead of going quiet. Both revs
-    # either side of this bump are SCHEMA_VERSION = 6, so this particular bump
-    # is not itself a schema move — it carries the refusal, the every-tick
-    # `database is locked` fix between the ingest and embed timers, and
+    # either side of that bump were SCHEMA_VERSION = 6, so it was not itself a
+    # schema move — it carried the refusal, the every-tick `database is
+    # locked` fix between the ingest and embed timers, and
     # `aggregator/health/schema_probe.py`, the probe that reports the skew.
+    #
+    # Bump 9d4e902 -> 9dd36dc (2026-09-05): SCHEMA_VERSION 6 -> 7, so THIS one
+    # IS a schema move. The first `aggregator-ingest` tick after the deploy
+    # migrates the cache (porter stemming on both FTS5 tables — a rebuild that
+    # takes minutes, not seconds); until that tick the schema-7 reader refuses
+    # the schema-6 cache, so the hourly health unit and the SessionStart hook
+    # will truthfully say "recall is dead" for up to half an hour. To close
+    # that window by hand: `systemctl --user start aggregator-ingest.service`.
+    # Also in this rev: `aggregator-mcp` no longer imports the
+    # Presidio/spaCy/torch stack at startup (MCP handshake ~2 s instead of
+    # 10-57 s — the real cause of the 2026-09-04/05 "recall down" sessions,
+    # which overran Claude Code's connect timeout); the
+    # `aggregator-schema-probe` console script that
+    # modules/nixos/aggregator-schema-health.nix now runs instead of a
+    # checkout file; and a daily `aggregator-tag` user timer (LLM topic tags
+    # via the `claude` CLI on the unit's PATH — the HM module enables it by
+    # default, and its runner fails loudly if `claude` is not a store path).
     #
     # The three uv2nix inputs below were already in flake.lock transitively
     # (tts-tool / substack-url-tool / prose-decorate each pull them); the
     # `follows` lines keep them deduplicated to one copy each.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/9d4e9022fd0b788b4684ba66c16b5c9445f3faa4";
+      url = "github:jonathanmoregard/aggregator/9dd36dcbedbce9c45069bcb321971910b98518dd";
       flake = false;
     };
 

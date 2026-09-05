@@ -96,6 +96,16 @@
     sources.github.enable = false;
 
     embed.enable = true;
+
+    # OFF for now, and deliberately. The 9dd36dc bump (2026-09-05) brought a
+    # daily `aggregator tag` timer — LLM topic tags over every record via the
+    # `claude` CLI, i.e. subscription quota, with a first pass over the whole
+    # corpus — and upstream enables it by default. tests/base.nix pins the
+    # exact set of aggregator timers on this host so that a new writer
+    # against cache.db is a decision, not a side effect of a pin bump.
+    # Turning it on IS that decision: flip this, extend the timer-set
+    # assertion, and say why, in a PR of its own.
+    tag.enable = false;
   };
 
   # A MEMORY CEILING THAT THROTTLES, AND DELIBERATELY DOES NOT KILL.
