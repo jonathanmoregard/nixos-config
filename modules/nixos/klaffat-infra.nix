@@ -129,9 +129,10 @@
 let
   cfg = config.services.klaffatInfra;
 
-  # The main klaffat checkout. The directory is renamed from `kablong` to
-  # `klaffat` once kablong PR #6 merges; this module targets the final
-  # name, so the wrapper refuses (loudly, with the path) until it exists.
+  # The main klaffat checkout. The GitHub repository was renamed from
+  # `kablong` to `klaffat` on 2026-09-05; moving the local directory to
+  # match is a founder step. This module targets the final name, so the
+  # wrapper refuses (loudly, with the path) until it exists.
   repoRoot = "/home/jonathan/Repos/klaffat";
   tfDir = "${repoRoot}/deploy/terraform";
 
@@ -832,7 +833,7 @@ in
 
     repoRemoteUrl = lib.mkOption {
       type = lib.types.str;
-      default = "https://github.com/jonathanmoregard/kablong.git";
+      default = "https://github.com/jonathanmoregard/klaffat.git";
       description = ''
         The one remote the klaffat checkout is allowed to have, and the
         only URL the wrappers will ask for `main`'s tip.
@@ -843,11 +844,10 @@ in
         trusted `git remote get-url origin` would be asking the agent
         where to look for the agent's own homework.
 
-        Still spelled `kablong` because that is what the GitHub repository
-        is still called; only the local directory is being renamed to
-        `klaffat`. Rename the repository and this default changes in the
-        same commit — the wrappers compare the string and refuse a
-        mismatch, loudly, printing both sides.
+        The repository was renamed from `kablong` to `klaffat` on
+        2026-09-05 and this default changed in the same commit. Should it
+        ever move again, change the two together — the wrappers compare
+        the string and refuse a mismatch, loudly, printing both sides.
       '';
     };
 
