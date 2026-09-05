@@ -103,8 +103,13 @@
 # `services.klaffatInfra.repoRemoteUrl` — a URL only root can change —
 # with the read-only token below, on EVERY privileged run:
 #
-#   klaffat-infra          `git archive` of deploy/terraform at main's tip
-#                          into a fresh 0700 directory, `tofu` runs there.
+#   klaffat-infra          `git archive` of deploy/ at main's tip into a
+#                          fresh 0700 directory — the whole deploy tree,
+#                          because hetzner.tf reads ../cloudflare-ips.json
+#                          (measured: archiving deploy/terraform alone made
+#                          every plan die on that file) — verified entry by
+#                          entry against the commit (regular files only, blob
+#                          shas equal) before `tofu` runs in deploy/terraform.
 #                          Committed content only; nothing on disk in the
 #                          founder's tree is ever read.
 #   klaffat-publish        `nix build git+file://<mirror>?rev=<sha>#…` —
@@ -161,15 +166,39 @@
 # — `sensitive = true` is a display hint, not a boundary. Reproduced
 # 2026-09-05 against the real wrapper.
 #
+# `fmt` is not offered either: it rewrites files in a working directory
+# this wrapper deletes on exit, so it would report changes and discard
+# them. Formatting belongs in the dev shell, committed like any edit.
+#
 # The verbs that remain get credentials by what they can DO, never by
 # what they are called: the two provider tokens go only to verbs that
 # instantiate providers (plan, apply, refresh, import, destroy); the AWS
 # key pair and the state passphrase go to every verb that touches state;
-# validate, fmt and version get nothing. What this does NOT close, and
-# is documented rather than pretended away: `show`, `output -json` and
+# validate and version get nothing. What this does NOT close, and is
+# documented rather than pretended away: `show`, `output -json` and
 # `state pull` print whatever the STATE holds (the demo host's read-only
 # IAM key, for instance). That is what the state is for, and reading it
 # costs the same sudo password as `apply`.
+#
+# `destroy` and `apply -destroy` are confirmed at /dev/tty. The destroy
+# flag is recognised by PREFIX — any `-destroy…` or `--destroy…` argument
+# counts — because OpenTofu parses booleans with Go's strconv.ParseBool,
+# which also accepts `1`, `t`, `T`, `True` and `TRUE`; a list of spellings
+# is exactly the kind of gate that leaks (`apply -destroy=1` walked past
+# the first one). `-destroy=false` therefore asks for confirmation too,
+# which costs a phrase and nothing else.
+#
+# ── The install wrapper's ssh identity ────────────────────────────────
+#
+# nixos-anywhere has to ssh to the fresh box as root, and root on the
+# laptop has no key of its own: the server's authorized key is the
+# founder's (`founder_public_key` in variables.tf). So the sudo rule for
+# klaffat-infra-install — and ONLY that rule — keeps SSH_AUTH_SOCK, and
+# root's ssh signs with whatever the founder has loaded in ssh-agent
+# (`ssh-add ~/.ssh/klaffat-deploy`). This grants nothing new: a process
+# running as the founder can already use that agent. It is scoped to the
+# one command that needs it; the OpenTofu and publish wrappers run under
+# a plain env_reset.
 { config, lib, pkgs, ... }:
 
 let
@@ -322,7 +351,7 @@ let
 
   klaffat-infra = pkgs.writeShellApplication {
     name = "klaffat-infra";
-    runtimeInputs = [ pkgs.opentofu pkgs.git pkgs.coreutils pkgs.gnutar ];
+    runtimeInputs = [ pkgs.opentofu pkgs.git pkgs.coreutils pkgs.gnutar pkgs.gawk ];
     text = ''
       ${rootOnlyPreamble "klaffat-infra" "<tofu subcommand> [args...]"}
       ${mirrorLib "klaffat-infra"}
@@ -341,7 +370,7 @@ let
       # TERMINAL, which no pipe can supply.
       subcmd="''${1-}"
       case "$subcmd" in
-        init|validate|fmt|plan|apply|refresh|show|output|providers|state|version|graph|import|taint|untaint|force-unlock|workspace|destroy)
+        init|validate|plan|apply|refresh|show|output|providers|state|version|graph|import|taint|untaint|force-unlock|workspace|destroy)
           ;;
         "")
           echo "klaffat-infra: usage: sudo klaffat-infra <tofu subcommand> [args...]" >&2
@@ -351,11 +380,15 @@ let
           echo "klaffat-infra: 'console' is not offered — it evaluates any expression with the provisioning credentials bound, and nonsensitive(var.hcloud_token) prints one. Refusing." >&2
           exit 2
           ;;
+        fmt)
+          echo "klaffat-infra: 'fmt' is not offered — it rewrites files in a working directory this wrapper deletes on exit. Run 'tofu fmt' in the dev shell and commit the result. Refusing." >&2
+          exit 2
+          ;;
         *)
           echo "klaffat-infra: '$subcmd' is not an allowed OpenTofu subcommand — refusing." >&2
-          echo "klaffat-infra: allowed: init validate fmt plan apply refresh show output" >&2
-          echo "klaffat-infra:          providers state version graph import taint untaint" >&2
-          echo "klaffat-infra:          force-unlock workspace destroy" >&2
+          echo "klaffat-infra: allowed: init validate plan apply refresh show output providers" >&2
+          echo "klaffat-infra:          state version graph import taint untaint force-unlock" >&2
+          echo "klaffat-infra:          workspace destroy" >&2
           exit 2
           ;;
       esac
@@ -378,20 +411,24 @@ let
           ;;
       esac
 
-      # `apply -destroy` IS `destroy`; the flag has to count as one.
-      # (`apply <saved-destroy-plan>` cannot be recognised from argv — the
-      # plan file has to be read to know. `plan -out` + `apply <file>` is
-      # not a path this wrapper offers a shortcut for, and the founder
-      # who saved the plan is the one applying it. Note the working
-      # directory is a fresh archive every run, so a plan file has to be
-      # saved by ABSOLUTE path to survive to the next invocation.)
+      # `apply -destroy` IS `destroy`; the flag has to count as one — in
+      # EVERY spelling. Matched by prefix, not by a list of values: Go's
+      # strconv.ParseBool takes 1/t/T/True/TRUE as well as true, and
+      # `apply -destroy=1 -auto-approve` walked straight past the list this
+      # used to be. `-destroy=false` is caught too and merely asks for a
+      # phrase. (`apply <saved-destroy-plan>` cannot be recognised from
+      # argv — the plan file has to be read to know. `plan -out` +
+      # `apply <file>` is not a path this wrapper offers a shortcut for, and
+      # the founder who saved the plan is the one applying it. Note the
+      # working directory is a fresh archive every run, so a plan file has
+      # to be saved by ABSOLUTE path to survive to the next invocation.)
       destroying=0
       if [ "$subcmd" = "destroy" ]; then
         destroying=1
       fi
       for _a in "$@"; do
         case "$_a" in
-          -destroy|--destroy|-destroy=true|--destroy=true) destroying=1 ;;
+          -destroy*|--destroy*) destroying=1 ;;
           *) ;;
         esac
       done
@@ -476,11 +513,42 @@ let
       #     anything OpenTofu writes into the working directory (a
       #     re-locked lock file, a plan saved by relative path) dies with
       #     it, deliberately.
+      #
+      #     The WHOLE deploy/ tree, not deploy/terraform: hetzner.tf reads
+      #     `file("''${path.module}/../cloudflare-ips.json")`, and archiving
+      #     the terraform directory alone made every validate/plan/apply die
+      #     on that file (reproduced against the real repo). deploy/ is the
+      #     provisioning surface; a reference outside it fails loudly here.
+      archive_paths="deploy"
       work="$(mktemp -d "${stateDir}/infra-XXXXXXXX")"
       trap 'rm -rf -- "$work"' EXIT
-      if ! git --git-dir="${mirrorDir}" archive --format=tar "$rev" -- deploy/terraform \
+
+      # Regular files only. A committed symlink would make root's tofu
+      # read — or, at deploy/terraform itself, run inside — whatever it
+      # points at; a submodule is a tree the mirror does not hold. Both
+      # are refused before anything is extracted.
+      if git --git-dir="${mirrorDir}" ls-tree -r "$rev" -- "$archive_paths" \
+           | awk '$1 != "100644" && $1 != "100755" { found = 1 } END { exit !found }'; then
+        gate_refuse "commit $rev has a symlink or submodule under $archive_paths — refusing."
+      fi
+      if ! git --git-dir="${mirrorDir}" archive --format=tar "$rev" -- "$archive_paths" \
            | tar -x -C "$work"; then
-        gate_refuse "commit $rev has no deploy/terraform to extract — refusing."
+        gate_refuse "commit $rev has no $archive_paths to extract — refusing."
+      fi
+
+      # What tofu will read must be, blob for blob, what the commit holds.
+      # `git archive` honours a committed .gitattributes: export-ignore
+      # drops files, export-subst rewrites them. Hash every extracted path
+      # in tree order and compare with the tree's own blob ids; a missing
+      # file fails hash-object, a rewritten one fails the compare.
+      expected_shas="$(git --git-dir="${mirrorDir}" ls-tree -r "$rev" -- "$archive_paths" | awk '{ print $3 }')"
+      if ! actual_shas="$(git --git-dir="${mirrorDir}" ls-tree -r --name-only "$rev" -- "$archive_paths" \
+             | (cd "$work" && git --git-dir="${mirrorDir}" hash-object --stdin-paths))" \
+         || [ "$expected_shas" != "$actual_shas" ]; then
+        gate_refuse "the extracted tree differs from commit $rev (export-ignore or export-subst in .gitattributes?) — refusing."
+      fi
+      if [ ! -d "$work/deploy/terraform" ]; then
+        gate_refuse "commit $rev has no deploy/terraform — refusing."
       fi
       cd "$work/deploy/terraform"
 
@@ -545,15 +613,13 @@ let
         exit 3
       fi
 
-      # --extra-files staging dir. /run/user/0 (tmpfs) when root has a
-      # runtime dir, otherwise the root-only state dir. Never /tmp: the
-      # private half of the demo host's SSH identity passes through here.
-      install -d -m 0700 "${stateDir}"
-      base="/run/user/0"
-      if [ ! -d "$base" ]; then
-        base="${stateDir}"
-      fi
-      EXTRA="$(mktemp -d "$base/klaffat-extra-files.XXXXXXXX")"
+      # --extra-files staging dir, on tmpfs. /run is root-writable tmpfs
+      # on NixOS whether or not root has a runtime dir (sudo does not
+      # create /run/user/0), so the private half of the demo host's SSH
+      # identity never touches a disk and the trap's rm is the whole
+      # cleanup — nothing to shred, nothing left in a journal. Never
+      # /tmp, never the on-disk state dir.
+      EXTRA="$(mktemp -d /run/klaffat-extra-files.XXXXXXXX)"
       trap 'rm -rf -- "$EXTRA"' EXIT
 
       install -d -m 0755 "$EXTRA/etc" "$EXTRA/etc/ssh"
@@ -573,7 +639,10 @@ let
       flakeref="git+file://${mirrorDir}?rev=$rev&allRefs=1"
       echo "klaffat-infra-install: installing klaffat-demo onto root@$ip" >&2
       echo "klaffat-infra-install: flakeref $flakeref" >&2
-      # No `exec`: the EXIT trap above must still fire to shred $EXTRA.
+      if [ -z "''${SSH_AUTH_SOCK-}" ]; then
+        echo "klaffat-infra-install: SSH_AUTH_SOCK is not set — root has no key of its own; run ssh-add for the key the server authorises (see the sudo rule: it keeps SSH_AUTH_SOCK for this command)." >&2
+      fi
+      # No `exec`: the EXIT trap above must still fire to remove $EXTRA.
       rc=0
       nix run "$flakeref#nixos-anywhere" -- \
         --extra-files "$EXTRA" \
@@ -667,6 +736,15 @@ let
           echo "klaffat-publish: push it first; only what the server has can be published." >&2
           exit 2
         fi
+        # Resolving proves the OBJECT is in the mirror; `fetch --prune`
+        # drops refs, not objects, so a force-pushed or deleted branch's
+        # commits linger until gc. Publishable means reachable from a
+        # branch the server has NOW.
+        if [ -z "$(git --git-dir="${mirrorDir}" for-each-ref --contains "$rev" refs/heads)" ]; then
+          echo "klaffat-publish: '$target' ($rev) is not reachable from any current branch of ${cfg.repoRemoteUrl} — refusing." >&2
+          echo "klaffat-publish: a force-pushed or deleted branch leaves its objects in the mirror; only what a live branch reaches can be published." >&2
+          exit 2
+        fi
       else
         rev="$(mirror_main_tip)"
       fi
@@ -719,14 +797,16 @@ let
   # are what `sudo klaffat-infra` actually resolves to through PATH and
   # sudo does not follow the symlink back to the store (see the comment on
   # security.sudo.extraRules below).
+  installCommands = [
+    "${klaffat-infra-install}/bin/klaffat-infra-install"
+    "/run/current-system/sw/bin/klaffat-infra-install"
+  ];
   sudoCommands = [
     "${klaffat-infra}/bin/klaffat-infra"
-    "${klaffat-infra-install}/bin/klaffat-infra-install"
     "${klaffat-publish}/bin/klaffat-publish"
     "/run/current-system/sw/bin/klaffat-infra"
-    "/run/current-system/sw/bin/klaffat-infra-install"
     "/run/current-system/sw/bin/klaffat-publish"
-  ];
+  ] ++ installCommands;
 
   # Every secret here shares one shape: encrypted to dellan's host key,
   # decrypted by root at activation, unreadable by jonathan.
@@ -864,10 +944,18 @@ in
     # the command is matched and before authentication, so the timestamp
     # rules bite for these commands only and no other sudo use on the
     # laptop changes behaviour.
+    #
+    # SSH_AUTH_SOCK survives env_reset for klaffat-infra-install ONLY: root
+    # has no ssh key, the fresh server authorises the founder's, and the
+    # founder's agent is where that key lives (header, "The install
+    # wrapper's ssh identity"). Not SETENV — the founder cannot set
+    # arbitrary variables; sudo passes this one through, for this command.
     security.sudo.extraConfig = ''
       Cmnd_Alias KLAFFAT_INFRA_CMNDS = ${lib.concatStringsSep ", " sudoCommands}
+      Cmnd_Alias KLAFFAT_INSTALL_CMNDS = ${lib.concatStringsSep ", " installCommands}
       Defaults!KLAFFAT_INFRA_CMNDS timestamp_timeout=0
       Defaults!KLAFFAT_INFRA_CMNDS timestamp_type=tty
+      Defaults!KLAFFAT_INSTALL_CMNDS env_keep += "SSH_AUTH_SOCK"
     '';
   };
 }

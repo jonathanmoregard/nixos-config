@@ -61,9 +61,16 @@
 #      refused); the build addresses the root-only mirror at the exact rev.
 #
 #   8. klaffat-infra-install refuses anything that is not an IP address
-#      (a resolvable hostname like `cafe.beef` used to pass), stages and
-#      then SHREDS its --extra-files dir, and hands `nix run` a flakeref
-#      into the root-only mirror pinned to the verified rev.
+#      (a resolvable hostname like `cafe.beef` used to pass), stages its
+#      --extra-files dir on tmpfs under /run and removes it on every exit
+#      path, and hands `nix run` a flakeref into the root-only mirror
+#      pinned to the verified rev.
+#
+#   9. What the archive may contain: a commit with a symlink under deploy/
+#      is refused before extraction; a commit whose .gitattributes drops a
+#      file with export-ignore is refused after it (blob shas compared);
+#      and the fixture reads ../cloudflare-ips.json the way hetzner.tf
+#      does, so an archive pathspec narrower than deploy/ fails the plan.
 { pkgs, inputs }:
 
 let
@@ -188,7 +195,7 @@ common.mkMinimalTest {
         machine.succeed(f"printf '%s' {shlex.quote(content)} > {path}")
 
     def state_leftovers():
-        _, ls = machine.execute("ls -A ${stateDir}")
+        _, ls = machine.execute("ls -A ${stateDir} /run")
         return [x for x in ls.split() if x.startswith(("infra-", "publish-", "klaffat-extra-files"))]
 
     # ---------------------------------------------------------------
@@ -302,6 +309,10 @@ common.mkMinimalTest {
     assert "'console' is not offered" in out, f"unexpected console refusal: {out!r}"
     assert "TEST-hcloud-token" not in out, f"console printed the token: {out!r}"
 
+    # `fmt` would rewrite files in a directory the wrapper deletes on exit.
+    rc, out = run("${bin}/klaffat-infra fmt")
+    assert rc == 2 and "'fmt' is not offered" in out, f"fmt should be refused by name: {rc} {out!r}"
+
     rc, out = run("${bin}/klaffat-infra plan")
     assert rc == 2, f"fetch-failure refusal should exit 2, got {rc}: {out!r}"
     assert "could not fetch ${originUrl} into the root-only mirror" in out, (
@@ -364,6 +375,18 @@ common.mkMinimalTest {
     assert "SETENV" not in rule_lines[0], f"rule carries SETENV: {rule_lines[0]!r}"
     assert "Defaults!KLAFFAT_INFRA_CMNDS timestamp_timeout=0" in sudoers
     assert "Defaults!KLAFFAT_INFRA_CMNDS timestamp_type=tty" in sudoers
+    # root has no ssh key; the install wrapper reaches the fresh box through
+    # the founder's agent, so SSH_AUTH_SOCK survives env_reset for that ONE
+    # command and for nothing else.
+    assert 'Defaults!KLAFFAT_INSTALL_CMNDS env_keep += "SSH_AUTH_SOCK"' in sudoers, (
+        "the install wrapper's sudo rule must keep SSH_AUTH_SOCK"
+    )
+    assert "KLAFFAT_INFRA_CMNDS env_keep" not in sudoers, "env_keep leaked onto the OpenTofu/publish rule"
+    install_alias = [ln for ln in sudoers.splitlines() if ln.startswith("Cmnd_Alias KLAFFAT_INSTALL_CMNDS")]
+    assert len(install_alias) == 1 and "klaffat-infra-install" in install_alias[0], install_alias
+    assert "klaffat-publish" not in install_alias[0] and "bin/klaffat-infra " not in install_alias[0] + " ", (
+        f"the install alias must name only the install wrapper: {install_alias[0]!r}"
+    )
 
     # ---------------------------------------------------------------
     # 7. THE ORIGIN, and the mirror that follows it.
@@ -381,16 +404,25 @@ common.mkMinimalTest {
             f"${git} -C {src} -c user.email=t@example.invalid -c user.name=t {args}"
         )
 
+    # The fixture reads a file OUTSIDE deploy/terraform exactly the way the
+    # real hetzner.tf does (`file("''${path.module}/../cloudflare-ips.json")`),
+    # so an archive pathspec narrower than deploy/ fails the plan here
+    # instead of on the founder's first credentialed run.
     def tf_fixture(canary):
         return (
             'variable "hcloud_token" {\n  type    = string\n  default = ""\n}\n'
             'variable "state_passphrase" {\n  type    = string\n  default = ""\n}\n'
+            'locals {\n  cf = jsondecode(file("''${path.module}/../cloudflare-ips.json"))\n}\n'
             f'output "canary" {{\n  value = "{canary}"\n}}\n'
+            'output "cloudflare_ip_count" {\n  value = length(local.cf.ipv4)\n}\n'
             'output "hcloud_token_present" {\n  value = var.hcloud_token != ""\n}\n'
             'output "state_passphrase_present" {\n  value = var.state_passphrase != ""\n}\n'
         )
 
+    cf_ips = '{"ipv4": ["203.0.113.0/24"]}\n'
+
     machine.succeed(f"install -d -m 0755 {src}/deploy/terraform")
+    write_file(f"{src}/deploy/cloudflare-ips.json", cf_ips)
     write_file(f"{src}/deploy/terraform/main.tf", tf_fixture("REMOTE-1"))
     # A flake with no inputs, so klaffat-publish's `nix build` gets past
     # fetching (offline) and fails on the missing attribute — which is how
@@ -422,6 +454,9 @@ common.mkMinimalTest {
         f"revision line missing or wrong: {out!r}"
     )
     assert 'canary = "REMOTE-1"' in squash(out), f"tofu did not plan the remote tree: {out!r}"
+    assert "cloudflare_ip_count = 1" in squash(out), (
+        f"the archive did not carry deploy/cloudflare-ips.json (pathspec too narrow?): {out!r}"
+    )
     assert "hcloud_token_present = true" in squash(out), f"plan did not receive the provider token: {out!r}"
     assert "state_passphrase_present = true" in squash(out), f"plan did not receive the state passphrase: {out!r}"
 
@@ -461,7 +496,8 @@ common.mkMinimalTest {
         )
 
     write_file("${repo}/deploy/terraform/main.tf", tf_fixture("LOCAL"))
-    machine.succeed("chown jonathan:users ${repo}/deploy/terraform/main.tf")
+    write_file("${repo}/deploy/cloudflare-ips.json", cf_ips)
+    machine.succeed("chown jonathan:users ${repo}/deploy/terraform/main.tf ${repo}/deploy/cloudflare-ips.json")
     as_jonathan("${git} init -q -b main ${repo}")
     as_jonathan_git("add -A")
     as_jonathan_git("commit -q -m 'agent: unreviewed local commit'")
@@ -488,6 +524,26 @@ common.mkMinimalTest {
         "chown jonathan:users ${repo}/.git/info/attributes ${repo}/.git/info/exclude "
         "${repo}/deploy/terraform/override.tf"
     )
+
+    # Positive control: the traps DO fire when git runs as jonathan in that
+    # repository — so "no marker after the wrappers ran" means the wrappers
+    # never opened it, not that the fixture is inert. (`execute`, not
+    # `succeed`: the fsmonitor stub answers the hook protocol crudely, and
+    # git's opinion of that answer is not what is under test.)
+    machine.execute(
+        "runuser -u jonathan -- env HOME=/home/jonathan ${git} -C ${repo} status --porcelain"
+    )
+    machine.execute(
+        "runuser -u jonathan -- env HOME=/home/jonathan "
+        "${git} -C ${repo} worktree add --detach /home/jonathan/wt-control HEAD"
+    )
+    fired = machine.succeed(f"cat {markers}")
+    for trap in [
+        "core.fsmonitor ran as jonathan",
+        "smudge filter ran as jonathan",
+        "post-checkout hook ran as jonathan",
+    ]:
+        assert trap in fired, f"positive control: {trap!r} did not fire for jonathan's own git: {fired!r}"
     machine.succeed(f"rm -f {markers}")
 
     rc, out = run("${bin}/klaffat-infra plan -no-color")
@@ -568,7 +624,14 @@ common.mkMinimalTest {
     # blocked on a read nobody can answer would hang the lane, and a hang
     # reads like an infrastructure problem rather than the assertion
     # failure it is. rc 124 says exactly that.
-    for cmd in ["destroy", "destroy -auto-approve", "apply -destroy"]:
+    # Every spelling OpenTofu's Go flag parser accepts for a true boolean,
+    # plus the explicit false — the flag is matched by prefix now, because
+    # `apply -destroy=1 -auto-approve` walked past a list of spellings.
+    for cmd in [
+        "destroy", "destroy -auto-approve", "apply -destroy",
+        "apply -destroy=1 -auto-approve", "apply -destroy=t", "apply -destroy=T",
+        "apply -destroy=TRUE", "apply -destroy=True", "apply --destroy=1", "apply -destroy=false",
+    ]:
         rc, out = run(f"yes | setsid --wait timeout 60 ${bin}/klaffat-infra {cmd}")
         assert rc != 124, (
             f"'{cmd}' blocked on a terminal read instead of refusing: {out!r}"
@@ -632,7 +695,15 @@ common.mkMinimalTest {
     assert rc != 2 and f"klaffat-publish: building klaffat-demo from {rev_hotfix}" in out, (
         f"an explicit rev the server has must be honoured: {rc} {out!r}"
     )
-    # …a commit the server has never seen is not, however explicitly named.
+    # …a commit whose branch the server has since deleted is refused even
+    # though `fetch --prune` leaves its objects in the mirror…
+    machine.succeed("${git} --git-dir=${originRoot}/klaffat.git branch -D hotfix")
+    rc, out = run(f"${bin}/klaffat-publish {rev_hotfix}")
+    assert rc == 2 and "is not reachable from any current branch" in out, (
+        f"a commit on a deleted branch was accepted for publishing: {rc} {out!r}"
+    )
+    assert "building klaffat-demo" not in out, f"publish reached the build with an unreachable commit: {out!r}"
+    # …and a commit the server has never seen is not, however explicitly named.
     rc, out = run(f"${bin}/klaffat-publish {rev_local}")
     assert rc == 2 and f"'{rev_local}' is not a commit on any branch of ${originUrl}" in out, (
         f"a local-only commit was accepted for publishing: {rc} {out!r}"
@@ -680,10 +751,15 @@ common.mkMinimalTest {
         assert f"flakeref git+file://${mirror}?rev={rev_b}&allRefs=1" in out, (
             f"the flakeref handed to nix run must pin main's tip in the mirror: {out!r}"
         )
-    _, leftovers = machine.execute("ls -A ${stateDir} /run/user/0 2>/dev/null")
+    _, leftovers = machine.execute("ls -A ${stateDir} /run")
     assert "klaffat-extra-files" not in leftovers, (
         f"--extra-files staging dir survived a failed install: {leftovers!r}"
     )
+    # The staging dir lives on tmpfs, never on the disk-backed state dir.
+    assert "/run/klaffat-extra-files." in srcs["klaffat-infra-install"], (
+        "the install wrapper must stage --extra-files under /run (tmpfs)"
+    )
+    assert "${stateDir}/klaffat-extra-files" not in srcs["klaffat-infra-install"]
 
     # ---------------------------------------------------------------
     # 11. Credentials by verb. Remove a secret and see which verbs still
@@ -723,6 +799,45 @@ common.mkMinimalTest {
     # And with everything back, version — which gets nothing — still runs.
     rc, out = run("${bin}/klaffat-infra version")
     assert rc == 0 and "OpenTofu v" in out, f"version did not reach tofu: {rc} {out!r}"
+    assert state_leftovers() == [], f"runs left artefacts in ${stateDir}: {state_leftovers()!r}"
+
+    # ---------------------------------------------------------------
+    # 12. What the archive may contain. Both cases are commits on the
+    #     server's main, i.e. inside the trust boundary — this is belt and
+    #     braces against a review that lets one through.
+    # ---------------------------------------------------------------
+    # 12a. A committed symlink under deploy/ is refused before extraction.
+    machine.succeed(f"ln -s /etc/hostname {src}/deploy/terraform/link.tf")
+    src_git("add -A")
+    src_git("commit -q -m 'symlink'")
+    push_origin()
+    rc, out = run("${bin}/klaffat-infra validate -no-color")
+    assert rc == 2 and "has a symlink or submodule under deploy" in out, (
+        f"a committed symlink was not refused: {rc} {out!r}"
+    )
+    assert "Success!" not in out, f"tofu ran on a tree with a symlink: {out!r}"
+    assert state_leftovers() == [], f"refusal left artefacts: {state_leftovers()!r}"
+
+    # 12b. A committed .gitattributes that drops a file from the archive is
+    #      refused after extraction: the blob shas no longer match the tree.
+    machine.succeed(f"rm {src}/deploy/terraform/link.tf")
+    write_file(f"{src}/.gitattributes", "deploy/terraform/main.tf export-ignore\n")
+    src_git("add -A")
+    src_git("commit -q -m 'export-ignore'")
+    push_origin()
+    rc, out = run("${bin}/klaffat-infra validate -no-color")
+    assert rc == 2 and "differs from commit" in out, (
+        f"an export-ignore'd archive was not refused: {rc} {out!r}"
+    )
+    assert "Success!" not in out, f"tofu ran on an incomplete tree: {out!r}"
+
+    # 12c. …and a clean commit runs again.
+    machine.succeed(f"rm {src}/.gitattributes")
+    src_git("add -A")
+    src_git("commit -q -m 'clean again'")
+    push_origin()
+    rc, out = run("${bin}/klaffat-infra validate -no-color")
+    assert rc == 0 and "Success!" in out, f"a clean commit should validate: {rc} {out!r}"
     assert state_leftovers() == [], f"runs left artefacts in ${stateDir}: {state_leftovers()!r}"
   '';
 }

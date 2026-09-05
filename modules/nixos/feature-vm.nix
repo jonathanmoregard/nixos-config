@@ -58,6 +58,7 @@ let
     "klaffat-aws-secret-access-key"
     "klaffat-demo-host-key"
     "klaffat-nix-signing-key"
+    "klaffat-github-token"
   ];
 in
 {
@@ -164,7 +165,7 @@ in
     # Point agenix at the host privkey 9p-mounted above, PLUS a throwaway
     # identity for the klaffat provisioning secrets.
     #
-    # Those ten are the one group deliberately NOT encrypted to any key
+    # Those eight are the one group deliberately NOT encrypted to any key
     # jonathan holds (modules/nixos/klaffat-infra.nix explains why), so the
     # 9p'd user key cannot open them and a smoke run would find
     # /run/agenix/klaffat-* absent — indistinguishable from the module
