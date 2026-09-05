@@ -26,11 +26,28 @@
 # ── Recovery recipient ────────────────────────────────────────────────
 #
 # Right now dellan's host key is the ONLY thing that can decrypt these
-# files. If the laptop dies, the ciphertext in this repo is unrecoverable
-# and every credential has to be reissued at the provider. Generate an
-# offline age identity (`age-keygen`, stored off the laptop — paper or a
+# files. Six of the seven are merely annoying to lose: reissue the token
+# at Hetzner, at Cloudflare, in IAM, regenerate the host key, mint a new
+# cache signing key.
+#
+# `klaffat-state-passphrase` is not one of those. It is the passphrase the
+# OpenTofu state is ALREADY encrypted under, so it cannot be reminted —
+# lose dellan's host key with no second recipient and every copy of the
+# state is gone permanently. Not "hard to recover": there is no other
+# holder and no derivation path back. No `tofu destroy`, no reconciling
+# apply, no record of what the stack currently is; recovery means deleting
+# every Hetzner and Cloudflare resource by hand in the two web consoles
+# and starting from an empty state file.
+#
+# The fix is a recipient that is not a machine in this stack: generate an
+# offline age identity (`age-keygen`, kept off this laptop — paper or a
 # hardware token), uncomment `recovery` below with its PUBLIC half, and
 # re-encrypt each file once with the command above.
+#
+# THE AGENT MUST NOT GENERATE IT. An identity the agent's own user can
+# read is not an offline identity, and that is the entire property this
+# slot exists for. Filed for the founder in
+# ~/.local/state/claude-tasks/kablong/pending_for_human.md (2026-09-05).
 let
   # dellan's SSH host key — /etc/ssh/ssh_host_ed25519_key.pub.
   # Same value as `age.rekey.hostPubkey` in hosts/dellan/default.nix.

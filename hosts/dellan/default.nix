@@ -108,8 +108,11 @@
     # to THIS host's key rather than to jonathan's user key. Deliberately
     # outside the agenix-rekey scheme so the principal an AI agent runs as
     # cannot decrypt tokens that create and destroy servers. See the
-    # module header — including the note that the property is not yet
-    # complete while profiles/base.nix keeps wheel NOPASSWD.
+    # module header. profiles/base.nix now sets
+    # `security.sudo.wheelNeedsPassword = true`, which is what makes the
+    # root-only secrets actually root-only; the remaining gap is named in
+    # the module header (commit-signature verification) and in
+    # secrets/secrets.nix (no offline recovery recipient yet).
     ../../modules/nixos/klaffat-infra.nix
   ];
 
