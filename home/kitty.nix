@@ -1,5 +1,420 @@
 { pkgs, lib, ... }:
 let
+  # Shared Python: is this `kitty @ ls` window one of kitty's OWN
+  # windows rather than a user pane? Interpolated verbatim into every
+  # script that has to answer the question, because answering it
+  # differently in different places is what the 2026-09-04 incident
+  # was made of — kitty-session-convert and kitty-restore-session each
+  # skipped `kitten ask` while kitty-pane-add skipped nothing, so an
+  # error overlay left the two restore paths disagreeing about how
+  # many panes existed.
+  #
+  # Requires `import os` in the consuming script.
+  kittyInternalWindowPy = ''
+    # kitty stamps KITTEN_RUNNING_AS_UI=1 into the environment of every
+    # window it spawns AS ITS OWN UI. There are exactly two such places
+    # in 0.48.2 — run_kitten_with_metadata (boss.py:2359), which is how
+    # `ask`, `hints`, `unicode_input`, `command-palette`, `choose-files`
+    # and the rest of the wrapped kittens are opened, and
+    # create_special_window_for_show_error (boss.py:2487), the
+    # `__show_error__` config-error overlay. `kitty @ ls` reports the
+    # variable: measured 2026-09-04 against real kitty 0.48.2 under
+    # Xvfb, the hints / unicode_input / command-palette overlays each
+    # came back with env.KITTEN_RUNNING_AS_UI == "1" and the user's own
+    # shell pane with none. (`ls` strips env vars COMMON to every
+    # window, which this never is: an overlay always accompanies the
+    # real pane it covers.)
+    #
+    # This env marker, not a name list, is the rule — and the reason is
+    # that names do not carry the distinction. kitty's
+    # wrapped_kitten_names() is ['ask', 'choose-files', 'clipboard',
+    # 'command-palette', 'diff', 'hints', 'hyperlinked_grep', 'icat',
+    # 'query_terminal', 'show_key', 'ssh', 'themes', 'transfer',
+    # 'unicode_input'], so `diff`, `icat` and `ssh` — the ones the user
+    # runs on purpose — sit in the very same set as `hints`. What
+    # separates them is WHO SPAWNED IT, and the marker is kitty's own
+    # record of exactly that: a `kitten diff` the user typed carries no
+    # marker and stays a real pane, which is the mirror-image bug this
+    # has to keep avoiding.
+    #
+    # (An earlier version of this comment claimed `ask` was "the one
+    # public-named kitten kitty spawns on the user's behalf". It is
+    # not, and that premise is what let four more overlay kinds
+    # through.)
+    UI_KITTEN_ENV = "KITTEN_RUNNING_AS_UI"
+
+    # And this module's OWN chrome: the overlay kitty-panes-reflow opens
+    # to tell the user why it refused (its only other output goes to
+    # kitty's log, where nobody reads it). Same class as kitty's own
+    # overlays and treated the same way — it is not a pane the user
+    # works in, so it must not take a grid slot, must not be counted by
+    # the 2x2 dispatch, and must not come back as a pane after a
+    # restore. Marked with our own variable rather than by writing
+    # kitty's: KITTEN_RUNNING_AS_UI is kitty's record of what KITTY
+    # spawned, and setting it ourselves would make that record a lie.
+    OWN_UI_ENV = "KITTY_SESSION_UI"
+
+
+    def _kitten_subcommand(cmdline):
+        """The kitten sub-command name, or None when not a kitten call.
+
+        Both spellings: kitty >= 0.42 execs `kitten <name>`, older
+        builds (and anything restored from an old snapshot) used
+        `kitty +kitten <name>`.
+        """
+        if not cmdline:
+            return None
+        exe = os.path.basename(cmdline[0])
+        if exe == "kitten" and len(cmdline) > 1:
+            return cmdline[1]
+        if exe == "kitty" and len(cmdline) > 2 and cmdline[1] == "+kitten":
+            return cmdline[2]
+        return None
+
+
+    def _is_kitten_runner(cmdline):
+        """True for kitty's Python kitten-runner spawn shape.
+
+        A kitten kitty ships no wrapped binary for takes the other
+        branch of the same `if` (boss.py:2364) and gets NO env marker:
+        `kitty +runpy 'from kittens.runner import main; main()'
+        <config-dir> <kitten> ...`. `resize_window` is the one
+        reachable from a default binding; measured verbatim in the
+        same Xvfb run. Structural rather than a name — nobody types
+        +runpy.
+        """
+        return (
+            len(cmdline) > 2
+            and os.path.basename(cmdline[0]) == "kitty"
+            and cmdline[1] == "+runpy"
+            and "kittens.runner" in cmdline[2]
+        )
+
+
+    def is_internal_window(cmdline):
+        """True for a cmdline kitty spawned as its own chrome.
+
+        The cmdline-only fallback, for the places no environment is
+        available: kitty's `foreground_processes` entries carry a
+        cmdline and nothing else. Dunder names are kitty-private by
+        convention — not in `kitten --help`, and a user cannot mean to
+        run one.
+        """
+        if _is_kitten_runner(cmdline):
+            return True
+        sub = _kitten_subcommand(cmdline)
+        if sub is None:
+            return False
+        return len(sub) > 4 and sub.startswith("__") and sub.endswith("__")
+
+
+    def window_is_internal(win):
+        """True for a `kitty @ ls` window that is kitty's own chrome.
+
+        Env markers first — kitty's own record of having spawned the
+        window itself, which is the only signal that separates a
+        `hints` overlay from a `kitten diff` the user ran, and ours for
+        the windows this module opens to talk to the user. Then the
+        cmdline shapes, which survive the death of the process the
+        same way pane_cmd's preference for `cmdline` does.
+        """
+        env = win.get("env") or {}
+        if env.get(UI_KITTEN_ENV) == "1" or env.get(OWN_UI_ENV) == "1":
+            return True
+        if is_internal_window(win.get("cmdline") or []):
+            return True
+        fg = win.get("foreground_processes") or []
+        return any(
+            is_internal_window(fp.get("cmdline") or []) for fp in fg
+        )
+  '';
+
+  # Shared Python: quote one value for a kitty session file. Used by
+  # every writer of one — kitty-session-convert (last.session) and
+  # kitty-restore-session (the --session stub) — because a session file
+  # only has to be corrupted by ONE of them to be refused.
+  #
+  # Requires `import re` and `import shlex` in the consuming script.
+  kittySessionTokenPy = ''
+    # A kitty session file is LINE-ORIENTED: kitty/session.py does
+    # `for line in raw.splitlines()` and then shlex-splits the rest of
+    # that ONE line. shlex.quote does NOT make a newline safe there --
+    # it keeps real newlines inside the quotes -- so a multi-line argv
+    # element turns one `launch` into as many directives as the value
+    # has lines. The restore notice is exactly such a value, and
+    # kitty-pane-add hands it to every claude pane, so it comes back in
+    # the pane's live cmdline on the next snapshot too.
+    #
+    # Measured 2026-09-04 against real kitty 0.48.2 under Xvfb: fed a
+    # 12-line session file, kitty opened `kitten __show_error__ --title
+    # 'The startup session was invalid'` and never started the user's
+    # claude. Fed the single-line one, it opened exactly one window.
+    #
+    # Line breaks are removed BEFORE quoting because quoting preserves
+    # them.
+    #
+    # The character class is DEFINED BY str.splitlines() -- it is not a
+    # judgement call about which breaks matter. kitty's session reader
+    # is literally `for line in raw.splitlines()`
+    # (kitty/session.py:249), so whatever CPython splits on is what
+    # kitty splits on, and anything CPython splits on that survives
+    # into a token turns one `launch` into several directives. The full
+    # set, enumerated from CPython (`len(("a"+c+"b").splitlines()) > 1`
+    # over every code point) rather than remembered:
+    #
+    #   \n LF  \v VT  \f FF  \r CR  \x1c FS  \x1d GS  \x1e RS
+    #   \x85 NEL    LINE SEPARATOR    PARAGRAPH SEPARATOR
+    #
+    # \x85 was missing until 2026-09-04. It is reachable: a directory
+    # name may hold any byte but '/' and NUL, so a cwd carrying a NEL
+    # produced a stub that `wc -l` called one line and kitty parsed as
+    # three -- and the emit_stub invariant below, sharing this same
+    # class, could not see it either. tests/kitty-scripts.nix phase A2
+    # re-derives the alphabet from CPython on every build so the two
+    # cannot drift apart again.
+    LINEBREAKS = re.compile(
+        "[\\r\\n\\v\\f\\x1c-\\x1e\\x85\\u2028\\u2029]"
+    )
+
+
+    def session_token(value):
+        """One quoted token that cannot break a session-file line."""
+        return shlex.quote(LINEBREAKS.sub(" ", value))
+  '';
+
+  # Shared Python: see through the pane-0 launcher, the OTHER launch
+  # indirection this module inserts between kitty and a pane's real
+  # command.
+  #
+  # Needs no imports.
+  #
+  # ── Why this exists ───────────────────────────────────────────────────
+  #
+  # Pane 0's real command cannot travel in kitty's `--session` stub: the
+  # restore notice is multi-line and a session file is line-oriented
+  # (kittySessionTokenPy above). So the stub launches THIS script in
+  # --exec-pane0 mode, with the line-carriable part of the argv after
+  # the flag, and --exec-pane0 puts the notice back from JSON before
+  # exec'ing it.
+  #
+  # kitty records a window's cmdline as WHAT IT SPAWNED, so after a
+  # restore pane 0's `window.cmdline` is that launcher — and the next
+  # snapshot reads it back. Until 2026-09-04 the launch line carried no
+  # argv at all, so the snapshot recorded pane 0 as
+  # `[kitty-restore-session, --exec-pane0]`: the stub's own launch line,
+  # as pane 0's command. The next restore then wrote that back into
+  # pane0-launch.json and --exec-pane0 execvp'd ITSELF, which re-read
+  # the same record and exec'd it again — a tight loop at 100% CPU with
+  # the session lost. Measured on the built derivation before the fix:
+  # `timeout 3 kitty-restore-session --exec-pane0` returned rc 124 with
+  # no output, for a pane 0 that was EITHER a zombie claude (orphaned
+  # MCP server holding the pty) OR — the wider case — any ordinary
+  # shell pane, since both fall past the `claude in foreground_processes`
+  # arm onto `window.cmdline`.
+  #
+  # The same class already bit unwrap_slice() one snippet below: a
+  # launcher the snapshotter cannot see through is a launcher that gets
+  # recorded as the command. Hence the same shape of answer — the
+  # indirection is transparent to every reader of `window.cmdline`.
+  kittyPane0LaunchPy = ''
+    PANE0_FLAG = "--exec-pane0"
+
+    # Set to the exec'ing process's pid just before --exec-pane0 hands
+    # the pane over. execvp keeps the pid, so seeing our OWN pid here
+    # means this process has already been through --exec-pane0 once and
+    # something led it back: that is an exec loop, whatever argv shape
+    # produced it, and it is refused. The pid, not a bare "1", is what
+    # keeps a kitty the user starts FROM a restored pane (a different
+    # process, inheriting the variable) out of the guard.
+    PANE0_EXEC_ENV = "KITTY_PANE0_EXEC"
+
+
+    def is_pane0_launcher(cmdline):
+        """True when running `cmdline` would re-enter --exec-pane0.
+
+        Recognised by the flag in argv position 1, not by the script's
+        name: the name is a store path in production and whatever a
+        test copied it to elsewhere. Over-matching is the safe
+        direction — a real command that happened to be
+        `<anything> --exec-pane0 ...` loses nothing but a launcher this
+        module put there.
+        """
+        cmdline = cmdline or []
+        return len(cmdline) >= 2 and cmdline[1] == PANE0_FLAG
+
+
+    def unwrap_pane0(cmdline):
+        """The real argv inside the pane-0 launcher, else cmdline.
+
+        Empty for a launcher recorded in the pre-2026-09-04 shape
+        (`[kitty-restore-session, --exec-pane0]`, nothing after it),
+        which is how a snapshot already carrying the self-referential
+        record is defused: pane_cmd() falls through it to the pane's
+        live foreground process instead of restoring the launcher.
+        """
+        cmdline = cmdline or []
+        if is_pane0_launcher(cmdline):
+            return cmdline[2:]
+        return cmdline
+  '';
+
+  # Shared Python: keep a RESTORED Claude Code pane inside
+  # claude-egress.slice, and let every consumer see through the launcher
+  # that puts it there.
+  #
+  # Requires `import os` in the consuming script, and kittyPane0LaunchPy
+  # interpolated ABOVE it (unwrap_launchers walks both launchers).
+  #
+  # ── Why this exists ───────────────────────────────────────────────────
+  #
+  # The slice is a security control, not bookkeeping:
+  # modules/nixos/claude-egress-observe.nix binds an nftables rule to
+  # that cgroup's INODE, so a Claude Code running outside it is
+  # unobserved while looking identical to an observed one. Restore
+  # launches claude two ways — `kitty @ launch -- claude …` for panes
+  # 1..N and an execvp for pane 0 — and both spawn children of kitty,
+  # which lives in the desktop session's own scope. Every restored
+  # session was therefore unconfined, silently, with the user's egress
+  # report under-counting rather than warning.
+  #
+  # ── Why a zsh round-trip and not systemd-run inline ───────────────────
+  #
+  # The policy — resolve the binary at CALL time (the native installer
+  # self-updates), probe that a scope in the slice can start before
+  # committing the real invocation, and degrade LOUDLY rather than
+  # silently when there is no user bus — lives exactly once, in
+  # `_claude_slice` (home/claude-egress-slice.nix). Re-deriving it here
+  # would be a second copy of a security control, free to drift from the
+  # one the user's own `claude` goes through; the first time the two
+  # disagreed, the restore path would be the one nobody was looking at.
+  # `_claude_slice` is a shell FUNCTION (that file explains why it cannot
+  # be a PATH wrapper), so reaching it means a zsh that has read the
+  # user's rc — the same rc tests/claude-egress.nix drives.
+  #
+  # ── Why the rc is SOURCED and the shell is not interactive ────────────
+  #
+  # `zsh -i -c CMD` was the obvious way to get the rc read, and it has a
+  # failure mode with no floor: an rc that `exec`s or `exit`s FOR
+  # INTERACTIVE SHELLS — a tmux auto-attach line is the classic — never
+  # reaches CMD at all. For panes 1..N that loses a pane. For pane 0 it
+  # loses everything: pane 0 is the stub's ONLY window, so its immediate
+  # exit takes kitty down with it, which is the no-terminal class this
+  # module already had to fix once.
+  #
+  # Sourcing the rc from a NON-interactive shell reaches the same single
+  # definition without ever entering an interactive-guarded branch.
+  # Measured against zsh 5.9 with four rcs (2026-09-04), launcher output
+  # per rc, `-i -c` vs `-c` + source:
+  #
+  #   rc that execs when interactive   nothing ran   | _claude_slice ran
+  #   rc that exits when interactive   nothing ran   | _claude_slice ran
+  #   rc with a parse error            loud fallback | loud fallback
+  #   rc that does not exist           loud fallback | loud fallback
+  #
+  # so it strictly dominates: the hazard class goes, and both existing
+  # degradations are unchanged (zsh's `source` of a missing file returns
+  # non-zero without exiting the shell, unlike POSIX `.`). `~/.zshenv` is
+  # read by every zsh, interactive or not, so ZDOTDIR is already correct
+  # when the path below is expanded, and the PATH the native Claude Code
+  # installer relies on is identical either way — verified on the
+  # deployed rc: `whence -p claude` gives ~/.local/bin/claude under both.
+  #
+  # What is left is an rc that execs or exits UNCONDITIONALLY. No
+  # launcher shape survives that, and neither does the user's own
+  # terminal, so it is not a hazard this module can be the one to carry.
+  #
+  # The launcher is handed the recorded claude path as `$0`, so the
+  # fallback branch still starts the user's session when the function is
+  # missing — the established trade-off from claude-egress-slice.nix is
+  # "observation degrades, the tool never fails to start", and a restore
+  # that opened no pane would be a worse outcome than an announced
+  # unobserved one.
+  claudeSliceLaunchPy = ''
+    # The zsh that owns the definition, by store path rather than
+    # $SHELL: restore runs from a background process where $SHELL may
+    # be unset, and this is the same zsh home-manager writes ~/.zshrc
+    # for. `-c` runs the launcher and exits, so the pane's lifetime is
+    # still claude's; the rc is sourced explicitly rather than by way
+    # of `-i`, for the reason set out above this string.
+    SLICE_SHELL = "${pkgs.zsh}/bin/zsh"
+    SLICE_MARK = "_claude_slice"
+    SLICE_SCRIPT = (
+        'source ''${ZDOTDIR:-$HOME}/.zshrc; '
+        'if typeset -f _claude_slice >/dev/null; then '
+        '_claude_slice "$@"; '
+        'else '
+        "print -ru2 -- 'claude-egress: UNOBSERVED "
+        "(_claude_slice is not defined in this shell, so this restored "
+        "pane runs Claude Code outside claude-egress.slice)'; "
+        'exec "$0" "$@"; '
+        'fi'
+    )
+
+
+    def _is_claude_exe(cmdline):
+        """True when cmdline[0] is the claude-code CLI itself."""
+        if not cmdline:
+            return False
+        return os.path.basename(cmdline[0]) == "claude"
+
+
+    def unwrap_slice(cmdline):
+        """The claude argv inside a slice launcher, else cmdline.
+
+        Every "is this a claude pane" question has to see through the
+        launcher. kitty records `window.cmdline` as what it spawned,
+        which after a restore is the zsh launcher rather than claude —
+        and that field is precisely what identifies a ZOMBIE pane
+        (claude gone, an orphaned stdio MCP server still holding the
+        pty). Without this, one restore would strip a pane of its
+        claude identity and the next would relaunch the orphan.
+        """
+        cmdline = cmdline or []
+        if (
+            len(cmdline) > 3
+            and os.path.basename(cmdline[0]) == "zsh"
+            and cmdline[1] == "-c"
+            and SLICE_MARK in cmdline[2]
+        ):
+            return cmdline[3:]
+        return cmdline
+
+
+    def unwrap_launchers(cmdline):
+        """The pane's own argv under every launcher this module adds.
+
+        Pane 0 is reached through BOTH of them: kitty spawns the
+        --exec-pane0 launcher, whose argv is the slice launcher, whose
+        argv is claude. Anything that asks "is this a claude pane" of a
+        `window.cmdline` has to strip both, in that order, or a
+        restored pane 0 loses its identity on the next snapshot.
+        """
+        return unwrap_slice(unwrap_pane0(cmdline))
+
+
+    def _is_claude(cmdline):
+        """True when this pane's command is claude, wrapped or not."""
+        return _is_claude_exe(unwrap_launchers(cmdline))
+
+
+    def slice_launch(cmdline):
+        """How a claude pane must actually be spawned.
+
+        Unwraps first, so wrapping is idempotent: a snapshot taken
+        after a restore already holds a wrapped cmdline and must not
+        grow a second launcher on the next one. Non-claude panes are
+        returned untouched — the slice is for Claude Code, and putting
+        a shell in it would make the egress report meaningless.
+        """
+        inner = unwrap_launchers(cmdline)
+        if not _is_claude_exe(inner):
+            # Everything but the pane-0 launcher comes back exactly as
+            # recorded; that one never does, because handing a pane
+            # back the launcher AS its command is the exec loop.
+            return unwrap_pane0(cmdline)
+        return [SLICE_SHELL, "-c", SLICE_SCRIPT] + inner
+  '';
+
   # Convert `kitty @ ls` JSON snapshot → kitty session-file format
   # (https://sw.kovidgoyal.net/kitty/overview/#startup-sessions).
   # Restores OS-window/tab/window topology, layouts, cwds, titles. Does
@@ -8,32 +423,39 @@ let
   kittySessionConvert = pkgs.writers.writePython3Bin "kitty-session-convert" {} ''
     import json
     import os
+    import re
     import shlex
     import sys
 
 
-    def _is_claude(cmdline):
-        """True when cmdline[0] is the claude-code CLI."""
-        if not cmdline:
-            return False
-        return os.path.basename(cmdline[0]) == "claude"
+    ${kittySessionTokenPy}
 
+    ${kittyInternalWindowPy}
+
+    ${kittyPane0LaunchPy}
+
+    ${claudeSliceLaunchPy}
 
     def pane_cmd(win):
         """The command this pane should be recorded as running.
 
-        Mirrors kitty-restore-session's picker: a `claude` entry
-        anywhere in the pid-ordered foreground list wins, then the
-        cmdline kitty actually launched the window with, then
-        foreground_processes[0]. Keeps last.session an honest
-        rendering of what restore will do.
+        Mirrors kitty-restore-session's picker, including the
+        pane-0-launcher unwrap: a `claude` entry anywhere in the
+        pid-ordered foreground list wins, then the cmdline kitty
+        actually launched the window with (minus the --exec-pane0
+        launcher, which is this module's own indirection and not a
+        command anybody can run), then foreground_processes[0]. Keeps
+        last.session an honest rendering of what restore will do —
+        and, since a human can feed last.session back to `kitty
+        --session`, keeps the launcher out of a file that would then
+        exec it as pane 0's command.
         """
         fg = win.get("foreground_processes") or []
         for fp in fg:
             cl = fp.get("cmdline") or []
             if _is_claude(cl):
                 return cl
-        wc = win.get("cmdline") or []
+        wc = unwrap_pane0(win.get("cmdline") or [])
         if wc:
             return wc
         return (fg[0].get("cmdline") or []) if fg else []
@@ -57,24 +479,30 @@ let
             # directive — `cd` between launches can confuse kitty into
             # opening extra OS windows under `--session`.
             for win in tab.get("windows", []):
+                # Skip kitty's own chrome (the `kitten ask` close
+                # confirmation, the `__show_error__` config-error
+                # overlay). Restoring one re-shows a dialog nobody
+                # asked for, and it inflates the pane count every
+                # other script derives its behaviour from.
+                if window_is_internal(win):
+                    continue
                 cwd = win.get("cwd")
                 wtitle = win.get("title", "")
-                cmdline = pane_cmd(win)
-                # Skip transient kitty internals (e.g. the `kitten ask`
-                # confirmation dialog tab that kitty spawns when the user
-                # clicks X with running processes — restoring it
-                # re-shows the prompt on next launch).
-                if any("kitten" in a for a in cmdline) and "ask" in cmdline:
-                    continue
+                # The session file has to be an honest rendering of what
+                # restore does, and what restore does with a claude pane
+                # is put it in claude-egress.slice. A last.session that
+                # launched a bare `claude` would hand anyone who fed it
+                # to `kitty --session` an unobserved session.
+                cmdline = slice_launch(pane_cmd(win))
                 parts = ["launch"]
                 if cwd:
                     parts.append("--cwd")
-                    parts.append(shlex.quote(cwd))
+                    parts.append(session_token(cwd))
                 if wtitle:
                     parts.append("--title")
-                    parts.append(shlex.quote(wtitle))
+                    parts.append(session_token(wtitle))
                 if cmdline:
-                    parts.extend(shlex.quote(a) for a in cmdline)
+                    parts.extend(session_token(a) for a in cmdline)
                 out.append(" ".join(parts))
     sys.stdout.write("\n".join(out) + "\n")
   '';
@@ -93,17 +521,38 @@ let
     """
     import glob
     import json
+    import os
     import subprocess
     import sys
 
 
+    ${kittyInternalWindowPy}
+
+    def _answers(sock):
+        """True when a live kitty is listening on `sock`."""
+        r = subprocess.run(
+            ["kitty", "@", "--to", sock, "ls"],
+            capture_output=True, timeout=3,
+        )
+        return r.returncode == 0
+
+
     def find_socket():
+        """Locate the kitty to talk to, preferring the one that spawned us.
+
+        kitty exports KITTY_LISTEN_ON into every window it launches, so
+        the ctrl+n binding (`launch --type=background kitty-pane-add`)
+        already knows the right socket. The glob is the fallback for
+        invocations from outside kitty, and it only ever knew about the
+        `unix:/tmp/kitty.sock` default -- it finds nothing if listen_on
+        is ever moved. Both candidates are still probed, so a stale
+        KITTY_LISTEN_ON falls through to the glob instead of failing.
+        """
+        env_sock = os.environ.get("KITTY_LISTEN_ON")
+        if env_sock and _answers(env_sock):
+            return env_sock
         for f in sorted(glob.glob("/tmp/kitty.sock-*")):
-            r = subprocess.run(
-                ["kitty", "@", "--to", f"unix:{f}", "ls"],
-                capture_output=True, timeout=3,
-            )
-            if r.returncode == 0:
+            if _answers(f"unix:{f}"):
                 return f"unix:{f}"
         return None
 
@@ -160,11 +609,28 @@ let
             print("no tab", file=sys.stderr)
             sys.exit(1)
 
-        # Inherit cwd from the focused window if --cwd wasn't given.
-        if cwd is None and focused_win is not None:
+        # Inherit cwd from the focused window if --cwd wasn't given —
+        # but not from an overlay kitty focused on its own (its cwd is
+        # wherever kitty happened to be, not where the user is).
+        if (
+            cwd is None
+            and focused_win is not None
+            and not window_is_internal(focused_win)
+        ):
             cwd = focused_win.get("cwd")
 
-        windows = active_tab.get("windows", [])
+        # Count REAL panes only. kitty's own overlay windows (config
+        # error, close confirmation) live in the same tab and are
+        # indistinguishable from panes in `kitty @ ls`; counting one
+        # shifts the whole vsplit/hsplit/new-tab sequence by a step and
+        # every added pane lands in a single column instead of the 2x2
+        # grid. Reproduced 2026-09-04: a mis-parsed session stub left an
+        # `__show_error__` window behind and the restored session came
+        # back stacked.
+        windows = [
+            w for w in active_tab.get("windows", [])
+            if not window_is_internal(w)
+        ]
         count = len(windows)
 
         common = []
@@ -179,8 +645,17 @@ let
         # Use insertion order via window ID (kitty auto-increments).
         # Smallest id = original full-height "left" pane; second-smallest
         # = result of vsplit, i.e. full-height "right" pane.
-        # `kitty @ ls` JSON doesn't expose at_x/at_y so we can't infer
-        # geometry directly.
+        #
+        # Insertion order rather than geometry because CREATING the
+        # next pane only needs to know which existing pane to split.
+        # An earlier comment here claimed geometry was unavailable at
+        # all; that is wrong and it misled the reflow work. Pixel
+        # coordinates really are absent (window.py:2272 as_dict has no
+        # at_x/at_y), but the full split TREE is not: `kitty @ ls`
+        # carries `tabs[].layout_state.pairs` (tabs.py:1461 ->
+        # layout/splits.py:959) plus `tabs[].groups`. That is what
+        # kitty-panes-reflow below reads to decide whether an existing
+        # layout is already the canonical grid.
         sorted_ids = sorted(w["id"] for w in windows)
         if count == 0:
             run("launch", *common, *cmd)
@@ -200,6 +675,678 @@ let
         main()
   '';
 
+  # Rearrange the panes a RUNNING kitty already has into the same
+  # canonical grid kitty-pane-add CREATES, without killing or
+  # respawning anything: every pane may be a long-lived `claude`
+  # session, so the only acceptable primitive is one that RE-PARENTS a
+  # window. `kitty @ detach-window` is that primitive; `launch` is not.
+  #
+  # Why detach-and-rebuild rather than driving the existing tree in
+  # place: no remote-control primitive can put a window at a CHOSEN
+  # INTERIOR slot of an arbitrary splits tree.
+  # `layout_action move_to_screen_edge` only re-roots outside-in
+  # (layout/splits.py:799 sets new_root=(win, whole_old_tree)),
+  # `layout_action rotate` only flips the pair holding the active
+  # window (splits.py:780), and `action move_window` is a pure SWAP of
+  # two existing leaves (window_list.py:517) which never changes the
+  # tree SHAPE. `_insert_window_in_direction` (boss.py:3368) is the
+  # primitive that would do it and is reachable only from mouse
+  # drag-and-drop (tabs.py:2101). Rebuilding into fresh EMPTY tabs is
+  # therefore the only sequence whose result is deterministic.
+  #
+  # Verified against kitty 0.48.2 by driving a real kitty under Xvfb:
+  # six stacked panes came back as 2x2 + 2 with all six PIDs
+  # byte-identical before and after.
+  kittyPanesReflow = pkgs.writers.writePython3Bin "kitty-panes-reflow" {} ''
+    """Reflow a running kitty's panes into the canonical 2x2 grid.
+
+    Usage: kitty-panes-reflow [--plan]
+    """
+    import fcntl
+    import glob
+    import json
+    import os
+    import subprocess
+    import sys
+    import traceback
+
+
+    ${kittyInternalWindowPy}
+
+    # Panes per tab in the canonical grid. Not a tunable: it IS the
+    # 2x2 shape kitty-pane-add creates (pane 1 full, pane 2 vsplit,
+    # pane 3 hsplit on the left, pane 4 hsplit on the right, pane 5+
+    # a new tab), and canonical_pairs()/plan_chunk() below are written
+    # for exactly those four slots. Wanting a different grid means
+    # rewriting both of them, not editing this number.
+    PANES_PER_TAB = 4
+
+    # What the notice overlay runs. sys.executable rather than a shell:
+    # the overlay is spawned BY KITTY, whose PATH is the desktop
+    # session's and not this script's, and this interpreter is already
+    # in the closure and already an absolute path. It prints the
+    # message and waits for one line, so Enter dismisses the window and
+    # nothing is left behind -- unlike `launch --hold`, which follows
+    # the command with a shell the user then has to close.
+    NOTICE_PY = (
+        "import sys\n"
+        "print(sys.argv[1])\n"
+        "try:\n"
+        "    input()\n"
+        "except BaseException:\n"
+        "    pass\n"
+    )
+
+
+    def _answers(sock):
+        """True when a live kitty is listening on `sock`."""
+        r = subprocess.run(
+            ["kitty", "@", "--to", sock, "ls"],
+            capture_output=True, timeout=3,
+        )
+        return r.returncode == 0
+
+
+    def find_socket():
+        """The kitty to reflow. KITTY_LISTEN_ON wins outright.
+
+        Deliberately unlike kitty-pane-add: a stale KITTY_LISTEN_ON
+        does NOT fall through to the /tmp/kitty.sock-* glob. Adding a
+        pane to the wrong kitty is a nuisance; rearranging every pane
+        of the wrong kitty is destruction, and the glob is precisely
+        the path by which a test harness would reach the user's live
+        session.
+        """
+        env_sock = os.environ.get("KITTY_LISTEN_ON")
+        if env_sock:
+            return env_sock if _answers(env_sock) else None
+        for f in sorted(glob.glob("/tmp/kitty.sock-*")):
+            if _answers("unix:" + f):
+                return "unix:" + f
+        return None
+
+
+    # The socket, once found, so a refusal raised deep in the plan can
+    # still be shown to the user. None on the --plan path, which never
+    # talks to a kitty at all.
+    SOCK = None
+
+    NOTICE_TITLE = "kitty-panes-reflow"
+
+
+    def surface(msg):
+        """Put `msg` where the user will actually see it.
+
+        The only invocation the user makes is the ctrl+shift+r binding,
+        which runs this command through `launch --type=background` --
+        and kitty gives such a process no window and no pty. It is
+        spawned with kitty's OWN stdout and stderr
+        (boss.run_background_process, boss.py:2913 Popen with
+        stdout/stderr defaulted), so everything printed goes to kitty's
+        log. Measured under Xvfb against kitty 0.48.2: a background
+        launch printing to both streams left the text in kitty's stderr
+        log and in NO window -- `kitty @ get-text` over every window
+        found none of it. Every refusal was therefore inaudible on the
+        one path that matters, and a part-rebuilt layout came with no
+        way to know why or what to do.
+
+        An overlay over the window the user is looking at, so it lands
+        where their eyes are even when the refusal is precisely that a
+        DIFFERENT OS window took focus. It is marked as this module's
+        own chrome (OWN_UI_ENV), so no snapshot restores it as a pane
+        and no later reflow gives it a grid slot -- the same treatment
+        kitty's own overlays get. Dismissed with Enter, so it does not
+        leave a shell behind the way `launch --hold` would.
+
+        Best-effort by construction: a refusal that cannot be shown is
+        still printed and still a refusal.
+        """
+        if not SOCK:
+            return
+        body = msg + "\n\n[press Enter to dismiss]"
+        try:
+            subprocess.run(
+                [
+                    "kitty", "@", "--to", SOCK, "launch",
+                    "--type=overlay", "--title", NOTICE_TITLE,
+                    "--env", OWN_UI_ENV + "=1",
+                    # `--` because the message is data: a line starting
+                    # with a dash must not be read as an option.
+                    "--", sys.executable, "-c", NOTICE_PY, body,
+                ],
+                check=False, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+    def ls(sock):
+        out = subprocess.check_output(
+            ["kitty", "@", "--to", sock, "ls"], text=True,
+        )
+        return json.loads(out)
+
+
+    def rc(sock, *args):
+        subprocess.run(["kitty", "@", "--to", sock, *args], check=True)
+
+
+    def tab_panes(tab):
+        """The tab's real panes, one per window GROUP, in group order.
+
+        A pane is a GROUP, not a window. kitty puts an overlay into
+        the SAME group as the window it covers -- the config-error
+        window is built with overlay_for=<window id>
+        (boss.py:2485-2494) and the close-confirmation `ask` kitten
+        likewise -- and the splits tree is keyed by group id
+        (tabs.py:1465 list_groups). So an overlay can never occupy a
+        grid slot of its own, and a group holding nothing but kitty's
+        own chrome is not a pane at all and is left exactly where it
+        is. Same window_is_internal() predicate kitty-pane-add,
+        kitty-session-convert and kitty-session-commit use, so none of
+        the four can disagree about what a pane is.
+
+        Falls back to one-pane-per-window for a payload with no
+        `groups` key.
+        """
+        by_id = {w.get("id"): w for w in tab.get("windows", [])}
+        panes = []
+        groups = tab.get("groups")
+        if groups:
+            for g in groups:
+                real = [
+                    by_id[i] for i in g.get("windows", [])
+                    if i in by_id and not window_is_internal(by_id[i])
+                ]
+                if real:
+                    panes.append(
+                        {"group": g.get("id"), "window": real[0]["id"]}
+                    )
+            return panes
+        for w in tab.get("windows", []):
+            if not window_is_internal(w):
+                panes.append({"group": None, "window": w.get("id")})
+        return panes
+
+
+    def canonical_pairs(gids):
+        """kitty's serialized splits tree for `gids` in slot order.
+
+        Slot order is creation order: upper-left, upper-right,
+        lower-left, lower-right. `horizontal` shows up only on the
+        vertically-split pairs because Pair.serialize emits the key
+        only when it is False (layout/splits.py:42-45) -- a tree
+        compared against one that spells out `"horizontal": true`
+        would never match anything kitty reports.
+        """
+        n = len(gids)
+        if n <= 1:
+            return {"one": gids[0]} if gids else {}
+        if n == 2:
+            return {"one": gids[0], "two": gids[1]}
+        left = {"horizontal": False, "one": gids[0], "two": gids[2]}
+        if n == 3:
+            return {"one": left, "two": gids[1]}
+        return {
+            "one": left,
+            "two": {"horizontal": False, "one": gids[1], "two": gids[3]},
+        }
+
+
+    def tree_shape(node):
+        """A serialized Pair tree with its leaf identities erased.
+
+        Leaf identity is dropped on purpose: reflow's contract is the
+        GRID, not which pane sits in which cell, so a tab that already
+        has the canonical shape must not be torn down merely to
+        reorder it. `bias` is ignored for the same reason -- kitty
+        serializes it only when the user has dragged a divider off
+        centre (splits.py:46-47), and rebuilding would silently undo
+        that.
+        """
+        if node is None:
+            return None
+        if not isinstance(node, dict):
+            return "pane"
+        return (
+            bool(node.get("horizontal", True)),
+            tree_shape(node.get("one")),
+            tree_shape(node.get("two")),
+        )
+
+
+    def tree_leaves(node):
+        if node is None:
+            return []
+        if not isinstance(node, dict):
+            return [node]
+        return tree_leaves(node.get("one")) + tree_leaves(node.get("two"))
+
+
+    def tab_is_canonical(tab, panes):
+        """True when this tab already holds the canonical grid."""
+        if tab.get("layout") != "splits":
+            # `stack` (and anything else) serializes no `pairs` at
+            # all, so there is nothing to compare and the tab has to
+            # be rebuilt into a splits one.
+            return False
+        pairs = (tab.get("layout_state") or {}).get("pairs")
+        if not isinstance(pairs, dict):
+            return False
+        gids = [p["group"] for p in panes]
+        if None in gids:
+            return False
+        if sorted(tree_leaves(pairs)) != sorted(gids):
+            # A slot is held by something that is not one of this
+            # tab's panes -- e.g. a kitten kitty opened as a window of
+            # its own rather than as an overlay. Not the canonical
+            # grid; reflow rebuilds around it and leaves it put.
+            return False
+        if len(gids) == 1:
+            # A lone pane looks identical in either slot of the root
+            # pair, so `{"two": g}` counts as canonical too: detaching
+            # it into a fresh tab would be pure churn.
+            return True
+        return tree_shape(pairs) == tree_shape(canonical_pairs(gids))
+
+
+    def pick_os_window(data):
+        """The single OS window to reflow, or None when unsure.
+
+        `kitty @ ls` returns a LIST of OS windows (boss.py:509
+        list_os_windows) and `detach-window --target-tab new` creates
+        its tab in the CURRENT one (boss.py:3338 ->
+        current_os_window()), so reflowing a non-focused OS window
+        would scatter its panes into the focused one. Refusing beats
+        guessing. `is_focused` is empty when no window manager has
+        assigned focus (a bare X server, e.g. under Xvfb), hence the
+        is_active / last_focused fallbacks before the single-window
+        one.
+        """
+        for key in ("is_focused", "is_active", "last_focused"):
+            for osw in data:
+                if osw.get(key):
+                    return osw
+        return data[0] if len(data) == 1 else None
+
+
+    def focused_window(osw):
+        """Id of the window the user is actually sitting in.
+
+        Not a scan for `is_focused` over every window: kitty sets that
+        flag on the active window of EVERY tab of the focused OS
+        window (tabs.py:1064 -- `w is active_window` of its own tab,
+        and the OS window is focused), so a naive scan picks whichever
+        tab happens to come last.
+        """
+        tabs = osw.get("tabs", [])
+        tab = next((t for t in tabs if t.get("is_focused")), None)
+        if tab is None:
+            tab = next((t for t in tabs if t.get("is_active")), None)
+        if tab is None:
+            return None
+        for w in tab.get("windows", []):
+            if w.get("is_focused") or w.get("is_active"):
+                return w.get("id")
+        return None
+
+
+    def collect(osw):
+        """[(tab, panes)] for every tab of `osw` holding a real pane."""
+        out = []
+        for tab in osw.get("tabs", []):
+            panes = tab_panes(tab)
+            if panes:
+                out.append((tab, panes))
+        return out
+
+
+    def is_canonical(osw):
+        """True when this OS window needs no work at all.
+
+        Two conditions. The panes have to be DISTRIBUTED canonically
+        --- full tabs of PANES_PER_TAB with the remainder last --- and
+        each tab has to hold the canonical shape for its own count.
+        Tabs holding no real pane are skipped rather than counted,
+        which is what makes a second run after a reflow that left a
+        chrome-only tab behind settle instead of oscillating.
+        """
+        entries = collect(osw)
+        total = sum(len(p) for _, p in entries)
+        if total == 0:
+            return True
+        full, rest = divmod(total, PANES_PER_TAB)
+        want = [PANES_PER_TAB] * full + ([rest] if rest else [])
+        if [len(p) for _, p in entries] != want:
+            return False
+        return all(tab_is_canonical(t, p) for t, p in entries)
+
+
+    def plan_chunk(chunk):
+        """Steps that rebuild one canonical tab out of `chunk`.
+
+        Transcribed from the sequence measured against kitty 0.48.2.
+        Every step RE-PARENTS an existing window, so no pane's process
+        is ever killed or respawned:
+
+          * `--target-tab new` makes an EMPTY tab -- new_tab(
+            empty_tab=True), boss.py:3338 -- and moves the anchor into
+            it. No shell is spawned.
+          * `--target-tab id:T` is NOT an append. attach_windows ->
+            Tab._add_window(location=None) ->
+            add_non_overlay_window (layout/splits.py:629) splits along
+            the default axis, anchored on the TARGET TAB'S ACTIVE
+            window. That is why every detach is preceded by an
+            explicit focus-window naming its anchor.
+          * `layout_action rotate 90` flips `horizontal` on the pair
+            holding the ACTIVE window (splits.py:780-798), turning the
+            vsplit that was just made into the hsplit the lower row
+            needs. It reads the tab's active group, NOT the command's
+            --match, so the focus step before it is load bearing.
+
+        Anchor windows, not tab ids: `--target-tab new` allocates an
+        id that cannot be known when the plan is built, and kitty
+        reallocates GROUP ids on every attach. Window ids are the only
+        identifier that survives the whole sequence.
+        """
+        ul = chunk[0]["window"]
+        # Focus the anchor BEFORE detaching it. `--target-tab new`
+        # builds its tab in whatever OS window is current when it runs
+        # (boss.py:3325 -> current_os_window()), and focusing a window
+        # is what makes that window's OS window current
+        # (rc/focus_window.py -> set_active_window(
+        # switch_os_window_if_needed=True)). Without it the first
+        # detach of every chunk is a bet on ambient focus.
+        steps = [["focus", ul], ["detach-new", ul], ["layout-splits", ul]]
+        if len(chunk) > 1:
+            steps += [["focus", ul], ["detach-to", chunk[1]["window"], ul]]
+        if len(chunk) > 2:
+            ll = chunk[2]["window"]
+            steps += [
+                ["focus", ul], ["detach-to", ll, ul],
+                ["focus", ll], ["rotate"],
+            ]
+        if len(chunk) > 3:
+            lr = chunk[3]["window"]
+            steps += [
+                ["focus", chunk[1]["window"]], ["detach-to", lr, ul],
+                ["focus", lr], ["rotate"],
+            ]
+        # Leave the rebuilt tab level. kitty serializes a non-central
+        # `bias` and tree_shape() deliberately ignores it, so without
+        # this a rebuilt tab could come back visibly lopsided and no
+        # later run would ever notice.
+        steps += [["focus", ul], ["equalize"]]
+        return steps
+
+
+    def build_plan(data):
+        """{os_window, noop, steps} for a `kitty @ ls` payload."""
+        osw = pick_os_window(data)
+        if osw is None:
+            return None
+        if is_canonical(osw):
+            return {"os_window": osw.get("id"), "noop": True, "steps": []}
+        panes = [p for _, ps in collect(osw) for p in ps]
+        steps = []
+        for i in range(0, len(panes), PANES_PER_TAB):
+            steps += plan_chunk(panes[i:i + PANES_PER_TAB])
+        focused = focused_window(osw)
+        if focused is not None:
+            # Every detach ends with target_tab.make_active()
+            # (boss.py:3352) and every anchor focus moves the cursor,
+            # so reflow finishes somewhere arbitrary unless it puts
+            # the user back.
+            steps.append(["focus", focused])
+        return {"os_window": osw.get("id"), "noop": False, "steps": steps}
+
+
+    def locate(sock, wid):
+        """(tab id, OS window id) currently holding window `wid`."""
+        for osw in ls(sock):
+            for tab in osw.get("tabs", []):
+                for w in tab.get("windows", []):
+                    if w.get("id") == wid:
+                        return tab.get("id"), osw.get("id")
+        return None, None
+
+
+    def _resolve_tab(sock, anchor, target):
+        tab, oswid = locate(sock, anchor)
+        if tab is None:
+            raise SystemExit(
+                "kitty-panes-reflow: anchor window %s disappeared "
+                "mid-reflow" % anchor
+            )
+        if oswid != target:
+            raise SystemExit(
+                "kitty-panes-reflow: anchor window %s now lives in OS "
+                "window %s, not the %s this reflow planned against; "
+                "stopping rather than rebuilding a window nobody asked "
+                "about" % (anchor, oswid, target)
+            )
+        return tab
+
+
+    def _require_os_window(sock, target):
+        """Refuse unless the OS window kitty will act on is the one
+        this reflow planned against.
+
+        Two of the steps read AMBIENT state rather than their
+        arguments. `detach-window --target-tab new` builds its tab in
+        current_os_window() (boss.py:3325), and `action layout_action`
+        lands on boss.active_window — `kitty @ action` cannot be
+        pinned with --match, because rc/action.py sends the option as
+        `match_window` while windows_for_match_payload only ever reads
+        `match` (rc/base.py:381), so the flag is accepted and ignored.
+        Every plan step is therefore preceded by a focus-window that
+        MAKES the planned OS window current, and this checks that the
+        focus actually took before the ambient command fires.
+        A user alt-tabbing to a second kitty window, or a second
+        reflow racing, is what it catches.
+
+        Checked immediately before each ambient command rather than
+        once up front: that is the only placement where it means
+        anything, since focus can move between any two steps.
+        """
+        osw = pick_os_window(ls(sock))
+        cur = osw.get("id") if osw else None
+        if cur != target:
+            raise SystemExit(
+                "kitty-panes-reflow: OS window %s is current, not the "
+                "%s this reflow planned against (another kitty window "
+                "took focus, or the planned one is gone). Stopping: "
+                "the layout is part-rebuilt, run it again to converge."
+                % (cur, target)
+            )
+
+
+    def execute(sock, target, steps):
+        for step in steps:
+            op = step[0]
+            if op == "focus":
+                rc(sock, "focus-window", "--match=id:%d" % step[1])
+            elif op == "detach-new":
+                _require_os_window(sock, target)
+                rc(sock, "detach-window", "--match=id:%d" % step[1],
+                   "--target-tab", "new")
+                # And the tab it made really is in the planned window.
+                _resolve_tab(sock, step[1], target)
+            elif op == "detach-to":
+                tab = _resolve_tab(sock, step[2], target)
+                rc(sock, "detach-window", "--match=id:%d" % step[1],
+                   "--target-tab", "id:%d" % tab)
+            elif op == "layout-splits":
+                tab = _resolve_tab(sock, step[1], target)
+                rc(sock, "goto-layout", "--match=id:%d" % tab, "splits")
+            elif op == "rotate":
+                _require_os_window(sock, target)
+                rc(sock, "action", "layout_action", "rotate", "90")
+            elif op == "equalize":
+                _require_os_window(sock, target)
+                rc(sock, "action", "layout_action", "equalize")
+            else:
+                raise SystemExit("unknown reflow step: " + repr(step))
+
+
+    def lock_path():
+        return os.path.join(
+            os.environ.get(
+                "XDG_CACHE_HOME",
+                os.path.join(os.path.expanduser("~"), ".cache"),
+            ),
+            "kitty-session",
+            "reflow.lock",
+        )
+
+
+    def take_lock():
+        """Hold the reflow lock, or refuse to start.
+
+        Two reflows interleaving would each plan against a topology
+        the other is halfway through rebuilding, and both drive the
+        same ambient focus that _require_os_window() is checking.
+        Advisory flock, so a crashed run releases it with its process
+        and there is no stale-lock age to guess at — and no timeout,
+        so no tuned number enters the design.
+
+        The handle is returned because closing it releases the lock:
+        without a live reference CPython would drop it immediately.
+        """
+        path = lock_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fh = open(path, "w")
+        except OSError:
+            # Nowhere to put a lock is not a reason to refuse the
+            # reflow; it only means concurrent runs are unguarded.
+            return None
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            raise SystemExit(
+                "kitty-panes-reflow: another reflow is already running; "
+                "two of them interleaving would each rebuild the "
+                "other's half-finished tabs"
+            )
+        return fh
+
+
+    def run():
+        if "--plan" in sys.argv:
+            # Test-only seam, same role as kitty-restore-session's
+            # --dump-panes: render the plan from a `kitty @ ls`
+            # payload on stdin without talking to any kitty. It is how
+            # the grid arithmetic is asserted with no terminal at all,
+            # and it is why the fast check never has to go looking for
+            # a socket -- /tmp/kitty.sock-* belongs to the user's live
+            # session.
+            try:
+                data = json.load(sys.stdin)
+            except ValueError:
+                print("--plan: stdin is not `kitty @ ls` JSON",
+                      file=sys.stderr)
+                sys.exit(1)
+            plan = build_plan(data)
+            if plan is None:
+                print("--plan: cannot tell which OS window to reflow",
+                      file=sys.stderr)
+                sys.exit(1)
+            json.dump(plan, sys.stdout)
+            return
+
+        # Locating the kitty comes first only so that a refusal has
+        # somewhere to be SHOWN (surface() needs the socket, and the
+        # lock refusal is one of the refusals). It reaches the wire
+        # with `ls` and nothing else; the lock still precedes every
+        # command that MOVES anything, which is what it is for.
+        global SOCK
+        SOCK = find_socket()
+        if not SOCK:
+            # Nothing to reflow and nowhere to say so. stderr only.
+            print("no live kitty", file=sys.stderr)
+            sys.exit(1)
+
+        lock = take_lock()
+        if lock is not None:
+            lock.write("%d\n" % os.getpid())
+            lock.flush()
+
+        plan = build_plan(ls(SOCK))
+        if plan is None:
+            raise SystemExit(
+                "kitty-panes-reflow: several kitty OS windows are open "
+                "and none of them is focused, so there is no way to "
+                "tell which one to reflow. Focus the one you mean and "
+                "run it again."
+            )
+        if plan["noop"]:
+            # Nothing is issued: no detach, no focus change, no
+            # visible churn. This command is meant to be safe to fire
+            # on a hunch -- and for the same reason it is not
+            # surfaced: an overlay every time would make the hunch
+            # expensive.
+            print("layout is already canonical")
+            return
+        try:
+            execute(SOCK, plan["os_window"], plan["steps"])
+        except subprocess.CalledProcessError as err:
+            # A pane closed between the plan and the step that moves
+            # it, or kitty refused the command. Say so instead of
+            # emitting a traceback: the layout is now part-rebuilt,
+            # and a second run converges on it from wherever it
+            # stopped.
+            raise SystemExit(
+                "kitty-panes-reflow: `%s` failed (rc %d); the layout is "
+                "part-rebuilt, run it again"
+                % (" ".join(err.cmd), err.returncode)
+            )
+
+
+    def main():
+        """Every stop reaches the user, whatever raised it.
+
+        The refusals are raised deep -- _require_os_window() and
+        _resolve_tab() fire between two remote-control commands, from
+        inside execute() -- and each one leaves the layout in a state
+        the user has to be told about. Catching SystemExit here, rather
+        than surfacing at each site, is what keeps that guarantee from
+        depending on whoever adds the next refusal remembering to.
+
+        The same argument applies to the exceptions nobody wrote a
+        refusal for. execute() re-reads `kitty @ ls` between steps, so a
+        kitty that answers with something json.loads() rejects raises
+        JSONDecodeError from the middle of a half-rebuilt layout -- and
+        a bare traceback on stderr goes to kitty's log, which is exactly
+        the inaudible place surface() exists to get out of. So: same
+        treatment, one line the user can act on, with the traceback
+        still printed for whoever reads the log afterwards.
+
+        Deliberately `Exception`, not `BaseException`: a ctrl-c or a
+        SIGTERM is the user stopping this themselves, and does not need
+        an overlay explaining itself back to them.
+        """
+        try:
+            run()
+        except SystemExit as exc:
+            if isinstance(exc.code, str):
+                surface(exc.code)
+            raise
+        except Exception as exc:
+            traceback.print_exc()
+            surface(
+                "kitty-panes-reflow: stopped on an unexpected error "
+                "(%s: %s); the layout may be part-rebuilt, run it again "
+                "to converge." % (type(exc).__name__, exc)
+            )
+            raise SystemExit(1)
+
+
+    if __name__ == "__main__":
+        main()
+  '';
+
   # Restore kitty topology from snapshot.json using kitty-pane-add. Waits
   # for the freshly-launched kitty's socket to appear, walks the snapshot,
   # then closes whatever default window kitty opened on startup.
@@ -210,10 +1357,19 @@ let
     import os
     import re
     import shlex
+    import shutil
     import subprocess
     import sys
     import time
 
+
+    ${kittySessionTokenPy}
+
+    ${kittyInternalWindowPy}
+
+    ${kittyPane0LaunchPy}
+
+    ${claudeSliceLaunchPy}
 
     def find_socket(timeout=30):
         deadline = time.time() + timeout
@@ -526,8 +1682,12 @@ let
 
         Mutates `claimed_sids` with the sid this pane ends up using.
         """
-        if not cmd or os.path.basename(cmd[0]) != "claude":
+        # Unwrap first: a snapshot taken after a restore records the
+        # claude-egress launcher as the pane's command, and the session
+        # to resume is decided by the claude argv inside it.
+        if not _is_claude(cmd):
             return cmd
+        cmd = unwrap_slice(cmd)
         proj_dir = None
         if cwd:
             encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
@@ -556,14 +1716,82 @@ let
         return cmd
 
 
-    STUB_PATH = "/tmp/kitty-stub-session"
+    # ---- pane-0 transport ----------------------------------------------
+    #
+    # session_token() above keeps every value that DOES go into the stub
+    # on one line, but flattening the restore notice would gut it: the
+    # orphan block is one line per subagent and one per edited file, and
+    # a wall of run-together text is not the message. So the NOTICE does
+    # not travel through the session file. The stub's launch command is
+    # this very script in --exec-pane0 mode, followed by as much of pane
+    # 0's argv as one line can hold (line_argv(), i.e. everything before
+    # the notice); the full argv, notice included, travels in JSON
+    # (where newlines are escaped by construction) and --exec-pane0
+    # execs it after checking that it extends what the launch line said.
+    # Pane 0 then receives the notice as an argv element by exactly the
+    # mechanism panes 1..N get it -- kitty-pane-add's `-- <cmd>
+    # <notice>` -- which is why there is no second notice-delivery path
+    # to keep in sync.
+    #
+    # The argv on the launch line is not redundant with the JSON. kitty
+    # reports a window's cmdline as what it SPAWNED, and that is what
+    # the next snapshot records as pane 0's command: with only the flag
+    # there, pane 0 was recorded as the launcher itself and the next
+    # restore exec'd it in a loop (kittyPane0LaunchPy). With the argv
+    # there, the record unwraps to the pane's real command, and the
+    # zombie arm of pane_cmd() below keeps working for pane 0 exactly as
+    # it does for panes 1..N.
+    #
+    # The considered alternative was `kitty @ send-text` once the socket
+    # is up. Rejected: it types into whatever the pane is showing, so it
+    # races claude's TUI coming up and the notice's own newlines read as
+    # submissions -- mangling the one message whose job is to be read
+    # exactly.
+
+    def cache_dir():
+        base = os.environ.get(
+            "XDG_CACHE_HOME",
+            os.path.join(os.path.expanduser("~"), ".cache"),
+        )
+        return os.path.join(base, "kitty-session")
 
 
-    def _is_claude(cmdline):
-        """True when cmdline[0] is the claude-code CLI."""
-        if not cmdline:
-            return False
-        return os.path.basename(cmdline[0]) == "claude"
+    def pane0_path():
+        return os.path.join(cache_dir(), "pane0-launch.json")
+
+
+    def stub_path():
+        """Where kitty's `--session` stub is written.
+
+        In the user's own cache dir, beside pane0-launch.json, NOT at
+        a fixed name in world-writable /tmp. kitty runs the launch
+        directives in this file, so it is a program: a predictable
+        /tmp path let anyone on the host pre-create it, or plant a
+        symlink at the name _write_atomic writes through.
+
+        Still overridable, so a test can drive emit_stub without going
+        near the live session's stub. The wrapper in home/kitty.nix
+        reads the same variable with the same default, and
+        tests/kitty-scripts.nix phase H2 asserts the two agree.
+        """
+        return os.environ.get(
+            "KITTY_STUB_PATH", os.path.join(cache_dir(), "stub-session")
+        )
+
+
+    def _self_exe():
+        """Absolute path to this script, for the stub's launch line.
+
+        kitty parses the session file before any login shell has run,
+        so a bare name is not guaranteed to resolve. argv[0] is the
+        store path the wrapper invoked; PATH lookup is the fallback.
+        """
+        cand = sys.argv[0]
+        if cand and os.sep in cand:
+            return os.path.realpath(cand)
+        return (
+            shutil.which("kitty-restore-session") or "kitty-restore-session"
+        )
 
 
     def pane_cmd(win):
@@ -590,24 +1818,29 @@ let
              had asked for it.
           4. foreground_processes[0], for kitty builds that do not
              report a per-window `cmdline` at all.
+
+        Arms 2 and 3 read `window.cmdline` — which for a RESTORED pane
+        0 is the --exec-pane0 launcher, this script's own launch line.
+        unwrap_pane0() takes it back off, so what is recorded is the
+        pane's command and never the launcher: without that, arm 3
+        hands the launcher to the next restore as pane 0's command and
+        --exec-pane0 execs itself in a loop. A launcher recorded in the
+        old flagless shape unwraps to nothing and falls through to arm
+        4, which is how an already-poisoned snapshot recovers.
         """
         fg = win.get("foreground_processes") or []
         for fp in fg:
             cl = fp.get("cmdline") or []
             if _is_claude(cl):
                 return cl
-        wc = win.get("cmdline") or []
+        wc = unwrap_pane0(win.get("cmdline") or [])
         if wc:
             return wc
         return (fg[0].get("cmdline") or []) if fg else []
 
 
     def load_panes():
-        cache = os.environ.get(
-            "XDG_CACHE_HOME",
-            os.path.join(os.path.expanduser("~"), ".cache"),
-        )
-        snap_path = os.path.join(cache, "kitty-session", "snapshot.json")
+        snap_path = os.path.join(cache_dir(), "snapshot.json")
         if not os.path.exists(snap_path) or os.path.getsize(snap_path) == 0:
             return []
         with open(snap_path) as fh:
@@ -626,12 +1859,16 @@ let
         for osw in snap:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
-                    cmd = pane_cmd(win)
-                    # Skip kitty's transient `kitten ask` confirmation
-                    # dialogs (saved if a snapshot fires while the
-                    # close-confirmation tab is open).
-                    if any("kitten" in a for a in cmd) and "ask" in cmd:
+                    # Skip kitty's own chrome — the `kitten ask`
+                    # close-confirmation dialog (saved if a snapshot
+                    # tick fires while it is open) and the
+                    # `__show_error__` config-error overlay. Same
+                    # predicate kitty-pane-add and
+                    # kitty-session-convert use, so the three cannot
+                    # disagree about how many panes there are.
+                    if window_is_internal(win):
                         continue
+                    cmd = pane_cmd(win)
                     cwd = win.get("cwd")
                     sid = win.get("claude_session_id")
                     cmd = maybe_resume_claude(cmd, cwd, sid, claimed_sids)
@@ -643,31 +1880,258 @@ let
         return panes
 
 
+    def _write_atomic(path, text):
+        """Replace `path` with `text`, refusing to write through a
+        symlink.
+
+        O_NOFOLLOW on the temp file, because `path + ".tmp"` is the
+        name an attacker gets to plant at: open('w') would truncate
+        whatever the link pointed at and then os.replace would move
+        the LINK into place, leaving kitty executing a file somebody
+        else still owns. 0600 because these hold the user's cwds,
+        window titles, argv and claude session ids.
+        """
+        tmp = path + ".tmp"
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        )
+        # Explicitly, not just via the open mode: a temp file left
+        # behind by a crashed run keeps whatever mode it already had.
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+
+
+    def line_argv(cmd):
+        """The leading run of `cmd` a session-file line can carry.
+
+        Everything up to the first element holding a line break —
+        which in practice is the whole argv minus the restore notice,
+        always its last element and the one value flattening would gut
+        (see the pane-0 transport note above). Every element kept is
+        line-break-free already, so session_token() only quotes it and
+        kitty's own shlex hands the exact bytes back. That exactness is
+        what lets exec_pane0() match the JSON record against what kitty
+        parsed, and what makes the recorded `window.cmdline` of a
+        restored pane 0 a truthful record of its command rather than a
+        pointer back at the launcher.
+        """
+        out = []
+        for a in cmd:
+            if LINEBREAKS.search(a):
+                break
+            out.append(a)
+        return out
+
+
+    def stub_carries_pane0(pane):
+        """True when the stub's launch line starts pane 0's OWN command.
+
+        False in exactly one case: the pane has a command whose FIRST
+        element holds a line break, so line_argv() keeps nothing and
+        there is no argv to put after the flag. A directory name may
+        contain any byte but '/' and NUL, so a binary under such a path
+        reaches here.
+
+        emit_stub() then declines to write the launcher at all -- a
+        `<self> --exec-pane0` with nothing after it is the exact
+        pre-2026-09-04 shape whose recorded cmdline pointed back at the
+        launcher -- and pane 0 comes up as kitty's default shell. That
+        would SILENTLY drop the user's command, so main() consults the
+        same predicate and restores pane 0 through kitty-pane-add like
+        any other pane, where the argv travels as a list and no line
+        orientation applies.
+
+        A pure function of the snapshot, so the two processes (the
+        wrapper's --emit-stub, then the restore) agree without any
+        shared state: they already both call load_panes().
+
+        A pane with NO recorded command is True, not False: nothing was
+        lost, so re-adding it would only open a second empty shell.
+        """
+        cmd = slice_launch(pane["cmd"])
+        return not cmd or bool(line_argv(cmd))
+
+
     def emit_stub():
-        """Write a kitty session file with only pane 0's launch directive.
-        Kitty starts directly into this single window (no default extra),
-        avoiding a close-window prompt on the spurious startup shell."""
+        """Write kitty's --session stub: pane 0, exactly one line.
+
+        Kitty starts directly into this single window (no default
+        extra), avoiding a close-window prompt on a spurious startup
+        shell. The launch line runs this script in --exec-pane0 mode
+        with as much of pane 0's argv as one line can hold; the full
+        argv, restore notice included, goes to pane0_path() and is what
+        --exec-pane0 actually execs. See the pane-0 transport note
+        above for why the notice cannot travel in the session file.
+        """
         panes = load_panes()
         if not panes:
             return
         p = panes[0]
+        # slice_launch() here and at the kitty-pane-add loop in main(),
+        # NOT inside load_panes(): --dump-panes stays a readout of WHICH
+        # session each pane resolved to, which is what tests assert on,
+        # while the two places that actually start a process are the two
+        # that put it in the slice.
+        cmd = slice_launch(p["cmd"])
         parts = ["launch"]
         if p["cwd"]:
-            parts += ["--cwd", shlex.quote(p["cwd"])]
+            parts += ["--cwd", session_token(p["cwd"])]
         if p["title"]:
-            parts += ["--title", shlex.quote(p["title"])]
-        if p["cmd"]:
-            parts += [shlex.quote(a) for a in p["cmd"]]
-        with open(STUB_PATH, "w") as fh:
-            fh.write(" ".join(parts) + "\n")
+            parts += ["--title", session_token(p["title"])]
+        carried = line_argv(cmd)
+        if cmd and carried:
+            _write_atomic(pane0_path(), json.dumps({
+                "cwd": p["cwd"],
+                "title": p["title"],
+                "cmd": cmd,
+            }))
+            parts += [session_token(_self_exe()), PANE0_FLAG]
+            parts += [session_token(a) for a in carried]
+        elif cmd:
+            # The launcher is NEVER emitted bare. `<self> --exec-pane0`
+            # with nothing after it is the pre-2026-09-04 shape: the
+            # exec-time guard turns it into a shell, so the user's
+            # command would vanish with only a line in kitty's log to
+            # say so. main() sees the same thing through
+            # stub_carries_pane0() and restores this pane over the
+            # remote-control path instead, where the argv travels as a
+            # list.
+            print(
+                "kitty-restore-session: pane 0's command starts with a "
+                "line break (" + repr(cmd[0]) + "), which a session file "
+                "cannot carry. Starting pane 0 as a plain shell and "
+                "restoring the command as an extra pane instead.",
+                file=sys.stderr,
+            )
+        # else: no command was recorded for this pane at all, so there
+        # is nothing for --exec-pane0 to become. A bare `launch` lets
+        # kitty open its default shell, which is the same outcome the
+        # exec-time fallback would reach by a longer route.
+        line = " ".join(parts)
+        # Invariant, not a cleanup. Every token above is line-break-free
+        # by construction, so this can only fire if a later edit adds an
+        # unsanitised one -- and then refusing to write beats handing
+        # kitty a stub it will mis-parse into extra windows. The wrapper
+        # treats a missing stub as "launch plain kitty".
+        if LINEBREAKS.search(line):
+            raise ValueError("stub line is not single-line: " + repr(line))
+        _write_atomic(stub_path(), line + "\n")
+
+
+    def _pane0_record():
+        """pane0_path()'s argv, or None when it is unusable."""
+        try:
+            with open(pane0_path()) as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        cmd = rec.get("cmd") if isinstance(rec, dict) else None
+        if (
+            isinstance(cmd, list)
+            and cmd
+            and all(isinstance(a, str) for a in cmd)
+        ):
+            return cmd
+        return None
+
+
+    def _pane0_cmd(recorded):
+        """What --exec-pane0 should become, or None for "a shell".
+
+        `recorded` is the argv kitty parsed off the stub's launch line
+        after the flag — which is also what kitty reports as this
+        window's cmdline, so it is authoritative about WHICH pane this
+        is. pane0_path() holds the same argv with the multi-line
+        restore notice still attached, and is used only when it EXTENDS
+        `recorded` exactly. That prefix match is what stops a pane
+        launched with some other command from adopting pane 0's
+        `claude --resume <sid>` and landing two panes on one session,
+        which is the corruption claimed_sids exists to prevent.
+        """
+        if os.environ.get(PANE0_EXEC_ENV) == str(os.getpid()):
+            print(
+                "kitty-restore-session: this process has already been "
+                "through " + PANE0_FLAG + " once, so pane 0's recorded "
+                "command leads back here. Refusing to exec it again "
+                "(that is a loop) and opening a shell instead.",
+                file=sys.stderr,
+            )
+            return None
+        if not recorded:
+            # The stub always names pane 0's argv after the flag, and
+            # the wrapper rewrites the stub with THIS binary immediately
+            # before launching kitty, so nothing legitimate reaches here
+            # bare. What used to is a pane restored from a snapshot that
+            # recorded the launcher itself as its command.
+            print(
+                "kitty-restore-session: " + PANE0_FLAG + " with no "
+                "command after it. Opening a shell rather than adopting "
+                "whatever pane 0 was last recorded as running.",
+                file=sys.stderr,
+            )
+            return None
+        if is_pane0_launcher(recorded):
+            print(
+                "kitty-restore-session: refusing to exec the pane-0 "
+                "launcher as pane 0's command -- that is an exec loop. "
+                "Opening a shell instead.",
+                file=sys.stderr,
+            )
+            return None
+        full = _pane0_record()
+        if (
+            full is not None
+            and not is_pane0_launcher(full)
+            and full[:len(recorded)] == recorded
+        ):
+            return full
+        return recorded
+
+
+    def exec_pane0(recorded):
+        """Become pane 0's real command, inside the window kitty made.
+
+        Reached only from the stub's launch line. The argv -- restore
+        notice included -- comes from pane0_path(), so a multi-line
+        notice reaches pane 0 as a single argv element exactly as it
+        reaches panes 1..N through kitty-pane-add.
+        """
+        cmd = _pane0_cmd(recorded)
+        if cmd is None:
+            # Hand the user a shell rather than let kitty close an
+            # empty pane out from under them.
+            cmd = [os.environ.get("SHELL") or "/bin/sh"]
+        # Survives the exec, so a second arrival in this same process
+        # is refused above whatever route brought it back. The argv
+        # checks catch the shapes we know; this catches the rest.
+        os.environ[PANE0_EXEC_ENV] = str(os.getpid())
+        try:
+            os.execvp(cmd[0], cmd)
+        except OSError:
+            os.execvp("/bin/sh", ["/bin/sh"])
 
 
     def main():
-        if "--emit-stub" in sys.argv:
+        # Dispatch on argv[1] POSITIONALLY, never `x in sys.argv`:
+        # everything after --exec-pane0 is pane 0's own argv, and a
+        # membership test would let a restore notice that merely
+        # mentions --emit-stub re-enter the writer instead of starting
+        # the pane.
+        mode = sys.argv[1] if len(sys.argv) > 1 else None
+
+        if mode == "--emit-stub":
             emit_stub()
             return
 
-        if "--dump-panes" in sys.argv:
+        if mode == PANE0_FLAG:
+            exec_pane0(sys.argv[2:])
+            return
+
+        if mode == "--dump-panes":
             # Test-only: emit resolved panes JSON so assertions can
             # inspect maybe_resume_claude's per-pane outcome (including
             # the same-cwd-collision-avoidance fallback) without having
@@ -676,9 +2140,16 @@ let
             return
 
         panes = load_panes()
-        if len(panes) <= 1:
-            # Pane 0 is already created via kitty's --session stub; if
-            # that's all there is, we're done.
+        if not panes:
+            return
+        # Skip pane[0] — kitty already created it from the --session
+        # stub — UNLESS the stub could not carry its command (see
+        # stub_carries_pane0). Then pane 0 came up as a plain shell and
+        # its real command has to be restored the ordinary way, or it is
+        # lost with nothing but a line in kitty's log to show for it.
+        first = 1 if stub_carries_pane0(panes[0]) else 0
+        if len(panes) <= first:
+            # Everything there is to restore is already on screen.
             return
 
         sock = find_socket()
@@ -686,15 +2157,14 @@ let
             print("kitty socket never appeared", file=sys.stderr)
             sys.exit(1)
 
-        # Skip pane[0] — kitty already created it from the --session stub.
-        for p in panes[1:]:
+        for p in panes[first:]:
             argv = ["kitty-pane-add"]
             if p["cwd"]:
                 argv += ["--cwd", p["cwd"]]
             if p["title"]:
                 argv += ["--title", p["title"]]
             if p["cmd"]:
-                argv += ["--", *p["cmd"]]
+                argv += ["--", *slice_launch(p["cmd"])]
             subprocess.run(argv, check=False)
 
 
@@ -762,7 +2232,9 @@ let
 
       dir="''${XDG_CACHE_HOME:-$HOME/.cache}/kitty-session"
       tsv="$dir/pane-sessions.tsv"
-      mkdir -p "$dir"
+      # Same 0700 as kitty-session-save: whichever of the two runs
+      # first on a fresh machine must not leave it world-readable.
+      install -d -m 700 "$dir"
 
       # flock guards concurrent SessionStart hooks (e.g. two new claude
       # sessions starting in the same second) AND the enricher's
@@ -837,12 +2309,9 @@ let
     )
 
 
-    def _is_claude(cmdline):
-        """True when cmdline[0] is the claude-code CLI."""
-        if not cmdline:
-            return False
-        return os.path.basename(cmdline[0]) == "claude"
+    ${kittyPane0LaunchPy}
 
+    ${claudeSliceLaunchPy}
 
     def load_tsv():
         """Return {window_id: session_id}. Malformed lines ignored."""
@@ -925,6 +2394,14 @@ let
         caller uses this to decide whether to overwrite snapshot.json
         or preserve the prior good one.
         """
+        # Audited 2026-09-04 against the internal-window class that
+        # broke kitty-pane-add (`kitten __show_error__`, `kitten ask`):
+        # this function needs no such filter and deliberately has none.
+        # `live` only decides which TSV rows to prune, and a TSV row
+        # exists only for a window whose claude ran the SessionStart
+        # hook, so an overlay's id can never be in it. The collision
+        # check keys off has_claude, which an overlay never satisfies.
+        # Adding a filter here would be dead code, not defence.
         tsv = load_tsv()
         live = set()
         claude_panes_by_cwd = {}
@@ -957,6 +2434,12 @@ let
                     # It stays FALSE for a pane the user launched as a
                     # shell and then quit claude inside — that window's
                     # cmdline is the shell, so no resurrection.
+                    #
+                    # After a restore that cmdline is the claude-egress
+                    # launcher rather than claude itself, which is why
+                    # _is_claude() unwraps: without it the FIRST restore
+                    # would strip every pane of its claude identity and
+                    # the second would relaunch the orphan.
                     has_claude = _is_claude(win.get("cmdline")) or any(
                         _is_claude(fp.get("cmdline")) for fp in fg
                     )
@@ -1046,18 +2529,318 @@ let
     sys.stdout.write(unwrap(sys.stdin.read()))
   '';
 
+  # ---- snapshot retention: named inputs, derived thresholds ---------
+  #
+  # Every number below is an INPUT with a reason. The two thresholds
+  # the code actually reads are PRODUCTS of them, so tuning happens by
+  # changing a reason rather than by nudging a constant until the
+  # symptom stops.
+  #
+  # saveIntervalSeconds — how often kitty-session-save.timer fires. The
+  #   timer and the collapse guard read this same binding, so they
+  #   cannot drift apart.
+  saveIntervalSeconds = 60;
+  # failedRelaunchBurst — how many relaunches one bad-restore episode
+  #   produces before a human intervenes. Three, observed 2026-09-04:
+  #   kitty died holding 6 panes, each of three relaunches re-saved a
+  #   degraded topology, and the third left one pane, at which point
+  #   restore hit `len(panes) <= 1` and opened nothing.
+  failedRelaunchBurst = 3;
+  # A pane-count collapse is only believed once it has SURVIVED a whole
+  # relaunch burst — each failed relaunch can persist at most one
+  # degraded snapshot, one tick apart. Product: 180s.
+  collapseGraceSeconds = failedRelaunchBurst * saveIntervalSeconds;
+  # collapseDivisor — what makes a drop "sharp": losing at least this
+  #   fraction of the panes between two consecutive ticks. Halving is
+  #   not something a user does by hand inside one tick, and closing
+  #   panes one at a time never trips it.
+  collapseDivisor = 2;
+  # historyBurstsCovered — how many independent bad episodes the
+  #   history has to outlive. The ring holds one entry per DISTINCT
+  #   pane count (the newest snapshot at that size), so an episode
+  #   contributes at most failedRelaunchBurst slots — one per failed
+  #   relaunch. Product: 12 slots, ~20KB each.
+  historyBurstsCovered = 4;
+  snapshotHistoryKeep = failedRelaunchBurst * historyBurstsCovered;
+  # historyMinPanes — the smallest topology worth recovering. A
+  #   snapshot at or below one pane carries nothing a human would
+  #   restore, so it never enters the ring and therefore can never
+  #   evict one that does.
+  historyMinPanes = 2;
+
+  # Decide whether a freshly-enriched snapshot may replace the current
+  # one, and keep a bounded history of the good ones. Split out of
+  # kitty-session-save so this arithmetic is testable without a kitty:
+  # the save wrapper's PATH is pinned to its runtimeInputs, so a test
+  # cannot stand in for `kitty @ ls` there.
+  #
+  # Exit codes:
+  #   0 — candidate committed as the new snapshot.json.
+  #   3 — candidate refused; the prior good snapshot is preserved.
+  #   1 — bad usage / unreadable candidate.
+  kittySessionCommit = pkgs.writers.writePython3Bin "kitty-session-commit" {} ''
+    """Commit a kitty snapshot, or preserve the prior good one.
+
+    Usage: kitty-session-commit <cache-dir>   (candidate JSON on stdin)
+    """
+    import json
+    import os
+    import re
+    import shutil
+    import sys
+    import time
+
+
+    ${kittyInternalWindowPy}
+
+    # Retention inputs, injected from home/kitty.nix where each one is
+    # stated with its reason. Named here so the values a test asserts
+    # against are read out of the deployed script rather than
+    # transcribed into the test.
+    SAVE_INTERVAL_S = ${toString saveIntervalSeconds}
+    FAILED_RELAUNCH_BURST = ${toString failedRelaunchBurst}
+    COLLAPSE_GRACE_S = ${toString collapseGraceSeconds}
+    COLLAPSE_DIVISOR = ${toString collapseDivisor}
+    HISTORY_KEEP = ${toString snapshotHistoryKeep}
+    HISTORY_MIN_PANES = ${toString historyMinPanes}
+
+    HISTORY_RE = re.compile(r"^snapshot-\d+\.\d+-(\d+)p\.json$")
+
+
+    def real_pane_count(data):
+        """Panes a human would recognise as theirs.
+
+        Excludes kitty's own overlay windows for the same reason
+        kitty-pane-add does: an error overlay padding the count is
+        exactly what would disarm the collapse guard below.
+        """
+        n = 0
+        for osw in data:
+            for tab in osw.get("tabs", []):
+                for win in tab.get("windows", []):
+                    if not window_is_internal(win):
+                        n += 1
+        return n
+
+
+    def _load(path):
+        """The current snapshot, or None when there isn't a usable one.
+
+        A truncated or hand-mangled snapshot.json reads as "no prior
+        good": committing over it is right, and it must not take the
+        save timer down with a traceback every 60 seconds.
+        """
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, list) else None
+
+
+    # These files record the user's cwds, window titles, argv and
+    # claude session ids. No secrets — a snapshot's per-pane env is
+    # KITTY_WINDOW_ID and PWD — but nobody else's business either, and
+    # the default 0644-in-0755 left them readable by anyone on the
+    # host, contained only by home-manager's homeMode 700.
+    STATE_FILE_MODE = 0o600
+    STATE_DIR_MODE = 0o700
+
+
+    def _secure_dir(path):
+        """Create `path` private, and keep it that way."""
+        try:
+            os.makedirs(path, mode=STATE_DIR_MODE, exist_ok=True)
+            os.chmod(path, STATE_DIR_MODE)
+        except OSError:
+            return False
+        return True
+
+
+    def _history_names(hdir):
+        try:
+            names = os.listdir(hdir)
+        except OSError:
+            return []
+        return sorted(n for n in names if HISTORY_RE.match(n))
+
+
+    def _entry_for_panes(hdir, count, skip=None):
+        """The history entry currently holding a `count`-pane topology.
+
+        At most one exists: rotate() below keeps the ring as one SLOT
+        per distinct pane count, so the count is the slot key.
+        """
+        suffix = "-%dp.json" % count
+        for name in _history_names(hdir):
+            if name != skip and name.endswith(suffix):
+                return name
+        return None
+
+
+    def collapsed(prev_count, new_count, snap_path):
+        """True when the pane count fell off a cliff, recently.
+
+        Two conditions, both needed. The DROP has to be sharp
+        (COLLAPSE_DIVISOR), which a user closing panes one at a time
+        never produces between two ticks. And the prior snapshot has to
+        be YOUNGER than the grace window, because a crash-and-relaunch
+        burst resolves inside it while a deliberate close does not — so
+        a real shrink is accepted a few minutes late instead of never.
+        Not writing is what keeps the age growing: preserving leaves
+        snapshot.json's mtime alone, so the window cannot renew itself.
+        """
+        # Below the smallest recoverable topology there is nothing to
+        # protect, so the same input that keeps such a snapshot out of
+        # the history also switches the guard off.
+        if prev_count < HISTORY_MIN_PANES:
+            return False
+        if new_count * COLLAPSE_DIVISOR > prev_count:
+            return False
+        try:
+            age = time.time() - os.path.getmtime(snap_path)
+        except OSError:
+            return False
+        return age < COLLAPSE_GRACE_S
+
+
+    def rotate(dirpath, snap_path, prev_count):
+        """Keep the outgoing snapshot as its topology size's entry.
+
+        The ring is one SLOT PER DISTINCT PANE COUNT, each holding the
+        FRESHEST snapshot seen at that size. Three properties follow,
+        and all three are load bearing:
+
+        * Bounded churn. A session sitting at one size (or oscillating
+          between two) replaces its own slot every tick instead of
+          appending, so it cannot flush the recoverable topologies out
+          by waiting — which a 60s timer would otherwise do in
+          HISTORY_KEEP minutes.
+        * Nothing recoverable is discarded on the way out. Keying on
+          "has the count CHANGED since the last rotation" instead was
+          the 2026-09-04 loss in miniature: a 6-pane entry rotated in
+          days ago made today's 6-pane snapshot look like a duplicate,
+          so when the post-crash collapse finally outlived the grace
+          window it overwrote the only copy carrying live session ids
+          and left the stale one behind. Same count is not same state.
+        * A snapshot below HISTORY_MIN_PANES never enters the ring at
+          all, so a degenerate state cannot evict a good one.
+
+        Write-then-unlink, never the reverse: a failed copy must not be
+        able to leave a size with no entry at all.
+        """
+        if prev_count < HISTORY_MIN_PANES:
+            return
+        hdir = os.path.join(dirpath, "history")
+        if not _secure_dir(hdir):
+            return
+        name = "snapshot-%.6f-%dp.json" % (time.time(), prev_count)
+        try:
+            dest = os.path.join(hdir, name)
+            shutil.copyfile(snap_path, dest)
+            os.chmod(dest, STATE_FILE_MODE)
+        except OSError:
+            return
+        stale = _entry_for_panes(hdir, prev_count, skip=name)
+        if stale is not None:
+            try:
+                os.unlink(os.path.join(hdir, stale))
+            except OSError:
+                pass
+        sys.stderr.write(
+            "kitty-session-commit: rotated %d-pane snapshot to %s\n"
+            % (prev_count, name)
+        )
+        prune(hdir)
+
+
+    def prune(hdir):
+        names = _history_names(hdir)
+        for name in names[:max(len(names) - HISTORY_KEEP, 0)]:
+            try:
+                os.unlink(os.path.join(hdir, name))
+            except OSError:
+                pass
+
+
+    def _write_atomic(path, text):
+        """Replace `path` with `text`, private and without following a
+        symlink planted at the temp name. Same rule as
+        kitty-restore-session's writer -- see STATE_FILE_MODE above."""
+        tmp = path + ".tmp"
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            STATE_FILE_MODE,
+        )
+        os.fchmod(fd, STATE_FILE_MODE)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+
+
+    def main():
+        if len(sys.argv) < 2:
+            sys.stderr.write("usage: kitty-session-commit <cache-dir>\n")
+            sys.exit(1)
+        dirpath = sys.argv[1]
+        try:
+            cand = json.load(sys.stdin)
+        except ValueError:
+            sys.stderr.write("kitty-session-commit: candidate is not JSON\n")
+            sys.exit(1)
+        if not isinstance(cand, list):
+            sys.stderr.write("kitty-session-commit: candidate is not a list\n")
+            sys.exit(1)
+
+        snap_path = os.path.join(dirpath, "snapshot.json")
+        prev = _load(snap_path)
+        new_count = real_pane_count(cand)
+        prev_count = real_pane_count(prev) if prev is not None else 0
+
+        if prev is not None and collapsed(prev_count, new_count, snap_path):
+            sys.stderr.write(
+                "kitty-session-commit: refusing %d-pane snapshot over a "
+                "%d-pane one saved %ds ago; preserving prior good\n"
+                % (
+                    new_count, prev_count,
+                    int(time.time() - os.path.getmtime(snap_path)),
+                )
+            )
+            sys.exit(3)
+
+        if prev is not None:
+            rotate(dirpath, snap_path, prev_count)
+        _write_atomic(snap_path, json.dumps(cand))
+
+
+    if __name__ == "__main__":
+        main()
+  '';
+
   # Snapshot current kitty state. No-op if no kitty is listening.
   kittySessionSave = pkgs.writeShellApplication {
     name = "kitty-session-save";
-    runtimeInputs = [ pkgs.kitty kittySessionConvert kittySessionEnrich pkgs.coreutils ];
+    runtimeInputs = [
+      pkgs.kitty
+      kittySessionConvert
+      kittySessionEnrich
+      kittySessionCommit
+      pkgs.coreutils
+    ];
     text = ''
       set -euo pipefail
 
       dir="''${XDG_CACHE_HOME:-$HOME/.cache}/kitty-session"
-      mkdir -p "$dir"
+      # 0700, not the umask default: this directory holds the user's
+      # cwds, window titles, argv and claude session ids, and nothing
+      # in it is anyone else's business. `install -d` also fixes a
+      # directory an older generation created 0755.
+      install -d -m 700 "$dir"
 
-      # Discover live kitty socket. Under `kitty -1` the listen_on path has
-      # `-{pid}` appended, so glob and pick the first live socket file.
+      # Discover live kitty socket. kitty appends `-{pid}` to the
+      # configured listen_on path on every launch (not only under `-1`),
+      # so glob and pick the first live socket file.
       sock=""
       if [ -n "''${KITTY_LISTEN_ON:-}" ]; then
         sock="$KITTY_LISTEN_ON"
@@ -1085,18 +2868,76 @@ let
       #        would fall back to latest-by-mtime on restore and collide
       #        with a sibling. Preserve the prior good snapshot.json
       #        instead of overwriting it with the dangerous partial.
-      #   any other non-zero — enricher crashed; preserve prior good.
+      #   any other non-zero — enricher crashed; preserve prior good
+      #        AND fail the unit, see the surfacing rule below.
+      #
+      # Surfacing rule for every gate below, stated once. Two of these
+      # exit codes are DESIGNED outcomes of a guard doing its job: they
+      # happen on an ordinary day and must stay silent, because the
+      # timer fires every 60s and a guard that logs is a guard that
+      # gets muted. Every OTHER non-zero is a crash, and the failure it
+      # produces is invisible without help: snapshots simply stop
+      # updating, forever, and nobody finds out until the next kitty
+      # crash restores state from whenever the breakage began.
+      #
+      # So an unexpected rc is written to stderr and PROPAGATED, which
+      # puts kitty-session-save into `systemctl --user --failed`.
+      # Deliberately not a desktop notification: at one tick a minute a
+      # persistent fault would be unusable as a popup, and the failed
+      # unit is already the place a user looks for "is anything
+      # broken". journald collapses the repeats.
       set +e
-      printf '%s\n' "$json" | kitty-session-enrich > "$dir/snapshot.json.tmp"
+      printf '%s\n' "$json" | kitty-session-enrich > "$dir/candidate.json.tmp"
       enrich_rc=$?
       set -e
-      if [ "$enrich_rc" -eq 0 ]; then
-        mv "$dir/snapshot.json.tmp" "$dir/snapshot.json"
-        kitty-session-convert < "$dir/snapshot.json" > "$dir/last.session.tmp"
-        mv "$dir/last.session.tmp" "$dir/last.session"
-      else
-        rm -f "$dir/snapshot.json.tmp"
+      if [ "$enrich_rc" -eq 2 ]; then
+        rm -f "$dir/candidate.json.tmp"
+        exit 0
       fi
+      if [ "$enrich_rc" -ne 0 ]; then
+        rm -f "$dir/candidate.json.tmp"
+        echo "kitty-session-save: kitty-session-enrich exited" \
+             "$enrich_rc (expected 0, or 2 for the partial-snapshot" \
+             "guard); snapshot.json is NOT being updated" >&2
+        exit "$enrich_rc"
+      fi
+
+      # Retention gate. kitty-session-commit decides whether the
+      # candidate may replace snapshot.json and keeps a bounded history
+      # of the good ones (thresholds and their rationale live in
+      # home/kitty.nix). Exit codes:
+      #   0  — committed; last.session is regenerated to match.
+      #   3  — refused, prior good snapshot preserved. NOT an error: it
+      #        is the guard doing its job, and last.session must stay in
+      #        step with the snapshot it was rendered from.
+      #   any other non-zero — commit crashed; leave everything alone
+      #        AND fail the unit, see the surfacing rule above.
+      #
+      # This is a SECOND gate, not a replacement for the enricher's:
+      # rc 2 above (partial snapshot, same-cwd claude panes with a
+      # missing TSV row) still short-circuits before we get here.
+      set +e
+      kitty-session-commit "$dir" < "$dir/candidate.json.tmp"
+      commit_rc=$?
+      set -e
+      rm -f "$dir/candidate.json.tmp"
+      case "$commit_rc" in
+        0)
+          kitty-session-convert < "$dir/snapshot.json" \
+            > "$dir/last.session.tmp"
+          mv "$dir/last.session.tmp" "$dir/last.session"
+          ;;
+        3)
+          # The collapse guard refused. Designed, and silent by
+          # design — see the surfacing rule above.
+          ;;
+        *)
+          echo "kitty-session-save: kitty-session-commit exited" \
+               "$commit_rc (expected 0, or 3 for the collapse guard);" \
+               "snapshot.json is NOT being updated" >&2
+          exit "$commit_rc"
+          ;;
+      esac
     '';
   };
 
@@ -1160,15 +3001,32 @@ let
       if [ "\$sockets_seen" -eq 0 ]; then
         rm -f "\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/pane-sessions.tsv"
       fi
+      # Same variable, same default, as kitty-restore-session's
+      # stub_path(). The user's own cache dir, not a fixed name in
+      # world-writable /tmp: kitty EXECUTES the launch directives in
+      # this file. tests/kitty-scripts.nix phase H2 asserts writer and
+      # reader still agree.
+      stub="\''${KITTY_STUB_PATH:-\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/stub-session}"
       if [ -s "\$snap" ] && [ "\$live" -eq 0 ]; then
         # Write a stub session file containing just pane 0; this makes
         # kitty start directly into our restored topology with no extra
         # default-startup window to clean up. Restore-session, running
         # in the background, fills in panes 1..N once kitty's socket is up.
-        ${kittyRestoreSession}/bin/kitty-restore-session --emit-stub
-        ( ${kittyRestoreSession}/bin/kitty-restore-session \
-            >/tmp/kitty-restore.log 2>&1 & )
-        exec ${pkgs.kitty}/bin/kitty --session /tmp/kitty-stub-session "\$@"
+        #
+        # emit-stub is NOT allowed to take kitty down with it. Under
+        # \`set -e\` a non-zero exit here (or a stale file left by an
+        # earlier run) used to mean either no terminal at all or kitty
+        # being handed a session file describing the wrong session.
+        # Remove the old file first, run the writer inside an \`if\` so
+        # errexit does not fire, and fall through to a plain kitty when
+        # it produced nothing.
+        rm -f "\$stub"
+        if ${kittyRestoreSession}/bin/kitty-restore-session --emit-stub \
+             && [ -s "\$stub" ]; then
+          ( ${kittyRestoreSession}/bin/kitty-restore-session \
+              >/tmp/kitty-restore.log 2>&1 & )
+          exec ${pkgs.kitty}/bin/kitty --session "\$stub" "\$@"
+        fi
       fi
       exec ${pkgs.kitty}/bin/kitty -1 "\$@"
       EOF
@@ -1181,9 +3039,11 @@ in
     kittyWithSession
     kittySessionConvert
     kittySessionEnrich
+    kittySessionCommit
     kittySessionSave
     kittyCopyUnwrap
     claudeKittyPaneRecord
+    kittyPanesReflow
     # WIP, not yet wired in (see wrapper above):
     kittyPaneAdd
     kittyRestoreSession
@@ -1206,8 +3066,12 @@ in
 
     # Remote control — JSON-over-Unix-socket for scripts / future MCP server
     # exposing pane management (`kitty @ ls`, launch, send-text, focus, ...).
-    # Kitty appends `-{pid}` under `-1` regardless of socket type; the save
-    # script globs `/tmp/kitty.sock-*` to find the live one.
+    # Kitty appends `-{pid}` to this path on EVERY launch, not only under
+    # `-1` (measured 2026-09-04: a plain `kitty --config` with
+    # `listen_on unix:/tmp/kreflow2-sock` created
+    # `/tmp/kreflow2-sock-2094322`). Nothing may assume the bare path
+    # exists; the save script globs `/tmp/kitty.sock-*` to find the live
+    # one, and kitty exports the resolved path as KITTY_LISTEN_ON.
     allow_remote_control yes
     listen_on unix:/tmp/kitty.sock
 
@@ -1327,6 +3191,22 @@ in
     map ctrl+< launch --location=vsplit --cwd=current
     # Add new pane via the 2x2-grid pattern (kitty-pane-add).
     map ctrl+n launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
+    # Rearrange the panes this kitty ALREADY has into that same grid,
+    # re-parenting them rather than respawning them (kitty-panes-reflow).
+    # A no-op when the layout is already canonical, so it is safe to
+    # fire on a hunch.
+    #
+    # ctrl+shift+r, not a plain ctrl+<char>: every ctrl+<letter> worth
+    # having is a readline binding, and reflow is a rarely-used
+    # deliberate gesture rather than a per-minute one like ctrl+n. It
+    # is free in kitty 0.48.2 (no default binds it — kitty reloads its
+    # config on ctrl+shift+f5) and it does NOT shadow the shell's
+    # ctrl+r reverse-i-search, because kitty matches the exact modifier
+    # set and passes plain ctrl+r straight through. It also sits in the
+    # same ctrl+shift namespace as the copy binds below. `r` is a
+    # literal character, so the libxkbcommon problem noted on ctrl+<
+    # above does not apply.
+    map ctrl+shift+r launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-panes-reflow
     # New tab inheriting cwd of current window.
     map ctrl+t new_tab_with_cwd
 
@@ -1376,7 +3256,10 @@ in
     Unit.Description = "Snapshot kitty session every minute";
     Timer = {
       OnBootSec = "30s";
-      OnUnitActiveSec = "60s";
+      # Same binding the collapse guard's grace window is derived from
+      # (see "snapshot retention" in the let block above), so the two
+      # cannot drift apart.
+      OnUnitActiveSec = "${toString saveIntervalSeconds}s";
       AccuracySec = "10s";
     };
     Install.WantedBy = [ "timers.target" ];
@@ -1407,6 +3290,23 @@ in
   # Final snapshot at logout. Bound to graphical-session.target so ExecStop
   # fires when the desktop session ends, capturing state newer than the
   # last 60s timer tick.
+  #
+  # Known and ACCEPTED race: this runs while kitty is being torn down,
+  # so `kitty @ ls` can answer after some panes have already gone. A
+  # drop that is not a halving (6 -> 4, say) is below the collapse
+  # guard's divisor and commits, replacing a good snapshot with a
+  # partial one.
+  #
+  # Deliberately not fixed. Every fix that distinguishes "two panes died
+  # during teardown" from "the user closed two panes and logged out"
+  # needs a threshold — a settling delay, a smaller divisor, a
+  # logout-specific pane floor — and a tuned number driving the design
+  # is what this module spent the retention section avoiding. The state
+  # is not lost either way: the history ring keeps the freshest snapshot
+  # at each distinct pane count, and rotation is unconditional for a
+  # size, so the outgoing 6-pane snapshot is retained as the logout save
+  # replaces it. Recovery is `cp history/snapshot-*-6p.json
+  # snapshot.json`, which is exactly what the ring is for.
   systemd.user.services.kitty-session-save-on-logout = {
     Unit = {
       Description = "Snapshot kitty session at logout";

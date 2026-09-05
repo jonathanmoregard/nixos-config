@@ -149,6 +149,9 @@ in
     })
   ];
   testScript = ''
+    import json
+    import shlex
+
     dellan.wait_for_unit("multi-user.target")
     dellan.wait_for_unit("home-manager-jonathan.service")
     dellan.wait_for_unit("default.target", "jonathan")
@@ -411,6 +414,38 @@ in
         "jq -e '[.[].tabs[].windows[]] | length == 4'",
         timeout=15,
     )
+    # Pane 0 gets a command of its OWN before the save. Left as the
+    # login shell it is byte-identical to what the exec-time refusal
+    # opens (`os.environ["SHELL"]`, also
+    # /run/current-system/sw/bin/zsh), so phase 5b below could not tell
+    # "pane 0 became its recorded command" from "--exec-pane0 refused
+    # and handed the user a shell" — and an assertion that cannot tell
+    # those apart is not asserting the thing it is named after.
+    # `exec` replaces the shell in place, so the window keeps its pid
+    # and phase 6's respawn comparison is unaffected.
+    pane0_magic = "44444"
+    dellan.succeed(
+        "su jonathan -c '" + sock_cmd
+        + ' send-text --match id:1 "exec ' + sleep_bin + " "
+        + pane0_magic + '\\n"' + "'"
+    )
+    # Sent ONCE: the pty buffers input, so text written before the shell
+    # starts reading is not lost. The wait is long because pane 0 holds
+    # the FIRST interactive zsh in a cold VM, which pays for compinit
+    # and the whole rc chain before it runs anything — measured at 77s
+    # on a green run in tests/claude-egress.nix, which warms it for the
+    # same reason. A 15s cap timed out here at 16.5s with the text still
+    # queued.
+    dellan.wait_until_succeeds(
+        "su jonathan -c '" + sock_cmd + " ls' | "
+        "jq -e '[.[].tabs[].windows[].cmdline | join(\" \")] | "
+        'any(. == "' + sleep_bin + " " + pane0_magic + "\")'",
+        timeout=300,
+    )
+    print("[diag] pane 0 after exec:\n" + dellan.succeed(
+        "su jonathan -c '" + sock_cmd + " ls' | "
+        "jq -c '[.[].tabs[].windows[] | {id, cmdline}]'"
+    ))
     dellan.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/ls-before.json'")
     print("[diag] before save:\n" + dellan.succeed("cat /tmp/ls-before.json"))
 
@@ -531,14 +566,345 @@ in
             "/tmp/ls-after.json"
         )
 
-    # 2x2 grid: tab uses splits layout with 4 distinct window groups.
-    # (kitty's `ls` JSON doesn't expose at_x/at_y; the layout pattern is
-    # encoded in `tabs[].groups[]` — 4 groups means 4 separate splits.)
+    # 2x2 grid. `groups | length == 4` only says there are four splits,
+    # not that they form the 2x2 — four panes in a column pass it too,
+    # which is exactly the shape the 2026-09-04 bad restore produced.
+    # Pixel geometry really is absent from `kitty @ ls`
+    # (kitty/window.py:2272 as_dict has no at_x/at_y), but the split
+    # TREE is not: `tabs[].layout_state.pairs` (kitty/tabs.py:1461 ->
+    # layout/splits.py:959) is the exact Pair tree. `shp` below erases
+    # the leaf ids (which kitty reallocates constantly) and keeps the
+    # structure. Note `horizontal` is serialized only when FALSE
+    # (splits.py:42-45), hence the has()-test rather than `// true`,
+    # which jq would take for the false branch.
+    shp = (
+        'def shp: if . == null then null '
+        'elif type == "object" then '
+        '[(if has("horizontal") then .horizontal else true end), '
+        '(.one|shp), (.two|shp)] else "pane" end; '
+    )
+    # Two side-by-side columns, each split top/bottom.
+    grid_2x2 = '[true,[false,"pane","pane"],[false,"pane","pane"]]'
+    # Two panes side by side — the canonical form for a remainder of 2.
+    grid_1x2 = '[true,"pane","pane"]'
     dellan.succeed(
         "jq -e '.[0].tabs[0].layout == \"splits\"' /tmp/ls-after.json"
     )
     dellan.succeed(
         "jq -e '.[0].tabs[0].groups | length == 4' /tmp/ls-after.json"
+    )
+    dellan.succeed(
+        f"jq -e '{shp}.[0].tabs[0].layout_state.pairs | shp == {grid_2x2}' "
+        "/tmp/ls-after.json"
+    )
+
+    # --- Phase 5b: what a LATER snapshot can record for pane 0.
+    #
+    # `window.cmdline` is `Child.cmdline` (kitty/child.py:593-598): the
+    # live /proc/<pid>/cmdline, falling back to the argv kitty SPAWNED
+    # when that process is gone. Pane 0 is spawned as
+    # `kitty-restore-session --exec-pane0 <argv...>`, so while it lives
+    # the readout is whatever --exec-pane0 became — asserted below — but
+    # the moment pane 0's own process dies with the pty still held open
+    # (the documented zombie case: claude gone, an orphaned stdio MCP
+    # server holding it), kitty answers with that spawn argv instead.
+    # While the launch line carried no argv, that fallback WAS the
+    # stub's own launch line, so the next snapshot recorded it as pane
+    # 0's command and the restore after that exec'd the launcher, which
+    # re-read the same record and exec'd it again: a tight loop at 100%
+    # CPU with the session gone.
+    #
+    # The stub is therefore the artifact to assert on — it is what
+    # decides the fallback. tests/kitty-scripts.nix phase J drives the
+    # dead-process half against the scripts; this is the real-kitty
+    # half.
+    stub = "/home/jonathan/.cache/kitty-session/stub-session"
+    stub_line = dellan.succeed(f"cat {stub}").strip()
+    print("[diag] stub:\n" + stub_line)
+    # kitty session-parses the line with shlex (kitty/session.py), so
+    # shlex is also how the argv it hands pane 0 is read back out.
+    stub_toks = shlex.split(stub_line)
+    assert "--exec-pane0" in stub_toks, (
+        "the stub does not launch pane 0 through --exec-pane0:\n" + stub_line
+    )
+    pane0_argv = stub_toks[stub_toks.index("--exec-pane0") + 1:]
+    assert pane0_argv, (
+        "the stub named NO argv after --exec-pane0. That is the shape "
+        "whose recorded cmdline pointed back at the launcher, and pane 0 "
+        "opens a bare shell instead of its own command:\n" + stub_line
+    )
+    cmdlines = json.loads(dellan.succeed(
+        "jq -c '[.[].tabs[].windows[].cmdline]' /tmp/ls-after.json"
+    ))
+    print("[diag] pane-0 argv: " + json.dumps(pane0_argv))
+    print("[diag] live cmdlines: " + json.dumps(cmdlines))
+    # The assertion this replaced was `[cmdline | select(index(
+    # "--exec-pane0")) | length] | all(. > 2)`, and it could not fail:
+    # execvp KEEPS the pid, so child.cmdline (kitty/child.py:593-596)
+    # reports the EXEC'D command and no live window's cmdline ever holds
+    # the flag. The select() yielded [] and all([]) is true. The green
+    # run's own diagnostic said so:
+    #   [["/run/current-system/sw/bin/zsh"],[".../sleep","11111"], ...]
+    #
+    # What is actually worth asserting is the positive: pane 0 IS running
+    # the argv the stub named. That fails if --exec-pane0 refused (the
+    # window would show $SHELL — distinguishable now that pane 0 carries
+    # a sleep of its own), if the exec never happened (the launcher argv
+    # would still be there), or if the argv was truncated in transit.
+    assert pane0_argv in cmdlines, (
+        "no window is running pane 0's recorded command "
+        f"{pane0_argv}; live cmdlines are {cmdlines}. --exec-pane0 either "
+        "refused and opened a shell, or never exec'd at all."
+    )
+    assert not [c for c in cmdlines if len(c) > 1 and c[1] == "--exec-pane0"], (
+        f"a window is still running the pane-0 launcher: {cmdlines}. The "
+        "next snapshot would record that as pane 0's command, and the "
+        "restore after it would exec the launcher again."
+    )
+
+    # === Phase 6: kitty-panes-reflow ===
+    #
+    # Reflow moves the panes a running kitty ALREADY has into that same
+    # grid. Every pane may be a long-lived `claude`, so the contract is
+    # re-parent, never respawn — which is why each assertion below
+    # carries a PID comparison rather than just a topology one. And
+    # because the user is invited to run it on a hunch, doing nothing at
+    # all when the layout is already right is a hard requirement, not an
+    # optimisation.
+    dellan.succeed(
+        "test -x /etc/profiles/per-user/jonathan/bin/kitty-panes-reflow"
+    )
+    dellan.succeed(
+        f"grep -qE '^map ctrl\\+shift\\+r launch --type=background .*"
+        f"kitty-panes-reflow$' {kitty_conf}"
+    )
+
+    def reflow_state(path):
+        """(group ids per tab, focused window, window->pid) from ls.
+
+        `window.pid` — kitty's `child.pid`, the process it forked for
+        that window — is what answers "was this pane respawned": a
+        `detach-window` re-parent keeps it, a `launch` cannot. NOT
+        `foreground_processes`, which kitty derives live from the pty's
+        foreground process GROUP and which can come back empty between
+        two `ls` calls a second apart while the pane is perfectly
+        alive. Measured on this lane: window 1 reported pid 1678 in one
+        readout and [] in the next, same process still attached, same
+        tree that had passed the phase a run earlier. Comparing that
+        field failed the lane for a race rather than for a regression.
+        """
+        dellan.succeed(f"su jonathan -c '{sock_cmd} ls > {path}'")
+        groups = dellan.succeed(
+            f"jq -cS '[.[].tabs[] | {{tab: .id, g: [.groups[].id]}}]' {path}"
+        ).strip()
+        focus = dellan.succeed(
+            "jq -cS '[.[].tabs[] | select(.is_focused) | .windows[] | "
+            f"select(.is_focused) | .id]' {path}"
+        ).strip()
+        pids = dellan.succeed(
+            "jq -cS '[.[].tabs[].windows[] | {id: .id, pid: .pid}] "
+            f"| sort_by(.id)' {path}"
+        ).strip()
+        return groups, focus, pids
+
+    # --- 6a: a layout that is already canonical is left completely
+    # alone. Group ids are the tell: kitty reallocates them on every
+    # attach (observed 1 -> 7 -> 19 across runs), so an unchanged set
+    # proves no detach happened, not merely that the end state matched.
+    before = reflow_state("/tmp/reflow-noop-before.json")
+    print("[diag] reflow no-op before: " + repr(before))
+    dellan.succeed("su jonathan -c kitty-panes-reflow")
+    dellan.sleep(1)
+    after = reflow_state("/tmp/reflow-noop-after.json")
+    print("[diag] reflow no-op after:  " + repr(after))
+    assert before == after, (
+        "reflow churned an already-canonical layout.\n"
+        f"before: {before}\nafter:  {after}\n"
+        "Group ids move only when a window is detached; focus moves "
+        "because every detach makes its target tab active. Either "
+        "changing here means running this on a hunch would tear up a "
+        "screenful of live claude sessions."
+    )
+
+    # --- 6b: a tab in `stack` layout. It serializes no `pairs` at all,
+    # so it can never be canonical; reflow has to switch it to splits
+    # and rebuild — without restarting any of the four processes.
+    dellan.succeed(f"su jonathan -c '{sock_cmd} goto-layout stack'")
+    dellan.sleep(1)
+    dellan.succeed(
+        f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-stack-before.json'"
+    )
+    dellan.succeed(
+        "jq -e '.[0].tabs[0].layout == \"stack\"' "
+        "/tmp/reflow-stack-before.json"
+    )
+    _, _, pids_before = reflow_state("/tmp/reflow-stack-before.json")
+    dellan.succeed("su jonathan -c kitty-panes-reflow")
+    dellan.sleep(2)
+    dellan.succeed(
+        f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-stack-after.json'"
+    )
+    print("[diag] after stack reflow:\n" + dellan.succeed(
+        "cat /tmp/reflow-stack-after.json"
+    ))
+    dellan.succeed(
+        "jq -e '.[0].tabs | length == 1' /tmp/reflow-stack-after.json"
+    )
+    dellan.succeed(
+        "jq -e '.[0].tabs[0].layout == \"splits\"' "
+        "/tmp/reflow-stack-after.json"
+    )
+    dellan.succeed(
+        f"jq -e '{shp}.[0].tabs[0].layout_state.pairs | shp == {grid_2x2}' "
+        "/tmp/reflow-stack-after.json"
+    )
+    _, _, pids_after = reflow_state("/tmp/reflow-stack-after2.json")
+    assert pids_before == pids_after, (
+        "reflow did not preserve the pane processes.\n"
+        f"before: {pids_before}\nafter:  {pids_after}\n"
+        "Every step must be a `detach-window` re-parent; a `launch` "
+        "anywhere in the sequence kills the user's claude session and "
+        "starts a new one."
+    )
+
+    # --- 6c: more panes than fit one tab. Six in a single tab spill to
+    # a second tab holding the canonical form for the remainder (2),
+    # again with every process intact.
+    for magic in ("44444", "55555"):
+        dellan.succeed(
+            f"su jonathan -c '{sock_cmd} launch --location=hsplit "
+            f"--keep-focus {sleep_bin} {magic}'"
+        )
+    dellan.sleep(2)
+    dellan.succeed(
+        f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-six-before.json'"
+    )
+    dellan.succeed(
+        "jq -e '[.[].tabs[].windows[]] | length == 6' "
+        "/tmp/reflow-six-before.json"
+    )
+    dellan.succeed(
+        "jq -e '.[0].tabs | length == 1' /tmp/reflow-six-before.json"
+    )
+    _, focus_before, six_pids_before = reflow_state(
+        "/tmp/reflow-six-before.json"
+    )
+    dellan.succeed("su jonathan -c kitty-panes-reflow")
+    dellan.sleep(2)
+    dellan.succeed(
+        f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-six-after.json'"
+    )
+    print("[diag] after six-pane reflow:\n" + dellan.succeed(
+        "cat /tmp/reflow-six-after.json"
+    ))
+    dellan.succeed(
+        "jq -e '.[0].tabs | length == 2' /tmp/reflow-six-after.json"
+    )
+    dellan.succeed(
+        f"jq -e '{shp}.[0].tabs[0].layout_state.pairs | shp == {grid_2x2}' "
+        "/tmp/reflow-six-after.json"
+    )
+    dellan.succeed(
+        f"jq -e '{shp}.[0].tabs[1].layout_state.pairs | shp == {grid_1x2}' "
+        "/tmp/reflow-six-after.json"
+    )
+    _, focus_after, six_pids_after = reflow_state(
+        "/tmp/reflow-six-after2.json"
+    )
+    assert six_pids_before == six_pids_after, (
+        "a six-pane reflow lost or restarted a pane process.\n"
+        f"before: {six_pids_before}\nafter:  {six_pids_after}"
+    )
+    assert focus_before == focus_after, (
+        "reflow left the cursor somewhere the user did not put it.\n"
+        f"before: {focus_before}\nafter:  {focus_after}\n"
+        "Every detach ends with target_tab.make_active(), so the "
+        "originally-focused window has to be re-focused at the end."
+    )
+
+    # --- 6d: and the rebuilt two-tab layout is itself canonical, so a
+    # follow-up run does nothing. Without this, a reflow that converged
+    # on a shape it does not itself recognise would churn on every
+    # invocation forever.
+    settled_before = reflow_state("/tmp/reflow-settle-before.json")
+    dellan.succeed("su jonathan -c kitty-panes-reflow")
+    dellan.sleep(1)
+    settled_after = reflow_state("/tmp/reflow-settle-after.json")
+    assert settled_before == settled_after, (
+        "reflow does not recognise its own output as canonical.\n"
+        f"before: {settled_before}\nafter:  {settled_after}"
+    )
+
+    # --- 6e: a refusal has to reach the user. The only invocation the
+    # user makes is the ctrl+shift+r binding, which is `launch
+    # --type=background` — and kitty spawns such a process with its OWN
+    # stdout and stderr, so everything it prints goes to kitty's log and
+    # into no window at all. Driven here exactly the way the binding
+    # does it, with the reflow lock held so the refusal is a certainty.
+    dellan.succeed(
+        "su jonathan -c 'flock -x /home/jonathan/.cache/kitty-session/"
+        "reflow.lock sleep 30 >/dev/null 2>&1 &'"
+    )
+    dellan.sleep(2)
+    dellan.succeed(
+        f"su jonathan -c '{sock_cmd} launch --type=background -- "
+        "/etc/profiles/per-user/jonathan/bin/kitty-panes-reflow'"
+    )
+    dellan.sleep(3)
+    dellan.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-notice.json'")
+    print("[diag] with the notice up:\n" + dellan.succeed(
+        "jq -c '[.[].tabs[] | {g: [.groups[] | {id, windows}], "
+        "w: [.windows[] | {id, title, ui: .env.KITTY_SESSION_UI}]}]' "
+        "/tmp/reflow-notice.json"
+    ))
+    dellan.succeed(
+        "jq -e '[.[].tabs[].windows[] | "
+        'select(.title == "kitty-panes-reflow")] | length == 1\' '
+        "/tmp/reflow-notice.json"
+    )
+    # Marked as this module's own chrome, so a snapshot taken while it
+    # is up does not restore it as a pane.
+    dellan.succeed(
+        "jq -e '[.[].tabs[].windows[] | "
+        'select(.title == "kitty-panes-reflow") | '
+        ".env.KITTY_SESSION_UI] == [\"1\"]' /tmp/reflow-notice.json"
+    )
+    notice_text = dellan.succeed(
+        f"su jonathan -c '{sock_cmd} get-text "
+        "--match title:kitty-panes-reflow'"
+    )
+    print("[diag] notice text:\n" + notice_text)
+    assert "another reflow is already running" in notice_text, (
+        "the notice overlay does not carry the refusal, so the user is "
+        "left with an unexplained non-event.\n" + notice_text
+    )
+    assert "press Enter to dismiss" in notice_text, (
+        "the notice does not say how to get rid of it."
+    )
+
+    # And it takes no grid slot: it is an overlay in its base window's
+    # group, and window_is_internal() filters it, so a reflow run while
+    # it is up still sees the layout as canonical and does nothing.
+    # Wait the holder out rather than killing it: `flock` keeps the
+    # locked fd open in the child it execs, so killing the pid the
+    # shell reports leaves the lock held, and `pkill -f` matches the
+    # driver's own shell running the pattern and kills that instead
+    # (measured: exit 143). Probing the lock itself needs no pid and no
+    # guess at how long anything takes.
+    dellan.wait_until_succeeds(
+        "flock -n -x /home/jonathan/.cache/kitty-session/reflow.lock "
+        "true",
+        timeout=60,
+    )
+    dellan.sleep(1)
+    notice_before = reflow_state("/tmp/reflow-notice-before.json")
+    dellan.succeed("su jonathan -c kitty-panes-reflow")
+    dellan.sleep(1)
+    notice_after = reflow_state("/tmp/reflow-notice-after.json")
+    assert notice_before == notice_after, (
+        "a reflow notice window was counted as a pane, so reflow tore "
+        "up a canonical layout to make room for kitty chrome.\n"
+        f"before: {notice_before}\nafter:  {notice_after}"
     )
   '';
 }
