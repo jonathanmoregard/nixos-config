@@ -102,9 +102,19 @@
     # flips this to `drop` in a separate PR, using the allowlist this
     # phase's data produces.
     ../../modules/nixos/claude-egress-observe.nix
+
+    # `klaffat-infra` — sudo-gated OpenTofu wrapper (+ install helper) for
+    # the Klaffat demo host, with its seven provisioning secrets encrypted
+    # to THIS host's key rather than to jonathan's user key. Deliberately
+    # outside the agenix-rekey scheme so the principal an AI agent runs as
+    # cannot decrypt tokens that create and destroy servers. See the
+    # module header — including the note that the property is not yet
+    # complete while profiles/base.nix keeps wheel NOPASSWD.
+    ../../modules/nixos/klaffat-infra.nix
   ];
 
   services.claudeEgressObserve.enable = true;
+  services.klaffatInfra.enable = true;
 
   # ---------------------------------------------------------------------
   # agenix-rekey per-host config.

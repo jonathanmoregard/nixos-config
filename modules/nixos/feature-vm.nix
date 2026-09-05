@@ -44,6 +44,22 @@
 # that key on the host can already decrypt every secret today. The
 # 9p export reproduces that same trust level inside the VM, no new
 # capability granted.
+let
+  # Throwaway recipient + ciphertexts for the klaffat provisioning
+  # secrets — see the `age.identityPaths` block below for why the feature
+  # VM cannot use the real ones. Shared with the vm-klaffat-infra lane so
+  # the smoke and the gate seed identical values.
+  klaffatFixtures = import ../../tests/lib/klaffat-fixtures.nix { inherit pkgs; };
+  klaffatSecretNames = [
+    "klaffat-hcloud-token"
+    "klaffat-cloudflare-api-token"
+    "klaffat-state-passphrase"
+    "klaffat-r2-access-key-id"
+    "klaffat-r2-secret-access-key"
+    "klaffat-r2-account-id"
+    "klaffat-demo-host-key"
+  ];
+in
 {
   virtualisation.vmVariant = {
     virtualisation = {
@@ -145,10 +161,26 @@
       };
     };
 
-    # Point agenix at the host privkey 9p-mounted above. jonathan@dellan
-    # is already a recipient of every `.age` in secrets/secrets.nix, so
-    # decryption succeeds without any rekey.
-    age.identityPaths = [ "/mnt/host-ssh/id_ed25519" ];
+    # Point agenix at the host privkey 9p-mounted above, PLUS a throwaway
+    # identity for the klaffat provisioning secrets.
+    #
+    # Those seven are the one group deliberately NOT encrypted to any key
+    # jonathan holds (modules/nixos/klaffat-infra.nix explains why), so the
+    # 9p'd user key cannot open them and a smoke run would find
+    # /run/agenix/klaffat-* absent — indistinguishable from the module
+    # being broken. The fixture identity below decrypts ONLY the fixture
+    # ciphertexts substituted underneath it; the real ciphertexts in
+    # secrets/ stay openable by dellan's host key alone.
+    #
+    # agenix tries every identity against every secret, so listing both
+    # here leaves the rekey-managed secrets' behaviour unchanged.
+    age.identityPaths = [
+      "/mnt/host-ssh/id_ed25519"
+      "${klaffatFixtures}/id_ed25519"
+    ];
+    age.secrets = lib.genAttrs klaffatSecretNames (n: {
+      file = lib.mkForce "${klaffatFixtures}/${n}.age";
+    });
 
     # Add jonathan@dellan as an authorized SSH key inside the VM so
     # the user/CC on dellan can ssh in without copying keys around.

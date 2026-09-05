@@ -256,6 +256,10 @@
         vm-listen-tools = mkLane ./tests/listen-tools.nix;
         vm-android-dev  = mkLane ./tests/android-dev.nix;
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
+        # Not in ci.yml's vm-minimal matrix yet — adding a lane there is a
+        # workflow change and is left to a deliberate, separate PR. Built
+        # locally before every push that touches modules/nixos/klaffat-infra.nix.
+        vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
         # Not a VM lane: runtime-invocation harness for the research-agent
         # guest's egress-init script (offline-resilience contract). Cheap
         # runCommand; seconds, not minutes.
