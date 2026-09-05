@@ -406,6 +406,120 @@ in
         f"claudee did not place the binary in the slice:\n{log}"
     )
 
+    # ── --continue must not override an explicit session selection ────
+    # `--continue` means "the most recent conversation in this directory"
+    # and it WINS over `--resume <sid>`, so the wrapper's unconditional
+    # prepend silently opened the wrong transcript. Real incident
+    # (2026-09-04): two `claude --resume <sid>` calls both reattached to
+    # the session already running, and pane-sessions.tsv ended up with
+    # three kitty window ids mapped to one session id.
+    #
+    # The predicate is _claude_selects_session (home/jonathan.nix), called
+    # by both this launcher and the jonathan.nix wrapper it shadows. Each
+    # accepted argument SHAPE gets its own case, because the CLI accepts
+    # more than `--resume <value>` — verified against claude 2.1.260:
+    # `--resume=<sid>` (commander's --long=VALUE) and `-r<sid>` / `-cv`
+    # (attached short values and clustered short booleans) all parse.
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def argv_case(cmd, want, forbid_continue, label):
+        clear_fake_log()
+        zsh(cmd)
+        log = fake_log()
+        print(f"[5] {label}:\n{log}")
+        assert want in log, (
+            f"{label}: `{cmd}` did not reach the binary as [{want}]:\n{log}"
+        )
+        if forbid_continue:
+            assert "--continue" not in log, (
+                f"{label}: the wrapper injected --continue over an explicit "
+                f"session selection — `{cmd}` would open the WRONG "
+                f"session:\n{log}"
+            )
+        # Whichever branch runs, the confinement is not optional.
+        assert "claude-egress.slice" in log, (
+            f"{label}: the binary escaped claude-egress.slice:\n{log}"
+        )
+
+    argv_case(
+        f"claude --resume {SID} --version",
+        f"argv: --resume {SID} --version",
+        True, "--resume <sid> passthrough",
+    )
+    argv_case(
+        f"claude --resume={SID} --version",
+        f"argv: --resume={SID} --version",
+        True, "--resume=<sid> passthrough",
+    )
+    argv_case(
+        f"claude -r {SID} --version",
+        f"argv: -r {SID} --version",
+        True, "-r <sid> passthrough",
+    )
+    argv_case(
+        "claude --session-id ABC --version",
+        "argv: --session-id ABC --version",
+        True, "--session-id passthrough",
+    )
+    argv_case(
+        "claude --print hello",
+        "argv: --print hello",
+        True, "--print passthrough (non-interactive keeps its meaning)",
+    )
+    # Control 1: a flag that selects no session must STILL get --continue.
+    # Without this, a wrapper that simply stopped injecting would pass
+    # every case above and silently break the daily default.
+    argv_case(
+        "claude --model opus --version",
+        "argv: --continue --model opus --version",
+        False, "non-session flag still resumes",
+    )
+    # Control 2: `--` ends the option list, so a session-looking word
+    # after it is prompt text and must not suppress the default.
+    argv_case(
+        "claude -- --resume x",
+        "argv: --continue -- --resume x",
+        False, "-- ends option scanning",
+    )
+
+    # ── --fork-session is a MODIFIER, not a session selector ──────────
+    # `claude --help` (2.1.260): "When resuming, create a new session ID
+    # instead of reusing the original (use with --resume or --continue)".
+    # It cannot select a session on its own, so treating it as a selector
+    # made bare `claude --fork-session` suppress --continue and silently
+    # open a FRESH session — the fork workflow lost, the same class of
+    # bug as the one the predicate exists to fix. Bare, it must expand to
+    # `--continue --fork-session`: fork the most recent conversation.
+    argv_case(
+        "claude --fork-session --version",
+        "argv: --continue --fork-session --version",
+        False, "bare --fork-session forks the most recent session",
+    )
+    # …and combined with a real selector it must still not gain one.
+    argv_case(
+        f"claude --fork-session --resume {SID}",
+        f"argv: --fork-session --resume {SID}",
+        True, "--fork-session --resume <sid> passthrough",
+    )
+    argv_case(
+        f"claude --fork-session -r {SID}",
+        f"argv: --fork-session -r {SID}",
+        True, "--fork-session -r <sid> passthrough",
+    )
+    # Control 3: `-f` has no short form in the CLI and is not in the
+    # `-*[crp]*` class, so dropping --fork-session must not have shifted
+    # the short-cluster catch-all either way.
+    argv_case(
+        "claude -f --version",
+        "argv: --continue -f --version",
+        False, "-f is not a session-selecting short cluster",
+    )
+    argv_case(
+        "claude -fc --version",
+        "argv: -fc --version",
+        True, "a short cluster containing c still selects",
+    )
+
     # Degradation path: with no user bus reachable the launcher must warn
     # and STILL start the tool. Observation degrades; the tool never
     # fails to start.

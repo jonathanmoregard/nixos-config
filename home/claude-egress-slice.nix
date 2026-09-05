@@ -65,8 +65,11 @@
     # Launches Claude Code inside claude-egress.slice so its egress (and
     # that of every MCP server it spawns, which are stdio children and
     # therefore inherit the cgroup) is observable. Redefines the
-    # claude()/claudee() pair from home/jonathan.nix; `clear` and
-    # `--continue` semantics are preserved verbatim.
+    # claude()/claudee() pair from home/jonathan.nix; `clear` and the
+    # `--continue` policy are preserved verbatim — the policy itself
+    # lives in `_claude_selects_session`, defined once in
+    # home/jonathan.nix and called from both wrappers so the shadowing
+    # copy here cannot drift from the one it shadows.
     _claude_slice() {
       local bin runner nop
       bin="$(whence -p claude 2>/dev/null)"
@@ -107,7 +110,16 @@
       "$runner" --user --scope --quiet --slice=claude-egress.slice -- "$bin" "$@"
     }
 
-    claude()  { clear; _claude_slice --continue "$@"; }
+    # Every branch goes through _claude_slice, so the slice confinement
+    # is unconditional — the --continue decision only picks the argv.
+    claude() {
+      clear
+      if _claude_selects_session "$@"; then
+        _claude_slice "$@"
+      else
+        _claude_slice --continue "$@"
+      fi
+    }
     claudee() { clear; _claude_slice "$@"; }
   '';
 }

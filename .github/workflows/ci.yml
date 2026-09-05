@@ -223,6 +223,21 @@ jobs:
       # expiry. Tiny runCommand — seconds.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.signal-expiry -L
+      # kitty session save/restore script contracts
+      # (tests/kitty-scripts.nix): the single-line session-stub
+      # invariant, pane 0's notice surviving as an argv element, grid
+      # dispatch counting real panes only, the snapshot history ring,
+      # and the pane-0 launcher never becoming pane 0's own command
+      # (which would exec-loop the restore). Drives the real
+      # derivations with fixture snapshots — boots nothing, runs in
+      # seconds, so it lives here rather than as a vm-minimal lane.
+      # The vm-kitty lane proves the topology comes back under a real
+      # X session; this one proves the file formats and arithmetic that
+      # lane cannot see. Every phase reproduces a link in the
+      # 2026-09-04 incident chain, so a regression here is a regression
+      # to a failure that actually cost a day's sessions.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.kitty-scripts -L
 
   docs:
     # Validate that every `nix run .#<attr>` reference in this repo's
