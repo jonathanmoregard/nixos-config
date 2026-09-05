@@ -231,9 +231,10 @@
 # walk past four literal spellings of one flag, and a list of bad
 # spellings is only ever as long as the last review. Value flags are taken
 # only in the one-token `-name=value` form (a value in its own argument
-# cannot be checked against its flag), `--` is refused, and any path
-# operand must be ABSOLUTE, because the working directory is a fresh
-# archive the wrapper deletes on exit.
+# cannot be checked against its flag), `--` is refused, and the only path
+# a caller may name at all is a saved plan under ${plansDir} — one
+# root-only directory, one name segment, no subdirectories (see "Where
+# plan files live" below).
 #
 # What the allowlist leaves out is what the design never needed:
 # variables come from the committed `*.auto.tfvars` and from the `TF_VAR_*`
@@ -250,16 +251,47 @@
 # install command), and rootOnlyPreamble unsets every `TF_*` and `AWS_*`
 # anyway, for the direct-root case too.
 #
-# THE RESIDUAL, documented rather than pretended away: `apply <PATH>`
-# applies a saved plan, and a plan file cannot be inspected from argv. A
-# plan is encrypted with the state passphrase (klaffat
-# deploy/terraform/versions.tf, the `plan {}` block), so only a plan this
-# wrapper itself wrote — as root, umask 077, to an absolute path — can be
-# applied at all. But a saved DESTROY plan then applies with neither the
-# `destroy klaffat` phrase nor OpenTofu's own approval prompt. The founder
-# who saved the plan is the founder applying it, and closing this properly
-# means reading the plan file, which is a bigger change than this round
-# takes on.
+# ── Where plan files live, and what that closes ───────────────────────
+#
+# CLOSED as of round 8: the write-what-where and the read-what-where that
+# `-out=`, `apply <path>` and `show <path>` used to be. Their shape was
+# `[[ "$2" == /* ]]` — a leading slash and nothing more — so any absolute
+# path the founder (or an agent holding one sudo password) typed was
+# opened by root's tofu. Reproduced 2026-09-06 against the real generated
+# wrapper: `plan -out=/etc/ssh/ssh_host_ed25519_key` exited 0 having
+# replaced a 35-byte canary file with a 1526-byte plan zip, and
+# `-out=/run/agenix/klaffat-cloudflare-api-token` replaced the wrapper's
+# OWN secret the same way; `apply <file>` and `show <file>` opened
+# whatever root could read (tofu's parser rejected a non-plan file without
+# echoing it, but the open happened either way).
+#
+# Now those three values must match ${plansDir}/<name> — one root-only
+# 0700 directory, one name segment starting with a letter, digit, `_` or
+# `-`, continuing with those plus `.`. That refuses `..`, `.`, dotfiles, a
+# further `/` (no subdirectories), a trailing `/`, whitespace, and every
+# path outside the directory. The check is deliberately LEXICAL, with no
+# realpath and no stat: the directory is root-only, so a symlink inside it
+# could only have been planted by root, and a filesystem lookup at check
+# time would just be a second thing to get wrong. Root writes and reads
+# plan files nowhere else.
+#
+# THE RESIDUAL that remains, documented rather than pretended away:
+#
+#   1. `apply <plan>` still applies a plan file this wrapper cannot
+#      inspect from argv. It can only ever be a plan ROOT ITSELF wrote:
+#      plans are encrypted with the state passphrase (klaffat
+#      deploy/terraform/versions.tf, `plan { enforced = true }`), which
+#      lives in /run/agenix at 0400 root, so the founder cannot forge one
+#      — but a saved DESTROY plan applies with neither the `destroy
+#      klaffat` phrase nor OpenTofu's own approval prompt. The founder who
+#      saved the plan is the founder applying it. Closing this means
+#      reading the plan file, which is a bigger change than this round
+#      takes on.
+#   2. The wrapper never empties ${plansDir}. Plan files accumulate there
+#      at 0600 root:root until the founder removes them. Deliberately no
+#      cleanup here: a wrapper that deleted files by age or count would be
+#      a second, unreviewed destructive path running under the same sudo
+#      password, and `rm` is the founder's to type.
 #
 # ── The install wrapper's ssh identity ────────────────────────────────
 #
@@ -307,6 +339,16 @@ let
   stateDir = "/var/lib/klaffat-infra";
   dataDir = "${stateDir}/terraform.d";
   mirrorDir = "${stateDir}/klaffat.git";
+
+  # THE ONLY DIRECTORY ROOT WRITES OR READS A PLAN FILE IN. 0700 root, so
+  # nothing jonathan can write is reachable through it, and — because the
+  # `PLAN` shape below is the literal prefix plus a single name segment —
+  # `-out=`, `apply <plan>` and `show <plan>` cannot name anything else.
+  # Round 8 measured what the previous shape (leading slash only) allowed:
+  # `plan -out=/etc/ssh/ssh_host_ed25519_key` had root's tofu open that
+  # path O_TRUNC and replace it with a 1526-byte plan zip, and the
+  # wrapper's own /run/agenix secret went the same way.
+  plansDir = "${stateDir}/plans";
 
   # CONTRACT v2 (2026-09-05): AWS, region eu-north-1. `klaffat-tofu-state`
   # is clickops-created with versioning ON (so it is never managed by the
@@ -513,8 +555,13 @@ let
       # `-destroy=1` walk past four literal spellings of the same flag. So
       # every token is matched against what THIS verb may take, and anything
       # unrecognised refuses — here, BEFORE mirror_sync touches the network
-      # and before a single secret is read, so a refusal costs nothing, says
-      # nothing, and never prints the `main @` line.
+      # and before a single secret is read, so a refusal costs nothing and
+      # says nothing. ARGV refusals specifically — and no others — print no
+      # `main @` line, because they are the only ones that run before
+      # mirror_sync. Every refusal LATER in the run (destroy unconfirmed, a
+      # symlink in the commit, an extracted tree that differs) prints the
+      # provenance line first and then its own; see the
+      # `-detailed-exitcode` note below for the rule that covers both.
       #
       # Value flags are accepted ONLY as one token, `-name=value`. A value
       # in its own argument (`-target ADDR`) cannot be checked against its
@@ -527,9 +574,26 @@ let
       # above unsets every TF_* anyway.
       #
       # `-detailed-exitcode` is allowed on `plan`, and it makes tofu exit 2
-      # for "there are changes" — the same code a refusal uses. They are
-      # told apart by the output: a refusal always prints a `klaffat-infra:`
-      # line and never the `main @` line; tofu's exit 2 always has both.
+      # for "there are changes" — the same code every refusal uses. The rule
+      # stated here until round 8 ("a refusal never prints the `main @`
+      # line") was FALSE, and measured false on 2026-09-06: `plan -no-color
+      # -destroy` with no controlling terminal printed
+      # `<url> main @ <sha>` and THEN refused with exit 2, because the
+      # provenance line is printed before the destroy confirmation, the
+      # symlink check and the archive comparison. The true rule is about the
+      # COUNT of `klaffat-infra:` lines, not the presence of one:
+      #
+      #   A successful run prints exactly one `klaffat-infra:` line — the
+      #   provenance line `<url> main @ <sha>`. Every refusal prints at
+      #   least one more `klaffat-infra:` line naming what was refused, and
+      #   exits 2. So `plan -detailed-exitcode` exit 2 means "changes
+      #   present" only when the provenance line is the ONLY
+      #   `klaffat-infra:` line in the output; the presence of `main @`
+      #   proves nothing by itself.
+      #
+      # The lane pins both halves: exactly one such line after a successful
+      # plan, at least two (provenance included) after a refusal that
+      # happens past mirror_sync.
       argv_bools=()
       argv_values=()
       argv_summary=""
@@ -544,13 +608,13 @@ let
           ;;
         plan)
           argv_bools=(-input=false -refresh-only -refresh=false -compact-warnings -detailed-exitcode -json)
-          argv_values=(-target:ADDR -replace:ADDR -parallelism:N -lock-timeout:DUR -out:PATH)
-          argv_summary="-input=false -refresh-only -refresh=false -compact-warnings -detailed-exitcode -json -destroy[=BOOL] -target=ADDR -replace=ADDR -parallelism=N -lock-timeout=DUR -out=/ABSOLUTE/PATH; no operands"
+          argv_values=(-target:ADDR -replace:ADDR -parallelism:N -lock-timeout:DUR -out:PLAN)
+          argv_summary="-input=false -refresh-only -refresh=false -compact-warnings -detailed-exitcode -json -destroy[=BOOL] -target=ADDR -replace=ADDR -parallelism=N -lock-timeout=DUR -out=${plansDir}/NAME; no operands"
           ;;
         apply)
           argv_bools=(-auto-approve -input=false -refresh-only -refresh=false -compact-warnings -json)
           argv_values=(-target:ADDR -replace:ADDR -parallelism:N -lock-timeout:DUR)
-          argv_summary="-auto-approve -input=false -refresh-only -refresh=false -compact-warnings -json -destroy[=BOOL] -target=ADDR -replace=ADDR -parallelism=N -lock-timeout=DUR; at most one operand, a saved plan named by ABSOLUTE path"
+          argv_summary="-auto-approve -input=false -refresh-only -refresh=false -compact-warnings -json -destroy[=BOOL] -target=ADDR -replace=ADDR -parallelism=N -lock-timeout=DUR; at most one operand, a saved plan under ${plansDir}/"
           ;;
         refresh)
           argv_bools=(-input=false -compact-warnings)
@@ -559,7 +623,7 @@ let
           ;;
         show)
           argv_bools=(-json)
-          argv_summary="-json; at most one operand, a saved plan or state file named by ABSOLUTE path"
+          argv_summary="-json; at most one operand, a saved plan under ${plansDir}/"
           ;;
         output)
           argv_bools=(-json -raw)
@@ -618,7 +682,8 @@ let
         echo "klaffat-infra: refused on every verb, by design: -var, -var-file, -plugin-dir," >&2
         echo "klaffat-infra:   -backend-config, -backend=, -from-module, -state, -state-out," >&2
         echo "klaffat-infra:   -backup, -chdir, 'state push', 'state replace-provider'," >&2
-        echo "klaffat-infra:   'workspace new|delete', 'providers mirror', '--', relative paths," >&2
+        echo "klaffat-infra:   'workspace new|delete', 'providers mirror', '--', every path" >&2
+        echo "klaffat-infra:   except a saved plan under ${plansDir}/ (relative ones included)," >&2
         echo "klaffat-infra:   and two-token value forms such as '-target ADDR'." >&2
         echo "klaffat-infra:   Every variable comes from the committed *.auto.tfvars and from the" >&2
         echo "klaffat-infra:   TF_VAR_* this wrapper exports out of /run/agenix; providers come" >&2
@@ -628,9 +693,19 @@ let
       }
 
       # The value shapes the contract names. ADDR is a resource address
-      # (`module.x.aws_instance.y["a"]`), so anything without whitespace;
-      # PATH must be ABSOLUTE because the working directory is a fresh
-      # archive this wrapper deletes on exit.
+      # (`module.x.aws_instance.y["a"]`), so anything without whitespace.
+      #
+      # PLAN is the ONLY shape that admits a filesystem path, and it admits
+      # exactly ${plansDir}/<name>: one root-only 0700 directory, one name
+      # segment starting with a letter, digit, `_` or `-` and continuing
+      # with those plus `.`. So `..`, `.`, dotfiles, a further `/`, a
+      # trailing `/`, whitespace and everything outside the directory are
+      # all refused by the same regex, with no realpath and no stat — see
+      # "Where plan files live" in the header for why lexical is enough.
+      # There is deliberately NO general `PATH` shape any more: the one it
+      # replaced tested for a leading slash, and round 8 reproduced root's
+      # tofu truncating /etc/ssh/ssh_host_ed25519_key through it. A shape
+      # that does not exist cannot be reused by the next flag.
       argv_shape_ok() {
         case "$1" in
           ADDR) [[ "$2" =~ ^[^[:space:]]+$ ]] ;;
@@ -639,9 +714,20 @@ let
           NAME) [[ "$2" =~ ^[A-Za-z0-9_-]+$ ]] ;;
           LOCK_ID) [[ "$2" =~ ^[A-Za-z0-9-]+$ ]] ;;
           ID) [[ "$2" =~ ^[^-] ]] ;;
-          PATH) [[ "$2" == /* ]] ;;
+          PLAN) [[ "$2" =~ ^${plansDir}/[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]] ;;
           *) false ;;
         esac
+      }
+
+      # Defined here, above the token loop, because BOTH users need it: the
+      # `-out=` value on `plan` and the single operand of `apply` and
+      # `show`. The generic value-shape refusal ("takes a value of the form
+      # PLAN") would name the shape and not the rule, and the rule is the
+      # part the founder has to learn.
+      argv_plan_path() {
+        if ! argv_shape_ok PLAN "$1"; then
+          argv_refuse "$1 is not a plan path. Saved plans live only in ${plansDir}/<name> (name: letters, digits, '.', '_', '-'; no subdirectories) — root writes and reads plan files nowhere else."
+        fi
       }
 
       argv_pos=()
@@ -686,7 +772,12 @@ let
                 if [ "$_name" = "$_t" ]; then
                   argv_refuse "$_name needs its value in the SAME token: write $_name=<$_vshape>. A value in its own argument cannot be checked against its flag."
                 fi
-                if argv_shape_ok "$_vshape" "$_val"; then
+                if [ "$_vshape" = PLAN ]; then
+                  # Refuses with the plans-directory rule rather than with
+                  # the shape's name.
+                  argv_plan_path "$_val"
+                  _hit=1
+                elif argv_shape_ok "$_vshape" "$_val"; then
                   _hit=1
                 else
                   argv_refuse "$_name takes a value of the form $_vshape, and $_val is not one."
@@ -717,12 +808,6 @@ let
         argv_arity=0
       fi
 
-      argv_abs_path() {
-        if ! argv_shape_ok PATH "$1"; then
-          argv_refuse "$1 must be an ABSOLUTE path. The working directory is a fresh archive of the verified commit that this wrapper deletes on exit, so a relative name reads — or writes — a file that does not outlive the run."
-        fi
-      }
-
       argv_check_addrs() {
         local _i="$1"
         local _a
@@ -743,10 +828,10 @@ let
           ;;
         apply|show)
           if [ "$_np" -gt 1 ]; then
-            argv_refuse "'$subcmd' takes at most one operand, a saved plan or state file."
+            argv_refuse "'$subcmd' takes at most one operand, a saved plan under ${plansDir}/."
           fi
           if [ "$_np" -eq 1 ]; then
-            argv_abs_path "$_p1"
+            argv_plan_path "$_p1"
           fi
           ;;
         output)
@@ -921,8 +1006,9 @@ let
       # argv — the plan file has to be read to know. `plan -out` +
       # `apply <file>` is not a path this wrapper offers a shortcut for, and
       # the founder who saved the plan is the one applying it. Note the
-      # working directory is a fresh archive every run, so a plan file has
-      # to be saved by ABSOLUTE path to survive to the next invocation.)
+      # working directory is a fresh archive every run, so a plan file only
+      # survives to the next invocation by being saved under ${plansDir},
+      # which is the one place `-out=` may name.)
       destroying=0
       if [ "$subcmd" = "destroy" ]; then
         destroying=1
@@ -1004,16 +1090,20 @@ let
       #     `sudo klaffat-infra apply` remains a real yes/no prompt.
       export TF_DATA_DIR="${dataDir}"
       export TF_INPUT=0
-      install -d -m 0700 "${stateDir}" "${dataDir}"
+      # ${plansDir} is created here, 0700 root, for the same reason the
+      # other two are: a `plan -out=` naming a file in it must find the
+      # directory. It is the only place `-out=`, `apply <plan>` and
+      # `show <plan>` may name, and the wrapper never empties it.
+      install -d -m 0700 "${stateDir}" "${dataDir}" "${plansDir}"
 
       # --- run against an ARCHIVE of the verified commit, in a fresh
       #     root-only directory that the trap removes. `git archive` from
       #     root's own mirror: committed content only, root's own
       #     attributes and config, no hooks, no working-tree metadata. The
       #     committed .terraform.lock.hcl is what `init` verifies against;
-      #     anything OpenTofu writes into the working directory (a
-      #     re-locked lock file, a plan saved by relative path) dies with
-      #     it, deliberately.
+      #     anything OpenTofu writes into the working directory — a
+      #     re-locked lock file, say — dies with it, deliberately. (A plan
+      #     cannot land here: `-out=` may only name ${plansDir}/<name>.)
       #
       #     The WHOLE deploy/ tree, not deploy/terraform: hetzner.tf reads
       #     `file("''${path.module}/../cloudflare-ips.json")`, and archiving
@@ -1203,8 +1293,16 @@ let
         echo "klaffat-infra-install: SSH_AUTH_SOCK is not set — root has no key of its own; run ssh-add for the key the server authorises (see the sudo rule: it keeps SSH_AUTH_SOCK for this command)." >&2
       fi
       # No `exec`: the EXIT trap above must still fire to remove $EXTRA.
+      #
+      # `--extra-experimental-features 'nix-command flakes'` for the same
+      # reason klaffat-publish passes it on every one of its four nix
+      # calls: a flakeref only resolves with those features on, and taking
+      # them from the system-wide nix.settings would make the most
+      # privileged step in this module — root installing a fresh machine —
+      # depend on configuration nothing here declares.
       rc=0
-      nix run "$flakeref#nixos-anywhere" -- \
+      nix --extra-experimental-features 'nix-command flakes' \
+        run "$flakeref#nixos-anywhere" -- \
         --extra-files "$EXTRA" \
         --flake "$flakeref#klaffat-demo" \
         "root@$ip" || rc=$?

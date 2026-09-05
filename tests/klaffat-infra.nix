@@ -55,10 +55,23 @@
 #      because they were an unguarded second input channel into the same
 #      credentialed process: `-var` / `-var-file` overrode the committed
 #      value, `state push` made root's tofu read a caller-named file,
-#      `-plugin-dir` became the only provider search location. Every
-#      refusal is asserted to land BEFORE the mirror is fetched — no
-#      `main @` line — and never to reach tofu, and the forms the founder
-#      needs are asserted to still get through.
+#      `-plugin-dir` became the only provider search location, and
+#      `plan -out=` / `apply <path>` / `show <path>` — checked for a
+#      leading slash and nothing else — made root's tofu open ANY absolute
+#      path the caller named, O_TRUNC on the write side (reproduced
+#      2026-09-06: a canary file and an agenix secret were both replaced by
+#      a plan zip, exit 0). Saved plans now live only in one root-only 0700
+#      directory under a single name segment, and the lane asserts both
+#      halves: the paths outside it are refused with the named file's bytes
+#      intact, and a plan saved inside it can still be shown and applied.
+#      Every case-13 refusal is an ARGV refusal, so each is asserted to land
+#      BEFORE the mirror is fetched — no `main @` line — and never to reach
+#      tofu, and the forms the founder needs are asserted to still get
+#      through. Refusals LATER in the run do print the provenance line, so
+#      the rule that tells a refusal from `plan -detailed-exitcode`'s own
+#      exit 2 is the COUNT of `klaffat-infra:` lines: exactly one after a
+#      successful run (case 13a), at least two after a refusal past
+#      mirror_sync (case 8).
 #
 #   6. Each verb sees only the credentials it is entitled to: with the
 #      Hetzner token removed, `validate` and `output` still run and `plan`
@@ -112,6 +125,12 @@ let
   # Root-only state the module owns, and the mirror inside it.
   stateDir = "/var/lib/klaffat-infra";
   mirror = "${stateDir}/klaffat.git";
+
+  # The one directory `plan -out=`, `apply <plan>` and `show <plan>` may
+  # name. Round 8 reproduced what the previous rule (any absolute path)
+  # allowed: root's tofu opened `-out=/etc/ssh/ssh_host_ed25519_key` with
+  # O_TRUNC and replaced it with a plan zip.
+  plansDir = "${stateDir}/plans";
 
   # The lane's stand-in for github.com: a bare repo under a root-owned
   # directory, served over HTTP by lighttpd + git-http-backend behind basic
@@ -207,6 +226,16 @@ common.mkMinimalTest {
     def write_file(path, content):
         machine.succeed(f"printf '%s' {shlex.quote(content)} > {path}")
 
+    # A LEFTOVER is a per-run TEMPORARY that outlived its trap: the archive
+    # directory (`infra-*`), klaffat-publish's scratch (`publish-*`), the
+    # install wrapper's --extra-files staging dir. This is an allowlist of
+    # those three name prefixes, so the durable state the module owns —
+    # `klaffat.git`, `terraform.d`, and as of round 8 `plans` and the plan
+    # files inside it — is not a leftover and never counts as one. That is
+    # deliberate for `plans`, not incidental: saved plans are the one thing
+    # a run is MEANT to leave behind (the wrapper never empties the
+    # directory; see the module header's residual (2)), and case 13a's
+    # positive control leaves one there for every later assertion to see.
     def state_leftovers():
         _, ls = machine.execute("ls -A ${stateDir} /run")
         return [x for x in ls.split() if x.startswith(("infra-", "publish-", "klaffat-extra-files"))]
@@ -679,6 +708,21 @@ common.mkMinimalTest {
             f"unexpected destroy refusal for '{cmd}': {out!r}"
         )
         assert "OpenTofu" not in out, f"'{cmd}' reached tofu: {out!r}"
+        # THE `-detailed-exitcode` RULE, refusal half. This refusal happens
+        # AFTER mirror_sync, so it prints the provenance line FIRST and then
+        # its own — which is why "a refusal never prints `main @`" was false
+        # and is no longer claimed anywhere. What is true, and what tells a
+        # refusal from tofu's own exit 2, is the COUNT: a successful run has
+        # exactly one `klaffat-infra:` line (13a asserts that half), a
+        # refusal past this point has at least two.
+        infra_lines = [ln for ln in out.splitlines() if ln.startswith("klaffat-infra:")]
+        assert len(infra_lines) >= 2, (
+            f"'{cmd}' refused after mirror_sync must print the provenance line AND a "
+            f"refusal line; got {infra_lines!r}"
+        )
+        assert any("main @" in ln for ln in infra_lines), (
+            f"'{cmd}' refused after mirror_sync without the provenance line: {infra_lines!r}"
+        )
 
     # 8a. WITH a real terminal and `yes` on stdin — the shape of the
     #     original attack. The pipe feeds stdin; the confirmation is read
@@ -960,6 +1004,18 @@ common.mkMinimalTest {
     #
     #     Each refusal below must cost exit 2, must happen BEFORE the mirror
     #     is touched (so no `main @` line) and must never reach tofu.
+    #
+    #     The plan-path rows are round 8's. `-out=`, `apply <path>` and
+    #     `show <path>` were checked for a LEADING SLASH and nothing else,
+    #     so root's tofu opened any absolute path the caller named:
+    #     reproduced 2026-09-06 against the real generated wrapper,
+    #     `plan -out=/etc/ssh/ssh_host_ed25519_key` exited 0 having replaced
+    #     a 35-byte canary file with a 1526-byte plan zip, and
+    #     `-out=/run/agenix/<secret>` replaced the wrapper's own secret the
+    #     same way. Saved plans now live in exactly one root-only 0700
+    #     directory under a single name segment, so `..`, a subdirectory, a
+    #     dotfile, a trailing slash and every path outside it are refused by
+    #     the same lexical rule.
     # ---------------------------------------------------------------
     write_file("/root/evil.tfvars", 'canary = "ATTACKER"\n')
     write_file("/root/evil.tfstate", '{"version": 4}\n')
@@ -980,6 +1036,18 @@ common.mkMinimalTest {
         "plan -bogus",
         "workspace new x",
         "providers mirror /root/m",
+        # Round 8: a plan path is the plans directory plus ONE name.
+        "plan -no-color -out=/etc/ssh/ssh_host_ed25519_key",
+        "plan -no-color -out=/dev/null",
+        "plan -no-color -out=/run/agenix/klaffat-hcloud-token",
+        "plan -no-color -out=/root/r7.tfplan",
+        "plan -no-color -out=${plansDir}/../r7.tfplan",
+        "plan -no-color -out=${plansDir}/sub/r7.tfplan",
+        "plan -no-color -out=${plansDir}/.hidden",
+        "plan -no-color -out=${plansDir}/",
+        "apply -no-color /etc/passwd",
+        "show -no-color /run/agenix/klaffat-hcloud-token",
+        "show -no-color ${plansDir}/../klaffat.git/HEAD",
     ]:
         rc, out = run(f"${bin}/klaffat-infra {args}")
         assert rc == 2, f"'{args}' should be refused with exit 2, got {rc}: {out!r}"
@@ -991,10 +1059,59 @@ common.mkMinimalTest {
         assert "ATTACKER" not in out, f"'{args}' let a caller-supplied value through: {out!r}"
     assert state_leftovers() == [], f"an argv refusal left artefacts: {state_leftovers()!r}"
 
+    # The refusal has to teach the RULE — the directory and the name shape —
+    # not just say no to this one path, because the founder's next attempt
+    # is otherwise another guess.
+    rc, out = run("${bin}/klaffat-infra plan -no-color -out=/etc/ssh/ssh_host_ed25519_key")
+    assert "is not a plan path" in out, f"the plan-path refusal must name what it wants: {out!r}"
+    assert "${plansDir}/<name>" in out, (
+        f"the refusal must name the plans directory: {out!r}"
+    )
+    assert "no subdirectories" in out, f"the refusal must name the name rule: {out!r}"
+
+    # …and the PROPERTY, measured rather than inferred: the file the caller
+    # named still holds its own bytes. This is the repro's scenario 1a/1b —
+    # at 4d3d73c the canary and the agenix secret were both replaced by a
+    # plan zip, exit 0.
+    write_file("/root/victim.txt", "canary-bytes-do-not-truncate\n")
+    victim_before = machine.succeed("cat /root/victim.txt")
+    rc, out = run("${bin}/klaffat-infra plan -no-color -out=/root/victim.txt")
+    assert rc == 2, f"-out=<outside the plans dir> should be refused, got {rc}: {out!r}"
+    assert machine.succeed("cat /root/victim.txt") == victim_before, (
+        "root's tofu opened the caller-named path with O_TRUNC: "
+        f"{machine.succeed('cat /root/victim.txt')!r}"
+    )
+    assert machine.succeed("cat /run/agenix/klaffat-hcloud-token").strip() == "TEST-hcloud-token", (
+        "the wrapper's own agenix secret was overwritten through -out="
+    )
+    # The directory itself is root-only and, so far, empty: every refusal
+    # above happened before tofu could write anything anywhere.
+    mode = machine.succeed("stat -c '%U:%a' ${plansDir}").strip()
+    assert mode == "root:700", f"the plans dir must be root:700, got '{mode}'"
+    assert machine.succeed("ls -A ${plansDir}").strip() == "", (
+        "a refused -out= wrote into the plans directory anyway"
+    )
+
     # 13a. …and the forms the founder actually needs still reach tofu.
     rc, out = run("${bin}/klaffat-infra plan -no-color")
     assert rc == 0 and 'canary = "REMOTE-2"' in squash(out), (
         f"the plain plan must still plan the committed values: {rc} {out!r}"
+    )
+    # THE `-detailed-exitcode` RULE, success half. `plan -detailed-exitcode`
+    # exits 2 for "there are changes", the same code every refusal uses, and
+    # what tells them apart is that a SUCCESSFUL run prints exactly one
+    # `klaffat-infra:` line — the provenance line — while a refusal prints
+    # at least one more (case 8 asserts that half). The rule the module used
+    # to state, "a refusal never prints `main @`", was measured false: a
+    # refusal past mirror_sync prints it first.
+    infra_lines = [ln for ln in out.splitlines() if ln.startswith("klaffat-infra:")]
+    assert len(infra_lines) == 1, (
+        f"a successful run must print exactly one klaffat-infra: line, the provenance "
+        f"line; got {infra_lines!r}"
+    )
+    assert "main @" in infra_lines[0], (
+        f"the one klaffat-infra: line on a successful run must be the provenance line: "
+        f"{infra_lines[0]!r}"
     )
 
     # A single-token `-target=` is allowed. tofu's own "Resource targeting
@@ -1004,16 +1121,26 @@ common.mkMinimalTest {
         f"-target=ADDR did not reach tofu: {rc} {out!r}"
     )
 
-    # plan -out= / show / apply, all by ABSOLUTE path — a relative one names
-    # a file inside the archive directory the trap deletes.
-    rc, out = run("${bin}/klaffat-infra plan -no-color -out=/root/r7.tfplan")
-    assert rc == 0 and "Saved the plan to: /root/r7.tfplan" in out, (
-        f"plan -out=<absolute> did not save a plan: {rc} {out!r}"
+    # plan -out= / show / apply, all naming a file in the ONE directory the
+    # wrapper offers. Until round 8 this control saved to /root/r7.tfplan
+    # and any absolute path was accepted; that path is now in the refusal
+    # list above, and the plan lives here instead.
+    rc, out = run("${bin}/klaffat-infra plan -no-color -out=${plansDir}/r7.tfplan")
+    assert rc == 0 and "Saved the plan to: ${plansDir}/r7.tfplan" in out, (
+        f"plan -out=<plans dir> did not save a plan: {rc} {out!r}"
     )
-    machine.succeed("test -f /root/r7.tfplan")
-    rc, out = run("${bin}/klaffat-infra show -no-color /root/r7.tfplan")
+    machine.succeed("test -f ${plansDir}/r7.tfplan")
+    # 0700 on the directory and 0600 on the file, both root: the plan is
+    # encrypted with the state passphrase, but jonathan should not be able
+    # to so much as list what the founder has planned.
+    mode = machine.succeed("stat -c '%U:%a' ${plansDir}").strip()
+    assert mode == "root:700", f"the plans dir must be root:700, got '{mode}'"
+    mode = machine.succeed("stat -c '%U:%a' ${plansDir}/r7.tfplan").strip()
+    assert mode == "root:600", f"a saved plan must be root:600, got '{mode}'"
+
+    rc, out = run("${bin}/klaffat-infra show -no-color ${plansDir}/r7.tfplan")
     assert rc == 0 and "REMOTE-2" in out, f"show <saved plan> did not reach tofu: {rc} {out!r}"
-    rc, out = run("${bin}/klaffat-infra apply -no-color /root/r7.tfplan")
+    rc, out = run("${bin}/klaffat-infra apply -no-color ${plansDir}/r7.tfplan")
     assert "Apply complete!" in out, (
         f"apply <saved plan> did not reach tofu: {rc} {out!r}"
     )
@@ -1031,6 +1158,36 @@ common.mkMinimalTest {
     assert rc == 0 and '"terraform_version"' in out, (
         f"version -json did not reach tofu: {rc} {out!r}"
     )
+
+    # 13b. `-help` waives a verb's MINIMUM operand count — and only the
+    #      minimum, never a maximum, a refusal by name or a shape. Nothing
+    #      exercised that branch: `apply -destroy -help` (case 8b) is the
+    #      only `-help` row and `apply` has no minimum, so `argv_arity=0`
+    #      could have been wired to anything. `import` needs two operands
+    #      and `state` needs one, so with no operand and no `-help` both
+    #      refuse; with `-help` both must get PAST the argv check and reach
+    #      tofu's own usage text. (`-help` is not an argv refusal and not
+    #      free: it still goes through mirror_sync and the archive, so the
+    #      provenance line is expected here — what must be absent is the
+    #      "'<verb>' accepts:" line every argv_refuse prints.)
+    for verb in ["state", "import"]:
+        rc, out = run(f"${bin}/klaffat-infra {verb} -no-color -help")
+        assert "accepts:" not in out, (
+            f"'{verb} -help' was argv-refused; -help must waive the minimum operand "
+            f"count: {rc} {out!r}"
+        )
+        assert f"Usage: tofu [global options] {verb}" in out, (
+            f"'{verb} -help' did not reach tofu's own help: {rc} {out!r}"
+        )
+    rc, out = run("${bin}/klaffat-infra state -no-color")
+    assert rc == 2 and "'state' needs one of" in out, (
+        f"without -help, 'state' with no operand must still refuse: {rc} {out!r}"
+    )
+    rc, out = run("${bin}/klaffat-infra import -no-color")
+    assert rc == 2 and "'import' takes exactly two operands" in out, (
+        f"without -help, 'import' with no operands must still refuse: {rc} {out!r}"
+    )
+
     assert state_leftovers() == [], f"runs left artefacts in ${stateDir}: {state_leftovers()!r}"
   '';
 }
