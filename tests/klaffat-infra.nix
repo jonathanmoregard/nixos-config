@@ -51,6 +51,15 @@
 #      `yes | sudo klaffat-infra destroy` is one password away from an
 #      empty stack.
 #
+#      The ARGUMENTS after the verb are allowlisted per verb too (case 13),
+#      because they were an unguarded second input channel into the same
+#      credentialed process: `-var` / `-var-file` overrode the committed
+#      value, `state push` made root's tofu read a caller-named file,
+#      `-plugin-dir` became the only provider search location. Every
+#      refusal is asserted to land BEFORE the mirror is fetched — no
+#      `main @` line — and never to reach tofu, and the forms the founder
+#      needs are asserted to still get through.
+#
 #   6. Each verb sees only the credentials it is entitled to: with the
 #      Hetzner token removed, `validate` and `output` still run and `plan`
 #      exits 3; with the state passphrase removed, `validate` runs and
@@ -61,16 +70,20 @@
 #      refused); the build addresses the root-only mirror at the exact rev.
 #
 #   8. klaffat-infra-install refuses anything that is not an IP address
-#      (a resolvable hostname like `cafe.beef` used to pass), stages its
+#      (a resolvable hostname like `cafe.beef` used to pass), CONFIRMS the
+#      target at /dev/tty by requiring the literal `install <ip>` back
+#      before the demo host's private key is read or staged, stages its
 #      --extra-files dir on tmpfs under /run and removes it on every exit
 #      path, and hands `nix run` a flakeref into the root-only mirror
 #      pinned to the verified rev.
 #
 #   9. What the archive may contain: a commit with a symlink under deploy/
 #      is refused before extraction; a commit whose .gitattributes drops a
-#      file with export-ignore is refused after it (blob shas compared);
-#      and the fixture reads ../cloudflare-ips.json the way hetzner.tf
-#      does, so an archive pathspec narrower than deploy/ fails the plan.
+#      file with export-ignore, or merely REWRITES one (`text`/`eol`), is
+#      refused after it (raw bytes compared with hash-object
+#      --no-filters); and the fixture reads ../cloudflare-ips.json the way
+#      hetzner.tf does, so an archive pathspec narrower than deploy/ fails
+#      the plan.
 { pkgs, inputs }:
 
 let
@@ -378,14 +391,34 @@ common.mkMinimalTest {
     # root has no ssh key; the install wrapper reaches the fresh box through
     # the founder's agent, so SSH_AUTH_SOCK survives env_reset for that ONE
     # command and for nothing else.
-    assert 'Defaults!KLAFFAT_INSTALL_CMNDS env_keep += "SSH_AUTH_SOCK"' in sudoers, (
-        "the install wrapper's sudo rule must keep SSH_AUTH_SOCK"
+    #
+    # That is a claim about the WHOLE sudoers file, not about the line this
+    # module emits, and greping for the module's own line could never have
+    # falsified it: nixpkgs emits a GLOBAL `env_keep+=SSH_AUTH_SOCK` under
+    # `security.pam.sshAgentAuth`, which dellan does not enable today.
+    # Enabling it anywhere would keep the variable for every sudo command on
+    # the laptop while the command-scoped line below still read correctly.
+    # So collect every line that keeps it, and assert the list is exactly
+    # the one.
+    ssh_sock_lines = [
+        ln.strip() for ln in sudoers.splitlines()
+        if "env_keep" in ln and "SSH_AUTH_SOCK" in ln
+    ]
+    assert ssh_sock_lines == ['Defaults!KLAFFAT_INSTALL_CMNDS env_keep += "SSH_AUTH_SOCK"'], (
+        "SSH_AUTH_SOCK must survive env_reset for the install command and for nothing "
+        f"else (security.pam.sshAgentAuth would widen it); sudoers keeps it on: {ssh_sock_lines!r}"
     )
     assert "KLAFFAT_INFRA_CMNDS env_keep" not in sudoers, "env_keep leaked onto the OpenTofu/publish rule"
+
+    # The alias body is `concatStringsSep ", "`, so every element but the
+    # last carries a trailing comma — which is why testing the JOINED line
+    # for `bin/klaffat-infra ` only ever caught a klaffat-infra appended
+    # LAST. Split the body and check each command in it.
     install_alias = [ln for ln in sudoers.splitlines() if ln.startswith("Cmnd_Alias KLAFFAT_INSTALL_CMNDS")]
-    assert len(install_alias) == 1 and "klaffat-infra-install" in install_alias[0], install_alias
-    assert "klaffat-publish" not in install_alias[0] and "bin/klaffat-infra " not in install_alias[0] + " ", (
-        f"the install alias must name only the install wrapper: {install_alias[0]!r}"
+    assert len(install_alias) == 1, install_alias
+    alias_cmds = [c.strip() for c in install_alias[0].split("=", 1)[1].split(", ")]
+    assert alias_cmds and all(c.endswith("/bin/klaffat-infra-install") for c in alias_cmds), (
+        f"the install alias must name only klaffat-infra-install: {alias_cmds!r}"
     )
 
     # ---------------------------------------------------------------
@@ -559,7 +592,12 @@ common.mkMinimalTest {
     )
     assert rev_local not in out, f"klaffat-publish targeted the local main {rev_local}: {out!r}"
 
-    rc, out = run("${bin}/klaffat-infra-install 10.0.0.1")
+    # The install wrapper confirms its TARGET at /dev/tty (case 10), so the
+    # flakeref line is only reached with the phrase typed on a pty.
+    rc, out = run(
+        "printf 'install 10.0.0.1\\n' | timeout 180 script -qec "
+        "'${bin}/klaffat-infra-install 10.0.0.1' /dev/null"
+    )
     assert rc != 0
     assert f"flakeref git+file://${mirror}?rev={rev_a}&allRefs=1" in out, (
         f"install did not pin the remote tip in the mirror: {out!r}"
@@ -724,8 +762,9 @@ common.mkMinimalTest {
     as_jonathan("${git} -C ${repo} -c core.fsmonitor= worktree add --detach /home/jonathan/wt HEAD")
 
     # ---------------------------------------------------------------
-    # 10. klaffat-infra-install: argument handling, the rev-pinned
-    #     flakeref, and the cleanup trap.
+    # 10. klaffat-infra-install: argument handling, the /dev/tty
+    #     confirmation of the TARGET, the rev-pinned flakeref, and the
+    #     cleanup trap.
     # ---------------------------------------------------------------
     rc, out = run("${bin}/klaffat-infra-install")
     assert rc == 2 and "usage:" in out, f"missing-arg refusal wrong: {rc} {out!r}"
@@ -739,12 +778,56 @@ common.mkMinimalTest {
         )
         assert "installing klaffat-demo" not in out, f"'{bad}' reached the install: {out!r}"
 
-    # Real staging run. `nix run` cannot succeed here (the fixture flake
-    # has no nixos-anywhere), which is exactly the failure the trap has to
-    # survive.
+    # 10a. NO TERMINAL, NO INSTALL. This wrapper writes the demo host's
+    #      PRIVATE ssh identity into a staging dir and hands it, with root
+    #      on a fresh machine, to whatever answers at the address in argv.
+    #      The IP check above proves the argument is an address; only the
+    #      founder can say it is the RIGHT address. So the target is
+    #      confirmed at /dev/tty, exactly like `destroy` — and `setsid
+    #      --wait` here for exactly the reason case 8 explains: the driver's
+    #      backdoor shell HAS a controlling terminal on /dev/hvc0, and a
+    #      prompt written to it desynchronises the driver protocol.
     for ip in ["10.0.0.1", "2a01:4f8::1"]:
-        rc, out = run(f"${bin}/klaffat-infra-install {ip}")
-        assert rc != 0, "install against a host-less flake should fail"
+        rc, out = run(f"yes | setsid --wait timeout 60 ${bin}/klaffat-infra-install {ip}")
+        assert rc != 124, (
+            f"install blocked on a terminal read instead of refusing ({ip}): {out!r}"
+        )
+        assert rc == 2, f"install without a terminal should exit 2 ({ip}), got {rc}: {out!r}"
+        assert "no terminal to confirm at" in out, f"unexpected install refusal ({ip}): {out!r}"
+        assert "installing klaffat-demo" not in out, (
+            f"an unconfirmed install proceeded ({ip}): {out!r}"
+        )
+    assert state_leftovers() == [], (
+        f"a refused install staged something anyway: {state_leftovers()!r}"
+    )
+
+    # 10b. WITH a terminal and the WRONG phrase: refused, nothing staged.
+    rc, out = run(
+        "printf 'no\\n' | timeout 60 script -qec "
+        "'${bin}/klaffat-infra-install 10.0.0.1' /dev/null"
+    )
+    assert rc != 124, f"install hung on a pty instead of reading the answer: {out!r}"
+    assert "type exactly 'install 10.0.0.1' to proceed" in out, (
+        f"the confirmation prompt never reached the terminal: {out!r}"
+    )
+    assert "install not confirmed" in out, f"a wrong answer must refuse: {out!r}"
+    assert "installing klaffat-demo" not in out, f"a refused install proceeded: {out!r}"
+    assert state_leftovers() == [], (
+        f"a refused install staged something anyway: {state_leftovers()!r}"
+    )
+
+    # 10c. The right phrase — the literal IP, retyped — gets through, and
+    #      `nix run` then fails on the fixture flake (no nixos-anywhere),
+    #      which is exactly the failure the cleanup trap has to survive.
+    for ip in ["10.0.0.1", "2a01:4f8::1"]:
+        rc, out = run(
+            f"printf 'install {ip}\\n' | timeout 180 script -qec "
+            f"'${bin}/klaffat-infra-install {ip}' /dev/null"
+        )
+        assert rc != 124, f"the confirmed install hung ({ip}): {out!r}"
+        assert "install not confirmed" not in out and "no terminal to confirm at" not in out, (
+            f"a correctly typed confirmation was still refused ({ip}): {out!r}"
+        )
         assert f"installing klaffat-demo onto root@{ip}" in out, (
             f"install did not reach the nixos-anywhere call: {out!r}"
         )
@@ -831,13 +914,123 @@ common.mkMinimalTest {
     )
     assert "Success!" not in out, f"tofu ran on an incomplete tree: {out!r}"
 
-    # 12c. …and a clean commit runs again.
+    # 12c. …and so is a .gitattributes that merely REWRITES the bytes.
+    #      export-ignore is not the only attribute `git archive` honours:
+    #      `text`/`eol` rewrite line endings, `ident` substitutes the blob
+    #      sha, `export-subst` expands `$Format:…$` and `filter` runs a
+    #      smudge command. Measured with git 2.55.0 on 2026-09-06 in a
+    #      scratch bare repo: `* text=auto eol=crlf` under deploy/ makes
+    #      `git archive` write CRLF where the blob holds LF, so what tofu
+    #      would read is NOT what the commit says. `hash-object
+    #      --no-filters` compares raw bytes, so it refuses.
     machine.succeed(f"rm {src}/.gitattributes")
+    write_file(f"{src}/deploy/.gitattributes", "* text=auto eol=crlf\n")
+    src_git("add -A")
+    src_git("commit -q -m 'eol=crlf'")
+    push_origin()
+    rc, out = run("${bin}/klaffat-infra validate -no-color")
+    assert rc == 2 and "differs from commit" in out, (
+        f"an eol-rewriting .gitattributes was not refused: {rc} {out!r}"
+    )
+    assert "text/eol" in out, (
+        f"the refusal must name the attribute classes that cause it: {out!r}"
+    )
+    assert "Success!" not in out, f"tofu ran on a rewritten tree: {out!r}"
+
+    # 12d. …and a clean commit runs again.
+    machine.succeed(f"rm {src}/deploy/.gitattributes")
     src_git("add -A")
     src_git("commit -q -m 'clean again'")
     push_origin()
     rc, out = run("${bin}/klaffat-infra validate -no-color")
     assert rc == 0 and "Success!" in out, f"a clean commit should validate: {rc} {out!r}"
+    assert state_leftovers() == [], f"runs left artefacts in ${stateDir}: {state_leftovers()!r}"
+
+    # ---------------------------------------------------------------
+    # 13. ARGV AFTER THE VERB IS ALLOWLISTED, PER VERB.
+    #
+    #     `tofu "$@"` used to hand root's OpenTofu every argument after the
+    #     verb. Reproduced 2026-09-06 against the real generated wrapper:
+    #     `-var`/`-var-file` override the value the committed tfvars
+    #     authored (and `apply -auto-approve -var …` commits it),
+    #     `state push` makes root's tofu READ a caller-named file,
+    #     `init -plugin-dir=` becomes the only provider search location and
+    #     `init -from-module=` copies code from outside the verified commit
+    #     into the working directory.
+    #
+    #     Each refusal below must cost exit 2, must happen BEFORE the mirror
+    #     is touched (so no `main @` line) and must never reach tofu.
+    # ---------------------------------------------------------------
+    write_file("/root/evil.tfvars", 'canary = "ATTACKER"\n')
+    write_file("/root/evil.tfstate", '{"version": 4}\n')
+    machine.succeed("install -d -m 0700 /root/plugins /root/m")
+
+    for args in [
+        "plan -no-color -var github_repo=attacker/x",
+        "plan -var=github_repo=attacker/x",
+        "plan -var-file=/root/evil.tfvars",
+        "init -plugin-dir=/root/plugins",
+        "init -backend-config=bucket=x",
+        "init -from-module=/root/m",
+        "state push /root/evil.tfstate",
+        "plan -target null_resource.x",
+        "plan -- -var",
+        "apply relative.tfplan",
+        "plan -out=relative.tfplan",
+        "plan -bogus",
+        "workspace new x",
+        "providers mirror /root/m",
+    ]:
+        rc, out = run(f"${bin}/klaffat-infra {args}")
+        assert rc == 2, f"'{args}' should be refused with exit 2, got {rc}: {out!r}"
+        assert "main @" not in out, (
+            f"'{args}' was checked only after the mirror was fetched: {out!r}"
+        )
+        assert "OpenTofu" not in out, f"'{args}' reached tofu: {out!r}"
+        assert "klaffat-infra:" in out, f"'{args}' refused without saying why: {out!r}"
+        assert "ATTACKER" not in out, f"'{args}' let a caller-supplied value through: {out!r}"
+    assert state_leftovers() == [], f"an argv refusal left artefacts: {state_leftovers()!r}"
+
+    # 13a. …and the forms the founder actually needs still reach tofu.
+    rc, out = run("${bin}/klaffat-infra plan -no-color")
+    assert rc == 0 and 'canary = "REMOTE-2"' in squash(out), (
+        f"the plain plan must still plan the committed values: {rc} {out!r}"
+    )
+
+    # A single-token `-target=` is allowed. tofu's own "Resource targeting
+    # is in effect" warning is the proof the flag reached it.
+    rc, out = run("${bin}/klaffat-infra plan -no-color -target=null_resource.nothing")
+    assert "Resource targeting is in effect" in out, (
+        f"-target=ADDR did not reach tofu: {rc} {out!r}"
+    )
+
+    # plan -out= / show / apply, all by ABSOLUTE path — a relative one names
+    # a file inside the archive directory the trap deletes.
+    rc, out = run("${bin}/klaffat-infra plan -no-color -out=/root/r7.tfplan")
+    assert rc == 0 and "Saved the plan to: /root/r7.tfplan" in out, (
+        f"plan -out=<absolute> did not save a plan: {rc} {out!r}"
+    )
+    machine.succeed("test -f /root/r7.tfplan")
+    rc, out = run("${bin}/klaffat-infra show -no-color /root/r7.tfplan")
+    assert rc == 0 and "REMOTE-2" in out, f"show <saved plan> did not reach tofu: {rc} {out!r}"
+    rc, out = run("${bin}/klaffat-infra apply -no-color /root/r7.tfplan")
+    assert "Apply complete!" in out, (
+        f"apply <saved plan> did not reach tofu: {rc} {out!r}"
+    )
+
+    rc, out = run("${bin}/klaffat-infra output -json")
+    assert rc == 0 and out.strip().endswith("}"), f"output -json was refused: {rc} {out!r}"
+    assert "is not an allowed argument" not in out, f"output -json was refused: {out!r}"
+
+    # `state list` has no state to list in this fixture; tofu's own error is
+    # what proves the operand and the verb both got through.
+    rc, out = run("${bin}/klaffat-infra state list")
+    assert "No state file was found" in out, f"state list did not reach tofu: {rc} {out!r}"
+
+    rc, out = run("${bin}/klaffat-infra version -json")
+    assert rc == 0 and '"terraform_version"' in out, (
+        f"version -json did not reach tofu: {rc} {out!r}"
+    )
     assert state_leftovers() == [], f"runs left artefacts in ${stateDir}: {state_leftovers()!r}"
   '';
 }

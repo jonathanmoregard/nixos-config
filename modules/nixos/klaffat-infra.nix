@@ -112,6 +112,22 @@
 #                          shas equal) before `tofu` runs in deploy/terraform.
 #                          Committed content only; nothing on disk in the
 #                          founder's tree is ever read.
+#
+# That verification compares RAW BYTES to the blob, with
+# `git hash-object --no-filters`. A committed `.gitattributes` is part of
+# the reviewed tree, but it still gets a vote on what `git archive` writes
+# to disk: `export-ignore` drops a file, `export-subst` and `ident`
+# rewrite one, `text`/`eol` rewrite line endings, `filter` runs a smudge
+# command. Measured with git 2.55.0 on 2026-09-06 in a scratch bare repo
+# with `deploy/.gitattributes` = `* text=auto eol=crlf`: `git archive`
+# wrote CRLF while the blob held LF, and hash-object — cwd in the
+# extracted tree, `--git-dir` on the bare mirror — applied no inverse
+# conversion (identical shas with and without `--no-filters`), so the
+# refusal fired. `--no-filters` makes that independent of what a future
+# git decides the cwd is, rather than a property observed once. The real
+# klaffat tree has NO .gitattributes (checked the same day:
+# `git ls-files | grep -i gitattributes` is empty), so this refuses
+# nothing that exists today.
 #   klaffat-publish        `nix build git+file://<mirror>?rev=<sha>#…` —
 #                          the exact commit. No worktree, no hooks, no
 #                          ownership bookkeeping in the founder's .git.
@@ -188,6 +204,63 @@
 # the first one). `-destroy=false` therefore asks for confirmation too,
 # which costs a phrase and nothing else.
 #
+# ── What ARGUMENTS reach OpenTofu: an allowlist, per verb ─────────────
+#
+# The verb was the only word this wrapper used to read. Everything after
+# it went to root's `tofu` unexamined, which made argv a second, unguarded
+# input channel into the same credentialed process — reproduced 2026-09-06
+# against the real generated wrapper:
+#
+#   - `plan -var github_repo=attacker/x` and
+#     `-var-file=<a file the founder's user can write>` both override the
+#     value the committed `demo.auto.tfvars` authored, and
+#     `apply -auto-approve -var …` commits it. In the real klaffat tree
+#     `github_repo` is the `sub` claim of the OIDC role allowed to read
+#     the NAR signing key (deploy/terraform/aws.tf), i.e. the key that
+#     decides what the demo host installs and runs as root.
+#   - `state push <a founder-writable file>` is READ by root's tofu and
+#     written over the encrypted remote state.
+#   - `init -plugin-dir=<a founder-writable dir>` makes that directory the
+#     ONLY place root's tofu looks for provider binaries, and
+#     `init -from-module=<dir>` copies configuration from outside the
+#     verified commit into the working directory.
+#
+# So argv after the verb is ALLOWLISTED, per verb, token by token, in the
+# same place the verb is checked: before the mirror is fetched and before
+# a single secret is read. Not a deny-list — round 6 watched `-destroy=1`
+# walk past four literal spellings of one flag, and a list of bad
+# spellings is only ever as long as the last review. Value flags are taken
+# only in the one-token `-name=value` form (a value in its own argument
+# cannot be checked against its flag), `--` is refused, and any path
+# operand must be ABSOLUTE, because the working directory is a fresh
+# archive the wrapper deletes on exit.
+#
+# What the allowlist leaves out is what the design never needed:
+# variables come from the committed `*.auto.tfvars` and from the `TF_VAR_*`
+# this wrapper exports out of /run/agenix; providers come from the
+# committed `.terraform.lock.hcl`; state comes from the committed backend.
+# `-var`, `-var-file`, `-plugin-dir`, `-from-module`, `-backend-config`,
+# `-state`/`-state-out`/`-backup`, `-chdir`, `state push`,
+# `state replace-provider`, `workspace new`/`delete` and `providers mirror`
+# are therefore refused by construction, not by name-matching.
+#
+# `TF_CLI_ARGS` and `TF_CLI_ARGS_<verb>` cannot be used to smuggle flags
+# past the allowlist: sudo's `env_reset` drops the caller's environment
+# (the rules below carry no SETENV and keep only SSH_AUTH_SOCK, for the
+# install command), and rootOnlyPreamble unsets every `TF_*` and `AWS_*`
+# anyway, for the direct-root case too.
+#
+# THE RESIDUAL, documented rather than pretended away: `apply <PATH>`
+# applies a saved plan, and a plan file cannot be inspected from argv. A
+# plan is encrypted with the state passphrase (klaffat
+# deploy/terraform/versions.tf, the `plan {}` block), so only a plan this
+# wrapper itself wrote — as root, umask 077, to an absolute path — can be
+# applied at all. But a saved DESTROY plan then applies with neither the
+# `destroy klaffat` phrase nor OpenTofu's own approval prompt. The founder
+# who saved the plan is the founder applying it, and closing this properly
+# means reading the plan file, which is a bigger change than this round
+# takes on.
+#
 # ── The install wrapper's ssh identity ────────────────────────────────
 #
 # nixos-anywhere has to ssh to the fresh box as root, and root on the
@@ -199,6 +272,30 @@
 # running as the founder can already use that agent. It is scoped to the
 # one command that needs it; the OpenTofu and publish wrappers run under
 # a plain env_reset.
+#
+# "ONLY that rule" is a claim about the WHOLE sudoers file, not just the
+# lines this module writes, and nixpkgs has a global
+# `env_keep+=SSH_AUTH_SOCK` of its own — emitted by
+# `security.pam.sshAgentAuth`, which dellan does not enable. Enabling it
+# anywhere would widen the variable to every sudo command on the laptop
+# and this header would quietly become false, so the lane no longer greps
+# for the command-scoped line: it collects EVERY sudoers line containing
+# both `env_keep` and `SSH_AUTH_SOCK` and asserts the list is exactly the
+# one line below.
+#
+# ── The install wrapper's target is confirmed at the terminal ─────────
+#
+# klaffat-infra-install stages the demo host's PRIVATE ssh identity into
+# an --extra-files directory and hands it, together with root on a fresh
+# machine, to whatever answers at the address in argv. The IP validation
+# proves the argument is an address; nothing can prove it is the RIGHT
+# address. So the founder retypes it: after the mirror is refreshed and
+# before the host key is read, the wrapper prints `root@<ip>`, the
+# revision and the flakeref to /dev/tty and requires the literal phrase
+# `install <ip>` back. Same mechanism as `destroy klaffat`, same reason —
+# a pipe cannot answer /dev/tty, and no controlling terminal means the run
+# is refused rather than confirmed by default. Nothing is read or staged
+# before the answer, so a refusal leaves no key anywhere.
 { config, lib, pkgs, ... }:
 
 let
@@ -353,7 +450,7 @@ let
     name = "klaffat-infra";
     runtimeInputs = [ pkgs.opentofu pkgs.git pkgs.coreutils pkgs.gnutar pkgs.gawk ];
     text = ''
-      ${rootOnlyPreamble "klaffat-infra" "<tofu subcommand> [args...]"}
+      ${rootOnlyPreamble "klaffat-infra" "<tofu subcommand> [allowed args...]"}
       ${mirrorLib "klaffat-infra"}
 
       # --- argv first, before anything expensive or credentialed.
@@ -373,7 +470,7 @@ let
         init|validate|plan|apply|refresh|show|output|providers|state|version|graph|import|taint|untaint|force-unlock|workspace|destroy)
           ;;
         "")
-          echo "klaffat-infra: usage: sudo klaffat-infra <tofu subcommand> [args...]" >&2
+          echo "klaffat-infra: usage: sudo klaffat-infra <tofu subcommand> [allowed args...]" >&2
           exit 2
           ;;
         console)
@@ -389,7 +486,411 @@ let
           echo "klaffat-infra: allowed: init validate plan apply refresh show output providers" >&2
           echo "klaffat-infra:          state version graph import taint untaint force-unlock" >&2
           echo "klaffat-infra:          workspace destroy" >&2
+          echo "klaffat-infra: the arguments after the subcommand are allowlisted per verb too;" >&2
+          echo "klaffat-infra: a refused one prints the forms that verb accepts." >&2
           exit 2
+          ;;
+      esac
+
+      # --- argv AFTER the verb: an ALLOWLIST, per verb, token by token.
+      #
+      # `tofu "$@"` used to hand root's OpenTofu every argument after the
+      # verb, unread. Reproduced 2026-09-06 against the real generated
+      # wrapper: `plan -var github_repo=attacker/x` and
+      # `-var-file=<a file the founder's user can write>` both override the
+      # value the committed demo.auto.tfvars authored; `apply -auto-approve
+      # -var …` commits it and removes the approval prompt in the same
+      # breath; `state push <a founder-writable file>` is READ by root's
+      # tofu; `init -plugin-dir=<a founder-writable dir>` becomes the ONLY
+      # place root's tofu looks for provider binaries; and
+      # `init -from-module=<dir>` copies code from outside the verified
+      # commit into the working directory. In the real klaffat tree
+      # `github_repo` is the `sub` claim of the OIDC role that may read the
+      # NAR signing key, so one argv word repointed the trust policy of the
+      # role that signs what the demo host installs as root.
+      #
+      # A DENY-list of spellings was not an option: round 6 watched
+      # `-destroy=1` walk past four literal spellings of the same flag. So
+      # every token is matched against what THIS verb may take, and anything
+      # unrecognised refuses — here, BEFORE mirror_sync touches the network
+      # and before a single secret is read, so a refusal costs nothing, says
+      # nothing, and never prints the `main @` line.
+      #
+      # Value flags are accepted ONLY as one token, `-name=value`. A value
+      # in its own argument (`-target ADDR`) cannot be checked against its
+      # flag without re-implementing OpenTofu's parser, so it is refused
+      # with a hint naming the `=` form. `--` is refused for the same
+      # reason: nothing after it could be checked.
+      #
+      # TF_CLI_ARGS / TF_CLI_ARGS_<verb> cannot smuggle flags around this:
+      # sudo's env_reset drops the caller's environment and the preamble
+      # above unsets every TF_* anyway.
+      #
+      # `-detailed-exitcode` is allowed on `plan`, and it makes tofu exit 2
+      # for "there are changes" — the same code a refusal uses. They are
+      # told apart by the output: a refusal always prints a `klaffat-infra:`
+      # line and never the `main @` line; tofu's exit 2 always has both.
+      argv_bools=()
+      argv_values=()
+      argv_summary=""
+      case "$subcmd" in
+        init)
+          argv_bools=(-upgrade -reconfigure -migrate-state -input=false -lockfile=readonly)
+          argv_summary="-upgrade -reconfigure -migrate-state -input=false -lockfile=readonly; no operands"
+          ;;
+        validate)
+          argv_bools=(-json)
+          argv_summary="-json; no operands"
+          ;;
+        plan)
+          argv_bools=(-input=false -refresh-only -refresh=false -compact-warnings -detailed-exitcode -json)
+          argv_values=(-target:ADDR -replace:ADDR -parallelism:N -lock-timeout:DUR -out:PATH)
+          argv_summary="-input=false -refresh-only -refresh=false -compact-warnings -detailed-exitcode -json -destroy[=BOOL] -target=ADDR -replace=ADDR -parallelism=N -lock-timeout=DUR -out=/ABSOLUTE/PATH; no operands"
+          ;;
+        apply)
+          argv_bools=(-auto-approve -input=false -refresh-only -refresh=false -compact-warnings -json)
+          argv_values=(-target:ADDR -replace:ADDR -parallelism:N -lock-timeout:DUR)
+          argv_summary="-auto-approve -input=false -refresh-only -refresh=false -compact-warnings -json -destroy[=BOOL] -target=ADDR -replace=ADDR -parallelism=N -lock-timeout=DUR; at most one operand, a saved plan named by ABSOLUTE path"
+          ;;
+        refresh)
+          argv_bools=(-input=false -compact-warnings)
+          argv_values=(-target:ADDR -parallelism:N -lock-timeout:DUR)
+          argv_summary="-input=false -compact-warnings -target=ADDR -parallelism=N -lock-timeout=DUR; no operands"
+          ;;
+        show)
+          argv_bools=(-json)
+          argv_summary="-json; at most one operand, a saved plan or state file named by ABSOLUTE path"
+          ;;
+        output)
+          argv_bools=(-json -raw)
+          argv_summary="-json -raw; at most one operand, an output NAME"
+          ;;
+        providers)
+          argv_summary="no flags; at most one operand, and only 'lock'"
+          ;;
+        state)
+          argv_bools=(-dry-run)
+          argv_values=(-lock-timeout:DUR)
+          argv_summary="list [ADDR...] | show ADDR | pull | rm ADDR... | mv ADDR ADDR; -dry-run and -lock-timeout=DUR on rm/mv only"
+          ;;
+        version)
+          argv_bools=(-json)
+          argv_summary="-json; no operands"
+          ;;
+        graph)
+          argv_bools=(-draw-cycles)
+          argv_values=(-type:NAME)
+          argv_summary="-draw-cycles -type=NAME; no operands"
+          ;;
+        import)
+          argv_bools=(-input=false)
+          argv_values=(-lock-timeout:DUR)
+          argv_summary="-input=false -lock-timeout=DUR; exactly two operands, ADDR and ID"
+          ;;
+        taint|untaint)
+          argv_values=(-lock-timeout:DUR)
+          argv_summary="-lock-timeout=DUR; exactly one operand, ADDR"
+          ;;
+        force-unlock)
+          argv_bools=(-force)
+          argv_summary="-force; exactly one operand, the LOCK_ID"
+          ;;
+        workspace)
+          argv_summary="no flags; list | show | select NAME"
+          ;;
+        destroy)
+          argv_bools=(-auto-approve -input=false -compact-warnings)
+          argv_values=(-target:ADDR -parallelism:N -lock-timeout:DUR)
+          argv_summary="-auto-approve -input=false -compact-warnings -target=ADDR -parallelism=N -lock-timeout=DUR; no operands"
+          ;;
+        *)
+          argv_summary="nothing"
+          ;;
+      esac
+
+      # Refusals name the verb's own forms first, then — once — the classes
+      # that are refused on EVERY verb, so the founder learns the rule
+      # rather than the symptom.
+      argv_refuse() {
+        echo "klaffat-infra: $1" >&2
+        echo "klaffat-infra: '$subcmd' accepts: $argv_summary" >&2
+        echo "klaffat-infra: plus -help and -no-color, on every verb." >&2
+        echo "klaffat-infra: refused on every verb, by design: -var, -var-file, -plugin-dir," >&2
+        echo "klaffat-infra:   -backend-config, -backend=, -from-module, -state, -state-out," >&2
+        echo "klaffat-infra:   -backup, -chdir, 'state push', 'state replace-provider'," >&2
+        echo "klaffat-infra:   'workspace new|delete', 'providers mirror', '--', relative paths," >&2
+        echo "klaffat-infra:   and two-token value forms such as '-target ADDR'." >&2
+        echo "klaffat-infra:   Every variable comes from the committed *.auto.tfvars and from the" >&2
+        echo "klaffat-infra:   TF_VAR_* this wrapper exports out of /run/agenix; providers come" >&2
+        echo "klaffat-infra:   from the committed .terraform.lock.hcl; state comes from the" >&2
+        echo "klaffat-infra:   committed backend. Nothing outside the verified commit is read." >&2
+        exit 2
+      }
+
+      # The value shapes the contract names. ADDR is a resource address
+      # (`module.x.aws_instance.y["a"]`), so anything without whitespace;
+      # PATH must be ABSOLUTE because the working directory is a fresh
+      # archive this wrapper deletes on exit.
+      argv_shape_ok() {
+        case "$1" in
+          ADDR) [[ "$2" =~ ^[^[:space:]]+$ ]] ;;
+          N) [[ "$2" =~ ^[0-9]+$ ]] ;;
+          DUR) [[ "$2" =~ ^[0-9]+(ms|s|m|h)$ ]] ;;
+          NAME) [[ "$2" =~ ^[A-Za-z0-9_-]+$ ]] ;;
+          LOCK_ID) [[ "$2" =~ ^[A-Za-z0-9-]+$ ]] ;;
+          ID) [[ "$2" =~ ^[^-] ]] ;;
+          PATH) [[ "$2" == /* ]] ;;
+          *) false ;;
+        esac
+      }
+
+      argv_pos=()
+      argv_help=0
+      for _t in "''${@:2}"; do
+        if [ "$_t" = "--" ]; then
+          argv_refuse "'--' is refused: nothing after it can be checked."
+        fi
+        case "$_t" in
+          -help) argv_help=1; continue ;;
+          -no-color) continue ;;
+        esac
+        # The destroy prefix rule from round 6, unchanged: any -destroy…
+        # token counts as destruction and is confirmed at /dev/tty below.
+        # It is a documented form of `plan` and `apply` and of nothing else.
+        case "$_t" in
+          -destroy*|--destroy*)
+            if [ "$subcmd" = "plan" ] || [ "$subcmd" = "apply" ]; then
+              continue
+            fi
+            argv_refuse "'$_t' is not an allowed argument to '$subcmd'."
+            ;;
+        esac
+        case "$_t" in
+          -*)
+            _hit=0
+            for _b in "''${argv_bools[@]}"; do
+              if [ "$_t" = "$_b" ]; then
+                _hit=1
+                break
+              fi
+            done
+            if [ "$_hit" -eq 0 ]; then
+              _name="''${_t%%=*}"
+              _val="''${_t#*=}"
+              for _v in "''${argv_values[@]}"; do
+                _vname="''${_v%%:*}"
+                _vshape="''${_v#*:}"
+                if [ "$_name" != "$_vname" ]; then
+                  continue
+                fi
+                if [ "$_name" = "$_t" ]; then
+                  argv_refuse "$_name needs its value in the SAME token: write $_name=<$_vshape>. A value in its own argument cannot be checked against its flag."
+                fi
+                if argv_shape_ok "$_vshape" "$_val"; then
+                  _hit=1
+                else
+                  argv_refuse "$_name takes a value of the form $_vshape, and $_val is not one."
+                fi
+                break
+              done
+            fi
+            if [ "$_hit" -eq 0 ]; then
+              argv_refuse "'$_t' is not an allowed argument to '$subcmd'."
+            fi
+            ;;
+          *)
+            argv_pos+=("$_t")
+            ;;
+        esac
+      done
+
+      # Operands. `-help` short-circuits OpenTofu's own parsing, so it also
+      # waives the MINIMUM operand counts here (never the maximums, never a
+      # refusal by name, never a shape).
+      _np="''${#argv_pos[@]}"
+      _p1=""
+      _p2=""
+      if [ "$_np" -ge 1 ]; then _p1="''${argv_pos[0]}"; fi
+      if [ "$_np" -ge 2 ]; then _p2="''${argv_pos[1]}"; fi
+      argv_arity=1
+      if [ "$argv_help" -eq 1 ] && [ "$_np" -eq 0 ]; then
+        argv_arity=0
+      fi
+
+      argv_abs_path() {
+        if ! argv_shape_ok PATH "$1"; then
+          argv_refuse "$1 must be an ABSOLUTE path. The working directory is a fresh archive of the verified commit that this wrapper deletes on exit, so a relative name reads — or writes — a file that does not outlive the run."
+        fi
+      }
+
+      argv_check_addrs() {
+        local _i="$1"
+        local _a
+        while [ "$_i" -lt "$_np" ]; do
+          _a="''${argv_pos[$_i]}"
+          if ! argv_shape_ok ADDR "$_a"; then
+            argv_refuse "$_a is not a resource address."
+          fi
+          _i=$(( _i + 1 ))
+        done
+      }
+
+      case "$subcmd" in
+        init|validate|plan|refresh|version|graph|destroy)
+          if [ "$_np" -ne 0 ]; then
+            argv_refuse "'$subcmd' takes no operands, and $_p1 is one."
+          fi
+          ;;
+        apply|show)
+          if [ "$_np" -gt 1 ]; then
+            argv_refuse "'$subcmd' takes at most one operand, a saved plan or state file."
+          fi
+          if [ "$_np" -eq 1 ]; then
+            argv_abs_path "$_p1"
+          fi
+          ;;
+        output)
+          if [ "$_np" -gt 1 ]; then
+            argv_refuse "'output' takes at most one operand, an output NAME."
+          fi
+          if [ "$_np" -eq 1 ] && ! argv_shape_ok NAME "$_p1"; then
+            argv_refuse "$_p1 is not an output name."
+          fi
+          ;;
+        providers)
+          if [ "$_np" -ge 1 ] && [ "$_p1" != "lock" ]; then
+            argv_refuse "'providers $_p1' is not offered — 'providers' and 'providers lock' are. 'providers mirror' writes a provider directory the CALLER names, and 'providers schema' is not needed here."
+          fi
+          if [ "$_np" -gt 1 ]; then
+            argv_refuse "'providers lock' takes no further operand."
+          fi
+          ;;
+        state)
+          if [ "$_np" -eq 0 ]; then
+            if [ "$argv_arity" -eq 1 ]; then
+              argv_refuse "'state' needs one of: list, show, pull, rm, mv."
+            fi
+          else
+            # The refusal BY NAME comes first, so `state push -dry-run …`
+            # is answered with the reason that matters rather than with a
+            # complaint about the flag.
+            #
+            # No literal "OpenTofu" in any refusal text: the lane proves a
+            # refusal never reached tofu by asserting that word is absent
+            # from the output, and a message that says it would make the
+            # assertion green for the wrong reason.
+            case "$_p1" in
+              push|replace-provider)
+                argv_refuse "'state $_p1' is refused by design: it makes root's tofu read a file the CALLER names and write it over the encrypted remote state."
+                ;;
+            esac
+            # -dry-run and -lock-timeout mean nothing to the read-only
+            # state verbs; accepting them there would be a silent no-op.
+            if [ "$_p1" != "rm" ] && [ "$_p1" != "mv" ]; then
+              for _t in "''${@:2}"; do
+                case "$_t" in
+                  -dry-run|-lock-timeout=*)
+                    argv_refuse "$_t applies only to 'state rm' and 'state mv'."
+                    ;;
+                esac
+              done
+            fi
+            case "$_p1" in
+              list)
+                argv_check_addrs 1
+                ;;
+              show)
+                if [ "$_np" -ne 2 ]; then
+                  argv_refuse "'state show' takes exactly one resource address."
+                fi
+                argv_check_addrs 1
+                ;;
+              pull)
+                if [ "$_np" -ne 1 ]; then
+                  argv_refuse "'state pull' takes no operand."
+                fi
+                ;;
+              rm)
+                if [ "$_np" -lt 2 ]; then
+                  argv_refuse "'state rm' takes at least one resource address."
+                fi
+                argv_check_addrs 1
+                ;;
+              mv)
+                if [ "$_np" -ne 3 ]; then
+                  argv_refuse "'state mv' takes exactly two resource addresses."
+                fi
+                argv_check_addrs 1
+                ;;
+              *)
+                argv_refuse "'state $_p1' is not offered — allowed: list, show, pull, rm, mv."
+                ;;
+            esac
+          fi
+          ;;
+        import)
+          if [ "$argv_arity" -eq 1 ]; then
+            if [ "$_np" -ne 2 ]; then
+              argv_refuse "'import' takes exactly two operands: ADDR then ID."
+            fi
+            if ! argv_shape_ok ADDR "$_p1"; then
+              argv_refuse "$_p1 is not a resource address."
+            fi
+            if ! argv_shape_ok ID "$_p2"; then
+              argv_refuse "$_p2 is not an import id."
+            fi
+          fi
+          ;;
+        taint|untaint)
+          if [ "$argv_arity" -eq 1 ]; then
+            if [ "$_np" -ne 1 ]; then
+              argv_refuse "'$subcmd' takes exactly one resource address."
+            fi
+            if ! argv_shape_ok ADDR "$_p1"; then
+              argv_refuse "$_p1 is not a resource address."
+            fi
+          fi
+          ;;
+        force-unlock)
+          if [ "$argv_arity" -eq 1 ]; then
+            if [ "$_np" -ne 1 ]; then
+              argv_refuse "'force-unlock' takes exactly one operand, the LOCK_ID tofu printed."
+            fi
+            if ! argv_shape_ok LOCK_ID "$_p1"; then
+              argv_refuse "$_p1 is not a lock id."
+            fi
+          fi
+          ;;
+        workspace)
+          if [ "$_np" -eq 0 ]; then
+            if [ "$argv_arity" -eq 1 ]; then
+              argv_refuse "'workspace' needs one of: list, show, select NAME."
+            fi
+          else
+            case "$_p1" in
+              new|delete)
+                argv_refuse "'workspace $_p1' is not offered: this design has exactly one workspace, the one the committed backend names."
+                ;;
+              list|show)
+                if [ "$_np" -ne 1 ]; then
+                  argv_refuse "'workspace $_p1' takes no further operand."
+                fi
+                ;;
+              select)
+                if [ "$_np" -ne 2 ]; then
+                  argv_refuse "'workspace select' takes exactly one workspace NAME."
+                fi
+                if ! argv_shape_ok NAME "$_p2"; then
+                  argv_refuse "$_p2 is not a workspace name."
+                fi
+                ;;
+              *)
+                argv_refuse "'workspace $_p1' is not offered — allowed: list, show, select NAME."
+                ;;
+            esac
+          fi
+          ;;
+        *)
           ;;
       esac
 
@@ -536,16 +1037,38 @@ let
         gate_refuse "commit $rev has no $archive_paths to extract — refusing."
       fi
 
-      # What tofu will read must be, blob for blob, what the commit holds.
-      # `git archive` honours a committed .gitattributes: export-ignore
-      # drops files, export-subst rewrites them. Hash every extracted path
-      # in tree order and compare with the tree's own blob ids; a missing
-      # file fails hash-object, a rewritten one fails the compare.
+      # What tofu will read must be, byte for byte, what the commit holds.
+      # `git archive` honours a committed .gitattributes, and FIVE attribute
+      # classes change what lands on disk: export-ignore drops a file,
+      # export-subst rewrites `$Format:…$`, `text`/`eol` rewrite line
+      # endings, `ident` substitutes the blob sha, and `filter` runs a
+      # smudge command. Hash every extracted path in tree order and compare
+      # with the tree's own blob ids; a missing file fails hash-object, a
+      # rewritten one fails the compare.
+      #
+      # `--no-filters` is load-bearing: without it hash-object is entitled
+      # to apply the INVERSE (clean) conversion, which would re-normalise a
+      # file `git archive` had just mangled and hand back the original blob
+      # sha — a check that passes while the bytes on disk differ. Measured
+      # with git 2.55.0 on 2026-09-06, in a scratch bare repo with
+      # `deploy/.gitattributes` = `* text=auto eol=crlf`: `git archive`
+      # DID write CRLF, and hash-object with `--git-dir` pointing at the
+      # bare mirror applied no conversion either way (identical shas with
+      # and without `--no-filters`), so the refusal fired. `--no-filters`
+      # states the intent rather than relying on that: the comparison is of
+      # raw bytes to blob, whatever git's future work-tree bookkeeping
+      # decides the cwd is.
+      #
+      # The real klaffat tree has no .gitattributes at all (checked
+      # 2026-09-06: `git ls-files | grep -i gitattributes` is empty), so no
+      # committed attribute is standing between the founder and a run
+      # today; this is the check that keeps it that way.
       expected_shas="$(git --git-dir="${mirrorDir}" ls-tree -r "$rev" -- "$archive_paths" | awk '{ print $3 }')"
       if ! actual_shas="$(git --git-dir="${mirrorDir}" ls-tree -r --name-only "$rev" -- "$archive_paths" \
-             | (cd "$work" && git --git-dir="${mirrorDir}" hash-object --stdin-paths))" \
+             | (cd "$work" && git --git-dir="${mirrorDir}" hash-object --no-filters --stdin-paths))" \
          || [ "$expected_shas" != "$actual_shas" ]; then
-        gate_refuse "the extracted tree differs from commit $rev (export-ignore or export-subst in .gitattributes?) — refusing."
+        echo "klaffat-infra: a committed .gitattributes under $archive_paths can do this: export-ignore drops a file, export-subst and ident rewrite one, text/eol rewrite line endings, filter runs a smudge command." >&2
+        gate_refuse "the extracted tree differs from commit $rev — refusing."
       fi
       if [ ! -d "$work/deploy/terraform" ]; then
         gate_refuse "commit $rev has no deploy/terraform — refusing."
@@ -568,11 +1091,12 @@ let
     name = "klaffat-infra-install";
     runtimeInputs = [ pkgs.openssh pkgs.coreutils config.nix.package pkgs.git ];
     text = ''
-      ${rootOnlyPreamble "klaffat-infra-install" "<ip>"}
+      ${rootOnlyPreamble "klaffat-infra-install" "<ip>   (then type 'install <ip>' at the terminal to confirm)"}
       ${mirrorLib "klaffat-infra-install"}
 
       if [ "$#" -ne 1 ]; then
         echo "klaffat-infra-install: usage: sudo klaffat-infra-install <ip>" >&2
+        echo "klaffat-infra-install: the install is confirmed at the terminal by typing 'install <ip>'." >&2
         exit 2
       fi
       ip="$1"
@@ -607,6 +1131,51 @@ let
       rev="$(mirror_main_tip)"
       echo "klaffat-infra-install: ${cfg.repoRemoteUrl} main @ $rev" >&2
 
+      # THE FLAKEREF NAMES THE COMMIT, IN ROOT'S MIRROR.
+      #
+      # A bare path flakeref builds the WORKING TREE, uncommitted edits
+      # included (measured on nix 2.34.8), and a `git+file://` flakeref
+      # into the founder's checkout would have root's nix run git inside
+      # a repository jonathan configures. `git+file://<mirror>?rev=<sha>`
+      # is neither: both the app AND the system being installed come out
+      # of root's own repository at the commit the server called main.
+      #
+      # Computed HERE, before the confirmation below, because the founder
+      # is asked to approve exactly what is about to be built and where.
+      flakeref="git+file://${mirrorDir}?rev=$rev&allRefs=1"
+
+      # --- the TARGET is confirmed at the terminal, the way destroy is.
+      #
+      # This wrapper stages the demo host's PRIVATE ssh identity and hands
+      # it, with root on a fresh machine, to whatever answers at the
+      # address in argv. The IP validation above proves the argument is an
+      # address; it cannot prove it is the RIGHT address, and until round 7
+      # nothing else asked. One sudo password plus one wrong octet — or one
+      # address an agent chose — shipped the demo host's key to a machine
+      # of someone else's choosing, silently.
+      #
+      # So: /dev/tty, which no pipe can supply (`yes | sudo
+      # klaffat-infra-install …` cannot answer it), the literal IP retyped,
+      # and nothing read or staged before the answer. No controlling
+      # terminal — a cron job, a systemd unit, an agent-spawned shell —
+      # means no confirmation is possible, so the run is refused.
+      if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+        gate_refuse "installing ships the demo host's private SSH key to root@$ip and there is no terminal to confirm at — refusing."
+      fi
+      {
+        echo
+        echo "klaffat-infra-install: this INSTALLS klaffat-demo onto root@$ip,"
+        echo "klaffat-infra-install: and ships the demo host's PRIVATE ssh identity to it."
+        echo "klaffat-infra-install: ${cfg.repoRemoteUrl} main @ $rev"
+        echo "klaffat-infra-install: flakeref $flakeref"
+        printf "klaffat-infra-install: type exactly 'install %s' to proceed: " "$ip"
+      } >&3
+      IFS= read -r _confirm <&3 || _confirm=""
+      exec 3>&-
+      if [ "$_confirm" != "install $ip" ]; then
+        gate_refuse "install not confirmed — refusing."
+      fi
+
       hostkey="${secretPath "klaffat-demo-host-key"}"
       if [ ! -r "$hostkey" ]; then
         echo "klaffat-infra-install: cannot read $hostkey — is the agenix secret provisioned?" >&2
@@ -628,15 +1197,6 @@ let
         > "$EXTRA/etc/ssh/ssh_host_ed25519_key.pub"
       chmod 0644 "$EXTRA/etc/ssh/ssh_host_ed25519_key.pub"
 
-      # THE FLAKEREF NAMES THE COMMIT, IN ROOT'S MIRROR.
-      #
-      # A bare path flakeref builds the WORKING TREE, uncommitted edits
-      # included (measured on nix 2.34.8), and a `git+file://` flakeref
-      # into the founder's checkout would have root's nix run git inside
-      # a repository jonathan configures. `git+file://<mirror>?rev=<sha>`
-      # is neither: both the app AND the system being installed come out
-      # of root's own repository at the commit the server called main.
-      flakeref="git+file://${mirrorDir}?rev=$rev&allRefs=1"
       echo "klaffat-infra-install: installing klaffat-demo onto root@$ip" >&2
       echo "klaffat-infra-install: flakeref $flakeref" >&2
       if [ -z "''${SSH_AUTH_SOCK-}" ]; then
