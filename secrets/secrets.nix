@@ -48,8 +48,22 @@ in
   "klaffat-hcloud-token.age".publicKeys = klaffat;
   "klaffat-cloudflare-api-token.age".publicKeys = klaffat;
   "klaffat-state-passphrase.age".publicKeys = klaffat;
-  "klaffat-r2-access-key-id.age".publicKeys = klaffat;
-  "klaffat-r2-secret-access-key.age".publicKeys = klaffat;
-  "klaffat-r2-account-id.age".publicKeys = klaffat;
   "klaffat-demo-host-key.age".publicKeys = klaffat;
+
+  # AWS (eu-north-1) IAM user `klaffat-laptop`: OpenTofu state bucket RW,
+  # nix cache bucket RW, and admin over the Terraform-managed IAM/OIDC/
+  # SecretsManager resources. The demo host's read-only user lives on the
+  # host, never here.
+  "klaffat-aws-access-key-id.age".publicKeys = klaffat;
+  "klaffat-aws-secret-access-key.age".publicKeys = klaffat;
+
+  # Binary-cache signing key (`sudo klaffat-publish`). A REAL key already —
+  # generated root-side inside the encrypting pipeline, never written in the
+  # clear, never displayed. Its public half lives in the klaffat host's
+  # `nix.settings.trusted-public-keys`; the secret half is additionally
+  # mirrored into AWS Secrets Manager by
+  # `sudo klaffat-publish --upload-signing-key` so Actions can sign with the
+  # same key. Rotating it means generating a new one, re-uploading, AND
+  # updating the host — in that order.
+  "klaffat-nix-signing-key.age".publicKeys = klaffat;
 }

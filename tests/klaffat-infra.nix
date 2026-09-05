@@ -13,13 +13,13 @@
 #      so "0400 root" is measured on a file that actually exists and
 #      "jonathan cannot read it" is a real permission denial.
 #
-#   2. `sudo klaffat-infra` REQUIRES A PASSWORD even though this host has
-#      `security.sudo.wheelNeedsPassword = false` and jonathan is in
-#      wheel. That is the whole point of the module's sudoers rule and it
-#      rests on last-match-wins ordering that nothing else in the repo
-#      exercises. The lane also asserts the control — `sudo -n true` still
-#      succeeds — so a future change that accidentally makes ALL sudo
-#      password-gated cannot make this look like it passed.
+#   2. NO sudo works without a password for jonathan — neither the
+#      wrappers nor `sudo -n true`. profiles/base.nix used to set
+#      `wheelNeedsPassword = false`, which made the root-only secrets a
+#      fiction (`sudo cat /run/agenix/klaffat-*` needed no password). The
+#      lane asserts both halves so a revert of that line fails here rather
+#      than silently reopening the hole, and so the per-command rules stay
+#      honest if it is ever loosened again.
 #
 #   3. Every refusal branch of the wrapper, at the REAL fixed path
 #      /home/jonathan/Repos/klaffat: absent, dirty, wrong branch. No
@@ -48,10 +48,10 @@ let
     "klaffat-hcloud-token"
     "klaffat-cloudflare-api-token"
     "klaffat-state-passphrase"
-    "klaffat-r2-access-key-id"
-    "klaffat-r2-secret-access-key"
-    "klaffat-r2-account-id"
+    "klaffat-aws-access-key-id"
+    "klaffat-aws-secret-access-key"
     "klaffat-demo-host-key"
+    "klaffat-nix-signing-key"
   ];
 
   git = "${pkgs.git}/bin/git";
@@ -89,6 +89,7 @@ common.mkMinimalTest {
     # ---------------------------------------------------------------
     machine.succeed("test -x ${bin}/klaffat-infra")
     machine.succeed("test -x ${bin}/klaffat-infra-install")
+    machine.succeed("test -x ${bin}/klaffat-publish")
 
     # ---------------------------------------------------------------
     # 2. Secrets decrypted, 0400 root:root, unreadable by jonathan.
@@ -121,6 +122,13 @@ common.mkMinimalTest {
     assert rc == 1, f"non-root klaffat-infra-install should exit 1, got {rc}"
     assert "this wrapper is root-only" in out, f"unexpected non-root refusal: {out!r}"
 
+    rc, out = run("runuser -u jonathan -- ${bin}/klaffat-publish")
+    assert rc == 1, f"non-root klaffat-publish should exit 1, got {rc}"
+    assert "this wrapper is root-only" in out, f"unexpected non-root refusal: {out!r}"
+    assert "sudo klaffat-publish [rev | --upload-signing-key]" in out, (
+        f"refusal must name the sudo form: {out!r}"
+    )
+
     # ---------------------------------------------------------------
     # 4. As root, with the checkout absent: the exact refusal.
     # ---------------------------------------------------------------
@@ -132,10 +140,32 @@ common.mkMinimalTest {
     )
     assert expected in out, f"expected {expected!r}, got {out!r}"
 
+    rc, out = run("${bin}/klaffat-publish")
+    assert rc == 2, f"absent-checkout refusal should exit 2, got {rc}: {out!r}"
+    assert "klaffat-publish: no klaffat checkout at ${repo} — refusing." in out, (
+        f"unexpected klaffat-publish refusal: {out!r}"
+    )
+
+    rc, out = run("${bin}/klaffat-publish aaaa bbbb")
+    assert rc == 2 and "usage: sudo klaffat-publish [rev | --upload-signing-key]" in out, (
+        f"too-many-args refusal wrong: {rc} {out!r}"
+    )
+
+    # --upload-signing-key validates its arity BEFORE touching AWS, which is
+    # the only part of that mode a network-less VM can reach.
+    rc, out = run("${bin}/klaffat-publish --upload-signing-key extra")
+    assert rc == 2 and "--upload-signing-key takes no other arguments" in out, (
+        f"upload-signing-key arity refusal wrong: {rc} {out!r}"
+    )
+
     # ---------------------------------------------------------------
     # 5. sudo: password required for the wrapper, NOT for everything else.
     # ---------------------------------------------------------------
-    machine.succeed("runuser -u jonathan -- sudo -n true")   # control: wheel is NOPASSWD
+    # wheel is no longer NOPASSWD: nothing jonathan sudoes runs unprompted,
+    # which is what makes /run/agenix/klaffat-* actually root-only.
+    rc, out = run("runuser -u jonathan -- sudo -n true")
+    assert rc != 0, "wheel still has NOPASSWD — the agenix secrets are reachable"
+    assert "password is required" in out, f"expected a password demand, got {out!r}"
 
     # Both spellings must prompt. The PATH-resolved one is what the founder
     # types; the store path is what the sudoers rule pins. sudo does not
@@ -147,6 +177,8 @@ common.mkMinimalTest {
         "$(readlink -f ${bin}/klaffat-infra) version",
         "${bin}/klaffat-infra-install 10.0.0.1",
         "$(readlink -f ${bin}/klaffat-infra-install) 10.0.0.1",
+        "${bin}/klaffat-publish",
+        "$(readlink -f ${bin}/klaffat-publish)",
     ]:
         rc, out = run(f"runuser -u jonathan -- sudo -n {form}")
         assert rc != 0, f"sudo ran '{form}' without a password"
@@ -226,6 +258,39 @@ common.mkMinimalTest {
         "stat -c '%a %U' /var/lib/klaffat-infra/terraform.d"
     ).strip()
     assert mode == "700 root", f"TF_DATA_DIR should be 700 root, got '{mode}'"
+
+    # ---------------------------------------------------------------
+    # 6d. klaffat-publish against the real checkout.
+    #
+    # The build cannot succeed (the fixture repo has no flake and no
+    # klaffat-demo host), which is precisely the failure the worktree
+    # bookkeeping has to survive: root must leave nothing behind that
+    # jonathan can no longer write.
+    # ---------------------------------------------------------------
+    rc, out = run("${bin}/klaffat-publish")
+    assert rc != 0, "klaffat-publish should fail against a flake-less checkout"
+    assert f"klaffat-publish: building klaffat-demo from {rev}" in out, (
+        f"publish did not reach the build with main's tip: {out!r}"
+    )
+
+    rc, out = run("${bin}/klaffat-publish no-such-rev")
+    assert rc == 2 and "is not a commit in ${repo}" in out, (
+        f"unknown-rev refusal wrong: {rc} {out!r}"
+    )
+
+    _, root_owned = machine.execute("find ${repo}/.git -user root")
+    assert root_owned.strip() == "", (
+        f"klaffat-publish left root-owned paths in the founder's .git: {root_owned!r}"
+    )
+    _, leftovers = machine.execute("ls -A /var/lib/klaffat-infra")
+    assert "publish-" not in leftovers, (
+        f"temporary publish worktree survived: {leftovers!r}"
+    )
+    # And the founder can still use his own worktrees afterwards.
+    machine.succeed(
+        "runuser -u jonathan -- env HOME=/home/jonathan "
+        "${git} -C ${repo} worktree add --detach /home/jonathan/wt HEAD"
+    )
 
     # ---------------------------------------------------------------
     # 7. klaffat-infra-install: argument handling + the cleanup trap.

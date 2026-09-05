@@ -15,7 +15,7 @@
 
 pkgs.runCommand "klaffat-infra-test-secrets"
 {
-  nativeBuildInputs = [ pkgs.age pkgs.openssh ];
+  nativeBuildInputs = [ pkgs.age pkgs.openssh pkgs.nix ];
 } ''
   mkdir -p "$out"
 
@@ -34,10 +34,14 @@ pkgs.runCommand "klaffat-infra-test-secrets"
   rm -f "$out/demo_host_key"
 
   for n in hcloud-token cloudflare-api-token state-passphrase \
-           r2-access-key-id r2-secret-access-key; do
+           aws-access-key-id aws-secret-access-key; do
     printf 'TEST-%s' "$n" | age -r "$pub" -o "$out/klaffat-$n.age"
   done
 
-  # Shapes AWS_ENDPOINT_URL_S3 as https://testaccount.r2.cloudflarestorage.com
-  printf 'testaccount' | age -r "$pub" -o "$out/klaffat-r2-account-id.age"
+  # A syntactically real Nix signing key, so `nix key convert-secret-to-public`
+  # and `nix store sign --key-file` have something valid to chew on.
+  nix --extra-experimental-features nix-command \
+    key generate-secret --key-name klaffat-demo-test-1 > "$out/signing-key"
+  age -r "$pub" -o "$out/klaffat-nix-signing-key.age" < "$out/signing-key"
+  rm -f "$out/signing-key"
 ''

@@ -27,22 +27,39 @@
 # cached (timestamp_timeout=0, timestamp_type=tty). Every credentialed
 # run is therefore one deliberate password entry by the founder.
 #
-# ── KNOWN GAP, must be closed for the above to be true ────────────────
+# ── Builds never run on the demo host ─────────────────────────────────
 #
-# profiles/base.nix sets `security.sudo.wheelNeedsPassword = false`, so
-# `%wheel ALL=(ALL:ALL) NOPASSWD: ALL` is in effect on dellan today.
-# jonathan is in wheel. That rule lets ANY process running as jonathan
-# do `sudo cat /run/agenix/klaffat-hcloud-token` with no password — which
-# defeats this module's entire premise.
+# Founder decision, 2026-09-05: the host substitutes, it does not build.
+# `sudo klaffat-publish [rev]` builds the host's toplevel HERE, signs the
+# closure with a root-only Nix signing key, and pushes it to the
+# S3 binary cache; the host pulls with its own read-only IAM user and
+# trusts the signing key's PUBLIC half.
 #
-# The rules below still do their job for the two wrappers (sudoers is
-# last-match-wins and the user rules here are emitted AFTER the wheel
-# rule, so they force a password prompt for these two commands — asserted
-# in tests/klaffat-infra.nix with `sudo -n`). But the SECRETS themselves
-# are only as safe as the weakest path to root, and today that path is
-# passwordless. Flipping wheelNeedsPassword to true is a separate,
-# founder-visible change to the daily driver and is deliberately NOT
-# bundled here.
+# GitHub Actions publishes the same way on push:main, but authenticates by
+# OIDC role assumption (no repository secrets — on a private Free repo a
+# same-repo PR workflow can read those, so a long-lived credential there
+# would be readable by anything that can open a PR) and fetches the
+# signing key from AWS Secrets Manager. `sudo klaffat-publish
+# --upload-signing-key` is the one path that puts the key there, from the
+# root-only agenix copy, behind the same password. Terraform manages only
+# the secret's existence, so the key never enters tofu state either.
+#
+# ── Why profiles/base.nix now requires a sudo password ────────────────
+#
+# It used to set `security.sudo.wheelNeedsPassword = false`, i.e.
+# `%wheel ALL=(ALL:ALL) NOPASSWD: ALL`, and jonathan is in wheel. That
+# rule let ANY process running as jonathan do
+# `sudo cat /run/agenix/klaffat-hcloud-token` with no password — which
+# defeated this module's entire premise, because the secrets are only as
+# safe as the weakest path to root.
+#
+# The per-command rules below would still have prompted (sudoers is
+# last-match-wins and these rules are emitted AFTER the wheel rule), but
+# that only gates the wrappers, not the files. So `wheelNeedsPassword` is
+# now `true` — founder-approved, 2026-09-05. The daily-driver consequence
+# is real: every `sudo` on dellan now asks for a password. The lane
+# asserts `sudo -n true` FAILS for jonathan, so a future revert cannot
+# quietly reopen the hole.
 #
 # ── Why no KLAFFAT_INFRA_ALLOW_BRANCH escape hatch ────────────────────
 #
@@ -77,8 +94,26 @@ let
   stateDir = "/var/lib/klaffat-infra";
   dataDir = "${stateDir}/terraform.d";
 
+  # CONTRACT v2 (2026-09-05): AWS, region eu-north-1. `klaffat-tofu-state`
+  # is clickops-created with versioning ON (so it is never managed by the
+  # state it holds, and its own history needs no wrapper support);
+  # `klaffat-nix-cache` is Terraform-managed.
+  awsRegion = "eu-north-1";
   bucket = "klaffat-tofu-state";
-  stateKey = "demo/terraform.tfstate";
+
+  # The Nix binary cache the demo host substitutes from. Builds never run on
+  # the host (founder decision, 2026-09-05) — the laptop, or GitHub Actions
+  # via OIDC, builds and signs; the host trusts the signing key's PUBLIC
+  # half and reads with its own read-only IAM user.
+  cacheBucket = "klaffat-nix-cache";
+  cacheUrl = "s3://${cacheBucket}?region=${awsRegion}";
+
+  # AWS Secrets Manager secret holding the signing key, so the Actions
+  # publish workflow signs with the SAME key as the laptop. Terraform
+  # manages the secret's existence; its value is written exactly once, by
+  # `sudo klaffat-publish --upload-signing-key`, from the root-only agenix
+  # copy — so the plaintext never passes through Terraform state or CI.
+  signingKeySecretId = "klaffat/nix-signing-key";
 
   secretPath = name: config.age.secrets.${name}.path;
 
@@ -93,10 +128,10 @@ let
   # in the VM lane. Prefix expansion is plain parameter expansion, always
   # present, and expands to zero words (not an error) under `set -u` when
   # nothing matches.
-  rootOnlyPreamble = name: ''
+  rootOnlyPreamble = name: usage: ''
     if [ "$(id -u)" -ne 0 ]; then
       echo "${name}: refusing to run as uid $(id -u) — this wrapper is root-only." >&2
-      echo "${name}: use: sudo ${name} ${if name == "klaffat-infra" then "<tofu args...>" else "<ip>"}" >&2
+      echo "${name}: use: sudo ${name} ${usage}" >&2
       exit 1
     fi
 
@@ -109,9 +144,9 @@ let
 
   klaffat-infra = pkgs.writeShellApplication {
     name = "klaffat-infra";
-    runtimeInputs = [ pkgs.opentofu pkgs.awscli2 pkgs.git pkgs.coreutils ];
+    runtimeInputs = [ pkgs.opentofu pkgs.git pkgs.coreutils ];
     text = ''
-      ${rootOnlyPreamble "klaffat-infra"}
+      ${rootOnlyPreamble "klaffat-infra" "<tofu args...>"}
 
       repo="${repoRoot}"
       tfdir="${tfDir}"
@@ -158,9 +193,8 @@ let
         "${secretPath "klaffat-hcloud-token"}" \
         "${secretPath "klaffat-cloudflare-api-token"}" \
         "${secretPath "klaffat-state-passphrase"}" \
-        "${secretPath "klaffat-r2-access-key-id"}" \
-        "${secretPath "klaffat-r2-secret-access-key"}" \
-        "${secretPath "klaffat-r2-account-id"}"; do
+        "${secretPath "klaffat-aws-access-key-id"}" \
+        "${secretPath "klaffat-aws-secret-access-key"}"; do
         if [ ! -r "$_s" ]; then
           echo "klaffat-infra: cannot read $_s — is the agenix secret provisioned?" >&2
           exit 3
@@ -170,12 +204,11 @@ let
       TF_VAR_hcloud_token="$(< "${secretPath "klaffat-hcloud-token"}")"
       TF_VAR_cloudflare_api_token="$(< "${secretPath "klaffat-cloudflare-api-token"}")"
       TF_VAR_state_passphrase="$(< "${secretPath "klaffat-state-passphrase"}")"
-      AWS_ACCESS_KEY_ID="$(< "${secretPath "klaffat-r2-access-key-id"}")"
-      AWS_SECRET_ACCESS_KEY="$(< "${secretPath "klaffat-r2-secret-access-key"}")"
-      account_id="$(< "${secretPath "klaffat-r2-account-id"}")"
-      AWS_ENDPOINT_URL_S3="https://$account_id.r2.cloudflarestorage.com"
+      AWS_ACCESS_KEY_ID="$(< "${secretPath "klaffat-aws-access-key-id"}")"
+      AWS_SECRET_ACCESS_KEY="$(< "${secretPath "klaffat-aws-secret-access-key"}")"
       export TF_VAR_hcloud_token TF_VAR_cloudflare_api_token TF_VAR_state_passphrase
-      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL_S3
+      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+      export AWS_DEFAULT_REGION="${awsRegion}"
 
       # --- environment. TF_IN_AUTOMATION is deliberately NOT set: its only
       #     effect is to suppress the "next step" hints, and this is an
@@ -194,35 +227,11 @@ let
       install -d -m 0700 "${stateDir}" "${dataDir}"
       cd "$tfdir"
 
-      # --- apply gets a post-run, server-side copy of the (already
-      #     client-side encrypted) state object into history/. Everything
-      #     else execs straight through.
-      if [ "''${1-}" != "apply" ]; then
-        exec tofu "$@"
-      fi
-
-      rc=0
-      tofu "$@" || rc=$?
-      if [ "$rc" -ne 0 ]; then
-        exit "$rc"
-      fi
-
-      ts="$(date -u +%Y%m%dT%H%M%SZ)"
-      key="history/$ts-demo.tfstate"
-      echo "klaffat-infra: copying encrypted state to $key" >&2
-      crc=0
-      aws s3api copy-object \
-        --endpoint-url "$AWS_ENDPOINT_URL_S3" \
-        --bucket "${bucket}" \
-        --copy-source "${bucket}/${stateKey}" \
-        --key "$key" >/dev/null || crc=$?
-      if [ "$crc" -ne 0 ]; then
-        echo "klaffat-infra: !! APPLY SUCCEEDED, HISTORY COPY FAILED (aws exit $crc)." >&2
-        echo "klaffat-infra: !! infrastructure is changed; only the dated snapshot is missing." >&2
-        echo "klaffat-infra: !! re-run the copy before the next apply, or accept the gap." >&2
-        exit 4
-      fi
-      echo "klaffat-infra: history copy ok -> $key" >&2
+      # No post-apply snapshot step: S3 bucket versioning on
+      # ${bucket} IS the state history, so every apply already leaves a
+      # restorable prior version behind with nothing for this wrapper to
+      # do (and nothing for it to get wrong on the way).
+      exec tofu "$@"
     '';
   };
 
@@ -230,7 +239,7 @@ let
     name = "klaffat-infra-install";
     runtimeInputs = [ pkgs.openssh pkgs.coreutils config.nix.package pkgs.git ];
     text = ''
-      ${rootOnlyPreamble "klaffat-infra-install"}
+      ${rootOnlyPreamble "klaffat-infra-install" "<ip>"}
 
       if [ "$#" -ne 1 ]; then
         echo "klaffat-infra-install: usage: sudo klaffat-infra-install <ip>" >&2
@@ -291,6 +300,187 @@ let
     '';
   };
 
+  klaffat-publish = pkgs.writeShellApplication {
+    name = "klaffat-publish";
+    runtimeInputs = [ config.nix.package pkgs.awscli2 pkgs.git pkgs.coreutils ];
+    text = ''
+      ${rootOnlyPreamble "klaffat-publish" "[rev | --upload-signing-key]"}
+
+      repo="${repoRoot}"
+
+      # Every AWS call below (and `nix copy`'s S3 store) authenticates with
+      # the laptop IAM user, read straight out of /run/agenix.
+      awsCreds() {
+        for _s in \
+          "${secretPath "klaffat-aws-access-key-id"}" \
+          "${secretPath "klaffat-aws-secret-access-key"}"; do
+          if [ ! -r "$_s" ]; then
+            echo "klaffat-publish: cannot read $_s — is the agenix secret provisioned?" >&2
+            exit 3
+          fi
+        done
+        AWS_ACCESS_KEY_ID="$(< "${secretPath "klaffat-aws-access-key-id"}")"
+        AWS_SECRET_ACCESS_KEY="$(< "${secretPath "klaffat-aws-secret-access-key"}")"
+        export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+        export AWS_DEFAULT_REGION="${awsRegion}"
+      }
+
+      signingPublicKey() {
+        nix --extra-experimental-features 'nix-command flakes' \
+          key convert-secret-to-public < "${secretPath "klaffat-nix-signing-key"}"
+      }
+
+      if [ ! -r "${secretPath "klaffat-nix-signing-key"}" ]; then
+        echo "klaffat-publish: cannot read ${secretPath "klaffat-nix-signing-key"} — is the agenix secret provisioned?" >&2
+        exit 3
+      fi
+
+      # --- --upload-signing-key: hand the SAME key to GitHub Actions.
+      #
+      # Terraform creates the Secrets Manager secret but deliberately never
+      # holds its value (that would put the signing key in tofu state).
+      # This mode is the one path that writes it, from the root-only agenix
+      # copy, behind the same sudo password. `file://` makes awscli read the
+      # value from the file rather than taking it on the command line, so
+      # the key never appears in argv or in the process table.
+      if [ "''${1-}" = "--upload-signing-key" ]; then
+        if [ "$#" -ne 1 ]; then
+          echo "klaffat-publish: --upload-signing-key takes no other arguments." >&2
+          exit 2
+        fi
+        awsCreds
+        aws secretsmanager put-secret-value \
+          --secret-id "${signingKeySecretId}" \
+          --secret-string "file://${secretPath "klaffat-nix-signing-key"}" \
+          --output text --query VersionId
+        echo
+        echo "klaffat-publish: signing key uploaded to Secrets Manager ${signingKeySecretId} (${awsRegion})"
+        printf '  public key: '
+        signingPublicKey
+        exit 0
+      fi
+
+      if [ "$#" -gt 1 ]; then
+        echo "klaffat-publish: usage: sudo klaffat-publish [rev | --upload-signing-key]" >&2
+        exit 2
+      fi
+
+      if [ ! -d "$repo" ]; then
+        echo "klaffat-publish: no klaffat checkout at $repo — refusing." >&2
+        echo "klaffat-publish: clone the klaffat repo to $repo first." >&2
+        exit 2
+      fi
+
+      export GIT_OPTIONAL_LOCKS=0
+
+      if ! git -C "$repo" -c safe.directory="$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "klaffat-publish: $repo is not a git worktree — refusing." >&2
+        exit 2
+      fi
+
+      # A dirty tree means the founder has uncommitted work; publishing a
+      # closure whose provenance is a commit that does not match what is on
+      # disk is exactly the confusion this refuses to create.
+      dirty="$(git -C "$repo" -c safe.directory="$repo" --no-optional-locks status --porcelain)"
+      if [ -n "$dirty" ]; then
+        echo "klaffat-publish: working tree at $repo is dirty — refusing." >&2
+        printf '%s\n' "$dirty" >&2
+        exit 2
+      fi
+
+      # Unlike klaffat-infra there is no "HEAD must be on main" check: the
+      # commit to publish is chosen EXPLICITLY here (argument, else main's
+      # tip), so whatever branch the founder happens to have checked out is
+      # irrelevant and refusing on it would be noise.
+      target="''${1-main}"
+      if ! rev="$(git -C "$repo" -c safe.directory="$repo" rev-parse --verify "$target^{commit}" 2>/dev/null)"; then
+        echo "klaffat-publish: '$target' is not a commit in $repo — refusing." >&2
+        exit 2
+      fi
+
+      awsCreds
+
+      # --- Build from a detached worktree under root-only state, never from
+      #     the founder's tree.
+      #
+      #     `git worktree add` DOES write into $repo/.git/worktrees/, and as
+      #     root that directory (and everything under it) is created
+      #     root-owned — after which jonathan's own `git worktree add` fails
+      #     with EACCES, the same class of breakage as root refreshing
+      #     .git/index. So every path git creates there is chowned back to
+      #     whoever owns $repo/.git, and the trap removes the dir entirely
+      #     when it was ours to begin with. A SIGKILL mid-run can still
+      #     leave an entry; `sudo git -C <repo> worktree prune` clears it.
+      install -d -m 0700 "${stateDir}"
+      work="${stateDir}/publish-$rev"
+      rm -rf -- "$work"
+      if ! git -C "$repo" -c safe.directory="$repo" worktree prune >/dev/null 2>&1; then
+        echo "klaffat-publish: 'git worktree prune' failed in $repo — refusing." >&2
+        exit 2
+      fi
+
+      # Anything git created under .git/worktrees goes back to the repo's
+      # owner. Called after `worktree add` and again from the trap.
+      unown() {
+        if [ -d "$repo/.git/worktrees" ]; then
+          chown -R --reference="$repo/.git" "$repo/.git/worktrees"
+        fi
+      }
+
+      cleanup() {
+        if ! git -C "$repo" -c safe.directory="$repo" \
+             worktree remove --force "$work" >/dev/null 2>&1; then
+          echo "klaffat-publish: could not remove the temporary worktree $work" >&2
+        fi
+        if ! git -C "$repo" -c safe.directory="$repo" worktree prune >/dev/null 2>&1; then
+          echo "klaffat-publish: run 'sudo git -C $repo worktree prune' to clear leftovers" >&2
+        fi
+        rm -rf -- "$work"
+        # rmdir only succeeds when we were the reason the dir existed; if the
+        # founder has worktrees of his own it stays, chowned back to him.
+        if [ -d "$repo/.git/worktrees" ] && ! rmdir "$repo/.git/worktrees" 2>/dev/null; then
+          unown
+        fi
+      }
+      trap cleanup EXIT
+
+      git -C "$repo" -c safe.directory="$repo" worktree add --detach "$work" "$rev" >/dev/null
+      unown
+      echo "klaffat-publish: building klaffat-demo from $rev" >&2
+
+      out="$(nix --extra-experimental-features 'nix-command flakes' build \
+        --no-link --print-out-paths \
+        "$work#nixosConfigurations.klaffat-demo.config.system.build.toplevel")"
+      echo "klaffat-publish: built $out" >&2
+
+      # --- Sign the whole closure with the root-only key. `nix store sign`
+      #     reads the key client-side, so /run/agenix stays 0400 root.
+      nix --extra-experimental-features 'nix-command flakes' store sign \
+        --key-file "${secretPath "klaffat-nix-signing-key"}" \
+        --recursive "$out"
+      echo "klaffat-publish: signed closure of $out" >&2
+
+      # --- Push to the S3-backed binary cache.
+      #
+      # Nix's S3 store takes its settings as URL QUERY PARAMETERS; `region`
+      # is the documented one (verified against `nix help-stores` on nix
+      # 2.34, which lists region/endpoint/scheme/addressing-style/profile).
+      # Credentials come from the standard AWS env vars set by awsCreds.
+      nix --extra-experimental-features 'nix-command flakes' copy \
+        --to '${cacheUrl}' "$out"
+
+      echo
+      echo "klaffat-publish: published"
+      echo "  revision:   $rev"
+      echo "  store path: $out"
+      echo "  cache:      ${cacheUrl}"
+      printf '  public key: '
+      signingPublicKey
+      echo
+      echo "  Put that public key in the klaffat host's nix.settings.trusted-public-keys."
+    '';
+  };
+
   # The command list the sudo rule and the command-scoped Defaults share.
   # Store paths pin the exact binaries; the /run/current-system spellings
   # are what `sudo klaffat-infra` actually resolves to through PATH and
@@ -299,8 +489,10 @@ let
   sudoCommands = [
     "${klaffat-infra}/bin/klaffat-infra"
     "${klaffat-infra-install}/bin/klaffat-infra-install"
+    "${klaffat-publish}/bin/klaffat-publish"
     "/run/current-system/sw/bin/klaffat-infra"
     "/run/current-system/sw/bin/klaffat-infra-install"
+    "/run/current-system/sw/bin/klaffat-publish"
   ];
 
   # Every secret here shares one shape: encrypted to dellan's host key,
@@ -324,10 +516,18 @@ in
       klaffat-hcloud-token = rootSecret ../../secrets/klaffat-hcloud-token.age;
       klaffat-cloudflare-api-token = rootSecret ../../secrets/klaffat-cloudflare-api-token.age;
       klaffat-state-passphrase = rootSecret ../../secrets/klaffat-state-passphrase.age;
-      klaffat-r2-access-key-id = rootSecret ../../secrets/klaffat-r2-access-key-id.age;
-      klaffat-r2-secret-access-key = rootSecret ../../secrets/klaffat-r2-secret-access-key.age;
-      klaffat-r2-account-id = rootSecret ../../secrets/klaffat-r2-account-id.age;
       klaffat-demo-host-key = rootSecret ../../secrets/klaffat-demo-host-key.age;
+
+      # One AWS identity for everything the laptop does: the IAM user
+      # `klaffat-laptop` (state bucket RW, cache bucket RW, and IAM/OIDC/
+      # SecretsManager admin for the Terraform-managed resources). The demo
+      # host gets its OWN read-only user; that credential never lands here.
+      klaffat-aws-access-key-id = rootSecret ../../secrets/klaffat-aws-access-key-id.age;
+      klaffat-aws-secret-access-key = rootSecret ../../secrets/klaffat-aws-secret-access-key.age;
+
+      # Nix binary-cache signing key — a real key, generated root-side
+      # inside the encrypting pipeline and never written in the clear.
+      klaffat-nix-signing-key = rootSecret ../../secrets/klaffat-nix-signing-key.age;
     };
 
     # The host key is the only identity that decrypts the above. dellan
@@ -347,10 +547,10 @@ in
     # On PATH system-wide so `sudo klaffat-infra` resolves; both refuse
     # outright unless euid is 0, so being on jonathan's PATH grants
     # nothing.
-    environment.systemPackages = [ klaffat-infra klaffat-infra-install ];
+    environment.systemPackages = [ klaffat-infra klaffat-infra-install klaffat-publish ];
 
     # ── sudo ────────────────────────────────────────────────────────────
-    # No NOPASSWD, no SETENV. Emitted after the module's own wheel rule
+    # No NOPASSWD, no SETENV. Emitted after the sudo module's own wheel rule
     # (mkOrder 600 in nixpkgs' security/sudo.nix), and sudoers is
     # last-match-wins, so these commands are password-gated even while
     # wheel is NOPASSWD.

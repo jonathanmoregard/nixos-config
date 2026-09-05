@@ -46,8 +46,23 @@
     ];
   };
 
-  # Allow wheel group to use sudo without password
-  security.sudo.wheelNeedsPassword = false;
+  # wheel must type a password for sudo.
+  #
+  # This was `false` until 2026-09-05. It changed because
+  # modules/nixos/klaffat-infra.nix keeps provisioning credentials — Hetzner
+  # and Cloudflare API tokens, the OpenTofu state passphrase, AWS keys, a
+  # Nix binary-cache signing key — as root-only agenix secrets specifically
+  # so that the principal an AI agent runs as (jonathan) cannot read them.
+  # `NOPASSWD: ALL` for wheel made that a fiction: `sudo cat
+  # /run/agenix/klaffat-hcloud-token` needed no password at all. Founder-
+  # approved; the consequence is that every sudo on dellan now prompts.
+  #
+  # Asserted by checks.x86_64-linux.vm-klaffat-infra (`sudo -n true` as
+  # jonathan must FAIL), so flipping this back cannot pass the gate quietly.
+  # The one deliberate exception stays explicit and narrow: the deploy
+  # webhook's NOPASSWD rule for `systemctl start nixos-deploy.service` in
+  # modules/nixos/nixos-auto-deploy.nix.
+  security.sudo.wheelNeedsPassword = true;
 
   # Enable zsh system-wide (required for it to be a valid login shell)
   programs.zsh.enable = true;

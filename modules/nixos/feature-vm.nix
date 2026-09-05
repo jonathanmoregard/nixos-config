@@ -54,10 +54,10 @@ let
     "klaffat-hcloud-token"
     "klaffat-cloudflare-api-token"
     "klaffat-state-passphrase"
-    "klaffat-r2-access-key-id"
-    "klaffat-r2-secret-access-key"
-    "klaffat-r2-account-id"
+    "klaffat-aws-access-key-id"
+    "klaffat-aws-secret-access-key"
     "klaffat-demo-host-key"
+    "klaffat-nix-signing-key"
   ];
 in
 {
@@ -164,7 +164,7 @@ in
     # Point agenix at the host privkey 9p-mounted above, PLUS a throwaway
     # identity for the klaffat provisioning secrets.
     #
-    # Those seven are the one group deliberately NOT encrypted to any key
+    # Those ten are the one group deliberately NOT encrypted to any key
     # jonathan holds (modules/nixos/klaffat-infra.nix explains why), so the
     # 9p'd user key cannot open them and a smoke run would find
     # /run/agenix/klaffat-* absent — indistinguishable from the module
