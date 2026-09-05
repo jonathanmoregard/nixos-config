@@ -5,7 +5,7 @@
 # What this lane proves, and why each assertion is behavioural rather
 # than a presence check:
 #
-#   1. The seven provisioning secrets DECRYPT inside the VM and land 0400
+#   1. The eight provisioning secrets DECRYPT inside the VM and land 0400
 #      root:root, and jonathan cannot read them. Every other lane in this
 #      repo asserts only the agenix *path*, because no test VM holds a
 #      recipient key — such an assertion is green for the wrong reason.
@@ -21,42 +21,49 @@
 #      than silently reopening the hole, and so the per-command rules stay
 #      honest if it is ever loosened again.
 #
-#   3. Every refusal branch of every wrapper, at the REAL fixed path
-#      /home/jonathan/Repos/klaffat: absent, dirty, wrong branch, wrong
-#      remote, HEAD not at the remote's tip, stray auto-loaded OpenTofu
-#      files. No test-only path override (the contract forbids one), so
-#      the lane builds a genuine jonathan-owned git repo at that exact
-#      location — which also exercises the `-c safe.directory` handling
-#      root needs to read another user's checkout at all.
+#   3. THE PROVENANCE GATE IS THE POINT OF THIS LANE, and it is now a
+#      mirror, not a check. Root fetches the pinned remote into its own
+#      bare repository before every run and builds from THAT. So the lane
+#      brings a real remote — a bare repo served by lighttpd +
+#      git-http-backend behind HTTP basic auth, exactly the shape GitHub
+#      presents — and asserts:
+#        - the run uses main's tip AS THE SERVER HAS IT, and follows it
+#          when it moves;
+#        - the token from /run/agenix is what authenticates the fetch
+#          (a wrong token refuses; the credential-helper path is exercised
+#          for real, not asserted by string);
+#        - an unreachable origin REFUSES — no fallback to the mirror's
+#          last contents;
+#        - a founder checkout at /home/jonathan/Repos/klaffat, booby-trapped
+#          with every jonathan-writable git hook the earlier designs were
+#          reproduced tripping (core.fsmonitor, a smudge filter,
+#          post-checkout, an exclude-hidden override.tf, a divergent local
+#          main), changes NOTHING: no trap fires, no root-owned path
+#          appears in it, and OpenTofu plans the remote's content.
 #
-#      THE PROVENANCE GATE IS THE POINT OF THIS LANE. The first draft of
-#      the module decided provenance from two facts jonathan owns — a
-#      clean tree and a branch named `main` — and an agent-authored commit
-#      on a purely local `main`, ahead of and divergent from origin/main,
-#      reached `tofu` as uid 0 with every credential exported. So the lane
-#      brings a real remote (a root-owned bare repo, reached over
-#      `file://`, pinned through services.klaffatInfra.repoRemoteUrl) and
-#      drives exactly that scenario: local main one commit ahead, tree
-#      clean, branch `main` — and asserts the refusal.
+#   4. The happy path reaches `tofu`, planning the ARCHIVED remote tree —
+#      a `canary` output whose value says which tree was read.
 #
-#   4. The happy path reaches `exec tofu`, printing the revision line
-#      first. `tofu version` is offline-safe (OpenTofu has no checkpoint
-#      call-home) and needs no init, so it is the cheapest argument that
-#      still proves env reconstruction + cd + exec all fired.
+#   5. Only allowlisted OpenTofu subcommands run at all, `console` is
+#      refused by name, and `destroy` (including `apply -destroy`) needs
+#      a confirmation typed at a terminal. sudo's prompt names the
+#      wrapper, never the subcommand, so without this
+#      `yes | sudo klaffat-infra destroy` is one password away from an
+#      empty stack.
 #
-#   5. Only allowlisted OpenTofu subcommands run at all, and `destroy`
-#      (including `apply -destroy`) needs a confirmation typed at a
-#      terminal. sudo's prompt names the wrapper, never the subcommand, so
-#      without this `yes | sudo klaffat-infra destroy` is one password
-#      away from an empty stack.
+#   6. Each verb sees only the credentials it is entitled to: with the
+#      Hetzner token removed, `validate` and `output` still run and `plan`
+#      exits 3; with the state passphrase removed, `validate` runs and
+#      `output` exits 3.
 #
-#   6. klaffat-publish's default target is the remote's main, not the
-#      local one, and the temporary build worktree leaves nothing behind.
+#   7. klaffat-publish's default target is the remote's main; an explicit
+#      rev must exist on SOME branch of the remote (a local-only commit is
+#      refused); the build addresses the root-only mirror at the exact rev.
 #
-#   7. klaffat-infra-install stages and then SHREDS its --extra-files dir,
-#      and the flakeref it hands `nix run` carries the verified `rev=` —
-#      a bare path flakeref builds the working tree, uncommitted edits
-#      included.
+#   8. klaffat-infra-install refuses anything that is not an IP address
+#      (a resolvable hostname like `cafe.beef` used to pass), stages and
+#      then SHREDS its --extra-files dir, and hands `nix run` a flakeref
+#      into the root-only mirror pinned to the verified rev.
 { pkgs, inputs }:
 
 let
@@ -72,18 +79,29 @@ let
     "klaffat-aws-secret-access-key"
     "klaffat-demo-host-key"
     "klaffat-nix-signing-key"
+    "klaffat-github-token"
   ];
 
   git = "${pkgs.git}/bin/git";
   bin = "/run/current-system/sw/bin";
+
+  # The founder's checkout. The wrappers no longer read it; the lane
+  # builds a booby-trapped one here to prove that.
   repo = "/home/jonathan/Repos/klaffat";
 
-  # The lane's stand-in for github.com: a bare repo that only ROOT can
-  # write, reached over `file://`. That is the property the gate needs —
-  # an authority outside the jonathan-owned checkout — and it is the one
-  # part of the real setup a network-less VM cannot borrow.
-  originDir = "/var/lib/klaffat-origin.git";
-  originUrl = "file://${originDir}";
+  # Root-only state the module owns, and the mirror inside it.
+  stateDir = "/var/lib/klaffat-infra";
+  mirror = "${stateDir}/klaffat.git";
+
+  # The lane's stand-in for github.com: a bare repo under a root-owned
+  # directory, served over HTTP by lighttpd + git-http-backend behind basic
+  # auth. That is the property the gate needs — an authority outside
+  # anything jonathan writes, reached over the network with a credential —
+  # and it is the one part of the real setup a network-less VM cannot
+  # borrow.
+  originRoot = "/var/lib/klaffat-origin";
+  originPort = 8080;
+  originUrl = "http://127.0.0.1:${toString originPort}/git/klaffat.git";
 
   # The literal `aws_secretsmanager_secret.nix_signing_key` creates in the
   # klaffat repo's deploy/terraform/aws.tf, and the one
@@ -103,27 +121,75 @@ common.mkMinimalTest {
       services.klaffatInfra.enable = true;
 
       # The pinned remote. In production this is the GitHub HTTPS URL and
-      # a token file goes with it; here it is a root-owned bare repo, so
-      # the gate's logic is exercised end to end with no network.
+      # the token secret goes with it; here it is the lane's own
+      # basic-auth http origin, so the gate's logic — fetch, authenticate,
+      # archive — is exercised end to end with no internet.
       services.klaffatInfra.repoRemoteUrl = originUrl;
 
       # Swap dellan's host-key-encrypted ciphertexts for fixtures this VM
       # can actually open. `file` (not `rekeyFile`) on both sides, so the
-      # only thing that changes is the recipient.
+      # only thing that changes is the recipient. The token fixture
+      # decrypts to the password the origin below expects.
       age.identityPaths = lib.mkForce [ "${fixtures}/id_ed25519" ];
       age.secrets = lib.genAttrs secretNames (n: {
         file = lib.mkForce "${fixtures}/${n}.age";
       });
+
+      # The origin. `GIT_CONFIG_*` safe.directory because the CGI runs as
+      # the lighttpd user against a root-owned repository — that is the
+      # test's ownership shape, not production's, where root fetches from
+      # GitHub.
+      services.lighttpd = {
+        enable = true;
+        port = originPort;
+        document-root = "/var/empty";
+        enableModules = [ "mod_alias" "mod_auth" "mod_authn_file" "mod_setenv" "mod_cgi" ];
+        extraConfig = ''
+          alias.url = ( "/git" => "${pkgs.git}/libexec/git-core/git-http-backend" )
+          $HTTP["url"] =~ "^/git" {
+            cgi.assign = ( "" => "" )
+            setenv.add-environment = (
+              "PATH" => "${pkgs.git}/bin:${pkgs.coreutils}/bin",
+              "GIT_PROJECT_ROOT" => "${originRoot}",
+              "GIT_HTTP_EXPORT_ALL" => "",
+              "GIT_CONFIG_COUNT" => "1",
+              "GIT_CONFIG_KEY_0" => "safe.directory",
+              "GIT_CONFIG_VALUE_0" => "*"
+            )
+            auth.backend = "plain"
+            auth.backend.plain.userfile = "/etc/klaffat-origin-users"
+            auth.require = ( "" => ( "method" => "basic", "realm" => "git", "require" => "valid-user" ) )
+          }
+        '';
+      };
+      environment.etc."klaffat-origin-users".text = "x-access-token:TEST-github-token\n";
+      systemd.tmpfiles.rules = [ "d ${originRoot} 0755 root root -" ];
     })
   ];
 
   testScript = ''
+    import shlex
+
     start_all()
     machine.wait_for_unit("multi-user.target")
+    machine.wait_for_unit("lighttpd.service")
+    machine.wait_for_open_port(${toString originPort})
 
     def run(cmd):
-        rc, out = machine.execute(cmd + " 2>&1")
+        rc, out = machine.execute(f"timeout 300 {cmd} 2>&1")
         return rc, out.strip()
+
+    # `tofu plan` pads output names to a column, so values are matched on
+    # whitespace-squashed text.
+    def squash(s):
+        return " ".join(s.split())
+
+    def write_file(path, content):
+        machine.succeed(f"printf '%s' {shlex.quote(content)} > {path}")
+
+    def state_leftovers():
+        _, ls = machine.execute("ls -A ${stateDir}")
+        return [x for x in ls.split() if x.startswith(("infra-", "publish-", "klaffat-extra-files"))]
 
     # ---------------------------------------------------------------
     # 1. All three wrappers reached PATH.
@@ -173,11 +239,27 @@ common.mkMinimalTest {
     # ---------------------------------------------------------------
     # 4. What the BUILT scripts render.
     #
-    #    Two of the round-4 defects were pure string faults that no
-    #    runtime path in a network-less VM can reach, so they are
-    #    asserted on the artifact the founder actually runs.
+    #    Some defects are pure string faults no runtime path in this VM
+    #    can reach (the Secrets Manager id), and some properties are
+    #    universal negatives (no wrapper ever addresses the founder's
+    #    tree). Both are asserted on the artifact the founder actually
+    #    runs.
     # ---------------------------------------------------------------
-    publish_src = machine.succeed("cat $(readlink -f ${bin}/klaffat-publish)")
+    srcs = {
+        w: machine.succeed(f"cat $(readlink -f ${bin}/{w})")
+        for w in ["klaffat-infra", "klaffat-infra-install", "klaffat-publish"]
+    }
+    for w, src in srcs.items():
+        # Root must never run git inside a repository jonathan owns: that
+        # loads jonathan's .git/config, and core.fsmonitor / filter.*.smudge
+        # / hooks in there execute as root. `safe.directory` is the switch
+        # that re-enables it, so its absence is the property.
+        assert "safe.directory" not in src, f"{w} re-enables root git inside a foreign repo"
+        assert "worktree add" not in src, f"{w} checks out a worktree (hooks + smudge filters run)"
+        assert "/home/jonathan" not in src, f"{w} addresses the founder's home"
+        assert "${mirror}" in src, f"{w} does not use the root-only mirror"
+
+    publish_src = srcs["klaffat-publish"]
     assert '--secret-id "${signingKeySecretId}"' in publish_src, (
         "klaffat-publish does not pass the Secrets Manager id Terraform creates "
         "(${signingKeySecretId}); put-secret-value does NOT create a missing "
@@ -187,28 +269,21 @@ common.mkMinimalTest {
         "the old slash-spelled Secrets Manager id is still in klaffat-publish"
     )
 
-    install_src = machine.succeed("cat $(readlink -f ${bin}/klaffat-infra-install)")
-    assert 'flakeref="git+file://$repo?rev=$rev"' in install_src, (
-        "klaffat-infra-install must address the repo by a rev-pinned git flakeref; "
-        "a bare path flakeref builds uncommitted working-tree content"
+    install_src = srcs["klaffat-infra-install"]
+    assert 'flakeref="git+file://${mirror}?rev=$rev&allRefs=1"' in install_src, (
+        "klaffat-infra-install must address the root-only mirror by a rev-pinned "
+        "git flakeref; a bare path flakeref builds working-tree content"
     )
-    for bad in ['nix run "${repo}#', '--flake "${repo}#']:
-        assert bad not in install_src, (
-            f"klaffat-infra-install still passes a bare path flakeref: {bad!r}"
-        )
+
+    infra_src = srcs["klaffat-infra"]
+    assert "console)" in infra_src and "'console' is not offered" in infra_src, (
+        "klaffat-infra must refuse `console` by name"
+    )
 
     # ---------------------------------------------------------------
-    # 5. As root, with the checkout absent: the exact refusals.
+    # 5. As root, before any origin exists: argv refusals need no
+    #    network; everything else refuses because the mirror fetch fails.
     # ---------------------------------------------------------------
-    rc, out = run("${bin}/klaffat-infra version")
-    assert rc == 2, f"absent-checkout refusal should exit 2, got {rc}: {out!r}"
-    expected = (
-        "klaffat-infra: no OpenTofu checkout at "
-        "${repo}/deploy/terraform — refusing."
-    )
-    assert expected in out, f"expected {expected!r}, got {out!r}"
-
-    # argv is validated before anything else, so these need no checkout.
     rc, out = run("${bin}/klaffat-infra")
     assert rc == 2 and "usage: sudo klaffat-infra <tofu subcommand>" in out, (
         f"no-subcommand refusal wrong: {rc} {out!r}"
@@ -221,10 +296,22 @@ common.mkMinimalTest {
             f"unexpected refusal for '{bogus}': {out!r}"
         )
 
+    # `console` evaluates nonsensitive(var.hcloud_token) and prints it.
+    rc, out = run("printf 'nonsensitive(var.hcloud_token)\\n' | ${bin}/klaffat-infra console")
+    assert rc == 2, f"console should be refused with exit 2, got {rc}: {out!r}"
+    assert "'console' is not offered" in out, f"unexpected console refusal: {out!r}"
+    assert "TEST-hcloud-token" not in out, f"console printed the token: {out!r}"
+
+    rc, out = run("${bin}/klaffat-infra plan")
+    assert rc == 2, f"fetch-failure refusal should exit 2, got {rc}: {out!r}"
+    assert "could not fetch ${originUrl} into the root-only mirror" in out, (
+        f"unexpected refusal with no origin: {out!r}"
+    )
+    assert "OpenTofu" not in out, f"tofu ran without a fetched mirror: {out!r}"
+
     rc, out = run("${bin}/klaffat-publish")
-    assert rc == 2, f"absent-checkout refusal should exit 2, got {rc}: {out!r}"
-    assert "klaffat-publish: no klaffat checkout at ${repo} — refusing." in out, (
-        f"unexpected klaffat-publish refusal: {out!r}"
+    assert rc == 2 and "could not fetch ${originUrl}" in out, (
+        f"klaffat-publish should refuse when the fetch fails: {rc} {out!r}"
     )
 
     rc, out = run("${bin}/klaffat-publish aaaa bbbb")
@@ -279,122 +366,187 @@ common.mkMinimalTest {
     assert "Defaults!KLAFFAT_INFRA_CMNDS timestamp_type=tty" in sudoers
 
     # ---------------------------------------------------------------
-    # 7. A real jonathan-owned checkout at the fixed path, plus a
-    #    root-owned "remote" it is pinned to.
+    # 7. THE ORIGIN, and the mirror that follows it.
+    #
+    #    Content is authored in a root-only work repo and pushed into the
+    #    served bare repo, the way commits reach GitHub. The fixture tree
+    #    is provider-free so `tofu plan` runs offline without `init`, and
+    #    its outputs report which tree was planned and which credentials
+    #    the process received.
     # ---------------------------------------------------------------
-    machine.succeed("install -d -o jonathan -g users /home/jonathan/Repos ${repo}")
-    machine.succeed(
-        "install -d -o jonathan -g users ${repo}/deploy ${repo}/deploy/terraform"
+    src = "/root/klaffat-src"
+
+    def src_git(args):
+        return machine.succeed(
+            f"${git} -C {src} -c user.email=t@example.invalid -c user.name=t {args}"
+        )
+
+    def tf_fixture(canary):
+        return (
+            'variable "hcloud_token" {\n  type    = string\n  default = ""\n}\n'
+            'variable "state_passphrase" {\n  type    = string\n  default = ""\n}\n'
+            f'output "canary" {{\n  value = "{canary}"\n}}\n'
+            'output "hcloud_token_present" {\n  value = var.hcloud_token != ""\n}\n'
+            'output "state_passphrase_present" {\n  value = var.state_passphrase != ""\n}\n'
+        )
+
+    machine.succeed(f"install -d -m 0755 {src}/deploy/terraform")
+    write_file(f"{src}/deploy/terraform/main.tf", tf_fixture("REMOTE-1"))
+    # A flake with no inputs, so klaffat-publish's `nix build` gets past
+    # fetching (offline) and fails on the missing attribute — which is how
+    # the lane tells "fetched the exact rev from the mirror" from "could
+    # not fetch".
+    write_file(f"{src}/flake.nix", "{ outputs = { self }: { }; }\n")
+    machine.succeed(f"${git} init -q -b main {src}")
+    src_git("add -A")
+    src_git("commit -q -m 'main 1'")
+    rev_a = src_git("rev-parse HEAD").strip()
+
+    machine.succeed("umask 022 && ${git} init -q --bare ${originRoot}/klaffat.git")
+
+    def push_origin():
+        machine.succeed(
+            "umask 022 && ${git} --git-dir=${originRoot}/klaffat.git "
+            f"fetch -q --prune file://{src} '+refs/heads/*:refs/heads/*'"
+        )
+        # The CGI runs as the lighttpd user.
+        machine.succeed("chmod -R a+rX ${originRoot}/klaffat.git")
+
+    push_origin()
+
+    # 7a. Happy path: the mirror is created, main's tip is what the server
+    #     has, and OpenTofu plans the archived REMOTE tree.
+    rc, out = run("${bin}/klaffat-infra plan -no-color")
+    assert rc == 0, f"clean run should succeed, got {rc}: {out!r}"
+    assert f"klaffat-infra: ${originUrl} main @ {rev_a}" in out, (
+        f"revision line missing or wrong: {out!r}"
     )
-    machine.succeed("install -o jonathan -g users /dev/null ${repo}/deploy/terraform/main.tf")
+    assert 'canary = "REMOTE-1"' in squash(out), f"tofu did not plan the remote tree: {out!r}"
+    assert "hcloud_token_present = true" in squash(out), f"plan did not receive the provider token: {out!r}"
+    assert "state_passphrase_present = true" in squash(out), f"plan did not receive the state passphrase: {out!r}"
+
+    mode = machine.succeed("stat -c '%a %U' ${mirror}").strip()
+    assert mode == "700 root", f"the mirror should be 700 root, got '{mode}'"
+    mode = machine.succeed("stat -c '%a %U' ${stateDir}/terraform.d").strip()
+    assert mode == "700 root", f"TF_DATA_DIR should be 700 root, got '{mode}'"
+    tip = machine.succeed("${git} --git-dir=${mirror} rev-parse refs/heads/main").strip()
+    assert tip == rev_a, f"mirror main is {tip}, server main is {rev_a}"
+    assert state_leftovers() == [], f"a run left artefacts in ${stateDir}: {state_leftovers()!r}"
+
+    # 7b. The token is what authenticates. With the wrong one in
+    #     /run/agenix the fetch is refused by the server and the wrapper
+    #     refuses — proving the credential helper is the path in use, and
+    #     that a 401 does not fall back to the mirror's last contents.
+    token_file = machine.succeed("readlink -f /run/agenix/klaffat-github-token").strip()
+    machine.succeed(f"printf 'WRONG' > {token_file}")
+    rc, out = run("${bin}/klaffat-infra plan -no-color")
+    assert rc == 2, f"a wrong token should refuse with exit 2, got {rc}: {out!r}"
+    assert "Authentication failed" in out, f"the server did not reject the token: {out!r}"
+    assert "could not fetch ${originUrl}" in out, f"unexpected wrong-token refusal: {out!r}"
+    assert "REMOTE-1" not in out, f"tofu ran on a stale mirror after a refused fetch: {out!r}"
+    machine.succeed(f"printf 'TEST-github-token' > {token_file}")
+
+    # 7c. THE DECOY. A jonathan-owned checkout at the fixed path, carrying
+    #     every trap the earlier designs were reproduced tripping. All of
+    #     it must be inert: the wrappers never open this repository.
+    machine.succeed("install -d -o jonathan -g users /home/jonathan/Repos ${repo}")
+    machine.succeed("install -d -o jonathan -g users ${repo}/deploy ${repo}/deploy/terraform")
+
+    def as_jonathan(cmd):
+        return machine.succeed(f"runuser -u jonathan -- env HOME=/home/jonathan {cmd}")
 
     def as_jonathan_git(args):
-        return machine.succeed(
-            "runuser -u jonathan -- env HOME=/home/jonathan "
+        return as_jonathan(
             f"${git} -C ${repo} -c user.email=t@example.invalid -c user.name=t {args}"
         )
 
-    machine.succeed(
-        "runuser -u jonathan -- env HOME=/home/jonathan ${git} init -q -b main ${repo}"
-    )
+    write_file("${repo}/deploy/terraform/main.tf", tf_fixture("LOCAL"))
+    machine.succeed("chown jonathan:users ${repo}/deploy/terraform/main.tf")
+    as_jonathan("${git} init -q -b main ${repo}")
     as_jonathan_git("add -A")
-    as_jonathan_git("commit -q -m init")
+    as_jonathan_git("commit -q -m 'agent: unreviewed local commit'")
     as_jonathan_git("remote add origin ${originUrl}")
+    rev_local = as_jonathan_git("rev-parse HEAD").strip()
+    assert rev_local != rev_a
 
-    # The "remote". --no-hardlinks so its objects are root-owned copies,
-    # not links into a directory jonathan writes.
-    #
-    # BOTH safe.directory entries: a local clone resolves the source to
-    # its .git directory and checks ownership on THAT path, so listing
-    # only the worktree gets "detected dubious ownership in repository at
-    # '<repo>/.git'". (Production never does this — the real remote is
-    # https and the wrappers only ever read the checkout in place.)
-    def clone_bare(dest):
-        machine.succeed(
-            "${git} -c safe.directory=${repo} -c safe.directory=${repo}/.git "
-            f"clone --bare --no-hardlinks -q ${repo} {dest}"
-        )
-
-    clone_bare("${originDir}")
-    rev_a = as_jonathan_git("rev-parse HEAD").strip()
-
-    # 7a. Dirty tree.
-    machine.succeed("install -o jonathan -g users /dev/null ${repo}/deploy/terraform/scratch")
-    rc, out = run("${bin}/klaffat-infra version")
-    assert rc == 2, f"dirty-tree refusal should exit 2, got {rc}: {out!r}"
-    assert "working tree at ${repo} is dirty — refusing." in out, (
-        f"unexpected dirty-tree refusal: {out!r}"
-    )
-    rc, out = run("${bin}/klaffat-infra-install 10.0.0.1")
-    assert rc == 2 and "working tree at ${repo} is dirty — refusing." in out, (
-        f"klaffat-infra-install accepted a dirty tree: {rc} {out!r}"
-    )
-    machine.succeed("rm ${repo}/deploy/terraform/scratch")
-
-    # Root just ran git in jonathan's checkout. It must not have taken
-    # ownership of anything: an index refreshed as root leaves the founder
-    # unable to `git checkout` his own repo afterwards.
-    owner = machine.succeed("stat -c '%U' ${repo}/.git/index").strip()
-    assert owner == "jonathan", (
-        f".git/index is owned by {owner!r} after a root wrapper run"
-    )
-
-    # 7b. Wrong branch.
-    as_jonathan_git("checkout -q -b feature")
-    rc, out = run("${bin}/klaffat-infra version")
-    assert rc == 2, f"branch refusal should exit 2, got {rc}: {out!r}"
-    assert "HEAD is on 'feature', not 'main' — refusing." in out, (
-        f"unexpected branch refusal: {out!r}"
-    )
-    rc, out = run("${bin}/klaffat-infra-install 10.0.0.1")
-    assert rc == 2 and "HEAD is on 'feature', not 'main' — refusing." in out, (
-        f"klaffat-infra-install accepted a non-main branch: {rc} {out!r}"
-    )
-    as_jonathan_git("checkout -q main")
-
-    # 7c. An untracked OpenTofu auto-load file. `git status --porcelain`
-    #     calls the tree clean (the fixture .gitignore hides it, and
-    #     .gitignore is jonathan's to write), but `tofu plan` would read
-    #     it and it would replace resource blocks wholesale.
+    markers = "/home/jonathan/markers.txt"
+    for name, body in [
+        ("fsmon.sh", f'echo "core.fsmonitor ran as $(id -un)" >> {markers}\nprintf "/"\n'),
+        ("smudge.sh", f'echo "smudge filter ran as $(id -un)" >> {markers}\ncat\n'),
+        ("post-checkout", f'echo "post-checkout hook ran as $(id -un)" >> {markers}\n'),
+    ]:
+        write_file(f"/home/jonathan/{name}", "#!/bin/sh\n" + body)
+        machine.succeed(f"chown jonathan:users /home/jonathan/{name} && chmod 755 /home/jonathan/{name}")
+    machine.succeed("cp /home/jonathan/post-checkout ${repo}/.git/hooks/post-checkout")
+    machine.succeed("chown jonathan:users ${repo}/.git/hooks/post-checkout")
+    as_jonathan_git("config core.fsmonitor /home/jonathan/fsmon.sh")
+    as_jonathan_git("config filter.evil.smudge /home/jonathan/smudge.sh")
+    write_file("${repo}/.git/info/attributes", "* filter=evil\n")
+    write_file("${repo}/.git/info/exclude", "deploy/terraform/override.tf\n")
+    write_file("${repo}/deploy/terraform/override.tf", 'output "canary" { value = "LOCAL-OVERRIDE" }\n')
     machine.succeed(
-        "runuser -u jonathan -- env HOME=/home/jonathan "
-        "sh -c 'printf \"deploy/terraform/override.tf\\n\" > ${repo}/.gitignore'"
+        "chown jonathan:users ${repo}/.git/info/attributes ${repo}/.git/info/exclude "
+        "${repo}/deploy/terraform/override.tf"
     )
-    as_jonathan_git("add -A")
-    as_jonathan_git("commit -q -m gitignore")
-    machine.succeed(
-        "runuser -u jonathan -- env HOME=/home/jonathan "
-        "sh -c 'printf \"# canary\\n\" > ${repo}/deploy/terraform/override.tf'"
-    )
-    clean = as_jonathan_git("status --porcelain").strip()
-    assert clean == "", f"the fixture must be porcelain-clean for this case: {clean!r}"
-    rc, out = run("${bin}/klaffat-infra version")
-    assert rc == 2, f"stray override.tf should be refused, got {rc}: {out!r}"
-    assert "OpenTofu auto-loads it" in out, (
-        f"unexpected stray-autoload refusal: {out!r}"
-    )
-    machine.succeed("rm ${repo}/deploy/terraform/override.tf")
+    machine.succeed(f"rm -f {markers}")
 
-    # The .gitignore commit put local main ahead of the remote; catch the
-    # remote up so the next cases start from equality.
-    machine.succeed("rm -rf ${originDir}")
-    clone_bare("${originDir}")
-    rev_a = as_jonathan_git("rev-parse HEAD").strip()
+    rc, out = run("${bin}/klaffat-infra plan -no-color")
+    assert rc == 0, f"the decoy must not break the run, got {rc}: {out!r}"
+    assert 'canary = "REMOTE-1"' in squash(out), f"tofu did not plan the remote tree: {out!r}"
+    assert "LOCAL" not in out, f"the founder's checkout leaked into the plan: {out!r}"
+    assert rev_local not in out, f"the local commit was mentioned: {out!r}"
 
-    # 7d. Clean, on main, at the remote's tip: prints the revision and
-    #     execs tofu.
-    rc, out = run("${bin}/klaffat-infra version")
-    assert rc == 0, f"clean run should succeed, got {rc}: {out!r}"
-    assert f"klaffat-infra: ${repo} @ {rev_a} (branch main, = ${originUrl} main)" in out, (
-        f"revision line missing or wrong: {out!r}"
+    rc, out = run("${bin}/klaffat-publish")
+    assert rc != 0
+    assert f"klaffat-publish: building klaffat-demo from {rev_a}" in out, (
+        f"klaffat-publish did not default to the REMOTE tip {rev_a}: {out!r}"
     )
-    assert "OpenTofu v" in out, f"tofu was not exec'd: {out!r}"
+    assert rev_local not in out, f"klaffat-publish targeted the local main {rev_local}: {out!r}"
 
-    # TF_DATA_DIR is root-only state, created by the wrapper.
-    mode = machine.succeed(
-        "stat -c '%a %U' /var/lib/klaffat-infra/terraform.d"
-    ).strip()
-    assert mode == "700 root", f"TF_DATA_DIR should be 700 root, got '{mode}'"
+    rc, out = run("${bin}/klaffat-infra-install 10.0.0.1")
+    assert rc != 0
+    assert f"flakeref git+file://${mirror}?rev={rev_a}&allRefs=1" in out, (
+        f"install did not pin the remote tip in the mirror: {out!r}"
+    )
+
+    machine.succeed(f"test ! -e {markers}")
+    _, root_owned = machine.execute("find ${repo} -user root")
+    assert root_owned.strip() == "", (
+        f"a wrapper left root-owned paths in the founder's checkout: {root_owned!r}"
+    )
+    assert state_leftovers() == [], f"runs left artefacts in ${stateDir}: {state_leftovers()!r}"
+
+    # 7d. main moves on the server; the next run follows it.
+    write_file(f"{src}/deploy/terraform/main.tf", tf_fixture("REMOTE-2"))
+    src_git("add -A")
+    src_git("commit -q -m 'main 2'")
+    rev_b = src_git("rev-parse HEAD").strip()
+    src_git("checkout -q -b hotfix")
+    write_file(f"{src}/deploy/terraform/main.tf", tf_fixture("HOTFIX"))
+    src_git("add -A")
+    src_git("commit -q -m 'hotfix 1'")
+    rev_hotfix = src_git("rev-parse HEAD").strip()
+    src_git("checkout -q main")
+    push_origin()
+
+    rc, out = run("${bin}/klaffat-infra plan -no-color")
+    assert rc == 0, f"run after main moved failed: {rc} {out!r}"
+    assert f"main @ {rev_b}" in out and 'canary = "REMOTE-2"' in squash(out), (
+        f"the mirror did not follow main to {rev_b}: {out!r}"
+    )
+    assert "HOTFIX" not in out, f"a non-main branch reached tofu: {out!r}"
+
+    # 7e. Origin unreachable: REFUSE. The mirror holds rev_b, and using it
+    #     would be exactly the stale-main fallback the design forbids.
+    machine.succeed("systemctl stop lighttpd.service")
+    rc, out = run("${bin}/klaffat-infra plan -no-color")
+    assert rc == 2, f"unreachable origin should refuse with exit 2, got {rc}: {out!r}"
+    assert "could not fetch ${originUrl}" in out, f"unexpected offline refusal: {out!r}"
+    assert "REMOTE-2" not in out, f"tofu ran on the stale mirror while offline: {out!r}"
+    rc, out = run("${bin}/klaffat-publish")
+    assert rc == 2 and "could not fetch" in out, f"publish used a stale mirror offline: {rc} {out!r}"
+    machine.succeed("systemctl start lighttpd.service")
+    machine.wait_for_open_port(${toString originPort})
 
     # ---------------------------------------------------------------
     # 8. destroy needs a terminal, and a pipe is not one.
@@ -417,7 +569,7 @@ common.mkMinimalTest {
     # reads like an infrastructure problem rather than the assertion
     # failure it is. rc 124 says exactly that.
     for cmd in ["destroy", "destroy -auto-approve", "apply -destroy"]:
-        rc, out = run(f"yes | setsid --wait timeout 30 ${bin}/klaffat-infra {cmd}")
+        rc, out = run(f"yes | setsid --wait timeout 60 ${bin}/klaffat-infra {cmd}")
         assert rc != 124, (
             f"'{cmd}' blocked on a terminal read instead of refusing: {out!r}"
         )
@@ -425,14 +577,14 @@ common.mkMinimalTest {
         assert "no terminal to confirm at" in out, (
             f"unexpected destroy refusal for '{cmd}': {out!r}"
         )
-        assert "OpenTofu v" not in out, f"'{cmd}' reached tofu: {out!r}"
+        assert "OpenTofu" not in out, f"'{cmd}' reached tofu: {out!r}"
 
     # 8a. WITH a real terminal and `yes` on stdin — the shape of the
     #     original attack. The pipe feeds stdin; the confirmation is read
     #     from /dev/tty, so the pipe never touches it and the typed answer
     #     (here deliberately wrong) is what decides.
     rc, out = run(
-        "printf 'no\\n' | timeout 30 script -qec "
+        "printf 'no\\n' | timeout 60 script -qec "
         "'yes | ${bin}/klaffat-infra destroy' /dev/null"
     )
     assert rc != 124, f"destroy hung on a pty instead of reading the answer: {out!r}"
@@ -442,161 +594,135 @@ common.mkMinimalTest {
     assert "destroy not confirmed — refusing." in out, (
         f"a wrong answer must refuse — the piped `yes` must not count: {out!r}"
     )
-    assert "OpenTofu v" not in out, f"destroy reached tofu anyway: {out!r}"
+    assert "OpenTofu" not in out, f"destroy reached tofu anyway: {out!r}"
 
     # 8b. …and the right answer, typed, gets through. `apply -destroy
     #     -help` is destroy-flagged (so it must be confirmed) but writes
-    #     no state, so the fixture tree stays clean for the cases below.
+    #     no state.
     rc, out = run(
-        "printf 'destroy klaffat\\n' | timeout 60 script -qec "
+        "printf 'destroy klaffat\\n' | timeout 120 script -qec "
         "'${bin}/klaffat-infra apply -destroy -help' /dev/null"
     )
     assert rc != 124, f"the confirmed destroy hung: {out!r}"
     assert "destroy not confirmed" not in out and "no terminal to confirm at" not in out, (
         f"a correctly typed confirmation was still refused: {out!r}"
     )
-    dirt = as_jonathan_git("status --porcelain").strip()
-    assert dirt == "", (
-        f"a wrapper run left artefacts in the founder's tree: {dirt!r}"
-    )
+    assert "Usage: tofu [global options] apply" in out, f"the confirmed command did not reach tofu: {out!r}"
+    assert state_leftovers() == [], f"a run left artefacts in ${stateDir}: {state_leftovers()!r}"
 
     # ---------------------------------------------------------------
-    # 9. THE PROVENANCE GATE. Clean tree, branch literally `main`, one
-    #    agent-authored commit that the remote has never seen.
-    # ---------------------------------------------------------------
-    machine.succeed(
-        "runuser -u jonathan -- env HOME=/home/jonathan "
-        "sh -c 'printf \"# CANARY unreviewed\\n\" >> ${repo}/deploy/terraform/main.tf'"
-    )
-    as_jonathan_git("add -A")
-    as_jonathan_git("commit -q -m 'agent: unreviewed local commit'")
-    rev_b = as_jonathan_git("rev-parse HEAD").strip()
-    assert rev_b != rev_a
-
-    branch = as_jonathan_git("rev-parse --abbrev-ref HEAD").strip()
-    dirt = as_jonathan_git("status --porcelain").strip()
-    assert branch == "main" and dirt == "", (
-        "the local facts the old gate trusted must both still hold here: "
-        f"branch={branch!r} dirty={dirt!r}"
-    )
-
-    for wrapper, args in [
-        ("klaffat-infra", "version"),
-        ("klaffat-infra-install", "10.0.0.1"),
-    ]:
-        rc, out = run(f"${bin}/{wrapper} {args}")
-        assert rc == 2, (
-            f"{wrapper} ran on a commit the remote never saw (exit {rc}): {out!r}"
-        )
-        assert "HEAD is not the tip of main on the remote" in out, (
-            f"unexpected provenance refusal from {wrapper}: {out!r}"
-        )
-        assert rev_b in out and rev_a in out, (
-            f"{wrapper} must print both shas so the founder can see the gap: {out!r}"
-        )
-        assert "OpenTofu v" not in out, f"{wrapper} reached tofu anyway: {out!r}"
-
-    # 9a. klaffat-publish's DEFAULT target is the remote's main, not the
-    #     local one — otherwise it signs and pushes a closure nothing
-    #     asked for while the deploy keeps failing on the real revision.
-    rc, out = run("${bin}/klaffat-publish")
-    assert rc != 0, "klaffat-publish should fail against a flake-less checkout"
-    assert f"klaffat-publish: building klaffat-demo from {rev_a}" in out, (
-        f"klaffat-publish did not default to the REMOTE tip {rev_a}: {out!r}"
-    )
-    assert rev_b not in out, (
-        f"klaffat-publish targeted the local main {rev_b}: {out!r}"
-    )
-
-    # 9b. …but an explicitly named commit stays explicit.
-    rc, out = run(f"${bin}/klaffat-publish {rev_b}")
-    assert rc != 0
-    assert f"klaffat-publish: building klaffat-demo from {rev_b}" in out, (
-        f"an explicit rev must be honoured: {out!r}"
-    )
-
-    as_jonathan_git(f"reset -q --hard {rev_a}")
-
-    # 9c. The pinned remote URL. `origin` lives in the jonathan-owned
-    #     .git/config, so a gate that fetched whatever it points at would
-    #     be no gate at all.
-    as_jonathan_git("remote set-url origin file:///var/lib/klaffat-evil.git")
-    clone_bare("/var/lib/klaffat-evil.git")
-    for wrapper, args in [
-        ("klaffat-infra", "version"),
-        ("klaffat-infra-install", "10.0.0.1"),
-        ("klaffat-publish", ""),
-    ]:
-        rc, out = run(f"${bin}/{wrapper} {args}")
-        assert rc == 2, f"{wrapper} accepted a repointed origin (exit {rc}): {out!r}"
-        assert "does not point at the pinned remote" in out, (
-            f"unexpected remote-url refusal from {wrapper}: {out!r}"
-        )
-    # Literal fixture path inside the throwaway test VM; removing the decoy
-    # repo is what lets a later case re-create it.
-    # arftl-allow: destructive-rm
-    machine.succeed("rm -rf /var/lib/klaffat-evil.git")
-    as_jonathan_git("remote set-url origin ${originUrl}")
-
-    # ---------------------------------------------------------------
-    # 10. klaffat-publish against the real checkout.
+    # 9. klaffat-publish: which commits it will build.
     #
-    # The build cannot succeed (the fixture repo has no flake and no
-    # klaffat-demo host), which is precisely the failure the worktree
-    # bookkeeping has to survive: root must leave nothing behind that
-    # jonathan can no longer write.
+    #    The build cannot succeed (the fixture flake has no klaffat-demo
+    #    host), and the failure it reaches is the proof: nix reports the
+    #    MIRROR flakeref at the exact rev as the flake lacking the
+    #    attribute, so the fetch from root's own repository worked.
     # ---------------------------------------------------------------
     rc, out = run("${bin}/klaffat-publish")
-    assert rc != 0, "klaffat-publish should fail against a flake-less checkout"
-    assert f"klaffat-publish: building klaffat-demo from {rev_a}" in out, (
-        f"publish did not reach the build with the remote's tip: {out!r}"
+    assert rc != 0, "klaffat-publish should fail against a host-less flake"
+    assert f"klaffat-publish: building klaffat-demo from {rev_b}" in out, (
+        f"publish did not default to the remote's main {rev_b}: {out!r}"
+    )
+    assert f"git+file://${mirror}?rev={rev_b}" in out and "does not provide attribute" in out, (
+        f"nix did not build from the mirror at the exact rev: {out!r}"
     )
 
+    # An explicit rev on ANOTHER branch of the remote is honoured…
+    rc, out = run(f"${bin}/klaffat-publish {rev_hotfix}")
+    assert rc != 2 and f"klaffat-publish: building klaffat-demo from {rev_hotfix}" in out, (
+        f"an explicit rev the server has must be honoured: {rc} {out!r}"
+    )
+    # …a commit the server has never seen is not, however explicitly named.
+    rc, out = run(f"${bin}/klaffat-publish {rev_local}")
+    assert rc == 2 and f"'{rev_local}' is not a commit on any branch of ${originUrl}" in out, (
+        f"a local-only commit was accepted for publishing: {rc} {out!r}"
+    )
+    assert "building klaffat-demo" not in out, f"publish reached the build with a local commit: {out!r}"
     rc, out = run("${bin}/klaffat-publish no-such-rev")
-    assert rc == 2 and "is not a commit in ${repo}" in out, (
+    assert rc == 2 and "is not a commit on any branch" in out, (
         f"unknown-rev refusal wrong: {rc} {out!r}"
     )
 
+    assert state_leftovers() == [], f"publish left artefacts in ${stateDir}: {state_leftovers()!r}"
     _, root_owned = machine.execute("find ${repo}/.git -user root")
     assert root_owned.strip() == "", (
         f"klaffat-publish left root-owned paths in the founder's .git: {root_owned!r}"
     )
-    _, leftovers = machine.execute("ls -A /var/lib/klaffat-infra")
-    assert "publish-" not in leftovers, (
-        f"temporary publish worktree survived: {leftovers!r}"
-    )
+    machine.succeed(f"test ! -e {markers}")
     # And the founder can still use his own worktrees afterwards.
-    machine.succeed(
-        "runuser -u jonathan -- env HOME=/home/jonathan "
-        "${git} -C ${repo} worktree add --detach /home/jonathan/wt HEAD"
-    )
+    as_jonathan("${git} -C ${repo} -c core.fsmonitor= worktree add --detach /home/jonathan/wt HEAD")
 
     # ---------------------------------------------------------------
-    # 11. klaffat-infra-install: argument handling, the rev-pinned
+    # 10. klaffat-infra-install: argument handling, the rev-pinned
     #     flakeref, and the cleanup trap.
     # ---------------------------------------------------------------
     rc, out = run("${bin}/klaffat-infra-install")
     assert rc == 2 and "usage:" in out, f"missing-arg refusal wrong: {rc} {out!r}"
 
-    rc, out = run("${bin}/klaffat-infra-install not-an-ip")
-    assert rc == 2 and "is not an IP address" in out, (
-        f"bad-address refusal wrong: {rc} {out!r}"
-    )
+    # Hostnames resolve, and this wrapper ships the demo host's private
+    # key to its argument. `cafe.beef` and `dead` are hex-and-dots.
+    for bad in ["not-an-ip", "cafe.beef", "dead", "999.1.1.1", "1.2.3", "1.2.3.4.5", "::ffff:1.2.3.4", "10.0.0.1:22"]:
+        rc, out = run(f"${bin}/klaffat-infra-install '{bad}'")
+        assert rc == 2 and "is not an IP address" in out, (
+            f"'{bad}' should be refused as not an IP address: {rc} {out!r}"
+        )
+        assert "installing klaffat-demo" not in out, f"'{bad}' reached the install: {out!r}"
 
-    # Real staging run. `nix run` cannot succeed here (the fixture repo has
-    # no flake), which is exactly the failure the trap has to survive.
-    rc, out = run("${bin}/klaffat-infra-install 10.0.0.1")
-    assert rc != 0, "install against a flake-less checkout should fail"
-    assert "installing klaffat-demo onto root@10.0.0.1" in out, (
-        f"install did not reach the nixos-anywhere call: {out!r}"
-    )
-    assert f"flakeref git+file://${repo}?rev={rev_a}" in out, (
-        "the flakeref handed to nix run must pin the verified rev — a bare path "
-        f"flakeref builds the working tree, uncommitted edits included: {out!r}"
-    )
-    _, leftovers = machine.execute("ls -A /var/lib/klaffat-infra /run/user/0 2>/dev/null")
+    # Real staging run. `nix run` cannot succeed here (the fixture flake
+    # has no nixos-anywhere), which is exactly the failure the trap has to
+    # survive.
+    for ip in ["10.0.0.1", "2a01:4f8::1"]:
+        rc, out = run(f"${bin}/klaffat-infra-install {ip}")
+        assert rc != 0, "install against a host-less flake should fail"
+        assert f"installing klaffat-demo onto root@{ip}" in out, (
+            f"install did not reach the nixos-anywhere call: {out!r}"
+        )
+        assert f"flakeref git+file://${mirror}?rev={rev_b}&allRefs=1" in out, (
+            f"the flakeref handed to nix run must pin main's tip in the mirror: {out!r}"
+        )
+    _, leftovers = machine.execute("ls -A ${stateDir} /run/user/0 2>/dev/null")
     assert "klaffat-extra-files" not in leftovers, (
         f"--extra-files staging dir survived a failed install: {leftovers!r}"
     )
+
+    # ---------------------------------------------------------------
+    # 11. Credentials by verb. Remove a secret and see which verbs still
+    #     run: a verb that never instantiates a provider must not need the
+    #     provider token; a verb that never touches state must not need
+    #     the state credentials.
+    # ---------------------------------------------------------------
+    def without_secret(name, body):
+        machine.succeed(f"mv /run/agenix/{name} /run/agenix/{name}.aside")
+        try:
+            body()
+        finally:
+            machine.succeed(f"mv /run/agenix/{name}.aside /run/agenix/{name}")
+
+    def scoped_by_provider_token():
+        rc, out = run("${bin}/klaffat-infra validate -no-color")
+        assert rc == 0 and "Success!" in out, f"validate should not need the Hetzner token: {rc} {out!r}"
+        rc, out = run("${bin}/klaffat-infra output -no-color")
+        assert rc == 0, f"output should not need the Hetzner token: {rc} {out!r}"
+        rc, out = run("${bin}/klaffat-infra plan -no-color")
+        assert rc == 3 and "cannot read /run/agenix/klaffat-hcloud-token" in out, (
+            f"plan must require the Hetzner token: {rc} {out!r}"
+        )
+        assert "canary" not in out, f"plan ran without the provider token: {out!r}"
+
+    def scoped_by_state_passphrase():
+        rc, out = run("${bin}/klaffat-infra validate -no-color")
+        assert rc == 0 and "Success!" in out, f"validate should not need the state passphrase: {rc} {out!r}"
+        rc, out = run("${bin}/klaffat-infra output -no-color")
+        assert rc == 3 and "cannot read /run/agenix/klaffat-state-passphrase" in out, (
+            f"output must require the state passphrase: {rc} {out!r}"
+        )
+
+    without_secret("klaffat-hcloud-token", scoped_by_provider_token)
+    without_secret("klaffat-state-passphrase", scoped_by_state_passphrase)
+
+    # And with everything back, version — which gets nothing — still runs.
+    rc, out = run("${bin}/klaffat-infra version")
+    assert rc == 0 and "OpenTofu v" in out, f"version did not reach tofu: {rc} {out!r}"
+    assert state_leftovers() == [], f"runs left artefacts in ${stateDir}: {state_leftovers()!r}"
   '';
 }

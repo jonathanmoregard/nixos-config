@@ -103,16 +103,20 @@
     # phase's data produces.
     ../../modules/nixos/claude-egress-observe.nix
 
-    # `klaffat-infra` — sudo-gated OpenTofu wrapper (+ install helper) for
-    # the Klaffat demo host, with its seven provisioning secrets encrypted
-    # to THIS host's key rather than to jonathan's user key. Deliberately
-    # outside the agenix-rekey scheme so the principal an AI agent runs as
-    # cannot decrypt tokens that create and destroy servers. See the
-    # module header. profiles/base.nix now sets
-    # `security.sudo.wheelNeedsPassword = true`, which is what makes the
-    # root-only secrets actually root-only; the remaining gap is named in
-    # the module header (commit-signature verification) and in
-    # secrets/secrets.nix (no offline recovery recipient yet).
+    # `klaffat-infra` — sudo-gated OpenTofu wrapper (+ install and publish
+    # helpers) for the Klaffat demo host, with its eight provisioning
+    # secrets encrypted to THIS host's key rather than to jonathan's user
+    # key. Deliberately outside the agenix-rekey scheme so the principal an
+    # AI agent runs as cannot decrypt tokens that create and destroy
+    # servers. Root builds from its own mirror of the pinned remote, never
+    # from jonathan's checkout; the module declares the mirror's read-only
+    # GitHub token (`klaffat-github-token`, a REPLACE_ME placeholder until
+    # the founder fills it) and wires it itself. See the module header.
+    # profiles/base.nix now sets `security.sudo.wheelNeedsPassword = true`,
+    # which is what makes the root-only secrets actually root-only; the
+    # remaining gap is named in the module header (commit-signature
+    # verification) and in secrets/secrets.nix (no offline recovery
+    # recipient yet).
     ../../modules/nixos/klaffat-infra.nix
   ];
 

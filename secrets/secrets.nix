@@ -18,17 +18,19 @@
 # from THIS directory, as root, with the host key as the identity:
 #
 #   cd <checkout>/secrets
-#   sudo agenix -e -i /etc/ssh/ssh_host_ed25519_key klaffat-hcloud-token.age
+#   sudo agenix -i /etc/ssh/ssh_host_ed25519_key -e klaffat-hcloud-token.age
 #
-# (`sudo` because /etc/ssh/ssh_host_ed25519_key is root-only — which is
-# the entire point.)
+# `-i` BEFORE `-e`: agenix's `-e` consumes the next token as the file to
+# edit, so `-e -i KEY FILE` opens a file literally named `-i`. (`sudo`
+# because /etc/ssh/ssh_host_ed25519_key is root-only — which is the entire
+# point.)
 #
 # ── Recovery recipient ────────────────────────────────────────────────
 #
 # Right now dellan's host key is the ONLY thing that can decrypt these
-# files. Six of the seven are merely annoying to lose: reissue the token
-# at Hetzner, at Cloudflare, in IAM, regenerate the host key, mint a new
-# cache signing key.
+# files. Seven of the eight are merely annoying to lose: reissue the token
+# at Hetzner, at Cloudflare, at GitHub, in IAM, regenerate the host key,
+# mint a new cache signing key.
 #
 # `klaffat-state-passphrase` is not one of those. It is the passphrase the
 # OpenTofu state is ALREADY encrypted under, so it cannot be reminted —
@@ -83,4 +85,13 @@ in
   # same key. Rotating it means generating a new one, re-uploading, AND
   # updating the host — in that order.
   "klaffat-nix-signing-key.age".publicKeys = klaffat;
+
+  # Read-only GitHub token (fine-grained: the klaffat repository only,
+  # Contents: read). The wrappers' provenance gate fetches `main` from the
+  # pinned URL into a root-only mirror before every run, and the repository
+  # is private, so this is what that fetch authenticates with. It can read
+  # the repo and do nothing else. Committed as an encrypted `REPLACE_ME`
+  # placeholder — until the founder edits the real token in, GitHub answers
+  # 401 and every wrapper refuses.
+  "klaffat-github-token.age".publicKeys = klaffat;
 }

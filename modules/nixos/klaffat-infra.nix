@@ -8,14 +8,14 @@
 #
 # An AI agent operates the klaffat repo as jonathan. The provisioning
 # credentials (Hetzner + Cloudflare API tokens, the OpenTofu state
-# encryption passphrase, the R2 S3 credentials) must therefore NOT be
+# encryption passphrase, the AWS credentials) must therefore NOT be
 # decryptable by jonathan. Every other secret in this repo is rekey-
 # managed and encrypted to jonathan's USER key (see
 # modules/nixos/agenix-rekey-common.nix) — i.e. to exactly the principal
 # the agent runs as. That is fine for API keys the agent is meant to
 # use; it is wrong for credentials that can create and destroy servers.
 #
-# So the seven secrets below deliberately do NOT go through agenix-rekey.
+# So the eight secrets below deliberately do NOT go through agenix-rekey.
 # They are plain `age.secrets.<n>.file` entries whose ciphertext is
 # encrypted straight to dellan's HOST key
 # (/etc/ssh/ssh_host_ed25519_key.pub, recipients in secrets/secrets.nix),
@@ -61,35 +61,69 @@
 # asserts `sudo -n true` FAILS for jonathan, so a future revert cannot
 # quietly reopen the hole.
 #
-# ── What "provenance" means here, and why a local check is not one ────
+# ── What "provenance" means here: root builds from ITS OWN mirror ─────
 #
-# The credentials above are spent on whatever code the checkout at
-# ${repoRoot} holds. The first draft of this module decided that with two
-# LOCAL facts: `git status --porcelain` is empty, and `git rev-parse
-# --abbrev-ref HEAD` says `main`. Both are things the `jonathan` user —
-# i.e. the agent — can arrange for itself. Reproduced 2026-09-05: an
-# agent-authored, unsigned commit on a purely local `main`, with HEAD both
-# ahead of and divergent from `origin/main`, passed the gate and reached
-# `tofu` as uid 0 with every TF_VAR_* exported.
+# The credentials above are spent on code, and which code is the whole
+# question. Two earlier designs answered it by looking at the founder's
+# checkout at /home/jonathan/Repos/klaffat, and both were reproduced as
+# bypassable on 2026-09-05:
 #
-# `refs/remotes/origin/main` is no better: it is a file inside the
-# jonathan-owned `.git`, and so is `origin`'s URL in `.git/config`.
+#   1. LOCAL facts — `git status --porcelain` empty and HEAD on a branch
+#      named `main`. Both are things the `jonathan` user (the agent)
+#      arranges for itself; an unsigned local commit passed and reached
+#      `tofu` as uid 0 with every TF_VAR_* exported.
+#   2. SERVER facts about the local tree — root asked GitHub for main's
+#      tip, required HEAD to equal it, then ran `tofu` IN THE CHECKOUT.
+#      The sha matched; the FILES did not have to. `git status` reports
+#      neither a `*.tf` hidden through `.git/info/exclude` nor a tracked
+#      one edited under `update-index --skip-worktree`, and OpenTofu reads
+#      the directory, not the commit.
 #
-# So the gate now asks the SERVER, as root:
+# The deeper problem is common to both, and to every "read the founder's
+# repository more carefully" fix that could follow: ROOT RUNNING GIT
+# INSIDE A REPOSITORY ANOTHER USER OWNS. `-c safe.directory=<repo>`
+# re-enables exactly what git's dubious-ownership check (CVE-2022-24765)
+# exists to stop — loading that repository's own configuration — and that
+# configuration executes code. Measured with git 2.55.0, each trigger a
+# jonathan-writable file, each command running as the invoking user:
 #
-#   1. `remote.origin.url` must equal `services.klaffatInfra.repoRemoteUrl`
-#      — a value only root can change, so the next step cannot be pointed
-#      at a repository the agent controls.
-#   2. root runs `git ls-remote <that pinned URL> refs/heads/main` from
-#      OUTSIDE the checkout (inside it, a `url.<evil>.insteadOf` line in
-#      the jonathan-owned `.git/config` would redirect the lookup), and
-#   3. HEAD must equal the sha the server just reported.
+#   - `core.fsmonitor` in .git/config runs on `git status`, even under
+#     GIT_OPTIONAL_LOCKS=0. The previous gate's clean-tree check was a
+#     root-exec primitive.
+#   - `filter.<x>.smudge` in .git/config plus `* filter=x` in
+#     .git/info/attributes runs on `git archive` AND on `git worktree
+#     add`, and the extracted files are whatever it printed.
+#   - `export-ignore` in .git/info/attributes silently drops files from
+#     `git archive`.
+#   - `.git/hooks/post-checkout` runs on `git worktree add` — the
+#     previous klaffat-publish.
 #
-# `ls-remote` rather than `fetch`: it reaches the same authority and
-# returns the same tip, but writes nothing — no objects, no FETCH_HEAD, no
-# `refs/remotes/*` — into the founder's `.git`. Root creating paths there
-# is a breakage this module already goes out of its way to avoid (see the
-# `.git/index` note below), and the VM lane asserts it never happens.
+# So root no longer opens the founder's checkout AT ALL. It keeps its own
+# bare mirror at ${mirrorDir} (0700 root), refreshed from
+# `services.klaffatInfra.repoRemoteUrl` — a URL only root can change —
+# with the read-only token below, on EVERY privileged run:
+#
+#   klaffat-infra          `git archive` of deploy/terraform at main's tip
+#                          into a fresh 0700 directory, `tofu` runs there.
+#                          Committed content only; nothing on disk in the
+#                          founder's tree is ever read.
+#   klaffat-publish        `nix build git+file://<mirror>?rev=<sha>#…` —
+#                          the exact commit. No worktree, no hooks, no
+#                          ownership bookkeeping in the founder's .git.
+#   klaffat-infra-install  the same flakeref shape, handed to
+#                          nixos-anywhere.
+#
+# Every git that runs as root now runs with ROOT's configuration against
+# ROOT's repository. The mirror's `.gitattributes` and
+# `.terraform.lock.hcl` are the committed, reviewed ones. What the founder
+# has checked out is irrelevant to all three wrappers: each prints the sha
+# it is about to use and where it came from, and an unpushed commit simply
+# does not run. There is no `-c safe.directory` anywhere in this file, and
+# the lane asserts there is not.
+#
+# The fetch fails CLOSED. A mirror that cannot be refreshed is not used —
+# no fallback to whatever it held last time — so an offline laptop or a
+# revoked token refuses rather than applying a stale `main`.
 #
 # NEXT STEP, not done here: verify the COMMIT SIGNATURE. "the tip of main
 # on the server" is only as good as the branch protection in front of it;
@@ -98,16 +132,18 @@
 # inventing one on his behalf would be worse than the gap, so this is
 # deliberately left for a follow-up.
 #
-# ── The credential the gate needs ─────────────────────────────────────
+# ── The credential the mirror fetch needs ─────────────────────────────
 #
-# The klaffat repository is PRIVATE, so an anonymous `ls-remote` gets
-# nothing. `services.klaffatInfra.remoteTokenFile` points at a root-only
-# file holding a read-only GitHub token; it is injected as an HTTP
-# Authorization header through GIT_CONFIG_* environment variables (never
-# argv, which the process table exposes). Until it is set the gate fails
-# CLOSED — the wrapper refuses rather than falling back to the local
-# facts it cannot trust. That is not a regression: ${repoRoot} does not
-# exist yet either, so the wrapper already refuses everything.
+# The klaffat repository is PRIVATE, so an anonymous fetch gets 401.
+# `services.klaffatInfra.remoteTokenFile` names a root-only file holding a
+# read-only GitHub token; by default that is the eighth agenix secret,
+# `klaffat-github-token`, which ships as an encrypted `REPLACE_ME`
+# placeholder until the founder edits the real token in (see
+# secrets/secrets.nix). The token reaches git through a credential
+# helper — never argv, which the process table exposes — and is only ever
+# offered to the pinned URL. Until it is real the fetch fails and every
+# wrapper refuses: fail-closed by construction, never a fallback to local
+# refs it cannot trust.
 #
 # ── Why no KLAFFAT_INFRA_ALLOW_BRANCH escape hatch ────────────────────
 #
@@ -118,30 +154,33 @@
 # the caller's environment, so the variable could never arrive. The
 # escape hatch is therefore omitted entirely rather than shipped dead.
 #
-# ── Why root runs git with an explicit safe.directory ─────────────────
+# ── Which credentials each OpenTofu verb sees ─────────────────────────
 #
-# The checkout is owned by jonathan and git refuses to operate on a
-# repository owned by another user ("detected dubious ownership"). Each
-# git invocation passes `-c safe.directory=<repo>` for exactly that path
-# instead of mutating root's global gitconfig.
+# `console` is not offered. It evaluates any expression with the
+# variables bound, and `nonsensitive(var.hcloud_token)` prints the token
+# — `sensitive = true` is a display hint, not a boundary. Reproduced
+# 2026-09-05 against the real wrapper.
+#
+# The verbs that remain get credentials by what they can DO, never by
+# what they are called: the two provider tokens go only to verbs that
+# instantiate providers (plan, apply, refresh, import, destroy); the AWS
+# key pair and the state passphrase go to every verb that touches state;
+# validate, fmt and version get nothing. What this does NOT close, and
+# is documented rather than pretended away: `show`, `output -json` and
+# `state pull` print whatever the STATE holds (the demo host's read-only
+# IAM key, for instance). That is what the state is for, and reading it
+# costs the same sudo password as `apply`.
 { config, lib, pkgs, ... }:
 
 let
   cfg = config.services.klaffatInfra;
 
-  # The main klaffat checkout. The GitHub repository was renamed from
-  # `kablong` to `klaffat` on 2026-09-05; moving the local directory to
-  # match is a founder step. This module targets the final name, so the
-  # wrapper refuses (loudly, with the path) until it exists.
-  repoRoot = "/home/jonathan/Repos/klaffat";
-  tfDir = "${repoRoot}/deploy/terraform";
-
-  # Root-only state. TF_DATA_DIR lives here rather than in the checkout so
-  # the provider cache, the backend config and any lock artefacts are
-  # never readable by jonathan and never dirty the tree the wrapper
-  # itself refuses to run against.
+  # Root-only state. Holds the bare mirror, TF_DATA_DIR and the per-run
+  # archive directories. Nothing here is readable by jonathan, and nothing
+  # the wrappers write lands anywhere else.
   stateDir = "/var/lib/klaffat-infra";
   dataDir = "${stateDir}/terraform.d";
+  mirrorDir = "${stateDir}/klaffat.git";
 
   # CONTRACT v2 (2026-09-05): AWS, region eu-north-1. `klaffat-tofu-state`
   # is clickops-created with versioning ON (so it is never managed by the
@@ -202,16 +241,15 @@ let
     done
   '';
 
-  # The read-only GitHub credential for the ls-remote below, as a git
+  # The read-only GitHub credential for the mirror fetch, as a git
   # credential helper.
   #
   # A helper rather than `-c http.<url>.extraHeader=…` or a
   # GIT_CONFIG_VALUE_n export: the `-c` form puts the token in argv, where
-  # anything that can read /proc sees it, and the env form collides with
-  # the `safe.directory` GIT_CONFIG_* the install wrapper needs later.
-  # Here argv carries only a store path; the token itself is read inside
-  # the helper, by a child of the root-only process, and never lands in a
-  # variable that outlives the lookup.
+  # anything that can read /proc sees it. Here argv carries only a store
+  # path; the token itself is read inside the helper, by a child of the
+  # root-only process, and never lands in a variable that outlives the
+  # lookup.
   #
   # git only runs this when the server answers 401, and only for the URL
   # it was asked about — which is the pinned one.
@@ -229,97 +267,54 @@ let
     lib.optionalString (remoteCredentialHelper != null)
       "-c credential.helper=${remoteCredentialHelper} ";
 
+  fetchHint =
+    if cfg.remoteTokenFile == null
+    then "that repository is private and services.klaffatInfra.remoteTokenFile is null"
+    else "the fetch needs the network and a valid read-only token in ${cfg.remoteTokenFile}";
+
   # The provenance gate, as shell functions shared by all three wrappers.
   # See "What provenance means here" in the header. Every refusal exits 2.
   #
-  # `autoloads` is opt-in because writeShellApplication runs shellcheck,
-  # and shellcheck fails the build on a function no caller invokes
-  # (SC2329) — which is a fair complaint: dead code in a security gate
-  # reads like a check that runs when it does not.
-  provenanceLib = { name, autoloads ? false }: ''
+  # Everything here addresses the mirror by `--git-dir`, never by `-C`:
+  # git never discovers a repository from the cwd (the caller's cwd is
+  # jonathan's), and the explicit form keeps working under
+  # `safe.bareRepository = explicit` should root's git ever carry it.
+  mirrorLib = name: ''
     gate_refuse() {
       echo "${name}: $1" >&2
       exit 2
     }
 
-    gate_require_worktree() {
-      if ! git -C "$1" -c safe.directory="$1" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        gate_refuse "$1 is not a git worktree — refusing."
-      fi
-    }
-
-    gate_require_clean() {
-      local dirty
-      dirty="$(git -C "$1" -c safe.directory="$1" --no-optional-locks status --porcelain)"
-      if [ -n "$dirty" ]; then
-        printf '%s\n' "$dirty" >&2
-        gate_refuse "working tree at $1 is dirty — refusing."
-      fi
-    }
-
-    ${lib.optionalString autoloads ''
-      # OpenTofu AUTO-LOADS override files and variable files from its
-      # working directory, so an untracked `override.tf` silently replaces
-      # resource blocks in a tree `git status --porcelain` calls clean —
-      # porcelain does not report ignored files, and `.gitignore` is itself
-      # jonathan-writable. Anything matching those names has to be part of
-      # the reviewed commit or the run is refused.
-      gate_require_no_stray_autoloads() {
-        local repo="$1" tfdir="$2" f
-        [ -d "$tfdir" ] || return 0
-        # `[ -e ]` and not just nullglob: nullglob only drops words that
-        # CONTAIN a wildcard, so the two literal `override.tf` spellings
-        # below survive it and would be tested whether they exist or not.
-        # Caught by re-running the U1 repro against this very gate, which
-        # refused a checkout that had no override.tf at all.
-        shopt -s nullglob
-        for f in \
-          "$tfdir"/override.tf "$tfdir"/override.tf.json \
-          "$tfdir"/*_override.tf "$tfdir"/*_override.tf.json \
-          "$tfdir"/*.tfvars "$tfdir"/*.tfvars.json; do
-          [ -e "$f" ] || continue
-          if ! git -C "$repo" -c safe.directory="$repo" \
-               ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
-            gate_refuse "$f is not tracked, and OpenTofu auto-loads it — refusing."
-          fi
-        done
-        shopt -u nullglob
-      }
-    ''}
-    gate_require_origin_url() {
-      local url
-      url="$(git -C "$1" -c safe.directory="$1" config --get remote.origin.url || true)"
-      if [ "$url" != "${cfg.repoRemoteUrl}" ]; then
-        echo "${name}:   origin  = ''${url:-<unset>}" >&2
-        echo "${name}:   expected= ${cfg.repoRemoteUrl}" >&2
-        gate_refuse "$1 does not point at the pinned remote — refusing."
-      fi
-    }
-
-    # main's tip AS THE SERVER REPORTS IT, printed on stdout.
-    gate_remote_main_tip() {
-      local out tip sha ref
-      # `cd` out of the checkout first: run this inside it and git reads
-      # the jonathan-owned .git/config, where one `url.<evil>.insteadOf`
-      # line would redirect the very lookup that is supposed to be
-      # authoritative. ${stateDir} is root-only and is not a work tree.
+    # Refresh root's bare mirror of the pinned remote, or refuse. Every
+    # branch head, pruned — so an explicit `klaffat-publish <rev>` can
+    # name any commit the server has, and nothing the server does not.
+    mirror_sync() {
       install -d -m 0700 "${stateDir}"
-      if ! out="$(
+      if [ ! -d "${mirrorDir}" ]; then
+        git init -q --bare "${mirrorDir}"
+        chmod 0700 "${mirrorDir}"
+        # nix resolves a flakeref through the repository's HEAD; root's
+        # `git init` may leave that on an unborn `master`.
+        git --git-dir="${mirrorDir}" symbolic-ref HEAD refs/heads/main
+      fi
+      # `-c credential.helper=` first EMPTIES the helper list, so the one
+      # appended after it is the only helper that runs.
+      if ! (
         cd "${stateDir}"
         export GIT_TERMINAL_PROMPT=0
-        git ${credentialArg}ls-remote "${cfg.repoRemoteUrl}" refs/heads/main
-      )"; then
-        gate_refuse "could not ask ${cfg.repoRemoteUrl} for main's tip${
-          lib.optionalString (cfg.remoteTokenFile == null)
-            " (that repository is private and services.klaffatInfra.remoteTokenFile is not set)"
-        } — refusing."
+        git --git-dir="${mirrorDir}" -c credential.helper= ${credentialArg}fetch --quiet --prune \
+          "${cfg.repoRemoteUrl}" '+refs/heads/*:refs/heads/*'
+      ); then
+        echo "${name}: (${fetchHint})" >&2
+        gate_refuse "could not fetch ${cfg.repoRemoteUrl} into the root-only mirror — refusing."
       fi
-      tip=""
-      while read -r sha ref; do
-        if [ "$ref" = "refs/heads/main" ]; then tip="$sha"; fi
-      done <<< "$out"
-      if [ -z "$tip" ]; then
-        gate_refuse "${cfg.repoRemoteUrl} reports no refs/heads/main — refusing."
+    }
+
+    # main's tip in the mirror just refreshed, on stdout.
+    mirror_main_tip() {
+      local tip
+      if ! tip="$(git --git-dir="${mirrorDir}" rev-parse --verify --quiet 'refs/heads/main^{commit}')"; then
+        gate_refuse "${cfg.repoRemoteUrl} has no main branch — refusing."
       fi
       printf '%s\n' "$tip"
     }
@@ -327,13 +322,10 @@ let
 
   klaffat-infra = pkgs.writeShellApplication {
     name = "klaffat-infra";
-    runtimeInputs = [ pkgs.opentofu pkgs.git pkgs.coreutils ];
+    runtimeInputs = [ pkgs.opentofu pkgs.git pkgs.coreutils pkgs.gnutar ];
     text = ''
       ${rootOnlyPreamble "klaffat-infra" "<tofu subcommand> [args...]"}
-      ${provenanceLib { name = "klaffat-infra"; autoloads = true; }}
-
-      repo="${repoRoot}"
-      tfdir="${tfDir}"
+      ${mirrorLib "klaffat-infra"}
 
       # --- argv first, before anything expensive or credentialed.
       #
@@ -349,18 +341,40 @@ let
       # TERMINAL, which no pipe can supply.
       subcmd="''${1-}"
       case "$subcmd" in
-        init|validate|fmt|plan|apply|refresh|show|output|providers|state|version|graph|console|import|taint|untaint|force-unlock|workspace|destroy)
+        init|validate|fmt|plan|apply|refresh|show|output|providers|state|version|graph|import|taint|untaint|force-unlock|workspace|destroy)
           ;;
         "")
           echo "klaffat-infra: usage: sudo klaffat-infra <tofu subcommand> [args...]" >&2
           exit 2
           ;;
+        console)
+          echo "klaffat-infra: 'console' is not offered — it evaluates any expression with the provisioning credentials bound, and nonsensitive(var.hcloud_token) prints one. Refusing." >&2
+          exit 2
+          ;;
         *)
           echo "klaffat-infra: '$subcmd' is not an allowed OpenTofu subcommand — refusing." >&2
           echo "klaffat-infra: allowed: init validate fmt plan apply refresh show output" >&2
-          echo "klaffat-infra:          providers state version graph console import taint" >&2
-          echo "klaffat-infra:          untaint force-unlock workspace destroy" >&2
+          echo "klaffat-infra:          providers state version graph import taint untaint" >&2
+          echo "klaffat-infra:          force-unlock workspace destroy" >&2
           exit 2
+          ;;
+      esac
+
+      # Which credentials this verb gets — see "Which credentials each
+      # OpenTofu verb sees" in the header. Decided by what the verb can
+      # DO: only verbs that instantiate providers see the provider tokens;
+      # only verbs that touch state see the state credentials.
+      provider_creds=0
+      state_creds=0
+      case "$subcmd" in
+        plan|apply|refresh|import|destroy)
+          provider_creds=1
+          state_creds=1
+          ;;
+        init|taint|untaint|force-unlock|show|output|state|graph|workspace|providers)
+          state_creds=1
+          ;;
+        *)
           ;;
       esac
 
@@ -368,7 +382,9 @@ let
       # (`apply <saved-destroy-plan>` cannot be recognised from argv — the
       # plan file has to be read to know. `plan -out` + `apply <file>` is
       # not a path this wrapper offers a shortcut for, and the founder
-      # who saved the plan is the one applying it.)
+      # who saved the plan is the one applying it. Note the working
+      # directory is a fresh archive every run, so a plan file has to be
+      # saved by ABSOLUTE path to survive to the next invocation.)
       destroying=0
       if [ "$subcmd" = "destroy" ]; then
         destroying=1
@@ -380,45 +396,12 @@ let
         esac
       done
 
-      # --- preflight: the checkout must exist, be a clean git worktree,
-      #     on main, and at the tip main has ON THE SERVER. No override:
-      #     see the module header.
-      if [ ! -d "$tfdir" ]; then
-        echo "klaffat-infra: no OpenTofu checkout at $tfdir — refusing." >&2
-        echo "klaffat-infra: clone the klaffat repo to $repo first (deploy/terraform must exist)." >&2
-        exit 2
-      fi
-
-      # Root must not leave a trace in the founder's checkout. `git status`
-      # normally REFRESHES .git/index, and doing that as root re-owns the
-      # index — after which jonathan's next `git checkout` dies with
-      # "index file open failed: Permission denied". Caught by the VM lane.
-      # GIT_OPTIONAL_LOCKS=0 makes every git call below read-only on disk.
-      export GIT_OPTIONAL_LOCKS=0
-
-      gate_require_worktree "$repo"
-      gate_require_clean "$repo"
-      gate_require_no_stray_autoloads "$repo" "$tfdir"
-
-      branch="$(git -C "$repo" -c safe.directory="$repo" rev-parse --abbrev-ref HEAD)"
-      if [ "$branch" != "main" ]; then
-        gate_refuse "HEAD is on '$branch', not 'main' — refusing."
-      fi
-
-      # The two checks that make the three above mean something: the
-      # remote is the one root pinned, and HEAD is what that remote says
-      # main is. Everything before this point is a fact the agent can
-      # manufacture locally.
-      gate_require_origin_url "$repo"
-      tip="$(gate_remote_main_tip)"
-
-      rev="$(git -C "$repo" -c safe.directory="$repo" rev-parse HEAD)"
-      if [ "$rev" != "$tip" ]; then
-        echo "klaffat-infra:   HEAD           = $rev" >&2
-        echo "klaffat-infra:   ${cfg.repoRemoteUrl} main = $tip" >&2
-        gate_refuse "HEAD is not the tip of main on the remote — refusing."
-      fi
-      echo "klaffat-infra: $repo @ $rev (branch $branch, = ${cfg.repoRemoteUrl} main)" >&2
+      # --- provenance: refresh root's mirror from the pinned remote and
+      #     take main's tip from THERE. No local checkout is consulted, so
+      #     there is nothing local to refuse on: see the module header.
+      mirror_sync
+      rev="$(mirror_main_tip)"
+      echo "klaffat-infra: ${cfg.repoRemoteUrl} main @ $rev" >&2
 
       # --- destruction needs a second, deliberate gesture.
       #
@@ -433,7 +416,7 @@ let
         {
           echo
           echo "klaffat-infra: '$subcmd' DESTROYS the Klaffat demo stack (servers, DNS, state)."
-          echo "klaffat-infra: at $repo @ $rev"
+          echo "klaffat-infra: at ${cfg.repoRemoteUrl} main @ $rev"
           printf "klaffat-infra: type exactly 'destroy klaffat' to proceed: "
         } >&3
         IFS= read -r _confirm <&3 || _confirm=""
@@ -444,27 +427,31 @@ let
       fi
 
       # --- secrets: read from /run/agenix (0400 root) into this process
-      #     only. Nothing is written back to disk and nothing is echoed.
-      for _s in \
-        "${secretPath "klaffat-hcloud-token"}" \
-        "${secretPath "klaffat-cloudflare-api-token"}" \
-        "${secretPath "klaffat-state-passphrase"}" \
-        "${secretPath "klaffat-aws-access-key-id"}" \
-        "${secretPath "klaffat-aws-secret-access-key"}"; do
-        if [ ! -r "$_s" ]; then
-          echo "klaffat-infra: cannot read $_s — is the agenix secret provisioned?" >&2
+      #     only, and only the ones this verb is entitled to. Nothing is
+      #     written back to disk and nothing is echoed.
+      require_secret() {
+        if [ ! -r "$1" ]; then
+          echo "klaffat-infra: cannot read $1 — is the agenix secret provisioned?" >&2
           exit 3
         fi
-      done
-
-      TF_VAR_hcloud_token="$(< "${secretPath "klaffat-hcloud-token"}")"
-      TF_VAR_cloudflare_api_token="$(< "${secretPath "klaffat-cloudflare-api-token"}")"
-      TF_VAR_state_passphrase="$(< "${secretPath "klaffat-state-passphrase"}")"
-      AWS_ACCESS_KEY_ID="$(< "${secretPath "klaffat-aws-access-key-id"}")"
-      AWS_SECRET_ACCESS_KEY="$(< "${secretPath "klaffat-aws-secret-access-key"}")"
-      export TF_VAR_hcloud_token TF_VAR_cloudflare_api_token TF_VAR_state_passphrase
-      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-      export AWS_DEFAULT_REGION="${awsRegion}"
+      }
+      if [ "$state_creds" -eq 1 ]; then
+        require_secret "${secretPath "klaffat-state-passphrase"}"
+        require_secret "${secretPath "klaffat-aws-access-key-id"}"
+        require_secret "${secretPath "klaffat-aws-secret-access-key"}"
+        TF_VAR_state_passphrase="$(< "${secretPath "klaffat-state-passphrase"}")"
+        AWS_ACCESS_KEY_ID="$(< "${secretPath "klaffat-aws-access-key-id"}")"
+        AWS_SECRET_ACCESS_KEY="$(< "${secretPath "klaffat-aws-secret-access-key"}")"
+        export TF_VAR_state_passphrase AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+        export AWS_DEFAULT_REGION="${awsRegion}"
+      fi
+      if [ "$provider_creds" -eq 1 ]; then
+        require_secret "${secretPath "klaffat-hcloud-token"}"
+        require_secret "${secretPath "klaffat-cloudflare-api-token"}"
+        TF_VAR_hcloud_token="$(< "${secretPath "klaffat-hcloud-token"}")"
+        TF_VAR_cloudflare_api_token="$(< "${secretPath "klaffat-cloudflare-api-token"}")"
+        export TF_VAR_hcloud_token TF_VAR_cloudflare_api_token
+      fi
 
       # --- environment. TF_IN_AUTOMATION is deliberately NOT set: its only
       #     effect is to suppress the "next step" hints, and this is an
@@ -479,15 +466,33 @@ let
       #     `sudo klaffat-infra apply` remains a real yes/no prompt.
       export TF_DATA_DIR="${dataDir}"
       export TF_INPUT=0
-
       install -d -m 0700 "${stateDir}" "${dataDir}"
-      cd "$tfdir"
+
+      # --- run against an ARCHIVE of the verified commit, in a fresh
+      #     root-only directory that the trap removes. `git archive` from
+      #     root's own mirror: committed content only, root's own
+      #     attributes and config, no hooks, no working-tree metadata. The
+      #     committed .terraform.lock.hcl is what `init` verifies against;
+      #     anything OpenTofu writes into the working directory (a
+      #     re-locked lock file, a plan saved by relative path) dies with
+      #     it, deliberately.
+      work="$(mktemp -d "${stateDir}/infra-XXXXXXXX")"
+      trap 'rm -rf -- "$work"' EXIT
+      if ! git --git-dir="${mirrorDir}" archive --format=tar "$rev" -- deploy/terraform \
+           | tar -x -C "$work"; then
+        gate_refuse "commit $rev has no deploy/terraform to extract — refusing."
+      fi
+      cd "$work/deploy/terraform"
 
       # No post-apply snapshot step: S3 bucket versioning on
       # ${bucket} IS the state history, so every apply already leaves a
       # restorable prior version behind with nothing for this wrapper to
       # do (and nothing for it to get wrong on the way).
-      exec tofu "$@"
+      #
+      # No `exec`: the EXIT trap above must still fire to remove $work.
+      rc=0
+      tofu "$@" || rc=$?
+      exit "$rc"
     '';
   };
 
@@ -496,53 +501,43 @@ let
     runtimeInputs = [ pkgs.openssh pkgs.coreutils config.nix.package pkgs.git ];
     text = ''
       ${rootOnlyPreamble "klaffat-infra-install" "<ip>"}
-      ${provenanceLib { name = "klaffat-infra-install"; }}
+      ${mirrorLib "klaffat-infra-install"}
 
       if [ "$#" -ne 1 ]; then
         echo "klaffat-infra-install: usage: sudo klaffat-infra-install <ip>" >&2
         exit 2
       fi
       ip="$1"
-      case "$ip" in
-        ""|*[!0-9a-fA-F.:]*)
-          echo "klaffat-infra-install: '$ip' is not an IP address — refusing." >&2
-          exit 2
-          ;;
-        *) ;;
-      esac
 
-      repo="${repoRoot}"
-      if [ ! -d "$repo" ]; then
-        echo "klaffat-infra-install: no klaffat checkout at $repo — refusing." >&2
+      # An IP ADDRESS, strictly. The first draft accepted any string of
+      # hex digits, dots and colons, which admits `cafe.beef` and `dead` —
+      # resolvable hostnames — and this wrapper hands the target the demo
+      # host's private SSH key via --extra-files. So: a dotted quad whose
+      # octets are ≤ 255, or an IPv6 literal (hex and colons only, at
+      # least two colons, no dots — a hostname cannot contain a colon).
+      ip_ok=0
+      if [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        ip_ok=1
+        for _o in "''${BASH_REMATCH[@]:1}"; do
+          if (( 10#$_o > 255 )); then
+            ip_ok=0
+          fi
+        done
+      elif [[ "$ip" =~ ^[0-9a-fA-F:]+$ && "$ip" == *:*:* ]]; then
+        ip_ok=1
+      fi
+      if [ "$ip_ok" -ne 1 ]; then
+        echo "klaffat-infra-install: '$ip' is not an IP address — refusing." >&2
         exit 2
       fi
 
-      # --- the SAME provenance gate as klaffat-infra.
-      #
-      # This wrapper had none at all: it made exactly one git call
-      # (`safe.directory`) and then handed root on a fresh server, plus
-      # the demo host's private SSH identity, to whatever the checkout
-      # happened to contain. It is the more dangerous of the two — the
-      # OpenTofu wrapper at least stops at a plan.
-      #
-      # (No stray-autoload check here: `override.tf` / `*.tfvars` are an
-      # OpenTofu working-directory concern, and this wrapper never runs
-      # OpenTofu. The nix flakeref below is pinned to a rev instead.)
-      export GIT_OPTIONAL_LOCKS=0
-      gate_require_worktree "$repo"
-      gate_require_clean "$repo"
-      branch="$(git -C "$repo" -c safe.directory="$repo" rev-parse --abbrev-ref HEAD)"
-      if [ "$branch" != "main" ]; then
-        gate_refuse "HEAD is on '$branch', not 'main' — refusing."
-      fi
-      gate_require_origin_url "$repo"
-      tip="$(gate_remote_main_tip)"
-      rev="$(git -C "$repo" -c safe.directory="$repo" rev-parse HEAD)"
-      if [ "$rev" != "$tip" ]; then
-        echo "klaffat-infra-install:   HEAD           = $rev" >&2
-        echo "klaffat-infra-install:   ${cfg.repoRemoteUrl} main = $tip" >&2
-        gate_refuse "HEAD is not the tip of main on the remote — refusing."
-      fi
+      # --- the SAME provenance gate as klaffat-infra: root's mirror,
+      #     main's tip as the server has it. This wrapper is the more
+      #     dangerous of the two — it hands root on a fresh server, plus
+      #     the demo host's private SSH identity, to whatever it builds.
+      mirror_sync
+      rev="$(mirror_main_tip)"
+      echo "klaffat-infra-install: ${cfg.repoRemoteUrl} main @ $rev" >&2
 
       hostkey="${secretPath "klaffat-demo-host-key"}"
       if [ ! -r "$hostkey" ]; then
@@ -567,28 +562,15 @@ let
         > "$EXTRA/etc/ssh/ssh_host_ed25519_key.pub"
       chmod 0644 "$EXTRA/etc/ssh/ssh_host_ed25519_key.pub"
 
-      # nix resolves a local path flakeref through git; the checkout is
-      # jonathan-owned, so hand root's git the one safe.directory it needs
-      # without touching any gitconfig on disk.
-      export GIT_CONFIG_COUNT=1
-      export GIT_CONFIG_KEY_0="safe.directory"
-      export GIT_CONFIG_VALUE_0="$repo"
-
-      # A BARE PATH FLAKEREF BUILDS THE WORKING TREE, NOT THE COMMIT.
+      # THE FLAKEREF NAMES THE COMMIT, IN ROOT'S MIRROR.
       #
-      # `nix run /path#attr` copies the tracked files as they are ON DISK,
-      # uncommitted edits included — measured on nix 2.34.8: editing a
-      # tracked file without committing changed what `nix run <path>#…`
-      # built, while `git+file://<dir>?rev=<sha>` kept building the commit.
-      # The clean-tree check above narrows that window but does not close
-      # it (git can call a tree clean that the flake still reads
-      # differently — skip-worktree, assume-unchanged, a racy mtime), and
-      # a gate that is only correct because a second gate held is not one.
-      #
-      # So both the app AND the system being installed are addressed by
-      # the verified rev. root can only ever build a committed object that
-      # the server agreed is main.
-      flakeref="git+file://$repo?rev=$rev"
+      # A bare path flakeref builds the WORKING TREE, uncommitted edits
+      # included (measured on nix 2.34.8), and a `git+file://` flakeref
+      # into the founder's checkout would have root's nix run git inside
+      # a repository jonathan configures. `git+file://<mirror>?rev=<sha>`
+      # is neither: both the app AND the system being installed come out
+      # of root's own repository at the commit the server called main.
+      flakeref="git+file://${mirrorDir}?rev=$rev&allRefs=1"
       echo "klaffat-infra-install: installing klaffat-demo onto root@$ip" >&2
       echo "klaffat-infra-install: flakeref $flakeref" >&2
       # No `exec`: the EXIT trap above must still fire to shred $EXTRA.
@@ -606,9 +588,7 @@ let
     runtimeInputs = [ config.nix.package pkgs.awscli2 pkgs.git pkgs.coreutils ];
     text = ''
       ${rootOnlyPreamble "klaffat-publish" "[rev | --upload-signing-key]"}
-      ${provenanceLib { name = "klaffat-publish"; }}
-
-      repo="${repoRoot}"
+      ${mirrorLib "klaffat-publish"}
 
       # Every AWS call below (and `nix copy`'s S3 store) authenticates with
       # the laptop IAM user, read straight out of /run/agenix.
@@ -667,112 +647,43 @@ let
         exit 2
       fi
 
-      if [ ! -d "$repo" ]; then
-        echo "klaffat-publish: no klaffat checkout at $repo — refusing." >&2
-        echo "klaffat-publish: clone the klaffat repo to $repo first." >&2
-        exit 2
-      fi
-
-      export GIT_OPTIONAL_LOCKS=0
-
-      gate_require_worktree "$repo"
-
-      # A dirty tree means the founder has uncommitted work; publishing a
-      # closure whose provenance is a commit that does not match what is on
-      # disk is exactly the confusion this refuses to create.
-      gate_require_clean "$repo"
-
-      # Unlike klaffat-infra there is no "HEAD must be on main" check: the
-      # commit to publish is chosen EXPLICITLY here (argument, else main's
-      # tip), so whatever branch the founder happens to have checked out is
-      # irrelevant and refusing on it would be noise.
+      # --- which commit. The DEFAULT is main's tip AS THE SERVER REPORTS
+      #     IT: the local `main` was once the default, and the agent writes
+      #     that ref freely — `sudo klaffat-publish` with no argument would
+      #     sign and push a closure nothing had reviewed while the host kept
+      #     asking for a different one.
       #
-      # The DEFAULT, though, used to be the LOCAL `main` — the same ref
-      # klaffat-infra's gate could be walked past, and one the agent
-      # writes freely. `sudo klaffat-publish` with no argument would then
-      # sign and push a closure nothing had reviewed, while the host kept
-      # asking for a different one and the deploy kept failing. So the
-      # default is now main's tip AS THE SERVER REPORTS IT, under the same
-      # pinned-URL rule as klaffat-infra.
-      #
-      # An explicit rev stays explicit: naming a commit is a deliberate
-      # act by the founder (bisecting a bad deploy, publishing a hotfix
-      # before it merges), and it is not the silent default that made this
-      # a defect.
+      #     An explicit rev stays explicit — naming a commit is a
+      #     deliberate act by the founder (bisecting a bad deploy,
+      #     publishing a hotfix before it merges) — but it has to be a
+      #     commit the SERVER has, on any branch. The mirror holds exactly
+      #     those, so a purely local commit is refused rather than
+      #     resolved.
+      mirror_sync
       if [ "$#" -eq 1 ]; then
         target="$1"
-      else
-        gate_require_origin_url "$repo"
-        target="$(gate_remote_main_tip)"
-      fi
-      if ! rev="$(git -C "$repo" -c safe.directory="$repo" rev-parse --verify "$target^{commit}" 2>/dev/null)"; then
-        echo "klaffat-publish: '$target' is not a commit in $repo — refusing." >&2
-        if [ "$#" -ne 1 ]; then
-          echo "klaffat-publish: that is ${cfg.repoRemoteUrl}'s main; run 'git -C $repo fetch origin main' first." >&2
+        if ! rev="$(git --git-dir="${mirrorDir}" rev-parse --verify --quiet --end-of-options "$target^{commit}")"; then
+          echo "klaffat-publish: '$target' is not a commit on any branch of ${cfg.repoRemoteUrl} — refusing." >&2
+          echo "klaffat-publish: push it first; only what the server has can be published." >&2
+          exit 2
         fi
-        exit 2
+      else
+        rev="$(mirror_main_tip)"
       fi
 
       awsCreds
 
-      # --- Build from a detached worktree under root-only state, never from
-      #     the founder's tree.
-      #
-      #     `git worktree add` DOES write into $repo/.git/worktrees/, and as
-      #     root that directory (and everything under it) is created
-      #     root-owned — after which jonathan's own `git worktree add` fails
-      #     with EACCES, the same class of breakage as root refreshing
-      #     .git/index. So every path git creates there is chowned back to
-      #     whoever owns $repo/.git, and the trap removes the dir entirely
-      #     when it was ours to begin with. A SIGKILL mid-run can still
-      #     leave an entry; `sudo git -C <repo> worktree prune` clears it.
-      install -d -m 0700 "${stateDir}"
-      work="${stateDir}/publish-$rev"
-      rm -rf -- "$work"
-      if ! git -C "$repo" -c safe.directory="$repo" worktree prune >/dev/null 2>&1; then
-        echo "klaffat-publish: 'git worktree prune' failed in $repo — refusing." >&2
-        exit 2
-      fi
-
-      # Anything git created under .git/worktrees goes back to the repo's
-      # owner. Called after `worktree add` and again from the trap.
-      unown() {
-        if [ -d "$repo/.git/worktrees" ]; then
-          chown -R --reference="$repo/.git" "$repo/.git/worktrees"
-        fi
-      }
-
-      cleanup() {
-        if ! git -C "$repo" -c safe.directory="$repo" \
-             worktree remove --force "$work" >/dev/null 2>&1; then
-          echo "klaffat-publish: could not remove the temporary worktree $work" >&2
-        fi
-        if ! git -C "$repo" -c safe.directory="$repo" worktree prune >/dev/null 2>&1; then
-          echo "klaffat-publish: run 'sudo git -C $repo worktree prune' to clear leftovers" >&2
-        fi
-        rm -rf -- "$work"
-        # rmdir only succeeds when we were the reason the dir existed; if the
-        # founder has worktrees of his own it stays, chowned back to him.
-        if [ -d "$repo/.git/worktrees" ] && ! rmdir "$repo/.git/worktrees" 2>/dev/null; then
-          unown
-        fi
-      }
-      trap cleanup EXIT
-
-      git -C "$repo" -c safe.directory="$repo" worktree add --detach "$work" "$rev" >/dev/null
-      unown
+      # --- Build the exact commit out of root's mirror. `git+file://…?rev=`
+      #     names the commit and nothing else: nothing is checked out (the
+      #     previous design checked a worktree out of the founder's repo, and
+      #     that ran the repo's post-checkout hook and smudge filters as
+      #     root), and nothing is written into the founder's .git.
       echo "klaffat-publish: building klaffat-demo from $rev" >&2
-
-      # A path flakeref, deliberately, and NOT the `git+file://…?rev=`
-      # shape klaffat-infra-install had to adopt. That fix exists because
-      # a path flakeref builds the WORKING TREE; here the working tree is
-      # $work, which `git worktree add --detach … "$rev"` just created
-      # from the verified commit inside a 0700 root-only directory. There
-      # is no window in which it holds anything but $rev, and no
-      # unprivileged process can open it.
+      echo "klaffat-publish: source ${cfg.repoRemoteUrl}, via the root-only mirror ${mirrorDir}" >&2
+      flakeref="git+file://${mirrorDir}?rev=$rev&allRefs=1"
       out="$(nix --extra-experimental-features 'nix-command flakes' build \
         --no-link --print-out-paths \
-        "$work#nixosConfigurations.klaffat-demo.config.system.build.toplevel")"
+        "$flakeref#nixosConfigurations.klaffat-demo.config.system.build.toplevel")"
       echo "klaffat-publish: built $out" >&2
 
       # --- Sign the whole closure with the root-only key. `nix store sign`
@@ -835,39 +746,43 @@ in
       type = lib.types.str;
       default = "https://github.com/jonathanmoregard/klaffat.git";
       description = ''
-        The one remote the klaffat checkout is allowed to have, and the
-        only URL the wrappers will ask for `main`'s tip.
+        The one URL root fetches the klaffat repository from, into its own
+        bare mirror, before every privileged run. `main`'s tip in that
+        mirror is what the wrappers build and apply.
 
         This must be a value only root can change, which is the whole
-        reason it is a module option: `origin`'s URL lives in
-        `.git/config` inside the jonathan-owned checkout, so a gate that
-        trusted `git remote get-url origin` would be asking the agent
-        where to look for the agent's own homework.
+        reason it is a module option: a gate that read `origin` out of the
+        founder's `.git/config` would be asking the agent where to look for
+        the agent's own homework.
 
         The repository was renamed from `kablong` to `klaffat` on
         2026-09-05 and this default changed in the same commit. Should it
-        ever move again, change the two together — the wrappers compare
-        the string and refuse a mismatch, loudly, printing both sides.
+        ever move again, change the two together — the wrappers refuse,
+        loudly, when the fetch fails.
       '';
     };
 
     remoteTokenFile = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "/run/agenix/klaffat-github-token";
+      default = config.age.secrets.klaffat-github-token.path;
+      defaultText = lib.literalExpression "config.age.secrets.klaffat-github-token.path";
       description = ''
         Root-only file holding a GitHub token with read access to
-        `repoRemoteUrl`, used for one `git ls-remote` per privileged run.
+        `repoRemoteUrl`, offered by a credential helper when the mirror
+        fetch is asked to authenticate.
 
-        The klaffat repository is private, so with this unset the lookup
-        goes out unauthenticated, fails, and every wrapper refuses — the
-        gate is fail-closed by construction and never falls back to the
-        local refs it cannot trust.
+        The default is the eighth host-key-encrypted agenix secret,
+        `klaffat-github-token`, which ships as a `REPLACE_ME` placeholder
+        the founder replaces with a fine-grained token (this repository,
+        Contents: read-only, nothing else). The klaffat repository is
+        private, so until then — and with `null` here — the fetch fails
+        and every wrapper refuses. The gate is fail-closed by construction
+        and never falls back to local refs it cannot trust.
 
-        Read access only. The token proves nothing and authorises
-        nothing in this design: it is transport credentials for a
-        question ("what is main's tip?") whose answer comes from GitHub
-        over TLS at a URL root pinned above.
+        Read access only. The token proves nothing and authorises nothing
+        in this design: it is transport credentials for a question ("what
+        is main?") whose answer comes from GitHub over TLS at a URL root
+        pinned above.
       '';
     };
   };
@@ -892,6 +807,15 @@ in
       # Nix binary-cache signing key — a real key, generated root-side
       # inside the encrypting pipeline and never written in the clear.
       klaffat-nix-signing-key = rootSecret ../../secrets/klaffat-nix-signing-key.age;
+
+      # The read-only GitHub token the mirror fetch authenticates with. Ships
+      # as an encrypted `REPLACE_ME` placeholder; the founder edits the real
+      # token in from secrets/ with
+      # `sudo agenix -i /etc/ssh/ssh_host_ed25519_key -e klaffat-github-token.age`.
+      # Until then GitHub answers 401 and every wrapper refuses — the
+      # declared-but-unwired shape this replaced refused forever with no
+      # secret to fill.
+      klaffat-github-token = rootSecret ../../secrets/klaffat-github-token.age;
     };
 
     # The host key is the only identity that decrypts the above. dellan
@@ -902,6 +826,7 @@ in
     age.identityPaths = lib.mkDefault [ "/etc/ssh/ssh_host_ed25519_key" ];
 
     # ── State dir ───────────────────────────────────────────────────────
+    # The mirror under it is created by the first privileged run.
     systemd.tmpfiles.rules = [
       "d ${stateDir} 0700 root root -"
       "d ${dataDir} 0700 root root -"

@@ -33,8 +33,11 @@ pkgs.runCommand "klaffat-infra-test-secrets"
   age -r "$pub" -o "$out/klaffat-demo-host-key.age" < "$out/demo_host_key"
   rm -f "$out/demo_host_key"
 
+  # github-token is what the lane's http origin (lighttpd + git-http-backend,
+  # basic auth) expects as the password for user x-access-token — so the
+  # credential-helper path is exercised for real, not asserted by string.
   for n in hcloud-token cloudflare-api-token state-passphrase \
-           aws-access-key-id aws-secret-access-key; do
+           aws-access-key-id aws-secret-access-key github-token; do
     printf 'TEST-%s' "$n" | age -r "$pub" -o "$out/klaffat-$n.age"
   done
 
