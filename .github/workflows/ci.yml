@@ -549,7 +549,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy]
+        # `klaffat-infra` is matrix-only, like listen-tools / camera-relay /
+        # auto-deploy: it is deliberately absent from `discover`'s LANES, so
+        # it never reports "cached" and always executes. That lane gates
+        # credential handling and the sudo password rule — a cache hit
+        # skipping it is exactly the silence it exists to prevent.
+        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra]
     steps:
       # Read this lane's cache status from the discover job. ALWAYS
       # runs (no `if:`) so subsequent steps can reference
