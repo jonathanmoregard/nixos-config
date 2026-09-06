@@ -277,7 +277,11 @@ let
       # The packaged probe, a store path from the same derivation as the
       # writer named in AGGREGATOR_WRITER_BIN. It rediscovers the reader
       # itself from ~/.claude.json. The override is an escape hatch and must
-      # name an EXECUTABLE — it is exec'd, not handed to an interpreter.
+      # name an EXECUTABLE — it is exec'd, not handed to an interpreter. The
+      # Claude Code SessionStart hook reads a variable of the same name from
+      # ITS OWN environment and additionally accepts a bare .py file; the two
+      # never share a process, so this unit's contract is the narrower one
+      # and a .py path here is announced as UNVERIFIED, never run.
       probe="''${AGGREGATOR_SCHEMA_PROBE:-${probeBin}}"
 
       notify() {
@@ -416,7 +420,7 @@ let
       # incident.
       spoke=""
       if [ -n "''${MONITOR_INVOCATION_ID:-}" ] && [ -r "$spoke_marker" ]; then
-        spoke="$(cat "$spoke_marker" 2>/dev/null)" || spoke=""
+        spoke="$(${pkgs.coreutils}/bin/cat "$spoke_marker" 2>/dev/null)" || spoke=""
       fi
       if [ -n "$spoke" ] && [ "$spoke" = "''${MONITOR_INVOCATION_ID:-}" ]; then
         echo "the check announced its own verdict for this run (invocation $spoke) — already in the journal above and toasted under its own 24h debounce; not raising a second notification"

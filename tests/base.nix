@@ -1534,6 +1534,14 @@ in
         "the unit's verdict did not reach the journal — the one channel that "
         f"works without a notification daemon:\n{health_log}"
     )
+    # ...and it must be the PROBE's verdict, not the script's own
+    # missing-probe branch, which announces the same headline with the same
+    # exit code. Only the real probe says this.
+    assert "CANNOT BE VERIFIED" in health_log, (
+        "exit 30 + UNVERIFIED reached the journal, but without the probe's "
+        "own summary — i.e. the unit never ran the packaged probe and took "
+        f"the missing-probe branch instead:\n{health_log}"
+    )
     # The OnFailure edge fired, and its notifier recognised that the check
     # had already announced this very run (the invocation-id marker), so it
     # journals the suppression instead of raising a second toast. Async, so

@@ -102,6 +102,13 @@
     # the schema-6 cache, so the hourly health unit and the SessionStart hook
     # will truthfully say "recall is dead" for up to half an hour. To close
     # that window by hand: `systemctl --user start aggregator-ingest.service`.
+    # AND THEN RESTART EVERY OPEN CLAUDE CODE SESSION (or its MCP): a session
+    # opened before the deploy is still talking to the schema-6
+    # `aggregator-mcp` PROCESS it launched, which refuses the migrated
+    # schema-7 cache just as hard — while the probe, reading the schema-7
+    # reader now on disk, reports FINE and stays silent. A running server
+    # keeps the code it was launched with; nothing on this host can see that
+    # from outside the session.
     # Also in this rev: `aggregator-mcp` no longer imports the
     # Presidio/spaCy/torch stack at startup (MCP handshake ~2 s instead of
     # 10-57 s — the real cause of the 2026-09-04/05 "recall down" sessions,
