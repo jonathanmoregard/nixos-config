@@ -184,7 +184,14 @@ in
       };
     } ''
     mkdir -p "$out/bin"
-    for prog in aggregator aggregator-mcp; do
+    # aggregator-schema-probe is the schema-skew probe that
+    # modules/nixos/aggregator-schema-health.nix runs hourly and that the
+    # Claude Code SessionStart hook runs at session start. The hook finds it
+    # as a SIBLING of the `aggregator-mcp` that ~/.claude.json names, so it
+    # has to land in this same bin/ or the packaged tier never exists and the
+    # hook falls back to guessing at a checkout. The spaCy PYTHONPATH is
+    # irrelevant to it (stdlib-only by contract) and harmless.
+    for prog in aggregator aggregator-mcp aggregator-schema-probe; do
       makeWrapper "${venv}/bin/$prog" "$out/bin/$prog" \
         --prefix PYTHONPATH : "${spacyModel}/${python.sitePackages}"
     done

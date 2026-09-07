@@ -6,10 +6,11 @@
 # Three components share one SQLite cache and each knows only its own half of
 # the contract:
 #
-#   * the READER — `aggregator-mcp`, launched by Claude Code out of the live
-#     working tree — opens the cache read-only and refuses every call when
-#     `PRAGMA user_version < SCHEMA_VERSION`. It can NEVER migrate: read-only
-#     by construction.
+#   * the READER — `aggregator-mcp`, launched by Claude Code; out of the live
+#     working tree at the time of the incident, out of the per-user profile
+#     (i.e. `pkgs.aggregator`) since 2026-08-31 — opens the cache read-only
+#     and refuses every call when `PRAGMA user_version != SCHEMA_VERSION`. It
+#     can NEVER migrate: read-only by construction.
 #   * the WRITER — `pkgs.aggregator`, what aggregator-ingest.service execs and
 #     what `aggregator` on $PATH resolves to — is a uv2nix build of the rev
 #     pinned as the `aggregator-src` flake input. It runs `migrate()`, which
@@ -59,27 +60,49 @@
 # text. It runs NO subprocesses at all, which also means a writer too broken or
 # too wedged to execute is still measurable and cannot hang this unit.
 #
-# ── Where the probe comes from, and why not from this repo ──
+# ── Where the probe comes from: the packaged `aggregator-schema-probe` ──
 #
-# `aggregator/health/schema_probe.py` in the aggregator repo, invoked out of
-# the checkout the MCP reader itself runs from. Three alternatives were
-# considered and rejected:
+# `${pkgs.aggregator}/bin/aggregator-schema-probe`, the console script the
+# aggregator installs beside `aggregator` and `aggregator-mcp` (declared in its
+# pyproject.toml; overlays/aggregator.nix wraps all three). Until 2026-09-05
+# this unit ran `python3 $HOME/Repos/aggregator/aggregator/health/schema_probe.py`
+# — the developer checkout — on the argument that the probe had to be exactly
+# as current as the reader, which then ran out of that same checkout. Two
+# things changed underneath that argument:
 #
-#   * vendoring the predicate here as shell — then nixos-config and the
-#     aggregator each own a copy of "what counts as healthy", and a detector
-#     that disagrees with itself about whether the machine is sick is worse
-#     than either half alone.
-#   * taking it from `${aggregator-src}` — that is the WRITER's pin, the very
-#     thing under suspicion. A detector shipped from the stale input goes stale
-#     with it, which reintroduces the blindness this unit exists to remove.
-#   * hard-coding the checkout path — the reader's location is stated by
-#     ~/.claude.json, which is what Claude Code actually executes; a literal
-#     here would keep reporting on a checkout the reader had stopped using.
+#   * the READER moved. Since 2026-08-31 ~/.claude.json launches
+#     `/etc/profiles/per-user/<user>/bin/aggregator-mcp` — this very package —
+#     so reader, writer and probe are ONE derivation built from ONE rev, and
+#     "as current as the reader" holds by construction instead of by reaching
+#     into a checkout.
+#   * on 2026-09-05 the checkout-resident probe raised a FALSE "recall is
+#     dead" toast: ~/Repos/aggregator had been pulled past a schema bump while
+#     reader, writer and cache were all still one version behind it, and the
+#     probe reported the checkout's number as the reader's. A probe read out
+#     of a working tree measures whichever branch happens to be checked out —
+#     the exact defect the 2026-08-16 packaging change closed for the ingest
+#     timer.
 #
-# Coupling the probe to the reader's own tree is deliberate and is the correct
-# direction: the probe is then exactly as current as the reader whose
-# requirement it reports, and if that tree is missing the probe says so rather
-# than guessing.
+# The old objection to "taking it from the writer's pin" — a predicate shipped
+# from a stale input goes stale with it — does not bite THIS probe, and that is
+# the property that makes the packaged form safe: the probe never imports its
+# own SCHEMA_VERSION. It reads the reader's constant as text out of the tree
+# that ~/.claude.json's `command` resolves to (walking the Nix wrapper chain),
+# reads the writer's the same way out of AGGREGATOR_WRITER_BIN, and reads the
+# cache's stamp read-only. Every number comes from a subject, none from the
+# prober; with no aggregator entry in ~/.claude.json at all it falls back to
+# its own tree and says so in `reader_dir`. A probe older than the config
+# shape it meets reports UNKNOWN — loud, never "fine" — which is the rule this
+# unit already lives by.
+#
+# Still rejected: vendoring the predicate here as shell. Then nixos-config and
+# the aggregator each own a copy of "what counts as healthy", and a detector
+# that disagrees with itself about whether the machine is sick is worse than
+# either half alone.
+#
+# AGGREGATOR_SCHEMA_PROBE stays as an escape hatch. It names an EXECUTABLE
+# (exec'd directly, not fed to an interpreter); tests/base.nix drives the
+# script's verdict routing through it with stub executables.
 #
 # ── How the WRITER is named, and why it is NOT looked up on PATH ──
 #
@@ -215,13 +238,13 @@ let
   # PATH the user manager happened to inherit.
   notifyCommand = "${pkgs.libnotify}/bin/notify-send";
 
-  # Plain python3 — the probe is stdlib-only BY CONTRACT (a test in the
-  # aggregator repo asserts it imports nothing from its own package), so it
-  # needs no venv, no uv, and none of the aggregator's dependency closure.
-  # Using `uv run` here would both drag in torch and WRITE to the developer's
-  # checkout from an unattended unit, which is the defect the 2026-08-16
-  # packaging change closed for the ingest timer.
-  pythonBin = "${pkgs.python3}/bin/python3";
+  # The PROBE: the packaged console script, out of the same derivation as the
+  # writer below — a store path built from a pinned rev, not a file in a
+  # checkout (see the header for why the checkout form was wrong). It is
+  # stdlib-only by contract, so the wrapper's PYTHONPATH and the venv behind
+  # it cost nothing at runtime: no torch, no spaCy, ~0.2 s against a 1.5 GB
+  # cache.
+  probeBin = "${pkgs.aggregator}/bin/aggregator-schema-probe";
 
   # The WRITER under test: the exact derivation aggregator-ingest.service
   # execs (`lib.getExe pkgs.aggregator` in aggregator-ingest-timer.nix), not
@@ -237,14 +260,11 @@ let
     # writeShellApplication appends that PATH rather than replacing it — i.e.
     # by luck, through the same ambient channel that left the writer
     # unresolvable. Named explicitly so it cannot go the same way.
-    runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.libnotify pkgs.python3 ];
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.libnotify ];
     text = ''
       set -uo pipefail
 
-      # Resolved at runtime, never spelled literally — see the header. The
-      # probe ships in the aggregator repo; the checkout it lives in is the
-      # one the MCP reader runs from, which the probe itself rediscovers from
-      # ~/.claude.json. This path only has to find the probe FILE.
+      # Resolved at runtime, never spelled literally — see the header.
       state_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/aggregator"
       stamp="$state_dir/schema-skew-notified"
       # The OnFailure notifier's own 24h stamp, cleared here on recovery —
@@ -254,7 +274,15 @@ let
       # tell "the check spoke and then failed on its verdict" from "the check
       # died without saying anything" — the only case its toast is for.
       spoke_marker="$state_dir/last-announced-invocation"
-      probe="''${AGGREGATOR_SCHEMA_PROBE:-$HOME/Repos/aggregator/aggregator/health/schema_probe.py}"
+      # The packaged probe, a store path from the same derivation as the
+      # writer named in AGGREGATOR_WRITER_BIN. It rediscovers the reader
+      # itself from ~/.claude.json. The override is an escape hatch and must
+      # name an EXECUTABLE — it is exec'd, not handed to an interpreter. The
+      # Claude Code SessionStart hook reads a variable of the same name from
+      # ITS OWN environment and additionally accepts a bare .py file; the two
+      # never share a process, so this unit's contract is the narrower one
+      # and a .py path here is announced as UNVERIFIED, never run.
+      probe="''${AGGREGATOR_SCHEMA_PROBE:-${probeBin}}"
 
       notify() {
         # Journal FIRST and unconditionally: a headless boot or a session with
@@ -289,20 +317,23 @@ let
         fi
       }
 
-      if [ ! -f "$probe" ]; then
-        # The detector's own machinery is missing. This is announced, not
-        # swallowed: a check that goes quiet when it cannot run is
-        # indistinguishable from one reporting good news, and exiting
-        # non-zero routes it into OnFailure as a second backstop.
+      if [ ! -x "$probe" ]; then
+        # The detector's own machinery is missing. With the packaged default
+        # this can only be a bad AGGREGATOR_SCHEMA_PROBE override — the store
+        # path is in this unit's closure and cannot be absent while the unit
+        # exists — but it is announced, not swallowed, all the same: a check
+        # that goes quiet when it cannot run is indistinguishable from one
+        # reporting good news, and exiting non-zero routes it into OnFailure
+        # as a second backstop.
         #
         # Exit 30, the probe's own UNKNOWN code, and not the ad-hoc 1 this
-        # used to be: "the probe file is absent" IS could-not-measure, so it
+        # used to be: "the probe is absent" IS could-not-measure, so it
         # should be indistinguishable from every other could-not-measure to
         # anything reading the exit status. It also leaves 1 and 2 meaning
         # "the detector itself crashed", which is the distinction
         # schema_probe.py's exit-code table is built around.
         notify "aggregator recall health UNVERIFIED" \
-          "The schema-skew probe is missing at $probe, so whether aggregator recall works is unknown. It ships in the aggregator repo at aggregator/health/schema_probe.py."
+          "The schema-skew probe at $probe is missing or not executable, so whether aggregator recall works is unknown. It is the aggregator package's aggregator-schema-probe console script; AGGREGATOR_SCHEMA_PROBE, if set, must name an executable."
         exit 30
       fi
 
@@ -314,7 +345,7 @@ let
       # this one call and restored immediately after. Deliberately NOT the
       # `if ! cmd; then rc=$?` shape, which bash zeroes (the PR #67 incident).
       set +e
-      summary=$(${pythonBin} "$probe" --text 2>&1)
+      summary=$("$probe" --text 2>&1)
       rc=$?
       set -e
 
@@ -389,7 +420,7 @@ let
       # incident.
       spoke=""
       if [ -n "''${MONITOR_INVOCATION_ID:-}" ] && [ -r "$spoke_marker" ]; then
-        spoke="$(cat "$spoke_marker" 2>/dev/null)" || spoke=""
+        spoke="$(${pkgs.coreutils}/bin/cat "$spoke_marker" 2>/dev/null)" || spoke=""
       fi
       if [ -n "$spoke" ] && [ "$spoke" = "''${MONITOR_INVOCATION_ID:-}" ]; then
         echo "the check announced its own verdict for this run (invocation $spoke) — already in the journal above and toasted under its own 24h debounce; not raising a second notification"

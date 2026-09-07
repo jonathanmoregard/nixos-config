@@ -1362,13 +1362,88 @@ in
             f"migrate() and re-stamps the cache it is measuring:\n{health_script}"
         )
 
+    # ── The probe is the PACKAGED one, a sibling of the writer ──
+    #
+    # Until 2026-09-05 this script ran the probe out of a developer checkout
+    # (`python3 $HOME/Repos/aggregator/aggregator/health/schema_probe.py`) —
+    # the one place every other aggregator unit here is forbidden to touch,
+    # and a path that does not exist on this VM (asserted above), so the real
+    # probe could never run here and a healthy verdict was unreachable on any
+    # fresh machine. The aggregator now installs the probe as a console
+    # script, `aggregator-schema-probe`, in the same derivation as
+    # `aggregator` and `aggregator-mcp` (overlays/aggregator.nix wraps all
+    # three), and the script defaults to THAT. Parsed out of the script's own
+    # AGGREGATOR_SCHEMA_PROBE `:-` default and compared against
+    # `agg_cli`, the store path the ingest unit execs: same directory means
+    # the probe is built from the very rev it measures as the writer.
+    mp = _re.search(
+        r':-(/nix/store/[^}]*/bin/aggregator-schema-probe)\}', health_script
+    )
+    health_probe = mp.group(1) if mp else ""
+    assert health_probe, (
+        "the schema-health script no longer defaults to the packaged "
+        "`aggregator-schema-probe`; a probe read out of a checkout is stale or "
+        f"absent on every machine but one:\n{health_script}"
+    )
+    assert health_probe.rsplit("/", 1)[0] == agg_cli.rsplit("/", 1)[0], (
+        f"the packaged probe {health_probe!r} is not a sibling of the writer "
+        f"{agg_cli!r}; the two must come out of one derivation or the probe "
+        "is measuring a writer it was not built with"
+    )
+    dellan.succeed(f"test -x {health_probe}")
+    # On the user's PATH too, beside `aggregator-mcp`: that sibling relation
+    # is what the SessionStart hook keys on to run the packaged probe rather
+    # than guess at a checkout.
+    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/aggregator-mcp")
+    dellan.succeed(
+        "test -x /etc/profiles/per-user/jonathan/bin/aggregator-schema-probe"
+    )
+
+    # ── Behavioural: the REAL probe runs from the store, on a bare machine ──
+    #
+    # No checkout, no ~/.claude.json naming a reader, no cache: the only
+    # honest verdict is could-not-measure, exit 30. What the run proves is
+    # the half that was unprovable while the probe lived in a checkout — the
+    # packaged entry point imports, follows the WRITER's wrapper chain (the
+    # same hop the shell walk above took) and reads the constant out of it.
+    # The number it reports must equal the one grep found; a probe that could
+    # not follow the chain reports writer_version null and STILL exits 30,
+    # which is why the exit code alone is not the assertion.
+    import json as _json
+    rc, out = dellan.execute(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        f"AGGREGATOR_WRITER_BIN={agg_cli} {health_probe} --json 2>&1'"
+    )
+    assert rc == 30, (
+        f"the packaged probe exited {rc} on a machine with no reader and no "
+        "cache; could-not-measure is 30 and nothing may be reported as "
+        f"anything milder:\n{out}"
+    )
+    verdict = _json.loads(out[out.index("{"):])
+    # `SCHEMA_VERSION = 7`, tolerating a trailing comment on that line.
+    expected_writer = int(_re.search(r"=\s*(\d+)", writer_schema).group(1))
+    assert verdict.get("state") == "unknown", (
+        "expected state 'unknown' with no cache to read, got "
+        f"{verdict.get('state')!r}:\n{out}"
+    )
+    assert verdict.get("writer_version") == expected_writer, (
+        "the packaged probe read "
+        f"writer_version={verdict.get('writer_version')!r} out of "
+        f"{agg_cli!r}; the wrapper walk found SCHEMA_VERSION = "
+        f"{expected_writer}. A probe that cannot follow the writer's wrapper "
+        "chain reports UNVERIFIED forever, indistinguishably from a real "
+        f"skew:\n{out}"
+    )
+
     # ── Behavioural: drive the REAL script with stub probes ──
     #
-    # The VM has no aggregator checkout (asserted above), so the real probe
-    # cannot run here. What CAN be proven is the half that lives in this
-    # repo: that the script routes each verdict to the right announcement,
-    # that a healthy verdict is genuinely silent, and that a verdict it does
-    # not recognise is announced rather than assumed benign.
+    # The real probe can only ever say 30 on this machine, so the routing of
+    # every OTHER verdict is driven with stubs: that the script announces
+    # each one under the right headline, that a healthy verdict is genuinely
+    # silent, and that a verdict it does not recognise is announced rather
+    # than assumed benign. The stubs are executables, because that is what
+    # the override names now — the script execs `$probe` directly instead of
+    # feeding a file to python3.
     #
     # notify-send has no daemon to talk to in this VM, so it fails and the
     # script logs the fallback line. That is deliberate: the journal marker
@@ -1384,12 +1459,12 @@ in
         # must surface as noise, never as silence.
         (77, "unrecognised status 77"),
     ]:
-        stub = f"/home/jonathan/probe-stubs/probe{code}.py"
+        stub = f"/home/jonathan/probe-stubs/probe{code}.sh"
         dellan.succeed(
-            f"printf 'import sys\\nprint(\"stub verdict {code}\")\\n"
-            f"sys.exit({code})\\n' > {stub}"
+            f"printf '#!/bin/sh\\necho \"stub verdict {code}\"\\n"
+            f"exit {code}\\n' > {stub}"
         )
-        dellan.succeed(f"chown jonathan {stub}")
+        dellan.succeed(f"chown jonathan {stub} && chmod +x {stub}")
         # Clear the debounce stamp between cases: it is per-24h and would
         # otherwise suppress every case after the first, turning four
         # assertions into one.
@@ -1426,6 +1501,62 @@ in
                 f"the probe's own summary text was dropped from the "
                 f"announcement, leaving a headline with no diagnosis:\n{out}"
             )
+
+    # ── Daemon poke: the unit as systemd runs it, not the script by hand ──
+    #
+    # Everything above invoked the ExecStart script from a login shell. This
+    # starts the real unit — the one carrying Environment= and the OnFailure
+    # edge — and reads the verdict back the way an operator would, from
+    # ExecMainStatus and the journal. It must be the unit's OWN status (30,
+    # for the same reason as the direct run above: no cache to read) and not
+    # a 1 from a script that died before announcing; and the announcement
+    # must reach the journal without a notification daemon.
+    dellan.execute(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start aggregator-schema-health.service'"
+    )
+    health_status = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -p ExecMainStatus --value "
+        "aggregator-schema-health.service'"
+    ).strip()
+    assert health_status == "30", (
+        "aggregator-schema-health.service run by systemd exited "
+        f"{health_status!r}; the probe's could-not-measure is 30 and the unit "
+        "must pass it through unaltered so OnFailure can see it"
+    )
+    health_log = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u aggregator-schema-health.service --no-pager' "
+        "|| true"
+    )
+    assert "aggregator recall health UNVERIFIED" in health_log, (
+        "the unit's verdict did not reach the journal — the one channel that "
+        f"works without a notification daemon:\n{health_log}"
+    )
+    # ...and it must be the PROBE's verdict, not the script's own
+    # missing-probe branch, which announces the same headline with the same
+    # exit code. Only the real probe says this.
+    assert "CANNOT BE VERIFIED" in health_log, (
+        "exit 30 + UNVERIFIED reached the journal, but without the probe's "
+        "own summary — i.e. the unit never ran the packaged probe and took "
+        f"the missing-probe branch instead:\n{health_log}"
+    )
+    # The OnFailure edge fired, and its notifier recognised that the check
+    # had already announced this very run (the invocation-id marker), so it
+    # journals the suppression instead of raising a second toast. Async, so
+    # poll — the notifier is dispatched after the failing unit settles.
+    dellan.wait_until_succeeds(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u aggregator-schema-health-failure-notify.service "
+        "--no-pager' | grep -q 'not raising a second notification'",
+        timeout=60,
+    )
+    # Leave the unit clean for anything later in this lane.
+    dellan.execute(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user reset-failed aggregator-schema-health.service'"
+    )
 
     # ── Silence must mean "verified", never "could not tell" ──
     #
@@ -1556,7 +1687,7 @@ in
     dellan.succeed(f"rm -f {stamp}")
     dellan.succeed("mkdir -p /home/jonathan/.local/state/aggregator")
     dellan.succeed(f"touch {stamp} && chown jonathan {stamp}")
-    healthy_stub = "/home/jonathan/probe-stubs/probe0.py"
+    healthy_stub = "/home/jonathan/probe-stubs/probe0.sh"
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         f"AGGREGATOR_SCHEMA_PROBE={healthy_stub} {health_exec}'"
