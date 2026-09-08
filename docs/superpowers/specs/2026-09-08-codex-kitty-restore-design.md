@@ -111,9 +111,13 @@ Read $KITTY_RESTORE_NOTE.
 ```
 
 The user then chooses the next action: Enter submits the pickup, while
-Backspace/Ctrl+U removes it. No agent turn begins automatically. Successful
-typing consumes the marker. A failed Kitty send restores the marker and logs a
-diagnostic; it never falls back to submitting a prompt.
+Backspace/Ctrl+U removes it. No agent turn begins automatically. The hook first
+confirms that the current numeric window ID exists on the current Kitty socket,
+then types and consumes the marker. This preflight is required because Kitty
+documents that `send-text` always exits successfully, even when it matched no
+window. A failed preflight leaves the marker in place and logs a diagnostic; it
+never falls back to submitting a prompt. The real Kitty smoke test verifies the
+bytes actually appear in the input buffer.
 
 Passing the note path through the pane environment avoids depending on a
 resumed runtime preserving the requested session UUID. Claude may assign a new
