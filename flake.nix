@@ -322,6 +322,19 @@
             .microvm.vms.research-agent.config.config
             .systemd.services.research-agent-egress-init.script;
         };
+        research-agent-codex-runtime =
+          let
+            guestPackages = self.nixosConfigurations.dellan.config
+              .microvm.vms.research-agent.config.config
+              .environment.systemPackages;
+          in
+          nixpkgs.lib.throwIfNot (builtins.elem pkgsLinux.codex guestPackages) ''
+            research-agent guest is missing pkgs.codex; Claude quota fallback cannot start.
+          ''
+            (pkgsLinux.runCommand "research-agent-codex-runtime" { } ''
+              test -x ${pkgsLinux.codex}/bin/codex
+              touch $out
+            '');
         # Not a VM lane: runtime-invocation harness for the research-agent
         # guest's egress-refresh script (atomic-replace + never-shrink
         # contract). Cheap runCommand; seconds, not minutes.

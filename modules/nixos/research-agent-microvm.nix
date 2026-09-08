@@ -36,6 +36,10 @@
       # worse failure than the drift this exists to fix.
       egressAllowlist = [
         "api.anthropic.com"
+        # Codex ChatGPT-account fallback. `codex doctor` reports this as
+        # the authenticated runtime endpoint; no OpenAI API-key route is
+        # enabled, so api.openai.com is intentionally not allowlisted.
+        "chatgpt.com"
         "api.exa.ai"
         "mcp.exa.ai"
         # api.tavily.com is AWS ELB-backed and its A records rotate on a
@@ -195,6 +199,7 @@
       environment.systemPackages = with pkgs; [
         bubblewrap
         claude-code
+        codex
         (python3.withPackages (ps: with ps; [ curl-cffi ]))
       ];
 

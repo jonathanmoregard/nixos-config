@@ -68,6 +68,11 @@ pkgs.runCommand "egress-init-retry-harness"
       exit 1
     fi
 
+    grep -q 'chatgpt.com' "$scriptPath" || {
+      echo "FAIL: Codex fallback endpoint chatgpt.com is absent from the guest allowlist."
+      exit 1
+    }
+
     grep -q "firewall active" out.log || {
       cat out.log
       echo "FAIL: script exited 0 but never reached 'firewall active'"; exit 1; }
