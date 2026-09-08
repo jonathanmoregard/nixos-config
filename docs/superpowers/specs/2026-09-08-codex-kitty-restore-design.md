@@ -102,6 +102,8 @@ complete recovery state beneath the fixed root:
     manifest.json
     pane-<ordinal>.md
     pane-<ordinal>.md.pending
+    pane-<ordinal>.expected-window
+    pane-<ordinal>.bootstrap-{bound,failed}
 ```
 
 The root and generation directories are mode `0700`; the manifest, notes, and
@@ -118,8 +120,8 @@ generation and at most the immediately previous generation for diagnosis, and
 removes older generations, abandoned temporary directories, and legacy loose
 `pane-*.md*` files. A previous generation is never eligible for delivery. Thus
 a topology shrink creates an active manifest containing only the new ordinals;
-obsolete notes and every marker state rotate out under a fixed two-generation
-cap instead of accumulating.
+obsolete notes, bootstrap receipts, and every marker state rotate out under a
+fixed two-generation cap instead of accumulating.
 
 Claude notes retain the useful existing detail about interrupted subagents,
 dirty worktrees, and surviving detached units. Codex notes state that the prior
@@ -128,12 +130,13 @@ directory and current Git summary when available, and tell the resumed agent to
 verify filesystem and process state before continuing. Notes never live in a
 project checkout or become part of a Git diff.
 
-The launch environment carries the exact note path as `KITTY_RESTORE_NOTE` and
-the generation token as `KITTY_RESTORE_BOOTSTRAP`. Resume commands contain no
-prompt. Passing the note path through the pane environment avoids depending on
-a resumed runtime preserving the requested session UUID. Claude may assign a
-new SessionStart ID while resuming an older conversation, so matching a note by
-session ID would be unreliable.
+The launch environment carries the exact note path as `KITTY_RESTORE_NOTE`, the
+generation token as `KITTY_RESTORE_BOOTSTRAP`, and the manifest ordinal as
+`KITTY_RESTORE_ORDINAL`. Resume commands contain no prompt. Passing the note
+path through the pane environment avoids depending on a resumed runtime
+preserving the requested session UUID. Claude may assign a new SessionStart ID
+while resuming an older conversation, so matching a note by session ID would be
+unreliable.
 
 ### Authoritative restored-pane binding
 
@@ -144,36 +147,40 @@ happens as soon as the new window ID is authoritative and before any subsequent
 delivery failure never rolls that row back, so the exact UUID survives every
 delivery outcome and remains available to the next autosave.
 
-Pane zero uses the environment of the process Kitty actually spawned rather
-than trying to discover itself by timing. `emit_stub` extends the existing
-mode-`0600` `pane0-launch.json` record with the generation token, ordinal 1,
-agent kind, exact recorded UUID, cwd, note path, and canonical argv, then puts
-the same token and note path in the stub's `--env` fields. The existing
-`--exec-pane0` helper runs inside the new pane before `execvp`; Kitty itself has
-already injected that pane's numeric `KITTY_WINDOW_ID` and configured
-`KITTY_LISTEN_ON`, as confirmed by the live smoke.
+Every restored Codex pane launches an in-pane bootstrap wrapper, never
+`codex resume` directly. The wrapper receives the private generation token,
+ordinal, and note path in its environment and independently carried exact argv
+for both the intended resume and the recorded safe shell. It requires `current`
+to name that generation and the manifest to contain exactly one matching
+ordinal whose kind, UUID, cwd, note path, and canonical argv all match. It then
+reads the numeric `KITTY_WINDOW_ID` that Kitty injected into the process it
+actually spawned. This self-observed ID, not a parent-side lookup, is the
+authoritative registry key. The independently carried shell argv remains
+available even when the manifest cannot be trusted.
 
-Before starting Codex, `--exec-pane0` requires the environment token, note path,
-ordinal, and canonical-argv prefix to match both `pane0-launch.json` and the
-active generation manifest. It also requires a numeric `KITTY_WINDOW_ID`.
-Those checks bind Kitty's own injected ID to exactly one planned pane without a
-socket query or a SessionStart event. The helper then persists the typed Codex
-row under the pane-session lock and runs the delivery state machine before
-`execvp` of the canonical resume argv. `send-text` writes to the same pane's pty
-input queue; the exec preserves that pty, and the absence of a newline keeps the
-queued draft from being submitted when Codex takes over. A delivery failure
-does not prevent the exact mapped resume. If any binding check or registry
-write fails, however, the helper leaves the marker pending, does not run
-delivery, and opens the safe fallback shell instead of starting an unmapped
-Codex resume.
+Pane zero keeps its existing one-line session-file transport. `emit_stub`
+extends the mode-`0600` `pane0-launch.json` record with the generation token,
+ordinal 1, and complete manifest binding; `--exec-pane0` verifies the stub argv
+prefix against that record and then enters the same in-pane bootstrap routine.
+This captures Kitty's injected window ID before `execvp` without a socket query,
+timing guess, or SessionStart event.
 
-For every later pane, `kitty-pane-add` returns the single decimal window ID
-emitted by its exact `kitty @ launch` call rather than discarding stdout. The
-restore loop validates that return, immediately persists the typed Codex row
-under the pane-session lock, and only then invokes the delivery preflight. A
-missing or malformed returned ID is never guessed: the launcher leaves the
-marker pending, logs a concise diagnostic, and does not claim successful
-binding or delivery.
+Later `kitty @ launch` calls also target the bootstrap wrapper. After each call
+returns, the parent writes its single decimal result to that ordinal's atomic
+`expected-window` file. The in-pane wrapper waits for that file and requires it
+to equal its own Kitty-injected ID before proceeding. This is a cross-check of
+the self-observed binding, not the source of the binding; a missing, malformed,
+or mismatched return can never select some other pane or session.
+
+Only after all checks pass does the wrapper atomically replace the typed Codex
+row under the pane-session lock. It then runs the delivery state machine, writes
+an atomic `bootstrap-bound` receipt, and `execvp`s the exact manifest argv.
+`send-text` writes to the same pane's pty input queue; the exec preserves that
+pty, and the absence of a newline keeps the queued draft from being submitted
+when Codex takes over. A delivery failure does not prevent the exact mapped
+resume. Any numeric-ID, token, ordinal, manifest, intended-argv, cross-check, or
+registry failure leaves `.pending`, writes `bootstrap-failed`, and execs the
+recorded safe shell instead of Codex.
 
 SessionStart remains the authority for ordinary starts and Claude restore. A
 later real Codex hook may replace the launcher-written row by the same window-ID
@@ -181,6 +188,25 @@ key, but for a restored Codex pane it performs registry replacement only and
 never calls draft delivery. The restore launcher owns that generation's sole
 automatic attempt, so a hook that appears after user input cannot insert a late
 pickup draft.
+
+### Restore and autosave serialization
+
+The cold-start parent holds the existing `restore.lock` continuously across
+destructive cleanup, generation publication, every pane launch, and a terminal
+`bootstrap-bound` or `bootstrap-failed` receipt from every restored Codex pane.
+The in-pane wrapper writes its receipt immediately before its final exec, so a
+bound receipt proves the typed row is already durable and a failed receipt
+proves that pane will exec the recorded safe shell. The parent does not release
+the lock while any launched Codex bootstrap lacks one of those outcomes.
+
+`kitty-session-save` opens that same cache-directory lock before socket
+discovery or `kitty @ ls` and takes it non-blockingly. If restore owns it, the
+saver exits successfully without creating a candidate, enriching, replacing
+`snapshot.json`, or regenerating `last.session`; the next timer tick retries.
+When the saver acquires the lock, it holds it through capture, enrichment,
+snapshot commit, and `last.session` replacement. Therefore no published
+snapshot can observe a restored Codex process between pane creation and its
+durable registry binding.
 
 ### Draft delivery state machine
 
@@ -246,6 +272,9 @@ act immediately and therefore violates the required manual decision point.
 - A Codex UUID is bootstrapped only from the valid `codex_session_id` attached
   to the exact snapshot pane being restored; there is no latest-by-mtime
   fallback for Codex.
+- Kitty never launches a restored `codex resume` argv directly. That exec is
+  reachable only after the in-pane wrapper has validated identity, persisted
+  the registry row, and published `bootstrap-bound`.
 - Every delivery path starts only after the typed mapping is durable. A failed
   target preflight leaves `.pending`; any attempted send ends or reconciles as
   `.uncertain`. Neither outcome removes or rolls back the mapping.
@@ -264,42 +293,51 @@ Development follows test-driven order.
    two same-directory Codex panes, legacy rows, invalid UUIDs, a pane returned
    to its shell, and exact `codex resume <id>` planning.
 2. Add a restore regression that deliberately emits no Codex hook after
-   `codex resume`. Assert that pane zero binds the Kitty-injected window ID and
-   later panes bind the decimal IDs returned by `kitty @ launch`, with each
-   typed row durable before the first `kitty @ ls` preflight.
+   `codex resume`. Assert that every Codex pane launches through the in-pane
+   wrapper, binds its Kitty-injected window ID under the pane-session lock, and
+   makes the typed row durable before the first delivery preflight. Assert that
+   no parent launch command starts `codex resume` directly.
 3. Make that preflight fail. Assert that `.pending` remains, the mapping remains,
    no send is attempted, and a subsequent periodic save preserves the exact
    recorded UUID as `codex_session_id`.
-4. Exercise the pane-zero bootstrap token, manifest, ordinal, note-path, and
-   canonical-argv checks. A unique valid binding must start the exact resume;
-   a missing, stale, mismatched, or ambiguous binding must claim no marker and
-   fail closed to the shell.
-5. Add deterministic delivery seams immediately before invoking `send-text` and
+4. Exercise the bootstrap token, active manifest, ordinal, note-path,
+   canonical-argv, and Kitty-injected-ID checks for pane zero and a later pane.
+   The later-pane control must also match the parent's launch-returned ID. A
+   unique valid binding starts the exact resume; any missing, stale, malformed,
+   mismatched, or ambiguous input claims no marker, writes `bootstrap-failed`,
+   and execs the recorded safe shell rather than Codex.
+5. Pause a later in-pane wrapper after Kitty creates its window but before it
+   writes the registry row. Start `kitty-session-save` and assert that its
+   nonblocking `restore.lock` acquisition exits zero without creating a
+   candidate or changing `snapshot.json` or `last.session`. Release the wrapper,
+   observe `bootstrap-bound`, then save again and assert the published snapshot
+   contains the exact `codex_session_id`.
+6. Add deterministic delivery seams immediately before invoking `send-text` and
    immediately after it returns. A handled pre-send failure returns `.sending`
    to `.pending` with zero send calls. An interruption after the send boundary
    leaves `.sending`; reconciliation changes it to `.uncertain`, and a later
    invocation makes no second send. Both paths retain the exact typed mapping.
-6. Simulate the window disappearing after the successful `kitty @ ls` preflight
+7. Simulate the window disappearing after the successful `kitty @ ls` preflight
    but before or during `send-text`. Assert `.uncertain`, no delivered claim,
    no mapping loss, and no automatic duplicate input even if `send-text` exits
    zero. The success control asserts the draft bytes are exactly
    `Read $KITTY_RESTORE_NOTE.` with no carriage return or newline.
-7. Create a smaller second restore generation after a larger topology. Assert
+8. Create a smaller second restore generation after a larger topology. Assert
    that only the new ordinals are active, stale `.pending`, `.sending`, and
    `.uncertain` files are reconciled and rotated or pruned under the restore
    lock, abandoned temporary state is removed, and the two-generation bound is
    enforced.
-8. Keep all existing Claude collision, zombie-pane, pane-zero, topology,
+9. Keep all existing Claude collision, zombie-pane, pane-zero, topology,
    retention, and egress-slice tests green.
-9. Build the affected `vm-claude-pane` and `vm-kitty` check lanes locally.
-10. Because this changes branching and multistep restore scripts, repeat the
+10. Build the affected `vm-claude-pane` and `vm-kitty` check lanes locally.
+11. Because this changes branching and multistep restore scripts, repeat the
    full `nixos-agent-testing` dual-client smoke against real Kitty in the
    feature VM. Restore one Claude and one Codex pane; verify both exact IDs,
    the Codex typed mapping before any hook or transcript update, UUID retention
    across a periodic save, and the exact pickup draft visible but unsent in
    both panes with no transcript turn. Exercise erasing one draft and manually
    submitting the other.
-11. Run the configured preflight/evaluation checks and independent close-out
+12. Run the configured preflight/evaluation checks and independent close-out
    review before committing, pushing, and opening the PR.
 
 ## Out of scope
