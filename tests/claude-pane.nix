@@ -177,8 +177,9 @@ in
         ("--remote", "ssh://worker", "exec-server"),
         ("--remote-auth-token-env", "CODEX_TOKEN", "mcp-server"),
         ("--local-provider", "ollama", "app-server"),
-        ("--image", "shot.png", "exec", "task"),
-        ("-i", "shot.png", "review", "--uncommitted"),
+        ("--image=shot.png", "exec", "task"),
+        ("-i", "shot.png", "extra.png", "--model", "dummy",
+         "review", "--uncommitted"),
     ):
         run_codex_hook(
             wid_codex, "/tmp/hook-codex-nested.json", nested_args
@@ -192,6 +193,34 @@ in
         assert nested_rows == 0, (
             f"codex {nested_args[0]} SessionStart overwrote the main "
             "pane mapping"
+        )
+
+    # Codex 0.146.0 declares `-i, --image <FILE>...`: space-separated
+    # tokens remain image values until another option appears, even when a
+    # value is spelled like a real subcommand. `--` likewise makes every
+    # later token a positional prompt, including help/version spellings.
+    interactive_grammar = (
+        (120, "81234567-1111-4111-8111-111111111111",
+         ("--image", "one.png", "two.png", "exec", "review")),
+        (121, "82345678-2222-4222-8222-222222222222",
+         ("-i", "one.png", "mcp-server")),
+        (122, "83456789-3333-4333-8333-333333333333",
+         ("--", "--help")),
+        (123, "84567890-4444-4444-8444-444444444444",
+         ("--", "-V")),
+    )
+    for grammar_wid, grammar_sid, grammar_args in interactive_grammar:
+        grammar_input = f"/tmp/hook-codex-grammar-{grammar_wid}.json"
+        stage_input(grammar_input, json.dumps({
+            "session_id": grammar_sid,
+            "cwd": f"/tmp/codex-grammar-{grammar_wid}",
+            "transcript_path": (
+                f"/home/jonathan/.codex/sessions/{grammar_wid}.jsonl"
+            ),
+        }))
+        run_codex_hook(grammar_wid, grammar_input, grammar_args)
+        dellan.succeed(
+            f"grep -qP '^{grammar_wid}\\tcodex\\t{grammar_sid}\\t' {tsv}"
         )
 
     # Re-invoking the hook for an existing window_id REPLACES the row,
@@ -376,6 +405,86 @@ in
         f"got rc={rc_codex_duplicate}"
     )
 
+    # Exercise the same Codex 0.146.0 grammar through foreground detection
+    # and restore. Stale TSV rows are deliberately present for every case:
+    # interactive roots must keep and resume them, while real subcommands
+    # must discard them and degrade to the recorded shell.
+    codex_grammar_cases = [
+        (120, "/tmp/image-long", "81234567-1111-4111-8111-111111111111",
+         ["/usr/bin/codex", "--image", "one.png", "two.png", "exec",
+          "review"], True),
+        (121, "/tmp/image-short", "82345678-2222-4222-8222-222222222222",
+         ["/usr/bin/codex", "-i", "one.png", "mcp-server"], True),
+        (122, "/tmp/dash-help", "83456789-3333-4333-8333-333333333333",
+         ["/usr/bin/codex", "--", "--help"], True),
+        (123, "/tmp/dash-version", "84567890-4444-4444-8444-444444444444",
+         ["/usr/bin/codex", "--", "-V"], True),
+        (124, "/tmp/image-equals", "85678901-5555-4555-8555-555555555555",
+         ["/usr/bin/codex", "--image=shot.png", "exec", "task"], False),
+        (125, "/tmp/image-option", "86789012-6666-4666-8666-666666666666",
+         ["/usr/bin/codex", "-i", "shot.png", "extra.png", "--model",
+          "dummy", "review", "--uncommitted"], False),
+    ]
+    grammar_ls = json.dumps([{
+        "tabs": [{"windows": [
+            {"id": grammar_wid, "cwd": grammar_cwd,
+             "cmdline": ["/bin/zsh"],
+             "foreground_processes": [{"cmdline": grammar_argv}]}
+            for grammar_wid, grammar_cwd, _sid, grammar_argv, _interactive
+            in codex_grammar_cases
+        ]}],
+    }])
+    stage_input("/tmp/fake-ls-codex-grammar.json", grammar_ls)
+    stage_input(
+        "/tmp/codex-grammar.tsv",
+        "\n".join(
+            f"{grammar_wid}\tcodex\t{grammar_sid}\t{grammar_cwd}\t0"
+            for grammar_wid, grammar_cwd, grammar_sid, _argv, _interactive
+            in codex_grammar_cases
+        ),
+    )
+    dellan.succeed(
+        "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
+        "KITTY_ENRICH_TSV=/tmp/codex-grammar.tsv kitty-session-enrich "
+        "< /tmp/fake-ls-codex-grammar.json "
+        "> /tmp/enriched-codex-grammar.json'"
+    )
+    grammar_enriched = json.loads(
+        dellan.succeed("cat /tmp/enriched-codex-grammar.json")
+    )[0]["tabs"][0]["windows"]
+    for grammar_window, grammar_case in zip(
+        grammar_enriched, codex_grammar_cases
+    ):
+        _wid, _cwd, grammar_sid, grammar_argv, interactive = grammar_case
+        if interactive:
+            assert grammar_window.get("codex_session_id") == grammar_sid, (
+                f"interactive Codex argv was discarded: {grammar_argv!r}"
+            )
+        else:
+            assert "codex_session_id" not in grammar_window, (
+                f"noninteractive Codex argv was enriched: {grammar_argv!r}"
+            )
+
+    grammar_cache = "/home/jonathan/.cache/kitty-session"
+    dellan.succeed(
+        "su - jonathan -c 'mkdir -p " + grammar_cache
+        + " && cp /tmp/enriched-codex-grammar.json "
+        + grammar_cache + "/snapshot.json'"
+    )
+    grammar_resolved = json.loads(dellan.succeed(
+        "su - jonathan -c 'kitty-restore-session --dump-panes'"
+    ))
+    for grammar_pane, grammar_case in zip(
+        grammar_resolved, codex_grammar_cases
+    ):
+        _wid, _cwd, grammar_sid, grammar_argv, interactive = grammar_case
+        expected_cmd = (["/usr/bin/codex", "resume", grammar_sid]
+                        if interactive else ["/bin/zsh"])
+        assert grammar_pane["cmd"] == expected_cmd, (
+            f"restore misclassified Codex argv {grammar_argv!r}: "
+            f"got {grammar_pane['cmd']!r}"
+        )
+
     # One-shot and service Codex processes are not interactive panes.
     # A stale row must not make either shape restorable.
     noninteractive_ls = json.dumps([{
@@ -412,11 +521,12 @@ in
              ]}]},
             {"id": 118, "cwd": "/tmp/image-exec", "cmdline": ["/bin/zsh"],
              "foreground_processes": [{"cmdline": [
-                 "/usr/bin/codex", "--image", "shot.png", "exec", "task"
+                 "/usr/bin/codex", "--image=shot.png", "exec", "task"
              ]}]},
             {"id": 119, "cwd": "/tmp/image-review", "cmdline": ["/bin/zsh"],
              "foreground_processes": [{"cmdline": [
-                 "/usr/bin/codex", "-i", "shot.png", "review", "--uncommitted"
+                 "/usr/bin/codex", "-i", "shot.png", "extra.png", "--model",
+                 "dummy", "review", "--uncommitted"
              ]}]},
         ]}],
     }])
@@ -629,12 +739,13 @@ in
             {"id": 118, "cwd": "/tmp/image-exec", "cmdline": ["/bin/zsh"],
              "codex_session_id": "66666666-ffff-4666-8666-666666666666",
              "foreground_processes": [{"cmdline": [
-                 "/usr/bin/codex", "--image", "shot.png", "exec", "task"
+                 "/usr/bin/codex", "--image=shot.png", "exec", "task"
              ]}]},
             {"id": 119, "cwd": "/tmp/image-review", "cmdline": ["/bin/zsh"],
              "codex_session_id": "77777777-abab-4777-8777-777777777777",
              "foreground_processes": [{"cmdline": [
-                 "/usr/bin/codex", "-i", "shot.png", "review", "--uncommitted"
+                 "/usr/bin/codex", "-i", "shot.png", "extra.png", "--model",
+                 "dummy", "review", "--uncommitted"
              ]}]},
         ]}],
     }])

@@ -271,9 +271,14 @@ let
   codexOptionsWithValue = [
     "-c" "--config" "-m" "--model" "-p" "--profile"
     "-s" "--sandbox" "-a" "--ask-for-approval" "-C" "--cd"
-    "--add-dir" "-i" "--image" "--enable" "--disable" "--remote"
+    "--add-dir" "--enable" "--disable" "--remote"
     "--remote-auth-token-env" "--local-provider"
   ];
+  codexVariadicOptions = [ "-i" "--image" ];
+  codexVariadicInlinePatterns = map
+    (option:
+      if lib.hasPrefix "--" option then "${option}=*" else "${option}?*")
+    codexVariadicOptions;
   codexNoninteractiveFlags = [ "-h" "--help" "-V" "--version" ];
   pythonStringSet = values:
     "{\n"
@@ -388,6 +393,7 @@ let
     # prompt text.
     CODEX_NONINTERACTIVE = ${pythonStringSet codexNoninteractiveSubcommands}
     CODEX_OPTIONS_WITH_VALUE = ${pythonStringSet codexOptionsWithValue}
+    CODEX_VARIADIC_OPTIONS = ${pythonStringSet codexVariadicOptions}
     CODEX_NONINTERACTIVE_FLAGS = ${pythonStringSet codexNoninteractiveFlags}
 
 
@@ -397,18 +403,40 @@ let
 
 
     def _codex_subcommand(cmdline):
-        """First non-option Codex argument after known option values."""
-        skip = False
-        for arg in (cmdline or [])[1:]:
-            if skip:
-                skip = False
-                continue
+        """First Codex subcommand or global exit flag before `--`.
+
+        Codex 0.146.0 declares image as `<FILE>...`: a separated `-i` or
+        `--image` absorbs every following non-option token. An attached
+        value (`-ifile` or `--image=file`) completes that occurrence, so
+        the next token is parsed normally. `--` ends option parsing and
+        makes even help/version spellings part of the interactive prompt.
+        """
+        args = (cmdline or [])[1:]
+        index = 0
+        while index < len(args):
+            arg = args[index]
             if arg == "--":
                 return None
+            if arg in CODEX_NONINTERACTIVE_FLAGS:
+                return arg
             if arg in CODEX_OPTIONS_WITH_VALUE:
-                skip = True
+                index += 2
+                continue
+            if arg in CODEX_VARIADIC_OPTIONS:
+                index += 1
+                while index < len(args) and not args[index].startswith("-"):
+                    index += 1
+                continue
+            if any(
+                arg.startswith(option + "=")
+                if option.startswith("--")
+                else arg.startswith(option) and len(arg) > len(option)
+                for option in CODEX_VARIADIC_OPTIONS
+            ):
+                index += 1
                 continue
             if arg.startswith("-"):
+                index += 1
                 continue
             return arg
         return None
@@ -418,9 +446,10 @@ let
         """True for Codex TUI root/resume/fork, never exec/services."""
         if not _is_codex_exe(cmdline):
             return False
-        if any(a in CODEX_NONINTERACTIVE_FLAGS for a in cmdline[1:]):
-            return False
-        return _codex_subcommand(cmdline) not in CODEX_NONINTERACTIVE
+        command = _codex_subcommand(cmdline)
+        return command not in (
+            CODEX_NONINTERACTIVE | CODEX_NONINTERACTIVE_FLAGS
+        )
 
 
     def unwrap_slice(cmdline):
@@ -2459,7 +2488,7 @@ let
       # service subcommand. Unknown positional text remains valid because
       # a root Codex invocation accepts an arbitrary prompt.
       classify_codex_parent() {
-        local pid="$PPID" parent comm arg skip
+        local pid="$PPID" parent comm arg skip image_values index
         local -a args=()
         while [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ]; do
           args=()
@@ -2468,14 +2497,31 @@ let
             comm="''${args[0]##*/}"
             if [ "$comm" = codex ]; then
               skip=0
-              for arg in "''${args[@]:1}"; do
+              image_values=0
+              index=1
+              while [ "$index" -lt "''${#args[@]}" ]; do
+                arg="''${args[$index]}"
                 if [ "$skip" -eq 1 ]; then
                   skip=0
+                  index=$((index + 1))
                   continue
+                fi
+                if [ "$image_values" -eq 1 ]; then
+                  case "$arg" in
+                    --)
+                      printf '%s\n' interactive; return ;;
+                    -*) image_values=0 ;;
+                    *)
+                      index=$((index + 1))
+                      continue ;;
+                  esac
                 fi
                 case "$arg" in
                   ${lib.concatStringsSep "|" codexOptionsWithValue})
                     skip=1 ;;
+                  ${lib.concatStringsSep "|" codexVariadicOptions})
+                    image_values=1 ;;
+                  ${lib.concatStringsSep "|" codexVariadicInlinePatterns}) ;;
                   ${lib.concatStringsSep "|" (codexNoninteractiveSubcommands ++ codexNoninteractiveFlags)})
                     printf '%s\n' noninteractive; return ;;
                   resume|fork)
@@ -2487,6 +2533,7 @@ let
                     # An arbitrary positional prompt is the root TUI.
                     printf '%s\n' interactive; return ;;
                 esac
+                index=$((index + 1))
               done
               printf '%s\n' interactive
               return
