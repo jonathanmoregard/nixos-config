@@ -132,11 +132,15 @@ project checkout or become part of a Git diff.
 
 The launch environment carries the exact note path as `KITTY_RESTORE_NOTE`, the
 generation token as `KITTY_RESTORE_BOOTSTRAP`, and the manifest ordinal as
-`KITTY_RESTORE_ORDINAL`. Resume commands contain no prompt. Passing the note
-path through the pane environment avoids depending on a resumed runtime
-preserving the requested session UUID. Claude may assign a new SessionStart ID
-while resuming an older conversation, so matching a note by session ID would be
-unreliable.
+`KITTY_RESTORE_ORDINAL`. The parent computes one monotonic deadline for the
+whole restore and carries it in the manifest and bootstrap environment as
+`KITTY_RESTORE_DEADLINE_MONOTONIC`. Its production timeout is the existing
+30-second socket-startup budget; the test-only
+`KITTY_RESTORE_TIMEOUT_SECONDS` override may shorten it. Resume commands contain
+no prompt. Passing the note path through the pane environment avoids depending
+on a resumed runtime preserving the requested session UUID. Claude may assign
+a new SessionStart ID while resuming an older conversation, so matching a note
+by session ID would be unreliable.
 
 ### Authoritative restored-pane binding
 
@@ -173,14 +177,13 @@ the self-observed binding, not the source of the binding; a missing, malformed,
 or mismatched return can never select some other pane or session.
 
 Only after all checks pass does the wrapper atomically replace the typed Codex
-row under the pane-session lock. It then runs the delivery state machine, writes
-an atomic `bootstrap-bound` receipt, and `execvp`s the exact manifest argv.
-`send-text` writes to the same pane's pty input queue; the exec preserves that
-pty, and the absence of a newline keeps the queued draft from being submitted
-when Codex takes over. A delivery failure does not prevent the exact mapped
-resume. Any numeric-ID, token, ordinal, manifest, intended-argv, cross-check, or
-registry failure leaves `.pending`, writes `bootstrap-failed`, and execs the
-recorded safe shell instead of Codex.
+row under the pane-session lock. It then writes atomic `bootstrap-bound` and
+`execvp`s the exact manifest argv. `bootstrap-bound` is deliberately
+intermediate: it proves the row is durable, but does not prove that the exec
+happened or that Codex is the foreground process. The wrapper never performs
+draft delivery itself. Any numeric-ID, token, ordinal, manifest, intended-argv,
+cross-check, or registry failure leaves `.pending`, writes `bootstrap-failed`,
+and execs the recorded safe shell instead of Codex.
 
 SessionStart remains the authority for ordinary starts and Claude restore. A
 later real Codex hook may replace the launcher-written row by the same window-ID
@@ -191,22 +194,49 @@ pickup draft.
 
 ### Restore and autosave serialization
 
-The cold-start parent holds the existing `restore.lock` continuously across
-destructive cleanup, generation publication, every pane launch, and a terminal
-`bootstrap-bound` or `bootstrap-failed` receipt from every restored Codex pane.
-The in-pane wrapper writes its receipt immediately before its final exec, so a
-bound receipt proves the typed row is already durable and a failed receipt
-proves that pane will exec the recorded safe shell. The parent does not release
-the lock while any launched Codex bootstrap lacks one of those outcomes.
+Immediately after acquiring the existing `restore.lock`, and before destructive
+cleanup, the cold-start parent atomically writes the mode-`0600`
+`restore-incomplete` guard with its generation and current stage. It then holds
+the lock continuously across cleanup, generation publication, every pane
+launch, and final settlement of every restored Codex pane. A bound pane is
+settled only when `kitty @ ls` reports that exact authoritative window ID with
+the interactive Codex process in its foreground list and the exact canonical
+`codex resume <UUID>` argv from its manifest entry. A bootstrap-wrapper process
+is never settled, even after `bootstrap-bound`. A failed pane is settled only
+when `bootstrap-failed` exists and the window is running its recorded safe shell
+or has reached the explicit safe-shell failure state. After observing a Codex
+pane settle, the parent runs that pane's draft-delivery state machine. It
+releases the lock only after every pane is settled and every eligible delivery
+attempt has reached a durable marker state.
+
+Socket startup, parent launch-result capture, `expected-window`, bootstrap
+receipt, foreground settlement, and delivery preflight all consume the same
+finite monotonic deadline; no stage resets it. Each polling loop checks the
+remaining time and uses a subprocess timeout no longer than that remainder. A
+missing launch return, killed wrapper, vanished window, or expired deadline
+logs the generation, ordinal, and exact failed stage, leaves an unclaimed draft
+`.pending`, and records the restore as incomplete. The parent closes or replaces
+only a window whose returned or self-reported ID and bootstrap-wrapper argv
+still prove it belongs to that entry; ambiguous windows are left untouched.
+Abandoned generation files rotate under the existing retention policy.
+
+The guard keeps the prior `snapshot.json` and `last.session` authoritative after
+any detected failure or abrupt parent exit. Only a fully settled cold restore
+removes it, immediately before releasing the lock; failure to remove it is
+itself a logged incomplete restore. A later cold restore may replace the guard
+while holding the lock and try again. Every exit path uses a `finally`
+equivalent to release `restore.lock`, including timeout and cleanup failure, so
+a dead wrapper cannot retain the lock forever.
 
 `kitty-session-save` opens that same cache-directory lock before socket
 discovery or `kitty @ ls` and takes it non-blockingly. If restore owns it, the
 saver exits successfully without creating a candidate, enriching, replacing
 `snapshot.json`, or regenerating `last.session`; the next timer tick retries.
 When the saver acquires the lock, it holds it through capture, enrichment,
-snapshot commit, and `last.session` replacement. Therefore no published
-snapshot can observe a restored Codex process between pane creation and its
-durable registry binding.
+snapshot commit, and `last.session` replacement. It also skips publication
+while `restore-incomplete` exists. Therefore no published snapshot can observe
+a restored Codex process between pane creation and terminal settlement, or
+replace the prior snapshot after a failed restore.
 
 ### Draft delivery state machine
 
@@ -219,11 +249,13 @@ Draft delivery uses three durable marker names beside the note:
 - `.uncertain`: a send may have reached Kitty; this is terminal and is never
   retried automatically.
 
-After the registry row is durable, the delivery helper resolves the note within
-the active generation and requires `kitty @ ls` on the configured socket to
-contain exactly one window with the authoritative ID. A missing, duplicate, or
-unreachable target leaves `.pending` untouched. Only a successful preflight may
-atomically rename `.pending` to `.sending`.
+For a restored Codex pane, delivery is eligible only after the registry row is
+durable and the parent has observed the exact Codex foreground argv in the
+authoritative window. The delivery helper then resolves the note within the
+active generation and requires a fresh `kitty @ ls` on the configured socket to
+contain exactly that one settled window. A missing, duplicate, unreachable, or
+still-bootstrap target leaves `.pending` untouched. Only a successful settled
+target preflight may atomically rename `.pending` to `.sending`.
 
 With the claim held, the helper sends exactly these constant bytes to that
 socket and window, without a carriage return or newline:
@@ -276,8 +308,9 @@ act immediately and therefore violates the required manual decision point.
   reachable only after the in-pane wrapper has validated identity, persisted
   the registry row, and published `bootstrap-bound`.
 - Every delivery path starts only after the typed mapping is durable. A failed
-  target preflight leaves `.pending`; any attempted send ends or reconciles as
-  `.uncertain`. Neither outcome removes or rolls back the mapping.
+  target preflight also requires parent-observed settled Codex foreground and
+  leaves `.pending`; any attempted send ends or reconciles as `.uncertain`.
+  Neither outcome removes or rolls back the mapping.
 - `.uncertain` is an honest no-ack outcome, not a delivered claim. It requires
   manual inspection or recovery and is never an automatic-resend source.
 - No failure path appends a newline, presses Enter, or otherwise submits the
@@ -310,34 +343,46 @@ Development follows test-driven order.
    writes the registry row. Start `kitty-session-save` and assert that its
    nonblocking `restore.lock` acquisition exits zero without creating a
    candidate or changing `snapshot.json` or `last.session`. Release the wrapper,
-   observe `bootstrap-bound`, then save again and assert the published snapshot
-   contains the exact `codex_session_id`.
-6. Add deterministic delivery seams immediately before invoking `send-text` and
+   wait for the exact Codex foreground settlement, then save again and assert
+   the published snapshot contains the exact `codex_session_id`.
+6. Pause the wrapper immediately after `bootstrap-bound` but before `execvp`.
+   Assert that the parent still holds `restore.lock`, `kitty @ ls` identifies the
+   wrapper rather than a settled Codex process, and a concurrent saver skips
+   without publishing an identity-less snapshot. Release the wrapper and assert
+   settlement occurs only when the exact `codex resume <UUID>` foreground argv
+   appears.
+7. Exercise a missing launch return, a wrapper killed before its receipt, a
+   vanished window, and a settlement timeout under a shortened shared deadline.
+   Each case must terminate within that deadline, log its generation/ordinal and
+   failed stage, leave the draft unclaimed, preserve the prior snapshot through
+   `restore-incomplete`, clean only unambiguously owned partial state/windows,
+   and release `restore.lock`.
+8. Add deterministic delivery seams immediately before invoking `send-text` and
    immediately after it returns. A handled pre-send failure returns `.sending`
    to `.pending` with zero send calls. An interruption after the send boundary
    leaves `.sending`; reconciliation changes it to `.uncertain`, and a later
    invocation makes no second send. Both paths retain the exact typed mapping.
-7. Simulate the window disappearing after the successful `kitty @ ls` preflight
+9. Simulate the window disappearing after the successful `kitty @ ls` preflight
    but before or during `send-text`. Assert `.uncertain`, no delivered claim,
    no mapping loss, and no automatic duplicate input even if `send-text` exits
    zero. The success control asserts the draft bytes are exactly
    `Read $KITTY_RESTORE_NOTE.` with no carriage return or newline.
-8. Create a smaller second restore generation after a larger topology. Assert
+10. Create a smaller second restore generation after a larger topology. Assert
    that only the new ordinals are active, stale `.pending`, `.sending`, and
    `.uncertain` files are reconciled and rotated or pruned under the restore
    lock, abandoned temporary state is removed, and the two-generation bound is
    enforced.
-9. Keep all existing Claude collision, zombie-pane, pane-zero, topology,
+11. Keep all existing Claude collision, zombie-pane, pane-zero, topology,
    retention, and egress-slice tests green.
-10. Build the affected `vm-claude-pane` and `vm-kitty` check lanes locally.
-11. Because this changes branching and multistep restore scripts, repeat the
+12. Build the affected `vm-claude-pane` and `vm-kitty` check lanes locally.
+13. Because this changes branching and multistep restore scripts, repeat the
    full `nixos-agent-testing` dual-client smoke against real Kitty in the
    feature VM. Restore one Claude and one Codex pane; verify both exact IDs,
    the Codex typed mapping before any hook or transcript update, UUID retention
    across a periodic save, and the exact pickup draft visible but unsent in
    both panes with no transcript turn. Exercise erasing one draft and manually
    submitting the other.
-12. Run the configured preflight/evaluation checks and independent close-out
+14. Run the configured preflight/evaluation checks and independent close-out
    review before committing, pushing, and opening the PR.
 
 ## Out of scope
