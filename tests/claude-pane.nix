@@ -8,8 +8,8 @@
 # user's two distinct ones.
 #
 # Mechanism: a Claude Code SessionStart hook
-# (`claude-kitty-pane-record`) writes (window_id, session_id, cwd,
-# ts) rows into ~/.cache/kitty-session/pane-sessions.tsv keyed by
+# (`claude-kitty-pane-record`) writes (window_id, agent_kind,
+# session_id, cwd, ts) rows into ~/.cache/kitty-session/pane-sessions.tsv keyed by
 # $KITTY_WINDOW_ID — the same integer kitty puts in `kitty @ ls`'s
 # window `id` field. The enricher joins the TSV into snapshot JSON.
 #
@@ -75,7 +75,10 @@
     tsv = "/home/jonathan/.cache/kitty-session/pane-sessions.tsv"
     sid_a = "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     sid_b = "bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    sid_codex = "cccc3333-cccc-4333-8333-cccccccccccc"
+    sid_codex_2 = "dddd4444-dddd-4444-8444-dddddddddddd"
     wid_a, wid_b = 101, 102
+    wid_codex, wid_codex_2 = 103, 104
 
     def stage_input(path, payload):
         dellan.succeed(
@@ -93,6 +96,14 @@
         "/tmp/hook-b.json",
         f'{{"session_id":"{sid_b}","cwd":"/tmp/fake"}}',
     )
+    stage_input(
+        "/tmp/hook-codex.json",
+        f'{{"session_id":"{sid_codex}","cwd":"/tmp/codex"}}',
+    )
+    stage_input(
+        "/tmp/hook-codex-2.json",
+        f'{{"session_id":"{sid_codex_2}","cwd":"/tmp/codex"}}',
+    )
     dellan.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
@@ -101,9 +112,25 @@
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
         "claude-kitty-pane-record < /tmp/hook-b.json'"
     )
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_codex} "
+        f"CODEX_THREAD_ID={sid_codex} "
+        "claude-kitty-pane-record < /tmp/hook-codex.json'"
+    )
+    dellan.succeed(
+        f"su - jonathan -c 'KITTY_WINDOW_ID={wid_codex_2} "
+        f"CODEX_THREAD_ID={sid_codex_2} "
+        "claude-kitty-pane-record < /tmp/hook-codex-2.json'"
+    )
     print("[diag phase6] TSV after hooks:\n" + dellan.succeed(f"cat {tsv}"))
-    dellan.succeed(f"grep -qP '^{wid_a}\\t{sid_a}\\t' {tsv}")
-    dellan.succeed(f"grep -qP '^{wid_b}\\t{sid_b}\\t' {tsv}")
+    dellan.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a}\\t' {tsv}")
+    dellan.succeed(f"grep -qP '^{wid_b}\\tclaude\\t{sid_b}\\t' {tsv}")
+    dellan.succeed(
+        f"grep -qP '^{wid_codex}\\tcodex\\t{sid_codex}\\t' {tsv}"
+    )
+    dellan.succeed(
+        f"grep -qP '^{wid_codex_2}\\tcodex\\t{sid_codex_2}\\t' {tsv}"
+    )
 
     # Re-invoking the hook for an existing window_id REPLACES the row,
     # doesn't append a duplicate — guards against unbounded TSV growth
@@ -124,7 +151,7 @@
         f"expected exactly 1 row for window {wid_a} after re-invocation, "
         f"got {row_count_a}"
     )
-    dellan.succeed(f"grep -qP '^{wid_a}\\t{sid_a2}\\t' {tsv}")
+    dellan.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a2}\\t' {tsv}")
     # Reset to original sid for downstream assertions.
     dellan.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
@@ -179,7 +206,7 @@
             f"non-cli gate; got {row_count_evil} matching rows"
         )
         # Existing main row for wid_a must remain untouched.
-        dellan.succeed(f"grep -qP '^{wid_a}\\t{sid_a}\\t' {tsv}")
+        dellan.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a}\\t' {tsv}")
 
     # Non-numeric KITTY_WINDOW_ID rejected — defends against TSV
     # corruption if some upstream sets the env var to a non-integer.
@@ -193,6 +220,160 @@
     assert row_count_abc == 0, (
         f"non-numeric KITTY_WINDOW_ID should be rejected; got {row_count_abc} row(s)"
     )
+
+    # --- 6a-2: Codex identity is exact and survives same-cwd panes. ---
+    fake_ls_codex = json.dumps([{
+        "tabs": [{
+            "windows": [
+                {"id": wid_codex, "cwd": "/tmp/codex", "title": "codex-a",
+                 "cmdline": ["/bin/zsh"],
+                 "foreground_processes": [
+                     {"pid": 31111, "cmdline": ["/usr/bin/codex"]}
+                 ]},
+                {"id": wid_codex_2, "cwd": "/tmp/codex", "title": "codex-b",
+                 "cmdline": ["/bin/zsh"],
+                 "foreground_processes": [
+                     {"pid": 32222,
+                      "cmdline": ["/usr/bin/codex", "--yolo"]}
+                 ]},
+            ],
+        }],
+    }])
+    stage_input("/tmp/fake-ls-codex.json", fake_ls_codex)
+    dellan.succeed(
+        "su - jonathan -c 'kitty-session-enrich "
+        "< /tmp/fake-ls-codex.json > /tmp/enriched-codex.json'"
+    )
+    enriched_codex = json.loads(dellan.succeed("cat /tmp/enriched-codex.json"))
+    codex_windows = enriched_codex[0]["tabs"][0]["windows"]
+    assert codex_windows[0].get("codex_session_id") == sid_codex
+    assert codex_windows[1].get("codex_session_id") == sid_codex_2
+    assert sid_codex != sid_codex_2
+    assert all("claude_session_id" not in w for w in codex_windows), (
+        "Codex panes were mislabeled as Claude panes"
+    )
+
+    # Negative control: with one exact mapping removed, two same-cwd
+    # Codex panes are collision-risk and the enricher must fail closed.
+    stage_input(
+        "/tmp/codex-partial.tsv",
+        f"{wid_codex}\tcodex\t{sid_codex}\t/tmp/codex\t0",
+    )
+    rc_codex_partial = int(dellan.succeed(
+        "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
+        "KITTY_ENRICH_TSV=/tmp/codex-partial.tsv kitty-session-enrich "
+        "< /tmp/fake-ls-codex.json > /tmp/enriched-codex-partial.json; "
+        "echo $?'"
+    ).strip().splitlines()[-1])
+    assert rc_codex_partial == 2, (
+        "same-cwd Codex panes with one missing exact id must exit 2; "
+        f"got rc={rc_codex_partial}"
+    )
+
+    # Legacy four-column rows remain readable. The live foreground agent
+    # disambiguates the UUID as Codex without rewriting the stored row.
+    stage_input(
+        "/tmp/codex-legacy.tsv",
+        f"{wid_codex}\t{sid_codex}\t/tmp/codex\t0",
+    )
+    legacy_codex_one = json.dumps([{
+        "tabs": [{"windows": [json.loads(json.dumps(
+            json.loads(fake_ls_codex)[0]["tabs"][0]["windows"][0]
+        ))]}],
+    }])
+    stage_input("/tmp/fake-ls-codex-legacy.json", legacy_codex_one)
+    dellan.succeed(
+        "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
+        "KITTY_ENRICH_TSV=/tmp/codex-legacy.tsv kitty-session-enrich "
+        "< /tmp/fake-ls-codex-legacy.json "
+        "> /tmp/enriched-codex-legacy.json'"
+    )
+    legacy_sid = dellan.succeed(
+        "jq -r '.[0].tabs[0].windows[0].codex_session_id // empty' "
+        "/tmp/enriched-codex-legacy.json"
+    ).strip()
+    assert legacy_sid == sid_codex, (
+        f"legacy Codex row was not disambiguated: got {legacy_sid!r}"
+    )
+
+    # A stale Codex row on a pane returned to its shell must attach no
+    # identity at all. Otherwise restore resurrects Codex over the shell.
+    fake_ls_codex_shell = json.dumps([{
+        "tabs": [{"windows": [{
+            "id": wid_codex, "cwd": "/tmp/codex", "title": "shell",
+            "cmdline": ["/bin/zsh"],
+            "foreground_processes": [
+                {"pid": 33333, "cmdline": ["/bin/zsh"]}
+            ],
+        }]}],
+    }])
+    stage_input("/tmp/fake-ls-codex-shell.json", fake_ls_codex_shell)
+    dellan.succeed(
+        "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
+        "KITTY_ENRICH_TSV=/tmp/codex-legacy.tsv kitty-session-enrich "
+        "< /tmp/fake-ls-codex-shell.json "
+        "> /tmp/enriched-codex-shell.json'"
+    )
+    shell_fields = json.loads(
+        dellan.succeed("cat /tmp/enriched-codex-shell.json")
+    )[0]["tabs"][0]["windows"][0]
+    assert "codex_session_id" not in shell_fields
+    assert "claude_session_id" not in shell_fields
+
+    # Restore emits canonical non-picker Codex commands, strips old launch
+    # flags, and never guesses a thread when the exact attachment is absent.
+    cache_dir = "/home/jonathan/.cache/kitty-session"
+    dellan.succeed(f"su - jonathan -c 'mkdir -p {cache_dir}'")
+    codex_restore_snap = json.dumps([{
+        "tabs": [{"windows": [
+            {**json.loads(fake_ls_codex)[0]["tabs"][0]["windows"][0],
+             "codex_session_id": sid_codex},
+            {**json.loads(fake_ls_codex)[0]["tabs"][0]["windows"][1],
+             "codex_session_id": sid_codex_2},
+            {"id": 105, "cwd": "/tmp/codex", "title": "missing-id",
+             "cmdline": ["/bin/zsh"],
+             "foreground_processes": [
+                 {"pid": 34444, "cmdline": ["/usr/bin/codex", "--yolo"]}
+             ]},
+            {"id": 106, "cwd": "/tmp/codex", "title": "invalid-id",
+             "cmdline": ["/bin/zsh"], "codex_session_id": "not-a-uuid",
+             "foreground_processes": [
+                 {"pid": 35555, "cmdline": ["/usr/bin/codex", "--yolo"]}
+             ]},
+        ]}],
+    }])
+    stage_input("/tmp/codex-restore-snap.json", codex_restore_snap)
+    dellan.succeed(
+        "su - jonathan -c 'cp /tmp/codex-restore-snap.json "
+        f"{cache_dir}/snapshot.json'"
+    )
+    codex_resolved = json.loads(dellan.succeed(
+        "su - jonathan -c 'kitty-restore-session --dump-panes'"
+    ))
+    assert codex_resolved[0]["cmd"] == [
+        "/usr/bin/codex", "resume", sid_codex
+    ]
+    assert codex_resolved[1]["cmd"] == [
+        "/usr/bin/codex", "resume", sid_codex_2
+    ]
+    assert all("--yolo" not in p["cmd"] for p in codex_resolved), (
+        "restore replayed an old Codex one-shot flag"
+    )
+    assert codex_resolved[2]["cmd"] == ["/bin/zsh"], (
+        "Codex pane without an exact id must degrade to its original shell"
+    )
+    assert codex_resolved[3]["cmd"] == ["/bin/zsh"], (
+        "Codex pane with an invalid id must not resume or guess a thread"
+    )
+
+    # The Codex-only enrich above pruned the production TSV to Codex wids.
+    # Re-seed the Claude rows used by all existing phases below.
+    for _wid, _input in ((wid_a, "/tmp/hook-a.json"),
+                         (wid_b, "/tmp/hook-b.json")):
+        dellan.succeed(
+            f"su - jonathan -c 'KITTY_WINDOW_ID={_wid} "
+            f"claude-kitty-pane-record < {_input}'"
+        )
 
     # --- 6b: enricher reads TSV and attaches id keyed by kitty window id.
     print("[diag phase6b] TSV right before enricher call:\n"
@@ -556,7 +737,7 @@
         "CLAUDE_CODE_ENTRYPOINT=cli "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
-    dellan.succeed(f"grep -qP '^{wid_a}\\t{sid_a}\\t' {tsv}")
+    dellan.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a}\\t' {tsv}")
 
     # 6f-5: restore-side load_panes refuses to collide. Stage a
     # snapshot.json where two same-cwd claude panes share a cwd but
@@ -888,11 +1069,12 @@
         f"concurrent hooks: expected {parallel_n} rows, got {actual_rows}; "
         f"flock guard missed a write race"
     )
-    # Every row must be well-formed: 4 tab-separated fields, sid is UUID,
+    # Every new row must be well-formed: 5 tab-separated fields, sid is UUID,
     # wid is numeric. Any malformed row indicates a partial-write race.
     bad = dellan.succeed(
         "awk -F'\\t' '"
-        "NF!=4 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9a-f-]+$/ "
+        "NF!=5 || $1 !~ /^[0-9]+$/ || $2 != \"claude\" || "
+        "$3 !~ /^[0-9a-f-]+$/ "
         "{print NR\": \"$0}' "
         f"{tsv} | wc -l"
     ).strip()
