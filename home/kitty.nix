@@ -257,6 +257,30 @@ let
         return cmdline
   '';
 
+  # One source of truth for both Codex classifiers below. The Python
+  # snapshot/enrich/restore path and Bash SessionStart ancestry path must
+  # skip exactly the same value-taking globals before looking for the real
+  # subcommand; drift here turns one-shot children into resumable panes.
+  codexNoninteractiveSubcommands = [
+    "exec" "e" "mcp" "mcp-server" "app-server" "completion"
+    "sandbox" "debug" "apply" "a" "cloud" "login" "logout"
+    "features" "responses-api-proxy" "review" "plugin"
+    "remote-control" "update" "doctor" "archive" "delete"
+    "unarchive" "exec-server" "help"
+  ];
+  codexOptionsWithValue = [
+    "-c" "--config" "-m" "--model" "-p" "--profile"
+    "-s" "--sandbox" "-a" "--ask-for-approval" "-C" "--cd"
+    "--add-dir" "-i" "--image" "--enable" "--disable" "--remote"
+    "--remote-auth-token-env" "--local-provider"
+  ];
+  codexNoninteractiveFlags = [ "-h" "--help" "-V" "--version" ];
+  pythonStringSet = values:
+    "{\n"
+    + lib.concatMapStringsSep "\n"
+      (value: "        ${builtins.toJSON value},") values
+    + "\n    }";
+
   # Shared Python: keep a RESTORED Claude Code pane inside
   # claude-egress.slice, and let every consumer see through the launcher
   # that puts it there.
@@ -362,18 +386,9 @@ let
     # prompt is also an interactive root invocation, so this is a deny-list
     # of known non-TUI subcommands rather than an allow-list of arbitrary
     # prompt text.
-    CODEX_NONINTERACTIVE = {
-        "exec", "e", "mcp", "mcp-server", "app-server", "completion",
-        "sandbox", "debug", "apply", "a", "cloud", "login", "logout",
-        "features", "responses-api-proxy", "review", "plugin",
-        "remote-control", "update", "doctor", "archive", "delete",
-        "unarchive", "exec-server", "help",
-    }
-    CODEX_OPTIONS_WITH_VALUE = {
-        "-c", "--config", "-m", "--model", "-p", "--profile",
-        "-s", "--sandbox", "-a", "--ask-for-approval", "-C", "--cd",
-        "--add-dir",
-    }
+    CODEX_NONINTERACTIVE = ${pythonStringSet codexNoninteractiveSubcommands}
+    CODEX_OPTIONS_WITH_VALUE = ${pythonStringSet codexOptionsWithValue}
+    CODEX_NONINTERACTIVE_FLAGS = ${pythonStringSet codexNoninteractiveFlags}
 
 
     def _is_codex_exe(cmdline):
@@ -403,7 +418,7 @@ let
         """True for Codex TUI root/resume/fork, never exec/services."""
         if not _is_codex_exe(cmdline):
             return False
-        if any(a in {"-h", "--help", "-V", "--version"} for a in cmdline[1:]):
+        if any(a in CODEX_NONINTERACTIVE_FLAGS for a in cmdline[1:]):
             return False
         return _codex_subcommand(cmdline) not in CODEX_NONINTERACTIVE
 
@@ -1817,14 +1832,20 @@ let
             "This pane was restored by kitty after its prior process tree "
             "ended. Any workers or subprocesses from before restore are no "
             "longer running unless they were independently detached.",
+            f"Working directory: {cwd or '(unknown)'}.",
         ]
         deadline = time.time() + RESTORE_BUDGET_S
         counts = _dirty_counts(cwd, deadline)
         if counts is not None:
             changed, staged = counts
             parts.append(
-                f"Working tree at {cwd or '(unknown cwd)'}: {changed} "
-                f"changed file(s), {staged} staged."
+                f"Git working tree: {changed} changed file(s), "
+                f"{staged} staged."
+            )
+        else:
+            parts.append(
+                "Git status unavailable (not a Git working tree or status "
+                "probe failed)."
             )
         parts.append(
             "Treat transcript claims about in-flight work as historical. "
@@ -2044,11 +2065,14 @@ let
         """Atomically replace `path` using a unique private temp file.
 
         mkstemp avoids the predictable `path + ".tmp"` name an attacker
-        could pre-plant as a symlink. The final os.replace changes the
-        directory entry itself rather than following an existing target.
-        0600 because these files hold recovery context or launch metadata.
+        could pre-plant as a symlink. Refuse an existing leaf symlink rather
+        than replacing it: recovery files are fail-closed metadata, and a
+        pre-planted final path must not be accepted as ordinary state. 0600
+        because these files hold recovery context or launch metadata.
         """
         parent = os.path.dirname(path) or "."
+        if os.path.lexists(path) and os.path.islink(path):
+            raise OSError(f"refusing symlink target: {path}")
         fd, tmp = tempfile.mkstemp(
             dir=parent, prefix="." + os.path.basename(path) + "."
         )
@@ -2450,9 +2474,9 @@ let
                   continue
                 fi
                 case "$arg" in
-                  -c|--config|-m|--model|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|--add-dir)
+                  ${lib.concatStringsSep "|" codexOptionsWithValue})
                     skip=1 ;;
-                  exec|e|mcp|mcp-server|app-server|completion|sandbox|debug|apply|a|cloud|login|logout|features|responses-api-proxy|review|plugin|remote-control|update|doctor|archive|delete|unarchive|exec-server|help|-h|--help|-V|--version)
+                  ${lib.concatStringsSep "|" (codexNoninteractiveSubcommands ++ codexNoninteractiveFlags)})
                     printf '%s\n' noninteractive; return ;;
                   resume|fork)
                     printf '%s\n' interactive; return ;;
@@ -3331,6 +3355,29 @@ let
       if [ "\''${1:-}" = "@" ]; then
         exec ${pkgs.kitty}/bin/kitty "\$@"
       fi
+      session_dir="\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session"
+      ${pkgs.coreutils}/bin/install -d -m 700 "\$session_dir"
+      snap="\$session_dir/snapshot.json"
+
+      # Serialize the complete cold-start decision: socket probing, stale
+      # cleanup, TSV reset, note/stub materialization, and topology restore.
+      # A simultaneous wrapper first waits for the winner's socket so it can
+      # join promptly. If the socket is slow, it blocks for the lock and then
+      # makes a fresh decision from the post-restore state.
+      exec 8>"\$session_dir/restore.lock"
+      if ! ${pkgs.util-linux}/bin/flock -n 8; then
+        for _attempt in \$(${pkgs.coreutils}/bin/seq 1 50); do
+          for f in /tmp/kitty.sock-*; do
+            [ -S "\$f" ] || continue
+            if ${pkgs.kitty}/bin/kitty @ --to "unix:\$f" ls >/dev/null 2>&1; then
+              exec ${pkgs.kitty}/bin/kitty -1 "\$@"
+            fi
+          done
+          sleep 0.1
+        done
+        ${pkgs.util-linux}/bin/flock -x 8
+      fi
+
       # Detect a running kitty by probing each socket — a kitty crash can
       # leave stale /tmp/kitty.sock-PID files behind that would otherwise
       # block restore on next launch. pgrep is unsafe here because the
@@ -3348,11 +3395,6 @@ let
         # Stale socket from a crashed instance — clean it up.
         rm -f "\$f"
       done
-      # First-launch restore: spawn kitty-restore-session in the
-      # background to inject panes via kitty-pane-add (preserving the
-      # 2x2 grid pattern), then exec plain kitty. The restore script
-      # waits for kitty's socket to appear before issuing its commands.
-      snap="\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/snapshot.json"
       # Drop the TSV before the new kitty starts: kitty assigns window
       # ids starting at 1 per instance, so the old kitty's wid→sid
       # rows would otherwise alias onto fresh panes in the window
@@ -3374,23 +3416,12 @@ let
       # reader still agree.
       stub="\''${KITTY_STUB_PATH:-\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/stub-session}"
       if [ -s "\$snap" ] && [ "\$live" -eq 0 ]; then
-        # Only one cold-start wrapper may materialize fixed ordinal note
-        # names and construct topology. The restore child inherits this
-        # flock and releases it only after every later pane has been added;
-        # a simultaneous wrapper waits for the winner's socket and joins it.
-        exec 8>"\$(dirname "\$snap")/restore.lock"
-        if ! ${pkgs.util-linux}/bin/flock -n 8; then
-          for _attempt in \$(seq 1 50); do
-            for f in /tmp/kitty.sock-*; do
-              [ -S "\$f" ] || continue
-              if ${pkgs.kitty}/bin/kitty @ --to "unix:\$f" ls >/dev/null 2>&1; then
-                exec ${pkgs.kitty}/bin/kitty -1 "\$@"
-              fi
-            done
-            sleep 0.1
-          done
-          exec ${pkgs.kitty}/bin/kitty -1 "\$@"
-        fi
+        # First-launch restore: spawn kitty-restore-session in the
+        # background to inject panes via kitty-pane-add (preserving the
+        # 2x2 grid pattern), then exec plain kitty. The restore script
+        # waits for kitty's socket to appear before issuing its commands.
+        # It inherits fd 8 and releases the lock only after every later pane
+        # has been added.
         # Write a stub session file containing just pane 0; this makes
         # kitty start directly into our restored topology with no extra
         # default-startup window to clean up. Restore-session, running
@@ -3413,9 +3444,9 @@ let
           exec 8>&-
           exec ${pkgs.kitty}/bin/kitty --session "\$stub" "\$@"
         fi
-        ${pkgs.util-linux}/bin/flock -u 8
-        exec 8>&-
       fi
+      ${pkgs.util-linux}/bin/flock -u 8
+      exec 8>&-
       exec ${pkgs.kitty}/bin/kitty -1 "\$@"
       EOF
       chmod +x $out/bin/kitty

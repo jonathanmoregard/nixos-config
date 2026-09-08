@@ -172,6 +172,13 @@ in
         ("exec", "--json", "task"),
         ("review", "--uncommitted"),
         ("exec-server",),
+        ("--enable", "search", "exec", "--json", "task"),
+        ("--disable", "shell_snapshot", "review", "--uncommitted"),
+        ("--remote", "ssh://worker", "exec-server"),
+        ("--remote-auth-token-env", "CODEX_TOKEN", "mcp-server"),
+        ("--local-provider", "ollama", "app-server"),
+        ("--image", "shot.png", "exec", "task"),
+        ("-i", "shot.png", "review", "--uncommitted"),
     ):
         run_codex_hook(
             wid_codex, "/tmp/hook-codex-nested.json", nested_args
@@ -381,13 +388,50 @@ in
              "cmdline": ["/bin/zsh"], "foreground_processes": [{
                  "cmdline": ["/usr/bin/codex", "mcp-server"]
              }]},
+            {"id": 113, "cwd": "/tmp/enable-exec", "cmdline": ["/bin/zsh"],
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--enable", "search", "exec", "task"
+             ]}]},
+            {"id": 114, "cwd": "/tmp/disable-review", "cmdline": ["/bin/zsh"],
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--disable", "shell_snapshot",
+                 "review", "--uncommitted"
+             ]}]},
+            {"id": 115, "cwd": "/tmp/remote-service", "cmdline": ["/bin/zsh"],
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--remote", "ssh://worker", "exec-server"
+             ]}]},
+            {"id": 116, "cwd": "/tmp/token-service", "cmdline": ["/bin/zsh"],
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--remote-auth-token-env", "CODEX_TOKEN",
+                 "mcp-server"
+             ]}]},
+            {"id": 117, "cwd": "/tmp/provider-service", "cmdline": ["/bin/zsh"],
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--local-provider", "ollama", "app-server"
+             ]}]},
+            {"id": 118, "cwd": "/tmp/image-exec", "cmdline": ["/bin/zsh"],
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--image", "shot.png", "exec", "task"
+             ]}]},
+            {"id": 119, "cwd": "/tmp/image-review", "cmdline": ["/bin/zsh"],
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "-i", "shot.png", "review", "--uncommitted"
+             ]}]},
         ]}],
     }])
     stage_input("/tmp/fake-ls-codex-noninteractive.json", noninteractive_ls)
     stage_input(
         "/tmp/codex-noninteractive.tsv",
         f"{wid_codex}\tcodex\t{sid_codex}\t/tmp/exec\t0\n"
-        f"{wid_codex_2}\tcodex\t{sid_codex_2}\t/tmp/service\t0",
+        f"{wid_codex_2}\tcodex\t{sid_codex_2}\t/tmp/service\t0\n"
+        "113\tcodex\t11111111-aaaa-4111-8111-111111111111\t/tmp/enable-exec\t0\n"
+        "114\tcodex\t22222222-bbbb-4222-8222-222222222222\t/tmp/disable-review\t0\n"
+        "115\tcodex\t33333333-cccc-4333-8333-333333333333\t/tmp/remote-service\t0\n"
+        "116\tcodex\t44444444-dddd-4444-8444-444444444444\t/tmp/token-service\t0\n"
+        "117\tcodex\t55555555-eeee-4555-8555-555555555555\t/tmp/provider-service\t0\n"
+        "118\tcodex\t66666666-ffff-4666-8666-666666666666\t/tmp/image-exec\t0\n"
+        "119\tcodex\t77777777-abab-4777-8777-777777777777\t/tmp/image-review\t0",
     )
     dellan.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
@@ -555,6 +599,43 @@ in
              "foreground_processes": [{
                  "cmdline": ["/usr/bin/codex", "exec-server"]
              }]},
+            {"id": 113, "cwd": "/tmp/enable-exec", "cmdline": ["/bin/zsh"],
+             "codex_session_id": "11111111-aaaa-4111-8111-111111111111",
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--enable", "search", "exec", "task"
+             ]}]},
+            {"id": 114, "cwd": "/tmp/disable-review", "cmdline": ["/bin/zsh"],
+             "codex_session_id": "22222222-bbbb-4222-8222-222222222222",
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--disable", "shell_snapshot",
+                 "review", "--uncommitted"
+             ]}]},
+            {"id": 115, "cwd": "/tmp/remote-service", "cmdline": ["/bin/zsh"],
+             "codex_session_id": "33333333-cccc-4333-8333-333333333333",
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--remote", "ssh://worker", "exec-server"
+             ]}]},
+            {"id": 116, "cwd": "/tmp/token-service", "cmdline": ["/bin/zsh"],
+             "codex_session_id": "44444444-dddd-4444-8444-444444444444",
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--remote-auth-token-env", "CODEX_TOKEN",
+                 "mcp-server"
+             ]}]},
+            {"id": 117, "cwd": "/tmp/provider-service", "cmdline": ["/bin/zsh"],
+             "codex_session_id": "55555555-eeee-4555-8555-555555555555",
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--local-provider", "ollama", "app-server"
+             ]}]},
+            {"id": 118, "cwd": "/tmp/image-exec", "cmdline": ["/bin/zsh"],
+             "codex_session_id": "66666666-ffff-4666-8666-666666666666",
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "--image", "shot.png", "exec", "task"
+             ]}]},
+            {"id": 119, "cwd": "/tmp/image-review", "cmdline": ["/bin/zsh"],
+             "codex_session_id": "77777777-abab-4777-8777-777777777777",
+             "foreground_processes": [{"cmdline": [
+                 "/usr/bin/codex", "-i", "shot.png", "review", "--uncommitted"
+             ]}]},
         ]}],
     }])
     stage_input("/tmp/unsafe-codex-snap.json", unsafe_codex_snap)
@@ -573,8 +654,9 @@ in
     assert unsafe_resolved[3]["cmd"] == ["/bin/zsh"], (
         "duplicate Codex thread ID was resumed in a second pane"
     )
-    assert unsafe_resolved[4]["cmd"] == ["/bin/zsh"]
-    assert unsafe_resolved[5]["cmd"] == ["/bin/zsh"]
+    assert all(p["cmd"] == ["/bin/zsh"] for p in unsafe_resolved[4:]), (
+        "value-taking Codex globals hid a noninteractive subcommand"
+    )
 
     # The Codex-only enrich above pruned the production TSV to Codex wids.
     # Re-seed the Claude rows used by all existing phases below.

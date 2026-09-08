@@ -632,6 +632,7 @@ pkgs.runCommand "kitty-scripts-harness"
       pkgs.coreutils
       pkgs.gnugrep
       pkgs.gnused
+      pkgs.git
       pkgs.jq
       # flock, for the concurrent-reflow assertion (E11).
       pkgs.util-linux
@@ -710,6 +711,62 @@ pkgs.runCommand "kitty-scripts-harness"
       cat "$KITTY_STUB_PATH"
       echo "FAIL(A): pane 0 launch does not carry KITTY_RESTORE_NOTE"
       exit 1; }
+
+    # Codex recovery notes always name the recorded cwd. Git repositories
+    # get a bounded dirty/staged summary; non-Git directories say explicitly
+    # that no status is available instead of silently omitting the cwd.
+    codex_sid=66666666-aaaa-4666-8666-666666666666
+    codex_note_case() { # <label> <cwd>
+      local label="$1" case_cwd="$2"
+      local case_cache="$PWD/fx/codex-$label-cache"
+      local case_state="$PWD/fx/codex-$label-state"
+      mkdir -p "$case_cache/kitty-session"
+      jq -n --arg cwd "$case_cwd" --arg sid "$codex_sid" '
+        [{tabs: [{windows: [{
+          id: 1, cwd: $cwd, title: "codex",
+          cmdline: ["/bin/zsh"], codex_session_id: $sid,
+          foreground_processes: [{cmdline: ["/usr/bin/codex"]}]
+        }]}]}]
+      ' > "$case_cache/kitty-session/snapshot.json"
+      (
+        export XDG_CACHE_HOME="$case_cache"
+        export XDG_STATE_HOME="$case_state"
+        export KITTY_STUB_PATH="$PWD/state/stub-codex-$label"
+        kitty-restore-session --emit-stub
+      )
+      printf '%s\n' "$case_state/claude/kitty-restore/pane-1.md"
+    }
+
+    codex_git_cwd="$PWD/fx/codex-git-work"
+    mkdir -p "$codex_git_cwd"
+    git init -q "$codex_git_cwd"
+    printf 'base\n' > "$codex_git_cwd/tracked"
+    git -C "$codex_git_cwd" add tracked
+    git -C "$codex_git_cwd" -c user.name=Fixture \
+      -c user.email=fixture@example.invalid commit -qm base
+    printf 'dirty\n' >> "$codex_git_cwd/tracked"
+    printf 'staged\n' > "$codex_git_cwd/staged"
+    git -C "$codex_git_cwd" add staged
+    codex_git_note=$(codex_note_case git "$codex_git_cwd")
+    grep -qF "Working directory: $codex_git_cwd." "$codex_git_note" || {
+      cat "$codex_git_note"
+      echo "FAIL(A/Codex): Git note omitted the recorded cwd"; exit 1; }
+    grep -qF 'Git working tree: 2 changed file(s), 1 staged.' \
+      "$codex_git_note" || {
+      cat "$codex_git_note"
+      echo "FAIL(A/Codex): Git note omitted the dirty/staged summary"; exit 1; }
+
+    codex_non_git_cwd="$PWD/fx/codex-non-git-work"
+    mkdir -p "$codex_non_git_cwd"
+    codex_non_git_note=$(codex_note_case non-git "$codex_non_git_cwd")
+    grep -qF "Working directory: $codex_non_git_cwd." \
+      "$codex_non_git_note" || {
+      cat "$codex_non_git_note"
+      echo "FAIL(A/Codex): non-Git note omitted the recorded cwd"; exit 1; }
+    grep -qF 'Git status unavailable (not a Git working tree or status probe failed).' \
+      "$codex_non_git_note" || {
+      cat "$codex_non_git_note"
+      echo "FAIL(A/Codex): non-Git note did not explain missing status"; exit 1; }
 
     # --- Phase A2: the sanitiser's alphabet is kitty's, not wc's ---
     #
@@ -848,14 +905,13 @@ pkgs.runCommand "kitty-scripts-harness"
     unset -f draft_rc kitty kitten
 
     # Atomic note replacement uses unpredictable same-directory temporary
-    # files. A predictable .tmp symlink must neither block a restore nor be
-    # followed, and concurrent writers must leave one complete note.
+    # files. Predictable old .tmp symlinks must neither block a restore nor
+    # be followed, and concurrent writers must leave one complete note.
     atomic_state="$PWD/fx/atomic-state"
     atomic_dir="$atomic_state/claude/kitty-restore"
     mkdir -p "$atomic_dir"
     printf 'canary\n' > state/note-canary
     ln -s "$PWD/state/note-canary" "$atomic_dir/pane-1.md.tmp"
-    ln -s "$PWD/state/note-canary" "$atomic_dir/pane-1.md"
     ln -s "$PWD/state/note-canary" "$atomic_dir/pane-1.md.pending.tmp"
     (
       export XDG_STATE_HOME="$atomic_state"
@@ -879,6 +935,47 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(B): concurrent note writers left partial/mixed content"
       diff -u "$note" "$atomic_note" || true
       exit 1; }
+
+    # Existing leaf symlinks are different from harmless obsolete .tmp
+    # names: the approved boundary refuses both the note and marker target.
+    # The canary must remain untouched and the pane must degrade to a shell.
+    leaf_state="$PWD/fx/leaf-symlink-state"
+    leaf_dir="$leaf_state/claude/kitty-restore"
+    mkdir -p "$leaf_dir"
+    ln -s "$PWD/state/note-canary" "$leaf_dir/pane-1.md"
+    (
+      export XDG_STATE_HOME="$leaf_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-leaf-symlink"
+      kitty-restore-session --emit-stub
+    )
+    [ -L "$leaf_dir/pane-1.md" ] || {
+      echo "FAIL(B): recovery writer replaced an existing note symlink"
+      exit 1; }
+    [ "$(cat state/note-canary)" = canary ] || {
+      echo "FAIL(B): recovery writer followed an existing note symlink"
+      exit 1; }
+    grep -qx launch state/stub-leaf-symlink || {
+      cat state/stub-leaf-symlink
+      echo "FAIL(B): note leaf symlink still launched the agent"; exit 1; }
+
+    marker_state="$PWD/fx/marker-symlink-state"
+    marker_dir="$marker_state/claude/kitty-restore"
+    mkdir -p "$marker_dir"
+    ln -s "$PWD/state/note-canary" "$marker_dir/pane-1.md.pending"
+    (
+      export XDG_STATE_HOME="$marker_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-marker-symlink"
+      kitty-restore-session --emit-stub
+    )
+    [ -L "$marker_dir/pane-1.md.pending" ] || {
+      echo "FAIL(B): recovery writer replaced an existing marker symlink"
+      exit 1; }
+    [ "$(cat state/note-canary)" = canary ] || {
+      echo "FAIL(B): recovery writer followed an existing marker symlink"
+      exit 1; }
+    grep -qx launch state/stub-marker-symlink || {
+      cat state/stub-marker-symlink
+      echo "FAIL(B): marker leaf symlink still launched the agent"; exit 1; }
 
     # Existing state directories are repaired to private mode. A symlink at
     # the restore-directory boundary is refused without touching its target;
@@ -1945,6 +2042,43 @@ pkgs.runCommand "kitty-scripts-harness"
       grep -n 'stub=' "$wrapper_bin" || true
       echo "FAIL(H2): the kitty wrapper still looks for the stub in the"
       echo "  old location, so the writer and the reader disagree."
+      exit 1; }
+
+    # H2b — cold-start serialization begins before socket inspection and
+    # the destructive stale-identity wipe. Hold the production lock, invoke
+    # the real wrapper with a harmless --version command, and observe the
+    # TSV while the contender is blocked. The old wrapper deleted the TSV
+    # before it ever opened restore.lock, so this assertion fails there.
+    wrapper_cache="$PWD/fx/wrapper-order-cache"
+    wrapper_dir="$wrapper_cache/kitty-session"
+    mkdir -p "$wrapper_dir"
+    printf '1\tclaude\t11111111-2222-4333-8444-555555555555\t/tmp\t0\n' \
+      > "$wrapper_dir/pane-sessions.tsv"
+    exec 9>"$wrapper_dir/restore.lock"
+    flock -x 9
+    (
+      export XDG_CACHE_HOME="$wrapper_cache"
+      "$wrapper_bin" --version > state/wrapper-version.out \
+        2> state/wrapper-version.err
+    ) & wrapper_pid=$!
+    sleep 1
+    [ -s "$wrapper_dir/pane-sessions.tsv" ] || {
+      cat state/wrapper-version.err || true
+      echo "FAIL(H2b): wrapper deleted pane-sessions.tsv before acquiring"
+      echo "  restore.lock; simultaneous cold starts can erase fresh rows"
+      exit 1; }
+    flock -u 9
+    exec 9>&-
+    wait "$wrapper_pid" || {
+      cat state/wrapper-version.err || true
+      echo "FAIL(H2b): serialized wrapper did not resume after lock release"
+      exit 1; }
+    [ ! -e "$wrapper_dir/pane-sessions.tsv" ] || {
+      echo "FAIL(H2b): lock holder released but stale identity was not wiped"
+      exit 1; }
+    grep -qi kitty state/wrapper-version.out || {
+      cat state/wrapper-version.out state/wrapper-version.err || true
+      echo "FAIL(H2b): ordinary no-session wrapper invocation did not run"
       exit 1; }
 
     # H3 — and the write itself does not follow a symlink. _write_atomic
