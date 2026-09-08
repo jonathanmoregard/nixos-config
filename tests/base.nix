@@ -88,6 +88,16 @@ let
     print("[ca-probe] OK")
   '';
 
+  # Replace the real multi-week embed command during the background-start
+  # probe. The production unit's Type and systemd lifecycle stay intact; only
+  # ExecStart becomes a bounded sleeping process that the VM can observe.
+  aggregatorEmbedBackgroundProbe = pkgs.writeText
+    "vm-base-aggregator-embed-background.conf" ''
+      [Service]
+      ExecStart=
+      ExecStart=${pkgs.coreutils}/bin/sleep 60
+    '';
+
   # Stand-in for a hand-edited ~/.claude/dcg.toml inside the VM.
   #
   # NOT a copy of the real file, and deliberately no longer claimed to be
@@ -1959,6 +1969,40 @@ in
     # counter that advances just enough to look healthy.
     assert "embed --catchup" in agg_embed_script, (
         f"the embed worker no longer drains the backlog:\n{agg_embed_script}"
+    )
+
+    # START MUST RETURN WHILE THE WORKER KEEPS RUNNING. The real catch-up
+    # takes weeks. A foreground start blocks Home Manager activation, so probe
+    # the same systemctl lifecycle with a bounded sleeper.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user stop aggregator-embed.service'"
+    )
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${aggregatorEmbedBackgroundProbe} "
+        "/home/jonathan/.config/systemd/user/"
+        "aggregator-embed.service.d/background-probe.conf"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user daemon-reload'"
+    )
+    dellan.succeed(
+        "timeout 5 su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start aggregator-embed.service'"
+    )
+    agg_embed_state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show aggregator-embed.service "
+        "-p ActiveState -p SubState -p MainPID'"
+    )
+    assert "ActiveState=active" in agg_embed_state, agg_embed_state
+    assert "SubState=running" in agg_embed_state, agg_embed_state
+    assert "MainPID=0" not in agg_embed_state, agg_embed_state
+    dellan.succeed(
+        "timeout 10 su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user stop aggregator-embed.service'"
     )
 
     # THE SEED UNIT IS HUMAN-TRIGGERED, and must stay that way. It is the one
