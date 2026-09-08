@@ -14,9 +14,8 @@
 #      turned one `launch` directive into 75 lines. kitty then failed
 #      the unterminated launch and opened a `kitten __show_error__`
 #      window instead of the user's claude.
-#   B. Dropping the notice from the stub must not silently drop the
-#      notice: pane 0 still has to receive it as an argv element, the
-#      same way kitty-pane-add hands it to panes 1..N.
+#   B. The notice is a private state file and only an unsent constant
+#      pickup draft reaches the TUI after SessionStart target preflight.
 #   C. That extra error window then shifted kitty-pane-add's 2x2 grid
 #      dispatch by one step (count started at 2, not 1), so every
 #      restored pane stacked into one column.
@@ -50,6 +49,7 @@ let
       "kitty-session-commit"
       "kitty-session-save"
       "kitty-panes-reflow"
+      "claude-kitty-pane-record"
       # The session-restoring `kitty` wrapper itself, so the stub path
       # it READS can be checked against the one the writer emits.
       "kitty-with-session"
@@ -657,6 +657,7 @@ pkgs.runCommand "kitty-scripts-harness"
     SID=$(python3 ${mkFixtures} "$PWD/fx" "$PWD/fakebin")
     export HOME="$PWD/fx/home"
     export XDG_CACHE_HOME="$HOME/.cache"
+    export XDG_STATE_HOME="$PWD/fx/state-home"
     # Never the real /tmp/kitty-stub-session — that file belongs to the
     # user's live kitty.
     export KITTY_STUB_PATH="$PWD/state/stub-session"
@@ -675,19 +676,40 @@ pkgs.runCommand "kitty-scripts-harness"
     grep -q '^launch ' "$KITTY_STUB_PATH" || {
       echo "FAIL(A): stub's single line is not a launch directive"; exit 1; }
 
-    # Sanity: the fixture really does produce a multi-line notice, so
-    # phase A is not passing because there was nothing to break on.
+    # Resume argv is canonical and contains no automatically-submitted
+    # recovery prompt. The note itself proves the rich context still exists.
     kitty-restore-session --dump-panes > state/panes.json
-    jq -e '.[0].cmd | map(select(test("restored by kitty"))) | length == 1' \
+    if jq -e '.[].cmd[]? | select(test("restored by kitty"))' \
+        state/panes.json > /dev/null; then
+      cat state/panes.json
+      echo "FAIL(A): restore still submits its recovery notice as argv"
+      exit 1
+    fi
+    jq -e --arg sid "$SID" \
+      '.[0].cmd == [($ENV.PWD + "/fakebin/claude"), "--resume", $sid]' \
       state/panes.json > /dev/null || {
       cat state/panes.json
-      echo "FAIL(A): fixture pane 0 carries no restore notice — phase A"
-      echo "  would pass vacuously. Fix the fixture, not the assertion."
+      echo "FAIL(A): pane 0 is not the canonical claude --resume UUID argv"
       exit 1; }
-    jq -e '.[0].cmd | map(select(test("\n"))) | length == 1' \
-      state/panes.json > /dev/null || {
-      echo "FAIL(A): fixture notice is single-line — phase A would pass"
-      echo "  vacuously."
+
+    note="$XDG_STATE_HOME/claude/kitty-restore/pane-1.md"
+    [ -f "$note" ] || {
+      echo "FAIL(A): --emit-stub wrote no private recovery note at $note"
+      exit 1; }
+    [ -f "$note.pending" ] || {
+      echo "FAIL(A): the one-shot pickup marker is missing"
+      exit 1; }
+    [ "$(stat -c %a "$(dirname "$note")")" = 700 ] || {
+      echo "FAIL(A): recovery-note directory is not mode 700"; exit 1; }
+    [ "$(stat -c %a "$note")" = 600 ] || {
+      echo "FAIL(A): recovery note is not mode 600"; exit 1; }
+    grep -qF "This pane was restored by kitty" "$note" || {
+      echo "FAIL(A): recovery note omits the restore boundary"; exit 1; }
+    grep -qF "edited 6 file(s):" "$note" || {
+      echo "FAIL(A): recovery note lost the orphan edit details"; exit 1; }
+    grep -qF -- "--env KITTY_RESTORE_NOTE=$note" "$KITTY_STUB_PATH" || {
+      cat "$KITTY_STUB_PATH"
+      echo "FAIL(A): pane 0 launch does not carry KITTY_RESTORE_NOTE"
       exit 1; }
 
     # --- Phase A2: the sanitiser's alphabet is kitty's, not wc's ---
@@ -735,7 +757,7 @@ pkgs.runCommand "kitty-scripts-harness"
         exit 1; }
     done < state/break-labels
 
-    # --- Phase B: pane 0 still receives the notice, as argv ---
+    # --- Phase B: pane 0 receives no prompt argv; hook types one draft ---
     #
     # Driven through the STUB rather than by calling --exec-pane0 bare:
     # the argv kitty parses off the launch line is half of what decides
@@ -751,14 +773,170 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(B): pane 0 did not resume the recorded session"; exit 1; }
     grep -qxF -- "$SID" "$ARGV_OUT" || {
       echo "FAIL(B): pane 0 resumed the wrong session id"; exit 1; }
-    grep -qF "This pane was restored by kitty" "$ARGV_OUT" || {
-      echo "FAIL(B): the restore notice never reached pane 0. Dropping"
-      echo "  it from the stub must not drop it from the pane."
+    [ "$(grep -cxF '===ARG===' "$ARGV_OUT")" -eq 2 ] || {
+      cat "$ARGV_OUT"
+      echo "FAIL(B): pane 0 received extra argv beyond --resume and UUID"
       exit 1; }
-    grep -qF "edited 6 file(s):" "$ARGV_OUT" || {
-      echo "FAIL(B): pane 0's notice lost the orphan block — the"
-      echo "  multi-line part is exactly what must survive the"
-      echo "  line-oriented session file."
+    if grep -qF "restored by kitty" "$ARGV_OUT"; then
+      echo "FAIL(B): recovery context was still submitted as prompt argv"
+      exit 1; }
+
+    # The shared SessionStart recorder confirms this numeric window exists
+    # on this socket before claiming the marker. send-text stdin must be the
+    # exact constant draft bytes, without CR/LF, and the marker is one-shot.
+    printf '[{"tabs":[{"windows":[{"id":77}]}]}]\n' \
+      > state/draft-ls.json
+    printf '{"session_id":"%s","cwd":"%s"}\n' "$SID" "$PWD/fx/work" \
+      > state/draft-hook.json
+    export DRAFT_LS_JSON="$PWD/state/draft-ls.json"
+    export DRAFT_BYTES="$PWD/state/draft-bytes"
+    export DRAFT_CALLS="$PWD/state/draft-calls"
+    : > "$DRAFT_CALLS"
+    draft_rc() {
+      if [ "$4" = ls ]; then cat "$DRAFT_LS_JSON"; return 0; fi
+      if [ "$4" = send-text ]; then
+        printf 'send-text\n' >> "$DRAFT_CALLS"
+        cat > "$DRAFT_BYTES"
+        return 0
+      fi
+      return 2
+    }
+    kitty() { draft_rc "$@"; }
+    kitten() { draft_rc "$@"; }
+    export -f draft_rc kitty kitten
+
+    KITTY_WINDOW_ID=77 KITTY_LISTEN_ON=unix:/fixture \
+      KITTY_RESTORE_NOTE="$note" \
+      claude-kitty-pane-record < state/draft-hook.json
+    python3 -c 'from pathlib import Path; assert Path("state/draft-bytes").read_bytes() == b"Read $KITTY_RESTORE_NOTE."'
+    [ ! -e "$note.pending" ] || {
+      echo "FAIL(B): delivered pickup marker was not consumed"; exit 1; }
+    [ "$(wc -l < "$DRAFT_CALLS")" -eq 1 ] || {
+      echo "FAIL(B): expected exactly one send-text call"; exit 1; }
+
+    # Second SessionStart sees no pending marker and cannot type twice.
+    KITTY_WINDOW_ID=77 KITTY_LISTEN_ON=unix:/fixture \
+      KITTY_RESTORE_NOTE="$note" \
+      claude-kitty-pane-record < state/draft-hook.json
+    [ "$(wc -l < "$DRAFT_CALLS")" -eq 1 ] || {
+      echo "FAIL(B): one-shot pickup was sent more than once"; exit 1; }
+
+    # Re-arm through the real writer, then make preflight omit this window.
+    # send-text itself always exits zero, so target absence must leave the
+    # marker pending and produce no fallback bytes.
+    kitty-restore-session --emit-stub
+    printf '[{"tabs":[{"windows":[{"id":88}]}]}]\n' \
+      > state/draft-ls-miss.json
+    export DRAFT_LS_JSON="$PWD/state/draft-ls-miss.json"
+    before_bytes=$(sha256sum "$DRAFT_BYTES" | cut -d' ' -f1)
+    KITTY_WINDOW_ID=77 KITTY_LISTEN_ON=unix:/fixture \
+      KITTY_RESTORE_NOTE="$note" \
+      claude-kitty-pane-record < state/draft-hook.json \
+      2> state/draft-miss.err
+    after_bytes=$(sha256sum "$DRAFT_BYTES" | cut -d' ' -f1)
+    [ "$before_bytes" = "$after_bytes" ] || {
+      echo "FAIL(B): target-miss preflight still sent terminal bytes"
+      exit 1; }
+    [ "$(wc -l < "$DRAFT_CALLS")" -eq 1 ] || {
+      echo "FAIL(B): send-text ran despite target-miss preflight"; exit 1; }
+    [ -f "$note.pending" ] || {
+      echo "FAIL(B): target-miss preflight consumed the pending marker"
+      exit 1; }
+    grep -qi 'window' state/draft-miss.err || {
+      echo "FAIL(B): target-miss preflight logged no diagnostic"; exit 1; }
+    unset -f draft_rc kitty kitten
+
+    # Atomic note replacement uses unpredictable same-directory temporary
+    # files. A predictable .tmp symlink must neither block a restore nor be
+    # followed, and concurrent writers must leave one complete note.
+    atomic_state="$PWD/fx/atomic-state"
+    atomic_dir="$atomic_state/claude/kitty-restore"
+    mkdir -p "$atomic_dir"
+    printf 'canary\n' > state/note-canary
+    ln -s "$PWD/state/note-canary" "$atomic_dir/pane-1.md.tmp"
+    ln -s "$PWD/state/note-canary" "$atomic_dir/pane-1.md"
+    ln -s "$PWD/state/note-canary" "$atomic_dir/pane-1.md.pending.tmp"
+    (
+      export XDG_STATE_HOME="$atomic_state"
+      kitty-restore-session --emit-stub
+    ) & atomic_one=$!
+    (
+      export XDG_STATE_HOME="$atomic_state"
+      kitty-restore-session --emit-stub
+    ) & atomic_two=$!
+    wait "$atomic_one"
+    wait "$atomic_two"
+    atomic_note="$atomic_dir/pane-1.md"
+    [ -f "$atomic_note" ] || {
+      echo "FAIL(B): concurrent note writers left no final note"; exit 1; }
+    [ ! -L "$atomic_note" ] || {
+      echo "FAIL(B): final recovery note remained a planted symlink"; exit 1; }
+    [ "$(cat state/note-canary)" = canary ] || {
+      echo "FAIL(B): note writer followed a predictable temp symlink"
+      exit 1; }
+    cmp -s "$note" "$atomic_note" || {
+      echo "FAIL(B): concurrent note writers left partial/mixed content"
+      diff -u "$note" "$atomic_note" || true
+      exit 1; }
+
+    # Existing state directories are repaired to private mode. A symlink at
+    # the restore-directory boundary is refused without touching its target;
+    # pane 0 degrades to a plain shell instead of launching an agent whose
+    # pickup note cannot be trusted.
+    mode_state="$PWD/fx/mode-state"
+    mkdir -p "$mode_state/claude/kitty-restore"
+    chmod 755 "$mode_state/claude/kitty-restore"
+    (
+      export XDG_STATE_HOME="$mode_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-mode"
+      kitty-restore-session --emit-stub
+    )
+    [ "$(stat -c %a "$mode_state/claude/kitty-restore")" = 700 ] || {
+      echo "FAIL(B): pre-existing recovery directory was not repaired to 700"
+      exit 1; }
+
+    symlink_state="$PWD/fx/symlink-state"
+    mkdir -p "$symlink_state/claude" state/note-target
+    ln -s "$PWD/state/note-target" \
+      "$symlink_state/claude/kitty-restore"
+    (
+      export XDG_STATE_HOME="$symlink_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-symlink-state"
+      kitty-restore-session --emit-stub
+    )
+    [ ! -e state/note-target/pane-1.md ] || {
+      echo "FAIL(B): recovery writer followed a parent-directory symlink"
+      exit 1; }
+    if grep -qE -- '--exec-pane0|KITTY_RESTORE_NOTE' \
+         state/stub-symlink-state; then
+      cat state/stub-symlink-state
+      echo "FAIL(B): unsafe note directory still launched restored agent"
+      exit 1
+    fi
+
+    # Kitty's session parser expands `$VARS` after tokenization. A literal
+    # dollar or splitlines character in pane 0's state path is therefore
+    # unrepresentable without changing the path. Fail closed on note/draft
+    # injection while still emitting a plain-shell launch stub.
+    dollar_state="$PWD/fx/\$UNSET-state"
+    (
+      export XDG_STATE_HOME="$dollar_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-dollar-state"
+      kitty-restore-session --emit-stub
+    )
+    grep -qx 'launch' state/stub-dollar-state || {
+      cat state/stub-dollar-state
+      echo "FAIL(B): dollar-bearing state path did not degrade to plain shell"
+      exit 1; }
+    line_state=$(printf '%s\n%s' "$PWD/fx/line" state)
+    (
+      export XDG_STATE_HOME="$line_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-line-state"
+      kitty-restore-session --emit-stub
+    )
+    grep -qx 'launch' state/stub-line-state || {
+      cat state/stub-line-state
+      echo "FAIL(B): line-breaking state path did not degrade to plain shell"
       exit 1; }
 
     # --- Phase C: grid dispatch counts real panes only ---
@@ -1547,6 +1725,23 @@ pkgs.runCommand "kitty-scripts-harness"
     [ "$(grep -c '^launch .*_claude_slice' "$KITTY_CMD_LOG")" -eq 1 ] || {
       echo "FAIL(F3): the wrapper was applied to something that is not"
       echo "  claude — over-wrapping poisons the observed cgroup."
+      exit 1; }
+    grep -qF -- "--env KITTY_RESTORE_NOTE=" "$KITTY_CMD_LOG" || {
+      echo "FAIL(F3): a later restored agent pane did not receive its"
+      echo "  recovery-note path through kitty-pane-add."
+      exit 1; }
+
+    # Environment names are data accepted by kitty-pane-add. Reject an
+    # invalid name before issuing any remote-control launch.
+    before_launches=$(wc -l < "$KITTY_CMD_LOG")
+    bad_env_rc=0
+    kitty-pane-add --env 'bad-name=value' -- /bin/sh \
+      2> state/bad-env.err || bad_env_rc=$?
+    [ "$bad_env_rc" -ne 0 ] || {
+      echo "FAIL(F3): kitty-pane-add accepted an invalid environment name"
+      exit 1; }
+    [ "$(wc -l < "$KITTY_CMD_LOG")" -eq "$before_launches" ] || {
+      echo "FAIL(F3): invalid --env still reached kitty remote control"
       exit 1; }
 
     # F4 — every consumer must see THROUGH the launcher. kitty records
