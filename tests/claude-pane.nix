@@ -168,19 +168,24 @@ in
         f'{{"session_id":"{sid_codex_nested}","cwd":"/tmp/codex",'
         '"transcript_path":"/home/jonathan/.codex/sessions/exec.jsonl"}',
     )
-    run_codex_hook(
-        wid_codex, "/tmp/hook-codex-nested.json",
+    for nested_args in (
         ("exec", "--json", "task"),
-    )
-    dellan.succeed(
-        f"grep -qP '^{wid_codex}\\tcodex\\t{sid_codex}\\t' {tsv}"
-    )
-    nested_rows = int(dellan.succeed(
-        f"grep -cP '\\t{sid_codex_nested}\\t' {tsv} || true"
-    ).strip())
-    assert nested_rows == 0, (
-        "a codex exec SessionStart overwrote the main pane mapping"
-    )
+        ("review", "--uncommitted"),
+        ("exec-server",),
+    ):
+        run_codex_hook(
+            wid_codex, "/tmp/hook-codex-nested.json", nested_args
+        )
+        dellan.succeed(
+            f"grep -qP '^{wid_codex}\\tcodex\\t{sid_codex}\\t' {tsv}"
+        )
+        nested_rows = int(dellan.succeed(
+            f"grep -cP '\\t{sid_codex_nested}\\t' {tsv} || true"
+        ).strip())
+        assert nested_rows == 0, (
+            f"codex {nested_args[0]} SessionStart overwrote the main "
+            "pane mapping"
+        )
 
     # Re-invoking the hook for an existing window_id REPLACES the row,
     # doesn't append a duplicate — guards against unbounded TSV growth
@@ -539,6 +544,17 @@ in
             {"id": 110, "cwd": "/tmp/b", "cmdline": ["/bin/zsh"],
              "codex_session_id": sid_codex,
              "foreground_processes": [{"cmdline": ["/usr/bin/codex"]}]},
+            {"id": 111, "cwd": "/tmp/review", "cmdline": ["/bin/zsh"],
+             "codex_session_id": "eeee5555-eeee-4555-8555-eeeeeeeeeeee",
+             "foreground_processes": [{
+                 "cmdline": ["/usr/bin/codex", "review", "--uncommitted"]
+             }]},
+            {"id": 112, "cwd": "/tmp/exec-server",
+             "cmdline": ["/bin/zsh"],
+             "codex_session_id": "ffff6666-ffff-4666-8666-ffffffffffff",
+             "foreground_processes": [{
+                 "cmdline": ["/usr/bin/codex", "exec-server"]
+             }]},
         ]}],
     }])
     stage_input("/tmp/unsafe-codex-snap.json", unsafe_codex_snap)
@@ -557,6 +573,8 @@ in
     assert unsafe_resolved[3]["cmd"] == ["/bin/zsh"], (
         "duplicate Codex thread ID was resumed in a second pane"
     )
+    assert unsafe_resolved[4]["cmd"] == ["/bin/zsh"]
+    assert unsafe_resolved[5]["cmd"] == ["/bin/zsh"]
 
     # The Codex-only enrich above pruned the production TSV to Codex wids.
     # Re-seed the Claude rows used by all existing phases below.

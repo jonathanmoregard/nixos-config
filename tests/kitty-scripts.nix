@@ -641,9 +641,8 @@ pkgs.runCommand "kitty-scripts-harness"
     export PATH="$PWD/fakebin:$PATH"
     mkdir -p fakebin fx state
 
-    # Fake claude: records the argv it was handed, one arg per record,
-    # so an assertion can look for the notice as a real argv element
-    # rather than as text that merely appeared somewhere.
+    # Fake claude records its argv one argument per record. Recovery
+    # context must not appear here: it is picked up manually from a note.
     cat > fakebin/claude <<'STUB'
     #!/bin/sh
     : > "$ARGV_OUT"
@@ -779,7 +778,8 @@ pkgs.runCommand "kitty-scripts-harness"
       exit 1; }
     if grep -qF "restored by kitty" "$ARGV_OUT"; then
       echo "FAIL(B): recovery context was still submitted as prompt argv"
-      exit 1; }
+      exit 1
+    fi
 
     # The shared SessionStart recorder confirms this numeric window exists
     # on this socket before claiming the marker. send-text stdin must be the
@@ -791,6 +791,7 @@ pkgs.runCommand "kitty-scripts-harness"
     export DRAFT_LS_JSON="$PWD/state/draft-ls.json"
     export DRAFT_BYTES="$PWD/state/draft-bytes"
     export DRAFT_CALLS="$PWD/state/draft-calls"
+    export CLAUDE_CODE_ENTRYPOINT=cli
     : > "$DRAFT_CALLS"
     draft_rc() {
       if [ "$4" = ls ]; then cat "$DRAFT_LS_JSON"; return 0; fi
@@ -1657,7 +1658,7 @@ pkgs.runCommand "kitty-scripts-harness"
     # surviving the trip intact.
 
     # F1 — pane 0's recorded launch argv is the slice launcher, with
-    # the resolved claude argv (notice included) inside it.
+    # the exact canonical Claude resume argv inside it and no prompt.
     pane0_json="$XDG_CACHE_HOME/kitty-session/pane0-launch.json"
     echo "--- pane0-launch.json ---"; cat "$pane0_json"; echo
     jq -e '.cmd[0] | endswith("/zsh")' "$pane0_json" > /dev/null || {
@@ -1681,9 +1682,9 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(F1): the recorded claude path is not passed through as"
       echo "  \$0, so the fallback branch has nothing to exec."
       exit 1; }
-    jq -e '.cmd | map(select(test("restored by kitty"))) | length == 1' \
+    jq -e '.cmd | map(select(test("restored by kitty"))) | length == 0' \
       "$pane0_json" > /dev/null || {
-      echo "FAIL(F1): the restore notice did not survive being wrapped."
+      echo "FAIL(F1): recovery context leaked back into argv."
       exit 1; }
     jq -e '.cmd | index("--resume") != null' "$pane0_json" > /dev/null || {
       echo "FAIL(F1): the resume argv did not survive being wrapped."

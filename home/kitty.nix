@@ -141,9 +141,8 @@ let
     # that ONE line. shlex.quote does NOT make a newline safe there --
     # it keeps real newlines inside the quotes -- so a multi-line argv
     # element turns one `launch` into as many directives as the value
-    # has lines. The restore notice is exactly such a value, and
-    # kitty-pane-add hands it to every claude pane, so it comes back in
-    # the pane's live cmdline on the next snapshot too.
+    # has lines. Recovery notes therefore travel as private files named
+    # by a single-line environment value, never as command argv.
     #
     # Measured 2026-09-04 against real kitty 0.48.2 under Xvfb: fed a
     # 12-line session file, kitty opened `kitten __show_error__ --title
@@ -358,6 +357,57 @@ let
         return os.path.basename(cmdline[0]) == "claude"
 
 
+    # Codex has both an interactive TUI and one-shot/service subcommands.
+    # Only the former is a pane that can safely be resumed. A positional
+    # prompt is also an interactive root invocation, so this is a deny-list
+    # of known non-TUI subcommands rather than an allow-list of arbitrary
+    # prompt text.
+    CODEX_NONINTERACTIVE = {
+        "exec", "e", "mcp", "mcp-server", "app-server", "completion",
+        "sandbox", "debug", "apply", "a", "cloud", "login", "logout",
+        "features", "responses-api-proxy", "review", "plugin",
+        "remote-control", "update", "doctor", "archive", "delete",
+        "unarchive", "exec-server", "help",
+    }
+    CODEX_OPTIONS_WITH_VALUE = {
+        "-c", "--config", "-m", "--model", "-p", "--profile",
+        "-s", "--sandbox", "-a", "--ask-for-approval", "-C", "--cd",
+        "--add-dir",
+    }
+
+
+    def _is_codex_exe(cmdline):
+        """True when cmdline[0] is the Codex CLI itself."""
+        return bool(cmdline) and os.path.basename(cmdline[0]) == "codex"
+
+
+    def _codex_subcommand(cmdline):
+        """First non-option Codex argument after known option values."""
+        skip = False
+        for arg in (cmdline or [])[1:]:
+            if skip:
+                skip = False
+                continue
+            if arg == "--":
+                return None
+            if arg in CODEX_OPTIONS_WITH_VALUE:
+                skip = True
+                continue
+            if arg.startswith("-"):
+                continue
+            return arg
+        return None
+
+
+    def _is_codex_exe_interactive(cmdline):
+        """True for Codex TUI root/resume/fork, never exec/services."""
+        if not _is_codex_exe(cmdline):
+            return False
+        if any(a in {"-h", "--help", "-V", "--version"} for a in cmdline[1:]):
+            return False
+        return _codex_subcommand(cmdline) not in CODEX_NONINTERACTIVE
+
+
     def unwrap_slice(cmdline):
         """The claude argv inside a slice launcher, else cmdline.
 
@@ -395,6 +445,21 @@ let
     def _is_claude(cmdline):
         """True when this pane's command is claude, wrapped or not."""
         return _is_claude_exe(unwrap_launchers(cmdline))
+
+
+    def _is_codex(cmdline):
+        """True when this pane's command is an interactive Codex TUI."""
+        return _is_codex_exe_interactive(unwrap_launchers(cmdline))
+
+
+    def _agent_kind(cmdline):
+        """The interactive agent kind under this module's launchers."""
+        inner = unwrap_launchers(cmdline)
+        if _is_claude_exe(inner):
+            return "claude"
+        if _is_codex_exe_interactive(inner):
+            return "codex"
+        return None
 
 
     def slice_launch(cmdline):
@@ -453,7 +518,7 @@ let
         fg = win.get("foreground_processes") or []
         for fp in fg:
             cl = fp.get("cmdline") or []
-            if _is_claude(cl):
+            if _agent_kind(cl):
                 return cl
         wc = unwrap_pane0(win.get("cmdline") or [])
         if wc:
@@ -517,11 +582,13 @@ let
   kittyPaneAdd = pkgs.writers.writePython3Bin "kitty-pane-add" {} ''
     """Add a pane following the 2x2-per-tab grid.
 
-    Usage: kitty-pane-add [--cwd DIR] [--title T] [-- CMD ARGS...]
+    Usage: kitty-pane-add [--cwd DIR] [--title T] [--env NAME=VALUE]
+                          [-- CMD ARGS...]
     """
     import glob
     import json
     import os
+    import re
     import subprocess
     import sys
 
@@ -560,6 +627,7 @@ let
     def parse_args(argv):
         cwd = None
         title = None
+        env = []
         cmd = []
         i = 1
         while i < len(argv):
@@ -570,17 +638,25 @@ let
             elif a == "--title":
                 title = argv[i + 1]
                 i += 2
+            elif a == "--env":
+                spec = argv[i + 1]
+                name, sep, _value = spec.partition("=")
+                if not sep or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+                    print(f"invalid env assignment: {spec}", file=sys.stderr)
+                    sys.exit(2)
+                env.append(spec)
+                i += 2
             elif a == "--":
                 cmd = argv[i + 1:]
                 break
             else:
                 print(f"unknown arg: {a}", file=sys.stderr)
                 sys.exit(2)
-        return cwd, title, cmd
+        return cwd, title, env, cmd
 
 
     def main():
-        cwd, title, cmd = parse_args(sys.argv)
+        cwd, title, env, cmd = parse_args(sys.argv)
         sock = find_socket()
         if not sock:
             print("no live kitty", file=sys.stderr)
@@ -638,6 +714,8 @@ let
             common += ["--cwd", cwd]
         if title:
             common += ["--title", title]
+        for spec in env:
+            common += ["--env", spec]
 
         def run(*xs):
             subprocess.run(["kitty", "@", "--to", sock, *xs], check=True)
@@ -1360,6 +1438,7 @@ let
     import shutil
     import subprocess
     import sys
+    import tempfile
     import time
 
 
@@ -1415,6 +1494,10 @@ let
     RESTORE_BUDGET_S = 3.0
     MAX_FILES_PER_AGENT = 12
     EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+    UUID_RE = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
 
 
     def _last_record(path):
@@ -1564,7 +1647,7 @@ let
 
 
     def restore_notice(proj_dir, sid, cwd=None):
-        """Prompt handed to every restored pane. Never None.
+        """Recovery-note content written for every restored Claude pane.
 
         Unconditional on purpose: the point is to kick the resumed
         session back into the work, and it has no other way to learn its
@@ -1647,21 +1730,13 @@ let
 
 
     def _resume_cmd(claude, sid, proj_dir, cwd=None):
-        """Resume command, plus the restore prompt.
-
-        The probe must never cost a restore: recovering the pane layout
-        matters more than delivering the notice, so every failure path
-        returns the plain resume command.
-        """
-        base = [claude, "--resume", sid]
-        try:
-            notice = restore_notice(proj_dir, sid, cwd)
-        except Exception:
-            return base
-        return base + [notice] if notice else base
+        """Canonical Claude resume argv; recovery context is a note."""
+        return [claude, "--resume", sid]
 
 
-    def maybe_resume_claude(cmd, cwd, session_id, claimed_sids):
+    def maybe_resume_claude(
+        cmd, shell_cmd, cwd, session_id, reserved_sids, used_sids
+    ):
         """If cmd is the claude-code CLI, rewrite to resume the correct
         session. Prefers the per-pane session_id captured at snapshot
         time (TSV populated by the SessionStart hook
@@ -1680,7 +1755,7 @@ let
         fresh rather than wrong-resume. Losing one pane's resume is
         recoverable; merging two panes onto one session corrupts both.
 
-        Mutates `claimed_sids` with the sid this pane ends up using.
+        Mutates `used_sids` with the sid this pane ends up using.
         """
         # Unwrap first: a snapshot taken after a restore records the
         # claude-egress launcher as the pane's command, and the session
@@ -1695,7 +1770,9 @@ let
         if session_id and proj_dir and os.path.isfile(
             os.path.join(proj_dir, f"{session_id}.jsonl")
         ):
-            claimed_sids.add(session_id)
+            if session_id in used_sids:
+                return shell_cmd
+            used_sids.add(session_id)
             return _resume_cmd(cmd[0], session_id, proj_dir, cwd)
         if not proj_dir or not os.path.isdir(proj_dir):
             return cmd
@@ -1709,29 +1786,61 @@ let
         sessions.sort(key=lambda t: t[1], reverse=True)
         for fname, _mtime in sessions:
             candidate = fname.removesuffix(".jsonl")
-            if candidate in claimed_sids:
+            if candidate in reserved_sids or candidate in used_sids:
                 continue
-            claimed_sids.add(candidate)
+            used_sids.add(candidate)
             return _resume_cmd(cmd[0], candidate, proj_dir, cwd)
         return cmd
 
 
+    def maybe_resume_codex(cmd, shell_cmd, session_id, used_sids):
+        """Return an exact canonical Codex resume, or the pane's shell.
+
+        Codex has no cwd-based fallback: without the exact snapshot thread
+        id, guessing can merge two panes. Old launch flags are intentionally
+        discarded rather than replayed around `resume`.
+        """
+        if not _is_codex(cmd):
+            return cmd
+        inner = unwrap_launchers(cmd)
+        if not isinstance(session_id, str) or not UUID_RE.match(session_id):
+            return shell_cmd
+        if session_id in used_sids:
+            return shell_cmd
+        used_sids.add(session_id)
+        return [inner[0], "resume", session_id]
+
+
+    def codex_restore_notice(cwd):
+        """Recovery boundary for a resumed Codex thread."""
+        parts = [
+            "This pane was restored by kitty after its prior process tree "
+            "ended. Any workers or subprocesses from before restore are no "
+            "longer running unless they were independently detached.",
+        ]
+        deadline = time.time() + RESTORE_BUDGET_S
+        counts = _dirty_counts(cwd, deadline)
+        if counts is not None:
+            changed, staged = counts
+            parts.append(
+                f"Working tree at {cwd or '(unknown cwd)'}: {changed} "
+                f"changed file(s), {staged} staged."
+            )
+        parts.append(
+            "Treat transcript claims about in-flight work as historical. "
+            "Verify filesystem and process state before continuing."
+        )
+        return "\n".join(parts)
+
+
     # ---- pane-0 transport ----------------------------------------------
     #
-    # session_token() above keeps every value that DOES go into the stub
-    # on one line, but flattening the restore notice would gut it: the
-    # orphan block is one line per subagent and one per edited file, and
-    # a wall of run-together text is not the message. So the NOTICE does
-    # not travel through the session file. The stub's launch command is
-    # this very script in --exec-pane0 mode, followed by as much of pane
-    # 0's argv as one line can hold (line_argv(), i.e. everything before
-    # the notice); the full argv, notice included, travels in JSON
-    # (where newlines are escaped by construction) and --exec-pane0
-    # execs it after checking that it extends what the launch line said.
-    # Pane 0 then receives the notice as an argv element by exactly the
-    # mechanism panes 1..N get it -- kitty-pane-add's `-- <cmd>
-    # <notice>` -- which is why there is no second notice-delivery path
-    # to keep in sync.
+    # session_token() keeps every value in the stub on one line. Recovery
+    # context is deliberately not argv: emit_stub writes it to a private
+    # state file, sets KITTY_RESTORE_NOTE to that single-line path, and
+    # records the canonical agent argv in pane0_path(). SessionStart then
+    # proves its exact kitty window exists and types the constant unsent
+    # draft `Read $KITTY_RESTORE_NOTE.` once.
     #
     # The argv on the launch line is not redundant with the JSON. kitty
     # reports a window's cmdline as what it SPAWNED, and that is what
@@ -1742,11 +1851,8 @@ let
     # zombie arm of pane_cmd() below keeps working for pane 0 exactly as
     # it does for panes 1..N.
     #
-    # The considered alternative was `kitty @ send-text` once the socket
-    # is up. Rejected: it types into whatever the pane is showing, so it
-    # races claude's TUI coming up and the notice's own newlines read as
-    # submissions -- mangling the one message whose job is to be read
-    # exactly.
+    # send-text is used only by SessionStart, after exact target preflight,
+    # and sends no newline. It cannot auto-submit recovery context.
 
     def cache_dir():
         base = os.environ.get(
@@ -1777,6 +1883,41 @@ let
         return os.environ.get(
             "KITTY_STUB_PATH", os.path.join(cache_dir(), "stub-session")
         )
+
+
+    def note_dir_path():
+        base = os.environ.get(
+            "XDG_STATE_HOME",
+            os.path.join(os.path.expanduser("~"), ".local", "state"),
+        )
+        path = os.path.abspath(os.path.join(base, "claude", "kitty-restore"))
+        # kitty's session parser expands $variables and splits on Python's
+        # full splitlines alphabet. Such a path cannot be transported
+        # byte-for-byte in a one-line --env token, so it is untrusted.
+        if "$" in path or LINEBREAKS.search(path):
+            return None
+        return path
+
+
+    def prepare_note_dir():
+        """Create the private note directory, refusing symlink roots."""
+        path = note_dir_path()
+        if path is None:
+            return None
+        parent = os.path.dirname(path)
+        try:
+            if os.path.lexists(parent) and os.path.islink(parent):
+                return None
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+            if os.path.lexists(path) and os.path.islink(path):
+                return None
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            if os.path.islink(path) or not os.path.isdir(path):
+                return None
+            os.chmod(path, 0o700)
+        except OSError:
+            return None
+        return path
 
 
     def _self_exe():
@@ -1831,7 +1972,7 @@ let
         fg = win.get("foreground_processes") or []
         for fp in fg:
             cl = fp.get("cmdline") or []
-            if _is_claude(cl):
+            if _agent_kind(cl):
                 return cl
         wc = unwrap_pane0(win.get("cmdline") or [])
         if wc:
@@ -1845,16 +1986,18 @@ let
             return []
         with open(snap_path) as fh:
             snap = json.load(fh)
-        # Seed claimed_sids with sids explicitly attached in the snapshot
-        # before resolving any fallback, so an un-enriched same-cwd pane
-        # can't grab a sibling's sid via latest-by-mtime.
-        claimed_sids = set()
+        # Seed reserved Claude ids before resolving any fallback, so an
+        # un-enriched same-cwd pane cannot grab a sibling's exact id via
+        # latest-by-mtime before that sibling is visited.
+        reserved_claude_sids = set()
         for osw in snap:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
                     sid = win.get("claude_session_id")
-                    if sid:
-                        claimed_sids.add(sid)
+                    if isinstance(sid, str) and UUID_RE.match(sid):
+                        reserved_claude_sids.add(sid)
+        used_claude_sids = set()
+        used_codex_sids = set()
         panes = []
         for osw in snap:
             for tab in osw.get("tabs", []):
@@ -1870,48 +2013,106 @@ let
                         continue
                     cmd = pane_cmd(win)
                     cwd = win.get("cwd")
-                    sid = win.get("claude_session_id")
-                    cmd = maybe_resume_claude(cmd, cwd, sid, claimed_sids)
+                    wc = unwrap_pane0(win.get("cmdline") or [])
+                    if wc and _agent_kind(wc) is None:
+                        shell_cmd = wc
+                    else:
+                        shell_cmd = [os.environ.get("SHELL") or "/bin/sh"]
+                    kind = _agent_kind(cmd)
+                    if kind == "claude":
+                        cmd = maybe_resume_claude(
+                            cmd, shell_cmd, cwd,
+                            win.get("claude_session_id"),
+                            reserved_claude_sids, used_claude_sids,
+                        )
+                    elif kind == "codex":
+                        cmd = maybe_resume_codex(
+                            cmd, shell_cmd, win.get("codex_session_id"),
+                            used_codex_sids,
+                        )
                     panes.append({
                         "cwd": cwd,
                         "title": win.get("title", ""),
                         "cmd": cmd,
+                        "agent_kind": kind if _agent_kind(cmd) else None,
+                        "shell_cmd": shell_cmd,
                     })
         return panes
 
 
     def _write_atomic(path, text):
-        """Replace `path` with `text`, refusing to write through a
-        symlink.
+        """Atomically replace `path` using a unique private temp file.
 
-        O_NOFOLLOW on the temp file, because `path + ".tmp"` is the
-        name an attacker gets to plant at: open('w') would truncate
-        whatever the link pointed at and then os.replace would move
-        the LINK into place, leaving kitty executing a file somebody
-        else still owns. 0600 because these hold the user's cwds,
-        window titles, argv and claude session ids.
+        mkstemp avoids the predictable `path + ".tmp"` name an attacker
+        could pre-plant as a symlink. The final os.replace changes the
+        directory entry itself rather than following an existing target.
+        0600 because these files hold recovery context or launch metadata.
         """
-        tmp = path + ".tmp"
-        fd = os.open(
-            tmp,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-            0o600,
+        parent = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(
+            dir=parent, prefix="." + os.path.basename(path) + "."
         )
-        # Explicitly, not just via the open mode: a temp file left
-        # behind by a crashed run keeps whatever mode it already had.
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fd = -1
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+
+    def materialize_note(pane, ordinal):
+        """Write this agent pane's note and one-shot marker."""
+        kind = pane.get("agent_kind")
+        if kind not in {"claude", "codex"}:
+            return None
+        directory = prepare_note_dir()
+        if directory is None:
+            return None
+        try:
+            if kind == "claude":
+                cmd = unwrap_launchers(pane["cmd"])
+                cwd = pane.get("cwd")
+                if len(cmd) >= 3 and cmd[1] == "--resume":
+                    sid = cmd[2]
+                    encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd or "")
+                    proj_dir = os.path.expanduser(
+                        f"~/.claude/projects/{encoded}"
+                    )
+                    text = restore_notice(proj_dir, sid, cwd)
+                else:
+                    text = (
+                        "This pane was restored by kitty after its prior "
+                        "process tree ended. No exact Claude session was "
+                        "safe to resume, so this is a fresh session. Verify "
+                        "filesystem and process state before continuing."
+                    )
+            else:
+                text = codex_restore_notice(pane.get("cwd"))
+            path = os.path.join(directory, f"pane-{ordinal}.md")
+            _write_atomic(path, text + "\n")
+            _write_atomic(path + ".pending", "pending\n")
+            return path
+        except (OSError, IndexError, TypeError):
+            return None
 
 
     def line_argv(cmd):
         """The leading run of `cmd` a session-file line can carry.
 
-        Everything up to the first element holding a line break —
-        which in practice is the whole argv minus the restore notice,
-        always its last element and the one value flattening would gut
-        (see the pane-0 transport note above). Every element kept is
+        Everything up to the first element holding a line break. Recovery
+        notes no longer appear in argv; this still protects arbitrary
+        recorded commands whose executable or arguments contain one of
+        kitty's line separators. Every element kept is
         line-break-free already, so session_token() only quotes it and
         kitty's own shlex hands the exact bytes back. That exactness is
         what lets exec_pane0() match the JSON record against what kitty
@@ -1952,6 +2153,11 @@ let
         A pane with NO recorded command is True, not False: nothing was
         lost, so re-adding it would only open a second empty shell.
         """
+        if pane.get("agent_kind") and prepare_note_dir() is None:
+            # emit_stub intentionally leaves a shell in pane 0 when it
+            # cannot provide the trusted recovery note. Do not re-add the
+            # agent later without the boundary.
+            return True
         cmd = slice_launch(pane["cmd"])
         return not cmd or bool(line_argv(cmd))
 
@@ -1963,9 +2169,9 @@ let
         extra), avoiding a close-window prompt on a spurious startup
         shell. The launch line runs this script in --exec-pane0 mode
         with as much of pane 0's argv as one line can hold; the full
-        argv, restore notice included, goes to pane0_path() and is what
-        --exec-pane0 actually execs. See the pane-0 transport note
-        above for why the notice cannot travel in the session file.
+        canonical argv goes to pane0_path() and is what --exec-pane0
+        actually execs. Recovery context is the private note referenced
+        by KITTY_RESTORE_NOTE, not part of either argv representation.
         """
         panes = load_panes()
         if not panes:
@@ -1982,6 +2188,19 @@ let
             parts += ["--cwd", session_token(p["cwd"])]
         if p["title"]:
             parts += ["--title", session_token(p["title"])]
+        note = materialize_note(p, 1) if p.get("agent_kind") else None
+        if p.get("agent_kind") and note is None:
+            print(
+                "kitty-restore-session: refusing to launch pane 0's "
+                "agent without a trusted recovery note; opening a shell",
+                file=sys.stderr,
+            )
+            cmd = []
+            # Deliberately plain: this is a safe fallback, not a partial
+            # reconstruction that might still carry unrepresentable data.
+            parts = ["launch"]
+        elif note is not None:
+            parts += ["--env", session_token("KITTY_RESTORE_NOTE=" + note)]
         carried = line_argv(cmd)
         if cmd and carried:
             _write_atomic(pane0_path(), json.dumps({
@@ -2045,9 +2264,9 @@ let
         `recorded` is the argv kitty parsed off the stub's launch line
         after the flag — which is also what kitty reports as this
         window's cmdline, so it is authoritative about WHICH pane this
-        is. pane0_path() holds the same argv with the multi-line
-        restore notice still attached, and is used only when it EXTENDS
-        `recorded` exactly. That prefix match is what stops a pane
+        is. pane0_path() holds the same canonical argv and is used only
+        when it EXTENDS `recorded` exactly (for an arbitrary recorded
+        line break). That prefix match is what stops a pane
         launched with some other command from adopting pane 0's
         `claude --resume <sid>` and landing two panes on one session,
         which is the corruption claimed_sids exists to prevent.
@@ -2095,10 +2314,9 @@ let
     def exec_pane0(recorded):
         """Become pane 0's real command, inside the window kitty made.
 
-        Reached only from the stub's launch line. The argv -- restore
-        notice included -- comes from pane0_path(), so a multi-line
-        notice reaches pane 0 as a single argv element exactly as it
-        reaches panes 1..N through kitty-pane-add.
+        Reached only from the stub's launch line. pane0_path() contains
+        the same canonical command, possibly extending the line-safe
+        prefix recorded in the stub. It never contains recovery context.
         """
         cmd = _pane0_cmd(recorded)
         if cmd is None:
@@ -2118,7 +2336,7 @@ let
     def main():
         # Dispatch on argv[1] POSITIONALLY, never `x in sys.argv`:
         # everything after --exec-pane0 is pane 0's own argv, and a
-        # membership test would let a restore notice that merely
+        # membership test would let arbitrary recorded argv that merely
         # mentions --emit-stub re-enter the writer instead of starting
         # the pane.
         mode = sys.argv[1] if len(sys.argv) > 1 else None
@@ -2157,14 +2375,21 @@ let
             print("kitty socket never appeared", file=sys.stderr)
             sys.exit(1)
 
-        for p in panes[first:]:
+        for ordinal, p in enumerate(panes[first:], start=first + 1):
             argv = ["kitty-pane-add"]
             if p["cwd"]:
                 argv += ["--cwd", p["cwd"]]
             if p["title"]:
                 argv += ["--title", p["title"]]
-            if p["cmd"]:
-                argv += ["--", *slice_launch(p["cmd"])]
+            cmd = p["cmd"]
+            if p.get("agent_kind"):
+                note = materialize_note(p, ordinal)
+                if note is None:
+                    cmd = p["shell_cmd"]
+                else:
+                    argv += ["--env", "KITTY_RESTORE_NOTE=" + note]
+            if cmd:
+                argv += ["--", *slice_launch(cmd)]
             subprocess.run(argv, check=False)
 
 
@@ -2172,45 +2397,26 @@ let
         main()
   '';
 
-  # Claude Code SessionStart hook: record (kitty_window_id, session_id, cwd)
-  # to pane-sessions.tsv. Consumed by kitty-session-enrich at snapshot time
-  # to attach a `claude_session_id` to each pane in `kitty @ ls` JSON, so
-  # restore can re-resume the *same* session per pane (not just the latest
-  # one in the cwd).
+  # Claude Code and Codex SessionStart hook: record
+  # (kitty_window_id, agent_kind, session_id, cwd) to pane-sessions.tsv.
+  # kitty-session-enrich joins that identity onto snapshots so restore can
+  # resume the exact Claude session or Codex thread for each pane.
   #
   # Mechanism replaces the earlier /proc/<pid>/fd scan, which assumed
   # `claude` keeps its session jsonl fd open — empirically it does not
   # (open/append/close per write), so the scan returned None and same-cwd
   # panes collapsed onto the latest-by-mtime fallback.
   #
-  # Hook input: JSON on stdin from Claude Code with { session_id, cwd, ... }.
+  # Hook input: JSON on stdin with { session_id, cwd, ... } (and Codex's
+  # transcript_path provenance field).
   # Required env: KITTY_WINDOW_ID (kitty injects this for every launched
   # window). Silent no-op outside kitty so the hook is safe to wire
   # globally.
   claudeKittyPaneRecord = pkgs.writeShellApplication {
     name = "claude-kitty-pane-record";
-    runtimeInputs = with pkgs; [ jq coreutils util-linux gawk ];
+    runtimeInputs = with pkgs; [ jq coreutils util-linux gawk kitty ];
     text = ''
       set -euo pipefail
-
-      # Only the main interactive Claude Code session may write the
-      # TSV. Nested `claude -p` invocations (SDK, agents, the
-      # step-back classifier, etc.) inherit KITTY_WINDOW_ID from the
-      # parent terminal, so their SessionStart hook fires with the
-      # SAME window_id but a fresh subprocess session_id. Without this
-      # gate, the nested write overwrites the main session's row and
-      # kitty restore resumes the subprocess instead of the user's
-      # session (which is exactly the watcher-prompt-on-resume bug
-      # this fix was discovered through).
-      #
-      # CLAUDE_CODE_ENTRYPOINT="cli" = main interactive session.
-      # "sdk-cli" / future values = subprocess; skip. Use the bare-form
-      # default (''${VAR-cli} not ''${VAR:-cli}) so an explicitly empty
-      # value ("") fails the gate instead of falling through to "cli":
-      # empty string is what a misconfigured shell launcher injects,
-      # and we want that to be loud (no TSV write), not silently
-      # treated as the main interactive session.
-      [ "''${CLAUDE_CODE_ENTRYPOINT-cli}" = "cli" ] || exit 0
 
       # Outside kitty → nothing to record.
       [ -n "''${KITTY_WINDOW_ID:-}" ] || exit 0
@@ -2218,13 +2424,92 @@ let
       input=$(cat)
       session_id=$(printf '%s' "$input" | jq -r '.session_id // empty')
       cwd=$(printf '%s' "$input" | jq -r '.cwd // empty')
+      transcript_path=$(
+        printf '%s' "$input" | jq -r '.transcript_path // empty'
+      )
+
+      # Codex exposes no reliable "this is the interactive TUI" hook
+      # variable: CODEX_THREAD_ID is absent from real SessionStart hook
+      # processes, and `codex exec` fires the same event. Walk /proc to
+      # find the owning codex argv and reject every known one-shot or
+      # service subcommand. Unknown positional text remains valid because
+      # a root Codex invocation accepts an arbitrary prompt.
+      classify_codex_parent() {
+        local pid="$PPID" parent comm arg skip
+        local -a args=()
+        while [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ]; do
+          args=()
+          mapfile -d "" -t args < "/proc/$pid/cmdline" 2>/dev/null || true
+          if [ "''${#args[@]}" -gt 0 ]; then
+            comm="''${args[0]##*/}"
+            if [ "$comm" = codex ]; then
+              skip=0
+              for arg in "''${args[@]:1}"; do
+                if [ "$skip" -eq 1 ]; then
+                  skip=0
+                  continue
+                fi
+                case "$arg" in
+                  -c|--config|-m|--model|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|--add-dir)
+                    skip=1 ;;
+                  exec|e|mcp|mcp-server|app-server|completion|sandbox|debug|apply|a|cloud|login|logout|features|responses-api-proxy|review|plugin|remote-control|update|doctor|archive|delete|unarchive|exec-server|help|-h|--help|-V|--version)
+                    printf '%s\n' noninteractive; return ;;
+                  resume|fork)
+                    printf '%s\n' interactive; return ;;
+                  --)
+                    printf '%s\n' interactive; return ;;
+                  -*) ;;
+                  *)
+                    # An arbitrary positional prompt is the root TUI.
+                    printf '%s\n' interactive; return ;;
+                esac
+              done
+              printf '%s\n' interactive
+              return
+            fi
+          fi
+          parent=$(awk '/^PPid:/ { print $2; exit }' "/proc/$pid/status" 2>/dev/null || true)
+          [ -n "$parent" ] || break
+          pid="$parent"
+        done
+        printf '%s\n' none
+      }
+
+      codex_parent=$(classify_codex_parent)
+      case "$codex_parent" in
+        interactive)
+          kind=codex
+          # A codex-looking transcript path is an independent provenance
+          # check: ancestry alone must not let an unrelated descendant
+          # poison this pane's row.
+          case "$transcript_path" in
+            "$HOME"/.codex/sessions/*.jsonl|"$HOME"/.codex/archived_sessions/*.jsonl) ;;
+            *) exit 0 ;;
+          esac
+          ;;
+        noninteractive)
+          exit 0
+          ;;
+        none)
+          # Only the main interactive Claude Code session may write the
+          # TSV. Nested SDK/print invocations inherit KITTY_WINDOW_ID.
+          [ "''${CLAUDE_CODE_ENTRYPOINT-cli}" = "cli" ] || exit 0
+          kind=claude
+          ;;
+      esac
 
       # Reject malformed input — TSV consumers rely on UUID-shaped sids.
       case "$session_id" in
         [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
         *) exit 0 ;;
       esac
-      [ -n "$cwd" ] || exit 0
+      # The registry is exactly one physical line per row. Python's
+      # splitlines() recognizes more separators than LF; reject that full
+      # alphabet plus tab before serialization.
+      printf '%s' "$input" | jq -e '
+        (.cwd | type == "string" and length > 0) and
+        (.cwd | test("[\u0009-\u000d\u001c-\u001e\u0085\u2028\u2029]") | not)
+      ' >/dev/null || exit 0
       # Reject window ids that would corrupt the TSV (tab is field sep).
       case "$KITTY_WINDOW_ID" in
         '''|*[!0-9]*) exit 0 ;;
@@ -2250,21 +2535,69 @@ let
         if [ -f "$tsv" ]; then
           awk -F'\t' -v wid="$KITTY_WINDOW_ID" '$1 != wid' "$tsv" > "$tmp"
         fi
-        printf '%s\t%s\t%s\t%s\n' \
-          "$KITTY_WINDOW_ID" "$session_id" "$cwd" "$(date +%s)" >> "$tmp"
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+          "$KITTY_WINDOW_ID" "$kind" "$session_id" "$cwd" "$(date +%s)" >> "$tmp"
         mv "$tmp" "$tsv"
       ) 9>"$dir/.pane-sessions.lock"
+
+      # Manual recovery-context pickup. Restore puts a private note path
+      # in this pane's environment; SessionStart waits until kitty confirms
+      # this exact numeric window exists, then types one constant draft.
+      # The draft references the env var rather than interpolating the path,
+      # so paths cannot become TUI commands. Every failure is best-effort:
+      # identity recording above remains successful and a pending marker is
+      # retained when the target cannot be proven.
+      deliver_restore_note() {
+        local note="''${KITTY_RESTORE_NOTE:-}"
+        local sock="''${KITTY_LISTEN_ON:-}"
+        [ -n "$note" ] && [ -n "$sock" ] || return 0
+        local state_base="''${XDG_STATE_HOME:-$HOME/.local/state}"
+        local expected="$state_base/claude/kitty-restore"
+        local resolved expected_resolved pending sending ls_json
+        resolved=$(realpath -m -- "$note" 2>/dev/null) || return 0
+        expected_resolved=$(realpath -m -- "$expected" 2>/dev/null) || return 0
+        [ "$(dirname -- "$resolved")" = "$expected_resolved" ] || return 0
+        [[ "$(basename -- "$resolved")" =~ ^pane-[0-9]+[.]md$ ]] || return 0
+        [ -f "$resolved" ] && [ ! -L "$resolved" ] || return 0
+        pending="$resolved.pending"
+        [ -f "$pending" ] && [ ! -L "$pending" ] || return 0
+
+        rc() {
+          if declare -F kitten >/dev/null; then
+            kitten "$@"
+          else
+            timeout 3 kitten "$@"
+          fi
+        }
+        if ! ls_json=$(rc @ --to "$sock" ls 2>/dev/null) ||
+           ! printf '%s' "$ls_json" | jq -e \
+             --argjson wid "$KITTY_WINDOW_ID" \
+             '[.[].tabs[].windows[] | select(.id == $wid)] | length == 1' >/dev/null; then
+          echo "claude-kitty-pane-record: restore-note target window $KITTY_WINDOW_ID not present; leaving marker pending" >&2
+          return 0
+        fi
+
+        sending="$pending.sending.$$"
+        mv -- "$pending" "$sending" 2>/dev/null || return 0
+        # Literal by design: the TUI expands this environment-variable
+        # reference when the user submits the prefilled draft.
+        # shellcheck disable=SC2016
+        if ! printf '%s' 'Read $KITTY_RESTORE_NOTE.' | \
+             rc @ --to "$sock" send-text \
+               --match "id:$KITTY_WINDOW_ID" --stdin >/dev/null 2>&1; then
+          echo "claude-kitty-pane-record: failed to send restore-note draft to window $KITTY_WINDOW_ID" >&2
+        fi
+        rm -f -- "$sending"
+        return 0
+      }
+      deliver_restore_note || true
     '';
   };
 
-  # Enrich `kitty @ ls` JSON with per-pane Claude Code session IDs.
-  # Multiple `claude` panes in the same cwd are indistinguishable from
-  # cmdline+cwd alone (cmdline is just `claude`, cwd matches), so on
-  # restore the latest-by-mtime fallback would collapse them all onto
-  # the same session. To disambiguate, look up each pane's
-  # claude_session_id in pane-sessions.tsv (populated by the Claude Code
-  # SessionStart hook, claude-kitty-pane-record). Keyed by kitty's
-  # `id` field — the same value claude sees as $KITTY_WINDOW_ID.
+  # Enrich `kitty @ ls` JSON with per-pane Claude session or Codex thread
+  # IDs. The typed registry is keyed by kitty's window id; legacy untyped
+  # rows are accepted only when the live foreground agent disambiguates
+  # them.
   #
   # Pruning: TSV entries whose window_id is not in the current live set
   # are removed on every enrich run, keeping the TSV bounded by current
@@ -2272,9 +2605,8 @@ let
   #
   # Exit codes:
   #   0  — enriched JSON written, safe to commit as new snapshot.
-  #   2  — collision risk: at least one cwd has multiple claude panes
-  #         and at least one of them lacks a TSV row (SessionStart
-  #         hook hadn't fired yet when the snapshot tick captured it).
+  #   2  — collision risk: same-kind/same-cwd panes have a missing exact
+  #         row, or a valid (kind, session_id) is duplicated across panes.
   #         The save wrapper treats this as "preserve the prior good
   #         snapshot.json"; persisting the partial would let the
   #         un-enriched pane fall back to latest-by-mtime on restore
@@ -2308,13 +2640,22 @@ let
         r"[0-9a-f]{4}-[0-9a-f]{12}$"
     )
 
+    UNSAFE_TSV_RE = re.compile(
+        r"[\t\n\v\f\r\x1c-\x1e\x85\u2028\u2029]"
+    )
+
 
     ${kittyPane0LaunchPy}
 
     ${claudeSliceLaunchPy}
 
     def load_tsv():
-        """Return {window_id: session_id}. Malformed lines ignored."""
+        """Return {window_id: (kind-or-None, session_id)}.
+
+        Four fields are the legacy Claude-only schema; five fields require
+        an explicit known kind. Reject unknown and extra fields rather than
+        partially reinterpreting them.
+        """
         if not os.path.isfile(TSV_PATH):
             return {}
         out = {}
@@ -2322,12 +2663,24 @@ let
             with open(TSV_PATH) as fh:
                 for line in fh:
                     parts = line.rstrip("\n").split("\t")
-                    if len(parts) < 2:
+                    if len(parts) == 4:
+                        wid, sid = parts[0], parts[1]
+                        kind = None
+                        cwd, timestamp = parts[2], parts[3]
+                    elif len(parts) == 5 and parts[1] in {"claude", "codex"}:
+                        wid, kind, sid = parts[0], parts[1], parts[2]
+                        cwd, timestamp = parts[3], parts[4]
+                    else:
                         continue
-                    wid, sid = parts[0], parts[1]
-                    if not wid.isdigit() or not UUID_RE.match(sid):
+                    if (
+                        not wid.isdigit()
+                        or not UUID_RE.match(sid)
+                        or not cwd
+                        or UNSAFE_TSV_RE.search(cwd)
+                        or not timestamp.isdigit()
+                    ):
                         continue
-                    out[int(wid)] = sid
+                    out[int(wid)] = (kind, sid)
         except OSError:
             return {}
         return out
@@ -2386,13 +2739,12 @@ let
 
 
     def enrich(data):
-        """Annotate each claude pane with its session id. Returns
+        """Annotate each interactive agent pane with its exact id. Returns
         (data, collision_risk) where collision_risk is True when the
         snapshot is partial in a way that would collapse same-cwd
-        sibling panes on restore — i.e. at least one cwd has multiple
-        claude panes and at least one of them lacks a TSV entry. The
-        caller uses this to decide whether to overwrite snapshot.json
-        or preserve the prior good one.
+        sibling panes on restore: a same-kind/same-cwd group is partial,
+        or one exact identity appears in multiple panes. The caller uses
+        this to preserve the prior good snapshot rather than commit risk.
         """
         # Audited 2026-09-04 against the internal-window class that
         # broke kitty-pane-add (`kitten __show_error__`, `kitten ask`):
@@ -2404,7 +2756,8 @@ let
         # Adding a filter here would be dead code, not defence.
         tsv = load_tsv()
         live = set()
-        claude_panes_by_cwd = {}
+        agent_panes_by_cwd = {}
+        identities = {}
         for osw in data:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
@@ -2440,21 +2793,38 @@ let
                     # _is_claude() unwraps: without it the FIRST restore
                     # would strip every pane of its claude identity and
                     # the second would relaunch the orphan.
-                    has_claude = _is_claude(win.get("cmdline")) or any(
-                        _is_claude(fp.get("cmdline")) for fp in fg
-                    )
-                    if not has_claude:
+                    # Codex is recoverable only while a live interactive
+                    # TUI appears in foreground_processes. Unlike Claude,
+                    # its stable window cmdline must not resurrect a dead
+                    # `codex exec`/service. Claude retains the stable arm
+                    # for the known orphaned-MCP zombie case above.
+                    kind = None
+                    for fp in fg:
+                        kind = _agent_kind(fp.get("cmdline"))
+                        if kind:
+                            break
+                    if kind is None and _is_claude(win.get("cmdline")):
+                        kind = "claude"
+                    if kind is None:
                         continue
-                    sid = tsv.get(wid) if isinstance(wid, int) else None
+                    entry = tsv.get(wid) if isinstance(wid, int) else None
+                    sid = None
+                    if entry is not None:
+                        row_kind, row_sid = entry
+                        if row_kind is None or row_kind == kind:
+                            sid = row_sid
                     if sid:
-                        win["claude_session_id"] = sid
+                        win[kind + "_session_id"] = sid
+                        identities[(kind, sid)] = (
+                            identities.get((kind, sid), 0) + 1
+                        )
                     cwd = win.get("cwd") or ""
-                    claude_panes_by_cwd.setdefault(cwd, []).append(sid)
+                    agent_panes_by_cwd.setdefault((kind, cwd), []).append(sid)
         prune_tsv(live)
         collision_risk = any(
             len(sids) > 1 and any(s is None for s in sids)
-            for sids in claude_panes_by_cwd.values()
-        )
+            for sids in agent_panes_by_cwd.values()
+        ) or any(count > 1 for count in identities.values())
         return data, collision_risk
 
 
@@ -2860,14 +3230,11 @@ let
       fi
       [ -z "$json" ] && exit 0
 
-      # Enrich with per-pane Claude session IDs before persisting.
+      # Enrich with exact per-pane Claude/Codex identities before persisting.
       # Exit codes from kitty-session-enrich:
       #   0  — fully enriched, snapshot safe to commit
-      #   2  — partial / collision-risk (multiple same-cwd claude panes
-      #        and at least one lacks a TSV row); the un-enriched pane
-      #        would fall back to latest-by-mtime on restore and collide
-      #        with a sibling. Preserve the prior good snapshot.json
-      #        instead of overwriting it with the dangerous partial.
+      #   2  — partial or duplicate agent identity; preserve the prior
+      #        good snapshot rather than risk two panes resuming one id.
       #   any other non-zero — enricher crashed; preserve prior good
       #        AND fail the unit, see the surfacing rule below.
       #
@@ -2914,8 +3281,7 @@ let
       #        AND fail the unit, see the surfacing rule above.
       #
       # This is a SECOND gate, not a replacement for the enricher's:
-      # rc 2 above (partial snapshot, same-cwd claude panes with a
-      # missing TSV row) still short-circuits before we get here.
+      # rc 2 above (partial/duplicate agent identity) still short-circuits.
       set +e
       kitty-session-commit "$dir" < "$dir/candidate.json.tmp"
       commit_rc=$?
@@ -3008,6 +3374,23 @@ let
       # reader still agree.
       stub="\''${KITTY_STUB_PATH:-\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/stub-session}"
       if [ -s "\$snap" ] && [ "\$live" -eq 0 ]; then
+        # Only one cold-start wrapper may materialize fixed ordinal note
+        # names and construct topology. The restore child inherits this
+        # flock and releases it only after every later pane has been added;
+        # a simultaneous wrapper waits for the winner's socket and joins it.
+        exec 8>"\$(dirname "\$snap")/restore.lock"
+        if ! ${pkgs.util-linux}/bin/flock -n 8; then
+          for _attempt in \$(seq 1 50); do
+            for f in /tmp/kitty.sock-*; do
+              [ -S "\$f" ] || continue
+              if ${pkgs.kitty}/bin/kitty @ --to "unix:\$f" ls >/dev/null 2>&1; then
+                exec ${pkgs.kitty}/bin/kitty -1 "\$@"
+              fi
+            done
+            sleep 0.1
+          done
+          exec ${pkgs.kitty}/bin/kitty -1 "\$@"
+        fi
         # Write a stub session file containing just pane 0; this makes
         # kitty start directly into our restored topology with no extra
         # default-startup window to clean up. Restore-session, running
@@ -3024,9 +3407,14 @@ let
         if ${kittyRestoreSession}/bin/kitty-restore-session --emit-stub \
              && [ -s "\$stub" ]; then
           ( ${kittyRestoreSession}/bin/kitty-restore-session \
-              >/tmp/kitty-restore.log 2>&1 & )
+              >/tmp/kitty-restore.log 2>&1 ) &
+          # The background restore owns fd 8 now. Closing our copy lets its
+          # exit, not the GUI's lifetime, define the critical section.
+          exec 8>&-
           exec ${pkgs.kitty}/bin/kitty --session "\$stub" "\$@"
         fi
+        ${pkgs.util-linux}/bin/flock -u 8
+        exec 8>&-
       fi
       exec ${pkgs.kitty}/bin/kitty -1 "\$@"
       EOF

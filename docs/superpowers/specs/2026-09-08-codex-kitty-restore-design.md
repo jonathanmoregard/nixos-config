@@ -41,10 +41,15 @@ record to include an agent kind:
 kitty_window_id<TAB>agent_kind<TAB>session_id<TAB>cwd<TAB>timestamp
 ```
 
-The hook records `codex` when `CODEX_THREAD_ID` identifies the current Codex
-thread; otherwise it records `claude`. The parser continues accepting the old
-four-column rows. For a legacy row, the live foreground process determines
-which agent owns the UUID.
+The hook records `codex` only when `/proc` ancestry proves the hook descends
+from an interactive Codex CLI and `transcript_path` has the expected
+`~/.codex/sessions/*.jsonl` shape. This is necessary because real Codex
+SessionStart hooks do not receive `CODEX_THREAD_ID`, while `codex exec` fires
+the same hook and must not overwrite the interactive pane row. Known one-shot
+and service subcommands are rejected; root, positional-prompt, `resume`, and
+`fork` invocations are interactive. Otherwise the recorder applies Claude's
+existing entrypoint gate. The parser continues accepting old four-column rows;
+the live foreground process disambiguates their agent kind.
 
 The enricher recognizes interactive `claude` and `codex` processes anywhere in
 `foreground_processes`, while continuing to ignore Kitty UI windows and

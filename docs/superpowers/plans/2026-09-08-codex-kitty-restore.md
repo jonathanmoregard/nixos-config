@@ -34,13 +34,10 @@ sid_codex_2 = "dddd4444-dddd-4444-8444-dddddddddddd"
 wid_codex, wid_codex_2 = 103, 104
 stage_input(
     "/tmp/hook-codex.json",
-    f'{{"session_id":"{sid_codex}","cwd":"/tmp/fake"}}',
+    f'{{"session_id":"{sid_codex}","cwd":"/tmp/fake",'
+    '"transcript_path":"/home/jonathan/.codex/sessions/main.jsonl"}',
 )
-dellan.succeed(
-    f"su - jonathan -c 'KITTY_WINDOW_ID={wid_codex} "
-    f"CODEX_THREAD_ID={sid_codex} "
-    "claude-kitty-pane-record < /tmp/hook-codex.json'"
-)
+run_codex_hook(wid_codex, "/tmp/hook-codex.json")
 dellan.succeed(
     f"grep -qP '^{wid_codex}\\tcodex\\t{sid_codex}\\t' {tsv}"
 )
@@ -193,11 +190,17 @@ Keep `slice_launch` restricted to Claude.
 
 - [ ] **Step 2: Write and parse agent-kind registry rows**
 
-In `claudeKittyPaneRecord`, derive kind without trusting arbitrary input:
+In `claudeKittyPaneRecord`, derive kind without trusting arbitrary input.
+Walk `/proc/$PPID` ancestry to the owning Codex executable, parse its argv,
+and accept interactive root/positional-prompt/`resume`/`fork` invocations only
+when the hook input also carries a Codex session transcript path. Explicitly
+reject `codex exec`, `review`, `exec-server`, and the other one-shot/service
+subcommands. Do not use `CODEX_THREAD_ID`: it is absent from real SessionStart
+hook processes.
 
 ```bash
 kind=claude
-if [ -n "${CODEX_THREAD_ID:-}" ] && [ "$CODEX_THREAD_ID" = "$session_id" ]; then
+if codex_ancestor_is_interactive && codex_transcript_path_is_valid; then
   kind=codex
 fi
 printf '%s\t%s\t%s\t%s\t%s\n' \
