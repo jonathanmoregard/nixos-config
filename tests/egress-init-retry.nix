@@ -68,6 +68,21 @@ pkgs.runCommand "egress-init-retry-harness"
       exit 1
     fi
 
+    grep -q 'chatgpt.com' "$scriptPath" || {
+      echo "FAIL: Codex fallback endpoint chatgpt.com is absent from the guest allowlist."
+      exit 1
+    }
+
+    grep -q 'auth.openai.com' "$scriptPath" || {
+      echo "FAIL: Codex managed-auth refresh endpoint auth.openai.com is absent from the guest allowlist."
+      exit 1
+    }
+
+    grep -q 'api.openai.com' "$scriptPath" || {
+      echo "FAIL: accepted Codex API-key endpoint api.openai.com is absent from the guest allowlist."
+      exit 1
+    }
+
     grep -q "firewall active" out.log || {
       cat out.log
       echo "FAIL: script exited 0 but never reached 'firewall active'"; exit 1; }

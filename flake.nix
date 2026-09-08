@@ -322,6 +322,32 @@
             .microvm.vms.research-agent.config.config
             .systemd.services.research-agent-egress-init.script;
         };
+        research-agent-codex-runtime =
+          let
+            guestPackages = self.nixosConfigurations.dellan.config
+              .microvm.vms.research-agent.config.config
+              .environment.systemPackages;
+          in
+          nixpkgs.lib.throwIfNot (builtins.elem pkgsLinux.codex guestPackages) ''
+            research-agent guest is missing pkgs.codex; Claude quota fallback cannot start.
+          ''
+            (pkgsLinux.runCommand "research-agent-codex-runtime" { } ''
+              test -x ${pkgsLinux.codex}/bin/codex
+              touch $out
+            '');
+        feature-vm-research-source =
+          let
+            launcher = self.apps.${linuxSystem}.feature-vm.program;
+          in
+          pkgsLinux.runCommand "feature-vm-research-source" { } ''
+            grep -q 'RESEARCH_AGENT_WORKTREE' ${launcher}
+            grep -q 'mount_tag=research-agent' ${launcher}
+            if grep -q 'research-agent-js-render' ${launcher}; then
+              echo "feature-vm still mounts a fixed stale research-agent worktree" >&2
+              exit 1
+            fi
+            touch $out
+          '';
         # Not a VM lane: runtime-invocation harness for the research-agent
         # guest's egress-refresh script (atomic-replace + never-shrink
         # contract). Cheap runCommand; seconds, not minutes.
@@ -467,6 +493,29 @@
                 chmod 0700 "$stagingDir"
                 install -m 0400 "$hostKey" "$stagingDir/id_ed25519"
 
+                # Export the actual research-agent checkout selected for this
+                # smoke. The default mirrors production; cross-repo feature
+                # work can point at its exact worktree without rebuilding or
+                # editing feature-vm.nix.
+                researchAgentWorktree="''${RESEARCH_AGENT_WORKTREE:-$HOME/Repos/research-agent}"
+                case "$researchAgentWorktree" in
+                  /*) ;;
+                  *)
+                    echo "[${name}] ERROR: RESEARCH_AGENT_WORKTREE must be absolute: $researchAgentWorktree" >&2
+                    exit 1
+                    ;;
+                esac
+                case "$researchAgentWorktree" in
+                  *,*)
+                    echo "[${name}] ERROR: RESEARCH_AGENT_WORKTREE cannot contain a comma: $researchAgentWorktree" >&2
+                    exit 1
+                    ;;
+                esac
+                if [ ! -f "$researchAgentWorktree/scripts/run-agent.sh" ] || [ ! -d "$researchAgentWorktree/agent" ]; then
+                  echo "[${name}] ERROR: no research-agent checkout at $researchAgentWorktree" >&2
+                  exit 1
+                fi
+
                 TMPDIR="$(mktemp -d -t ${name}.XXXXXX)"
                 export TMPDIR
                 trap 'rm -rf "$TMPDIR"' EXIT INT TERM
@@ -477,12 +526,14 @@
                 controlOpts="-qmp unix:$TMPDIR/qmp.sock,server=on,wait=off"
                 controlOpts="$controlOpts -serial unix:$TMPDIR/serial.sock,server=on,wait=off"
 
-                export QEMU_OPTS="''${QEMU_OPTS:-${displayMode} -snapshot $controlOpts}"
+                researchAgentOpt="-virtfs local,path=$researchAgentWorktree,security_model=mapped-xattr,mount_tag=research-agent"
+                export QEMU_OPTS="''${QEMU_OPTS:-${displayMode} -snapshot $controlOpts} $researchAgentOpt"
 
                 echo "[${name}] tmpdir=$TMPDIR" >&2
                 echo "[${name}] ssh:        ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/id_ed25519 jonathan@localhost" >&2
                 echo "[${name}] qmp:        nix run .#feature-vm-screencap -- $TMPDIR/qmp.sock /tmp/snap.png" >&2
                 echo "[${name}] serial:     socat - UNIX-CONNECT:$TMPDIR/serial.sock" >&2
+                echo "[${name}] research:   $researchAgentWorktree" >&2
 
                 # Don't `exec` — we need bash to stay alive long enough
                 # to run the trap that cleans $TMPDIR on QEMU exit.

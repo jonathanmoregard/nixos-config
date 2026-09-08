@@ -36,6 +36,13 @@
       # worse failure than the drift this exists to fix.
       egressAllowlist = [
         "api.anthropic.com"
+        # Codex fallback endpoints: ChatGPT sessions call chatgpt.com and
+        # refresh managed OAuth tokens through auth.openai.com. The host
+        # loader also accepts Codex's OPENAI_API_KEY auth shape, whose
+        # responses endpoint is api.openai.com.
+        "chatgpt.com"
+        "auth.openai.com"
+        "api.openai.com"
         "api.exa.ai"
         "mcp.exa.ai"
         # api.tavily.com is AWS ELB-backed and its A records rotate on a
@@ -195,6 +202,7 @@
       environment.systemPackages = with pkgs; [
         bubblewrap
         claude-code
+        codex
         (python3.withPackages (ps: with ps; [ curl-cffi ]))
       ];
 

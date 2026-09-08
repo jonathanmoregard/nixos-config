@@ -116,17 +116,6 @@ in
       qemu.options = [
         "-virtfs"
         "local,path=/home/jonathan/.cache/feature-vm/host-ssh,security_model=none,mount_tag=host-ssh"
-        # research-agent worktree → /home/jonathan/Repos/research-agent
-        # inside the feature-vm. Production dellan has the real repo at
-        # that path; in the feature-vm we 9p-mount the host worktree so
-        # the inner microvm's virtiofs share for /workspace has actual
-        # code to run for an E2E research() call.
-        #
-        # Path tracks the worktree currently under test — the scraper
-        # microvm needs `scraper/server.py` from this branch's
-        # research-agent worktree at /workspace/scraper/server.py.
-        "-virtfs"
-        "local,path=/home/jonathan/worktrees/research-agent-js-render,security_model=mapped-xattr,mount_tag=research-agent"
       ];
 
       # Mount the host-ssh 9p export read-only at /mnt/host-ssh.
