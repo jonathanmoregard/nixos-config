@@ -34,11 +34,13 @@
 # `ingest --all` runner and still wires one unit per source, which is what
 # this timer deliberately replaced.
 #
-# Consumes: age.secrets.github-readonly-pat (declared in
-# hosts/dellan/default.nix with owner=jonathan / mode=0400). The PAT is
-# stored raw (no `KEY=` prefix); the wrapper cats + exports it. github is one
-# of the nine sources and still needs GH_TOKEN, so the agenix wrapper stays
-# exactly as it was.
+# GitHub auth comes from gh's existing desktop-keyring OAuth entry. This unit
+# runs as jonathan, so gh reaches the same Secret Service entry as an
+# interactive shell. The wrapper must not export a copied token: an env token
+# shadows gh's keyring and expires independently. The packaged aggregator
+# constrains every GitHub subprocess to `gh api --method GET` and validates
+# each path against its fixed search-endpoint capability before spawning gh,
+# so broad OAuth scopes cannot turn this reader into a write path.
 #
 # NO agenix secret for ticktick, deliberately. The ticktick source reads
 # TICKTICK_ACCESS_TOKEN from the shared ~/.config/todo/env store, which
@@ -51,8 +53,8 @@
 #
 #   1. `OnFailure=aggregator-ingest-failure-notify.service` (systemd).
 #      Fires when the UNIT fails — i.e. the wrapper died before or instead
-#      of producing a run report: unreadable/empty agenix secret, missing
-#      checkout, `uv` broken, TimeoutStartSec reaped a wedged run, OOM kill.
+#      of producing a run report: no usable CA bundle,
+#      TimeoutStartSec reaped a wedged run, OOM kill.
 #      In every one of those cases the aggregator's in-process notifier
 #      never got to run, so without this channel the failure reaches the
 #      journal and nowhere else. Same shape as the sota-watch OnFailure
@@ -163,7 +165,7 @@
 # trust store explicitly cannot inherit a broken one. Removing two
 # Environment= lines to save nothing is how the 2026-08-15 incident would
 # come back through a different interpreter.
-{ config, pkgs, lib, ... }:
+{ pkgs, lib, ... }:
 let
   # The deployed artifact. Store path, pinned rev, no working tree.
   aggregatorBin = lib.getExe pkgs.aggregator;
@@ -187,7 +189,7 @@ let
     echo "aggregator ingest run FAILED — inspect: journalctl --user -u aggregator-ingest.service -n 200"
     if ! ${notifyCommand} -u critical -a aggregator \
       "aggregator ingest FAILED" \
-      "The all-sources ingest run exited non-zero. Likely: unreadable/empty github-readonly-pat, no usable CA bundle, or a run that ended with errors (exit 3). Details: journalctl --user -u aggregator-ingest.service -n 200"; then
+      "The all-sources ingest run exited non-zero. Likely: gh keyring authentication unavailable, no usable CA bundle, or a run that ended with errors (exit 3). Details: journalctl --user -u aggregator-ingest.service -n 200"; then
       echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only"
     fi
   '';
@@ -195,9 +197,9 @@ let
   ingestScript = pkgs.writeShellApplication {
     name = "aggregator-ingest";
     # `gh` is the only external command the aggregator shells out to
-    # (aggregator/sources/github.py). `coreutils` so `cat` does not depend
-    # on whatever PATH the user manager happened to inherit. `libnotify` so
-    # a future edit that spells the notify command bare still resolves it.
+    # (aggregator/sources/github.py). `coreutils` keeps basic wrapper tools
+    # independent of whatever PATH the user manager inherited. `libnotify`
+    # keeps a future bare notify command resolvable.
     #
     # `uv` and `git` are deliberately GONE. They were here to run the CLI
     # out of the developer's checkout; keeping them on PATH would leave the
@@ -205,26 +207,6 @@ let
     runtimeInputs = [ pkgs.gh pkgs.coreutils pkgs.libnotify ];
     text = ''
       set -euo pipefail
-
-      secret_path=${lib.escapeShellArg config.age.secrets.github-readonly-pat.path}
-      if [ ! -r "$secret_path" ]; then
-        echo "aggregator-ingest: secret unreadable at $secret_path (mode/owner?)" >&2
-        exit 1
-      fi
-      # Separate assignment + export so `set -e` catches a read failure.
-      # `export FOO=$(cmd)` masks cmd's exit through the export builtin.
-      token=$(cat "$secret_path")
-      if [ -z "$token" ]; then
-        # Fail loud instead of exporting GH_TOKEN="" — an empty secret
-        # usually means agenix decryption produced a zero-byte file
-        # (wrong recipient, empty plaintext). Silent-degrading to
-        # empty would fall through to `gh auth` (write-capable) which
-        # the aggregator then refuses with WriteCapableTokenError; the
-        # explicit check makes the root cause obvious in the journal.
-        echo "aggregator-ingest: secret at $secret_path is empty" >&2
-        exit 1
-      fi
-      export GH_TOKEN="$token"
 
       # No checkout guard any more, and that absence is the point: the code
       # is a store path in this unit's own closure, so it cannot be missing
@@ -270,7 +252,7 @@ let
 in
 {
   systemd.user.services.aggregator-ingest = {
-    description = "Aggregator: all-sources ingest (agenix-wrapped)";
+    description = "Aggregator: all-sources ingest";
     unitConfig.OnFailure = "aggregator-ingest-failure-notify.service";
     environment = {
       # Presence installs the aggregator's in-process notifier; the value
