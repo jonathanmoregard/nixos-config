@@ -945,7 +945,7 @@ let
               try:
                   os.unlink(tmp_path)
               except FileNotFoundError:
-                  pass
+                  tmp_path = ""
       finally:
           os.close(lock_fd)
     '';
@@ -2395,7 +2395,7 @@ let
             try:
                 os.unlink(tmp)
             except FileNotFoundError:
-                pass
+                tmp = ""
 
 
     def _read_regular(path):
@@ -2478,7 +2478,7 @@ let
             if re.fullmatch(r"generation-[0-9a-f]{32}", candidate):
                 previous = candidate
         except OSError:
-            pass
+            previous = None
 
         for name in os.listdir(root):
             path = os.path.join(root, name)
@@ -2603,7 +2603,7 @@ let
                     os.environ.get("KITTY_RESTORE_TIMEOUT_SECONDS", 30)
                 )
             except ValueError:
-                pass
+                timeout = 30.0
         if not (0.05 <= timeout <= 300.0):
             timeout = 30.0
         deadline = time.monotonic() + timeout
@@ -2753,8 +2753,12 @@ let
         if argv:
             try:
                 os.execvp(argv[0], argv)
-            except OSError:
-                pass
+            except OSError as error:
+                print(
+                    "kitty-restore-session: could not exec recorded safe "
+                    f"shell; opening /bin/sh: {error}",
+                    file=sys.stderr,
+                )
         os.execvp("/bin/sh", ["/bin/sh"])
 
 
@@ -3339,8 +3343,12 @@ let
                 os.replace(sending, pending)
                 os.chmod(pending, 0o600)
                 _fsync_directory(os.path.dirname(note), "draft-rollback")
-            except OSError:
-                pass
+            except OSError as error:
+                print(
+                    "kitty-restore-session: could not roll back draft "
+                    f"claim before send: {error}",
+                    file=sys.stderr,
+                )
             return False
 
         remaining = _remaining(deadline)
@@ -3349,8 +3357,12 @@ let
                 os.replace(sending, pending)
                 os.chmod(pending, 0o600)
                 _fsync_directory(os.path.dirname(note), "draft-rollback")
-            except OSError:
-                pass
+            except OSError as error:
+                print(
+                    "kitty-restore-session: could not roll back expired "
+                    f"draft claim: {error}",
+                    file=sys.stderr,
+                )
             return False
         try:
             subprocess.run(
@@ -3364,8 +3376,12 @@ let
                 capture_output=True,
                 timeout=remaining,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        except (OSError, subprocess.TimeoutExpired) as error:
+            print(
+                "kitty-restore-session: draft send invocation failed: "
+                f"{error}",
+                file=sys.stderr,
+            )
         if (
             os.environ.get("KITTY_RESTORE_TEST") == "1"
             and os.environ.get(
