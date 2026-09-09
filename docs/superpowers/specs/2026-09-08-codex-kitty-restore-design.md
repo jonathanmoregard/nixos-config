@@ -204,10 +204,12 @@ the interactive Codex process in its foreground list and the exact canonical
 `codex resume <UUID>` argv from its manifest entry. A bootstrap-wrapper process
 is never settled, even after `bootstrap-bound`. A failed pane is settled only
 when `bootstrap-failed` exists and the window is running its recorded safe shell
-or has reached the explicit safe-shell failure state. After observing a Codex
-pane settle, the parent runs that pane's draft-delivery state machine. It
-releases the lock only after every pane is settled and every eligible delivery
-attempt has reached a durable marker state.
+or has reached the explicit safe-shell failure state. Terminal settlement is a
+liveness condition: either outcome stops the wait for that pane. Only an exact
+Codex settlement is eligible for draft delivery; a safe-shell settlement leaves
+`.pending` untouched. The parent releases the lock after every pane reaches one
+of the terminal settlement states and every eligible delivery attempt reaches a
+durable marker state.
 
 Socket startup, parent launch-result capture, `expected-window`, bootstrap
 receipt, foreground settlement, and delivery preflight all consume the same
@@ -221,12 +223,17 @@ still prove it belongs to that entry; ambiguous windows are left untouched.
 Abandoned generation files rotate under the existing retention policy.
 
 The guard keeps the prior `snapshot.json` and `last.session` authoritative after
-any detected failure or abrupt parent exit. Only a fully settled cold restore
-removes it, immediately before releasing the lock; failure to remove it is
-itself a logged incomplete restore. A later cold restore may replace the guard
-while holding the lock and try again. Every exit path uses a `finally`
-equivalent to release `restore.lock`, including timeout and cleanup failure, so
-a dead wrapper cannot retain the lock forever.
+any detected failure or abrupt parent exit. Successful restore completion is
+stricter than terminal settlement: every planned Codex pane must settle as its
+exact intended `codex resume <UUID>`, and every other required pane launch must
+succeed. Only that all-success outcome removes the guard immediately before
+releasing the lock. Any `bootstrap-failed` or safe-shell settlement is terminal
+for waiting and permits lock release, but marks the restore unsuccessful and
+keeps the guard and prior snapshots intact. Failure to remove the guard after an
+otherwise successful restore is itself a logged incomplete restore. A later
+cold restore may replace the guard while holding the lock and try again. Every
+exit path uses a `finally` equivalent to release `restore.lock`, including
+timeout and cleanup failure, so a dead wrapper cannot retain the lock forever.
 
 `kitty-session-save` opens that same cache-directory lock before socket
 discovery or `kitty @ ls` and takes it non-blockingly. If restore owns it, the
@@ -357,32 +364,37 @@ Development follows test-driven order.
    failed stage, leave the draft unclaimed, preserve the prior snapshot through
    `restore-incomplete`, clean only unambiguously owned partial state/windows,
    and release `restore.lock`.
-8. Add deterministic delivery seams immediately before invoking `send-text` and
+8. Force one planned Codex pane to write `bootstrap-failed` and settle as its
+   recorded safe shell. Assert that this terminal state stops the wait and
+   releases `restore.lock`, so a saver can acquire it, but does not count as
+   successful restore completion: `restore-incomplete` remains, the saver
+   publishes nothing, and the prior exact snapshot and backups remain intact.
+9. Add deterministic delivery seams immediately before invoking `send-text` and
    immediately after it returns. A handled pre-send failure returns `.sending`
    to `.pending` with zero send calls. An interruption after the send boundary
    leaves `.sending`; reconciliation changes it to `.uncertain`, and a later
    invocation makes no second send. Both paths retain the exact typed mapping.
-9. Simulate the window disappearing after the successful `kitty @ ls` preflight
+10. Simulate the window disappearing after the successful `kitty @ ls` preflight
    but before or during `send-text`. Assert `.uncertain`, no delivered claim,
    no mapping loss, and no automatic duplicate input even if `send-text` exits
    zero. The success control asserts the draft bytes are exactly
    `Read $KITTY_RESTORE_NOTE.` with no carriage return or newline.
-10. Create a smaller second restore generation after a larger topology. Assert
+11. Create a smaller second restore generation after a larger topology. Assert
    that only the new ordinals are active, stale `.pending`, `.sending`, and
    `.uncertain` files are reconciled and rotated or pruned under the restore
    lock, abandoned temporary state is removed, and the two-generation bound is
    enforced.
-11. Keep all existing Claude collision, zombie-pane, pane-zero, topology,
+12. Keep all existing Claude collision, zombie-pane, pane-zero, topology,
    retention, and egress-slice tests green.
-12. Build the affected `vm-claude-pane` and `vm-kitty` check lanes locally.
-13. Because this changes branching and multistep restore scripts, repeat the
+13. Build the affected `vm-claude-pane` and `vm-kitty` check lanes locally.
+14. Because this changes branching and multistep restore scripts, repeat the
    full `nixos-agent-testing` dual-client smoke against real Kitty in the
    feature VM. Restore one Claude and one Codex pane; verify both exact IDs,
    the Codex typed mapping before any hook or transcript update, UUID retention
    across a periodic save, and the exact pickup draft visible but unsent in
    both panes with no transcript turn. Exercise erasing one draft and manually
    submitting the other.
-14. Run the configured preflight/evaluation checks and independent close-out
+15. Run the configured preflight/evaluation checks and independent close-out
    review before committing, pushing, and opening the PR.
 
 ## Out of scope
