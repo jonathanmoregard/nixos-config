@@ -155,12 +155,21 @@ Every restored Codex pane launches an in-pane bootstrap wrapper, never
 `codex resume` directly. The wrapper receives the private generation token,
 ordinal, and note path in its environment and independently carried exact argv
 for both the intended resume and the recorded safe shell. It requires `current`
-to name that generation and the manifest to contain exactly one matching
-ordinal whose kind, UUID, cwd, note path, and canonical argv all match. It then
-reads the numeric `KITTY_WINDOW_ID` that Kitty injected into the process it
-actually spawned. This self-observed ID, not a parent-side lookup, is the
-authoritative registry key. The independently carried shell argv remains
-available even when the manifest cannot be trusted.
+to name that generation, the token to match it, and the explicit ordinal to
+select one structurally valid manifest entry. Only after those checks establish
+a unique receipt target and binding may the wrapper trust that entry's recorded
+safe shell or write a receipt into its generation. It then compares both
+independently carried argv values against the entry and reads the numeric
+`KITTY_WINDOW_ID` that Kitty injected into the process it actually spawned.
+This self-observed ID, not a parent-side lookup, is the authoritative registry
+key.
+
+A failure before that binding boundary—including a missing or stale token, a
+missing or wrong ordinal, or a top-level, `panes`, or entry structure that
+prevents unique binding—logs locally, leaves every note marker untouched,
+writes no bootstrap receipt, and execs fixed `/bin/sh`. Neither a generation
+chosen by untrusted input nor caller-carried fallback argv is trusted on this
+path.
 
 Pane zero keeps its existing one-line session-file transport. `emit_stub`
 extends the mode-`0600` `pane0-launch.json` record with the generation token,
@@ -181,9 +190,16 @@ row under the pane-session lock. It then writes atomic `bootstrap-bound` and
 `execvp`s the exact manifest argv. `bootstrap-bound` is deliberately
 intermediate: it proves the row is durable, but does not prove that the exec
 happened or that Codex is the foreground process. The wrapper never performs
-draft delivery itself. Any numeric-ID, token, ordinal, manifest, intended-argv,
-cross-check, or registry failure leaves `.pending`, writes `bootstrap-failed`,
-and execs the recorded safe shell instead of Codex.
+draft delivery itself.
+
+After the binding boundary, a note, independently carried argv, numeric window,
+`expected-window`, registry, or bound-receipt failure leaves `.pending`, writes
+`bootstrap-failed` where possible, and execs the manifest-recorded safe shell
+instead of Codex. If that failure receipt cannot itself persist, the parent
+observes no terminal receipt and handles the pane through the same bounded
+deadline. This post-binding behavior does not weaken the pre-binding rule:
+untrusted token, ordinal, or manifest structure never selects a receipt path or
+fallback command.
 
 SessionStart remains the authority for ordinary starts and Claude restore. A
 later real Codex hook may replace the launcher-written row by the same window-ID
@@ -209,7 +225,13 @@ liveness condition: either outcome stops the wait for that pane. Only an exact
 Codex settlement is eligible for draft delivery; a safe-shell settlement leaves
 `.pending` untouched. The parent releases the lock after every pane reaches one
 of the terminal settlement states and every eligible delivery attempt reaches a
-durable marker state.
+durable marker state, or after the shared deadline ends an unsettled
+pre-binding failure.
+
+A pre-binding failure has no receipt and therefore is not a failed-pane
+settlement. The parent reaches its bounded deadline, preserves the prior
+snapshot and `restore-incomplete`, leaves all note markers untouched, and
+releases `restore.lock` through the normal timeout path.
 
 Socket startup, parent launch-result capture, `expected-window`, bootstrap
 receipt, foreground settlement, and delivery preflight all consume the same
@@ -227,13 +249,15 @@ any detected failure or abrupt parent exit. Successful restore completion is
 stricter than terminal settlement: every planned Codex pane must settle as its
 exact intended `codex resume <UUID>`, and every other required pane launch must
 succeed. Only that all-success outcome removes the guard immediately before
-releasing the lock. Any `bootstrap-failed` or safe-shell settlement is terminal
-for waiting and permits lock release, but marks the restore unsuccessful and
-keeps the guard and prior snapshots intact. Failure to remove the guard after an
-otherwise successful restore is itself a logged incomplete restore. A later
-cold restore may replace the guard while holding the lock and try again. Every
-exit path uses a `finally` equivalent to release `restore.lock`, including
-timeout and cleanup failure, so a dead wrapper cannot retain the lock forever.
+releasing the lock. A post-binding `bootstrap-failed` plus safe-shell settlement
+is terminal for waiting and permits lock release, but marks the restore
+unsuccessful and keeps the guard and prior snapshots intact. A pre-binding
+failure reaches the same unsuccessful result only through the bounded timeout,
+not a receipt. Failure to remove the guard after an otherwise successful restore
+is itself a logged incomplete restore. A later cold restore may replace the
+guard while holding the lock and try again. Every exit path uses a `finally`
+equivalent to release `restore.lock`, including timeout and cleanup failure, so
+a dead wrapper cannot retain the lock forever.
 
 `kitty-session-save` opens that same cache-directory lock before socket
 discovery or `kitty @ ls` and takes it non-blockingly. If restore owns it, the
@@ -306,8 +330,11 @@ act immediately and therefore violates the required manual decision point.
 - The typed text is constant; note contents and paths are never interpolated
   into terminal input.
 - Missing or malformed recovery state cannot prevent Kitty from opening a pane.
-  An identity-critical Codex bootstrap failure degrades that pane to the safe
-  shell rather than starting a resume whose exact mapping cannot be preserved.
+  Before a unique active-generation/ordinal binding exists, the wrapper writes
+  no receipt and execs fixed `/bin/sh`; it never trusts caller-carried fallback
+  argv. After that binding exists, a later validation or persistence failure may
+  write `bootstrap-failed` and exec the manifest-recorded safe shell. Neither
+  path starts a resume whose exact mapping cannot be preserved.
 - A Codex UUID is bootstrapped only from the valid `codex_session_id` attached
   to the exact snapshot pane being restored; there is no latest-by-mtime
   fallback for Codex.
@@ -342,10 +369,19 @@ Development follows test-driven order.
    recorded UUID as `codex_session_id`.
 4. Exercise the bootstrap token, active manifest, ordinal, note-path,
    canonical-argv, and Kitty-injected-ID checks for pane zero and a later pane.
-   The later-pane control must also match the parent's launch-returned ID. A
-   unique valid binding starts the exact resume; any missing, stale, malformed,
-   mismatched, or ambiguous input claims no marker, writes `bootstrap-failed`,
-   and execs the recorded safe shell rather than Codex.
+   Give two panes distinct UUIDs and ordinals but the same safe-shell argv; both
+   must bind their exact ordinal. The later-pane control must also match the
+   parent's launch-returned ID. A unique valid binding starts the exact resume.
+   Missing/stale token, missing/wrong ordinal, and malformed top-level,
+   `panes`, or entry structure that prevents unique binding must write no
+   receipt, leave every note marker untouched, avoid caller-carried fallback,
+   and exec fixed `/bin/sh`. Once token, ordinal, and a structurally valid entry
+   establish a trusted binding, note/argv/window/`expected-window`/registry or
+   bound-receipt failure must leave `.pending`, write `bootstrap-failed` where
+   possible, and exec the manifest-recorded safe shell. If the failure receipt
+   cannot persist, assert that the parent reaches the finite deadline,
+   preserves the prior snapshot and `restore-incomplete`, and releases the
+   lock.
 5. Pause a later in-pane wrapper after Kitty creates its window but before it
    writes the registry row. Start `kitty-session-save` and assert that its
    nonblocking `restore.lock` acquisition exits zero without creating a

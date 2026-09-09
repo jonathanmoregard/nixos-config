@@ -339,9 +339,10 @@ commands rather than generic “tests pass” wording.
 
 Extend the existing fake-Kitty harness with two Codex panes and deliberately do
 not invoke `claude-kitty-pane-record` after either `codex resume` launch. Give
-each pane a distinct recorded UUID, safe-shell argv, ordinal, and fake
-Kitty-injected window ID. The parent-side launch log must contain the bootstrap
-wrapper, never direct Codex:
+each pane a distinct recorded UUID, ordinal, and fake Kitty-injected window ID,
+but give both panes the same safe-shell argv. This proves the ordinal, rather
+than a commonly shared shell command, selects the binding. The parent-side
+launch log must contain the bootstrap wrapper, never direct Codex:
 
 ```bash
 if jq -e '.argv | index("codex") and index("resume")' \
@@ -385,13 +386,26 @@ test ! -e state/codex-exec-called
 Release the seam and assert the executed argv is exactly
 `codex resume <UUID>`, with no prompt or replayed flags.
 
-- [ ] **Step 4: Assert every identity failure degrades to safe shell**
+- [ ] **Step 4: Assert pre-binding and post-binding failures separately**
 
 Run independent cases for missing/malformed window ID, stale generation token,
-wrong ordinal, altered note path, altered resume argv, missing/mismatched
-`expected-window`, and registry-writer failure. Each case must create
-`bootstrap-failed`, leave the note `.pending`, omit `codex` from the exec log,
-and execute the recorded safe shell.
+wrong ordinal, malformed top-level/`panes`/entry structures, altered note path,
+altered resume and safe-shell argv, missing/mismatched `expected-window`,
+registry-writer failure, and bound-receipt publication failure.
+
+Missing/stale token, missing/wrong ordinal, and malformed structure that
+prevents selection of one valid manifest entry are pre-binding failures. Assert
+that they create no receipt, leave every note marker untouched, log without a
+traceback, never execute caller-carried fallback argv, and exec fixed `/bin/sh`.
+The parent must observe the absent receipt, reach its bounded deadline, preserve
+the prior snapshot and `restore-incomplete`, and release `restore.lock`.
+
+Once the active token, unique ordinal, and structurally valid manifest entry
+establish a trusted binding, note/argv/window/`expected-window`/registry or
+bound-receipt failure is post-binding. Assert that it leaves `.pending`, writes
+`bootstrap-failed` where possible, omits Codex from the exec log, and executes
+the manifest-recorded safe shell. If the receipt itself cannot persist, assert
+that the parent handles the missing receipt through the same bounded timeout.
 
 - [ ] **Step 5: Run RED and commit**
 
@@ -450,8 +464,16 @@ through the same bootstrap function. Validate active token, manifest binding,
 exact independently carried resume/safe-shell argv, note path, ordinal, and
 Kitty's own numeric `KITTY_WINDOW_ID`. Later panes also wait for and match the
 atomic `expected-window` result. On success, call the shared registry writer,
-write `bootstrap-bound`, then `execvp` exact Codex argv. On identity or writer
-failure, write `bootstrap-failed` and `execvp` the recorded safe shell.
+write `bootstrap-bound`, then `execvp` exact Codex argv.
+
+Do not choose a receipt path or fallback from untrusted input. Before the active
+token, unique ordinal, and structurally valid manifest entry establish a
+binding, failure logs locally, leaves every note marker untouched, writes no
+receipt, and execs fixed `/bin/sh`. After that boundary, a note, argv, window,
+`expected-window`, registry, or bound-receipt failure writes
+`bootstrap-failed` where possible and `execvp`s the manifest-recorded safe
+shell. A failed receipt write leaves the parent to resolve the absent receipt at
+the shared deadline.
 
 - [ ] **Step 4: Run focused GREEN checks**
 
@@ -503,10 +525,12 @@ later process can acquire it.
 
 - [ ] **Step 3: Separate terminal failure from successful completion**
 
-Make one pane write `bootstrap-failed` and settle in its safe shell. Assert the
-parent stops waiting and releases the lock, but keeps `restore-incomplete` and
-the prior exact snapshot. A saver after lock release must still skip
-publication while the guard exists.
+Make one post-binding pane write `bootstrap-failed` and settle in its
+manifest-recorded safe shell. Assert the parent stops waiting and releases the
+lock, but keeps `restore-incomplete` and the prior exact snapshot. A saver after
+lock release must still skip publication while the guard exists. Keep the
+pre-binding control receipt-free and assert it exits only through the bounded
+timeout path.
 
 - [ ] **Step 4: Extend real-X topology coverage**
 
@@ -548,16 +572,20 @@ Compute one `time.monotonic() + timeout` deadline, using production 30 seconds
 and only honoring `KITTY_RESTORE_TIMEOUT_SECONDS` in the generated test path.
 Every socket, launch-return, expected-window, receipt, foreground, and preflight
 wait consumes the remaining budget. Observe exact `codex resume <UUID>` as
-successful settlement; observe `bootstrap-failed` plus safe shell as terminal
-failure. Release the lock from a `finally` path on every exit.
+successful settlement; observe a post-binding `bootstrap-failed` plus the
+manifest-recorded safe shell as terminal failure. A pre-binding failure has no
+receipt: assert that the parent times it out, preserves the prior snapshot and
+`restore-incomplete`, leaves note markers untouched, and still releases the
+lock from a `finally` path.
 
 - [ ] **Step 3: Preserve prior snapshots on incomplete restore**
 
 Remove `restore-incomplete` only when every Codex pane settles on exact intended
-argv and every other required pane launch succeeds. Timeout, vanished windows,
-safe-shell settlement, cleanup failure, or guard-removal failure keeps the
-guard and prior `snapshot.json`/`last.session` authoritative. Close partial
-windows only when returned/self-reported ID and bootstrap argv prove ownership.
+argv and every other required pane launch succeeds. Pre-binding timeout,
+vanished windows, post-binding manifest-safe-shell settlement, cleanup failure,
+or guard-removal failure keeps the guard and prior
+`snapshot.json`/`last.session` authoritative. Close partial windows only when
+returned/self-reported ID and bootstrap argv prove ownership.
 
 - [ ] **Step 4: Implement honest draft marker transitions**
 
