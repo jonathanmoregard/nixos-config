@@ -2638,25 +2638,108 @@ pkgs.runCommand "kitty-scripts-harness"
     chmod +x fakebin/codex fakebin/bootstrap-safe-shell
     codex_bin="$PWD/fakebin/codex"
     safe_bin="$PWD/fakebin/bootstrap-safe-shell"
+    bootstrap_bin=$(command -v kitty-restore-session)
+    resume_json=$(jq -nc --arg codex "$codex_bin" --arg sid "$sid_later" \
+      '[$codex, "resume", $sid]')
+    safe_json=$(jq -nc --arg safe "$safe_bin" '[$safe, "shared"]')
 
     jq -n \
       --arg cwd "$bootstrap_work" --arg codex "$codex_bin" \
       --arg safe "$safe_bin" --arg sid0 "$sid_zero" \
-      --arg sid2 "$sid_later" '
+      --arg sid2 "$sid_later" --arg restore "$bootstrap_bin" \
+      --arg resume "$resume_json" --arg safeJson "$safe_json" '
       [{tabs: [{layout: "splits", windows: [
         {id: 1, cwd: $cwd, title: "codex zero",
          cmdline: [$safe, "shared"], codex_session_id: $sid0,
          foreground_processes: [{cmdline: [$codex]}]},
         {id: 2, cwd: $cwd, title: "codex later",
-         cmdline: [$safe, "shared"], codex_session_id: $sid2,
-         foreground_processes: [{cmdline: [$codex, "--dangerously-bypass-approvals-and-sandbox"]}]}
+         cmdline: [$restore, "--bootstrap", $resume, $safeJson],
+         codex_session_id: $sid2,
+         foreground_processes: [{cmdline: [$codex, "resume", $sid2]}]}
       ]}]}]
     ' > "$bootstrap_cache/kitty-session/snapshot.json"
+    bootstrap_snapshot="$bootstrap_cache/kitty-session/snapshot.json"
+    cp "$bootstrap_snapshot" state/bootstrap-snapshot-good.json
 
     export XDG_CACHE_HOME="$bootstrap_cache"
     export XDG_STATE_HOME="$bootstrap_state"
     export KITTY_STUB_PATH="$PWD/state/bootstrap-stub"
     export KITTY_RESTORE_TIMEOUT_SECONDS=12
+
+    # A snapshot taken after restoring a later Codex pane sees the exact
+    # Codex resume in foreground_processes, but Kitty still reports the
+    # bootstrap wrapper it spawned in window.cmdline. Loading must keep
+    # identity from the foreground/session binding while independently
+    # recovering the carried safe shell. Saving that loaded pane must never
+    # turn the bootstrap launcher itself into the next generation's fallback.
+    kitty-restore-session --dump-panes > state/bootstrap-restored-panes.json
+    jq -e --arg codex "$codex_bin" --arg sid "$sid_later" \
+      --arg safe "$safe_bin" '
+      .[1].cmd == [$codex, "resume", $sid]
+      and .[1].shell_cmd == [$safe, "shared"]
+    ' state/bootstrap-restored-panes.json >/dev/null || {
+      cat state/bootstrap-restored-panes.json
+      echo "FAIL(bootstrap/reload): a restored later Codex pane did not"
+      echo "  keep exact resume identity plus its independently carried"
+      echo "  safe shell, or it adopted the bootstrap launcher as fallback."
+      exit 1
+    }
+
+    malformed_launcher_fails_closed() { # <label> <launcher-json>
+      local label="$1" launcher_json="$2"
+      local case_cache="$PWD/fx/bootstrap-load-$label-cache"
+      local case_state="$PWD/fx/bootstrap-load-$label-state"
+      local case_panes="$PWD/state/bootstrap-load-$label-panes.json"
+      mkdir -p "$case_cache/kitty-session"
+      jq --argjson launcher "$launcher_json" \
+        '.[0].tabs[0].windows[1].cmdline = $launcher' \
+        state/bootstrap-snapshot-good.json \
+        > "$case_cache/kitty-session/snapshot.json"
+      (
+        export XDG_CACHE_HOME="$case_cache"
+        export XDG_STATE_HOME="$case_state"
+        export KITTY_STUB_PATH="$PWD/state/bootstrap-load-$label-stub"
+        kitty-restore-session --dump-panes > "$case_panes"
+        kitty-restore-session --emit-stub
+      )
+      jq -e --arg codex "$codex_bin" --arg sid "$sid_later" '
+        .[1].cmd == [$codex, "resume", $sid]
+        and .[1].shell_cmd == ["/bin/sh"]
+      ' "$case_panes" >/dev/null || {
+        cat "$case_panes"
+        echo "FAIL(bootstrap/load-$label): malformed launcher did not"
+        echo "  preserve exact Codex identity while failing closed to /bin/sh."
+        exit 1
+      }
+      local case_root="$case_state/claude/kitty-restore"
+      local case_generation="$case_root/$(cat "$case_root/current")"
+      jq -e --arg codex "$codex_bin" --arg sid "$sid_later" '
+        .panes["2"].resume_argv == [$codex, "resume", $sid]
+        and .panes["2"].safe_shell_argv == ["/bin/sh"]
+      ' "$case_generation/manifest.json" >/dev/null || {
+        cat "$case_generation/manifest.json"
+        echo "FAIL(bootstrap/load-$label): save re-adopted a malformed"
+        echo "  bootstrap launcher instead of persisting /bin/sh."
+        exit 1
+      }
+    }
+
+    wrong_count=$(jq -nc --arg restore "$bootstrap_bin" \
+      --arg resume "$resume_json" '[$restore, "--bootstrap", $resume]')
+    bad_json=$(jq -nc --arg restore "$bootstrap_bin" \
+      --arg safe "$safe_json" '[$restore, "--bootstrap", "{", $safe]')
+    non_argv=$(jq -nc --arg restore "$bootstrap_bin" \
+      --arg resume "$resume_json" \
+      '[$restore, "--bootstrap", $resume, "{\\\"not\\\":\\\"argv\\\"}"]')
+    recursive_safe=$(jq -nc --arg restore "$bootstrap_bin" \
+      --arg resume "$resume_json" --arg safe "$safe_json" '
+      [$restore, "--bootstrap", $resume,
+       ([$restore, "--bootstrap", $resume, $safe] | tojson)]')
+    malformed_launcher_fails_closed wrong-count "$wrong_count"
+    malformed_launcher_fails_closed bad-json "$bad_json"
+    malformed_launcher_fails_closed non-argv "$non_argv"
+    malformed_launcher_fails_closed recursion "$recursive_safe"
+
     kitty-restore-session --emit-stub
 
     restore_root="$bootstrap_state/claude/kitty-restore"
@@ -2759,8 +2842,6 @@ pkgs.runCommand "kitty-scripts-harness"
     deadline=$(jq -r '.deadline_monotonic' "$manifest")
     note1="$generation/pane-1.md"
     note2="$generation/pane-2.md"
-    bootstrap_bin=$(command -v kitty-restore-session)
-
     # Pane zero enters bootstrap via the exact argv Kitty parsed from the
     # one-line stub. No hook runs, yet its mapping must exist afterwards.
     export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-pane0-exec"

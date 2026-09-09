@@ -1699,6 +1699,48 @@ let
     )
 
 
+    def is_bootstrap_launcher(cmdline):
+        """True for a direct or pane-0-carried Codex bootstrap argv."""
+        cmdline = cmdline or []
+        return (
+            len(cmdline) >= 2 and cmdline[1] == BOOTSTRAP_FLAG
+        ) or (
+            is_pane0_launcher(cmdline)
+            and len(cmdline) >= 3
+            and cmdline[2] == BOOTSTRAP_FLAG
+        )
+
+
+    def bootstrap_safe_argv(cmdline):
+        """Validated safe argv carried beside a canonical Codex resume."""
+        cmdline = cmdline or []
+        if is_pane0_launcher(cmdline):
+            if len(cmdline) != 5 or cmdline[2] != BOOTSTRAP_FLAG:
+                return None
+            resume_json, safe_json = cmdline[3:]
+        else:
+            if len(cmdline) != 4 or cmdline[1] != BOOTSTRAP_FLAG:
+                return None
+            resume_json, safe_json = cmdline[2:]
+        try:
+            resume = json.loads(resume_json)
+            safe = json.loads(safe_json)
+        except (TypeError, ValueError):
+            return None
+        if not (
+            _is_argv(resume)
+            and len(resume) == 3
+            and os.path.basename(resume[0]) == "codex"
+            and resume[1] == "resume"
+            and UUID_RE.fullmatch(resume[2])
+            and _is_argv(safe)
+        ):
+            return None
+        if is_pane0_launcher(safe) or is_bootstrap_launcher(safe):
+            return None
+        return safe
+
+
     def _last_record(path):
         """Last complete JSONL record of path, or None when unsure.
 
@@ -2218,8 +2260,11 @@ let
                         continue
                     cmd = pane_cmd(win)
                     cwd = win.get("cwd")
-                    wc = unwrap_pane0(win.get("cmdline") or [])
-                    if wc and _agent_kind(wc) is None:
+                    raw_wc = win.get("cmdline") or []
+                    wc = unwrap_pane0(raw_wc)
+                    if is_bootstrap_launcher(raw_wc):
+                        shell_cmd = bootstrap_safe_argv(raw_wc) or ["/bin/sh"]
+                    elif wc and _agent_kind(wc) is None:
                         shell_cmd = wc
                     else:
                         shell_cmd = [os.environ.get("SHELL") or "/bin/sh"]
