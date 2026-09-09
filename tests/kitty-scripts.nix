@@ -3997,6 +3997,68 @@ pkgs.runCommand "kitty-scripts-harness"
     ); then correction_failures=$((correction_failures + 1)); fi
 
     if ! (
+      # Completion is not published until restore-complete itself is durable.
+      # _write_atomic replaces its destination before syncing the directory,
+      # so this injection exercises the dangerous visible-but-unsynced state.
+      prepare_transaction_case completion-fsync 5
+      : > "$TX_CONTROL/saver-ls-calls"
+      export KITTY_RESTORE_TEST_FAIL_DIR_FSYNC=write:restore-complete
+      export KITTY_RESTORE_TEST_FAIL_COMPLETION_CLEANUP=1
+      start_transaction_restore normal
+      set +e
+      wait "$TX_PARENT_PID"
+      completion_rc=$?
+      set -e
+      unset KITTY_RESTORE_TEST_FAIL_DIR_FSYNC
+      unset KITTY_RESTORE_TEST_FAIL_COMPLETION_CLEANUP
+      completion_failures=0
+      [ "$completion_rc" -ne 0 ] \
+        && [ -f "$TX_ROOT/restore-clearing" ] \
+        && grep -Fq 'injected directory fsync failure for write:restore-complete' \
+          "$TX_CONTROL/restore.log" \
+        && grep -Fq 'injected completion receipt cleanup failure' \
+          "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(correction/completion-fsync): injected completion failure was treated as success"
+        completion_failures=$((completion_failures + 1))
+      }
+      TX_CALLER=saver bash "$save_bin" || true
+      [ ! -s "$TX_CONTROL/saver-ls-calls" ] \
+        && [ "$TX_BEFORE" = "$(sha256sum \
+          "$TX_DIR/snapshot.json" "$TX_DIR/last.session")" ] || {
+        echo "FAIL(correction/completion-fsync): saver discovered or published after failed completion"
+        completion_failures=$((completion_failures + 1))
+      }
+
+      # The next planned restore publishes its primary barrier before
+      # reconciling both fixed names. Its successful cancellation is the
+      # negative control: the bounded completion state permits saving again.
+      next_token=$(kitty-restore-session --begin-restore)
+      [ "$(jq -r .generation "$TX_ROOT/restore-incomplete")" \
+          = "$next_token" ] \
+        && [ ! -e "$TX_ROOT/restore-clearing" ] \
+        && [ ! -e "$TX_ROOT/restore-complete" ] || {
+        echo "FAIL(correction/completion-fsync): next begin did not reconcile fixed markers"
+        completion_failures=$((completion_failures + 1))
+      }
+      kitty-restore-session --cancel-restore "$next_token"
+      marker_count=$(find "$TX_ROOT" -maxdepth 1 -name 'restore-*' | wc -l)
+      [ "$marker_count" -le 2 ] || {
+        find "$TX_ROOT" -maxdepth 1 -name 'restore-*' -print
+        echo "FAIL(correction/completion-fsync): restore markers accumulated"
+        completion_failures=$((completion_failures + 1))
+      }
+      : > "$TX_CONTROL/saver-ls-calls"
+      TX_CALLER=saver bash "$save_bin"
+      [ -s "$TX_CONTROL/saver-ls-calls" ] || {
+        echo "FAIL(correction/completion-fsync): successful recovery kept saver blocked"
+        completion_failures=$((completion_failures + 1))
+      }
+      stop_transaction_child
+      [ "$completion_failures" -eq 0 ]
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
       prepare_transaction_case publication-abort 5
       old_token="$TX_TOKEN"
       old_hashes=$(transaction_hashes)
