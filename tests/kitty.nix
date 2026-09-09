@@ -479,7 +479,7 @@ in
         + codex_sid
         + "' '[.[].tabs[].windows[] | select("
         + ".foreground_processes[]?.cmdline == [$codex, \"resume\", $sid])"
-        + ") | .id] | unique | if length == 1 then .[0] else error("
+        + " | .id] | unique | if length == 1 then .[0] else error("
         + "\"expected one live Codex pane\") end' > /tmp/codex-window-id"
     )
     dellan.succeed(

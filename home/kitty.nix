@@ -1627,6 +1627,8 @@ let
   # then closes whatever default window kitty opened on startup.
   kittyRestoreSession = pkgs.writers.writePython3Bin "kitty-restore-session" {} ''
     """Restore kitty session from snapshot.json via kitty-pane-add."""
+    import contextlib
+    import fcntl
     import glob
     import json
     import os
@@ -1649,17 +1651,34 @@ let
 
     ${claudeSliceLaunchPy}
 
-    def find_socket(timeout=30):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            for f in sorted(glob.glob("/tmp/kitty.sock-*")):
-                r = subprocess.run(
-                    ["kitty", "@", "--to", f"unix:{f}", "ls"],
-                    capture_output=True, timeout=2,
-                )
+    def _remaining(deadline):
+        return max(0.0, deadline - time.monotonic())
+
+
+    def find_socket(timeout=30, deadline=None):
+        if deadline is None:
+            deadline = time.monotonic() + timeout
+        while _remaining(deadline) > 0:
+            candidates = []
+            configured = os.environ.get("KITTY_LISTEN_ON")
+            if configured:
+                candidates.append(configured)
+            candidates.extend(
+                f"unix:{path}"
+                for path in sorted(glob.glob("/tmp/kitty.sock-*"))
+            )
+            for socket in dict.fromkeys(candidates):
+                try:
+                    r = subprocess.run(
+                        ["kitty", "@", "--to", socket, "ls"],
+                        capture_output=True,
+                        timeout=min(2.0, _remaining(deadline)),
+                    )
+                except subprocess.TimeoutExpired:
+                    continue
                 if r.returncode == 0:
-                    return f"unix:{f}"
-            time.sleep(0.3)
+                    return socket
+            time.sleep(min(0.3, _remaining(deadline)))
         return None
 
 
@@ -2110,6 +2129,34 @@ let
         return os.path.join(base, "kitty-session")
 
 
+    @contextlib.contextmanager
+    def restore_transaction_lock():
+        """Use the wrapper's inherited lock, or acquire it directly."""
+        directory = cache_dir()
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        path = os.path.join(directory, "restore.lock")
+        own_fd = None
+        fd = 8
+        try:
+            inherited = os.fstat(fd)
+            target = os.stat(path)
+            if (inherited.st_dev, inherited.st_ino) != (
+                target.st_dev, target.st_ino
+            ):
+                raise OSError("fd 8 is not restore.lock")
+        except OSError:
+            own_fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+            fd = own_fd
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if own_fd is not None:
+                fcntl.flock(own_fd, fcntl.LOCK_UN)
+                os.close(own_fd)
+
+
     def pane0_path():
         return os.path.join(cache_dir(), "pane0-launch.json")
 
@@ -2391,31 +2438,97 @@ let
         }
 
 
+    def _remove_state_entry(path):
+        """Remove one recovery artifact without following a leaf symlink."""
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+
+
+    def _reconcile_generation_state(root):
+        """Make stale sends honest and remove non-generation leftovers."""
+        previous = None
+        try:
+            candidate = _read_regular(os.path.join(root, "current")).strip()
+            if re.fullmatch(r"generation-[0-9a-f]{32}", candidate):
+                previous = candidate
+        except OSError:
+            pass
+
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            if re.fullmatch(r"generation-[0-9a-f]{32}", name):
+                if not os.path.isdir(path) or os.path.islink(path):
+                    _remove_state_entry(path)
+                    continue
+                for marker in os.listdir(path):
+                    if not re.fullmatch(
+                        r"pane-[1-9][0-9]*[.]md[.]sending", marker
+                    ):
+                        continue
+                    sending = os.path.join(path, marker)
+                    uncertain = sending[:-len("sending")] + "uncertain"
+                    if os.path.lexists(uncertain):
+                        _remove_state_entry(sending)
+                    else:
+                        os.replace(sending, uncertain)
+                        os.chmod(uncertain, 0o600)
+            elif name.startswith(".generation-"):
+                _remove_state_entry(path)
+            elif re.fullmatch(r"pane-[1-9][0-9]*[.]md.*", name):
+                _remove_state_entry(path)
+        return previous
+
+
+    def _retain_generations(root, active, previous):
+        keep = {active}
+        if previous and previous != active:
+            keep.add(previous)
+        for name in os.listdir(root):
+            if (
+                re.fullmatch(r"generation-[0-9a-f]{32}", name)
+                and name not in keep
+            ):
+                _remove_state_entry(os.path.join(root, name))
+
+
+    def _write_restore_guard(root, token, stage):
+        _write_atomic(
+            os.path.join(root, "restore-incomplete"),
+            json.dumps({"generation": token, "stage": stage}, sort_keys=True)
+            + "\n",
+        )
+
+
     def publish_generation(panes):
         """Stage a complete private recovery generation, then publish it."""
         root = prepare_note_dir()
         if root is None:
             return None
-        # Until the later retention/migration slice removes old loose note
-        # names, treat a planted legacy leaf as an unsafe state boundary.
-        # Never let generation naming turn a previously refused symlink into
-        # an ignored one that silently restores the agent anyway.
-        for ordinal, pane in enumerate(panes, start=1):
-            if pane.get("agent_kind") not in {"claude", "codex"}:
-                continue
-            for suffix in (".md", ".md.pending"):
-                legacy = os.path.join(root, f"pane-{ordinal}{suffix}")
-                if os.path.lexists(legacy) and os.path.islink(legacy):
-                    return None
         token = "generation-" + secrets.token_hex(16)
+        try:
+            # The guard precedes reconciliation and every destructive cleanup.
+            _write_restore_guard(root, token, "reconciling")
+            previous = _reconcile_generation_state(root)
+        except OSError as error:
+            print(
+                "kitty-restore-session: could not begin restore generation: "
+                f"{error}",
+                file=sys.stderr,
+            )
+            return None
         final_dir = os.path.join(root, token)
         temp_dir = tempfile.mkdtemp(prefix="." + token + ".tmp-", dir=root)
         os.chmod(temp_dir, 0o700)
         timeout = 30.0
-        try:
-            timeout = float(os.environ.get("KITTY_RESTORE_TIMEOUT_SECONDS", 30))
-        except ValueError:
-            pass
+        if os.environ.get("KITTY_RESTORE_TEST") == "1":
+            try:
+                timeout = float(
+                    os.environ.get("KITTY_RESTORE_TIMEOUT_SECONDS", 30)
+                )
+            except ValueError:
+                pass
         if not (0.05 <= timeout <= 300.0):
             timeout = 30.0
         deadline = time.monotonic() + timeout
@@ -2463,6 +2576,8 @@ let
             os.rename(temp_dir, final_dir)
             temp_dir = None
             _write_atomic(os.path.join(root, "current"), token + "\n")
+            _retain_generations(root, token, previous)
+            _write_restore_guard(root, token, "launching")
             return final_dir, manifest
         except (OSError, TypeError, ValueError) as error:
             print(
@@ -3011,6 +3126,385 @@ let
             os.execvp("/bin/sh", ["/bin/sh"])
 
 
+    def _stage_failure(generation, ordinal, stage, detail=""):
+        message = (
+            "kitty-restore-session: "
+            f"generation={generation} ordinal={ordinal} stage={stage}"
+        )
+        if detail:
+            message += " " + detail
+        print(message, file=sys.stderr)
+
+
+    def _kitty_ls(sock, deadline):
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            return None
+        try:
+            result = subprocess.run(
+                ["kitty", "@", "--to", sock, "ls"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=remaining,
+            )
+            if result.returncode != 0:
+                return None
+            data = json.loads(result.stdout)
+            return data if isinstance(data, list) else None
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+
+
+    def _all_windows(state):
+        if not isinstance(state, list):
+            return []
+        return [
+            window
+            for os_window in state
+            if isinstance(os_window, dict)
+            for tab in os_window.get("tabs", [])
+            if isinstance(tab, dict)
+            for window in tab.get("windows", [])
+            if isinstance(window, dict)
+        ]
+
+
+    def _foreground_has(window, argv):
+        return any(
+            isinstance(process, dict) and process.get("cmdline") == argv
+            for process in window.get("foreground_processes", [])
+        )
+
+
+    def _registry_window(entry):
+        path = os.path.join(cache_dir(), "pane-sessions.tsv")
+        try:
+            rows = _read_regular(path).splitlines()
+        except OSError:
+            return None
+        matches = []
+        for row in rows:
+            fields = row.split("\t")
+            if (
+                len(fields) >= 5
+                and fields[0].isdigit()
+                and fields[1] == "codex"
+                and fields[2] == entry["session_id"]
+                and fields[3] == entry["cwd"]
+            ):
+                matches.append(int(fields[0]))
+        return matches[0] if len(matches) == 1 else None
+
+
+    def _regular_marker(path):
+        try:
+            return stat.S_ISREG(os.lstat(path).st_mode)
+        except OSError:
+            return False
+
+
+    def _deliver_codex_draft(sock, entry, window_id, deadline, generation):
+        note = entry["note_path"]
+        pending = note + ".pending"
+        sending = note + ".sending"
+        uncertain = note + ".uncertain"
+        if _regular_marker(uncertain):
+            return True
+        if not _regular_marker(pending):
+            return False
+        state = _kitty_ls(sock, deadline)
+        targets = [
+            window
+            for window in _all_windows(state)
+            if window.get("id") == window_id
+            and _foreground_has(window, entry["resume_argv"])
+        ]
+        if len(targets) != 1:
+            _stage_failure(
+                generation, entry["ordinal"], "preflight",
+                "exact settled target unavailable",
+            )
+            return False
+        try:
+            os.replace(pending, sending)
+            os.chmod(sending, 0o600)
+        except OSError:
+            return False
+        if (
+            os.environ.get("KITTY_RESTORE_TEST") == "1"
+            and os.environ.get("KITTY_RESTORE_TEST_FAIL_BEFORE_SEND") == "1"
+        ):
+            try:
+                os.replace(sending, pending)
+            except OSError:
+                pass
+            return False
+
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            try:
+                os.replace(sending, pending)
+            except OSError:
+                pass
+            return False
+        try:
+            subprocess.run(
+                [
+                    "kitty", "@", "--to", sock, "send-text",
+                    "--match", f"id:{window_id}", "--stdin",
+                ],
+                input="Read $KITTY_RESTORE_NOTE.",
+                text=True,
+                check=False,
+                capture_output=True,
+                timeout=remaining,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if (
+            os.environ.get("KITTY_RESTORE_TEST") == "1"
+            and os.environ.get(
+                "KITTY_RESTORE_TEST_LEAVE_SENDING_AFTER_SEND"
+            ) == "1"
+        ):
+            return True
+        try:
+            if os.path.lexists(uncertain):
+                os.unlink(sending)
+            else:
+                os.replace(sending, uncertain)
+                os.chmod(uncertain, 0o600)
+        except OSError:
+            return False
+        return _regular_marker(uncertain)
+
+
+    def _finish_restore_guard(root, generation):
+        guard = os.path.join(root, "restore-incomplete")
+        try:
+            payload = json.loads(_read_regular(guard))
+            if payload.get("generation") != generation:
+                raise OSError("restore guard generation changed")
+            os.unlink(guard)
+            directory_fd = os.open(
+                root,
+                os.O_RDONLY | os.O_CLOEXEC
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return True
+        except (OSError, TypeError, ValueError) as error:
+            _stage_failure(generation, 0, "guard-removal", str(error))
+            return False
+
+
+    def restore_topology():
+        panes = load_panes()
+        if not panes:
+            return
+        try:
+            active, generation_dir, manifest = load_active_generation()
+            deadline = float(manifest["deadline_monotonic"])
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            _stage_failure("unknown", 0, "generation", str(error))
+            return
+        root = os.path.dirname(generation_dir)
+        try:
+            _write_restore_guard(root, active, "launching")
+        except OSError as error:
+            _stage_failure(active, 0, "guard", str(error))
+            return
+
+        first = 1 if stub_carries_pane0(panes[0]) else 0
+        sock = find_socket(deadline=deadline)
+        if not sock:
+            _stage_failure(active, 0, "socket", "socket never appeared")
+            return
+
+        codex = {}
+        all_success = True
+        pane_one = manifest.get("panes", {}).get("1")
+        if first == 1 and isinstance(pane_one, dict) \
+                and pane_one.get("kind") == "codex":
+            codex[1] = {"entry": pane_one, "window_id": None,
+                        "launch_return": True, "window_seen": False}
+
+        for ordinal, pane in enumerate(panes[first:], start=first + 1):
+            binding = None
+            argv = ["kitty-pane-add"]
+            if pane["cwd"]:
+                argv += ["--cwd", pane["cwd"]]
+            if pane["title"]:
+                argv += ["--title", pane["title"]]
+            cmd = pane["cmd"]
+            if pane.get("agent_kind"):
+                binding = manifest.get("panes", {}).get(str(ordinal))
+                if not isinstance(binding, dict):
+                    binding = None
+                note = binding.get("note_path") if binding else None
+                if note is None or binding.get("kind") != pane.get("agent_kind"):
+                    cmd = pane["shell_cmd"]
+                    all_success = False
+                else:
+                    argv += ["--env", "KITTY_RESTORE_NOTE=" + note]
+                    if binding["kind"] == "codex":
+                        carried_resume = unwrap_launchers(pane.get("cmd") or [])
+                        carried_safe = pane.get("shell_cmd") or ["/bin/sh"]
+                        argv += [
+                            "--env", "KITTY_RESTORE_BOOTSTRAP=" + active,
+                            "--env", "KITTY_RESTORE_ORDINAL=" + str(ordinal),
+                            "--env", "KITTY_RESTORE_DEADLINE_MONOTONIC="
+                            + str(deadline),
+                        ]
+                        cmd = [
+                            _self_exe(), BOOTSTRAP_FLAG,
+                            json.dumps(carried_resume, separators=(",", ":")),
+                            json.dumps(carried_safe, separators=(",", ":")),
+                        ]
+            if cmd:
+                argv += ["--", *slice_launch(cmd)]
+            remaining = _remaining(deadline)
+            if remaining <= 0:
+                _stage_failure(active, ordinal, "launch-return", "deadline")
+                all_success = False
+                continue
+            try:
+                result = subprocess.run(
+                    argv, check=False, capture_output=True, text=True,
+                    timeout=remaining,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                _stage_failure(active, ordinal, "launch-return", str(error))
+                all_success = False
+                if binding and binding.get("kind") == "codex":
+                    codex[ordinal] = {
+                        "entry": binding, "window_id": None,
+                        "launch_return": False, "window_seen": False,
+                    }
+                continue
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+            if result.returncode != 0:
+                _stage_failure(
+                    active, ordinal, "launch-return",
+                    f"exit={result.returncode}",
+                )
+                all_success = False
+            if binding and binding.get("kind") == "codex":
+                returned = result.stdout.strip()
+                valid_return = (
+                    result.returncode == 0
+                    and re.fullmatch(r"[0-9]+", returned) is not None
+                )
+                window_id = int(returned) if valid_return else None
+                codex[ordinal] = {
+                    "entry": binding,
+                    "window_id": window_id,
+                    "launch_return": valid_return,
+                    "window_seen": False,
+                }
+                if not valid_return:
+                    _stage_failure(active, ordinal, "launch-return")
+                    all_success = False
+                else:
+                    try:
+                        _write_atomic(
+                            os.path.join(
+                                generation_dir,
+                                f"pane-{ordinal}.expected-window",
+                            ),
+                            returned + "\n",
+                        )
+                    except OSError as error:
+                        _stage_failure(
+                            active, ordinal, "expected-window", str(error)
+                        )
+                        all_success = False
+
+        if (
+            os.environ.get("KITTY_RESTORE_TEST") == "1"
+            and os.environ.get("KITTY_RESTORE_TEST_LAUNCH_ONLY") == "1"
+        ):
+            return
+
+        unsettled = set(codex)
+        successful = {}
+        while unsettled and _remaining(deadline) > 0:
+            state = _kitty_ls(sock, deadline)
+            windows = _all_windows(state)
+            for ordinal in list(unsettled):
+                record = codex[ordinal]
+                entry = record["entry"]
+                window_id = record["window_id"]
+                registry_id = _registry_window(entry)
+                if window_id is None:
+                    window_id = registry_id
+                    record["window_id"] = window_id
+                window = next(
+                    (item for item in windows if item.get("id") == window_id),
+                    None,
+                )
+                if window is not None:
+                    record["window_seen"] = True
+                bound = _regular_marker(os.path.join(
+                    generation_dir, f"pane-{ordinal}.bootstrap-bound"
+                ))
+                failed = _regular_marker(os.path.join(
+                    generation_dir, f"pane-{ordinal}.bootstrap-failed"
+                ))
+                if (
+                    window is not None
+                    and bound
+                    and registry_id == window_id
+                    and _foreground_has(window, entry["resume_argv"])
+                ):
+                    successful[ordinal] = window_id
+                    unsettled.remove(ordinal)
+                elif (
+                    window is not None
+                    and failed
+                    and _foreground_has(window, entry["safe_shell_argv"])
+                ):
+                    all_success = False
+                    unsettled.remove(ordinal)
+            if unsettled:
+                time.sleep(min(0.02, _remaining(deadline)))
+
+        for ordinal in unsettled:
+            record = codex[ordinal]
+            entry = record["entry"]
+            if not record["launch_return"]:
+                stage = "launch-return"
+            elif not _regular_marker(os.path.join(
+                generation_dir, f"pane-{ordinal}.bootstrap-bound"
+            )) and not _regular_marker(os.path.join(
+                generation_dir, f"pane-{ordinal}.bootstrap-failed"
+            )):
+                stage = "bootstrap-receipt"
+            else:
+                stage = (
+                    "foreground-settlement"
+                    if record["window_seen"]
+                    else "expected-window"
+                )
+            _stage_failure(active, ordinal, stage, "deadline expired")
+            all_success = False
+
+        for ordinal, window_id in successful.items():
+            if not _deliver_codex_draft(
+                sock, codex[ordinal]["entry"], window_id, deadline, active
+            ):
+                all_success = False
+
+        if all_success and not unsettled:
+            _finish_restore_guard(root, active)
+
+
     def main():
         # Dispatch on argv[1] POSITIONALLY, never `x in sys.argv`:
         # everything after --exec-pane0 is pane 0's own argv, and a
@@ -3020,7 +3514,8 @@ let
         mode = sys.argv[1] if len(sys.argv) > 1 else None
 
         if mode == "--emit-stub":
-            emit_stub()
+            with restore_transaction_lock():
+                emit_stub()
             return
 
         if mode == PANE0_FLAG:
@@ -3041,96 +3536,8 @@ let
             json.dump(load_panes(), sys.stdout)
             return
 
-        panes = load_panes()
-        if not panes:
-            return
-        try:
-            active, generation, manifest = load_active_generation()
-        except (OSError, TypeError, ValueError):
-            active = generation = manifest = None
-        # Skip pane[0] — kitty already created it from the --session
-        # stub — UNLESS the stub could not carry its command (see
-        # stub_carries_pane0). Then pane 0 came up as a plain shell and
-        # its real command has to be restored the ordinary way, or it is
-        # lost with nothing but a line in kitty's log to show for it.
-        first = 1 if stub_carries_pane0(panes[0]) else 0
-        if len(panes) <= first:
-            # Everything there is to restore is already on screen.
-            return
-
-        sock = find_socket()
-        if not sock:
-            print("kitty socket never appeared", file=sys.stderr)
-            sys.exit(1)
-
-        for ordinal, p in enumerate(panes[first:], start=first + 1):
-            argv = ["kitty-pane-add"]
-            if p["cwd"]:
-                argv += ["--cwd", p["cwd"]]
-            if p["title"]:
-                argv += ["--title", p["title"]]
-            cmd = p["cmd"]
-            if p.get("agent_kind"):
-                binding = (
-                    manifest.get("panes", {}).get(str(ordinal))
-                    if manifest else None
-                )
-                if not isinstance(binding, dict):
-                    binding = None
-                note = binding.get("note_path") if binding else None
-                if note is None or binding.get("kind") != p.get("agent_kind"):
-                    cmd = p["shell_cmd"]
-                else:
-                    argv += ["--env", "KITTY_RESTORE_NOTE=" + note]
-                    if binding["kind"] == "codex":
-                        carried_resume = unwrap_launchers(p.get("cmd") or [])
-                        carried_safe = p.get("shell_cmd") or ["/bin/sh"]
-                        argv += [
-                            "--env", "KITTY_RESTORE_BOOTSTRAP=" + active,
-                            "--env", "KITTY_RESTORE_ORDINAL=" + str(ordinal),
-                            "--env",
-                            "KITTY_RESTORE_DEADLINE_MONOTONIC="
-                            + str(manifest["deadline_monotonic"]),
-                        ]
-                        cmd = [
-                            _self_exe(),
-                            BOOTSTRAP_FLAG,
-                            json.dumps(
-                                carried_resume, separators=(",", ":")
-                            ),
-                            json.dumps(
-                                carried_safe,
-                                separators=(",", ":"),
-                            ),
-                        ]
-            if cmd:
-                argv += ["--", *slice_launch(cmd)]
-            result = subprocess.run(
-                argv, check=False, capture_output=True, text=True
-            )
-            if (
-                p.get("agent_kind") == "codex"
-                and binding is not None
-                and result.returncode == 0
-            ):
-                returned = result.stdout.strip()
-                if re.fullmatch(r"[0-9]+", returned):
-                    try:
-                        _write_atomic(
-                            os.path.join(
-                                generation,
-                                f"pane-{ordinal}.expected-window",
-                            ),
-                            returned + "\n",
-                        )
-                    except OSError as error:
-                        print(
-                            "kitty-restore-session: could not publish "
-                            f"expected window for pane {ordinal}: {error}",
-                            file=sys.stderr,
-                        )
-            if result.stderr:
-                sys.stderr.write(result.stderr)
+        with restore_transaction_lock():
+            restore_topology()
 
 
     if __name__ == "__main__":
@@ -3303,7 +3710,7 @@ let
         local state_base="''${XDG_STATE_HOME:-$HOME/.local/state}"
         local expected="$state_base/claude/kitty-restore"
         local resolved expected_resolved generation generation_name
-        local current pending sending ls_json
+        local current pending sending uncertain ls_json send_rc
         resolved=$(realpath -m -- "$note" 2>/dev/null) || return 0
         expected_resolved=$(realpath -m -- "$expected" 2>/dev/null) || return 0
         generation=$(dirname -- "$resolved")
@@ -3333,17 +3740,37 @@ let
           return 0
         fi
 
-        sending="$pending.sending.$$"
+        sending="$resolved.sending"
+        uncertain="$resolved.uncertain"
         mv -- "$pending" "$sending" 2>/dev/null || return 0
+        if [ "''${KITTY_RESTORE_TEST:-}" = 1 ] \
+            && [ "''${KITTY_RESTORE_TEST_FAIL_BEFORE_SEND:-}" = 1 ]; then
+          mv -- "$sending" "$pending" 2>/dev/null || true
+          return 0
+        fi
         # Literal by design: the TUI expands this environment-variable
         # reference when the user submits the prefilled draft.
+        set +e
         # shellcheck disable=SC2016
-        if ! printf '%s' 'Read $KITTY_RESTORE_NOTE.' | \
-             rc @ --to "$sock" send-text \
-               --match "id:$KITTY_WINDOW_ID" --stdin >/dev/null 2>&1; then
+        printf '%s' 'Read $KITTY_RESTORE_NOTE.' | \
+          rc @ --to "$sock" send-text \
+            --match "id:$KITTY_WINDOW_ID" --stdin >/dev/null 2>&1
+        send_rc=$?
+        set -e
+        if [ "''${KITTY_RESTORE_TEST:-}" = 1 ] \
+            && [ "''${KITTY_RESTORE_TEST_LEAVE_SENDING_AFTER_SEND:-}" = 1 ]; then
+          return 0
+        fi
+        # Kitty has no acknowledgement boundary. Once invocation began,
+        # success and failure are equally uncertain and neither may retry.
+        if [ -e "$uncertain" ] || [ -L "$uncertain" ]; then
+          rm -f -- "$sending"
+        else
+          mv -- "$sending" "$uncertain" 2>/dev/null || true
+        fi
+        if [ "$send_rc" -ne 0 ]; then
           echo "claude-kitty-pane-record: failed to send restore-note draft to window $KITTY_WINDOW_ID" >&2
         fi
-        rm -f -- "$sending"
         return 0
       }
       deliver_restore_note || true
@@ -3953,6 +4380,7 @@ let
       kittySessionEnrich
       kittySessionCommit
       pkgs.coreutils
+      pkgs.util-linux
     ];
     text = ''
       set -euo pipefail
@@ -3963,6 +4391,19 @@ let
       # in it is anyone else's business. `install -d` also fixes a
       # directory an older generation created 0755.
       install -d -m 700 "$dir"
+
+      # Autosave and cold restore share one transaction boundary. Refuse
+      # nonblockingly before socket discovery: a timer tick during restore is
+      # expected and the next tick will retry after the lock is released.
+      exec 8>"$dir/restore.lock"
+      if ! flock -n -x 8; then
+        exit 0
+      fi
+      restore_root="''${XDG_STATE_HOME:-$HOME/.local/state}/claude/kitty-restore"
+      if [ -e "$restore_root/restore-incomplete" ] \
+          || [ -L "$restore_root/restore-incomplete" ]; then
+        exit 0
+      fi
 
       # Discover live kitty socket. kitty appends `-{pid}` to the
       # configured listen_on path on every launch (not only under `-1`),
