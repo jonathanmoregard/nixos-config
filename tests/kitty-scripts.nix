@@ -699,7 +699,8 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(A): pane 0 is not the canonical claude --resume UUID argv"
       exit 1; }
 
-    note="$XDG_STATE_HOME/claude/kitty-restore/pane-1.md"
+    restore_root="$XDG_STATE_HOME/claude/kitty-restore"
+    note="$restore_root/$(cat "$restore_root/current")/pane-1.md"
     [ -f "$note" ] || {
       echo "FAIL(A): --emit-stub wrote no private recovery note at $note"
       exit 1; }
@@ -741,7 +742,8 @@ pkgs.runCommand "kitty-scripts-harness"
         export KITTY_STUB_PATH="$PWD/state/stub-codex-$label"
         kitty-restore-session --emit-stub
       )
-      printf '%s\n' "$case_state/claude/kitty-restore/pane-1.md"
+      local case_root="$case_state/claude/kitty-restore"
+      printf '%s/%s/pane-1.md\n' "$case_root" "$(cat "$case_root/current")"
     }
 
     codex_git_cwd="$PWD/fx/codex-git-work"
@@ -798,6 +800,7 @@ pkgs.runCommand "kitty-scripts-harness"
     while read -r label; do
       (
         export XDG_CACHE_HOME="$PWD/breaks/$label"
+        export XDG_STATE_HOME="$PWD/breaks/$label-state"
         export KITTY_STUB_PATH="$PWD/state/stub-$label"
         kitty-restore-session --emit-stub
       ) || {
@@ -890,6 +893,7 @@ pkgs.runCommand "kitty-scripts-harness"
     # send-text itself always exits zero, so target absence must leave the
     # marker pending and produce no fallback bytes.
     kitty-restore-session --emit-stub
+    note="$restore_root/$(cat "$restore_root/current")/pane-1.md"
     printf '[{"tabs":[{"windows":[{"id":88}]}]}]\n' \
       > state/draft-ls-miss.json
     export DRAFT_LS_JSON="$PWD/state/draft-ls-miss.json"
@@ -930,7 +934,7 @@ pkgs.runCommand "kitty-scripts-harness"
     ) & atomic_two=$!
     wait "$atomic_one"
     wait "$atomic_two"
-    atomic_note="$atomic_dir/pane-1.md"
+    atomic_note="$atomic_dir/$(cat "$atomic_dir/current")/pane-1.md"
     [ -f "$atomic_note" ] || {
       echo "FAIL(B): concurrent note writers left no final note"; exit 1; }
     [ ! -L "$atomic_note" ] || {
@@ -1074,6 +1078,9 @@ pkgs.runCommand "kitty-scripts-harness"
     if [ -n "''${LS_SWITCHED:-}" ]; then : > "$LS_SWITCHED"; fi
     shift 3
     printf '%s\n' "$*" >> "$KITTY_CMD_LOG"
+    if [ "''${1:-}" = launch ] && [ -n "''${KITTY_FAKE_WINDOW_ID:-}" ]; then
+      printf '%s\n' "$KITTY_FAKE_WINDOW_ID"
+    fi
     exit 0
     STUB
     chmod +x fakebin/kitty
@@ -2743,7 +2750,7 @@ pkgs.runCommand "kitty-scripts-harness"
 
     bootstrap_argv() { # <ordinal>
       jq -r --arg ordinal "$1" '
-        .panes[$ordinal].resume_argv | @json,
+        (.panes[$ordinal].resume_argv | @json),
         (.panes[$ordinal].safe_shell_argv | @json)
       ' "$manifest"
     }
@@ -2882,6 +2889,24 @@ pkgs.runCommand "kitty-scripts-harness"
     bootstrap_failure registry-writer 202 "$token" 2 "$note2" \
       "''${pane2_args[0]}" "''${pane2_args[1]}" match \
       "$PWD/state/registry-cache-file"
+
+    # When neither carried argv identifies a manifest entry, even the
+    # alleged safe-shell argv is untrusted. Fall back to /bin/sh; never
+    # execute an arbitrary argv supplied to the bootstrap entrypoint.
+    export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-unbound-forged-safe"
+    : > "$BOOTSTRAP_EXEC_LOG"
+    env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
+      KITTY_RESTORE_BOOTSTRAP="$token" KITTY_RESTORE_ORDINAL=2 \
+      KITTY_RESTORE_NOTE="$note2" \
+      KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
+      BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+      "$bootstrap_bin" --bootstrap "$altered_resume" "$altered_safe" \
+      </dev/null >/dev/null 2> state/bootstrap-unbound-forged-safe.err || true
+    [ ! -s "$BOOTSTRAP_EXEC_LOG" ] || {
+      cat "$BOOTSTRAP_EXEC_LOG"
+      echo "FAIL(bootstrap/unbound): executed caller-supplied safe argv"
+      exit 1
+    }
     unset KITTY_RESTORE_TEST KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"

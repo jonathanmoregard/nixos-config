@@ -185,7 +185,7 @@ let
   # indirection this module inserts between kitty and a pane's real
   # command.
   #
-  # Needs no imports.
+  # Requires `import json` in consumers.
   #
   # ── Why this exists ───────────────────────────────────────────────────
   #
@@ -217,6 +217,7 @@ let
   # indirection is transparent to every reader of `window.cmdline`.
   kittyPane0LaunchPy = ''
     PANE0_FLAG = "--exec-pane0"
+    BOOTSTRAP_FLAG = "--bootstrap"
 
     # Set to the exec'ing process's pid just before --exec-pane0 hands
     # the pane over. execvp keeps the pid, so seeing our OWN pid here
@@ -253,6 +254,18 @@ let
         """
         cmdline = cmdline or []
         if is_pane0_launcher(cmdline):
+            if len(cmdline) >= 4 and cmdline[2] == BOOTSTRAP_FLAG:
+                try:
+                    resume = json.loads(cmdline[3])
+                except (TypeError, ValueError):
+                    return []
+                if (
+                    isinstance(resume, list)
+                    and resume
+                    and all(isinstance(arg, str) for arg in resume)
+                ):
+                    return resume
+                return []
             return cmdline[2:]
         return cmdline
   '';
@@ -762,7 +775,14 @@ let
             common += ["--env", spec]
 
         def run(*xs):
-            subprocess.run(["kitty", "@", "--to", sock, *xs], check=True)
+            result = subprocess.run(
+                ["kitty", "@", "--to", sock, *xs],
+                check=True, capture_output=True, text=True,
+            )
+            if xs and xs[0] == "launch":
+                # `kitty @ launch` prints the created window id. Restore
+                # persists it as a cross-check for the in-pane bootstrap.
+                sys.stdout.write(result.stdout)
 
         # Use insertion order via window ID (kitty auto-increments).
         # Smallest id = original full-height "left" pane; second-smallest
@@ -796,6 +816,117 @@ let
     if __name__ == "__main__":
         main()
   '';
+
+  # One atomic typed-registry writer for both SessionStart and the no-hook
+  # restore bootstrap. The registry remains line-compatible with historical
+  # readers: new rows have five fields, while unrelated legacy four-field
+  # rows are preserved byte-for-byte until the enricher prunes them.
+  kittyPaneRegistryWrite = pkgs.writers.writePython3Bin
+    "kitty-pane-registry-write" {} ''
+      import argparse
+      import fcntl
+      import os
+      import re
+      import stat
+      import tempfile
+      import time
+
+
+      UUID_RE = re.compile(
+          r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+          r"[0-9a-f]{4}-[0-9a-f]{12}$"
+      )
+
+
+      def fail(message):
+          raise SystemExit("kitty-pane-registry-write: " + message)
+
+
+      parser = argparse.ArgumentParser()
+      parser.add_argument("--window-id", required=True)
+      parser.add_argument("--kind", required=True)
+      parser.add_argument("--session-id", required=True)
+      parser.add_argument("--cwd", required=True)
+      args = parser.parse_args()
+
+      if not re.fullmatch(r"[0-9]+", args.window_id):
+          fail("window id must be decimal")
+      if args.kind not in {"claude", "codex"}:
+          fail("kind must be claude or codex")
+      if not UUID_RE.fullmatch(args.session_id):
+          fail("session id must be a canonical lowercase UUID")
+      if (
+          not os.path.isabs(args.cwd)
+          or "\0" in args.cwd
+          or "\t" in args.cwd
+          or len(args.cwd.splitlines()) != 1
+      ):
+          fail("cwd must be absolute and contain no row separators")
+
+      cache_base = os.environ.get(
+          "XDG_CACHE_HOME", os.path.join(os.path.expanduser("~"), ".cache")
+      )
+      directory = os.path.join(cache_base, "kitty-session")
+      if os.path.lexists(directory) and os.path.islink(directory):
+          fail("refusing symlink registry directory")
+      os.makedirs(directory, mode=0o700, exist_ok=True)
+      if os.path.islink(directory) or not os.path.isdir(directory):
+          fail("registry directory is not a real directory")
+      os.chmod(directory, 0o700)
+
+      registry = os.path.join(directory, "pane-sessions.tsv")
+      lock_path = os.path.join(directory, ".pane-sessions.lock")
+      nofollow = getattr(os, "O_NOFOLLOW", 0)
+      lock_fd = os.open(
+          lock_path,
+          os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | nofollow,
+          0o600,
+      )
+      try:
+          os.fchmod(lock_fd, 0o600)
+          fcntl.flock(lock_fd, fcntl.LOCK_EX)
+          old_rows = []
+          if os.path.lexists(registry):
+              info = os.lstat(registry)
+              if not stat.S_ISREG(info.st_mode):
+                  fail("refusing non-regular registry")
+              old_fd = os.open(registry, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+              with os.fdopen(old_fd, "r", errors="replace") as old:
+                  old_rows = old.readlines()
+
+          tmp_fd, tmp_path = tempfile.mkstemp(
+              dir=directory, prefix=".pane-sessions.tsv."
+          )
+          try:
+              os.fchmod(tmp_fd, 0o600)
+              with os.fdopen(tmp_fd, "w") as out:
+                  tmp_fd = -1
+                  for row in old_rows:
+                      if row.split("\t", 1)[0] != args.window_id:
+                          out.write(row)
+                  out.write(
+                      "\t".join((
+                          args.window_id,
+                          args.kind,
+                          args.session_id,
+                          args.cwd,
+                          str(int(time.time())),
+                      )) + "\n"
+                  )
+                  out.flush()
+                  os.fsync(out.fileno())
+              os.replace(tmp_path, registry)
+              os.chmod(registry, 0o600)
+          finally:
+              if tmp_fd >= 0:
+                  os.close(tmp_fd)
+              try:
+                  os.unlink(tmp_path)
+              except FileNotFoundError:
+                  pass
+      finally:
+          os.close(lock_fd)
+    '';
 
   # Rearrange the panes a RUNNING kitty already has into the same
   # canonical grid kitty-pane-add CREATES, without killing or
@@ -1478,8 +1609,10 @@ let
     import json
     import os
     import re
+    import secrets
     import shlex
     import shutil
+    import stat
     import subprocess
     import sys
     import tempfile
@@ -2123,6 +2256,343 @@ let
                 pass
 
 
+    def _read_regular(path):
+        """Read a private regular file without following its final leaf."""
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"refusing non-regular recovery file: {path}")
+        fd = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        with os.fdopen(fd) as source:
+            return source.read()
+
+
+    def _note_text(pane):
+        kind = pane.get("agent_kind")
+        if kind == "codex":
+            return codex_restore_notice(pane.get("cwd"))
+        if kind != "claude":
+            return None
+        cmd = unwrap_launchers(pane["cmd"])
+        cwd = pane.get("cwd")
+        if len(cmd) >= 3 and cmd[1] == "--resume":
+            sid = cmd[2]
+            encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd or "")
+            proj_dir = os.path.expanduser(f"~/.claude/projects/{encoded}")
+            return restore_notice(proj_dir, sid, cwd)
+        return (
+            "This pane was restored by kitty after its prior process tree "
+            "ended. No exact Claude session was safe to resume, so this is "
+            "a fresh session. Verify filesystem and process state before "
+            "continuing."
+        )
+
+
+    def _binding(pane, ordinal, note_path):
+        kind = pane.get("agent_kind")
+        cmd = unwrap_launchers(pane.get("cmd") or [])
+        if kind == "claude":
+            session_id = (
+                cmd[2]
+                if len(cmd) >= 3
+                and cmd[1] == "--resume"
+                and UUID_RE.fullmatch(cmd[2])
+                else None
+            )
+        elif kind == "codex" and len(cmd) == 3 and cmd[1] == "resume":
+            session_id = cmd[2]
+        else:
+            return None
+        if kind == "codex" and not UUID_RE.fullmatch(session_id):
+            return None
+        return {
+            "ordinal": ordinal,
+            "kind": kind,
+            "session_id": session_id,
+            "cwd": pane.get("cwd"),
+            "note_path": note_path,
+            "resume_argv": cmd,
+            "safe_shell_argv": pane.get("shell_cmd") or ["/bin/sh"],
+        }
+
+
+    def publish_generation(panes):
+        """Stage a complete private recovery generation, then publish it."""
+        root = prepare_note_dir()
+        if root is None:
+            return None
+        # Until the later retention/migration slice removes old loose note
+        # names, treat a planted legacy leaf as an unsafe state boundary.
+        # Never let generation naming turn a previously refused symlink into
+        # an ignored one that silently restores the agent anyway.
+        for ordinal, pane in enumerate(panes, start=1):
+            if pane.get("agent_kind") not in {"claude", "codex"}:
+                continue
+            for suffix in (".md", ".md.pending"):
+                legacy = os.path.join(root, f"pane-{ordinal}{suffix}")
+                if os.path.lexists(legacy) and os.path.islink(legacy):
+                    return None
+        token = "generation-" + secrets.token_hex(16)
+        final_dir = os.path.join(root, token)
+        temp_dir = tempfile.mkdtemp(prefix="." + token + ".tmp-", dir=root)
+        os.chmod(temp_dir, 0o700)
+        timeout = 30.0
+        try:
+            timeout = float(os.environ.get("KITTY_RESTORE_TIMEOUT_SECONDS", 30))
+        except ValueError:
+            pass
+        if not (0.05 <= timeout <= 300.0):
+            timeout = 30.0
+        deadline = time.monotonic() + timeout
+        manifest = {
+            "generation": token,
+            "deadline_monotonic": deadline,
+            "panes": {},
+        }
+        try:
+            for ordinal, pane in enumerate(panes, start=1):
+                if pane.get("agent_kind") not in {"claude", "codex"}:
+                    continue
+                final_note = os.path.join(final_dir, f"pane-{ordinal}.md")
+                entry = _binding(pane, ordinal, final_note)
+                text = _note_text(pane)
+                if entry is None or text is None:
+                    raise OSError("agent pane lacks an exact recovery binding")
+                _write_atomic(
+                    os.path.join(temp_dir, f"pane-{ordinal}.md"), text + "\n"
+                )
+                _write_atomic(
+                    os.path.join(temp_dir, f"pane-{ordinal}.md.pending"),
+                    "pending\n",
+                )
+                manifest["panes"][str(ordinal)] = entry
+
+            _write_atomic(
+                os.path.join(temp_dir, "manifest.json"),
+                json.dumps(manifest, sort_keys=True) + "\n",
+            )
+            if panes:
+                pane0 = panes[0]
+                binding = manifest["panes"].get("1")
+                _write_atomic(
+                    os.path.join(temp_dir, "pane0-launch.json"),
+                    json.dumps({
+                        "generation": token,
+                        "ordinal": 1,
+                        "binding": binding,
+                        "cwd": pane0.get("cwd"),
+                        "title": pane0.get("title", ""),
+                        "cmd": slice_launch(pane0.get("cmd") or []),
+                    }, sort_keys=True) + "\n",
+                )
+            os.rename(temp_dir, final_dir)
+            temp_dir = None
+            _write_atomic(os.path.join(root, "current"), token + "\n")
+            return final_dir, manifest
+        except (OSError, TypeError, ValueError) as error:
+            print(
+                f"kitty-restore-session: could not publish recovery "
+                f"generation: {error}",
+                file=sys.stderr,
+            )
+            return None
+        finally:
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+    def load_active_generation():
+        root = note_dir_path()
+        if root is None or os.path.islink(root) or not os.path.isdir(root):
+            raise OSError("unsafe recovery root")
+        current = _read_regular(os.path.join(root, "current")).strip()
+        if not re.fullmatch(r"generation-[0-9a-f]{32}", current):
+            raise OSError("malformed active generation")
+        generation = os.path.join(root, current)
+        info = os.lstat(generation)
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError("active generation is not a real directory")
+        manifest = json.loads(_read_regular(
+            os.path.join(generation, "manifest.json")
+        ))
+        if manifest.get("generation") != current:
+            raise OSError("manifest generation mismatch")
+        return current, generation, manifest
+
+
+    def _argv_json(value):
+        try:
+            argv = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or not all(isinstance(arg, str) for arg in argv)
+        ):
+            return None
+        return argv
+
+
+    def _receipt_entry(manifest, resume, safe):
+        matches = []
+        for entry in manifest.get("panes", {}).values():
+            if not isinstance(entry, dict) or entry.get("kind") != "codex":
+                continue
+            if (
+                entry.get("resume_argv") == resume
+                or entry.get("safe_shell_argv") == safe
+            ):
+                matches.append(entry)
+        unique = {entry.get("ordinal"): entry for entry in matches}
+        return next(iter(unique.values())) if len(unique) == 1 else None
+
+
+    def _receipt(generation, entry, state):
+        if generation is None or entry is None:
+            return
+        ordinal = entry.get("ordinal")
+        if not isinstance(ordinal, int) or ordinal < 1:
+            return
+        try:
+            _write_atomic(
+                os.path.join(generation, f"pane-{ordinal}.bootstrap-{state}"),
+                state + "\n",
+            )
+        except OSError:
+            pass
+
+
+    def _exec_safe(argv):
+        if argv:
+            try:
+                os.execvp(argv[0], argv)
+            except OSError:
+                pass
+        os.execvp("/bin/sh", ["/bin/sh"])
+
+
+    def bootstrap(resume_json, safe_json, pane_zero=False):
+        """Bind a restored Codex pane from inside Kitty, then exec it."""
+        resume = _argv_json(resume_json)
+        carried_safe = _argv_json(safe_json)
+        # Caller-carried argv is not a fallback authority. Trust the
+        # generation's safe-shell binding only after a unique manifest entry
+        # has been identified; otherwise fail closed to the system shell.
+        safe = ["/bin/sh"]
+        generation = None
+        manifest = None
+        entry = None
+        try:
+            active, generation, manifest = load_active_generation()
+            entry = _receipt_entry(manifest, resume, carried_safe)
+            if entry is None:
+                raise ValueError("bootstrap argv matches no unique pane")
+            expected_safe = entry.get("safe_shell_argv")
+            if isinstance(expected_safe, list) and expected_safe:
+                safe = expected_safe
+
+            token = os.environ.get("KITTY_RESTORE_BOOTSTRAP")
+            ordinal = os.environ.get("KITTY_RESTORE_ORDINAL")
+            note = os.environ.get("KITTY_RESTORE_NOTE")
+            deadline_text = os.environ.get("KITTY_RESTORE_DEADLINE_MONOTONIC")
+            window_id = os.environ.get("KITTY_WINDOW_ID")
+            if token != active:
+                raise ValueError("stale bootstrap generation")
+            if ordinal != str(entry.get("ordinal")):
+                raise ValueError("bootstrap ordinal mismatch")
+            if note != entry.get("note_path"):
+                raise ValueError("bootstrap note mismatch")
+            deadline = float(deadline_text)
+            if deadline != manifest.get("deadline_monotonic"):
+                raise ValueError("bootstrap deadline mismatch")
+            if time.monotonic() >= deadline:
+                raise ValueError("bootstrap deadline expired")
+            if not window_id or not re.fullmatch(r"[0-9]+", window_id):
+                raise ValueError("Kitty window id is not decimal")
+            if resume != entry.get("resume_argv"):
+                raise ValueError("bootstrap resume argv mismatch")
+            if (
+                safe_json is None
+                or carried_safe != entry.get("safe_shell_argv")
+            ):
+                raise ValueError("bootstrap safe-shell argv mismatch")
+            if (
+                entry.get("kind") != "codex"
+                or not UUID_RE.fullmatch(entry.get("session_id", ""))
+                or resume != [resume[0], "resume", entry["session_id"]]
+                or not os.path.isabs(entry.get("cwd") or "")
+            ):
+                raise ValueError("manifest Codex binding is malformed")
+            if note != os.path.join(
+                generation, f"pane-{entry['ordinal']}.md"
+            ):
+                raise ValueError("manifest note path escapes generation")
+            _read_regular(note)
+            _read_regular(note + ".pending")
+
+            if pane_zero:
+                pane0 = json.loads(_read_regular(
+                    os.path.join(generation, "pane0-launch.json")
+                ))
+                if (
+                    pane0.get("generation") != active
+                    or pane0.get("ordinal") != entry["ordinal"]
+                    or pane0.get("binding") != entry
+                ):
+                    raise ValueError("pane-zero launch record mismatch")
+            else:
+                expected_path = os.path.join(
+                    generation, f"pane-{entry['ordinal']}.expected-window"
+                )
+                expected = None
+                while time.monotonic() < deadline:
+                    try:
+                        expected = _read_regular(expected_path).strip()
+                        break
+                    except FileNotFoundError:
+                        time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+                if expected is None or not re.fullmatch(r"[0-9]+", expected):
+                    raise ValueError("missing or malformed expected window")
+                if expected != window_id:
+                    raise ValueError("launch-returned window mismatch")
+
+            writer = (
+                "${kittyPaneRegistryWrite}"  # noqa: E501
+                + "/bin/kitty-pane-registry-write"
+            )
+            subprocess.run([
+                writer,
+                "--window-id", window_id,
+                "--kind", "codex",
+                "--session-id", entry["session_id"],
+                "--cwd", entry["cwd"],
+            ], check=True)
+            _receipt(generation, entry, "bound")
+
+            pause = os.environ.get("KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND")
+            if os.environ.get("KITTY_RESTORE_TEST") == "1" and pause:
+                _write_atomic(pause, "paused\n")
+                release = pause + ".release"
+                while time.monotonic() < deadline and not os.path.exists(release):
+                    time.sleep(0.02)
+                if not os.path.exists(release):
+                    raise ValueError("after-bound test seam timed out")
+            os.execvp(resume[0], resume)
+        except (
+            IndexError, KeyError, OSError, TypeError, ValueError,
+            subprocess.SubprocessError,
+        ) as error:
+            print(
+                f"kitty-restore-session: Codex bootstrap failed: {error}",
+                file=sys.stderr,
+            )
+            _receipt(generation, entry, "failed")
+            _exec_safe(safe)
+
+
     def materialize_note(pane, ordinal):
         """Write this agent pane's note and one-shot marker."""
         kind = pane.get("agent_kind")
@@ -2229,6 +2699,7 @@ let
         panes = load_panes()
         if not panes:
             return
+        generation_state = publish_generation(panes)
         p = panes[0]
         # slice_launch() here and at the kitty-pane-add loop in main(),
         # NOT inside load_panes(): --dump-panes stays a readout of WHICH
@@ -2241,7 +2712,9 @@ let
             parts += ["--cwd", session_token(p["cwd"])]
         if p["title"]:
             parts += ["--title", session_token(p["title"])]
-        note = materialize_note(p, 1) if p.get("agent_kind") else None
+        manifest = generation_state[1] if generation_state else None
+        binding = manifest["panes"].get("1") if manifest else None
+        note = binding.get("note_path") if binding else None
         if p.get("agent_kind") and note is None:
             print(
                 "kitty-restore-session: refusing to launch pane 0's "
@@ -2254,7 +2727,28 @@ let
             parts = ["launch"]
         elif note is not None:
             parts += ["--env", session_token("KITTY_RESTORE_NOTE=" + note)]
-        carried = line_argv(cmd)
+            if p.get("agent_kind") == "codex":
+                parts += [
+                    "--env",
+                    session_token(
+                        "KITTY_RESTORE_BOOTSTRAP=" + manifest["generation"]
+                    ),
+                    "--env",
+                    session_token("KITTY_RESTORE_ORDINAL=1"),
+                    "--env",
+                    session_token(
+                        "KITTY_RESTORE_DEADLINE_MONOTONIC="
+                        + str(manifest["deadline_monotonic"])
+                    ),
+                ]
+        if binding and binding.get("kind") == "codex":
+            carried = [
+                BOOTSTRAP_FLAG,
+                json.dumps(binding["resume_argv"], separators=(",", ":")),
+                json.dumps(binding["safe_shell_argv"], separators=(",", ":")),
+            ]
+        else:
+            carried = line_argv(cmd)
         if cmd and carried:
             _write_atomic(pane0_path(), json.dumps({
                 "cwd": p["cwd"],
@@ -2371,6 +2865,11 @@ let
         the same canonical command, possibly extending the line-safe
         prefix recorded in the stub. It never contains recovery context.
         """
+        if recorded and recorded[0] == BOOTSTRAP_FLAG:
+            os.environ[PANE0_EXEC_ENV] = str(os.getpid())
+            if len(recorded) == 3:
+                bootstrap(recorded[1], recorded[2], pane_zero=True)
+            _exec_safe(_argv_json(recorded[2]) if len(recorded) > 2 else None)
         cmd = _pane0_cmd(recorded)
         if cmd is None:
             # Hand the user a shell rather than let kitty close an
@@ -2402,6 +2901,12 @@ let
             exec_pane0(sys.argv[2:])
             return
 
+        if mode == BOOTSTRAP_FLAG:
+            resume_json = sys.argv[2] if len(sys.argv) > 2 else None
+            safe_json = sys.argv[3] if len(sys.argv) > 3 else None
+            bootstrap(resume_json, safe_json)
+            return
+
         if mode == "--dump-panes":
             # Test-only: emit resolved panes JSON so assertions can
             # inspect maybe_resume_claude's per-pane outcome (including
@@ -2413,6 +2918,10 @@ let
         panes = load_panes()
         if not panes:
             return
+        try:
+            active, generation, manifest = load_active_generation()
+        except (OSError, TypeError, ValueError):
+            active = generation = manifest = None
         # Skip pane[0] — kitty already created it from the --session
         # stub — UNLESS the stub could not carry its command (see
         # stub_carries_pane0). Then pane 0 came up as a plain shell and
@@ -2436,14 +2945,62 @@ let
                 argv += ["--title", p["title"]]
             cmd = p["cmd"]
             if p.get("agent_kind"):
-                note = materialize_note(p, ordinal)
-                if note is None:
+                binding = (
+                    manifest.get("panes", {}).get(str(ordinal))
+                    if manifest else None
+                )
+                note = binding.get("note_path") if binding else None
+                if note is None or binding.get("kind") != p.get("agent_kind"):
                     cmd = p["shell_cmd"]
                 else:
                     argv += ["--env", "KITTY_RESTORE_NOTE=" + note]
+                    if binding["kind"] == "codex":
+                        argv += [
+                            "--env", "KITTY_RESTORE_BOOTSTRAP=" + active,
+                            "--env", "KITTY_RESTORE_ORDINAL=" + str(ordinal),
+                            "--env",
+                            "KITTY_RESTORE_DEADLINE_MONOTONIC="
+                            + str(manifest["deadline_monotonic"]),
+                        ]
+                        cmd = [
+                            _self_exe(),
+                            BOOTSTRAP_FLAG,
+                            json.dumps(
+                                binding["resume_argv"], separators=(",", ":")
+                            ),
+                            json.dumps(
+                                binding["safe_shell_argv"],
+                                separators=(",", ":"),
+                            ),
+                        ]
             if cmd:
                 argv += ["--", *slice_launch(cmd)]
-            subprocess.run(argv, check=False)
+            result = subprocess.run(
+                argv, check=False, capture_output=True, text=True
+            )
+            if (
+                p.get("agent_kind") == "codex"
+                and binding is not None
+                and result.returncode == 0
+            ):
+                returned = result.stdout.strip()
+                if re.fullmatch(r"[0-9]+", returned):
+                    try:
+                        _write_atomic(
+                            os.path.join(
+                                generation,
+                                f"pane-{ordinal}.expected-window",
+                            ),
+                            returned + "\n",
+                        )
+                    except OSError as error:
+                        print(
+                            "kitty-restore-session: could not publish "
+                            f"expected window for pane {ordinal}: {error}",
+                            file=sys.stderr,
+                        )
+            if result.stderr:
+                sys.stderr.write(result.stderr)
 
 
     if __name__ == "__main__":
@@ -2467,7 +3024,9 @@ let
   # globally.
   claudeKittyPaneRecord = pkgs.writeShellApplication {
     name = "claude-kitty-pane-record";
-    runtimeInputs = with pkgs; [ jq coreutils util-linux gawk kitty ];
+    runtimeInputs = with pkgs; [
+      jq coreutils util-linux gawk kitty kittyPaneRegistryWrite
+    ];
     text = ''
       set -euo pipefail
 
@@ -2586,30 +3145,19 @@ let
         '''|*[!0-9]*) exit 0 ;;
       esac
 
-      dir="''${XDG_CACHE_HOME:-$HOME/.cache}/kitty-session"
-      tsv="$dir/pane-sessions.tsv"
-      # Same 0700 as kitty-session-save: whichever of the two runs
-      # first on a fresh machine must not leave it world-readable.
-      install -d -m 700 "$dir"
+      kitty-pane-registry-write \
+        --window-id "$KITTY_WINDOW_ID" \
+        --kind "$kind" \
+        --session-id "$session_id" \
+        --cwd "$cwd"
 
-      # flock guards concurrent SessionStart hooks (e.g. two new claude
-      # sessions starting in the same second) AND the enricher's
-      # prune_tsv (which takes the same lock from Python). Replace any
-      # existing entry for this window_id, then atomically rename into
-      # place. The trap cleans up the tmp file if any step between
-      # mktemp and the final mv fails — mv consumes the source path,
-      # so on success the trap's `rm -f` is a no-op.
-      (
-        flock -x 9
-        tmp=$(mktemp -p "$dir" ".pane-sessions.tsv.XXXX")
-        trap 'rm -f "$tmp"' EXIT
-        if [ -f "$tsv" ]; then
-          awk -F'\t' -v wid="$KITTY_WINDOW_ID" '$1 != wid' "$tsv" > "$tmp"
-        fi
-        printf '%s\t%s\t%s\t%s\t%s\n' \
-          "$KITTY_WINDOW_ID" "$kind" "$session_id" "$cwd" "$(date +%s)" >> "$tmp"
-        mv "$tmp" "$tsv"
-      ) 9>"$dir/.pane-sessions.lock"
+      # A restored Codex pane was already bound by the in-pane bootstrap.
+      # Codex 0.146 may emit this hook only after the user's first input;
+      # replacing the same row is harmless, but inserting a recovery draft
+      # at that late point is not. The restore launcher owns delivery.
+      if [ "$kind" = codex ] && [ -n "''${KITTY_RESTORE_BOOTSTRAP:-}" ]; then
+        exit 0
+      fi
 
       # Manual recovery-context pickup. Restore puts a private note path
       # in this pane's environment; SessionStart waits until kitty confirms
@@ -2624,10 +3172,17 @@ let
         [ -n "$note" ] && [ -n "$sock" ] || return 0
         local state_base="''${XDG_STATE_HOME:-$HOME/.local/state}"
         local expected="$state_base/claude/kitty-restore"
-        local resolved expected_resolved pending sending ls_json
+        local resolved expected_resolved generation generation_name
+        local current pending sending ls_json
         resolved=$(realpath -m -- "$note" 2>/dev/null) || return 0
         expected_resolved=$(realpath -m -- "$expected" 2>/dev/null) || return 0
-        [ "$(dirname -- "$resolved")" = "$expected_resolved" ] || return 0
+        generation=$(dirname -- "$resolved")
+        [ "$(dirname -- "$generation")" = "$expected_resolved" ] || return 0
+        generation_name=$(basename -- "$generation")
+        [[ "$generation_name" =~ ^generation-[0-9a-f]{32}$ ]] || return 0
+        current="$expected_resolved/current"
+        [ -f "$current" ] && [ ! -L "$current" ] || return 0
+        [ "$(cat -- "$current" 2>/dev/null)" = "$generation_name" ] || return 0
         [[ "$(basename -- "$resolved")" =~ ^pane-[0-9]+[.]md$ ]] || return 0
         [ -f "$resolved" ] && [ ! -L "$resolved" ] || return 0
         pending="$resolved.pending"
@@ -3509,6 +4064,7 @@ in
     kittySessionSave
     kittyCopyUnwrap
     claudeKittyPaneRecord
+    kittyPaneRegistryWrite
     kittyPanesReflow
     # WIP, not yet wired in (see wrapper above):
     kittyPaneAdd
