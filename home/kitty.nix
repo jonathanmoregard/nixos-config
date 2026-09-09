@@ -564,36 +564,8 @@ let
     )
 
 
-    def _is_argv(value):
-        return (
-            isinstance(value, list)
-            and bool(value)
-            and all(isinstance(arg, str) for arg in value)
-        )
-
-
-    def recorded_shell(win):
-        """Return the pane shell without replaying an agent launcher."""
-        raw = win.get("cmdline") or []
-        safe_json = None
-        if (
-            len(raw) == 5
-            and is_pane0_launcher(raw)
-            and raw[2] == BOOTSTRAP_FLAG
-        ):
-            safe_json = raw[4]
-        elif len(raw) == 4 and raw[1] == BOOTSTRAP_FLAG:
-            safe_json = raw[3]
-        if safe_json is not None:
-            try:
-                safe = json.loads(safe_json)
-            except (TypeError, ValueError):
-                safe = None
-            if _is_argv(safe) and _agent_kind(safe) is None:
-                return safe
-        launched = unwrap_pane0(raw)
-        if launched and _agent_kind(launched) is None:
-            return launched
+    def clean_user_shell():
+        """Open a shell without replaying any recorded command wrapper."""
         return [os.environ.get("SHELL") or "/bin/sh"]
 
 
@@ -621,7 +593,7 @@ let
                 sid = win.get("codex_session_id")
                 if isinstance(sid, str) and UUID_RE.fullmatch(sid):
                     return [unwrap_launchers(cl)[0], "resume", sid]
-                return recorded_shell(win)
+                return clean_user_shell()
         wc = unwrap_pane0(win.get("cmdline") or [])
         if wc:
             return wc
