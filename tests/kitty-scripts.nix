@@ -3510,6 +3510,9 @@ pkgs.runCommand "kitty-scripts-harness"
     if command == "send-text":
         with (control / "send-calls").open("a") as out:
             out.write("send\n")
+        if os.environ.get("TX_MODE") == "disappear-after-preflight":
+            (control / "send-zero-after-disappear").touch()
+            raise SystemExit(0)
         (control / "draft-bytes").write_bytes(sys.stdin.buffer.read())
         raise SystemExit(0)
 
@@ -3755,6 +3758,210 @@ pkgs.runCommand "kitty-scripts-harness"
       exit 1
     }
     stop_transaction_child
+
+    # --- Phase P: correction seams for transaction durability ---------
+    #
+    # Keep these independent so one missing guarantee does not hide the
+    # remaining RED evidence. Every injected failure has a live negative
+    # control: either prepare_transaction_case first completes publication,
+    # or the same primitive is rerun without its injection.
+    correction_failures=0
+
+    if ! (
+      guard_case="$PWD/guard-before-cleanup"
+      mkdir -p "$guard_case/cache/kitty-session" "$guard_case/state/claude"
+      jq -n '[{tabs: [{layout: "splits", windows: [{
+        id: 1, cwd: "/tmp", title: "guard timing",
+        cmdline: ["/bin/sh"],
+        foreground_processes: [{cmdline: ["/bin/sh"]}]
+      }]}]}]' > "$guard_case/cache/kitty-session/snapshot.json"
+      printf 'prior exact session\n' > "$guard_case/cache/kitty-session/last.session"
+      printf 'prior typed row\n' > "$guard_case/cache/kitty-session/pane-sessions.tsv"
+      printf 'prior executable stub\n' > "$guard_case/stub"
+      [ ! -e "$guard_case/state/claude/kitty-restore/restore-incomplete" ] \
+        && [ ! -e "$guard_case/guard-visible" ] || exit 1
+
+      env XDG_CACHE_HOME="$guard_case/cache" \
+        XDG_STATE_HOME="$guard_case/state" \
+        KITTY_STUB_PATH="$guard_case/stub" \
+        KITTY_RESTORE_TEST=1 KITTY_RESTORE_TIMEOUT_SECONDS=0.05 \
+        KITTY_RESTORE_TEST_PAUSE_AFTER_GUARD="$guard_case/guard-visible" \
+        ${underTest}/bin/kitty > "$guard_case/wrapper.out" \
+          2> "$guard_case/wrapper.err" &
+      wrapper_pid=$!
+      for _attempt in $(seq 1 100); do
+        [ -e "$guard_case/guard-visible" ] && break
+        kill -0 "$wrapper_pid" 2>/dev/null || break
+        sleep 0.01
+      done
+      if [ ! -e "$guard_case/guard-visible" ]; then
+        kill "$wrapper_pid" 2>/dev/null || true
+        wait "$wrapper_pid" 2>/dev/null || true
+        echo "FAIL(correction/guard-timing): no guard-visible pause before cleanup"
+        exit 1
+      fi
+      guard="$guard_case/state/claude/kitty-restore/restore-incomplete"
+      [ "$(cat "$guard_case/cache/kitty-session/pane-sessions.tsv")" \
+          = 'prior typed row' ] \
+        && [ "$(cat "$guard_case/stub")" = 'prior executable stub' ] || {
+        echo "FAIL(correction/guard-timing): cleanup preceded durable guard"
+        exit 1
+      }
+      token=$(jq -er '.generation | select(test("^generation-[0-9a-f]{32}$"))' \
+        "$guard")
+      [ "$(jq -r .stage "$guard")" = planned ] || {
+        echo "FAIL(correction/guard-timing): initial guard stage was not planned"
+        exit 1
+      }
+      : > "$guard_case/guard-visible.release"
+      wait "$wrapper_pid" 2>/dev/null || true
+      for _attempt in $(seq 1 100); do
+        [ -s "$guard_case/state/claude/kitty-restore/current" ] && break
+        sleep 0.01
+      done
+      [ "$(cat "$guard_case/state/claude/kitty-restore/current")" = "$token" ] \
+        && [ "$(jq -r .generation "$guard")" = "$token" ] || {
+        cat "$guard_case/wrapper.err" 2>/dev/null || true
+        echo "FAIL(correction/guard-timing): planned token did not flow into publication"
+        exit 1
+      }
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      fsync_case="$PWD/fsync-failure"
+      mkdir -p "$fsync_case/cache/kitty-session" "$fsync_case/state"
+      printf 'snapshot sentinel\n' > "$fsync_case/cache/kitty-session/snapshot.json"
+      set +e
+      KITTY_RESTORE_TEST=1 \
+        KITTY_RESTORE_TEST_FAIL_DIR_FSYNC='write:restore-incomplete' \
+        XDG_CACHE_HOME="$fsync_case/cache" XDG_STATE_HOME="$fsync_case/state" \
+        kitty-restore-session --begin-restore \
+          > "$fsync_case/token" 2> "$fsync_case/fail.err"
+      fail_rc=$?
+      set -e
+      [ "$fail_rc" -ne 0 ] \
+        && grep -qF 'injected directory fsync failure' "$fsync_case/fail.err" \
+        && [ -f "$fsync_case/state/claude/kitty-restore/restore-incomplete" ] \
+        && grep -qxF 'snapshot sentinel' \
+          "$fsync_case/cache/kitty-session/snapshot.json" || {
+        cat "$fsync_case/fail.err" 2>/dev/null || true
+        echo "FAIL(correction/fsync): atomic replacement ignored directory fsync failure"
+        exit 1
+      }
+      token=$(KITTY_RESTORE_TEST=1 XDG_CACHE_HOME="$fsync_case/cache" \
+        XDG_STATE_HOME="$fsync_case/state" \
+        kitty-restore-session --begin-restore)
+      [ "$(jq -r .generation \
+          "$fsync_case/state/claude/kitty-restore/restore-incomplete")" \
+          = "$token" ] || {
+        echo "FAIL(correction/fsync): uninjected begin-restore control failed"
+        exit 1
+      }
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      prepare_transaction_case delivery-fsync 5
+      export KITTY_RESTORE_TEST_FAIL_DIR_FSYNC=draft-claim
+      start_transaction_restore normal
+      wait "$TX_PARENT_PID" || true
+      unset KITTY_RESTORE_TEST_FAIL_DIR_FSYNC
+      [ -f "$TX_GENERATION/pane-2.md.sending" ] \
+        && [ ! -e "$TX_GENERATION/pane-2.md.pending" ] \
+        && [ -f "$TX_ROOT/restore-incomplete" ] \
+        && grep -qF 'injected directory fsync failure' \
+          "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(correction/draft-fsync): failed claim was treated as durable"
+        exit 1
+      }
+      old_note="$TX_GENERATION/pane-2.md"
+      kitty-restore-session --emit-stub
+      [ -f "$old_note.uncertain" ] \
+        && [ ! -e "$old_note.sending" ] \
+        && [ ! -e "$old_note.pending" ] || {
+        echo "FAIL(correction/draft-fsync): stale claim was not reconciled terminally"
+        exit 1
+      }
+      stop_transaction_child
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      # The immediately preceding post-bound case is the uninjected success
+      # control: it durably removed its guard only after exact settlement.
+      prepare_transaction_case guard-clear 5
+      export KITTY_RESTORE_TEST_FAIL_DIR_FSYNC=guard-clear
+      start_transaction_restore normal
+      wait "$TX_PARENT_PID" || true
+      unset KITTY_RESTORE_TEST_FAIL_DIR_FSYNC
+      [ -f "$TX_ROOT/restore-incomplete" ] \
+        && grep -Fq "generation=$TX_TOKEN ordinal=0 stage=guard-removal" \
+          "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(correction/guard-clear): failed clear lost the incomplete guard"
+        exit 1
+      }
+      stop_transaction_child
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      prepare_transaction_case publication-abort 5
+      old_token="$TX_TOKEN"
+      old_hashes=$(transaction_hashes)
+      rm -f "$KITTY_STUB_PATH"
+      set +e
+      KITTY_RESTORE_TEST_FAIL_PUBLICATION=reconcile \
+        kitty-restore-session --emit-stub \
+          > "$TX_CONTROL/publish.out" 2> "$TX_CONTROL/publish.err"
+      publish_rc=$?
+      set -e
+      [ "$publish_rc" -ne 0 ] \
+        && grep -qF 'injected publication reconciliation failure' \
+          "$TX_CONTROL/publish.err" \
+        && [ ! -e "$KITTY_STUB_PATH" ] \
+        && [ "$(cat "$TX_ROOT/current")" = "$old_token" ] \
+        && [ "$(transaction_hashes)" = "$old_hashes" ] \
+        && [ -f "$TX_ROOT/restore-incomplete" ] || {
+        cat "$TX_CONTROL/publish.err" 2>/dev/null || true
+        echo "FAIL(correction/publication): cleanup failure proceeded into publication/stub"
+        exit 1
+      }
+      stop_transaction_child
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      prepare_transaction_case disappear-after-preflight 5
+      start_transaction_restore disappear-after-preflight
+      wait "$TX_PARENT_PID" || true
+      [ -f "$TX_CONTROL/send-zero-after-disappear" ] \
+        && [ "$(wc -l < "$TX_CONTROL/send-calls")" -eq 1 ] \
+        && [ ! -e "$TX_CONTROL/draft-bytes" ] \
+        && [ -f "$TX_GENERATION/pane-2.md.uncertain" ] \
+        && [ ! -e "$TX_GENERATION/pane-2.md.pending" ] \
+        && [ ! -e "$TX_GENERATION/pane-2.md.sending" ] \
+        && grep -qP "^202\\tcodex\\t$tx_sid\\t/tmp\\t[0-9]+$" \
+          "$TX_DIR/pane-sessions.tsv" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(correction/disappeared-send): attempted send was not terminally uncertain"
+        exit 1
+      }
+      # Terminal uncertainty is the negative control for automatic retry:
+      # even another complete parent restore cannot cross the send boundary.
+      stop_transaction_child
+      start_transaction_restore disappear-after-preflight
+      wait "$TX_PARENT_PID" || true
+      [ "$(wc -l < "$TX_CONTROL/send-calls")" -eq 1 ] \
+        && grep -qP "^202\\tcodex\\t$tx_sid\\t/tmp\\t[0-9]+$" \
+          "$TX_DIR/pane-sessions.tsv" || {
+        echo "FAIL(correction/disappeared-send): uncertain draft was sent twice"
+        exit 1
+      }
+      stop_transaction_child
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    [ "$correction_failures" -eq 0 ] || {
+      echo "FAIL(correction): $correction_failures durability seam(s) failed"
+      exit 1
+    }
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"
