@@ -2548,6 +2548,14 @@ let
             raise OSError("unsafe recovery root")
         token = "generation-" + secrets.token_hex(16)
         _write_restore_guard(root, token, "planned")
+        # A new durable primary guard supersedes the fixed clearing receipt
+        # pair left by the previous successful restore. Reconcile it only
+        # after publishing the new guard: any cleanup failure therefore
+        # remains saver-blocking, and the two fixed names cannot accumulate.
+        for name in ("restore-complete", "restore-clearing"):
+            path = os.path.join(root, name)
+            if os.path.lexists(path):
+                _remove_state_entry(path)
         return root, token
 
 
@@ -2862,13 +2870,18 @@ let
                 "${kittyPaneRegistryWrite}"  # noqa: E501
                 + "/bin/kitty-pane-registry-write"
             )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("bootstrap deadline expired before binding")
             subprocess.run([
                 writer,
                 "--window-id", window_id,
                 "--kind", "codex",
                 "--session-id", entry["session_id"],
                 "--cwd", entry["cwd"],
-            ], check=True)
+            ], check=True, timeout=remaining)
+            if time.monotonic() >= deadline:
+                raise ValueError("bootstrap deadline expired before receipt")
             _receipt(generation, entry, "bound")
             _test_trace("bootstrap-bound")
 
@@ -2880,6 +2893,8 @@ let
                     time.sleep(0.02)
                 if not os.path.exists(release):
                     raise ValueError("after-bound test seam timed out")
+            if time.monotonic() >= deadline:
+                raise ValueError("bootstrap deadline expired before exec")
             _test_trace("exec")
             os.execvp(resume[0], resume)
         except (
@@ -3377,11 +3392,20 @@ let
 
     def _finish_restore_guard(root, generation):
         guard = os.path.join(root, "restore-incomplete")
+        clearing = os.path.join(root, "restore-clearing")
+        complete = os.path.join(root, "restore-complete")
         try:
             original = _read_regular(guard)
             payload = json.loads(original)
             if payload.get("generation") != generation:
                 raise OSError("restore guard generation changed")
+            # Remove a stale completion receipt while the primary guard is
+            # still durable, then publish the clearing marker before unlinking
+            # that primary. If both the unlink fsync and primary recreation
+            # fail, this pre-durable marker remains the saver-visible barrier.
+            if os.path.lexists(complete):
+                _remove_state_entry(complete)
+            _write_atomic(clearing, generation + "\n")
             os.unlink(guard)
             try:
                 _fsync_directory(root, "guard-clear")
@@ -3393,6 +3417,15 @@ let
                 # an incomplete marker rather than a false success claim.
                 restore_error = None
                 try:
+                    if (
+                        os.environ.get("KITTY_RESTORE_TEST") == "1"
+                        and os.environ.get(
+                            "KITTY_RESTORE_TEST_FAIL_GUARD_RESTORE"
+                        ) == "1"
+                    ):
+                        raise OSError(
+                            "injected primary guard restoration failure"
+                        )
                     _write_atomic(guard, original)
                 except OSError as error:
                     restore_error = error
@@ -3401,6 +3434,12 @@ let
                     detail += f"; guard restoration: {restore_error}"
                 _stage_failure(generation, 0, "guard-removal", detail)
                 return False
+            # The completed receipt has the same canonical token as the
+            # clearing marker and becomes durable only after primary removal
+            # did. The saver accepts this exact pair; every partial/malformed
+            # state remains blocked. Keeping two fixed names avoids a second
+            # unsafe unlink and bounds retained marker state.
+            _write_atomic(complete, generation + "\n")
             return True
         except (OSError, TypeError, ValueError) as error:
             _stage_failure(generation, 0, "guard-removal", str(error))
@@ -4573,6 +4612,23 @@ finally:
       if [ -e "$restore_root/restore-incomplete" ] \
           || [ -L "$restore_root/restore-incomplete" ]; then
         exit 0
+      fi
+      clearing="$restore_root/restore-clearing"
+      complete="$restore_root/restore-complete"
+      if [ -e "$clearing" ] || [ -L "$clearing" ] \
+          || [ -e "$complete" ] || [ -L "$complete" ]; then
+        # A matched, canonical pair is a durable completion receipt. Every
+        # other clearing state is an incomplete restore and must remain a
+        # barrier even when restoration of restore-incomplete itself failed.
+        if [ ! -f "$clearing" ] || [ -L "$clearing" ] \
+            || [ ! -f "$complete" ] || [ -L "$complete" ] \
+            || ! cmp -s "$clearing" "$complete"; then
+          exit 0
+        fi
+        clearing_token="$(cat "$clearing")"
+        if [[ ! "$clearing_token" =~ ^generation-[0-9a-f]{32}$ ]]; then
+          exit 0
+        fi
       fi
 
       # Discover live kitty socket. kitty appends `-{pid}` to the

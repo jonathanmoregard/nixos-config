@@ -3565,6 +3565,12 @@ pkgs.runCommand "kitty-scripts-harness"
         print("202")
     STUB
     chmod +x fakebin/kitty
+    # writeShellApplication prepends the real Kitty package to PATH. Export a
+    # shell shim so saver subprocesses exercise this phase's stateful fake too;
+    # Python subprocesses already find fakebin through the harness PATH.
+    transaction_probe_kitty() { "$PWD/fakebin/kitty" "$@"; }
+    kitty() { transaction_probe_kitty "$@"; }
+    export -f transaction_probe_kitty kitty
 
     wait_for_file() { # <path> <label>
       local path="$1" label="$2"
