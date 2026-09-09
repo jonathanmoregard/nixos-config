@@ -3727,6 +3727,52 @@ pkgs.runCommand "kitty-scripts-harness"
     bounded_failure vanished expected-window 800
     bounded_failure foreground-timeout foreground-settlement 800
 
+    # The registry writer is part of the bootstrap transaction and therefore
+    # shares the parent's deadline. Holding its real advisory lock past that
+    # deadline must not leave an orphaned writer that later publishes bound
+    # and execs Codex after the parent has already released restore.lock.
+    deadline_failures=0
+    if ! (
+      prepare_transaction_case registry-lock-timeout 1
+      (
+        exec 9>"$TX_DIR/.pane-sessions.lock"
+        flock -x 9
+        : > "$TX_CONTROL/registry-lock-held"
+        while [ ! -e "$TX_CONTROL/registry-lock-release" ]; do
+          sleep 0.02
+        done
+      ) & registry_lock_pid=$!
+      wait_for_file "$TX_CONTROL/registry-lock-held" registry-lock-timeout
+      start_ms=$(date +%s%3N)
+      start_transaction_restore normal
+      wait "$TX_PARENT_PID" || true
+      elapsed=$(( $(date +%s%3N) - start_ms ))
+      [ "$elapsed" -ge 800 ] && [ "$elapsed" -lt 4000 ] || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(transaction/registry-lock-timeout): parent elapsed ''${elapsed}ms outside shared deadline"
+        exit 1
+      }
+      [ ! -e "$TX_GENERATION/pane-2.bootstrap-bound" ] \
+        && [ ! -e "$TX_CONTROL/exact-ready" ] || {
+        echo "FAIL(transaction/registry-lock-timeout): bootstrap completed past parent deadline"
+        exit 1
+      }
+      : > "$TX_CONTROL/registry-lock-release"
+      wait "$registry_lock_pid"
+      sleep 0.3
+      [ ! -e "$TX_GENERATION/pane-2.bootstrap-bound" ] \
+        && [ ! -e "$TX_CONTROL/exact-ready" ] \
+        && ! grep -qP "^202\\tcodex\\t$tx_sid\\t/tmp\\t[0-9]+$" \
+          "$TX_DIR/pane-sessions.tsv" 2>/dev/null || {
+        cat "$TX_CONTROL/restore.log"
+        cat "$TX_DIR/pane-sessions.tsv" 2>/dev/null || true
+        echo "FAIL(transaction/registry-lock-timeout): delayed child published after lock release"
+        exit 1
+      }
+      assert_transaction_preserved registry-lock-timeout
+      stop_transaction_child
+    ); then deadline_failures=$((deadline_failures + 1)); fi
+
     # Post-binding failure is terminal without being success. The durable row
     # remains for SessionStart replacement, safe-shell settlement releases the
     # lock promptly, and a later saver skips solely because the guard persists.
@@ -3904,6 +3950,47 @@ pkgs.runCommand "kitty-scripts-harness"
     ); then correction_failures=$((correction_failures + 1)); fi
 
     if ! (
+      # If directory fsync and restoration of the primary guard both fail,
+      # the pre-durable clearing marker is the only saver-visible barrier.
+      # A later guarded completion reconciles the fixed marker set and is the
+      # negative control: saving becomes possible again without accumulation.
+      prepare_transaction_case guard-clear-dual 5
+      export KITTY_RESTORE_TEST_FAIL_DIR_FSYNC=guard-clear
+      export KITTY_RESTORE_TEST_FAIL_GUARD_RESTORE=1
+      start_transaction_restore normal
+      wait "$TX_PARENT_PID" || true
+      unset KITTY_RESTORE_TEST_FAIL_DIR_FSYNC
+      unset KITTY_RESTORE_TEST_FAIL_GUARD_RESTORE
+      [ ! -e "$TX_ROOT/restore-incomplete" ] \
+        && [ -f "$TX_ROOT/restore-clearing" ] \
+        && grep -Fq 'injected primary guard restoration failure' \
+          "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(correction/guard-clear-dual): dual failure lost its fallback barrier"
+        exit 1
+      }
+      TX_CALLER=saver bash "$save_bin"
+      [ ! -e "$TX_CONTROL/saver-ls-calls" ] || {
+        echo "FAIL(correction/guard-clear-dual): saver ignored fallback barrier"
+        exit 1
+      }
+      next_token=$(kitty-restore-session --begin-restore)
+      kitty-restore-session --cancel-restore "$next_token"
+      marker_count=$(find "$TX_ROOT" -maxdepth 1 -name 'restore-*' | wc -l)
+      [ "$marker_count" -le 2 ] || {
+        find "$TX_ROOT" -maxdepth 1 -name 'restore-*' -print
+        echo "FAIL(correction/guard-clear-dual): restore markers accumulated"
+        exit 1
+      }
+      TX_CALLER=saver bash "$save_bin"
+      [ -s "$TX_CONTROL/saver-ls-calls" ] || {
+        echo "FAIL(correction/guard-clear-dual): successful completion kept saver blocked"
+        exit 1
+      }
+      stop_transaction_child
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
       prepare_transaction_case publication-abort 5
       old_token="$TX_TOKEN"
       old_hashes=$(transaction_hashes)
@@ -3981,8 +4068,9 @@ pkgs.runCommand "kitty-scripts-harness"
       stop_transaction_child
     ); then correction_failures=$((correction_failures + 1)); fi
 
-    [ "$correction_failures" -eq 0 ] || {
-      echo "FAIL(correction): $correction_failures durability seam(s) failed"
+    total_failures=$((deadline_failures + correction_failures))
+    [ "$total_failures" -eq 0 ] || {
+      echo "FAIL(correction): $total_failures deadline/durability seam(s) failed"
       exit 1
     }
 
