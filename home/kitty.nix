@@ -2550,7 +2550,6 @@ let
                 raise ValueError("manifest panes is not an object")
             if str(ordinal) not in panes:
                 raise ValueError("manifest has no entry for bootstrap ordinal")
-            receipt_target = {"ordinal": ordinal}
             candidate = panes[str(ordinal)]
             if not isinstance(candidate, dict):
                 raise ValueError("manifest pane entry is not an object")
@@ -2575,14 +2574,16 @@ let
             ):
                 raise ValueError("manifest Codex binding is malformed")
 
-            # The active token and explicit ordinal choose one candidate.
-            # Both argv copies must then agree before either becomes trusted.
+            # The active token, ordinal, and structurally valid entry establish
+            # the receipt target and its safe fallback. The independently
+            # carried argv must still match before Codex itself may run.
+            entry = candidate
+            receipt_target = entry
+            safe = entry["safe_shell_argv"]
             if resume != candidate["resume_argv"]:
                 raise ValueError("bootstrap resume argv mismatch")
             if carried_safe != candidate["safe_shell_argv"]:
                 raise ValueError("bootstrap safe-shell argv mismatch")
-            entry = candidate
-            safe = entry["safe_shell_argv"]
 
             if note != entry["note_path"]:
                 raise ValueError("bootstrap note mismatch")

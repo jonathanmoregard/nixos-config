@@ -2855,8 +2855,8 @@ pkgs.runCommand "kitty-scripts-harness"
     chmod +x fakebin/bootstrap-altered
     altered_bin="$PWD/fakebin/bootstrap-altered"
 
-    manifest_mismatch_fails_closed() { # <label>
-      local label="$1"
+    manifest_mismatch_fails_closed() { # <label> <manifest-safe-marker>
+      local label="$1" safe_marker="$2"
       rm -f "$generation/pane-2.bootstrap-bound" \
         "$generation/pane-2.bootstrap-failed"
       printf '202\n' > "$generation/pane-2.expected-window"
@@ -2875,11 +2875,15 @@ pkgs.runCommand "kitty-scripts-harness"
         echo "FAIL(bootstrap/manifest-$label): failure receipt missing"
         exit 1
       }
-      [ ! -s "$BOOTSTRAP_EXEC_LOG" ] || {
+      grep -qx "$safe_marker" "$BOOTSTRAP_EXEC_LOG" || {
         cat "$BOOTSTRAP_EXEC_LOG"
-        echo "FAIL(bootstrap/manifest-$label): altered argv executed"
+        echo "FAIL(bootstrap/manifest-$label): manifest safe shell did not run"
         exit 1
       }
+      if grep -qx codex "$BOOTSTRAP_EXEC_LOG"; then
+        echo "FAIL(bootstrap/manifest-$label): altered Codex argv executed"
+        exit 1
+      fi
       ! grep -q Traceback "$PWD/state/bootstrap-manifest-$label.err" || {
         cat "$PWD/state/bootstrap-manifest-$label.err"
         echo "FAIL(bootstrap/manifest-$label): traceback escaped"
@@ -2901,7 +2905,7 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(bootstrap): later launch copied mutated manifest resume argv"
       exit 1
     }
-    manifest_mismatch_fails_closed resume
+    manifest_mismatch_fails_closed resume safe-shell
 
     jq --arg altered "$altered_bin" '
       .panes["2"].safe_shell_argv = [$altered, "safe"]
@@ -2916,7 +2920,7 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(bootstrap): later launch copied mutated manifest safe argv"
       exit 1
     }
-    manifest_mismatch_fails_closed safe
+    manifest_mismatch_fails_closed safe altered
     cp "$manifest_good" "$manifest"
     chmod 600 "$manifest"
 
@@ -2967,7 +2971,7 @@ pkgs.runCommand "kitty-scripts-harness"
     malformed_manifest_fails_closed top-level-array '[.]' no
     malformed_manifest_fails_closed panes-array '.panes = []' no
     malformed_manifest_fails_closed scalar-entry \
-      '.panes["2"] = "not-an-entry"' yes
+      '.panes["2"] = "not-an-entry"' no
     cp "$manifest_good" "$manifest"
     chmod 600 "$manifest"
 
@@ -3061,9 +3065,9 @@ pkgs.runCommand "kitty-scripts-harness"
     bootstrap_failure altered-note 202 "$token" 2 "$note1" \
       "''${pane2_args[0]}" "''${pane2_args[1]}" match recorded
     bootstrap_failure altered-resume 202 "$token" 2 "$note2" \
-      "$altered_resume" "''${pane2_args[1]}" match system
+      "$altered_resume" "''${pane2_args[1]}" match recorded
     bootstrap_failure altered-safe-shell 202 "$token" 2 "$note2" \
-      "''${pane2_args[0]}" "$altered_safe" match system
+      "''${pane2_args[0]}" "$altered_safe" match recorded
     bootstrap_failure missing-expected 202 "$token" 2 "$note2" \
       "''${pane2_args[0]}" "''${pane2_args[1]}" missing recorded
     bootstrap_failure mismatched-expected 202 "$token" 2 "$note2" \
@@ -3101,10 +3105,11 @@ pkgs.runCommand "kitty-scripts-harness"
     bootstrap_unbound_failure stale-token "$stale_token" 2
     bootstrap_unbound_failure wrong-ordinal "$token" 7
 
-    # When neither carried argv identifies a manifest entry, even the
-    # alleged safe-shell argv is untrusted. Fall back to /bin/sh; never
-    # execute an arbitrary argv supplied to the bootstrap entrypoint.
-    export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-unbound-forged-safe"
+    # Carried argv never selects identity. Once token + ordinal + manifest
+    # structure bind pane 2, altering both carried values must publish failure
+    # and use the manifest safe shell, never either caller-supplied argv.
+    rm -f "$generation/pane-2.bootstrap-failed"
+    export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-bound-forged-argv"
     : > "$BOOTSTRAP_EXEC_LOG"
     env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
       KITTY_RESTORE_BOOTSTRAP="$token" KITTY_RESTORE_ORDINAL=2 \
@@ -3112,10 +3117,15 @@ pkgs.runCommand "kitty-scripts-harness"
       KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
       BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
       "$bootstrap_bin" --bootstrap "$altered_resume" "$altered_safe" \
-      </dev/null >/dev/null 2> state/bootstrap-unbound-forged-safe.err || true
-    [ ! -s "$BOOTSTRAP_EXEC_LOG" ] || {
+      </dev/null >/dev/null 2> state/bootstrap-bound-forged-argv.err || true
+    [ -f "$generation/pane-2.bootstrap-failed" ] || {
+      cat state/bootstrap-bound-forged-argv.err
+      echo "FAIL(bootstrap/bound-forged): failure receipt missing"; exit 1; }
+    grep -qx safe-shell "$BOOTSTRAP_EXEC_LOG" \
+      && ! grep -qx codex "$BOOTSTRAP_EXEC_LOG" \
+      && ! grep -qx changed "$BOOTSTRAP_EXEC_LOG" || {
       cat "$BOOTSTRAP_EXEC_LOG"
-      echo "FAIL(bootstrap/unbound): executed caller-supplied safe argv"
+      echo "FAIL(bootstrap/bound-forged): wrong fallback argv executed"
       exit 1
     }
     unset KITTY_RESTORE_TEST KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND
