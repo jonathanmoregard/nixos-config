@@ -1064,6 +1064,9 @@ pkgs.runCommand "kitty-scripts-harness"
     #!/bin/sh
     # argv is always: @ --to <sock> <subcommand> [args...]
     if [ "$4" = "ls" ]; then
+      if [ -n "''${KITTY_LS_CALLS:-}" ]; then
+        printf 'ls\n' >> "$KITTY_LS_CALLS"
+      fi
       if [ -n "''${LS_JSON_2:-}" ] && [ -f "''${LS_SWITCHED:-/nonexistent}" ]; then
         cat "$LS_JSON_2"
       else
@@ -3216,6 +3219,84 @@ pkgs.runCommand "kitty-scripts-harness"
       exit 1
     }
     unset KITTY_RESTORE_TEST KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND
+
+    # --- Phase N: restore/save transaction serialization ------------
+    # The saver must acquire the same lock nonblockingly before even asking
+    # Kitty for a socket snapshot. A successful no-op is observable both in
+    # the prior snapshot hashes and in the negative-control ls call log.
+    tx_cache="$PWD/fx/transaction-cache"
+    tx_state="$PWD/fx/transaction-state"
+    tx_dir="$tx_cache/kitty-session"
+    tx_root="$tx_state/claude/kitty-restore"
+    mkdir -p "$tx_dir" "$tx_root"
+    cp "$PWD/grid/two-real.json" "$tx_dir/snapshot.json"
+    printf 'prior exact session\n' > "$tx_dir/last.session"
+    jq '.[0].tabs[0].windows[0].cwd = "/changed-by-save"' \
+      "$PWD/grid/two-real.json" > state/transaction-live.json
+    export XDG_CACHE_HOME="$tx_cache"
+    export XDG_STATE_HOME="$tx_state"
+    export LS_JSON="$PWD/state/transaction-live.json"
+    export KITTY_LS_CALLS="$PWD/state/transaction-ls-calls"
+    : > "$KITTY_LS_CALLS"
+
+    transaction_hashes() {
+      sha256sum "$tx_dir/snapshot.json" "$tx_dir/last.session"
+    }
+    transaction_kitty() {
+      if [ "$4" = ls ]; then
+        printf 'ls\n' >> "$KITTY_LS_CALLS"
+        cat "$LS_JSON"
+        return 0
+      fi
+      return 2
+    }
+    kitty() { transaction_kitty "$@"; }
+    export -f transaction_kitty kitty
+
+    exec 7>"$tx_dir/restore.lock"
+    flock -x 7
+    before=$(transaction_hashes)
+    bash "$save_bin"
+    after=$(transaction_hashes)
+    [ "$before" = "$after" ] || {
+      echo "FAIL(transaction/lock): saver changed snapshot state while"
+      echo "  restore.lock was held across an in-progress cold restore."
+      diff -u <(printf '%s\n' "$before") <(printf '%s\n' "$after") || true
+      exit 1
+    }
+    [ ! -s "$KITTY_LS_CALLS" ] || {
+      echo "FAIL(transaction/lock): saver discovered/captured Kitty before"
+      echo "  its nonblocking restore.lock refusal."
+      exit 1
+    }
+    [ ! -e "$tx_dir/candidate.json.tmp" ] || {
+      echo "FAIL(transaction/lock): skipped saver left a candidate behind"
+      exit 1
+    }
+    flock -u 7
+    exec 7>&-
+
+    # The guard is independently durable: after terminal restore failure the
+    # lock is released, but publication must still skip until a later cold
+    # restore succeeds. This negative control would publish changed live state
+    # if guard inspection were absent or happened after capture.
+    printf 'generation-fixture stage=failed\n' > "$tx_root/restore-incomplete"
+    chmod 600 "$tx_root/restore-incomplete"
+    : > "$KITTY_LS_CALLS"
+    before=$(transaction_hashes)
+    bash "$save_bin"
+    after=$(transaction_hashes)
+    [ "$before" = "$after" ] || {
+      echo "FAIL(transaction/guard): saver replaced prior exact state while"
+      echo "  restore-incomplete remained after a failed restore."
+      exit 1
+    }
+    [ ! -s "$KITTY_LS_CALLS" ] || {
+      echo "FAIL(transaction/guard): saver captured Kitty before refusing"
+      echo "  the durable restore-incomplete guard."
+      exit 1
+    }
+    unset -f transaction_kitty kitty
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"
