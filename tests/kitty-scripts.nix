@@ -312,6 +312,13 @@ let
         "/usr/bin/codex", "touch /tmp/replayed-without-id",
     ])
     codex_without_id["cmdline"] = SHELL
+    codex_indirect_without_id = win(1, [
+        "/usr/bin/codex", "touch /tmp/replayed-indirectly",
+    ])
+    codex_indirect_without_id["cmdline"] = [
+        "/bin/sh", "-c",
+        "exec /usr/bin/codex 'touch /tmp/replayed-indirectly'",
+    ]
 
     cases = {
         # 1 real pane + kitty's config-error overlay. The overlay is
@@ -381,6 +388,7 @@ let
         # may be replayed when this fallback is used.
         "codex-with-id": tab([codex_with_id]),
         "codex-without-id": tab([codex_without_id]),
+        "codex-indirect-without-id": tab([codex_indirect_without_id]),
     }
     for name, data in cases.items():
         with open(os.path.join(out, name + ".json"), "w") as fh:
@@ -1250,14 +1258,24 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(C/convert): last.session replayed Codex flags or a"
       echo "  positional prompt instead of the exact recorded UUID."
       exit 1; }
-    kitty-session-convert < grid/codex-without-id.json \
+    SHELL=/bin/sh kitty-session-convert < grid/codex-without-id.json \
       > state/codex-without-id.session
     grep -qxF \
-      'launch --cwd /tmp --title w1 /run/current-system/sw/bin/zsh' \
+      'launch --cwd /tmp --title w1 /bin/sh' \
       state/codex-without-id.session || {
       cat state/codex-without-id.session
       echo "FAIL(C/convert): last.session replayed a Codex prompt without"
-      echo "  an exact UUID instead of degrading to the recorded shell."
+      echo "  an exact UUID instead of degrading to a clean user shell."
+      exit 1; }
+    SHELL=/bin/sh kitty-session-convert \
+      < grid/codex-indirect-without-id.json \
+      > state/codex-indirect-without-id.session
+    grep -qxF \
+      'launch --cwd /tmp --title w1 /bin/sh' \
+      state/codex-indirect-without-id.session || {
+      cat state/codex-indirect-without-id.session
+      echo "FAIL(C/convert): an indirect shell wrapper replayed a Codex"
+      echo "  positional prompt instead of opening a clean user shell."
       exit 1; }
 
     # --- Phase D: snapshot retention ---
