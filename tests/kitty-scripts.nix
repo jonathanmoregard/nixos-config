@@ -190,6 +190,13 @@ let
             "stub line has no --exec-pane0 launcher: %r\n" % (toks,)
         )
         sys.exit(2)
+    # Model the part of kitty's session parser that installs `--env`
+    # assignments on the launched pane. The restore bootstrap treats these
+    # as untrusted claims and validates them against its private manifest.
+    for i, tok in enumerate(toks[:-1]):
+        if tok == "--env":
+            name, value = toks[i + 1].split("=", 1)
+            os.environ[name] = value
     argv = toks[toks.index("--exec-pane0") - 1:]
     sys.stderr.write("stub argv: %r\n" % (argv,))
     os.execvp(argv[0], argv)
@@ -2596,6 +2603,286 @@ pkgs.runCommand "kitty-scripts-harness"
         echo "  pane."
         exit 1; }
     ) || exit 1
+
+    # --- Phase M: no-hook Codex restore binds before exec -----------
+    #
+    # Codex 0.146 starts `resume <UUID>` with the correct Kitty
+    # environment but emits no SessionStart/hook/transcript event before
+    # the first user input. Therefore the restore launcher itself must bind
+    # the exact UUID to Kitty's injected numeric window id before Codex is
+    # exec'd. This fixture deliberately invokes no SessionStart recorder.
+    bootstrap_cache="$PWD/fx/bootstrap-cache"
+    bootstrap_state="$PWD/fx/bootstrap-state"
+    bootstrap_work="$PWD/fx/bootstrap-work"
+    mkdir -p "$bootstrap_cache/kitty-session" "$bootstrap_work"
+    sid_zero=01234567-89ab-4cde-8f01-23456789abcd
+    sid_later=89abcdef-0123-4567-89ab-cdef01234567
+
+    cat > fakebin/codex <<'STUB'
+    #!/bin/sh
+    printf 'codex\n' >> "$BOOTSTRAP_EXEC_LOG"
+    for arg in "$@"; do printf '%s\n' "$arg" >> "$BOOTSTRAP_EXEC_LOG"; done
+    STUB
+    cat > fakebin/bootstrap-safe-shell <<'STUB'
+    #!/bin/sh
+    printf 'safe-shell\n' >> "$BOOTSTRAP_EXEC_LOG"
+    for arg in "$@"; do printf '%s\n' "$arg" >> "$BOOTSTRAP_EXEC_LOG"; done
+    STUB
+    chmod +x fakebin/codex fakebin/bootstrap-safe-shell
+    codex_bin="$PWD/fakebin/codex"
+    safe_bin="$PWD/fakebin/bootstrap-safe-shell"
+
+    jq -n \
+      --arg cwd "$bootstrap_work" --arg codex "$codex_bin" \
+      --arg safe "$safe_bin" --arg sid0 "$sid_zero" \
+      --arg sid2 "$sid_later" '
+      [{tabs: [{layout: "splits", windows: [
+        {id: 1, cwd: $cwd, title: "codex zero",
+         cmdline: [$safe, "zero"], codex_session_id: $sid0,
+         foreground_processes: [{cmdline: [$codex]}]},
+        {id: 2, cwd: $cwd, title: "codex later",
+         cmdline: [$safe, "later"], codex_session_id: $sid2,
+         foreground_processes: [{cmdline: [$codex, "--dangerously-bypass-approvals-and-sandbox"]}]}
+      ]}]}]
+    ' > "$bootstrap_cache/kitty-session/snapshot.json"
+
+    export XDG_CACHE_HOME="$bootstrap_cache"
+    export XDG_STATE_HOME="$bootstrap_state"
+    export KITTY_STUB_PATH="$PWD/state/bootstrap-stub"
+    export KITTY_RESTORE_TIMEOUT_SECONDS=12
+    kitty-restore-session --emit-stub
+
+    restore_root="$bootstrap_state/claude/kitty-restore"
+    [ "$(stat -c %a "$restore_root")" = 700 ] || {
+      echo "FAIL(bootstrap): recovery root is not mode 0700"; exit 1; }
+    [ -f "$restore_root/current" ] || {
+      echo "FAIL(bootstrap): no active generation pointer"; exit 1; }
+    [ "$(stat -c %a "$restore_root/current")" = 600 ] || {
+      echo "FAIL(bootstrap): current is not mode 0600"; exit 1; }
+    token=$(cat "$restore_root/current")
+    case "$token" in
+      generation-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+      *) echo "FAIL(bootstrap): generation token is not random 128-bit hex: $token"; exit 1 ;;
+    esac
+    generation="$restore_root/$token"
+    manifest="$generation/manifest.json"
+    pane0_launch="$generation/pane0-launch.json"
+    [ "$(stat -c %a "$generation")" = 700 ] || {
+      echo "FAIL(bootstrap): generation is not mode 0700"; exit 1; }
+    for private in "$manifest" "$pane0_launch" \
+      "$generation/pane-1.md" "$generation/pane-1.md.pending" \
+      "$generation/pane-2.md" "$generation/pane-2.md.pending"; do
+      [ -f "$private" ] && [ "$(stat -c %a "$private")" = 600 ] || {
+        echo "FAIL(bootstrap): missing/non-private generation file $private"
+        exit 1
+      }
+    done
+    jq -e --arg token "$token" --arg cwd "$bootstrap_work" \
+      --arg codex "$codex_bin" --arg safe "$safe_bin" \
+      --arg sid0 "$sid_zero" --arg sid2 "$sid_later" \
+      --arg note0 "$generation/pane-1.md" \
+      --arg note2 "$generation/pane-2.md" '
+      .generation == $token
+      and (.deadline_monotonic | type == "number")
+      and .panes["1"] == {
+        ordinal: 1, kind: "codex", session_id: $sid0, cwd: $cwd,
+        note_path: $note0, resume_argv: [$codex, "resume", $sid0],
+        safe_shell_argv: [$safe, "zero"]
+      }
+      and .panes["2"] == {
+        ordinal: 2, kind: "codex", session_id: $sid2, cwd: $cwd,
+        note_path: $note2, resume_argv: [$codex, "resume", $sid2],
+        safe_shell_argv: [$safe, "later"]
+      }
+    ' "$manifest" >/dev/null || {
+      cat "$manifest" 2>/dev/null || true
+      echo "FAIL(bootstrap): manifest does not bind exact pane identities"
+      exit 1
+    }
+    jq -e --slurpfile manifest "$manifest" '
+      .generation == $manifest[0].generation
+      and .ordinal == 1
+      and .binding == $manifest[0].panes["1"]
+    ' "$pane0_launch" >/dev/null || {
+      cat "$pane0_launch" 2>/dev/null || true
+      echo "FAIL(bootstrap): pane0-launch does not carry manifest binding"
+      exit 1
+    }
+    for name in KITTY_RESTORE_BOOTSTRAP KITTY_RESTORE_ORDINAL \
+      KITTY_RESTORE_NOTE KITTY_RESTORE_DEADLINE_MONOTONIC; do
+      grep -q -- "--env $name=" "$KITTY_STUB_PATH" || {
+        cat "$KITTY_STUB_PATH"
+        echo "FAIL(bootstrap): pane zero omitted $name"; exit 1; }
+    done
+    grep -q -- '--exec-pane0' "$KITTY_STUB_PATH" || {
+      echo "FAIL(bootstrap): pane zero bypasses --exec-pane0"; exit 1; }
+    if grep -qE -- "codex( |')+resume" "$KITTY_STUB_PATH"; then
+      echo "FAIL(bootstrap): pane zero launches codex resume directly"
+      exit 1
+    fi
+
+    # The parent creates later panes through the same bootstrap entrypoint.
+    export LS_JSON="$PWD/grid/two-real.json"
+    export KITTY_CMD_LOG="$PWD/state/bootstrap-parent-launches"
+    export KITTY_FAKE_WINDOW_ID=202
+    : > "$KITTY_CMD_LOG"
+    kitty-restore-session
+    echo "--- bootstrap parent launches ---"; cat "$KITTY_CMD_LOG"
+    grep -q -- '--bootstrap' "$KITTY_CMD_LOG" || {
+      echo "FAIL(bootstrap): parent did not launch the bootstrap wrapper"
+      exit 1
+    }
+    if grep -qE -- "codex( |')+resume" "$KITTY_CMD_LOG"; then
+      echo "FAIL(bootstrap): parent launched codex resume directly"
+      exit 1
+    fi
+    [ "$(cat "$generation/pane-2.expected-window")" = 202 ] || {
+      echo "FAIL(bootstrap): parent did not publish launch-returned window"
+      exit 1
+    }
+
+    bootstrap_argv() { # <ordinal>
+      jq -r --arg ordinal "$1" '
+        .panes[$ordinal].resume_argv | @json,
+        (.panes[$ordinal].safe_shell_argv | @json)
+      ' "$manifest"
+    }
+    mapfile -t pane1_args < <(bootstrap_argv 1)
+    mapfile -t pane2_args < <(bootstrap_argv 2)
+    deadline=$(jq -r '.deadline_monotonic' "$manifest")
+    note1="$generation/pane-1.md"
+    note2="$generation/pane-2.md"
+    bootstrap_bin=$(command -v kitty-restore-session)
+
+    # Pane zero enters bootstrap via the exact argv Kitty parsed from the
+    # one-line stub. No hook runs, yet its mapping must exist afterwards.
+    export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-pane0-exec"
+    : > "$BOOTSTRAP_EXEC_LOG"
+    KITTY_WINDOW_ID=201 python3 ${mkStubExec} "$KITTY_STUB_PATH" \
+      2> state/bootstrap-pane0.err
+    grep -qP "^201\\tcodex\\t$sid_zero\\t$bootstrap_work\\t[0-9]+$" \
+      "$bootstrap_cache/kitty-session/pane-sessions.tsv" || {
+      cat "$bootstrap_cache/kitty-session/pane-sessions.tsv" || true
+      echo "FAIL(bootstrap): pane zero no-hook mapping is missing"; exit 1; }
+    printf 'codex\nresume\n%s\n' "$sid_zero" > state/expected-pane0-exec
+    cmp -s state/expected-pane0-exec "$BOOTSTRAP_EXEC_LOG" || {
+      cat "$BOOTSTRAP_EXEC_LOG"
+      echo "FAIL(bootstrap): pane zero exec was not exact codex resume UUID"
+      exit 1
+    }
+
+    # Later pane: pause after the durable row + bootstrap-bound receipt and
+    # before execvp. That boundary is the regression's essential ordering.
+    export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-later-exec"
+    export KITTY_RESTORE_TEST=1
+    export KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND="$PWD/state/bootstrap-pause"
+    rm -f "$BOOTSTRAP_EXEC_LOG" "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND" \
+      "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND.release" \
+      "$generation/pane-2.bootstrap-bound" \
+      "$generation/pane-2.bootstrap-failed"
+    KITTY_RESTORE_BOOTSTRAP="$token" KITTY_RESTORE_ORDINAL=2 \
+      KITTY_RESTORE_NOTE="$note2" \
+      KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" \
+      KITTY_WINDOW_ID=202 \
+      "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
+        "''${pane2_args[1]}" & bootstrap_pid=$!
+    for unused in $(seq 1 100); do
+      [ -e "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND" ] && break
+      sleep 0.02
+    done
+    [ -e "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND" ] || {
+      wait "$bootstrap_pid" || true
+      echo "FAIL(bootstrap): after-bound test seam was never reached"
+      exit 1
+    }
+    grep -qP "^202\\tcodex\\t$sid_later\\t$bootstrap_work\\t[0-9]+$" \
+      "$bootstrap_cache/kitty-session/pane-sessions.tsv" || {
+      cat "$bootstrap_cache/kitty-session/pane-sessions.tsv" || true
+      echo "FAIL(bootstrap): mapping was not durable at bootstrap-bound"
+      exit 1
+    }
+    [ -f "$generation/pane-2.bootstrap-bound" ] || {
+      echo "FAIL(bootstrap): bound receipt missing before exec"; exit 1; }
+    [ ! -e "$BOOTSTRAP_EXEC_LOG" ] || {
+      echo "FAIL(bootstrap): Codex exec happened before bootstrap-bound pause"
+      exit 1
+    }
+    : > "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND.release"
+    wait "$bootstrap_pid"
+    printf 'codex\nresume\n%s\n' "$sid_later" > state/expected-later-exec
+    cmp -s state/expected-later-exec "$BOOTSTRAP_EXEC_LOG" || {
+      cat "$BOOTSTRAP_EXEC_LOG"
+      echo "FAIL(bootstrap): later exec was not exact codex resume UUID"
+      exit 1
+    }
+
+    bootstrap_failure() { # <label> <wid> <token> <ord> <note> <resume> <safe> <expected-mode> [cache]
+      local label="$1" wid="$2" supplied_token="$3" ordinal="$4"
+      local supplied_note="$5" resume_json="$6" safe_json="$7"
+      local expected_mode="$8" supplied_cache="''${9:-$bootstrap_cache}"
+      rm -f "$generation/pane-2.bootstrap-bound" \
+        "$generation/pane-2.bootstrap-failed" \
+        "$generation/pane-2.expected-window"
+      case "$expected_mode" in
+        match) printf '202\n' > "$generation/pane-2.expected-window" ;;
+        mismatch) printf '999\n' > "$generation/pane-2.expected-window" ;;
+        malformed) printf 'not-a-window\n' > "$generation/pane-2.expected-window" ;;
+        missing) ;;
+      esac
+      export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-failure-$label"
+      : > "$BOOTSTRAP_EXEC_LOG"
+      env XDG_CACHE_HOME="$supplied_cache" XDG_STATE_HOME="$bootstrap_state" \
+        KITTY_RESTORE_BOOTSTRAP="$supplied_token" \
+        KITTY_RESTORE_ORDINAL="$ordinal" \
+        KITTY_RESTORE_NOTE="$supplied_note" \
+        KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" \
+        BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+        ''${wid:+KITTY_WINDOW_ID="$wid"} \
+        "$bootstrap_bin" --bootstrap "$resume_json" "$safe_json" \
+        >/dev/null 2> "$PWD/state/bootstrap-failure-$label.err" || true
+      [ -f "$generation/pane-2.bootstrap-failed" ] || {
+        cat "$PWD/state/bootstrap-failure-$label.err"
+        echo "FAIL(bootstrap/$label): bootstrap-failed missing"; exit 1; }
+      [ -f "$note2.pending" ] || {
+        echo "FAIL(bootstrap/$label): pending marker was claimed"; exit 1; }
+      grep -qx safe-shell "$BOOTSTRAP_EXEC_LOG" || {
+        cat "$BOOTSTRAP_EXEC_LOG"
+        echo "FAIL(bootstrap/$label): recorded safe shell did not run"
+        exit 1
+      }
+      if grep -qx codex "$BOOTSTRAP_EXEC_LOG"; then
+        echo "FAIL(bootstrap/$label): Codex ran after identity failure"
+        exit 1
+      fi
+    }
+
+    altered_resume=$(jq -nc --arg codex "$codex_bin" --arg sid "$sid_later" \
+      '[$codex, "--yolo", "resume", $sid]')
+    altered_safe=$(jq -nc --arg safe "$safe_bin" '[$safe, "changed"]')
+    stale_token=generation-ffffffffffffffffffffffffffffffff
+    bootstrap_failure missing-window "" "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match
+    bootstrap_failure malformed-window nope "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match
+    bootstrap_failure stale-token 202 "$stale_token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match
+    bootstrap_failure wrong-ordinal 202 "$token" 7 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match
+    bootstrap_failure altered-note 202 "$token" 2 "$note1" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match
+    bootstrap_failure altered-resume 202 "$token" 2 "$note2" \
+      "$altered_resume" "''${pane2_args[1]}" match
+    bootstrap_failure altered-safe-shell 202 "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "$altered_safe" match
+    bootstrap_failure missing-expected 202 "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" missing
+    bootstrap_failure mismatched-expected 202 "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" mismatch
+    printf 'not-a-directory\n' > state/registry-cache-file
+    bootstrap_failure registry-writer 202 "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match \
+      "$PWD/state/registry-cache-file"
+    unset KITTY_RESTORE_TEST KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"
