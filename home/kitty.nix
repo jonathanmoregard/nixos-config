@@ -141,9 +141,8 @@ let
     # that ONE line. shlex.quote does NOT make a newline safe there --
     # it keeps real newlines inside the quotes -- so a multi-line argv
     # element turns one `launch` into as many directives as the value
-    # has lines. The restore notice is exactly such a value, and
-    # kitty-pane-add hands it to every claude pane, so it comes back in
-    # the pane's live cmdline on the next snapshot too.
+    # has lines. Recovery notes therefore travel as private files named
+    # by a single-line environment value, never as command argv.
     #
     # Measured 2026-09-04 against real kitty 0.48.2 under Xvfb: fed a
     # 12-line session file, kitty opened `kitten __show_error__ --title
@@ -186,7 +185,7 @@ let
   # indirection this module inserts between kitty and a pane's real
   # command.
   #
-  # Needs no imports.
+  # Requires `import json` in consumers.
   #
   # ── Why this exists ───────────────────────────────────────────────────
   #
@@ -218,6 +217,7 @@ let
   # indirection is transparent to every reader of `window.cmdline`.
   kittyPane0LaunchPy = ''
     PANE0_FLAG = "--exec-pane0"
+    BOOTSTRAP_FLAG = "--bootstrap"
 
     # Set to the exec'ing process's pid just before --exec-pane0 hands
     # the pane over. execvp keeps the pid, so seeing our OWN pid here
@@ -254,9 +254,50 @@ let
         """
         cmdline = cmdline or []
         if is_pane0_launcher(cmdline):
+            if len(cmdline) >= 4 and cmdline[2] == BOOTSTRAP_FLAG:
+                try:
+                    resume = json.loads(cmdline[3])
+                except (TypeError, ValueError):
+                    return []
+                if (
+                    isinstance(resume, list)
+                    and resume
+                    and all(isinstance(arg, str) for arg in resume)
+                ):
+                    return resume
+                return []
             return cmdline[2:]
         return cmdline
   '';
+
+  # One source of truth for both Codex classifiers below. The Python
+  # snapshot/enrich/restore path and Bash SessionStart ancestry path must
+  # skip exactly the same value-taking globals before looking for the real
+  # subcommand; drift here turns one-shot children into resumable panes.
+  codexNoninteractiveSubcommands = [
+    "exec" "e" "mcp" "mcp-server" "app-server" "completion"
+    "sandbox" "debug" "apply" "a" "cloud" "login" "logout"
+    "features" "responses-api-proxy" "review" "plugin"
+    "remote-control" "update" "doctor" "archive" "delete"
+    "unarchive" "exec-server" "help"
+  ];
+  codexOptionsWithValue = [
+    "-c" "--config" "-m" "--model" "-p" "--profile"
+    "-s" "--sandbox" "-a" "--ask-for-approval" "-C" "--cd"
+    "--add-dir" "--enable" "--disable" "--remote"
+    "--remote-auth-token-env" "--local-provider"
+  ];
+  codexVariadicOptions = [ "-i" "--image" ];
+  codexVariadicInlinePatterns = map
+    (option:
+      if lib.hasPrefix "--" option then "${option}=*" else "${option}?*")
+    codexVariadicOptions;
+  codexNoninteractiveFlags = [ "-h" "--help" "-V" "--version" ];
+  pythonStringSet = values:
+    "{\n"
+    + lib.concatMapStringsSep "\n"
+      (value: "        ${builtins.toJSON value},") values
+    + "\n    }";
 
   # Shared Python: keep a RESTORED Claude Code pane inside
   # claude-egress.slice, and let every consumer see through the launcher
@@ -358,6 +399,72 @@ let
         return os.path.basename(cmdline[0]) == "claude"
 
 
+    # Codex has both an interactive TUI and one-shot/service subcommands.
+    # Only the former is a pane that can safely be resumed. A positional
+    # prompt is also an interactive root invocation, so this is a deny-list
+    # of known non-TUI subcommands rather than an allow-list of arbitrary
+    # prompt text.
+    CODEX_NONINTERACTIVE = ${pythonStringSet codexNoninteractiveSubcommands}
+    CODEX_OPTIONS_WITH_VALUE = ${pythonStringSet codexOptionsWithValue}
+    CODEX_VARIADIC_OPTIONS = ${pythonStringSet codexVariadicOptions}
+    CODEX_NONINTERACTIVE_FLAGS = ${pythonStringSet codexNoninteractiveFlags}
+
+
+    def _is_codex_exe(cmdline):
+        """True when cmdline[0] is the Codex CLI itself."""
+        return bool(cmdline) and os.path.basename(cmdline[0]) == "codex"
+
+
+    def _codex_subcommand(cmdline):
+        """First Codex subcommand or global exit flag before `--`.
+
+        Codex 0.146.0 declares image as `<FILE>...`: a separated `-i` or
+        `--image` absorbs every following non-option token. An attached
+        value (`-ifile` or `--image=file`) completes that occurrence, so
+        the next token is parsed normally. `--` ends option parsing and
+        makes even help/version spellings part of the interactive prompt.
+        """
+        args = (cmdline or [])[1:]
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg == "--":
+                return None
+            if arg in CODEX_NONINTERACTIVE_FLAGS:
+                return arg
+            if arg in CODEX_OPTIONS_WITH_VALUE:
+                index += 2
+                continue
+            if arg in CODEX_VARIADIC_OPTIONS:
+                index += 1
+                while index < len(args) and not args[index].startswith("-"):
+                    index += 1
+                continue
+            if any(
+                arg.startswith(option + "=")
+                if option.startswith("--")
+                else arg.startswith(option) and len(arg) > len(option)
+                for option in CODEX_VARIADIC_OPTIONS
+            ):
+                index += 1
+                continue
+            if arg.startswith("-"):
+                index += 1
+                continue
+            return arg
+        return None
+
+
+    def _is_codex_exe_interactive(cmdline):
+        """True for Codex TUI root/resume/fork, never exec/services."""
+        if not _is_codex_exe(cmdline):
+            return False
+        command = _codex_subcommand(cmdline)
+        return command not in (
+            CODEX_NONINTERACTIVE | CODEX_NONINTERACTIVE_FLAGS
+        )
+
+
     def unwrap_slice(cmdline):
         """The claude argv inside a slice launcher, else cmdline.
 
@@ -395,6 +502,21 @@ let
     def _is_claude(cmdline):
         """True when this pane's command is claude, wrapped or not."""
         return _is_claude_exe(unwrap_launchers(cmdline))
+
+
+    def _is_codex(cmdline):
+        """True when this pane's command is an interactive Codex TUI."""
+        return _is_codex_exe_interactive(unwrap_launchers(cmdline))
+
+
+    def _agent_kind(cmdline):
+        """The interactive agent kind under this module's launchers."""
+        inner = unwrap_launchers(cmdline)
+        if _is_claude_exe(inner):
+            return "claude"
+        if _is_codex_exe_interactive(inner):
+            return "codex"
+        return None
 
 
     def slice_launch(cmdline):
@@ -436,6 +558,17 @@ let
 
     ${claudeSliceLaunchPy}
 
+    UUID_RE = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
+
+
+    def clean_user_shell():
+        """Open a shell without replaying any recorded command wrapper."""
+        return [os.environ.get("SHELL") or "/bin/sh"]
+
+
     def pane_cmd(win):
         """The command this pane should be recorded as running.
 
@@ -453,8 +586,14 @@ let
         fg = win.get("foreground_processes") or []
         for fp in fg:
             cl = fp.get("cmdline") or []
-            if _is_claude(cl):
+            kind = _agent_kind(cl)
+            if kind == "claude":
                 return cl
+            if kind == "codex":
+                sid = win.get("codex_session_id")
+                if isinstance(sid, str) and UUID_RE.fullmatch(sid):
+                    return [unwrap_launchers(cl)[0], "resume", sid]
+                return clean_user_shell()
         wc = unwrap_pane0(win.get("cmdline") or [])
         if wc:
             return wc
@@ -517,11 +656,13 @@ let
   kittyPaneAdd = pkgs.writers.writePython3Bin "kitty-pane-add" {} ''
     """Add a pane following the 2x2-per-tab grid.
 
-    Usage: kitty-pane-add [--cwd DIR] [--title T] [-- CMD ARGS...]
+    Usage: kitty-pane-add [--cwd DIR] [--title T] [--env NAME=VALUE]
+                          [-- CMD ARGS...]
     """
     import glob
     import json
     import os
+    import re
     import subprocess
     import sys
 
@@ -560,6 +701,7 @@ let
     def parse_args(argv):
         cwd = None
         title = None
+        env = []
         cmd = []
         i = 1
         while i < len(argv):
@@ -570,17 +712,25 @@ let
             elif a == "--title":
                 title = argv[i + 1]
                 i += 2
+            elif a == "--env":
+                spec = argv[i + 1]
+                name, sep, _value = spec.partition("=")
+                if not sep or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+                    print(f"invalid env assignment: {spec}", file=sys.stderr)
+                    sys.exit(2)
+                env.append(spec)
+                i += 2
             elif a == "--":
                 cmd = argv[i + 1:]
                 break
             else:
                 print(f"unknown arg: {a}", file=sys.stderr)
                 sys.exit(2)
-        return cwd, title, cmd
+        return cwd, title, env, cmd
 
 
     def main():
-        cwd, title, cmd = parse_args(sys.argv)
+        cwd, title, env, cmd = parse_args(sys.argv)
         sock = find_socket()
         if not sock:
             print("no live kitty", file=sys.stderr)
@@ -638,9 +788,18 @@ let
             common += ["--cwd", cwd]
         if title:
             common += ["--title", title]
+        for spec in env:
+            common += ["--env", spec]
 
         def run(*xs):
-            subprocess.run(["kitty", "@", "--to", sock, *xs], check=True)
+            result = subprocess.run(
+                ["kitty", "@", "--to", sock, *xs],
+                check=True, capture_output=True, text=True,
+            )
+            if xs and xs[0] == "launch":
+                # `kitty @ launch` prints the created window id. Restore
+                # persists it as a cross-check for the in-pane bootstrap.
+                sys.stdout.write(result.stdout)
 
         # Use insertion order via window ID (kitty auto-increments).
         # Smallest id = original full-height "left" pane; second-smallest
@@ -674,6 +833,139 @@ let
     if __name__ == "__main__":
         main()
   '';
+
+  # One atomic typed-registry writer for both SessionStart and the no-hook
+  # restore bootstrap. The registry remains line-compatible with historical
+  # readers: new rows have five fields, while unrelated legacy four-field
+  # rows are preserved byte-for-byte until the enricher prunes them.
+  kittyPaneRegistryWrite = pkgs.writers.writePython3Bin
+    "kitty-pane-registry-write" {} ''
+      import argparse
+      import fcntl
+      import os
+      import re
+      import stat
+      import tempfile
+      import time
+
+
+      UUID_RE = re.compile(
+          r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+          r"[0-9a-f]{4}-[0-9a-f]{12}$"
+      )
+
+
+      def fail(message):
+          raise SystemExit("kitty-pane-registry-write: " + message)
+
+
+      def test_trace(event):
+          path = os.environ.get("KITTY_RESTORE_TEST_TRACE")
+          if os.environ.get("KITTY_RESTORE_TEST") != "1" or not path:
+              return
+          with open(path, "a") as trace:
+              trace.write(event + "\n")
+              trace.flush()
+              os.fsync(trace.fileno())
+
+
+      parser = argparse.ArgumentParser()
+      parser.add_argument("--window-id", required=True)
+      parser.add_argument("--kind", required=True)
+      parser.add_argument("--session-id", required=True)
+      parser.add_argument("--cwd", required=True)
+      args = parser.parse_args()
+
+      if not re.fullmatch(r"[0-9]+", args.window_id):
+          fail("window id must be decimal")
+      if args.kind not in {"claude", "codex"}:
+          fail("kind must be claude or codex")
+      if not UUID_RE.fullmatch(args.session_id):
+          fail("session id must be a canonical lowercase UUID")
+      if (
+          not os.path.isabs(args.cwd)
+          or "\0" in args.cwd
+          or "\t" in args.cwd
+          or len(args.cwd.splitlines()) != 1
+      ):
+          fail("cwd must be absolute and contain no row separators")
+
+      cache_base = os.environ.get(
+          "XDG_CACHE_HOME", os.path.join(os.path.expanduser("~"), ".cache")
+      )
+      directory = os.path.join(cache_base, "kitty-session")
+      if os.path.lexists(directory) and os.path.islink(directory):
+          fail("refusing symlink registry directory")
+      os.makedirs(directory, mode=0o700, exist_ok=True)
+      if os.path.islink(directory) or not os.path.isdir(directory):
+          fail("registry directory is not a real directory")
+      os.chmod(directory, 0o700)
+
+      registry = os.path.join(directory, "pane-sessions.tsv")
+      lock_path = os.path.join(directory, ".pane-sessions.lock")
+      nofollow = getattr(os, "O_NOFOLLOW", 0)
+      lock_fd = os.open(
+          lock_path,
+          os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | nofollow,
+          0o600,
+      )
+      try:
+          os.fchmod(lock_fd, 0o600)
+          fcntl.flock(lock_fd, fcntl.LOCK_EX)
+          old_rows = []
+          if os.path.lexists(registry):
+              info = os.lstat(registry)
+              if not stat.S_ISREG(info.st_mode):
+                  fail("refusing non-regular registry")
+              old_fd = os.open(registry, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+              with os.fdopen(old_fd, "r", errors="replace") as old:
+                  old_rows = old.readlines()
+
+          tmp_fd, tmp_path = tempfile.mkstemp(
+              dir=directory, prefix=".pane-sessions.tsv."
+          )
+          try:
+              os.fchmod(tmp_fd, 0o600)
+              with os.fdopen(tmp_fd, "w") as out:
+                  tmp_fd = -1
+                  for row in old_rows:
+                      if row.split("\t", 1)[0] != args.window_id:
+                          out.write(row)
+                  out.write(
+                      "\t".join((
+                          args.window_id,
+                          args.kind,
+                          args.session_id,
+                          args.cwd,
+                          str(int(time.time())),
+                      )) + "\n"
+                  )
+                  out.flush()
+                  os.fsync(out.fileno())
+                  test_trace("file-fsync")
+              os.replace(tmp_path, registry)
+              test_trace("replace")
+              os.chmod(registry, 0o600)
+              directory_fd = os.open(
+                  directory,
+                  os.O_RDONLY | os.O_CLOEXEC
+                  | getattr(os, "O_DIRECTORY", 0) | nofollow,
+              )
+              try:
+                  os.fsync(directory_fd)
+              finally:
+                  os.close(directory_fd)
+              test_trace("directory-fsync")
+          finally:
+              if tmp_fd >= 0:
+                  os.close(tmp_fd)
+              try:
+                  os.unlink(tmp_path)
+              except FileNotFoundError:
+                  tmp_path = ""
+      finally:
+          os.close(lock_fd)
+    '';
 
   # Rearrange the panes a RUNNING kitty already has into the same
   # canonical grid kitty-pane-add CREATES, without killing or
@@ -1352,14 +1644,19 @@ let
   # then closes whatever default window kitty opened on startup.
   kittyRestoreSession = pkgs.writers.writePython3Bin "kitty-restore-session" {} ''
     """Restore kitty session from snapshot.json via kitty-pane-add."""
+    import contextlib
+    import fcntl
     import glob
     import json
     import os
     import re
+    import secrets
     import shlex
     import shutil
+    import stat
     import subprocess
     import sys
+    import tempfile
     import time
 
 
@@ -1371,17 +1668,34 @@ let
 
     ${claudeSliceLaunchPy}
 
-    def find_socket(timeout=30):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            for f in sorted(glob.glob("/tmp/kitty.sock-*")):
-                r = subprocess.run(
-                    ["kitty", "@", "--to", f"unix:{f}", "ls"],
-                    capture_output=True, timeout=2,
-                )
+    def _remaining(deadline):
+        return max(0.0, deadline - time.monotonic())
+
+
+    def find_socket(timeout=30, deadline=None):
+        if deadline is None:
+            deadline = time.monotonic() + timeout
+        while _remaining(deadline) > 0:
+            candidates = []
+            configured = os.environ.get("KITTY_LISTEN_ON")
+            if configured:
+                candidates.append(configured)
+            candidates.extend(
+                f"unix:{path}"
+                for path in sorted(glob.glob("/tmp/kitty.sock-*"))
+            )
+            for socket in dict.fromkeys(candidates):
+                try:
+                    r = subprocess.run(
+                        ["kitty", "@", "--to", socket, "ls"],
+                        capture_output=True,
+                        timeout=min(2.0, _remaining(deadline)),
+                    )
+                except subprocess.TimeoutExpired:
+                    continue
                 if r.returncode == 0:
-                    return f"unix:{f}"
-            time.sleep(0.3)
+                    return socket
+            time.sleep(min(0.3, _remaining(deadline)))
         return None
 
 
@@ -1415,6 +1729,53 @@ let
     RESTORE_BUDGET_S = 3.0
     MAX_FILES_PER_AGENT = 12
     EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+    UUID_RE = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
+
+
+    def is_bootstrap_launcher(cmdline):
+        """True for a direct or pane-0-carried Codex bootstrap argv."""
+        cmdline = cmdline or []
+        return (
+            len(cmdline) >= 2 and cmdline[1] == BOOTSTRAP_FLAG
+        ) or (
+            is_pane0_launcher(cmdline)
+            and len(cmdline) >= 3
+            and cmdline[2] == BOOTSTRAP_FLAG
+        )
+
+
+    def bootstrap_safe_argv(cmdline, expected_resume):
+        """Validated safe argv carried beside a canonical Codex resume."""
+        cmdline = cmdline or []
+        if is_pane0_launcher(cmdline):
+            if len(cmdline) != 5 or cmdline[2] != BOOTSTRAP_FLAG:
+                return None
+            resume_json, safe_json = cmdline[3:]
+        else:
+            if len(cmdline) != 4 or cmdline[1] != BOOTSTRAP_FLAG:
+                return None
+            resume_json, safe_json = cmdline[2:]
+        try:
+            resume = json.loads(resume_json)
+            safe = json.loads(safe_json)
+        except (TypeError, ValueError):
+            return None
+        if not (
+            _is_argv(resume)
+            and len(resume) == 3
+            and os.path.basename(resume[0]) == "codex"
+            and resume[1] == "resume"
+            and UUID_RE.fullmatch(resume[2])
+            and resume == expected_resume
+            and _is_argv(safe)
+        ):
+            return None
+        if is_pane0_launcher(safe) or is_bootstrap_launcher(safe):
+            return None
+        return safe
 
 
     def _last_record(path):
@@ -1564,7 +1925,7 @@ let
 
 
     def restore_notice(proj_dir, sid, cwd=None):
-        """Prompt handed to every restored pane. Never None.
+        """Recovery-note content written for every restored Claude pane.
 
         Unconditional on purpose: the point is to kick the resumed
         session back into the work, and it has no other way to learn its
@@ -1647,21 +2008,13 @@ let
 
 
     def _resume_cmd(claude, sid, proj_dir, cwd=None):
-        """Resume command, plus the restore prompt.
-
-        The probe must never cost a restore: recovering the pane layout
-        matters more than delivering the notice, so every failure path
-        returns the plain resume command.
-        """
-        base = [claude, "--resume", sid]
-        try:
-            notice = restore_notice(proj_dir, sid, cwd)
-        except Exception:
-            return base
-        return base + [notice] if notice else base
+        """Canonical Claude resume argv; recovery context is a note."""
+        return [claude, "--resume", sid]
 
 
-    def maybe_resume_claude(cmd, cwd, session_id, claimed_sids):
+    def maybe_resume_claude(
+        cmd, shell_cmd, cwd, session_id, reserved_sids, used_sids
+    ):
         """If cmd is the claude-code CLI, rewrite to resume the correct
         session. Prefers the per-pane session_id captured at snapshot
         time (TSV populated by the SessionStart hook
@@ -1680,7 +2033,7 @@ let
         fresh rather than wrong-resume. Losing one pane's resume is
         recoverable; merging two panes onto one session corrupts both.
 
-        Mutates `claimed_sids` with the sid this pane ends up using.
+        Mutates `used_sids` with the sid this pane ends up using.
         """
         # Unwrap first: a snapshot taken after a restore records the
         # claude-egress launcher as the pane's command, and the session
@@ -1695,7 +2048,9 @@ let
         if session_id and proj_dir and os.path.isfile(
             os.path.join(proj_dir, f"{session_id}.jsonl")
         ):
-            claimed_sids.add(session_id)
+            if session_id in used_sids:
+                return shell_cmd
+            used_sids.add(session_id)
             return _resume_cmd(cmd[0], session_id, proj_dir, cwd)
         if not proj_dir or not os.path.isdir(proj_dir):
             return cmd
@@ -1709,29 +2064,67 @@ let
         sessions.sort(key=lambda t: t[1], reverse=True)
         for fname, _mtime in sessions:
             candidate = fname.removesuffix(".jsonl")
-            if candidate in claimed_sids:
+            if candidate in reserved_sids or candidate in used_sids:
                 continue
-            claimed_sids.add(candidate)
+            used_sids.add(candidate)
             return _resume_cmd(cmd[0], candidate, proj_dir, cwd)
         return cmd
 
 
+    def maybe_resume_codex(cmd, shell_cmd, session_id, used_sids):
+        """Return an exact canonical Codex resume, or the pane's shell.
+
+        Codex has no cwd-based fallback: without the exact snapshot thread
+        id, guessing can merge two panes. Old launch flags are intentionally
+        discarded rather than replayed around `resume`.
+        """
+        if not _is_codex(cmd):
+            return cmd
+        inner = unwrap_launchers(cmd)
+        if not isinstance(session_id, str) or not UUID_RE.match(session_id):
+            return shell_cmd
+        if session_id in used_sids:
+            return shell_cmd
+        used_sids.add(session_id)
+        return [inner[0], "resume", session_id]
+
+
+    def codex_restore_notice(cwd):
+        """Recovery boundary for a resumed Codex thread."""
+        parts = [
+            "This pane was restored by kitty after its prior process tree "
+            "ended. Any workers or subprocesses from before restore are no "
+            "longer running unless they were independently detached.",
+            f"Working directory: {cwd or '(unknown)'}.",
+        ]
+        deadline = time.time() + RESTORE_BUDGET_S
+        counts = _dirty_counts(cwd, deadline)
+        if counts is not None:
+            changed, staged = counts
+            parts.append(
+                f"Git working tree: {changed} changed file(s), "
+                f"{staged} staged."
+            )
+        else:
+            parts.append(
+                "Git status unavailable (not a Git working tree or status "
+                "probe failed)."
+            )
+        parts.append(
+            "Treat transcript claims about in-flight work as historical. "
+            "Verify filesystem and process state before continuing."
+        )
+        return "\n".join(parts)
+
+
     # ---- pane-0 transport ----------------------------------------------
     #
-    # session_token() above keeps every value that DOES go into the stub
-    # on one line, but flattening the restore notice would gut it: the
-    # orphan block is one line per subagent and one per edited file, and
-    # a wall of run-together text is not the message. So the NOTICE does
-    # not travel through the session file. The stub's launch command is
-    # this very script in --exec-pane0 mode, followed by as much of pane
-    # 0's argv as one line can hold (line_argv(), i.e. everything before
-    # the notice); the full argv, notice included, travels in JSON
-    # (where newlines are escaped by construction) and --exec-pane0
-    # execs it after checking that it extends what the launch line said.
-    # Pane 0 then receives the notice as an argv element by exactly the
-    # mechanism panes 1..N get it -- kitty-pane-add's `-- <cmd>
-    # <notice>` -- which is why there is no second notice-delivery path
-    # to keep in sync.
+    # session_token() keeps every value in the stub on one line. Recovery
+    # context is deliberately not argv: emit_stub writes it to a private
+    # state file, sets KITTY_RESTORE_NOTE to that single-line path, and
+    # records the canonical agent argv in pane0_path(). SessionStart then
+    # proves its exact kitty window exists and types the constant unsent
+    # draft `Read $KITTY_RESTORE_NOTE.` once.
     #
     # The argv on the launch line is not redundant with the JSON. kitty
     # reports a window's cmdline as what it SPAWNED, and that is what
@@ -1742,11 +2135,8 @@ let
     # zombie arm of pane_cmd() below keeps working for pane 0 exactly as
     # it does for panes 1..N.
     #
-    # The considered alternative was `kitty @ send-text` once the socket
-    # is up. Rejected: it types into whatever the pane is showing, so it
-    # races claude's TUI coming up and the notice's own newlines read as
-    # submissions -- mangling the one message whose job is to be read
-    # exactly.
+    # send-text is used only by SessionStart, after exact target preflight,
+    # and sends no newline. It cannot auto-submit recovery context.
 
     def cache_dir():
         base = os.environ.get(
@@ -1754,6 +2144,34 @@ let
             os.path.join(os.path.expanduser("~"), ".cache"),
         )
         return os.path.join(base, "kitty-session")
+
+
+    @contextlib.contextmanager
+    def restore_transaction_lock():
+        """Use the wrapper's inherited lock, or acquire it directly."""
+        directory = cache_dir()
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        path = os.path.join(directory, "restore.lock")
+        own_fd = None
+        fd = 8
+        try:
+            inherited = os.fstat(fd)
+            target = os.stat(path)
+            if (inherited.st_dev, inherited.st_ino) != (
+                target.st_dev, target.st_ino
+            ):
+                raise OSError("fd 8 is not restore.lock")
+        except OSError:
+            own_fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+            fd = own_fd
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if own_fd is not None:
+                fcntl.flock(own_fd, fcntl.LOCK_UN)
+                os.close(own_fd)
 
 
     def pane0_path():
@@ -1777,6 +2195,41 @@ let
         return os.environ.get(
             "KITTY_STUB_PATH", os.path.join(cache_dir(), "stub-session")
         )
+
+
+    def note_dir_path():
+        base = os.environ.get(
+            "XDG_STATE_HOME",
+            os.path.join(os.path.expanduser("~"), ".local", "state"),
+        )
+        path = os.path.abspath(os.path.join(base, "claude", "kitty-restore"))
+        # kitty's session parser expands $variables and splits on Python's
+        # full splitlines alphabet. Such a path cannot be transported
+        # byte-for-byte in a one-line --env token, so it is untrusted.
+        if "$" in path or LINEBREAKS.search(path):
+            return None
+        return path
+
+
+    def prepare_note_dir():
+        """Create the private note directory, refusing symlink roots."""
+        path = note_dir_path()
+        if path is None:
+            return None
+        parent = os.path.dirname(path)
+        try:
+            if os.path.lexists(parent) and os.path.islink(parent):
+                return None
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+            if os.path.lexists(path) and os.path.islink(path):
+                return None
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            if os.path.islink(path) or not os.path.isdir(path):
+                return None
+            os.chmod(path, 0o700)
+        except OSError:
+            return None
+        return path
 
 
     def _self_exe():
@@ -1831,7 +2284,7 @@ let
         fg = win.get("foreground_processes") or []
         for fp in fg:
             cl = fp.get("cmdline") or []
-            if _is_claude(cl):
+            if _agent_kind(cl):
                 return cl
         wc = unwrap_pane0(win.get("cmdline") or [])
         if wc:
@@ -1845,16 +2298,18 @@ let
             return []
         with open(snap_path) as fh:
             snap = json.load(fh)
-        # Seed claimed_sids with sids explicitly attached in the snapshot
-        # before resolving any fallback, so an un-enriched same-cwd pane
-        # can't grab a sibling's sid via latest-by-mtime.
-        claimed_sids = set()
+        # Seed reserved Claude ids before resolving any fallback, so an
+        # un-enriched same-cwd pane cannot grab a sibling's exact id via
+        # latest-by-mtime before that sibling is visited.
+        reserved_claude_sids = set()
         for osw in snap:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
                     sid = win.get("claude_session_id")
-                    if sid:
-                        claimed_sids.add(sid)
+                    if isinstance(sid, str) and UUID_RE.match(sid):
+                        reserved_claude_sids.add(sid)
+        used_claude_sids = set()
+        used_codex_sids = set()
         panes = []
         for osw in snap:
             for tab in osw.get("tabs", []):
@@ -1870,48 +2325,662 @@ let
                         continue
                     cmd = pane_cmd(win)
                     cwd = win.get("cwd")
-                    sid = win.get("claude_session_id")
-                    cmd = maybe_resume_claude(cmd, cwd, sid, claimed_sids)
+                    raw_wc = win.get("cmdline") or []
+                    wc = unwrap_pane0(raw_wc)
+                    if is_bootstrap_launcher(raw_wc):
+                        shell_cmd = ["/bin/sh"]
+                    elif wc and _agent_kind(wc) is None:
+                        shell_cmd = wc
+                    else:
+                        shell_cmd = [os.environ.get("SHELL") or "/bin/sh"]
+                    kind = _agent_kind(cmd)
+                    if kind == "claude":
+                        cmd = maybe_resume_claude(
+                            cmd, shell_cmd, cwd,
+                            win.get("claude_session_id"),
+                            reserved_claude_sids, used_claude_sids,
+                        )
+                    elif kind == "codex":
+                        cmd = maybe_resume_codex(
+                            cmd, shell_cmd, win.get("codex_session_id"),
+                            used_codex_sids,
+                        )
+                        if is_bootstrap_launcher(raw_wc):
+                            shell_cmd = (
+                                bootstrap_safe_argv(raw_wc, cmd)
+                                or ["/bin/sh"]
+                            )
                     panes.append({
                         "cwd": cwd,
                         "title": win.get("title", ""),
                         "cmd": cmd,
+                        "agent_kind": kind if _agent_kind(cmd) else None,
+                        "shell_cmd": shell_cmd,
                     })
         return panes
 
 
-    def _write_atomic(path, text):
-        """Replace `path` with `text`, refusing to write through a
-        symlink.
-
-        O_NOFOLLOW on the temp file, because `path + ".tmp"` is the
-        name an attacker gets to plant at: open('w') would truncate
-        whatever the link pointed at and then os.replace would move
-        the LINK into place, leaving kitty executing a file somebody
-        else still owns. 0600 because these hold the user's cwds,
-        window titles, argv and claude session ids.
-        """
-        tmp = path + ".tmp"
-        fd = os.open(
-            tmp,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-            0o600,
+    def _fsync_directory(directory, event):
+        """Make one directory-entry transition durable before returning."""
+        if (
+            os.environ.get("KITTY_RESTORE_TEST") == "1"
+            and os.environ.get("KITTY_RESTORE_TEST_FAIL_DIR_FSYNC") == event
+        ):
+            raise OSError(
+                f"injected directory fsync failure for {event}"
+            )
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY | os.O_CLOEXEC
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
         )
-        # Explicitly, not just via the open mode: a temp file left
-        # behind by a crashed run keeps whatever mode it already had.
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
+    def _write_atomic(path, text):
+        """Atomically replace `path` using a unique private temp file.
+
+        mkstemp avoids the predictable `path + ".tmp"` name an attacker
+        could pre-plant as a symlink. Refuse an existing leaf symlink rather
+        than replacing it: recovery files are fail-closed metadata, and a
+        pre-planted final path must not be accepted as ordinary state. 0600
+        because these files hold recovery context or launch metadata.
+        """
+        parent = os.path.dirname(path) or "."
+        if os.path.lexists(path) and os.path.islink(path):
+            raise OSError(f"refusing symlink target: {path}")
+        fd, tmp = tempfile.mkstemp(
+            dir=parent, prefix="." + os.path.basename(path) + "."
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fd = -1
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+            _fsync_directory(parent, "write:" + os.path.basename(path))
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                tmp = ""
+
+
+    def _read_regular(path):
+        """Read a private regular file without following its final leaf."""
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"refusing non-regular recovery file: {path}")
+        fd = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        with os.fdopen(fd) as source:
+            return source.read()
+
+
+    def _note_text(pane):
+        kind = pane.get("agent_kind")
+        if kind == "codex":
+            return codex_restore_notice(pane.get("cwd"))
+        if kind != "claude":
+            return None
+        cmd = unwrap_launchers(pane["cmd"])
+        cwd = pane.get("cwd")
+        if len(cmd) >= 3 and cmd[1] == "--resume":
+            sid = cmd[2]
+            encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd or "")
+            proj_dir = os.path.expanduser(f"~/.claude/projects/{encoded}")
+            return restore_notice(proj_dir, sid, cwd)
+        return (
+            "This pane was restored by kitty after its prior process tree "
+            "ended. No exact Claude session was safe to resume, so this is "
+            "a fresh session. Verify filesystem and process state before "
+            "continuing."
+        )
+
+
+    def _binding(pane, ordinal, note_path):
+        kind = pane.get("agent_kind")
+        cmd = unwrap_launchers(pane.get("cmd") or [])
+        if kind == "claude":
+            session_id = (
+                cmd[2]
+                if len(cmd) >= 3
+                and cmd[1] == "--resume"
+                and UUID_RE.fullmatch(cmd[2])
+                else None
+            )
+        elif kind == "codex" and len(cmd) == 3 and cmd[1] == "resume":
+            session_id = cmd[2]
+        else:
+            return None
+        if kind == "codex" and not UUID_RE.fullmatch(session_id):
+            return None
+        return {
+            "ordinal": ordinal,
+            "kind": kind,
+            "session_id": session_id,
+            "cwd": pane.get("cwd"),
+            "note_path": note_path,
+            "resume_argv": cmd,
+            "safe_shell_argv": pane.get("shell_cmd") or ["/bin/sh"],
+        }
+
+
+    def _remove_state_entry(path):
+        """Remove one recovery artifact without following a leaf symlink."""
+        parent = os.path.dirname(path) or "."
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+        _fsync_directory(parent, "cleanup")
+
+
+    def _reconcile_generation_state(root):
+        """Make stale sends honest and remove non-generation leftovers."""
+        previous = None
+        try:
+            candidate = _read_regular(os.path.join(root, "current")).strip()
+            if re.fullmatch(r"generation-[0-9a-f]{32}", candidate):
+                previous = candidate
+        except OSError:
+            previous = None
+
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            if re.fullmatch(r"generation-[0-9a-f]{32}", name):
+                if not os.path.isdir(path) or os.path.islink(path):
+                    _remove_state_entry(path)
+                    continue
+                for marker in os.listdir(path):
+                    if not re.fullmatch(
+                        r"pane-[1-9][0-9]*[.]md[.]sending", marker
+                    ):
+                        continue
+                    sending = os.path.join(path, marker)
+                    uncertain = sending[:-len("sending")] + "uncertain"
+                    if os.path.lexists(uncertain):
+                        _remove_state_entry(sending)
+                    else:
+                        os.replace(sending, uncertain)
+                        os.chmod(uncertain, 0o600)
+                        _fsync_directory(path, "draft-reconcile")
+            elif name.startswith(".generation-"):
+                _remove_state_entry(path)
+            elif re.fullmatch(r"pane-[1-9][0-9]*[.]md.*", name):
+                _remove_state_entry(path)
+        return previous
+
+
+    def _retain_generations(root, active, previous):
+        keep = {active}
+        if previous and previous != active:
+            keep.add(previous)
+        for name in os.listdir(root):
+            if (
+                re.fullmatch(r"generation-[0-9a-f]{32}", name)
+                and name not in keep
+            ):
+                _remove_state_entry(os.path.join(root, name))
+
+
+    def _write_restore_guard(root, token, stage):
+        _write_atomic(
+            os.path.join(root, "restore-incomplete"),
+            json.dumps({"generation": token, "stage": stage}, sort_keys=True)
+            + "\n",
+        )
+
+
+    def _read_restore_guard(root):
+        payload = json.loads(_read_regular(
+            os.path.join(root, "restore-incomplete")
+        ))
+        if not isinstance(payload, dict):
+            raise OSError("restore guard is not an object")
+        return payload
+
+
+    def _require_restore_guard(root, token):
+        payload = _read_restore_guard(root)
+        if payload.get("generation") != token:
+            raise OSError("restore guard generation changed")
+        return payload
+
+
+    def _begin_restore_guard():
+        root = prepare_note_dir()
+        if root is None:
+            raise OSError("unsafe recovery root")
+        token = "generation-" + secrets.token_hex(16)
+        _write_restore_guard(root, token, "planned")
+        # A new durable primary guard supersedes the fixed clearing receipt
+        # pair left by the previous successful restore. Reconcile it only
+        # after publishing the new guard: any cleanup failure therefore
+        # remains saver-blocking, and the two fixed names cannot accumulate.
+        for name in ("restore-complete", "restore-clearing"):
+            path = os.path.join(root, name)
+            if os.path.lexists(path):
+                _remove_state_entry(path)
+        return root, token
+
+
+    def publish_generation(panes, token):
+        """Stage a complete private recovery generation, then publish it."""
+        root = prepare_note_dir()
+        if root is None:
+            return None
+        if not re.fullmatch(r"generation-[0-9a-f]{32}", token or ""):
+            print(
+                "kitty-restore-session: invalid planned generation token",
+                file=sys.stderr,
+            )
+            return None
+        try:
+            # The wrapper or direct --emit-stub entrypoint wrote this exact
+            # planned token immediately after locking. Never fall back through
+            # current after a failed publication from a different generation.
+            _require_restore_guard(root, token)
+            _write_restore_guard(root, token, "reconciling")
+            if (
+                os.environ.get("KITTY_RESTORE_TEST") == "1"
+                and os.environ.get(
+                    "KITTY_RESTORE_TEST_FAIL_PUBLICATION"
+                ) == "reconcile"
+            ):
+                raise OSError(
+                    "injected publication reconciliation failure"
+                )
+            previous = _reconcile_generation_state(root)
+        except OSError as error:
+            print(
+                "kitty-restore-session: could not begin restore generation: "
+                f"{error}",
+                file=sys.stderr,
+            )
+            return None
+        final_dir = os.path.join(root, token)
+        temp_dir = tempfile.mkdtemp(prefix="." + token + ".tmp-", dir=root)
+        os.chmod(temp_dir, 0o700)
+        timeout = 30.0
+        if os.environ.get("KITTY_RESTORE_TEST") == "1":
+            try:
+                timeout = float(
+                    os.environ.get("KITTY_RESTORE_TIMEOUT_SECONDS", 30)
+                )
+            except ValueError:
+                timeout = 30.0
+        if not (0.05 <= timeout <= 300.0):
+            timeout = 30.0
+        deadline = time.monotonic() + timeout
+        manifest = {
+            "generation": token,
+            "deadline_monotonic": deadline,
+            "panes": {},
+        }
+        try:
+            for ordinal, pane in enumerate(panes, start=1):
+                if pane.get("agent_kind") not in {"claude", "codex"}:
+                    continue
+                final_note = os.path.join(final_dir, f"pane-{ordinal}.md")
+                entry = _binding(pane, ordinal, final_note)
+                text = _note_text(pane)
+                if entry is None or text is None:
+                    raise OSError("agent pane lacks an exact recovery binding")
+                _write_atomic(
+                    os.path.join(temp_dir, f"pane-{ordinal}.md"), text + "\n"
+                )
+                _write_atomic(
+                    os.path.join(temp_dir, f"pane-{ordinal}.md.pending"),
+                    "pending\n",
+                )
+                manifest["panes"][str(ordinal)] = entry
+
+            _write_atomic(
+                os.path.join(temp_dir, "manifest.json"),
+                json.dumps(manifest, sort_keys=True) + "\n",
+            )
+            if panes:
+                pane0 = panes[0]
+                binding = manifest["panes"].get("1")
+                _write_atomic(
+                    os.path.join(temp_dir, "pane0-launch.json"),
+                    json.dumps({
+                        "generation": token,
+                        "ordinal": 1,
+                        "binding": binding,
+                        "cwd": pane0.get("cwd"),
+                        "title": pane0.get("title", ""),
+                        "cmd": slice_launch(pane0.get("cmd") or []),
+                    }, sort_keys=True) + "\n",
+                )
+            os.rename(temp_dir, final_dir)
+            _fsync_directory(root, "generation-publish")
+            temp_dir = None
+            _write_atomic(os.path.join(root, "current"), token + "\n")
+            _retain_generations(root, token, previous)
+            _write_restore_guard(root, token, "launching")
+            return final_dir, manifest
+        except (OSError, TypeError, ValueError) as error:
+            print(
+                f"kitty-restore-session: could not publish recovery "
+                f"generation: {error}",
+                file=sys.stderr,
+            )
+            return None
+        finally:
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+    def _active_generation_path():
+        root = note_dir_path()
+        if root is None or os.path.islink(root) or not os.path.isdir(root):
+            raise OSError("unsafe recovery root")
+        current = _read_regular(os.path.join(root, "current")).strip()
+        if not re.fullmatch(r"generation-[0-9a-f]{32}", current):
+            raise OSError("malformed active generation")
+        generation = os.path.join(root, current)
+        info = os.lstat(generation)
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError("active generation is not a real directory")
+        return current, generation
+
+
+    def load_active_generation():
+        current, generation = _active_generation_path()
+        manifest = json.loads(_read_regular(
+            os.path.join(generation, "manifest.json")
+        ))
+        if not isinstance(manifest, dict):
+            raise OSError("manifest is not an object")
+        if manifest.get("generation") != current:
+            raise OSError("manifest generation mismatch")
+        if not isinstance(manifest.get("panes"), dict):
+            raise OSError("manifest panes is not an object")
+        return current, generation, manifest
+
+
+    def _argv_json(value):
+        try:
+            argv = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or not all(isinstance(arg, str) for arg in argv)
+        ):
+            return None
+        return argv
+
+
+    def _is_argv(value):
+        return (
+            isinstance(value, list)
+            and bool(value)
+            and all(isinstance(arg, str) for arg in value)
+        )
+
+
+    def _receipt(generation, entry, state):
+        if generation is None or entry is None:
+            raise ValueError("receipt target is unavailable")
+        ordinal = entry.get("ordinal")
+        if not isinstance(ordinal, int) or ordinal < 1:
+            raise ValueError("receipt ordinal is invalid")
+        _write_atomic(
+            os.path.join(generation, f"pane-{ordinal}.bootstrap-{state}"),
+            state + "\n",
+        )
+        directory_fd = os.open(
+            generation,
+            os.O_RDONLY | os.O_CLOEXEC
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
+    def _test_trace(event):
+        path = os.environ.get("KITTY_RESTORE_TEST_TRACE")
+        if os.environ.get("KITTY_RESTORE_TEST") != "1" or not path:
+            return
+        with open(path, "a") as trace:
+            trace.write(event + "\n")
+            trace.flush()
+            os.fsync(trace.fileno())
+
+
+    def _exec_safe(argv):
+        if argv:
+            try:
+                os.execvp(argv[0], argv)
+            except OSError as error:
+                print(
+                    "kitty-restore-session: could not exec recorded safe "
+                    f"shell; opening /bin/sh: {error}",
+                    file=sys.stderr,
+                )
+        os.execvp("/bin/sh", ["/bin/sh"])
+
+
+    def bootstrap(resume_json, safe_json, pane_zero=False):
+        """Bind a restored Codex pane from inside Kitty, then exec it."""
+        resume = _argv_json(resume_json)
+        carried_safe = _argv_json(safe_json)
+        safe = ["/bin/sh"]
+        generation = None
+        manifest = None
+        entry = None
+        receipt_target = None
+        try:
+            active, generation = _active_generation_path()
+            token = os.environ.get("KITTY_RESTORE_BOOTSTRAP")
+            ordinal_text = os.environ.get("KITTY_RESTORE_ORDINAL")
+            note = os.environ.get("KITTY_RESTORE_NOTE")
+            deadline_text = os.environ.get("KITTY_RESTORE_DEADLINE_MONOTONIC")
+            window_id = os.environ.get("KITTY_WINDOW_ID")
+            if token != active:
+                raise ValueError("stale bootstrap generation")
+            if not ordinal_text or not re.fullmatch(r"[1-9][0-9]*", ordinal_text):
+                raise ValueError("bootstrap ordinal is invalid")
+            ordinal = int(ordinal_text)
+
+            manifest = json.loads(_read_regular(
+                os.path.join(generation, "manifest.json")
+            ))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest is not an object")
+            if manifest.get("generation") != active:
+                raise ValueError("manifest generation mismatch")
+            panes = manifest.get("panes")
+            if not isinstance(panes, dict):
+                raise ValueError("manifest panes is not an object")
+            if str(ordinal) not in panes:
+                raise ValueError("manifest has no entry for bootstrap ordinal")
+            candidate = panes[str(ordinal)]
+            if not isinstance(candidate, dict):
+                raise ValueError("manifest pane entry is not an object")
+            if (
+                candidate.get("ordinal") != ordinal
+                or candidate.get("kind") != "codex"
+                or not isinstance(candidate.get("session_id"), str)
+                or not UUID_RE.fullmatch(candidate["session_id"])
+                or not isinstance(candidate.get("cwd"), str)
+                or not os.path.isabs(candidate["cwd"])
+                or not isinstance(candidate.get("note_path"), str)
+                or candidate["note_path"] != os.path.join(
+                    generation, f"pane-{ordinal}.md"
+                )
+                or not _is_argv(candidate.get("resume_argv"))
+                or candidate["resume_argv"] != [
+                    candidate["resume_argv"][0],
+                    "resume",
+                    candidate["session_id"],
+                ]
+                or not _is_argv(candidate.get("safe_shell_argv"))
+            ):
+                raise ValueError("manifest Codex binding is malformed")
+
+            # The active token, ordinal, and structurally valid entry establish
+            # the receipt target and its safe fallback. The independently
+            # carried argv must still match before Codex itself may run.
+            entry = candidate
+            receipt_target = entry
+            safe = entry["safe_shell_argv"]
+            if resume != candidate["resume_argv"]:
+                raise ValueError("bootstrap resume argv mismatch")
+            if carried_safe != candidate["safe_shell_argv"]:
+                raise ValueError("bootstrap safe-shell argv mismatch")
+
+            if note != entry["note_path"]:
+                raise ValueError("bootstrap note mismatch")
+            deadline = float(deadline_text)
+            if deadline != manifest.get("deadline_monotonic"):
+                raise ValueError("bootstrap deadline mismatch")
+            if time.monotonic() >= deadline:
+                raise ValueError("bootstrap deadline expired")
+            if not window_id or not re.fullmatch(r"[0-9]+", window_id):
+                raise ValueError("Kitty window id is not decimal")
+            _read_regular(note)
+            _read_regular(note + ".pending")
+
+            if pane_zero:
+                pane0 = json.loads(_read_regular(
+                    os.path.join(generation, "pane0-launch.json")
+                ))
+                if (
+                    not isinstance(pane0, dict)
+                    or pane0.get("generation") != active
+                    or pane0.get("ordinal") != entry["ordinal"]
+                    or pane0.get("binding") != entry
+                ):
+                    raise ValueError("pane-zero launch record mismatch")
+            else:
+                expected_path = os.path.join(
+                    generation, f"pane-{entry['ordinal']}.expected-window"
+                )
+                expected = None
+                while time.monotonic() < deadline:
+                    try:
+                        expected = _read_regular(expected_path).strip()
+                        break
+                    except FileNotFoundError:
+                        time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+                if expected is None or not re.fullmatch(r"[0-9]+", expected):
+                    raise ValueError("missing or malformed expected window")
+                if expected != window_id:
+                    raise ValueError("launch-returned window mismatch")
+
+            writer = (
+                "${kittyPaneRegistryWrite}"  # noqa: E501
+                + "/bin/kitty-pane-registry-write"
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("bootstrap deadline expired before binding")
+            subprocess.run([
+                writer,
+                "--window-id", window_id,
+                "--kind", "codex",
+                "--session-id", entry["session_id"],
+                "--cwd", entry["cwd"],
+            ], check=True, timeout=remaining)
+            if time.monotonic() >= deadline:
+                raise ValueError("bootstrap deadline expired before receipt")
+            _receipt(generation, entry, "bound")
+            _test_trace("bootstrap-bound")
+
+            pause = os.environ.get("KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND")
+            if os.environ.get("KITTY_RESTORE_TEST") == "1" and pause:
+                _write_atomic(pause, "paused\n")
+                release = pause + ".release"
+                while time.monotonic() < deadline and not os.path.exists(release):
+                    time.sleep(0.02)
+                if not os.path.exists(release):
+                    raise ValueError("after-bound test seam timed out")
+            if time.monotonic() >= deadline:
+                raise ValueError("bootstrap deadline expired before exec")
+            _test_trace("exec")
+            os.execvp(resume[0], resume)
+        except (
+            IndexError, KeyError, OSError, TypeError, ValueError,
+            subprocess.SubprocessError,
+        ) as error:
+            print(
+                f"kitty-restore-session: Codex bootstrap failed: {error}",
+                file=sys.stderr,
+            )
+            if receipt_target is not None:
+                try:
+                    _receipt(generation, receipt_target, "failed")
+                except (OSError, TypeError, ValueError) as receipt_error:
+                    print(
+                        "kitty-restore-session: could not publish failed "
+                        f"bootstrap receipt: {receipt_error}",
+                        file=sys.stderr,
+                    )
+            _exec_safe(safe)
+
+
+    def materialize_note(pane, ordinal):
+        """Write this agent pane's note and one-shot marker."""
+        kind = pane.get("agent_kind")
+        if kind not in {"claude", "codex"}:
+            return None
+        directory = prepare_note_dir()
+        if directory is None:
+            return None
+        try:
+            if kind == "claude":
+                cmd = unwrap_launchers(pane["cmd"])
+                cwd = pane.get("cwd")
+                if len(cmd) >= 3 and cmd[1] == "--resume":
+                    sid = cmd[2]
+                    encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd or "")
+                    proj_dir = os.path.expanduser(
+                        f"~/.claude/projects/{encoded}"
+                    )
+                    text = restore_notice(proj_dir, sid, cwd)
+                else:
+                    text = (
+                        "This pane was restored by kitty after its prior "
+                        "process tree ended. No exact Claude session was "
+                        "safe to resume, so this is a fresh session. Verify "
+                        "filesystem and process state before continuing."
+                    )
+            else:
+                text = codex_restore_notice(pane.get("cwd"))
+            path = os.path.join(directory, f"pane-{ordinal}.md")
+            _write_atomic(path, text + "\n")
+            _write_atomic(path + ".pending", "pending\n")
+            return path
+        except (OSError, IndexError, TypeError):
+            return None
 
 
     def line_argv(cmd):
         """The leading run of `cmd` a session-file line can carry.
 
-        Everything up to the first element holding a line break —
-        which in practice is the whole argv minus the restore notice,
-        always its last element and the one value flattening would gut
-        (see the pane-0 transport note above). Every element kept is
+        Everything up to the first element holding a line break. Recovery
+        notes no longer appear in argv; this still protects arbitrary
+        recorded commands whose executable or arguments contain one of
+        kitty's line separators. Every element kept is
         line-break-free already, so session_token() only quotes it and
         kitty's own shlex hands the exact bytes back. That exactness is
         what lets exec_pane0() match the JSON record against what kitty
@@ -1952,24 +3021,40 @@ let
         A pane with NO recorded command is True, not False: nothing was
         lost, so re-adding it would only open a second empty shell.
         """
+        if pane.get("agent_kind") and prepare_note_dir() is None:
+            # emit_stub intentionally leaves a shell in pane 0 when it
+            # cannot provide the trusted recovery note. Do not re-add the
+            # agent later without the boundary.
+            return True
         cmd = slice_launch(pane["cmd"])
         return not cmd or bool(line_argv(cmd))
 
 
-    def emit_stub():
+    def _emit_safe_stub():
+        """Open one plain pane when recovery state cannot be trusted."""
+        if not load_panes():
+            return False
+        _write_atomic(stub_path(), "launch\n")
+        return True
+
+
+    def emit_stub(token):
         """Write kitty's --session stub: pane 0, exactly one line.
 
         Kitty starts directly into this single window (no default
         extra), avoiding a close-window prompt on a spurious startup
         shell. The launch line runs this script in --exec-pane0 mode
         with as much of pane 0's argv as one line can hold; the full
-        argv, restore notice included, goes to pane0_path() and is what
-        --exec-pane0 actually execs. See the pane-0 transport note
-        above for why the notice cannot travel in the session file.
+        canonical argv goes to pane0_path() and is what --exec-pane0
+        actually execs. Recovery context is the private note referenced
+        by KITTY_RESTORE_NOTE, not part of either argv representation.
         """
         panes = load_panes()
         if not panes:
             return
+        generation_state = publish_generation(panes, token)
+        if generation_state is None:
+            return False
         p = panes[0]
         # slice_launch() here and at the kitty-pane-add loop in main(),
         # NOT inside load_panes(): --dump-panes stays a readout of WHICH
@@ -1982,7 +3067,43 @@ let
             parts += ["--cwd", session_token(p["cwd"])]
         if p["title"]:
             parts += ["--title", session_token(p["title"])]
-        carried = line_argv(cmd)
+        manifest = generation_state[1]
+        binding = manifest["panes"].get("1")
+        note = binding.get("note_path") if binding else None
+        if p.get("agent_kind") and note is None:
+            print(
+                "kitty-restore-session: refusing to launch pane 0's "
+                "agent without a trusted recovery note; opening a shell",
+                file=sys.stderr,
+            )
+            cmd = []
+            # Deliberately plain: this is a safe fallback, not a partial
+            # reconstruction that might still carry unrepresentable data.
+            parts = ["launch"]
+        elif note is not None:
+            parts += ["--env", session_token("KITTY_RESTORE_NOTE=" + note)]
+            if p.get("agent_kind") == "codex":
+                parts += [
+                    "--env",
+                    session_token(
+                        "KITTY_RESTORE_BOOTSTRAP=" + manifest["generation"]
+                    ),
+                    "--env",
+                    session_token("KITTY_RESTORE_ORDINAL=1"),
+                    "--env",
+                    session_token(
+                        "KITTY_RESTORE_DEADLINE_MONOTONIC="
+                        + str(manifest["deadline_monotonic"])
+                    ),
+                ]
+        if binding and binding.get("kind") == "codex":
+            carried = [
+                BOOTSTRAP_FLAG,
+                json.dumps(binding["resume_argv"], separators=(",", ":")),
+                json.dumps(binding["safe_shell_argv"], separators=(",", ":")),
+            ]
+        else:
+            carried = line_argv(cmd)
         if cmd and carried:
             _write_atomic(pane0_path(), json.dumps({
                 "cwd": p["cwd"],
@@ -2020,6 +3141,7 @@ let
         if LINEBREAKS.search(line):
             raise ValueError("stub line is not single-line: " + repr(line))
         _write_atomic(stub_path(), line + "\n")
+        return True
 
 
     def _pane0_record():
@@ -2045,9 +3167,9 @@ let
         `recorded` is the argv kitty parsed off the stub's launch line
         after the flag — which is also what kitty reports as this
         window's cmdline, so it is authoritative about WHICH pane this
-        is. pane0_path() holds the same argv with the multi-line
-        restore notice still attached, and is used only when it EXTENDS
-        `recorded` exactly. That prefix match is what stops a pane
+        is. pane0_path() holds the same canonical argv and is used only
+        when it EXTENDS `recorded` exactly (for an arbitrary recorded
+        line break). That prefix match is what stops a pane
         launched with some other command from adopting pane 0's
         `claude --resume <sid>` and landing two panes on one session,
         which is the corruption claimed_sids exists to prevent.
@@ -2095,11 +3217,15 @@ let
     def exec_pane0(recorded):
         """Become pane 0's real command, inside the window kitty made.
 
-        Reached only from the stub's launch line. The argv -- restore
-        notice included -- comes from pane0_path(), so a multi-line
-        notice reaches pane 0 as a single argv element exactly as it
-        reaches panes 1..N through kitty-pane-add.
+        Reached only from the stub's launch line. pane0_path() contains
+        the same canonical command, possibly extending the line-safe
+        prefix recorded in the stub. It never contains recovery context.
         """
+        if recorded and recorded[0] == BOOTSTRAP_FLAG:
+            os.environ[PANE0_EXEC_ENV] = str(os.getpid())
+            if len(recorded) == 3:
+                bootstrap(recorded[1], recorded[2], pane_zero=True)
+            _exec_safe(_argv_json(recorded[2]) if len(recorded) > 2 else None)
         cmd = _pane0_cmd(recorded)
         if cmd is None:
             # Hand the user a shell rather than let kitty close an
@@ -2115,21 +3241,547 @@ let
             os.execvp("/bin/sh", ["/bin/sh"])
 
 
+    def _stage_failure(generation, ordinal, stage, detail=""):
+        message = (
+            "kitty-restore-session: "
+            f"generation={generation} ordinal={ordinal} stage={stage}"
+        )
+        if detail:
+            message += " " + detail
+        print(message, file=sys.stderr)
+
+
+    def _kitty_ls(sock, deadline):
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            return None
+        try:
+            result = subprocess.run(
+                ["kitty", "@", "--to", sock, "ls"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=remaining,
+            )
+            if result.returncode != 0:
+                return None
+            data = json.loads(result.stdout)
+            return data if isinstance(data, list) else None
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+
+
+    def _all_windows(state):
+        if not isinstance(state, list):
+            return []
+        return [
+            window
+            for os_window in state
+            if isinstance(os_window, dict)
+            for tab in os_window.get("tabs", [])
+            if isinstance(tab, dict)
+            for window in tab.get("windows", [])
+            if isinstance(window, dict)
+        ]
+
+
+    def _foreground_has(window, argv):
+        return any(
+            isinstance(process, dict) and process.get("cmdline") == argv
+            for process in window.get("foreground_processes", [])
+        )
+
+
+    def _registry_window(entry):
+        path = os.path.join(cache_dir(), "pane-sessions.tsv")
+        try:
+            rows = _read_regular(path).splitlines()
+        except OSError:
+            return None
+        matches = []
+        for row in rows:
+            fields = row.split("\t")
+            if (
+                len(fields) >= 5
+                and fields[0].isdigit()
+                and fields[1] == "codex"
+                and fields[2] == entry["session_id"]
+                and fields[3] == entry["cwd"]
+            ):
+                matches.append(int(fields[0]))
+        return matches[0] if len(matches) == 1 else None
+
+
+    def _regular_marker(path):
+        try:
+            return stat.S_ISREG(os.lstat(path).st_mode)
+        except OSError:
+            return False
+
+
+    def _deliver_codex_draft(sock, entry, window_id, deadline, generation):
+        note = entry["note_path"]
+        pending = note + ".pending"
+        sending = note + ".sending"
+        uncertain = note + ".uncertain"
+        if _regular_marker(uncertain):
+            return True
+        if not _regular_marker(pending):
+            return False
+        state = _kitty_ls(sock, deadline)
+        targets = [
+            window
+            for window in _all_windows(state)
+            if window.get("id") == window_id
+            and _foreground_has(window, entry["resume_argv"])
+        ]
+        if len(targets) != 1:
+            _stage_failure(
+                generation, entry["ordinal"], "preflight",
+                "exact settled target unavailable",
+            )
+            return False
+        try:
+            os.replace(pending, sending)
+            os.chmod(sending, 0o600)
+            _fsync_directory(os.path.dirname(note), "draft-claim")
+        except OSError as error:
+            print(
+                "kitty-restore-session: draft claim is not durable: "
+                f"{error}",
+                file=sys.stderr,
+            )
+            return False
+        if (
+            os.environ.get("KITTY_RESTORE_TEST") == "1"
+            and os.environ.get("KITTY_RESTORE_TEST_FAIL_BEFORE_SEND") == "1"
+        ):
+            try:
+                os.replace(sending, pending)
+                os.chmod(pending, 0o600)
+                _fsync_directory(os.path.dirname(note), "draft-rollback")
+            except OSError as error:
+                print(
+                    "kitty-restore-session: could not roll back draft "
+                    f"claim before send: {error}",
+                    file=sys.stderr,
+                )
+            return False
+
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            try:
+                os.replace(sending, pending)
+                os.chmod(pending, 0o600)
+                _fsync_directory(os.path.dirname(note), "draft-rollback")
+            except OSError as error:
+                print(
+                    "kitty-restore-session: could not roll back expired "
+                    f"draft claim: {error}",
+                    file=sys.stderr,
+                )
+            return False
+        try:
+            subprocess.run(
+                [
+                    "kitty", "@", "--to", sock, "send-text",
+                    "--match", f"id:{window_id}", "--stdin",
+                ],
+                input="Read $KITTY_RESTORE_NOTE.",
+                text=True,
+                check=False,
+                capture_output=True,
+                timeout=remaining,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            print(
+                "kitty-restore-session: draft send invocation failed: "
+                f"{error}",
+                file=sys.stderr,
+            )
+        if (
+            os.environ.get("KITTY_RESTORE_TEST") == "1"
+            and os.environ.get(
+                "KITTY_RESTORE_TEST_LEAVE_SENDING_AFTER_SEND"
+            ) == "1"
+        ):
+            return True
+        try:
+            if os.path.lexists(uncertain):
+                os.unlink(sending)
+            else:
+                os.replace(sending, uncertain)
+                os.chmod(uncertain, 0o600)
+            _fsync_directory(os.path.dirname(note), "draft-uncertain")
+        except OSError as error:
+            print(
+                "kitty-restore-session: draft uncertainty is not durable: "
+                f"{error}",
+                file=sys.stderr,
+            )
+            return False
+        return _regular_marker(uncertain)
+
+
+    def _finish_restore_guard(root, generation):
+        guard = os.path.join(root, "restore-incomplete")
+        clearing = os.path.join(root, "restore-clearing")
+        complete = os.path.join(root, "restore-complete")
+        try:
+            original = _read_regular(guard)
+            payload = json.loads(original)
+            if payload.get("generation") != generation:
+                raise OSError("restore guard generation changed")
+            # Remove a stale completion receipt while the primary guard is
+            # still durable, then publish the clearing marker before unlinking
+            # that primary. If both the unlink fsync and primary recreation
+            # fail, this pre-durable marker remains the saver-visible barrier.
+            if os.path.lexists(complete):
+                _remove_state_entry(complete)
+            _write_atomic(clearing, generation + "\n")
+            os.unlink(guard)
+            try:
+                _fsync_directory(root, "guard-clear")
+            except OSError as clear_error:
+                # An unlink followed by a failed directory fsync has an
+                # unknowable crash outcome. Restore the visible guard before
+                # reporting failure; _write_atomic replaces the name before
+                # its own directory fsync, so even that fsync failing leaves
+                # an incomplete marker rather than a false success claim.
+                restore_error = None
+                try:
+                    if (
+                        os.environ.get("KITTY_RESTORE_TEST") == "1"
+                        and os.environ.get(
+                            "KITTY_RESTORE_TEST_FAIL_GUARD_RESTORE"
+                        ) == "1"
+                    ):
+                        raise OSError(
+                            "injected primary guard restoration failure"
+                        )
+                    _write_atomic(guard, original)
+                except OSError as error:
+                    restore_error = error
+                detail = str(clear_error)
+                if restore_error is not None:
+                    detail += f"; guard restoration: {restore_error}"
+                _stage_failure(generation, 0, "guard-removal", detail)
+                return False
+            # The clearing marker remains the authoritative barrier until the
+            # completion receipt is durable. _write_atomic replaces before it
+            # syncs the directory, so a post-replace fsync error may leave a
+            # visible receipt; the saver still refuses it while clearing is
+            # present. Receipt cleanup is only hygiene and cannot weaken that
+            # barrier even when cleanup itself fails.
+            try:
+                _write_atomic(complete, generation + "\n")
+            except OSError as publish_error:
+                cleanup_error = None
+                try:
+                    if (
+                        os.environ.get("KITTY_RESTORE_TEST") == "1"
+                        and os.environ.get(
+                            "KITTY_RESTORE_TEST_FAIL_COMPLETION_CLEANUP"
+                        ) == "1"
+                    ):
+                        raise OSError(
+                            "injected completion receipt cleanup failure"
+                        )
+                    if os.path.lexists(complete):
+                        _remove_state_entry(complete)
+                except OSError as error:
+                    cleanup_error = error
+                detail = str(publish_error)
+                if cleanup_error is not None:
+                    detail += f"; completion cleanup: {cleanup_error}"
+                raise OSError(detail)
+
+            # A durable completion receipt makes this unlink safe: if its
+            # directory fsync fails, the live name is gone and saving is safe;
+            # after a crash the conservative outcome is that clearing returns
+            # and blocks until the next begin reconciles the fixed markers.
+            os.unlink(clearing)
+            try:
+                _fsync_directory(root, "completion-clear")
+            except OSError as cleanup_error:
+                print(
+                    "kitty-restore-session: completion cleanup is not "
+                    f"durable: {cleanup_error}",
+                    file=sys.stderr,
+                )
+            return True
+        except (OSError, TypeError, ValueError) as error:
+            _stage_failure(generation, 0, "guard-removal", str(error))
+            return False
+
+
+    def restore_topology():
+        panes = load_panes()
+        if not panes:
+            return False
+        try:
+            active, generation_dir, manifest = load_active_generation()
+            deadline = float(manifest["deadline_monotonic"])
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            _stage_failure("unknown", 0, "generation", str(error))
+            return False
+        root = os.path.dirname(generation_dir)
+        try:
+            _require_restore_guard(root, active)
+            _write_restore_guard(root, active, "launching")
+        except OSError as error:
+            _stage_failure(active, 0, "guard", str(error))
+            return False
+
+        first = 1 if stub_carries_pane0(panes[0]) else 0
+        sock = find_socket(deadline=deadline)
+        if not sock:
+            _stage_failure(active, 0, "socket", "socket never appeared")
+            return False
+
+        codex = {}
+        all_success = True
+        pane_one = manifest.get("panes", {}).get("1")
+        if first == 1 and isinstance(pane_one, dict) \
+                and pane_one.get("kind") == "codex":
+            codex[1] = {"entry": pane_one, "window_id": None,
+                        "launch_return": True, "window_seen": False}
+
+        for ordinal, pane in enumerate(panes[first:], start=first + 1):
+            binding = None
+            argv = ["kitty-pane-add"]
+            if pane["cwd"]:
+                argv += ["--cwd", pane["cwd"]]
+            if pane["title"]:
+                argv += ["--title", pane["title"]]
+            cmd = pane["cmd"]
+            if pane.get("agent_kind"):
+                binding = manifest.get("panes", {}).get(str(ordinal))
+                if not isinstance(binding, dict):
+                    binding = None
+                note = binding.get("note_path") if binding else None
+                if note is None or binding.get("kind") != pane.get("agent_kind"):
+                    cmd = pane["shell_cmd"]
+                    all_success = False
+                else:
+                    argv += ["--env", "KITTY_RESTORE_NOTE=" + note]
+                    if binding["kind"] == "codex":
+                        carried_resume = unwrap_launchers(pane.get("cmd") or [])
+                        carried_safe = pane.get("shell_cmd") or ["/bin/sh"]
+                        argv += [
+                            "--env", "KITTY_RESTORE_BOOTSTRAP=" + active,
+                            "--env", "KITTY_RESTORE_ORDINAL=" + str(ordinal),
+                            "--env", "KITTY_RESTORE_DEADLINE_MONOTONIC="
+                            + str(deadline),
+                        ]
+                        cmd = [
+                            _self_exe(), BOOTSTRAP_FLAG,
+                            json.dumps(carried_resume, separators=(",", ":")),
+                            json.dumps(carried_safe, separators=(",", ":")),
+                        ]
+            if cmd:
+                argv += ["--", *slice_launch(cmd)]
+            remaining = _remaining(deadline)
+            if remaining <= 0:
+                _stage_failure(active, ordinal, "launch-return", "deadline")
+                all_success = False
+                continue
+            try:
+                result = subprocess.run(
+                    argv, check=False, capture_output=True, text=True,
+                    timeout=remaining,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                _stage_failure(active, ordinal, "launch-return", str(error))
+                all_success = False
+                if binding and binding.get("kind") == "codex":
+                    codex[ordinal] = {
+                        "entry": binding, "window_id": None,
+                        "launch_return": False, "window_seen": False,
+                    }
+                continue
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+            if result.returncode != 0:
+                _stage_failure(
+                    active, ordinal, "launch-return",
+                    f"exit={result.returncode}",
+                )
+                all_success = False
+            if binding and binding.get("kind") == "codex":
+                returned = result.stdout.strip()
+                valid_return = (
+                    result.returncode == 0
+                    and re.fullmatch(r"[0-9]+", returned) is not None
+                )
+                window_id = int(returned) if valid_return else None
+                codex[ordinal] = {
+                    "entry": binding,
+                    "window_id": window_id,
+                    "launch_return": valid_return,
+                    "window_seen": False,
+                }
+                if not valid_return:
+                    _stage_failure(active, ordinal, "launch-return")
+                    all_success = False
+                else:
+                    try:
+                        _write_atomic(
+                            os.path.join(
+                                generation_dir,
+                                f"pane-{ordinal}.expected-window",
+                            ),
+                            returned + "\n",
+                        )
+                    except OSError as error:
+                        _stage_failure(
+                            active, ordinal, "expected-window", str(error)
+                        )
+                        all_success = False
+
+        if (
+            os.environ.get("KITTY_RESTORE_TEST") == "1"
+            and os.environ.get("KITTY_RESTORE_TEST_LAUNCH_ONLY") == "1"
+        ):
+            return True
+
+        unsettled = set(codex)
+        successful = {}
+        while unsettled and _remaining(deadline) > 0:
+            state = _kitty_ls(sock, deadline)
+            windows = _all_windows(state)
+            for ordinal in list(unsettled):
+                record = codex[ordinal]
+                entry = record["entry"]
+                window_id = record["window_id"]
+                registry_id = _registry_window(entry)
+                if window_id is None:
+                    window_id = registry_id
+                    record["window_id"] = window_id
+                window = next(
+                    (item for item in windows if item.get("id") == window_id),
+                    None,
+                )
+                if window is not None:
+                    record["window_seen"] = True
+                bound = _regular_marker(os.path.join(
+                    generation_dir, f"pane-{ordinal}.bootstrap-bound"
+                ))
+                failed = _regular_marker(os.path.join(
+                    generation_dir, f"pane-{ordinal}.bootstrap-failed"
+                ))
+                if (
+                    window is not None
+                    and bound
+                    and registry_id == window_id
+                    and _foreground_has(window, entry["resume_argv"])
+                ):
+                    successful[ordinal] = window_id
+                    unsettled.remove(ordinal)
+                elif (
+                    window is not None
+                    and failed
+                    and _foreground_has(window, entry["safe_shell_argv"])
+                ):
+                    all_success = False
+                    unsettled.remove(ordinal)
+            if unsettled:
+                time.sleep(min(0.02, _remaining(deadline)))
+
+        for ordinal in unsettled:
+            record = codex[ordinal]
+            entry = record["entry"]
+            if not record["launch_return"]:
+                stage = "launch-return"
+            elif not _regular_marker(os.path.join(
+                generation_dir, f"pane-{ordinal}.bootstrap-bound"
+            )) and not _regular_marker(os.path.join(
+                generation_dir, f"pane-{ordinal}.bootstrap-failed"
+            )):
+                stage = "bootstrap-receipt"
+            else:
+                stage = (
+                    "foreground-settlement"
+                    if record["window_seen"]
+                    else "expected-window"
+                )
+            _stage_failure(active, ordinal, stage, "deadline expired")
+            all_success = False
+
+        for ordinal, window_id in successful.items():
+            if not _deliver_codex_draft(
+                sock, codex[ordinal]["entry"], window_id, deadline, active
+            ):
+                all_success = False
+
+        if all_success and not unsettled:
+            if not _finish_restore_guard(root, active):
+                all_success = False
+        return all_success and not unsettled
+
+
     def main():
         # Dispatch on argv[1] POSITIONALLY, never `x in sys.argv`:
         # everything after --exec-pane0 is pane 0's own argv, and a
-        # membership test would let a restore notice that merely
+        # membership test would let arbitrary recorded argv that merely
         # mentions --emit-stub re-enter the writer instead of starting
         # the pane.
         mode = sys.argv[1] if len(sys.argv) > 1 else None
 
+        if mode == "--begin-restore":
+            try:
+                with restore_transaction_lock():
+                    _, token = _begin_restore_guard()
+                print(token)
+                return 0
+            except OSError as error:
+                print(
+                    "kitty-restore-session: could not write planned restore "
+                    f"guard: {error}",
+                    file=sys.stderr,
+                )
+                return 1
+
+        if mode == "--cancel-restore":
+            token = sys.argv[2] if len(sys.argv) > 2 else ""
+            try:
+                root = prepare_note_dir()
+                if root is None:
+                    raise OSError("unsafe recovery root")
+                with restore_transaction_lock():
+                    return 0 if _finish_restore_guard(root, token) else 1
+            except OSError as error:
+                _stage_failure(token or "unknown", 0, "guard-removal", str(error))
+                return 1
+
         if mode == "--emit-stub":
-            emit_stub()
-            return
+            with restore_transaction_lock():
+                # An unrepresentable or symlinked state root cannot carry a
+                # private generation. Preserve the long-standing safe-shell
+                # fallback without consulting current or launching an agent.
+                root = prepare_note_dir()
+                if root is None:
+                    return 0 if _emit_safe_stub() else 1
+                token = os.environ.get("KITTY_RESTORE_GENERATION")
+                try:
+                    if token:
+                        _require_restore_guard(root, token)
+                    else:
+                        _, token = _begin_restore_guard()
+                except OSError as error:
+                    _stage_failure(token or "unknown", 0, "guard", str(error))
+                    return 1
+                return 0 if emit_stub(token) else 1
 
         if mode == PANE0_FLAG:
             exec_pane0(sys.argv[2:])
             return
+
+        if mode == BOOTSTRAP_FLAG:
+            resume_json = sys.argv[2] if len(sys.argv) > 2 else None
+            safe_json = sys.argv[3] if len(sys.argv) > 3 else None
+            bootstrap(resume_json, safe_json)
+            return 0
 
         if mode == "--dump-panes":
             # Test-only: emit resolved panes JSON so assertions can
@@ -2137,80 +3789,38 @@ let
             # the same-cwd-collision-avoidance fallback) without having
             # to spin up a real kitty.
             json.dump(load_panes(), sys.stdout)
-            return
+            return 0
 
-        panes = load_panes()
-        if not panes:
-            return
-        # Skip pane[0] — kitty already created it from the --session
-        # stub — UNLESS the stub could not carry its command (see
-        # stub_carries_pane0). Then pane 0 came up as a plain shell and
-        # its real command has to be restored the ordinary way, or it is
-        # lost with nothing but a line in kitty's log to show for it.
-        first = 1 if stub_carries_pane0(panes[0]) else 0
-        if len(panes) <= first:
-            # Everything there is to restore is already on screen.
-            return
-
-        sock = find_socket()
-        if not sock:
-            print("kitty socket never appeared", file=sys.stderr)
-            sys.exit(1)
-
-        for p in panes[first:]:
-            argv = ["kitty-pane-add"]
-            if p["cwd"]:
-                argv += ["--cwd", p["cwd"]]
-            if p["title"]:
-                argv += ["--title", p["title"]]
-            if p["cmd"]:
-                argv += ["--", *slice_launch(p["cmd"])]
-            subprocess.run(argv, check=False)
+        with restore_transaction_lock():
+            return 0 if restore_topology() else 1
 
 
     if __name__ == "__main__":
-        main()
+        raise SystemExit(main())
   '';
 
-  # Claude Code SessionStart hook: record (kitty_window_id, session_id, cwd)
-  # to pane-sessions.tsv. Consumed by kitty-session-enrich at snapshot time
-  # to attach a `claude_session_id` to each pane in `kitty @ ls` JSON, so
-  # restore can re-resume the *same* session per pane (not just the latest
-  # one in the cwd).
+  # Claude Code and Codex SessionStart hook: record
+  # (kitty_window_id, agent_kind, session_id, cwd) to pane-sessions.tsv.
+  # kitty-session-enrich joins that identity onto snapshots so restore can
+  # resume the exact Claude session or Codex thread for each pane.
   #
   # Mechanism replaces the earlier /proc/<pid>/fd scan, which assumed
   # `claude` keeps its session jsonl fd open — empirically it does not
   # (open/append/close per write), so the scan returned None and same-cwd
   # panes collapsed onto the latest-by-mtime fallback.
   #
-  # Hook input: JSON on stdin from Claude Code with { session_id, cwd, ... }.
+  # Hook input: JSON on stdin with { session_id, cwd, ... } (and Codex's
+  # transcript_path provenance field).
   # Required env: KITTY_WINDOW_ID (kitty injects this for every launched
   # window). Silent no-op outside kitty so the hook is safe to wire
   # globally.
   claudeKittyPaneRecord = pkgs.writeShellApplication {
     name = "claude-kitty-pane-record";
-    runtimeInputs = with pkgs; [ jq coreutils util-linux gawk ];
+    runtimeInputs = with pkgs; [
+      jq coreutils util-linux gawk kitty python3 kittyPaneRegistryWrite
+    ];
     text = ''
       set -euo pipefail
-
-      # Only the main interactive Claude Code session may write the
-      # TSV. Nested `claude -p` invocations (SDK, agents, the
-      # step-back classifier, etc.) inherit KITTY_WINDOW_ID from the
-      # parent terminal, so their SessionStart hook fires with the
-      # SAME window_id but a fresh subprocess session_id. Without this
-      # gate, the nested write overwrites the main session's row and
-      # kitty restore resumes the subprocess instead of the user's
-      # session (which is exactly the watcher-prompt-on-resume bug
-      # this fix was discovered through).
-      #
-      # CLAUDE_CODE_ENTRYPOINT="cli" = main interactive session.
-      # "sdk-cli" / future values = subprocess; skip. Use the bare-form
-      # default (''${VAR-cli} not ''${VAR:-cli}) so an explicitly empty
-      # value ("") fails the gate instead of falling through to "cli":
-      # empty string is what a misconfigured shell launcher injects,
-      # and we want that to be loud (no TSV write), not silently
-      # treated as the main interactive session.
-      [ "''${CLAUDE_CODE_ENTRYPOINT-cli}" = "cli" ] || exit 0
 
       # Outside kitty → nothing to record.
       [ -n "''${KITTY_WINDOW_ID:-}" ] || exit 0
@@ -2218,53 +3828,237 @@ let
       input=$(cat)
       session_id=$(printf '%s' "$input" | jq -r '.session_id // empty')
       cwd=$(printf '%s' "$input" | jq -r '.cwd // empty')
+      transcript_path=$(
+        printf '%s' "$input" | jq -r '.transcript_path // empty'
+      )
+
+      # Codex exposes no reliable "this is the interactive TUI" hook
+      # variable: CODEX_THREAD_ID is absent from real SessionStart hook
+      # processes, and `codex exec` fires the same event. Walk /proc to
+      # find the owning codex argv and reject every known one-shot or
+      # service subcommand. Unknown positional text remains valid because
+      # a root Codex invocation accepts an arbitrary prompt.
+      classify_codex_parent() {
+        local pid="$PPID" parent comm arg skip image_values index
+        local -a args=()
+        while [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ]; do
+          args=()
+          mapfile -d "" -t args < "/proc/$pid/cmdline" 2>/dev/null || true
+          if [ "''${#args[@]}" -gt 0 ]; then
+            comm="''${args[0]##*/}"
+            if [ "$comm" = codex ]; then
+              skip=0
+              image_values=0
+              index=1
+              while [ "$index" -lt "''${#args[@]}" ]; do
+                arg="''${args[$index]}"
+                if [ "$skip" -eq 1 ]; then
+                  skip=0
+                  index=$((index + 1))
+                  continue
+                fi
+                if [ "$image_values" -eq 1 ]; then
+                  case "$arg" in
+                    --)
+                      printf '%s\n' interactive; return ;;
+                    -*) image_values=0 ;;
+                    *)
+                      index=$((index + 1))
+                      continue ;;
+                  esac
+                fi
+                case "$arg" in
+                  ${lib.concatStringsSep "|" codexOptionsWithValue})
+                    skip=1 ;;
+                  ${lib.concatStringsSep "|" codexVariadicOptions})
+                    image_values=1 ;;
+                  ${lib.concatStringsSep "|" codexVariadicInlinePatterns}) ;;
+                  ${lib.concatStringsSep "|" (codexNoninteractiveSubcommands ++ codexNoninteractiveFlags)})
+                    printf '%s\n' noninteractive; return ;;
+                  resume|fork)
+                    printf '%s\n' interactive; return ;;
+                  --)
+                    printf '%s\n' interactive; return ;;
+                  -*) ;;
+                  *)
+                    # An arbitrary positional prompt is the root TUI.
+                    printf '%s\n' interactive; return ;;
+                esac
+                index=$((index + 1))
+              done
+              printf '%s\n' interactive
+              return
+            fi
+          fi
+          parent=$(awk '/^PPid:/ { print $2; exit }' "/proc/$pid/status" 2>/dev/null || true)
+          [ -n "$parent" ] || break
+          pid="$parent"
+        done
+        printf '%s\n' none
+      }
+
+      codex_parent=$(classify_codex_parent)
+      case "$codex_parent" in
+        interactive)
+          kind=codex
+          # A codex-looking transcript path is an independent provenance
+          # check: ancestry alone must not let an unrelated descendant
+          # poison this pane's row.
+          case "$transcript_path" in
+            "$HOME"/.codex/sessions/*.jsonl|"$HOME"/.codex/archived_sessions/*.jsonl) ;;
+            *) exit 0 ;;
+          esac
+          ;;
+        noninteractive)
+          exit 0
+          ;;
+        none)
+          # Only the main interactive Claude Code session may write the
+          # TSV. Nested SDK/print invocations inherit KITTY_WINDOW_ID.
+          [ "''${CLAUDE_CODE_ENTRYPOINT-cli}" = "cli" ] || exit 0
+          kind=claude
+          ;;
+      esac
 
       # Reject malformed input — TSV consumers rely on UUID-shaped sids.
       case "$session_id" in
         [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
         *) exit 0 ;;
       esac
-      [ -n "$cwd" ] || exit 0
+      # The registry is exactly one physical line per row. Python's
+      # splitlines() recognizes more separators than LF; reject that full
+      # alphabet plus tab before serialization.
+      printf '%s' "$input" | jq -e '
+        (.cwd | type == "string" and length > 0) and
+        (.cwd | test("[\u0009-\u000d\u001c-\u001e\u0085\u2028\u2029]") | not)
+      ' >/dev/null || exit 0
       # Reject window ids that would corrupt the TSV (tab is field sep).
       case "$KITTY_WINDOW_ID" in
         '''|*[!0-9]*) exit 0 ;;
       esac
 
-      dir="''${XDG_CACHE_HOME:-$HOME/.cache}/kitty-session"
-      tsv="$dir/pane-sessions.tsv"
-      # Same 0700 as kitty-session-save: whichever of the two runs
-      # first on a fresh machine must not leave it world-readable.
-      install -d -m 700 "$dir"
+      kitty-pane-registry-write \
+        --window-id "$KITTY_WINDOW_ID" \
+        --kind "$kind" \
+        --session-id "$session_id" \
+        --cwd "$cwd"
 
-      # flock guards concurrent SessionStart hooks (e.g. two new claude
-      # sessions starting in the same second) AND the enricher's
-      # prune_tsv (which takes the same lock from Python). Replace any
-      # existing entry for this window_id, then atomically rename into
-      # place. The trap cleans up the tmp file if any step between
-      # mktemp and the final mv fails — mv consumes the source path,
-      # so on success the trap's `rm -f` is a no-op.
-      (
-        flock -x 9
-        tmp=$(mktemp -p "$dir" ".pane-sessions.tsv.XXXX")
-        trap 'rm -f "$tmp"' EXIT
-        if [ -f "$tsv" ]; then
-          awk -F'\t' -v wid="$KITTY_WINDOW_ID" '$1 != wid' "$tsv" > "$tmp"
+      # A restored Codex pane was already bound by the in-pane bootstrap.
+      # Codex 0.146 may emit this hook only after the user's first input;
+      # replacing the same row is harmless, but inserting a recovery draft
+      # at that late point is not. The restore launcher owns delivery.
+      if [ "$kind" = codex ] && [ -n "''${KITTY_RESTORE_BOOTSTRAP:-}" ]; then
+        exit 0
+      fi
+
+      # Manual recovery-context pickup. Restore puts a private note path
+      # in this pane's environment; SessionStart waits until kitty confirms
+      # this exact numeric window exists, then types one constant draft.
+      # The draft references the env var rather than interpolating the path,
+      # so paths cannot become TUI commands. Every failure is best-effort:
+      # identity recording above remains successful and a pending marker is
+      # retained when the target cannot be proven.
+      deliver_restore_note() {
+        local note="''${KITTY_RESTORE_NOTE:-}"
+        local sock="''${KITTY_LISTEN_ON:-}"
+        [ -n "$note" ] && [ -n "$sock" ] || return 0
+        local state_base="''${XDG_STATE_HOME:-$HOME/.local/state}"
+        local expected="$state_base/claude/kitty-restore"
+        local resolved expected_resolved generation generation_name
+        local current pending sending uncertain ls_json send_rc
+        resolved=$(realpath -m -- "$note" 2>/dev/null) || return 0
+        expected_resolved=$(realpath -m -- "$expected" 2>/dev/null) || return 0
+        generation=$(dirname -- "$resolved")
+        [ "$(dirname -- "$generation")" = "$expected_resolved" ] || return 0
+        generation_name=$(basename -- "$generation")
+        [[ "$generation_name" =~ ^generation-[0-9a-f]{32}$ ]] || return 0
+        current="$expected_resolved/current"
+        [ -f "$current" ] && [ ! -L "$current" ] || return 0
+        [ "$(cat -- "$current" 2>/dev/null)" = "$generation_name" ] || return 0
+        [[ "$(basename -- "$resolved")" =~ ^pane-[0-9]+[.]md$ ]] || return 0
+        [ -f "$resolved" ] && [ ! -L "$resolved" ] || return 0
+        pending="$resolved.pending"
+        [ -f "$pending" ] && [ ! -L "$pending" ] || return 0
+
+        sync_marker_dir() {
+          local directory="$1" event="$2"
+          if [ "''${KITTY_RESTORE_TEST:-}" = 1 ] \
+              && [ "''${KITTY_RESTORE_TEST_FAIL_DIR_FSYNC:-}" = "$event" ]; then
+            echo "claude-kitty-pane-record: injected directory fsync failure for $event" >&2
+            return 1
+          fi
+          python3 -c 'import os, sys
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(sys.argv[1], flags)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)' "$directory"
+        }
+
+        rc() {
+          if declare -F kitten >/dev/null; then
+            kitten "$@"
+          else
+            timeout 3 kitten "$@"
+          fi
+        }
+        if ! ls_json=$(rc @ --to "$sock" ls 2>/dev/null) ||
+           ! printf '%s' "$ls_json" | jq -e \
+             --argjson wid "$KITTY_WINDOW_ID" \
+             '[.[].tabs[].windows[] | select(.id == $wid)] | length == 1' >/dev/null; then
+          echo "claude-kitty-pane-record: restore-note target window $KITTY_WINDOW_ID not present; leaving marker pending" >&2
+          return 0
         fi
-        printf '%s\t%s\t%s\t%s\n' \
-          "$KITTY_WINDOW_ID" "$session_id" "$cwd" "$(date +%s)" >> "$tmp"
-        mv "$tmp" "$tsv"
-      ) 9>"$dir/.pane-sessions.lock"
+
+        sending="$resolved.sending"
+        uncertain="$resolved.uncertain"
+        mv -- "$pending" "$sending" 2>/dev/null || return 0
+        sync_marker_dir "$generation" draft-hook-claim || return 0
+        if [ "''${KITTY_RESTORE_TEST:-}" = 1 ] \
+            && [ "''${KITTY_RESTORE_TEST_FAIL_BEFORE_SEND:-}" = 1 ]; then
+          if mv -- "$sending" "$pending" 2>/dev/null; then
+            sync_marker_dir "$generation" draft-hook-rollback || true
+          fi
+          return 0
+        fi
+        # Literal by design: the TUI expands this environment-variable
+        # reference when the user submits the prefilled draft.
+        set +e
+        # shellcheck disable=SC2016
+        printf '%s' 'Read $KITTY_RESTORE_NOTE.' | \
+          rc @ --to "$sock" send-text \
+            --match "id:$KITTY_WINDOW_ID" --stdin >/dev/null 2>&1
+        send_rc=$?
+        set -e
+        if [ "''${KITTY_RESTORE_TEST:-}" = 1 ] \
+            && [ "''${KITTY_RESTORE_TEST_LEAVE_SENDING_AFTER_SEND:-}" = 1 ]; then
+          return 0
+        fi
+        # Kitty has no acknowledgement boundary. Once invocation began,
+        # success and failure are equally uncertain and neither may retry.
+        if [ -e "$uncertain" ] || [ -L "$uncertain" ]; then
+          if rm -f -- "$sending"; then
+            sync_marker_dir "$generation" draft-hook-uncertain || true
+          fi
+        else
+          if mv -- "$sending" "$uncertain" 2>/dev/null; then
+            sync_marker_dir "$generation" draft-hook-uncertain || true
+          fi
+        fi
+        if [ "$send_rc" -ne 0 ]; then
+          echo "claude-kitty-pane-record: failed to send restore-note draft to window $KITTY_WINDOW_ID" >&2
+        fi
+        return 0
+      }
+      deliver_restore_note || true
     '';
   };
 
-  # Enrich `kitty @ ls` JSON with per-pane Claude Code session IDs.
-  # Multiple `claude` panes in the same cwd are indistinguishable from
-  # cmdline+cwd alone (cmdline is just `claude`, cwd matches), so on
-  # restore the latest-by-mtime fallback would collapse them all onto
-  # the same session. To disambiguate, look up each pane's
-  # claude_session_id in pane-sessions.tsv (populated by the Claude Code
-  # SessionStart hook, claude-kitty-pane-record). Keyed by kitty's
-  # `id` field — the same value claude sees as $KITTY_WINDOW_ID.
+  # Enrich `kitty @ ls` JSON with per-pane Claude session or Codex thread
+  # IDs. The typed registry is keyed by kitty's window id; legacy untyped
+  # rows are accepted only when the live foreground agent disambiguates
+  # them.
   #
   # Pruning: TSV entries whose window_id is not in the current live set
   # are removed on every enrich run, keeping the TSV bounded by current
@@ -2272,9 +4066,8 @@ let
   #
   # Exit codes:
   #   0  — enriched JSON written, safe to commit as new snapshot.
-  #   2  — collision risk: at least one cwd has multiple claude panes
-  #         and at least one of them lacks a TSV row (SessionStart
-  #         hook hadn't fired yet when the snapshot tick captured it).
+  #   2  — collision risk: same-kind/same-cwd panes have a missing exact
+  #         row, or a valid (kind, session_id) is duplicated across panes.
   #         The save wrapper treats this as "preserve the prior good
   #         snapshot.json"; persisting the partial would let the
   #         un-enriched pane fall back to latest-by-mtime on restore
@@ -2308,13 +4101,22 @@ let
         r"[0-9a-f]{4}-[0-9a-f]{12}$"
     )
 
+    UNSAFE_TSV_RE = re.compile(
+        r"[\t\n\v\f\r\x1c-\x1e\x85\u2028\u2029]"
+    )
+
 
     ${kittyPane0LaunchPy}
 
     ${claudeSliceLaunchPy}
 
     def load_tsv():
-        """Return {window_id: session_id}. Malformed lines ignored."""
+        """Return {window_id: (kind-or-None, session_id)}.
+
+        Four fields are the legacy Claude-only schema; five fields require
+        an explicit known kind. Reject unknown and extra fields rather than
+        partially reinterpreting them.
+        """
         if not os.path.isfile(TSV_PATH):
             return {}
         out = {}
@@ -2322,12 +4124,24 @@ let
             with open(TSV_PATH) as fh:
                 for line in fh:
                     parts = line.rstrip("\n").split("\t")
-                    if len(parts) < 2:
+                    if len(parts) == 4:
+                        wid, sid = parts[0], parts[1]
+                        kind = None
+                        cwd, timestamp = parts[2], parts[3]
+                    elif len(parts) == 5 and parts[1] in {"claude", "codex"}:
+                        wid, kind, sid = parts[0], parts[1], parts[2]
+                        cwd, timestamp = parts[3], parts[4]
+                    else:
                         continue
-                    wid, sid = parts[0], parts[1]
-                    if not wid.isdigit() or not UUID_RE.match(sid):
+                    if (
+                        not wid.isdigit()
+                        or not UUID_RE.match(sid)
+                        or not cwd
+                        or UNSAFE_TSV_RE.search(cwd)
+                        or not timestamp.isdigit()
+                    ):
                         continue
-                    out[int(wid)] = sid
+                    out[int(wid)] = (kind, sid)
         except OSError:
             return {}
         return out
@@ -2386,13 +4200,12 @@ let
 
 
     def enrich(data):
-        """Annotate each claude pane with its session id. Returns
+        """Annotate each interactive agent pane with its exact id. Returns
         (data, collision_risk) where collision_risk is True when the
         snapshot is partial in a way that would collapse same-cwd
-        sibling panes on restore — i.e. at least one cwd has multiple
-        claude panes and at least one of them lacks a TSV entry. The
-        caller uses this to decide whether to overwrite snapshot.json
-        or preserve the prior good one.
+        sibling panes on restore: a same-kind/same-cwd group is partial,
+        or one exact identity appears in multiple panes. The caller uses
+        this to preserve the prior good snapshot rather than commit risk.
         """
         # Audited 2026-09-04 against the internal-window class that
         # broke kitty-pane-add (`kitten __show_error__`, `kitten ask`):
@@ -2404,7 +4217,8 @@ let
         # Adding a filter here would be dead code, not defence.
         tsv = load_tsv()
         live = set()
-        claude_panes_by_cwd = {}
+        agent_panes_by_cwd = {}
+        identities = {}
         for osw in data:
             for tab in osw.get("tabs", []):
                 for win in tab.get("windows", []):
@@ -2440,21 +4254,38 @@ let
                     # _is_claude() unwraps: without it the FIRST restore
                     # would strip every pane of its claude identity and
                     # the second would relaunch the orphan.
-                    has_claude = _is_claude(win.get("cmdline")) or any(
-                        _is_claude(fp.get("cmdline")) for fp in fg
-                    )
-                    if not has_claude:
+                    # Codex is recoverable only while a live interactive
+                    # TUI appears in foreground_processes. Unlike Claude,
+                    # its stable window cmdline must not resurrect a dead
+                    # `codex exec`/service. Claude retains the stable arm
+                    # for the known orphaned-MCP zombie case above.
+                    kind = None
+                    for fp in fg:
+                        kind = _agent_kind(fp.get("cmdline"))
+                        if kind:
+                            break
+                    if kind is None and _is_claude(win.get("cmdline")):
+                        kind = "claude"
+                    if kind is None:
                         continue
-                    sid = tsv.get(wid) if isinstance(wid, int) else None
+                    entry = tsv.get(wid) if isinstance(wid, int) else None
+                    sid = None
+                    if entry is not None:
+                        row_kind, row_sid = entry
+                        if row_kind is None or row_kind == kind:
+                            sid = row_sid
                     if sid:
-                        win["claude_session_id"] = sid
+                        win[kind + "_session_id"] = sid
+                        identities[(kind, sid)] = (
+                            identities.get((kind, sid), 0) + 1
+                        )
                     cwd = win.get("cwd") or ""
-                    claude_panes_by_cwd.setdefault(cwd, []).append(sid)
+                    agent_panes_by_cwd.setdefault((kind, cwd), []).append(sid)
         prune_tsv(live)
         collision_risk = any(
             len(sids) > 1 and any(s is None for s in sids)
-            for sids in claude_panes_by_cwd.values()
-        )
+            for sids in agent_panes_by_cwd.values()
+        ) or any(count > 1 for count in identities.values())
         return data, collision_risk
 
 
@@ -2827,6 +4658,7 @@ let
       kittySessionEnrich
       kittySessionCommit
       pkgs.coreutils
+      pkgs.util-linux
     ];
     text = ''
       set -euo pipefail
@@ -2837,6 +4669,36 @@ let
       # in it is anyone else's business. `install -d` also fixes a
       # directory an older generation created 0755.
       install -d -m 700 "$dir"
+
+      # Autosave and cold restore share one transaction boundary. Refuse
+      # nonblockingly before socket discovery: a timer tick during restore is
+      # expected and the next tick will retry after the lock is released.
+      exec 8>"$dir/restore.lock"
+      if ! flock -n -x 8; then
+        exit 0
+      fi
+      restore_root="''${XDG_STATE_HOME:-$HOME/.local/state}/claude/kitty-restore"
+      if [ -e "$restore_root/restore-incomplete" ] \
+          || [ -L "$restore_root/restore-incomplete" ]; then
+        exit 0
+      fi
+      clearing="$restore_root/restore-clearing"
+      complete="$restore_root/restore-complete"
+      # Clearing is pre-durable and authoritative. A matching completion name
+      # may already be visible when its directory fsync reports failure, so no
+      # completion receipt can override a clearing marker that still exists.
+      if [ -e "$clearing" ] || [ -L "$clearing" ]; then
+        exit 0
+      fi
+      if [ -e "$complete" ] || [ -L "$complete" ]; then
+        if [ ! -f "$complete" ] || [ -L "$complete" ]; then
+          exit 0
+        fi
+        complete_token="$(cat "$complete")"
+        if [[ ! "$complete_token" =~ ^generation-[0-9a-f]{32}$ ]]; then
+          exit 0
+        fi
+      fi
 
       # Discover live kitty socket. kitty appends `-{pid}` to the
       # configured listen_on path on every launch (not only under `-1`),
@@ -2860,14 +4722,11 @@ let
       fi
       [ -z "$json" ] && exit 0
 
-      # Enrich with per-pane Claude session IDs before persisting.
+      # Enrich with exact per-pane Claude/Codex identities before persisting.
       # Exit codes from kitty-session-enrich:
       #   0  — fully enriched, snapshot safe to commit
-      #   2  — partial / collision-risk (multiple same-cwd claude panes
-      #        and at least one lacks a TSV row); the un-enriched pane
-      #        would fall back to latest-by-mtime on restore and collide
-      #        with a sibling. Preserve the prior good snapshot.json
-      #        instead of overwriting it with the dangerous partial.
+      #   2  — partial or duplicate agent identity; preserve the prior
+      #        good snapshot rather than risk two panes resuming one id.
       #   any other non-zero — enricher crashed; preserve prior good
       #        AND fail the unit, see the surfacing rule below.
       #
@@ -2914,8 +4773,7 @@ let
       #        AND fail the unit, see the surfacing rule above.
       #
       # This is a SECOND gate, not a replacement for the enricher's:
-      # rc 2 above (partial snapshot, same-cwd claude panes with a
-      # missing TSV row) still short-circuits before we get here.
+      # rc 2 above (partial/duplicate agent identity) still short-circuits.
       set +e
       kitty-session-commit "$dir" < "$dir/candidate.json.tmp"
       commit_rc=$?
@@ -2965,6 +4823,54 @@ let
       if [ "\''${1:-}" = "@" ]; then
         exec ${pkgs.kitty}/bin/kitty "\$@"
       fi
+      session_dir="\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session"
+      ${pkgs.coreutils}/bin/install -d -m 700 "\$session_dir"
+      snap="\$session_dir/snapshot.json"
+
+      # Serialize the complete cold-start decision: socket probing, stale
+      # cleanup, TSV reset, note/stub materialization, and topology restore.
+      # A simultaneous wrapper first waits for the winner's socket so it can
+      # join promptly. If the socket is slow, it blocks for the lock and then
+      # makes a fresh decision from the post-restore state.
+      exec 8>"\$session_dir/restore.lock"
+      if ! ${pkgs.util-linux}/bin/flock -n 8; then
+        for _attempt in \$(${pkgs.coreutils}/bin/seq 1 50); do
+          for f in /tmp/kitty.sock-*; do
+            [ -S "\$f" ] || continue
+            if ${pkgs.kitty}/bin/kitty @ --to "unix:\$f" ls >/dev/null 2>&1; then
+              exec ${pkgs.kitty}/bin/kitty -1 "\$@"
+            fi
+          done
+          sleep 0.1
+        done
+        ${pkgs.util-linux}/bin/flock -x 8
+      fi
+
+      # A non-empty snapshot means this wrapper may perform a cold restore.
+      # Publish its durable planned-generation guard immediately after taking
+      # restore.lock, before stale socket, TSV, or stub cleanup. The same token
+      # is passed into generation publication; no later process invents a
+      # replacement token or falls back through an older current pointer.
+      restore_token=""
+      if [ -s "\$snap" ]; then
+        if ! restore_token="\$(
+          ${kittyRestoreSession}/bin/kitty-restore-session --begin-restore
+        )"; then
+          echo "kitty: could not create the cold-restore guard; preserving prior state" >&2
+          ${pkgs.util-linux}/bin/flock -u 8
+          exec 8>&-
+          exec ${pkgs.kitty}/bin/kitty -1 "\$@"
+        fi
+        export KITTY_RESTORE_GENERATION="\$restore_token"
+        if [ "\''${KITTY_RESTORE_TEST:-}" = 1 ] \
+            && [ -n "\''${KITTY_RESTORE_TEST_PAUSE_AFTER_GUARD:-}" ]; then
+          : > "\$KITTY_RESTORE_TEST_PAUSE_AFTER_GUARD"
+          while [ ! -e "\$KITTY_RESTORE_TEST_PAUSE_AFTER_GUARD.release" ]; do
+            sleep 0.01
+          done
+        fi
+      fi
+
       # Detect a running kitty by probing each socket — a kitty crash can
       # leave stale /tmp/kitty.sock-PID files behind that would otherwise
       # block restore on next launch. pgrep is unsafe here because the
@@ -2982,11 +4888,14 @@ let
         # Stale socket from a crashed instance — clean it up.
         rm -f "\$f"
       done
-      # First-launch restore: spawn kitty-restore-session in the
-      # background to inject panes via kitty-pane-add (preserving the
-      # 2x2 grid pattern), then exec plain kitty. The restore script
-      # waits for kitty's socket to appear before issuing its commands.
-      snap="\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/snapshot.json"
+      if [ "\$live" -eq 1 ] && [ -n "\$restore_token" ]; then
+        if ! ${kittyRestoreSession}/bin/kitty-restore-session \
+            --cancel-restore "\$restore_token"; then
+          echo "kitty: live-instance guard cleanup failed; leaving restore incomplete" >&2
+        fi
+        unset KITTY_RESTORE_GENERATION
+        restore_token=""
+      fi
       # Drop the TSV before the new kitty starts: kitty assigns window
       # ids starting at 1 per instance, so the old kitty's wid→sid
       # rows would otherwise alias onto fresh panes in the window
@@ -3008,6 +4917,12 @@ let
       # reader still agree.
       stub="\''${KITTY_STUB_PATH:-\''${XDG_CACHE_HOME:-\$HOME/.cache}/kitty-session/stub-session}"
       if [ -s "\$snap" ] && [ "\$live" -eq 0 ]; then
+        # First-launch restore: spawn kitty-restore-session in the
+        # background to inject panes via kitty-pane-add (preserving the
+        # 2x2 grid pattern), then exec plain kitty. The restore script
+        # waits for kitty's socket to appear before issuing its commands.
+        # It inherits fd 8 and releases the lock only after every later pane
+        # has been added.
         # Write a stub session file containing just pane 0; this makes
         # kitty start directly into our restored topology with no extra
         # default-startup window to clean up. Restore-session, running
@@ -3023,11 +4938,18 @@ let
         rm -f "\$stub"
         if ${kittyRestoreSession}/bin/kitty-restore-session --emit-stub \
              && [ -s "\$stub" ]; then
+          unset KITTY_RESTORE_GENERATION
           ( ${kittyRestoreSession}/bin/kitty-restore-session \
-              >/tmp/kitty-restore.log 2>&1 & )
+              >/tmp/kitty-restore.log 2>&1 ) &
+          # The background restore owns fd 8 now. Closing our copy lets its
+          # exit, not the GUI's lifetime, define the critical section.
+          exec 8>&-
           exec ${pkgs.kitty}/bin/kitty --session "\$stub" "\$@"
         fi
       fi
+      unset KITTY_RESTORE_GENERATION
+      ${pkgs.util-linux}/bin/flock -u 8
+      exec 8>&-
       exec ${pkgs.kitty}/bin/kitty -1 "\$@"
       EOF
       chmod +x $out/bin/kitty
@@ -3043,6 +4965,7 @@ in
     kittySessionSave
     kittyCopyUnwrap
     claudeKittyPaneRecord
+    kittyPaneRegistryWrite
     kittyPanesReflow
     # WIP, not yet wired in (see wrapper above):
     kittyPaneAdd

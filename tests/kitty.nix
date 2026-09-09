@@ -127,6 +127,18 @@ let
         sys.exit(1)
     print("config parses clean under the deployed kitty")
   '';
+
+  # A real long-lived foreground process named `codex`. A shell wrapper
+  # would make kitty report its child (`sleep`) instead, weakening the
+  # restore-settlement assertion into an argv fixture rather than behavior.
+  testCodex = pkgs.writeCBin "codex" ''
+    #include <signal.h>
+    #include <unistd.h>
+
+    int main(void) {
+      for (;;) pause();
+    }
+  '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
   name = "vm-kitty";
@@ -145,7 +157,7 @@ in
         user = "jonathan";
       };
       services.displayManager.defaultSession = "xterm";
-      environment.systemPackages = with pkgs; [ jq findutils ];
+      environment.systemPackages = with pkgs; [ jq findutils testCodex ];
     })
   ];
   testScript = ''
@@ -390,19 +402,24 @@ in
     # user does ctrl+shift+v on the real desktop — that's the manual
     # verification step the PR description hands them.
     sleep_bin = "/run/current-system/sw/bin/sleep"
+    codex_bin = "${testCodex}/bin/codex"
+    codex_sid = "77777777-aaaa-4777-8777-777777777777"
     panes = [
         ("/tmp", "11111"),
         ("/var", "22222"),
-        ("/etc", "33333"),
     ]
-    # Set up 4 panes via kitty-pane-add — drives the 2x2 grid pattern
-    # (vsplit, hsplit-left, hsplit-right, new-tab). Default first window
-    # acts as pane 1; 3 additional pane-adds give us 4 total in 2x2.
+    # Set up 4 panes via kitty-pane-add — two ordinary commands plus a real
+    # no-hook Codex pane. Default first window acts as pane 1; 3 additional
+    # pane-adds give us 4 total in 2x2.
     for cwd, magic in panes:
         dellan.succeed(
             "su jonathan -c "
             f"'kitty-pane-add --cwd {cwd} -- {sleep_bin} {magic}'"
         )
+    dellan.succeed(
+        "su jonathan -c "
+        f"'kitty-pane-add --cwd /etc -- {codex_bin} resume {codex_sid}'"
+    )
     dellan.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls' | "
         "jq -e '[.[].tabs[].windows[]] | length == 4'",
@@ -448,6 +465,29 @@ in
     ))
     dellan.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/ls-before.json'")
     print("[diag] before save:\n" + dellan.succeed("cat /tmp/ls-before.json"))
+
+    # Model the durable no-hook binding that the restore bootstrap itself
+    # must recreate. The live foreground argv selects exactly one window;
+    # writing a guessed or cwd-matched ID would let this test pass while the
+    # next save silently attached the thread to the wrong pane.
+    dellan.succeed(
+        "su jonathan -c '"
+        + sock_cmd
+        + " ls' | jq -r --arg codex '"
+        + codex_bin
+        + "' --arg sid '"
+        + codex_sid
+        + "' '[.[].tabs[].windows[] | select("
+        + ".foreground_processes[]?.cmdline == [$codex, \"resume\", $sid])"
+        + " | .id] | unique | if length == 1 then .[0] else error("
+        + "\"expected one live Codex pane\") end' > /tmp/codex-window-id"
+    )
+    dellan.succeed(
+        "su jonathan -c 'wid=$(cat /tmp/codex-window-id); "
+        "printf \"%s\\tcodex\\t%s\\t/etc\\t%s\\n\" \"$wid\" "
+        f"\"{codex_sid}\" \"$(date +%s)\" > "
+        "/home/jonathan/.cache/kitty-session/pane-sessions.tsv'"
+    )
 
     # --- Phase 2: save. Files must materialize and parse cleanly. ---
     dellan.succeed("su jonathan -c kitty-session-save")
@@ -552,9 +592,37 @@ in
         "jq -e '[.[].tabs[].windows[]] | length == 4' /tmp/ls-after.json",
         timeout=30,
     )
+    # Successful completion is stricter than terminal settlement: the guard
+    # may disappear only after the exact intended Codex argv is foreground.
+    restore_guard = (
+        "/home/jonathan/.local/state/claude/kitty-restore/restore-incomplete"
+    )
+    dellan.wait_until_succeeds(
+        f"su jonathan -c '{sock_cmd} ls > /tmp/ls-after.json' && "
+        "jq -e --arg codex '"
+        + codex_bin
+        + "' --arg sid '"
+        + codex_sid
+        + "' '[.[].tabs[].windows[].foreground_processes[]?.cmdline] "
+        "| any(. == [$codex, \"resume\", $sid])' /tmp/ls-after.json",
+        timeout=30,
+    )
+    dellan.wait_until_succeeds(f"test ! -e {restore_guard}", timeout=30)
+
+    # A subsequent real save must keep the exact restored thread identity.
+    # This is the no-hook regression: process argv alone cannot safely invent
+    # which same-cwd Codex thread the pane owns.
+    dellan.succeed("su jonathan -c kitty-session-save")
+    dellan.succeed(
+        "jq -e --arg sid '"
+        + codex_sid
+        + "' '[.[].tabs[].windows[].codex_session_id?] | any(. == $sid)' "
+        "/home/jonathan/.cache/kitty-session/snapshot.json"
+    )
     print("[diag] ls-after final:\n" + dellan.succeed("cat /tmp/ls-after.json"))
 
-    # All 3 magic sleep cmds must be back, with their cwds.
+    # Both ordinary commands must be back, with their cwds. The Codex pane's
+    # exact foreground command was asserted above before guard removal.
     for cwd, magic in panes:
         dellan.succeed(
             f"jq -e '[.[].tabs[].windows[].cwd] | any(. == \"{cwd}\")' "

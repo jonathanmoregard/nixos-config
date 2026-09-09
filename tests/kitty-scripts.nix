@@ -14,9 +14,8 @@
 #      turned one `launch` directive into 75 lines. kitty then failed
 #      the unterminated launch and opened a `kitten __show_error__`
 #      window instead of the user's claude.
-#   B. Dropping the notice from the stub must not silently drop the
-#      notice: pane 0 still has to receive it as an argv element, the
-#      same way kitty-pane-add hands it to panes 1..N.
+#   B. The notice is a private state file and only an unsent constant
+#      pickup draft reaches the TUI after SessionStart target preflight.
 #   C. That extra error window then shifted kitty-pane-add's 2x2 grid
 #      dispatch by one step (count started at 2, not 1), so every
 #      restored pane stacked into one column.
@@ -50,6 +49,7 @@ let
       "kitty-session-commit"
       "kitty-session-save"
       "kitty-panes-reflow"
+      "claude-kitty-pane-record"
       # The session-restoring `kitty` wrapper itself, so the stub path
       # it READS can be checked against the one the writer emits.
       "kitty-with-session"
@@ -190,6 +190,13 @@ let
             "stub line has no --exec-pane0 launcher: %r\n" % (toks,)
         )
         sys.exit(2)
+    # Model the part of kitty's session parser that installs `--env`
+    # assignments on the launched pane. The restore bootstrap treats these
+    # as untrusted claims and validates them against its private manifest.
+    for i, tok in enumerate(toks[:-1]):
+        if tok == "--env":
+            name, value = toks[i + 1].split("=", 1)
+            os.environ[name] = value
     argv = toks[toks.index("--exec-pane0") - 1:]
     sys.stderr.write("stub argv: %r\n" % (argv,))
     os.execvp(argv[0], argv)
@@ -294,6 +301,24 @@ let
 
     KITTEN = "/nix/store/fake-kitty/bin/kitten"
     SHELL = ["/run/current-system/sw/bin/zsh"]
+    CODEX_SID = "cccc3333-cccc-4333-8333-cccccccccccc"
+
+    codex_with_id = win(1, [
+        "/usr/bin/codex", "--yolo", "touch /tmp/replayed",
+    ])
+    codex_with_id["cmdline"] = SHELL
+    codex_with_id["codex_session_id"] = CODEX_SID
+    codex_without_id = win(1, [
+        "/usr/bin/codex", "touch /tmp/replayed-without-id",
+    ])
+    codex_without_id["cmdline"] = SHELL
+    codex_indirect_without_id = win(1, [
+        "/usr/bin/codex", "touch /tmp/replayed-indirectly",
+    ])
+    codex_indirect_without_id["cmdline"] = [
+        "/bin/sh", "-c",
+        "exec /usr/bin/codex 'touch /tmp/replayed-indirectly'",
+    ]
 
     cases = {
         # 1 real pane + kitty's config-error overlay. The overlay is
@@ -358,6 +383,12 @@ let
                 "first line\nsecond line\nthird line",
             ]),
         ]),
+        # last.session is executable input to kitty. A live Codex argv can
+        # contain both unsafe flags and a positional prompt, neither of which
+        # may be replayed when this fallback is used.
+        "codex-with-id": tab([codex_with_id]),
+        "codex-without-id": tab([codex_without_id]),
+        "codex-indirect-without-id": tab([codex_indirect_without_id]),
     }
     for name, data in cases.items():
         with open(os.path.join(out, name + ".json"), "w") as fh:
@@ -632,6 +663,7 @@ pkgs.runCommand "kitty-scripts-harness"
       pkgs.coreutils
       pkgs.gnugrep
       pkgs.gnused
+      pkgs.git
       pkgs.jq
       # flock, for the concurrent-reflow assertion (E11).
       pkgs.util-linux
@@ -641,9 +673,8 @@ pkgs.runCommand "kitty-scripts-harness"
     export PATH="$PWD/fakebin:$PATH"
     mkdir -p fakebin fx state
 
-    # Fake claude: records the argv it was handed, one arg per record,
-    # so an assertion can look for the notice as a real argv element
-    # rather than as text that merely appeared somewhere.
+    # Fake claude records its argv one argument per record. Recovery
+    # context must not appear here: it is picked up manually from a note.
     cat > fakebin/claude <<'STUB'
     #!/bin/sh
     : > "$ARGV_OUT"
@@ -657,6 +688,7 @@ pkgs.runCommand "kitty-scripts-harness"
     SID=$(python3 ${mkFixtures} "$PWD/fx" "$PWD/fakebin")
     export HOME="$PWD/fx/home"
     export XDG_CACHE_HOME="$HOME/.cache"
+    export XDG_STATE_HOME="$PWD/fx/state-home"
     # Never the real /tmp/kitty-stub-session — that file belongs to the
     # user's live kitty.
     export KITTY_STUB_PATH="$PWD/state/stub-session"
@@ -675,20 +707,99 @@ pkgs.runCommand "kitty-scripts-harness"
     grep -q '^launch ' "$KITTY_STUB_PATH" || {
       echo "FAIL(A): stub's single line is not a launch directive"; exit 1; }
 
-    # Sanity: the fixture really does produce a multi-line notice, so
-    # phase A is not passing because there was nothing to break on.
+    # Resume argv is canonical and contains no automatically-submitted
+    # recovery prompt. The note itself proves the rich context still exists.
     kitty-restore-session --dump-panes > state/panes.json
-    jq -e '.[0].cmd | map(select(test("restored by kitty"))) | length == 1' \
+    if jq -e '.[].cmd[]? | select(test("restored by kitty"))' \
+        state/panes.json > /dev/null; then
+      cat state/panes.json
+      echo "FAIL(A): restore still submits its recovery notice as argv"
+      exit 1
+    fi
+    jq -e --arg sid "$SID" \
+      '.[0].cmd == [($ENV.PWD + "/fakebin/claude"), "--resume", $sid]' \
       state/panes.json > /dev/null || {
       cat state/panes.json
-      echo "FAIL(A): fixture pane 0 carries no restore notice — phase A"
-      echo "  would pass vacuously. Fix the fixture, not the assertion."
+      echo "FAIL(A): pane 0 is not the canonical claude --resume UUID argv"
       exit 1; }
-    jq -e '.[0].cmd | map(select(test("\n"))) | length == 1' \
-      state/panes.json > /dev/null || {
-      echo "FAIL(A): fixture notice is single-line — phase A would pass"
-      echo "  vacuously."
+
+    restore_root="$XDG_STATE_HOME/claude/kitty-restore"
+    note="$restore_root/$(cat "$restore_root/current")/pane-1.md"
+    [ -f "$note" ] || {
+      echo "FAIL(A): --emit-stub wrote no private recovery note at $note"
       exit 1; }
+    [ -f "$note.pending" ] || {
+      echo "FAIL(A): the one-shot pickup marker is missing"
+      exit 1; }
+    [ "$(stat -c %a "$(dirname "$note")")" = 700 ] || {
+      echo "FAIL(A): recovery-note directory is not mode 700"; exit 1; }
+    [ "$(stat -c %a "$note")" = 600 ] || {
+      echo "FAIL(A): recovery note is not mode 600"; exit 1; }
+    grep -qF "This pane was restored by kitty" "$note" || {
+      echo "FAIL(A): recovery note omits the restore boundary"; exit 1; }
+    grep -qF "edited 6 file(s):" "$note" || {
+      echo "FAIL(A): recovery note lost the orphan edit details"; exit 1; }
+    grep -qF -- "--env KITTY_RESTORE_NOTE=$note" "$KITTY_STUB_PATH" || {
+      cat "$KITTY_STUB_PATH"
+      echo "FAIL(A): pane 0 launch does not carry KITTY_RESTORE_NOTE"
+      exit 1; }
+
+    # Codex recovery notes always name the recorded cwd. Git repositories
+    # get a bounded dirty/staged summary; non-Git directories say explicitly
+    # that no status is available instead of silently omitting the cwd.
+    codex_sid=66666666-aaaa-4666-8666-666666666666
+    codex_note_case() { # <label> <cwd>
+      local label="$1" case_cwd="$2"
+      local case_cache="$PWD/fx/codex-$label-cache"
+      local case_state="$PWD/fx/codex-$label-state"
+      mkdir -p "$case_cache/kitty-session"
+      jq -n --arg cwd "$case_cwd" --arg sid "$codex_sid" '
+        [{tabs: [{windows: [{
+          id: 1, cwd: $cwd, title: "codex",
+          cmdline: ["/bin/zsh"], codex_session_id: $sid,
+          foreground_processes: [{cmdline: ["/usr/bin/codex"]}]
+        }]}]}]
+      ' > "$case_cache/kitty-session/snapshot.json"
+      (
+        export XDG_CACHE_HOME="$case_cache"
+        export XDG_STATE_HOME="$case_state"
+        export KITTY_STUB_PATH="$PWD/state/stub-codex-$label"
+        kitty-restore-session --emit-stub
+      )
+      local case_root="$case_state/claude/kitty-restore"
+      printf '%s/%s/pane-1.md\n' "$case_root" "$(cat "$case_root/current")"
+    }
+
+    codex_git_cwd="$PWD/fx/codex-git-work"
+    mkdir -p "$codex_git_cwd"
+    git init -q "$codex_git_cwd"
+    printf 'base\n' > "$codex_git_cwd/tracked"
+    git -C "$codex_git_cwd" add tracked
+    git -C "$codex_git_cwd" -c user.name=Fixture \
+      -c user.email=fixture@example.invalid commit -qm base
+    printf 'dirty\n' >> "$codex_git_cwd/tracked"
+    printf 'staged\n' > "$codex_git_cwd/staged"
+    git -C "$codex_git_cwd" add staged
+    codex_git_note=$(codex_note_case git "$codex_git_cwd")
+    grep -qF "Working directory: $codex_git_cwd." "$codex_git_note" || {
+      cat "$codex_git_note"
+      echo "FAIL(A/Codex): Git note omitted the recorded cwd"; exit 1; }
+    grep -qF 'Git working tree: 2 changed file(s), 1 staged.' \
+      "$codex_git_note" || {
+      cat "$codex_git_note"
+      echo "FAIL(A/Codex): Git note omitted the dirty/staged summary"; exit 1; }
+
+    codex_non_git_cwd="$PWD/fx/codex-non-git-work"
+    mkdir -p "$codex_non_git_cwd"
+    codex_non_git_note=$(codex_note_case non-git "$codex_non_git_cwd")
+    grep -qF "Working directory: $codex_non_git_cwd." \
+      "$codex_non_git_note" || {
+      cat "$codex_non_git_note"
+      echo "FAIL(A/Codex): non-Git note omitted the recorded cwd"; exit 1; }
+    grep -qF 'Git status unavailable (not a Git working tree or status probe failed).' \
+      "$codex_non_git_note" || {
+      cat "$codex_non_git_note"
+      echo "FAIL(A/Codex): non-Git note did not explain missing status"; exit 1; }
 
     # --- Phase A2: the sanitiser's alphabet is kitty's, not wc's ---
     #
@@ -713,6 +824,7 @@ pkgs.runCommand "kitty-scripts-harness"
     while read -r label; do
       (
         export XDG_CACHE_HOME="$PWD/breaks/$label"
+        export XDG_STATE_HOME="$PWD/breaks/$label-state"
         export KITTY_STUB_PATH="$PWD/state/stub-$label"
         kitty-restore-session --emit-stub
       ) || {
@@ -735,7 +847,7 @@ pkgs.runCommand "kitty-scripts-harness"
         exit 1; }
     done < state/break-labels
 
-    # --- Phase B: pane 0 still receives the notice, as argv ---
+    # --- Phase B: pane 0 receives no prompt argv; hook types one draft ---
     #
     # Driven through the STUB rather than by calling --exec-pane0 bare:
     # the argv kitty parses off the launch line is half of what decides
@@ -751,14 +863,270 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(B): pane 0 did not resume the recorded session"; exit 1; }
     grep -qxF -- "$SID" "$ARGV_OUT" || {
       echo "FAIL(B): pane 0 resumed the wrong session id"; exit 1; }
-    grep -qF "This pane was restored by kitty" "$ARGV_OUT" || {
-      echo "FAIL(B): the restore notice never reached pane 0. Dropping"
-      echo "  it from the stub must not drop it from the pane."
+    [ "$(grep -cxF '===ARG===' "$ARGV_OUT")" -eq 2 ] || {
+      cat "$ARGV_OUT"
+      echo "FAIL(B): pane 0 received extra argv beyond --resume and UUID"
       exit 1; }
-    grep -qF "edited 6 file(s):" "$ARGV_OUT" || {
-      echo "FAIL(B): pane 0's notice lost the orphan block — the"
-      echo "  multi-line part is exactly what must survive the"
-      echo "  line-oriented session file."
+    if grep -qF "restored by kitty" "$ARGV_OUT"; then
+      echo "FAIL(B): recovery context was still submitted as prompt argv"
+      exit 1
+    fi
+
+    # The shared SessionStart recorder confirms this numeric window exists
+    # on this socket before claiming the marker. send-text stdin must be the
+    # exact constant draft bytes, without CR/LF, and the marker is one-shot.
+    printf '[{"tabs":[{"windows":[{"id":77}]}]}]\n' \
+      > state/draft-ls.json
+    printf '{"session_id":"%s","cwd":"%s"}\n' "$SID" "$PWD/fx/work" \
+      > state/draft-hook.json
+    export DRAFT_LS_JSON="$PWD/state/draft-ls.json"
+    export DRAFT_BYTES="$PWD/state/draft-bytes"
+    export DRAFT_CALLS="$PWD/state/draft-calls"
+    export CLAUDE_CODE_ENTRYPOINT=cli
+    : > "$DRAFT_CALLS"
+    draft_rc() {
+      if [ "$4" = ls ]; then cat "$DRAFT_LS_JSON"; return 0; fi
+      if [ "$4" = send-text ]; then
+        printf 'send-text\n' >> "$DRAFT_CALLS"
+        cat > "$DRAFT_BYTES"
+        return 0
+      fi
+      return 2
+    }
+    kitty() { draft_rc "$@"; }
+    kitten() { draft_rc "$@"; }
+    export -f draft_rc kitty kitten
+
+    KITTY_WINDOW_ID=77 KITTY_LISTEN_ON=unix:/fixture \
+      KITTY_RESTORE_NOTE="$note" \
+      claude-kitty-pane-record < state/draft-hook.json
+    python3 -c 'from pathlib import Path; assert Path("state/draft-bytes").read_bytes() == b"Read $KITTY_RESTORE_NOTE."'
+    [ -f "$note.uncertain" ] && [ ! -e "$note.pending" ] \
+      && [ ! -e "$note.sending" ] || {
+      echo "FAIL(B): attempted delivery did not end in honest .uncertain"
+      exit 1
+    }
+    [ "$(wc -l < "$DRAFT_CALLS")" -eq 1 ] || {
+      echo "FAIL(B): expected exactly one send-text call"; exit 1; }
+
+    # Second SessionStart sees only terminal .uncertain and cannot type twice.
+    KITTY_WINDOW_ID=77 KITTY_LISTEN_ON=unix:/fixture \
+      KITTY_RESTORE_NOTE="$note" \
+      claude-kitty-pane-record < state/draft-hook.json
+    [ "$(wc -l < "$DRAFT_CALLS")" -eq 1 ] || {
+      echo "FAIL(B): one-shot pickup was sent more than once"; exit 1; }
+
+    # A handled failure before send-text is spawned can prove no external
+    # boundary was crossed, so it is the sole path allowed to restore pending.
+    kitty-restore-session --emit-stub
+    note="$restore_root/$(cat "$restore_root/current")/pane-1.md"
+    before_calls=$(wc -l < "$DRAFT_CALLS")
+    KITTY_RESTORE_TEST=1 KITTY_RESTORE_TEST_FAIL_BEFORE_SEND=1 \
+      KITTY_WINDOW_ID=77 KITTY_LISTEN_ON=unix:/fixture \
+      KITTY_RESTORE_NOTE="$note" \
+      claude-kitty-pane-record < state/draft-hook.json
+    [ -f "$note.pending" ] && [ ! -e "$note.sending" ] \
+      && [ ! -e "$note.uncertain" ] || {
+      echo "FAIL(B): handled pre-spawn failure did not restore .pending"
+      exit 1
+    }
+    [ "$(wc -l < "$DRAFT_CALLS")" -eq "$before_calls" ] || {
+      echo "FAIL(B): pre-spawn failure still invoked send-text"; exit 1; }
+
+    # A crash-sized interruption after invocation leaves .sending. The next
+    # cold-start reconciliation must convert it to .uncertain, never pending,
+    # so automatic recovery cannot duplicate possibly delivered input.
+    old_note="$note"
+    KITTY_RESTORE_TEST=1 KITTY_RESTORE_TEST_LEAVE_SENDING_AFTER_SEND=1 \
+      KITTY_WINDOW_ID=77 KITTY_LISTEN_ON=unix:/fixture \
+      KITTY_RESTORE_NOTE="$old_note" \
+      claude-kitty-pane-record < state/draft-hook.json
+    [ -f "$old_note.sending" ] && [ ! -e "$old_note.pending" ] || {
+      echo "FAIL(B): post-send interruption did not retain .sending"
+      exit 1
+    }
+    [ "$(wc -l < "$DRAFT_CALLS")" -eq "$((before_calls + 1))" ] || {
+      echo "FAIL(B): post-send seam did not cross exactly one send boundary"
+      exit 1
+    }
+    kitty-restore-session --emit-stub
+    [ -f "$old_note.uncertain" ] && [ ! -e "$old_note.sending" ] \
+      && [ ! -e "$old_note.pending" ] || {
+      echo "FAIL(B): stale .sending was not reconciled to .uncertain"
+      exit 1
+    }
+    KITTY_WINDOW_ID=77 KITTY_LISTEN_ON=unix:/fixture \
+      KITTY_RESTORE_NOTE="$old_note" \
+      claude-kitty-pane-record < state/draft-hook.json
+    [ "$(wc -l < "$DRAFT_CALLS")" -eq "$((before_calls + 1))" ] || {
+      echo "FAIL(B): reconciled .uncertain was automatically resent"
+      exit 1
+    }
+
+    # Re-arm through the real writer, then make preflight omit this window.
+    # send-text itself always exits zero, so target absence must leave the
+    # marker pending and produce no fallback bytes.
+    kitty-restore-session --emit-stub
+    note="$restore_root/$(cat "$restore_root/current")/pane-1.md"
+    printf '[{"tabs":[{"windows":[{"id":88}]}]}]\n' \
+      > state/draft-ls-miss.json
+    export DRAFT_LS_JSON="$PWD/state/draft-ls-miss.json"
+    before_bytes=$(sha256sum "$DRAFT_BYTES" | cut -d' ' -f1)
+    before_miss_calls=$(wc -l < "$DRAFT_CALLS")
+    KITTY_WINDOW_ID=77 KITTY_LISTEN_ON=unix:/fixture \
+      KITTY_RESTORE_NOTE="$note" \
+      claude-kitty-pane-record < state/draft-hook.json \
+      2> state/draft-miss.err
+    after_bytes=$(sha256sum "$DRAFT_BYTES" | cut -d' ' -f1)
+    [ "$before_bytes" = "$after_bytes" ] || {
+      echo "FAIL(B): target-miss preflight still sent terminal bytes"
+      exit 1; }
+    [ "$(wc -l < "$DRAFT_CALLS")" -eq "$before_miss_calls" ] || {
+      echo "FAIL(B): send-text ran despite target-miss preflight"; exit 1; }
+    [ -f "$note.pending" ] || {
+      echo "FAIL(B): target-miss preflight consumed the pending marker"
+      exit 1; }
+    grep -qi 'window' state/draft-miss.err || {
+      echo "FAIL(B): target-miss preflight logged no diagnostic"; exit 1; }
+    unset -f draft_rc kitty kitten
+
+    # Atomic note replacement uses unpredictable same-directory temporary
+    # files. Predictable old .tmp symlinks must neither block a restore nor
+    # be followed, and concurrent writers must leave one complete note.
+    atomic_state="$PWD/fx/atomic-state"
+    atomic_dir="$atomic_state/claude/kitty-restore"
+    mkdir -p "$atomic_dir"
+    printf 'canary\n' > state/note-canary
+    ln -s "$PWD/state/note-canary" "$atomic_dir/pane-1.md.tmp"
+    ln -s "$PWD/state/note-canary" "$atomic_dir/pane-1.md.pending.tmp"
+    (
+      export XDG_STATE_HOME="$atomic_state"
+      kitty-restore-session --emit-stub
+    ) & atomic_one=$!
+    (
+      export XDG_STATE_HOME="$atomic_state"
+      kitty-restore-session --emit-stub
+    ) & atomic_two=$!
+    wait "$atomic_one"
+    wait "$atomic_two"
+    atomic_note="$atomic_dir/$(cat "$atomic_dir/current")/pane-1.md"
+    [ -f "$atomic_note" ] || {
+      echo "FAIL(B): concurrent note writers left no final note"; exit 1; }
+    [ ! -L "$atomic_note" ] || {
+      echo "FAIL(B): final recovery note remained a planted symlink"; exit 1; }
+    [ "$(cat state/note-canary)" = canary ] || {
+      echo "FAIL(B): note writer followed a predictable temp symlink"
+      exit 1; }
+    cmp -s "$note" "$atomic_note" || {
+      echo "FAIL(B): concurrent note writers left partial/mixed content"
+      diff -u "$note" "$atomic_note" || true
+      exit 1; }
+
+    # Legacy loose leaf symlinks are cleanup inputs now that active notes are
+    # generation-scoped. Unlink the legacy name without following it, keep the
+    # canary untouched, and launch only from the private generation.
+    leaf_state="$PWD/fx/leaf-symlink-state"
+    leaf_dir="$leaf_state/claude/kitty-restore"
+    mkdir -p "$leaf_dir"
+    ln -s "$PWD/state/note-canary" "$leaf_dir/pane-1.md"
+    (
+      export XDG_STATE_HOME="$leaf_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-leaf-symlink"
+      kitty-restore-session --emit-stub
+    )
+    [ ! -e "$leaf_dir/pane-1.md" ] || {
+      echo "FAIL(B): legacy loose note symlink survived cleanup"
+      exit 1; }
+    [ "$(cat state/note-canary)" = canary ] || {
+      echo "FAIL(B): recovery writer followed an existing note symlink"
+      exit 1; }
+    grep -q -- '--env KITTY_RESTORE_NOTE=.*/generation-' \
+      state/stub-leaf-symlink || {
+      cat state/stub-leaf-symlink
+      echo "FAIL(B): cleaned legacy note did not use generation state"
+      exit 1
+    }
+
+    marker_state="$PWD/fx/marker-symlink-state"
+    marker_dir="$marker_state/claude/kitty-restore"
+    mkdir -p "$marker_dir"
+    ln -s "$PWD/state/note-canary" "$marker_dir/pane-1.md.pending"
+    (
+      export XDG_STATE_HOME="$marker_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-marker-symlink"
+      kitty-restore-session --emit-stub
+    )
+    [ ! -e "$marker_dir/pane-1.md.pending" ] || {
+      echo "FAIL(B): legacy loose marker symlink survived cleanup"
+      exit 1; }
+    [ "$(cat state/note-canary)" = canary ] || {
+      echo "FAIL(B): recovery writer followed an existing marker symlink"
+      exit 1; }
+    grep -q -- '--env KITTY_RESTORE_NOTE=.*/generation-' \
+      state/stub-marker-symlink || {
+      cat state/stub-marker-symlink
+      echo "FAIL(B): cleaned legacy marker did not use generation state"
+      exit 1
+    }
+
+    # Existing state directories are repaired to private mode. A symlink at
+    # the restore-directory boundary is refused without touching its target;
+    # pane 0 degrades to a plain shell instead of launching an agent whose
+    # pickup note cannot be trusted.
+    mode_state="$PWD/fx/mode-state"
+    mkdir -p "$mode_state/claude/kitty-restore"
+    chmod 755 "$mode_state/claude/kitty-restore"
+    (
+      export XDG_STATE_HOME="$mode_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-mode"
+      kitty-restore-session --emit-stub
+    )
+    [ "$(stat -c %a "$mode_state/claude/kitty-restore")" = 700 ] || {
+      echo "FAIL(B): pre-existing recovery directory was not repaired to 700"
+      exit 1; }
+
+    symlink_state="$PWD/fx/symlink-state"
+    mkdir -p "$symlink_state/claude" state/note-target
+    ln -s "$PWD/state/note-target" \
+      "$symlink_state/claude/kitty-restore"
+    (
+      export XDG_STATE_HOME="$symlink_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-symlink-state"
+      kitty-restore-session --emit-stub
+    )
+    [ ! -e state/note-target/pane-1.md ] || {
+      echo "FAIL(B): recovery writer followed a parent-directory symlink"
+      exit 1; }
+    if grep -qE -- '--exec-pane0|KITTY_RESTORE_NOTE' \
+         state/stub-symlink-state; then
+      cat state/stub-symlink-state
+      echo "FAIL(B): unsafe note directory still launched restored agent"
+      exit 1
+    fi
+
+    # Kitty's session parser expands `$VARS` after tokenization. A literal
+    # dollar or splitlines character in pane 0's state path is therefore
+    # unrepresentable without changing the path. Fail closed on note/draft
+    # injection while still emitting a plain-shell launch stub.
+    dollar_state="$PWD/fx/\$UNSET-state"
+    (
+      export XDG_STATE_HOME="$dollar_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-dollar-state"
+      kitty-restore-session --emit-stub
+    )
+    grep -qx 'launch' state/stub-dollar-state || {
+      cat state/stub-dollar-state
+      echo "FAIL(B): dollar-bearing state path did not degrade to plain shell"
+      exit 1; }
+    line_state=$(printf '%s\n%s' "$PWD/fx/line" state)
+    (
+      export XDG_STATE_HOME="$line_state"
+      export KITTY_STUB_PATH="$PWD/state/stub-line-state"
+      kitty-restore-session --emit-stub
+    )
+    grep -qx 'launch' state/stub-line-state || {
+      cat state/stub-line-state
+      echo "FAIL(B): line-breaking state path did not degrade to plain shell"
       exit 1; }
 
     # --- Phase C: grid dispatch counts real panes only ---
@@ -777,6 +1145,9 @@ pkgs.runCommand "kitty-scripts-harness"
     #!/bin/sh
     # argv is always: @ --to <sock> <subcommand> [args...]
     if [ "$4" = "ls" ]; then
+      if [ -n "''${KITTY_LS_CALLS:-}" ]; then
+        printf 'ls\n' >> "$KITTY_LS_CALLS"
+      fi
       if [ -n "''${LS_JSON_2:-}" ] && [ -f "''${LS_SWITCHED:-/nonexistent}" ]; then
         cat "$LS_JSON_2"
       else
@@ -791,6 +1162,9 @@ pkgs.runCommand "kitty-scripts-harness"
     if [ -n "''${LS_SWITCHED:-}" ]; then : > "$LS_SWITCHED"; fi
     shift 3
     printf '%s\n' "$*" >> "$KITTY_CMD_LOG"
+    if [ "''${1:-}" = launch ] && [ -n "''${KITTY_FAKE_WINDOW_ID:-}" ]; then
+      printf '%s\n' "$KITTY_FAKE_WINDOW_ID"
+    fi
     exit 0
     STUB
     chmod +x fakebin/kitty
@@ -870,6 +1244,38 @@ pkgs.runCommand "kitty-scripts-harness"
       exit 1; }
     [ "$(grep -c '^launch' state/multi.session)" -eq 1 ] || {
       echo "FAIL(C/convert): expected exactly one launch directive"
+      exit 1; }
+
+    # The normal cold restore already canonicalizes Codex to
+    # `codex resume <UUID>`. last.session is independently executable and
+    # must enforce the same no-replayed-prompt boundary.
+    kitty-session-convert < grid/codex-with-id.json \
+      > state/codex-with-id.session
+    grep -qxF \
+      'launch --cwd /tmp --title w1 /usr/bin/codex resume cccc3333-cccc-4333-8333-cccccccccccc' \
+      state/codex-with-id.session || {
+      cat state/codex-with-id.session
+      echo "FAIL(C/convert): last.session replayed Codex flags or a"
+      echo "  positional prompt instead of the exact recorded UUID."
+      exit 1; }
+    SHELL=/bin/sh kitty-session-convert < grid/codex-without-id.json \
+      > state/codex-without-id.session
+    grep -qxF \
+      'launch --cwd /tmp --title w1 /bin/sh' \
+      state/codex-without-id.session || {
+      cat state/codex-without-id.session
+      echo "FAIL(C/convert): last.session replayed a Codex prompt without"
+      echo "  an exact UUID instead of degrading to a clean user shell."
+      exit 1; }
+    SHELL=/bin/sh kitty-session-convert \
+      < grid/codex-indirect-without-id.json \
+      > state/codex-indirect-without-id.session
+    grep -qxF \
+      'launch --cwd /tmp --title w1 /bin/sh' \
+      state/codex-indirect-without-id.session || {
+      cat state/codex-indirect-without-id.session
+      echo "FAIL(C/convert): an indirect shell wrapper replayed a Codex"
+      echo "  positional prompt instead of opening a clean user shell."
       exit 1; }
 
     # --- Phase D: snapshot retention ---
@@ -1479,7 +1885,7 @@ pkgs.runCommand "kitty-scripts-harness"
     # surviving the trip intact.
 
     # F1 — pane 0's recorded launch argv is the slice launcher, with
-    # the resolved claude argv (notice included) inside it.
+    # the exact canonical Claude resume argv inside it and no prompt.
     pane0_json="$XDG_CACHE_HOME/kitty-session/pane0-launch.json"
     echo "--- pane0-launch.json ---"; cat "$pane0_json"; echo
     jq -e '.cmd[0] | endswith("/zsh")' "$pane0_json" > /dev/null || {
@@ -1503,9 +1909,9 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(F1): the recorded claude path is not passed through as"
       echo "  \$0, so the fallback branch has nothing to exec."
       exit 1; }
-    jq -e '.cmd | map(select(test("restored by kitty"))) | length == 1' \
+    jq -e '.cmd | map(select(test("restored by kitty"))) | length == 0' \
       "$pane0_json" > /dev/null || {
-      echo "FAIL(F1): the restore notice did not survive being wrapped."
+      echo "FAIL(F1): recovery context leaked back into argv."
       exit 1; }
     jq -e '.cmd | index("--resume") != null' "$pane0_json" > /dev/null || {
       echo "FAIL(F1): the resume argv did not survive being wrapped."
@@ -1547,6 +1953,23 @@ pkgs.runCommand "kitty-scripts-harness"
     [ "$(grep -c '^launch .*_claude_slice' "$KITTY_CMD_LOG")" -eq 1 ] || {
       echo "FAIL(F3): the wrapper was applied to something that is not"
       echo "  claude — over-wrapping poisons the observed cgroup."
+      exit 1; }
+    grep -qF -- "--env KITTY_RESTORE_NOTE=" "$KITTY_CMD_LOG" || {
+      echo "FAIL(F3): a later restored agent pane did not receive its"
+      echo "  recovery-note path through kitty-pane-add."
+      exit 1; }
+
+    # Environment names are data accepted by kitty-pane-add. Reject an
+    # invalid name before issuing any remote-control launch.
+    before_launches=$(wc -l < "$KITTY_CMD_LOG")
+    bad_env_rc=0
+    kitty-pane-add --env 'bad-name=value' -- /bin/sh \
+      2> state/bad-env.err || bad_env_rc=$?
+    [ "$bad_env_rc" -ne 0 ] || {
+      echo "FAIL(F3): kitty-pane-add accepted an invalid environment name"
+      exit 1; }
+    [ "$(wc -l < "$KITTY_CMD_LOG")" -eq "$before_launches" ] || {
+      echo "FAIL(F3): invalid --env still reached kitty remote control"
       exit 1; }
 
     # F4 — every consumer must see THROUGH the launcher. kitty records
@@ -1749,6 +2172,43 @@ pkgs.runCommand "kitty-scripts-harness"
       grep -n 'stub=' "$wrapper_bin" || true
       echo "FAIL(H2): the kitty wrapper still looks for the stub in the"
       echo "  old location, so the writer and the reader disagree."
+      exit 1; }
+
+    # H2b — cold-start serialization begins before socket inspection and
+    # the destructive stale-identity wipe. Hold the production lock, invoke
+    # the real wrapper with a harmless --version command, and observe the
+    # TSV while the contender is blocked. The old wrapper deleted the TSV
+    # before it ever opened restore.lock, so this assertion fails there.
+    wrapper_cache="$PWD/fx/wrapper-order-cache"
+    wrapper_dir="$wrapper_cache/kitty-session"
+    mkdir -p "$wrapper_dir"
+    printf '1\tclaude\t11111111-2222-4333-8444-555555555555\t/tmp\t0\n' \
+      > "$wrapper_dir/pane-sessions.tsv"
+    exec 9>"$wrapper_dir/restore.lock"
+    flock -x 9
+    (
+      export XDG_CACHE_HOME="$wrapper_cache"
+      "$wrapper_bin" --version > state/wrapper-version.out \
+        2> state/wrapper-version.err
+    ) & wrapper_pid=$!
+    sleep 1
+    [ -s "$wrapper_dir/pane-sessions.tsv" ] || {
+      cat state/wrapper-version.err || true
+      echo "FAIL(H2b): wrapper deleted pane-sessions.tsv before acquiring"
+      echo "  restore.lock; simultaneous cold starts can erase fresh rows"
+      exit 1; }
+    flock -u 9
+    exec 9>&-
+    wait "$wrapper_pid" || {
+      cat state/wrapper-version.err || true
+      echo "FAIL(H2b): serialized wrapper did not resume after lock release"
+      exit 1; }
+    [ ! -e "$wrapper_dir/pane-sessions.tsv" ] || {
+      echo "FAIL(H2b): lock holder released but stale identity was not wiped"
+      exit 1; }
+    grep -qi kitty state/wrapper-version.out || {
+      cat state/wrapper-version.out state/wrapper-version.err || true
+      echo "FAIL(H2b): ordinary no-session wrapper invocation did not run"
       exit 1; }
 
     # H3 — and the write itself does not follow a symlink. _write_atomic
@@ -2266,6 +2726,1477 @@ pkgs.runCommand "kitty-scripts-harness"
         echo "  pane."
         exit 1; }
     ) || exit 1
+
+    # --- Phase M: no-hook Codex restore binds before exec -----------
+    #
+    # Codex 0.146 starts `resume <UUID>` with the correct Kitty
+    # environment but emits no SessionStart/hook/transcript event before
+    # the first user input. Therefore the restore launcher itself must bind
+    # the exact UUID to Kitty's injected numeric window id before Codex is
+    # exec'd. This fixture deliberately invokes no SessionStart recorder.
+    bootstrap_cache="$PWD/fx/bootstrap-cache"
+    bootstrap_state="$PWD/fx/bootstrap-state"
+    bootstrap_work="$PWD/fx/bootstrap-work"
+    mkdir -p "$bootstrap_cache/kitty-session" "$bootstrap_work"
+    sid_zero=01234567-89ab-4cde-8f01-23456789abcd
+    sid_later=89abcdef-0123-4567-89ab-cdef01234567
+
+    cat > fakebin/codex <<'STUB'
+    #!/bin/sh
+    printf 'codex\n' >> "$BOOTSTRAP_EXEC_LOG"
+    for arg in "$@"; do printf '%s\n' "$arg" >> "$BOOTSTRAP_EXEC_LOG"; done
+    STUB
+    cat > fakebin/bootstrap-safe-shell <<'STUB'
+    #!/bin/sh
+    printf 'safe-shell\n' >> "$BOOTSTRAP_EXEC_LOG"
+    for arg in "$@"; do printf '%s\n' "$arg" >> "$BOOTSTRAP_EXEC_LOG"; done
+    STUB
+    chmod +x fakebin/codex fakebin/bootstrap-safe-shell
+    codex_bin="$PWD/fakebin/codex"
+    safe_bin="$PWD/fakebin/bootstrap-safe-shell"
+    bootstrap_bin=$(command -v kitty-restore-session)
+    resume_json=$(jq -nc --arg codex "$codex_bin" --arg sid "$sid_later" \
+      '[$codex, "resume", $sid]')
+    safe_json=$(jq -nc --arg safe "$safe_bin" '[$safe, "shared"]')
+
+    jq -n \
+      --arg cwd "$bootstrap_work" --arg codex "$codex_bin" \
+      --arg safe "$safe_bin" --arg sid0 "$sid_zero" \
+      --arg sid2 "$sid_later" --arg restore "$bootstrap_bin" \
+      --arg resume "$resume_json" --arg safeJson "$safe_json" '
+      [{tabs: [{layout: "splits", windows: [
+        {id: 1, cwd: $cwd, title: "codex zero",
+         cmdline: [$safe, "shared"], codex_session_id: $sid0,
+         foreground_processes: [{cmdline: [$codex]}]},
+        {id: 2, cwd: $cwd, title: "codex later",
+         cmdline: [$restore, "--bootstrap", $resume, $safeJson],
+         codex_session_id: $sid2,
+         foreground_processes: [{cmdline: [$codex, "resume", $sid2]}]}
+      ]}]}]
+    ' > "$bootstrap_cache/kitty-session/snapshot.json"
+    bootstrap_snapshot="$bootstrap_cache/kitty-session/snapshot.json"
+    cp "$bootstrap_snapshot" state/bootstrap-snapshot-good.json
+
+    export XDG_CACHE_HOME="$bootstrap_cache"
+    export XDG_STATE_HOME="$bootstrap_state"
+    export KITTY_STUB_PATH="$PWD/state/bootstrap-stub"
+    export KITTY_RESTORE_TIMEOUT_SECONDS=12
+
+    # A snapshot taken after restoring a later Codex pane sees the exact
+    # Codex resume in foreground_processes, but Kitty still reports the
+    # bootstrap wrapper it spawned in window.cmdline. Loading must keep
+    # identity from the foreground/session binding while independently
+    # recovering the carried safe shell. Saving that loaded pane must never
+    # turn the bootstrap launcher itself into the next generation's fallback.
+    kitty-restore-session --dump-panes > state/bootstrap-restored-panes.json
+    jq -e --arg codex "$codex_bin" --arg sid "$sid_later" \
+      --arg safe "$safe_bin" '
+      .[1].cmd == [$codex, "resume", $sid]
+      and .[1].shell_cmd == [$safe, "shared"]
+    ' state/bootstrap-restored-panes.json >/dev/null || {
+      cat state/bootstrap-restored-panes.json
+      echo "FAIL(bootstrap/reload): a restored later Codex pane did not"
+      echo "  keep exact resume identity plus its independently carried"
+      echo "  safe shell, or it adopted the bootstrap launcher as fallback."
+      exit 1
+    }
+
+    malformed_launcher_fails_closed() { # <label> <launcher-json>
+      local label="$1" launcher_json="$2"
+      local case_cache="$PWD/fx/bootstrap-load-$label-cache"
+      local case_state="$PWD/fx/bootstrap-load-$label-state"
+      local case_panes="$PWD/state/bootstrap-load-$label-panes.json"
+      mkdir -p "$case_cache/kitty-session"
+      jq --argjson launcher "$launcher_json" \
+        '.[0].tabs[0].windows[1].cmdline = $launcher' \
+        state/bootstrap-snapshot-good.json \
+        > "$case_cache/kitty-session/snapshot.json"
+      (
+        export XDG_CACHE_HOME="$case_cache"
+        export XDG_STATE_HOME="$case_state"
+        export KITTY_STUB_PATH="$PWD/state/bootstrap-load-$label-stub"
+        kitty-restore-session --dump-panes > "$case_panes"
+        kitty-restore-session --emit-stub
+      )
+      jq -e --arg codex "$codex_bin" --arg sid "$sid_later" '
+        .[1].cmd == [$codex, "resume", $sid]
+        and .[1].shell_cmd == ["/bin/sh"]
+      ' "$case_panes" >/dev/null || {
+        cat "$case_panes"
+        echo "FAIL(bootstrap/load-$label): malformed launcher did not"
+        echo "  preserve exact Codex identity while failing closed to /bin/sh."
+        exit 1
+      }
+      local case_root="$case_state/claude/kitty-restore"
+      local case_generation="$case_root/$(cat "$case_root/current")"
+      jq -e --arg codex "$codex_bin" --arg sid "$sid_later" '
+        .panes["2"].resume_argv == [$codex, "resume", $sid]
+        and .panes["2"].safe_shell_argv == ["/bin/sh"]
+      ' "$case_generation/manifest.json" >/dev/null || {
+        cat "$case_generation/manifest.json"
+        echo "FAIL(bootstrap/load-$label): save re-adopted a malformed"
+        echo "  bootstrap launcher instead of persisting /bin/sh."
+        exit 1
+      }
+    }
+
+    wrong_count=$(jq -nc --arg restore "$bootstrap_bin" \
+      --arg resume "$resume_json" '[$restore, "--bootstrap", $resume]')
+    bad_json=$(jq -nc --arg restore "$bootstrap_bin" \
+      --arg safe "$safe_json" '[$restore, "--bootstrap", "{", $safe]')
+    non_argv=$(jq -nc --arg restore "$bootstrap_bin" \
+      --arg resume "$resume_json" \
+      '[$restore, "--bootstrap", $resume, "{\\\"not\\\":\\\"argv\\\"}"]')
+    recursive_safe=$(jq -nc --arg restore "$bootstrap_bin" \
+      --arg resume "$resume_json" --arg safe "$safe_json" '
+      [$restore, "--bootstrap", $resume,
+       ([$restore, "--bootstrap", $resume, $safe] | tojson)]')
+    mismatched_resume=$(jq -nc --arg codex "$codex_bin" '
+      [$codex, "resume", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"]')
+    mismatched_valid=$(jq -nc --arg restore "$bootstrap_bin" \
+      --arg resume "$mismatched_resume" --arg safe "$safe_json" \
+      '[$restore, "--bootstrap", $resume, $safe]')
+    malformed_launcher_fails_closed wrong-count "$wrong_count"
+    malformed_launcher_fails_closed bad-json "$bad_json"
+    malformed_launcher_fails_closed non-argv "$non_argv"
+    malformed_launcher_fails_closed recursion "$recursive_safe"
+    malformed_launcher_fails_closed mismatched-resume "$mismatched_valid"
+
+    kitty-restore-session --emit-stub
+
+    restore_root="$bootstrap_state/claude/kitty-restore"
+    [ "$(stat -c %a "$restore_root")" = 700 ] || {
+      echo "FAIL(bootstrap): recovery root is not mode 0700"; exit 1; }
+    [ -f "$restore_root/current" ] || {
+      echo "FAIL(bootstrap): no active generation pointer"; exit 1; }
+    [ "$(stat -c %a "$restore_root/current")" = 600 ] || {
+      echo "FAIL(bootstrap): current is not mode 0600"; exit 1; }
+    token=$(cat "$restore_root/current")
+    case "$token" in
+      generation-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+      *) echo "FAIL(bootstrap): generation token is not random 128-bit hex: $token"; exit 1 ;;
+    esac
+    generation="$restore_root/$token"
+    manifest="$generation/manifest.json"
+    pane0_launch="$generation/pane0-launch.json"
+    [ "$(stat -c %a "$generation")" = 700 ] || {
+      echo "FAIL(bootstrap): generation is not mode 0700"; exit 1; }
+    for private in "$manifest" "$pane0_launch" \
+      "$generation/pane-1.md" "$generation/pane-1.md.pending" \
+      "$generation/pane-2.md" "$generation/pane-2.md.pending"; do
+      [ -f "$private" ] && [ "$(stat -c %a "$private")" = 600 ] || {
+        echo "FAIL(bootstrap): missing/non-private generation file $private"
+        exit 1
+      }
+    done
+    jq -e --arg token "$token" --arg cwd "$bootstrap_work" \
+      --arg codex "$codex_bin" --arg safe "$safe_bin" \
+      --arg sid0 "$sid_zero" --arg sid2 "$sid_later" \
+      --arg note0 "$generation/pane-1.md" \
+      --arg note2 "$generation/pane-2.md" '
+      .generation == $token
+      and (.deadline_monotonic | type == "number")
+      and .panes["1"] == {
+        ordinal: 1, kind: "codex", session_id: $sid0, cwd: $cwd,
+        note_path: $note0, resume_argv: [$codex, "resume", $sid0],
+        safe_shell_argv: [$safe, "shared"]
+      }
+      and .panes["2"] == {
+        ordinal: 2, kind: "codex", session_id: $sid2, cwd: $cwd,
+        note_path: $note2, resume_argv: [$codex, "resume", $sid2],
+        safe_shell_argv: [$safe, "shared"]
+      }
+    ' "$manifest" >/dev/null || {
+      cat "$manifest" 2>/dev/null || true
+      echo "FAIL(bootstrap): manifest does not bind exact pane identities"
+      exit 1
+    }
+    jq -e --slurpfile manifest "$manifest" '
+      .generation == $manifest[0].generation
+      and .ordinal == 1
+      and .binding == $manifest[0].panes["1"]
+    ' "$pane0_launch" >/dev/null || {
+      cat "$pane0_launch" 2>/dev/null || true
+      echo "FAIL(bootstrap): pane0-launch does not carry manifest binding"
+      exit 1
+    }
+    for name in KITTY_RESTORE_BOOTSTRAP KITTY_RESTORE_ORDINAL \
+      KITTY_RESTORE_NOTE KITTY_RESTORE_DEADLINE_MONOTONIC; do
+      grep -q -- "--env $name=" "$KITTY_STUB_PATH" || {
+        cat "$KITTY_STUB_PATH"
+        echo "FAIL(bootstrap): pane zero omitted $name"; exit 1; }
+    done
+    grep -q -- '--exec-pane0' "$KITTY_STUB_PATH" || {
+      echo "FAIL(bootstrap): pane zero bypasses --exec-pane0"; exit 1; }
+    if grep -qE -- "codex( |')+resume" "$KITTY_STUB_PATH"; then
+      echo "FAIL(bootstrap): pane zero launches codex resume directly"
+      exit 1
+    fi
+
+    # The parent creates later panes through the same bootstrap entrypoint.
+    export LS_JSON="$PWD/grid/two-real.json"
+    export KITTY_CMD_LOG="$PWD/state/bootstrap-parent-launches"
+    export KITTY_FAKE_WINDOW_ID=202
+    export KITTY_RESTORE_TEST=1 KITTY_RESTORE_TEST_LAUNCH_ONLY=1
+    : > "$KITTY_CMD_LOG"
+    kitty-restore-session
+    echo "--- bootstrap parent launches ---"; cat "$KITTY_CMD_LOG"
+    grep -q -- '--bootstrap' "$KITTY_CMD_LOG" || {
+      echo "FAIL(bootstrap): parent did not launch the bootstrap wrapper"
+      exit 1
+    }
+    if grep -qE -- "codex( |')+resume" "$KITTY_CMD_LOG"; then
+      echo "FAIL(bootstrap): parent launched codex resume directly"
+      exit 1
+    fi
+    [ "$(cat "$generation/pane-2.expected-window")" = 202 ] || {
+      echo "FAIL(bootstrap): parent did not publish launch-returned window"
+      exit 1
+    }
+
+    bootstrap_argv() { # <ordinal>
+      jq -r --arg ordinal "$1" '
+        (.panes[$ordinal].resume_argv | @json),
+        (.panes[$ordinal].safe_shell_argv | @json)
+      ' "$manifest"
+    }
+    mapfile -t pane1_args < <(bootstrap_argv 1)
+    mapfile -t pane2_args < <(bootstrap_argv 2)
+    deadline=$(jq -r '.deadline_monotonic' "$manifest")
+    note1="$generation/pane-1.md"
+    note2="$generation/pane-2.md"
+    # Pane zero enters bootstrap via the exact argv Kitty parsed from the
+    # one-line stub. No hook runs, yet its mapping must exist afterwards.
+    export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-pane0-exec"
+    : > "$BOOTSTRAP_EXEC_LOG"
+    KITTY_WINDOW_ID=201 python3 ${mkStubExec} "$KITTY_STUB_PATH" \
+      2> state/bootstrap-pane0.err
+    grep -qP "^201\\tcodex\\t$sid_zero\\t$bootstrap_work\\t[0-9]+$" \
+      "$bootstrap_cache/kitty-session/pane-sessions.tsv" || {
+      cat "$bootstrap_cache/kitty-session/pane-sessions.tsv" || true
+      echo "FAIL(bootstrap): pane zero no-hook mapping is missing"; exit 1; }
+    printf 'codex\nresume\n%s\n' "$sid_zero" > state/expected-pane0-exec
+    cmp -s state/expected-pane0-exec "$BOOTSTRAP_EXEC_LOG" || {
+      cat "$BOOTSTRAP_EXEC_LOG"
+      echo "FAIL(bootstrap): pane zero exec was not exact codex resume UUID"
+      exit 1
+    }
+
+    # Later pane: pause after the durable row + bootstrap-bound receipt and
+    # before execvp. That boundary is the regression's essential ordering.
+    export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-later-exec"
+    export KITTY_RESTORE_TEST=1
+    export KITTY_RESTORE_TEST_TRACE="$PWD/state/bootstrap-order"
+    export KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND="$PWD/state/bootstrap-pause"
+    rm -f "$BOOTSTRAP_EXEC_LOG" "$KITTY_RESTORE_TEST_TRACE" \
+      "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND" \
+      "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND.release" \
+      "$generation/pane-2.bootstrap-bound" \
+      "$generation/pane-2.bootstrap-failed"
+    KITTY_RESTORE_BOOTSTRAP="$token" KITTY_RESTORE_ORDINAL=2 \
+      KITTY_RESTORE_NOTE="$note2" \
+      KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" \
+      KITTY_WINDOW_ID=202 \
+      "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
+        "''${pane2_args[1]}" & bootstrap_pid=$!
+    for unused in $(seq 1 100); do
+      [ -e "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND" ] && break
+      sleep 0.02
+    done
+    [ -e "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND" ] || {
+      wait "$bootstrap_pid" || true
+      echo "FAIL(bootstrap): after-bound test seam was never reached"
+      exit 1
+    }
+    grep -qP "^202\\tcodex\\t$sid_later\\t$bootstrap_work\\t[0-9]+$" \
+      "$bootstrap_cache/kitty-session/pane-sessions.tsv" || {
+      cat "$bootstrap_cache/kitty-session/pane-sessions.tsv" || true
+      echo "FAIL(bootstrap): mapping was not durable at bootstrap-bound"
+      exit 1
+    }
+    [ -f "$generation/pane-2.bootstrap-bound" ] || {
+      echo "FAIL(bootstrap): bound receipt missing before exec"; exit 1; }
+    printf '%s\n' file-fsync replace directory-fsync bootstrap-bound \
+      > state/expected-bootstrap-order-before-exec
+    cmp -s state/expected-bootstrap-order-before-exec \
+      "$KITTY_RESTORE_TEST_TRACE" || {
+      cat "$KITTY_RESTORE_TEST_TRACE" 2>/dev/null || true
+      echo "FAIL(bootstrap): registry durability order is incomplete"
+      exit 1
+    }
+    [ ! -e "$BOOTSTRAP_EXEC_LOG" ] || {
+      echo "FAIL(bootstrap): Codex exec happened before bootstrap-bound pause"
+      exit 1
+    }
+    : > "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND.release"
+    wait "$bootstrap_pid"
+    printf 'codex\nresume\n%s\n' "$sid_later" > state/expected-later-exec
+    cmp -s state/expected-later-exec "$BOOTSTRAP_EXEC_LOG" || {
+      cat "$BOOTSTRAP_EXEC_LOG"
+      echo "FAIL(bootstrap): later exec was not exact codex resume UUID"
+      exit 1
+    }
+    printf 'exec\n' >> state/expected-bootstrap-order-before-exec
+    cmp -s state/expected-bootstrap-order-before-exec \
+      "$KITTY_RESTORE_TEST_TRACE" || {
+      cat "$KITTY_RESTORE_TEST_TRACE" 2>/dev/null || true
+      echo "FAIL(bootstrap): exec did not follow durable receipt"
+      exit 1
+    }
+    unset KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND KITTY_RESTORE_TEST_TRACE
+
+    # Launch-carried resume and safe-shell argv are an independent copy of
+    # the resolved snapshot. A structurally valid manifest edit after those
+    # inputs are fixed must be detected, not copied into a later launch.
+    manifest_good="$PWD/state/bootstrap-manifest-good.json"
+    cp "$manifest" "$manifest_good"
+    mutated_sid=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+    cat > fakebin/bootstrap-altered <<'STUB'
+    #!/bin/sh
+    printf 'altered\n' >> "$BOOTSTRAP_EXEC_LOG"
+    for arg in "$@"; do printf '%s\n' "$arg" >> "$BOOTSTRAP_EXEC_LOG"; done
+    STUB
+    chmod +x fakebin/bootstrap-altered
+    altered_bin="$PWD/fakebin/bootstrap-altered"
+
+    manifest_mismatch_fails_closed() { # <label> <manifest-safe-marker>
+      local label="$1" safe_marker="$2"
+      rm -f "$generation/pane-2.bootstrap-bound" \
+        "$generation/pane-2.bootstrap-failed"
+      printf '202\n' > "$generation/pane-2.expected-window"
+      export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-manifest-$label-exec"
+      : > "$BOOTSTRAP_EXEC_LOG"
+      env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
+        KITTY_RESTORE_TEST=1 KITTY_RESTORE_BOOTSTRAP="$token" \
+        KITTY_RESTORE_ORDINAL=2 KITTY_RESTORE_NOTE="$note2" \
+        KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
+        BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+        "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
+          "''${pane2_args[1]}" </dev/null >/dev/null \
+          2> "$PWD/state/bootstrap-manifest-$label.err" || true
+      [ -f "$generation/pane-2.bootstrap-failed" ] || {
+        cat "$PWD/state/bootstrap-manifest-$label.err"
+        echo "FAIL(bootstrap/manifest-$label): failure receipt missing"
+        exit 1
+      }
+      grep -qx "$safe_marker" "$BOOTSTRAP_EXEC_LOG" || {
+        cat "$BOOTSTRAP_EXEC_LOG"
+        echo "FAIL(bootstrap/manifest-$label): manifest safe shell did not run"
+        exit 1
+      }
+      if grep -qx codex "$BOOTSTRAP_EXEC_LOG"; then
+        echo "FAIL(bootstrap/manifest-$label): altered Codex argv executed"
+        exit 1
+      fi
+      ! grep -q Traceback "$PWD/state/bootstrap-manifest-$label.err" || {
+        cat "$PWD/state/bootstrap-manifest-$label.err"
+        echo "FAIL(bootstrap/manifest-$label): traceback escaped"
+        exit 1
+      }
+    }
+
+    jq --arg altered "$altered_bin" --arg sid "$mutated_sid" '
+      .panes["2"].session_id = $sid
+      | .panes["2"].resume_argv = [$altered, "resume", $sid]
+    ' "$manifest_good" > "$manifest"
+    chmod 600 "$manifest"
+    : > "$KITTY_CMD_LOG"
+    kitty-restore-session
+    grep -Fq -- "$sid_later" "$KITTY_CMD_LOG" \
+      && ! grep -Fq -- "$mutated_sid" "$KITTY_CMD_LOG" \
+      && ! grep -Fq -- "$altered_bin" "$KITTY_CMD_LOG" || {
+      cat "$KITTY_CMD_LOG"
+      echo "FAIL(bootstrap): later launch copied mutated manifest resume argv"
+      exit 1
+    }
+    manifest_mismatch_fails_closed resume safe-shell
+
+    jq --arg altered "$altered_bin" '
+      .panes["2"].safe_shell_argv = [$altered, "safe"]
+    ' "$manifest_good" > "$manifest"
+    chmod 600 "$manifest"
+    : > "$KITTY_CMD_LOG"
+    kitty-restore-session
+    grep -Fq -- "$safe_bin" "$KITTY_CMD_LOG" \
+      && grep -Fq -- 'shared' "$KITTY_CMD_LOG" \
+      && ! grep -Fq -- "$altered_bin" "$KITTY_CMD_LOG" || {
+      cat "$KITTY_CMD_LOG"
+      echo "FAIL(bootstrap): later launch copied mutated manifest safe argv"
+      exit 1
+    }
+    manifest_mismatch_fails_closed safe altered
+    cp "$manifest_good" "$manifest"
+    chmod 600 "$manifest"
+
+    malformed_manifest_fails_closed() { # <label> <jq-filter> <receipt>
+      local label="$1" filter="$2" receipt="$3"
+      jq "$filter" "$manifest_good" > "$manifest"
+      chmod 600 "$manifest"
+      rm -f "$generation/pane-2.bootstrap-bound" \
+        "$generation/pane-2.bootstrap-failed"
+      printf '202\n' > "$generation/pane-2.expected-window"
+      export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-malformed-$label-exec"
+      : > "$BOOTSTRAP_EXEC_LOG"
+      env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
+        KITTY_RESTORE_TEST=1 KITTY_RESTORE_BOOTSTRAP="$token" \
+        KITTY_RESTORE_ORDINAL=2 KITTY_RESTORE_NOTE="$note2" \
+        KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
+        BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+        "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
+          "''${pane2_args[1]}" </dev/null >/dev/null \
+          2> "$PWD/state/bootstrap-malformed-$label.err" || true
+      [ ! -s "$BOOTSTRAP_EXEC_LOG" ] || {
+        cat "$BOOTSTRAP_EXEC_LOG"
+        echo "FAIL(bootstrap/malformed-$label): non-system fallback executed"
+        exit 1
+      }
+      ! grep -q Traceback "$PWD/state/bootstrap-malformed-$label.err" || {
+        cat "$PWD/state/bootstrap-malformed-$label.err"
+        echo "FAIL(bootstrap/malformed-$label): traceback escaped"
+        exit 1
+      }
+      if [ "$receipt" = yes ]; then
+        [ -f "$generation/pane-2.bootstrap-failed" ] || {
+          cat "$PWD/state/bootstrap-malformed-$label.err"
+          echo "FAIL(bootstrap/malformed-$label): safe failure receipt missing"
+          exit 1
+        }
+      else
+        [ ! -e "$generation/pane-2.bootstrap-failed" ] || {
+          echo "FAIL(bootstrap/malformed-$label): guessed an unsafe receipt"
+          exit 1
+        }
+      fi
+      [ -f "$note2.pending" ] || {
+        echo "FAIL(bootstrap/malformed-$label): pending marker was claimed"
+        exit 1
+      }
+    }
+    malformed_manifest_fails_closed top-level-array '[.]' no
+    malformed_manifest_fails_closed panes-array '.panes = []' no
+    malformed_manifest_fails_closed scalar-entry \
+      '.panes["2"] = "not-an-entry"' no
+    cp "$manifest_good" "$manifest"
+    chmod 600 "$manifest"
+
+    # A registry row is not sufficient success: the bound receipt itself
+    # must publish durably before Codex starts.
+    rm -f "$generation/pane-2.bootstrap-bound" \
+      "$generation/pane-2.bootstrap-failed"
+    mkdir "$generation/pane-2.bootstrap-bound"
+    printf '202\n' > "$generation/pane-2.expected-window"
+    export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-receipt-failure-exec"
+    : > "$BOOTSTRAP_EXEC_LOG"
+    env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
+      KITTY_RESTORE_TEST=1 KITTY_RESTORE_BOOTSTRAP="$token" \
+      KITTY_RESTORE_ORDINAL=2 KITTY_RESTORE_NOTE="$note2" \
+      KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
+      BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+      "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
+        "''${pane2_args[1]}" </dev/null >/dev/null \
+        2> state/bootstrap-receipt-failure.err || true
+    rmdir "$generation/pane-2.bootstrap-bound"
+    [ -f "$generation/pane-2.bootstrap-failed" ] || {
+      cat state/bootstrap-receipt-failure.err
+      echo "FAIL(bootstrap/receipt): failure receipt missing"; exit 1; }
+    grep -qx safe-shell "$BOOTSTRAP_EXEC_LOG" \
+      && ! grep -qx codex "$BOOTSTRAP_EXEC_LOG" || {
+      cat "$BOOTSTRAP_EXEC_LOG"
+      echo "FAIL(bootstrap/receipt): Codex ran without a bound receipt"
+      exit 1
+    }
+
+    bootstrap_failure() { # <label> <wid> <token> <ord> <note> <resume> <safe> <expected-mode> <fallback> [cache]
+      local label="$1" wid="$2" supplied_token="$3" ordinal="$4"
+      local supplied_note="$5" resume_json="$6" safe_json="$7"
+      local expected_mode="$8" fallback="$9"
+      local supplied_cache="''${10:-$bootstrap_cache}"
+      rm -f "$generation/pane-2.bootstrap-bound" \
+        "$generation/pane-2.bootstrap-failed" \
+        "$generation/pane-2.expected-window"
+      case "$expected_mode" in
+        match) printf '202\n' > "$generation/pane-2.expected-window" ;;
+        mismatch) printf '999\n' > "$generation/pane-2.expected-window" ;;
+        malformed) printf 'not-a-window\n' > "$generation/pane-2.expected-window" ;;
+        missing) ;;
+      esac
+      export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-failure-$label"
+      : > "$BOOTSTRAP_EXEC_LOG"
+      env XDG_CACHE_HOME="$supplied_cache" XDG_STATE_HOME="$bootstrap_state" \
+        KITTY_RESTORE_BOOTSTRAP="$supplied_token" \
+        KITTY_RESTORE_ORDINAL="$ordinal" \
+        KITTY_RESTORE_NOTE="$supplied_note" \
+        KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" \
+        BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+        ''${wid:+KITTY_WINDOW_ID="$wid"} \
+        "$bootstrap_bin" --bootstrap "$resume_json" "$safe_json" \
+        >/dev/null 2> "$PWD/state/bootstrap-failure-$label.err" || true
+      [ -f "$generation/pane-2.bootstrap-failed" ] || {
+        cat "$PWD/state/bootstrap-failure-$label.err"
+        echo "FAIL(bootstrap/$label): bootstrap-failed missing"; exit 1; }
+      [ -f "$note2.pending" ] || {
+        echo "FAIL(bootstrap/$label): pending marker was claimed"; exit 1; }
+      case "$fallback" in
+        recorded)
+          grep -qx safe-shell "$BOOTSTRAP_EXEC_LOG" || {
+            cat "$BOOTSTRAP_EXEC_LOG"
+            echo "FAIL(bootstrap/$label): recorded safe shell did not run"
+            exit 1
+          }
+          ;;
+        system)
+          [ ! -s "$BOOTSTRAP_EXEC_LOG" ] || {
+            cat "$BOOTSTRAP_EXEC_LOG"
+            echo "FAIL(bootstrap/$label): unverified fallback argv ran"
+            exit 1
+          }
+          ;;
+      esac
+      if grep -qx codex "$BOOTSTRAP_EXEC_LOG"; then
+        echo "FAIL(bootstrap/$label): Codex ran after identity failure"
+        exit 1
+      fi
+    }
+
+    altered_resume=$(jq -nc --arg codex "$codex_bin" --arg sid "$sid_later" \
+      '[$codex, "--yolo", "resume", $sid]')
+    altered_safe=$(jq -nc --arg safe "$safe_bin" '[$safe, "changed"]')
+    stale_token=generation-ffffffffffffffffffffffffffffffff
+    bootstrap_failure missing-window "" "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match recorded
+    bootstrap_failure malformed-window nope "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match recorded
+    bootstrap_failure altered-note 202 "$token" 2 "$note1" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match recorded
+    bootstrap_failure altered-resume 202 "$token" 2 "$note2" \
+      "$altered_resume" "''${pane2_args[1]}" match recorded
+    bootstrap_failure altered-safe-shell 202 "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "$altered_safe" match recorded
+    bootstrap_failure missing-expected 202 "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" missing recorded
+    bootstrap_failure mismatched-expected 202 "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" mismatch recorded
+    printf 'not-a-directory\n' > state/registry-cache-file
+    bootstrap_failure registry-writer 202 "$token" 2 "$note2" \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match recorded \
+      "$PWD/state/registry-cache-file"
+
+    bootstrap_unbound_failure() { # <label> <token> <ordinal>
+      local label="$1" supplied_token="$2" ordinal="$3"
+      rm -f "$generation/pane-2.bootstrap-failed" \
+        "$generation/pane-$ordinal.bootstrap-failed"
+      printf '202\n' > "$generation/pane-2.expected-window"
+      export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-unbound-$label"
+      : > "$BOOTSTRAP_EXEC_LOG"
+      env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
+        KITTY_RESTORE_BOOTSTRAP="$supplied_token" \
+        KITTY_RESTORE_ORDINAL="$ordinal" KITTY_RESTORE_NOTE="$note2" \
+        KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
+        BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+        "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
+          "''${pane2_args[1]}" </dev/null >/dev/null \
+          2> "$PWD/state/bootstrap-unbound-$label.err" || true
+      [ ! -s "$BOOTSTRAP_EXEC_LOG" ] || {
+        cat "$BOOTSTRAP_EXEC_LOG"
+        echo "FAIL(bootstrap/$label): unbound argv executed"; exit 1; }
+      [ ! -e "$generation/pane-2.bootstrap-failed" ] \
+        && [ ! -e "$generation/pane-$ordinal.bootstrap-failed" ] || {
+        echo "FAIL(bootstrap/$label): guessed an unbound receipt"; exit 1; }
+      ! grep -q Traceback "$PWD/state/bootstrap-unbound-$label.err" || {
+        cat "$PWD/state/bootstrap-unbound-$label.err"
+        echo "FAIL(bootstrap/$label): traceback escaped"; exit 1; }
+    }
+    bootstrap_unbound_failure stale-token "$stale_token" 2
+    bootstrap_unbound_failure wrong-ordinal "$token" 7
+
+    # Carried argv never selects identity. Once token + ordinal + manifest
+    # structure bind pane 2, altering both carried values must publish failure
+    # and use the manifest safe shell, never either caller-supplied argv.
+    rm -f "$generation/pane-2.bootstrap-failed"
+    export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-bound-forged-argv"
+    : > "$BOOTSTRAP_EXEC_LOG"
+    env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
+      KITTY_RESTORE_BOOTSTRAP="$token" KITTY_RESTORE_ORDINAL=2 \
+      KITTY_RESTORE_NOTE="$note2" \
+      KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
+      BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+      "$bootstrap_bin" --bootstrap "$altered_resume" "$altered_safe" \
+      </dev/null >/dev/null 2> state/bootstrap-bound-forged-argv.err || true
+    [ -f "$generation/pane-2.bootstrap-failed" ] || {
+      cat state/bootstrap-bound-forged-argv.err
+      echo "FAIL(bootstrap/bound-forged): failure receipt missing"; exit 1; }
+    grep -qx safe-shell "$BOOTSTRAP_EXEC_LOG" \
+      && ! grep -qx codex "$BOOTSTRAP_EXEC_LOG" \
+      && ! grep -qx changed "$BOOTSTRAP_EXEC_LOG" || {
+      cat "$BOOTSTRAP_EXEC_LOG"
+      echo "FAIL(bootstrap/bound-forged): wrong fallback argv executed"
+      exit 1
+    }
+    unset KITTY_RESTORE_TEST KITTY_RESTORE_TEST_LAUNCH_ONLY \
+      KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND
+
+    # --- Phase N: restore/save transaction serialization ------------
+    # The saver must acquire the same lock nonblockingly before even asking
+    # Kitty for a socket snapshot. A successful no-op is observable both in
+    # the prior snapshot hashes and in the negative-control ls call log.
+    tx_cache="$PWD/fx/transaction-cache"
+    tx_state="$PWD/fx/transaction-state"
+    tx_dir="$tx_cache/kitty-session"
+    tx_root="$tx_state/claude/kitty-restore"
+    mkdir -p "$tx_dir" "$tx_root"
+    cp "$PWD/grid/two-real.json" "$tx_dir/snapshot.json"
+    printf 'prior exact session\n' > "$tx_dir/last.session"
+    jq '.[0].tabs[0].windows[0].cwd = "/changed-by-save"' \
+      "$PWD/grid/two-real.json" > state/transaction-live.json
+    export XDG_CACHE_HOME="$tx_cache"
+    export XDG_STATE_HOME="$tx_state"
+    export LS_JSON="$PWD/state/transaction-live.json"
+    export KITTY_LS_CALLS="$PWD/state/transaction-ls-calls"
+    : > "$KITTY_LS_CALLS"
+
+    transaction_hashes() {
+      sha256sum "$tx_dir/snapshot.json" "$tx_dir/last.session"
+    }
+    transaction_kitty() {
+      if [ "$4" = ls ]; then
+        printf 'ls\n' >> "$KITTY_LS_CALLS"
+        cat "$LS_JSON"
+        return 0
+      fi
+      return 2
+    }
+    kitty() { transaction_kitty "$@"; }
+    export -f transaction_kitty kitty
+
+    exec 7>"$tx_dir/restore.lock"
+    flock -x 7
+    before=$(transaction_hashes)
+    bash "$save_bin"
+    after=$(transaction_hashes)
+    [ "$before" = "$after" ] || {
+      echo "FAIL(transaction/lock): saver changed snapshot state while"
+      echo "  restore.lock was held across an in-progress cold restore."
+      diff -u <(printf '%s\n' "$before") <(printf '%s\n' "$after") || true
+      exit 1
+    }
+    [ ! -s "$KITTY_LS_CALLS" ] || {
+      echo "FAIL(transaction/lock): saver discovered/captured Kitty before"
+      echo "  its nonblocking restore.lock refusal."
+      exit 1
+    }
+    [ ! -e "$tx_dir/candidate.json.tmp" ] || {
+      echo "FAIL(transaction/lock): skipped saver left a candidate behind"
+      exit 1
+    }
+    flock -u 7
+    exec 7>&-
+
+    # The guard is independently durable: after terminal restore failure the
+    # lock is released, but publication must still skip until a later cold
+    # restore succeeds. This negative control would publish changed live state
+    # if guard inspection were absent or happened after capture.
+    printf 'generation-fixture stage=failed\n' > "$tx_root/restore-incomplete"
+    chmod 600 "$tx_root/restore-incomplete"
+    : > "$KITTY_LS_CALLS"
+    before=$(transaction_hashes)
+    bash "$save_bin"
+    after=$(transaction_hashes)
+    [ "$before" = "$after" ] || {
+      echo "FAIL(transaction/guard): saver replaced prior exact state while"
+      echo "  restore-incomplete remained after a failed restore."
+      exit 1
+    }
+    [ ! -s "$KITTY_LS_CALLS" ] || {
+      echo "FAIL(transaction/guard): saver captured Kitty before refusing"
+      echo "  the durable restore-incomplete guard."
+      exit 1
+    }
+    unset -f transaction_kitty kitty
+
+    # Generation cleanup is bounded by topology, not by note ordinal names.
+    # Shrinking two restored agents to one activates only ordinal 1, keeps the
+    # immediately previous generation for diagnosis, and removes every older
+    # generation/temp/legacy artifact without following planted symlinks.
+    export XDG_CACHE_HOME="$bootstrap_cache"
+    export XDG_STATE_HOME="$bootstrap_state"
+    export KITTY_STUB_PATH="$PWD/state/bootstrap-retention-stub"
+    retention_root="$bootstrap_state/claude/kitty-restore"
+    retention_previous=$(cat "$retention_root/current")
+    retention_previous_dir="$retention_root/$retention_previous"
+    mv "$retention_previous_dir/pane-2.md.pending" \
+      "$retention_previous_dir/pane-2.md.sending"
+    for suffix in aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; do
+      mkdir -p "$retention_root/generation-$suffix"
+      printf 'old\n' > "$retention_root/generation-$suffix/manifest.json"
+    done
+    mkdir -p "$retention_root/.generation-abandoned.tmp-fixture"
+    printf 'abandoned\n' \
+      > "$retention_root/.generation-abandoned.tmp-fixture/manifest.json"
+    printf 'legacy\n' > "$retention_root/pane-99.md.pending"
+    printf 'retention-canary\n' > state/retention-canary
+    ln -s "$PWD/state/retention-canary" \
+      "$retention_root/pane-98.md.uncertain"
+    jq '.[0].tabs[0].windows |= .[:1]' state/bootstrap-snapshot-good.json \
+      > "$bootstrap_snapshot"
+    kitty-restore-session --emit-stub
+    retention_current=$(cat "$retention_root/current")
+    [ "$retention_current" != "$retention_previous" ] || {
+      echo "FAIL(retention): cold restore reused a generation token"; exit 1; }
+    [ "$(find "$retention_root" -maxdepth 1 -type d \
+        -name 'generation-*' | wc -l)" -eq 2 ] || {
+      find "$retention_root" -maxdepth 1 -mindepth 1 -printf '%f\n'
+      echo "FAIL(retention): active+previous generation bound was exceeded"
+      exit 1
+    }
+    [ -d "$retention_root/$retention_current" ] \
+      && [ -d "$retention_previous_dir" ] || {
+      echo "FAIL(retention): active or immediately previous generation lost"
+      exit 1
+    }
+    jq -e '.panes | keys == ["1"]' \
+      "$retention_root/$retention_current/manifest.json" >/dev/null || {
+      cat "$retention_root/$retention_current/manifest.json"
+      echo "FAIL(retention): topology shrink kept obsolete ordinal state"
+      exit 1
+    }
+    [ -f "$retention_previous_dir/pane-2.md.uncertain" ] \
+      && [ ! -e "$retention_previous_dir/pane-2.md.sending" ] || {
+      echo "FAIL(retention): stale sending marker was not reconciled"
+      exit 1
+    }
+    [ ! -e "$retention_root/generation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ] \
+      && [ ! -e "$retention_root/generation-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ] \
+      && [ ! -e "$retention_root/.generation-abandoned.tmp-fixture" ] \
+      && [ ! -e "$retention_root/pane-99.md.pending" ] \
+      && [ ! -e "$retention_root/pane-98.md.uncertain" ] || {
+      echo "FAIL(retention): old/temp/legacy recovery state survived cleanup"
+      exit 1
+    }
+    [ "$(cat state/retention-canary)" = retention-canary ] || {
+      echo "FAIL(retention): legacy symlink cleanup followed its target"
+      exit 1
+    }
+    [ "$(stat -c %a "$retention_root")" = 700 ] \
+      && [ "$(stat -c %a "$retention_root/$retention_current")" = 700 ] \
+      && [ "$(stat -c %a "$retention_root/$retention_current/manifest.json")" = 600 ] \
+      && [ "$(stat -c %a "$retention_root/$retention_current/pane-1.md")" = 600 ] || {
+      echo "FAIL(retention): private generation modes regressed"
+      exit 1
+    }
+
+    # --- Phase O: one deadline covers launch through settlement -----
+    # This fake Kitty actually starts the in-pane bootstrap and reports its
+    # state transitions through `@ ls`. It lets the parent prove that a
+    # bootstrap wrapper is not settlement, that safe-shell failure is terminal
+    # but unsuccessful, and that every receipt-free path is deadline-bounded.
+    cat > fakebin/codex <<'STUB'
+    #!/bin/sh
+    : > "$TX_EXACT_READY"
+    exec sleep 30
+    STUB
+    cat > fakebin/transaction-safe <<'STUB'
+    #!/bin/sh
+    : > "$TX_SAFE_READY"
+    exec sleep 30
+    STUB
+    chmod +x fakebin/codex fakebin/transaction-safe
+    tx_codex="$PWD/fakebin/codex"
+    tx_safe="$PWD/fakebin/transaction-safe"
+    tx_sid=24682468-1357-4abc-8def-246824681357
+
+    cat > fakebin/kitty <<'STUB'
+    #!${pkgs.python3}/bin/python3
+    import json
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    args = sys.argv[1:]
+    command = args[3] if len(args) > 3 else ""
+    control = Path(os.environ["TX_CONTROL"])
+    control.mkdir(parents=True, exist_ok=True)
+
+    def generation():
+        root = Path(os.environ["TX_ROOT"])
+        return root / (root / "current").read_text().strip()
+
+    def window(cmdline, wid, cwd):
+        return {
+            "id": wid,
+            "is_focused": wid == 101,
+            "cwd": cwd,
+            "title": "transaction",
+            "cmdline": cmdline,
+            "foreground_processes": [{"cmdline": cmdline}],
+        }
+
+    if command == "ls":
+        with (control / "ls-calls").open("a") as out:
+            out.write("ls\n")
+        if os.environ.get("TX_CALLER") == "saver":
+            with (control / "saver-ls-calls").open("a") as out:
+                out.write("ls\n")
+        windows = [window(["/bin/sh"], 101, "/tmp")]
+        launch_file = control / "launch.json"
+        if launch_file.exists() and os.environ.get("TX_MODE") != "vanished":
+            launch = json.loads(launch_file.read_text())
+            gen = generation()
+            failed = gen / "pane-2.bootstrap-failed"
+            if (control / "safe-ready").exists() and failed.exists():
+                shown = launch["safe"]
+            elif (
+                (control / "exact-ready").exists()
+                and os.environ.get("TX_MODE") != "foreground-timeout"
+            ):
+                shown = launch["resume"]
+            else:
+                shown = launch["wrapper"]
+            windows.append(window(shown, 202, launch["cwd"]))
+        print(json.dumps([{"tabs": [{
+            "is_focused": True,
+            "layout": "splits",
+            "windows": windows,
+        }]}]))
+        raise SystemExit(0)
+
+    if command == "send-text":
+        with (control / "send-calls").open("a") as out:
+            out.write("send\n")
+        if os.environ.get("TX_MODE") == "disappear-after-preflight":
+            (control / "send-zero-after-disappear").touch()
+            raise SystemExit(0)
+        (control / "draft-bytes").write_bytes(sys.stdin.buffer.read())
+        raise SystemExit(0)
+
+    if command != "launch":
+        raise SystemExit(0)
+
+    tail = args[4:]
+    env = os.environ.copy()
+    index = 0
+    while index < len(tail):
+        item = tail[index]
+        if item in {"--cwd", "--title", "--env"}:
+            value = tail[index + 1]
+            if item == "--env":
+                name, data = value.split("=", 1)
+                env[name] = data
+            index += 2
+        elif item.startswith("--"):
+            index += 1
+        else:
+            break
+    cmd = tail[index:]
+    resume = json.loads(cmd[-2])
+    safe = json.loads(cmd[-1])
+    (control / "launch.json").write_text(json.dumps({
+        "wrapper": cmd,
+        "resume": resume,
+        "safe": safe,
+        "cwd": env.get("PWD", "/tmp"),
+    }))
+    env["KITTY_WINDOW_ID"] = "202"
+    env["TX_EXACT_READY"] = str(control / "exact-ready")
+    env["TX_SAFE_READY"] = str(control / "safe-ready")
+    if os.environ.get("TX_MODE") == "bound-failure":
+        (generation() / "pane-2.bootstrap-bound").mkdir(exist_ok=True)
+    child = subprocess.Popen(
+        cmd, env=env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    (control / "child-pid").write_text(str(child.pid))
+    if os.environ.get("TX_MODE") == "killed-wrapper":
+        child.send_signal(signal.SIGKILL)
+        child.wait()
+    if os.environ.get("TX_MODE") == "pause-launch-return":
+        (control / "launch-paused").touch()
+        release = control / "launch-release"
+        while not release.exists():
+            time.sleep(0.02)
+    if os.environ.get("TX_MODE") != "missing-launch-return":
+        print("202")
+    STUB
+    chmod +x fakebin/kitty
+    # writeShellApplication prepends the real Kitty package to PATH. Export a
+    # shell shim so saver subprocesses exercise this phase's stateful fake too;
+    # Python subprocesses already find fakebin through the harness PATH.
+    transaction_probe_kitty() { "$PWD/fakebin/kitty" "$@"; }
+    kitty() { transaction_probe_kitty "$@"; }
+    export -f transaction_probe_kitty kitty
+
+    wait_for_file() { # <path> <label>
+      local path="$1" label="$2"
+      for unused in $(seq 1 250); do
+        [ -e "$path" ] && return 0
+        sleep 0.02
+      done
+      cat "$(dirname "$path")/restore.log" 2>/dev/null || true
+      echo "FAIL(transaction/$label): timed out waiting for $path"
+      return 1
+    }
+
+    prepare_transaction_case() { # <label> <timeout>
+      TX_LABEL="$1"
+      TX_CASE="$PWD/fx/transaction-$TX_LABEL"
+      TX_CONTROL="$TX_CASE/control"
+      TX_CACHE="$TX_CASE/cache"
+      TX_STATE="$TX_CASE/state"
+      TX_DIR="$TX_CACHE/kitty-session"
+      TX_ROOT="$TX_STATE/claude/kitty-restore"
+      mkdir -p "$TX_CONTROL" "$TX_DIR"
+      jq -n --arg codex "$tx_codex" --arg safe "$tx_safe" \
+        --arg sid "$tx_sid" '
+        [{tabs: [{layout: "splits", windows: [
+          {id: 1, cwd: "/tmp", title: "shell", cmdline: ["/bin/sh"],
+           foreground_processes: [{cmdline: ["/bin/sh"]}]},
+          {id: 2, cwd: "/tmp", title: "codex", cmdline: [$safe],
+           codex_session_id: $sid,
+           foreground_processes: [{cmdline: [$codex]}]}
+        ]}]}]
+      ' > "$TX_DIR/snapshot.json"
+      printf 'prior exact last.session\n' > "$TX_DIR/last.session"
+      export XDG_CACHE_HOME="$TX_CACHE" XDG_STATE_HOME="$TX_STATE"
+      export KITTY_STUB_PATH="$TX_CASE/stub"
+      export KITTY_RESTORE_TEST=1 KITTY_RESTORE_TIMEOUT_SECONDS="$2"
+      export KITTY_LISTEN_ON=unix:/transaction-fixture
+      export TX_LABEL TX_CASE TX_CONTROL TX_CACHE TX_STATE TX_DIR TX_ROOT
+      export TX_EXACT_READY="$TX_CONTROL/exact-ready"
+      export TX_SAFE_READY="$TX_CONTROL/safe-ready"
+      kitty-restore-session --emit-stub
+      TX_TOKEN=$(cat "$TX_ROOT/current")
+      TX_GENERATION="$TX_ROOT/$TX_TOKEN"
+      TX_BEFORE=$(sha256sum "$TX_DIR/snapshot.json" "$TX_DIR/last.session")
+      export TX_TOKEN TX_GENERATION TX_BEFORE
+    }
+
+    start_transaction_restore() { # <mode>
+      export TX_MODE="$1"
+      kitty-restore-session > "$TX_CONTROL/restore.log" 2>&1 &
+      TX_PARENT_PID=$!
+      export TX_PARENT_PID
+    }
+
+    stop_transaction_child() {
+      if [ -s "$TX_CONTROL/child-pid" ]; then
+        kill "$(cat "$TX_CONTROL/child-pid")" 2>/dev/null || true
+      fi
+    }
+
+    assert_transaction_preserved() { # <label>
+      local label="$1" after
+      after=$(sha256sum "$TX_DIR/snapshot.json" "$TX_DIR/last.session")
+      [ "$TX_BEFORE" = "$after" ] || {
+        echo "FAIL(transaction/$label): prior snapshot/last.session changed"
+        exit 1
+      }
+      [ -f "$TX_GENERATION/pane-2.md.pending" ] || {
+        echo "FAIL(transaction/$label): draft marker was claimed"; exit 1; }
+      [ -f "$TX_ROOT/restore-incomplete" ] || {
+        echo "FAIL(transaction/$label): incomplete guard was lost"; exit 1; }
+      flock -n -x "$TX_DIR/restore.lock" true || {
+        echo "FAIL(transaction/$label): restore.lock was not released"
+        exit 1
+      }
+    }
+
+    # Pre-registry pause: fake Kitty withholds the launch return while the
+    # child waits for expected-window. Saver must skip without one ls call.
+    prepare_transaction_case pre-bound 5
+    start_transaction_restore pause-launch-return
+    wait_for_file "$TX_CONTROL/launch-paused" pre-bound
+    TX_CALLER=saver bash "$save_bin"
+    [ ! -e "$TX_CONTROL/saver-ls-calls" ] || {
+      echo "FAIL(transaction/pre-bound): saver reached ls during restore"
+      exit 1
+    }
+    : > "$TX_CONTROL/launch-release"
+    wait "$TX_PARENT_PID"
+    [ ! -e "$TX_ROOT/restore-incomplete" ] || {
+      cat "$TX_CONTROL/restore.log"
+      echo "FAIL(transaction/pre-bound): successful restore kept guard"
+      exit 1
+    }
+    stop_transaction_child
+
+    # Post-bound is still not settlement: the parent must remain alive and
+    # keep the lock until the wrapper execs exact Codex foreground argv.
+    prepare_transaction_case post-bound 5
+    export KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND="$TX_CONTROL/after-bound"
+    start_transaction_restore normal
+    wait_for_file "$TX_CONTROL/after-bound" post-bound
+    kill -0 "$TX_PARENT_PID" || {
+      echo "FAIL(transaction/post-bound): parent exited at bootstrap-bound"
+      exit 1
+    }
+    TX_CALLER=saver bash "$save_bin"
+    [ ! -e "$TX_CONTROL/saver-ls-calls" ] || {
+      echo "FAIL(transaction/post-bound): saver reached ls before settlement"
+      exit 1
+    }
+    : > "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND.release"
+    wait "$TX_PARENT_PID"
+    [ ! -e "$TX_ROOT/restore-incomplete" ] || {
+      echo "FAIL(transaction/post-bound): exact settlement kept guard"
+      exit 1
+    }
+    python3 -c 'from pathlib import Path; data = Path("'"$TX_CONTROL"'/draft-bytes").read_bytes(); assert data == b"Read $KITTY_RESTORE_NOTE."; assert b"\n" not in data and b"\r" not in data'
+    [ -f "$TX_GENERATION/pane-2.md.uncertain" ] \
+      && [ ! -e "$TX_GENERATION/pane-2.md.pending" ] \
+      && [ ! -e "$TX_GENERATION/pane-2.md.sending" ] || {
+      echo "FAIL(transaction/post-bound): delivery state was not uncertain"
+      exit 1
+    }
+    [ "$(wc -l < "$TX_CONTROL/send-calls")" -eq 1 ] || {
+      echo "FAIL(transaction/post-bound): draft crossed send boundary twice"
+      exit 1
+    }
+    grep -qP "^202\\tcodex\\t$tx_sid\\t/tmp\\t[0-9]+$" \
+      "$TX_DIR/pane-sessions.tsv" || {
+      echo "FAIL(transaction/post-bound): durable exact mapping disappeared"
+      exit 1
+    }
+    stop_transaction_child
+    unset KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND
+
+    bounded_failure() { # <mode> <stage> <minimum-ms>
+      local mode="$1" stage="$2" minimum_ms="$3" start_ms end_ms elapsed
+      prepare_transaction_case "$mode" 1
+      start_ms=$(date +%s%3N)
+      start_transaction_restore "$mode"
+      wait "$TX_PARENT_PID" || true
+      end_ms=$(date +%s%3N)
+      elapsed=$((end_ms - start_ms))
+      [ "$elapsed" -ge "$minimum_ms" ] && [ "$elapsed" -lt 4000 ] || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(transaction/$mode): elapsed ''${elapsed}ms outside shared deadline"
+        exit 1
+      }
+      grep -Fq "generation=$TX_TOKEN ordinal=2 stage=$stage" \
+        "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(transaction/$mode): precise stage diagnostic missing"
+        exit 1
+      }
+      assert_transaction_preserved "$mode"
+      stop_transaction_child
+    }
+    bounded_failure missing-launch-return launch-return 0
+    bounded_failure killed-wrapper bootstrap-receipt 800
+    bounded_failure vanished expected-window 800
+    bounded_failure foreground-timeout foreground-settlement 800
+
+    # The registry writer is part of the bootstrap transaction and therefore
+    # shares the parent's deadline. Holding its real advisory lock past that
+    # deadline must not leave an orphaned writer that later publishes bound
+    # and execs Codex after the parent has already released restore.lock.
+    deadline_failures=0
+    if ! (
+      prepare_transaction_case registry-lock-timeout 1
+      (
+        exec 9>"$TX_DIR/.pane-sessions.lock"
+        flock -x 9
+        : > "$TX_CONTROL/registry-lock-held"
+        while [ ! -e "$TX_CONTROL/registry-lock-release" ]; do
+          sleep 0.02
+        done
+      ) & registry_lock_pid=$!
+      wait_for_file "$TX_CONTROL/registry-lock-held" registry-lock-timeout
+      start_ms=$(date +%s%3N)
+      start_transaction_restore normal
+      wait "$TX_PARENT_PID" || true
+      elapsed=$(( $(date +%s%3N) - start_ms ))
+      [ "$elapsed" -ge 800 ] && [ "$elapsed" -lt 4000 ] || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(transaction/registry-lock-timeout): parent elapsed ''${elapsed}ms outside shared deadline"
+        exit 1
+      }
+      [ ! -e "$TX_GENERATION/pane-2.bootstrap-bound" ] \
+        && [ ! -e "$TX_CONTROL/exact-ready" ] || {
+        echo "FAIL(transaction/registry-lock-timeout): bootstrap completed past parent deadline"
+        exit 1
+      }
+      : > "$TX_CONTROL/registry-lock-release"
+      wait "$registry_lock_pid"
+      sleep 0.3
+      [ ! -e "$TX_GENERATION/pane-2.bootstrap-bound" ] \
+        && [ ! -e "$TX_CONTROL/exact-ready" ] \
+        && ! grep -qP "^202\\tcodex\\t$tx_sid\\t/tmp\\t[0-9]+$" \
+          "$TX_DIR/pane-sessions.tsv" 2>/dev/null || {
+        cat "$TX_CONTROL/restore.log"
+        cat "$TX_DIR/pane-sessions.tsv" 2>/dev/null || true
+        echo "FAIL(transaction/registry-lock-timeout): delayed child published after lock release"
+        exit 1
+      }
+      assert_transaction_preserved registry-lock-timeout
+      stop_transaction_child
+    ); then deadline_failures=$((deadline_failures + 1)); fi
+
+    # Post-binding failure is terminal without being success. The durable row
+    # remains for SessionStart replacement, safe-shell settlement releases the
+    # lock promptly, and a later saver skips solely because the guard persists.
+    prepare_transaction_case bound-failure 5
+    start_ms=$(date +%s%3N)
+    start_transaction_restore bound-failure
+    wait "$TX_PARENT_PID" || true
+    elapsed=$(( $(date +%s%3N) - start_ms ))
+    [ "$elapsed" -lt 3000 ] || {
+      echo "FAIL(transaction/bound-failure): terminal safe shell timed out"
+      exit 1
+    }
+    [ -f "$TX_GENERATION/pane-2.bootstrap-failed" ] \
+      && [ -f "$TX_CONTROL/safe-ready" ] || {
+      cat "$TX_CONTROL/restore.log"
+      echo "FAIL(transaction/bound-failure): safe-shell settlement missing"
+      exit 1
+    }
+    grep -qP "^202\\tcodex\\t$tx_sid\\t/tmp\\t[0-9]+$" \
+      "$TX_DIR/pane-sessions.tsv" || {
+      cat "$TX_DIR/pane-sessions.tsv" 2>/dev/null || true
+      echo "FAIL(transaction/bound-failure): durable registry row was deleted"
+      exit 1
+    }
+    assert_transaction_preserved bound-failure
+    TX_CALLER=saver bash "$save_bin"
+    [ ! -e "$TX_CONTROL/saver-ls-calls" ] || {
+      echo "FAIL(transaction/bound-failure): saver ignored retained guard"
+      exit 1
+    }
+    stop_transaction_child
+
+    # --- Phase P: correction seams for transaction durability ---------
+    #
+    # Keep these independent so one missing guarantee does not hide the
+    # remaining RED evidence. Every injected failure has a live negative
+    # control: either prepare_transaction_case first completes publication,
+    # or the same primitive is rerun without its injection.
+    correction_failures=0
+
+    if ! (
+      guard_case="$PWD/guard-before-cleanup"
+      mkdir -p "$guard_case/cache/kitty-session" "$guard_case/state/claude"
+      jq -n '[{tabs: [{layout: "splits", windows: [{
+        id: 1, cwd: "/tmp", title: "guard timing",
+        cmdline: ["/bin/sh"],
+        foreground_processes: [{cmdline: ["/bin/sh"]}]
+      }]}]}]' > "$guard_case/cache/kitty-session/snapshot.json"
+      printf 'prior exact session\n' > "$guard_case/cache/kitty-session/last.session"
+      printf 'prior typed row\n' > "$guard_case/cache/kitty-session/pane-sessions.tsv"
+      printf 'prior executable stub\n' > "$guard_case/stub"
+      [ ! -e "$guard_case/state/claude/kitty-restore/restore-incomplete" ] \
+        && [ ! -e "$guard_case/guard-visible" ] || exit 1
+
+      env XDG_CACHE_HOME="$guard_case/cache" \
+        XDG_STATE_HOME="$guard_case/state" \
+        KITTY_STUB_PATH="$guard_case/stub" \
+        KITTY_RESTORE_TEST=1 KITTY_RESTORE_TIMEOUT_SECONDS=0.05 \
+        KITTY_RESTORE_TEST_PAUSE_AFTER_GUARD="$guard_case/guard-visible" \
+        ${underTest}/bin/kitty > "$guard_case/wrapper.out" \
+          2> "$guard_case/wrapper.err" &
+      wrapper_pid=$!
+      for _attempt in $(seq 1 100); do
+        [ -e "$guard_case/guard-visible" ] && break
+        kill -0 "$wrapper_pid" 2>/dev/null || break
+        sleep 0.01
+      done
+      if [ ! -e "$guard_case/guard-visible" ]; then
+        kill "$wrapper_pid" 2>/dev/null || true
+        wait "$wrapper_pid" 2>/dev/null || true
+        echo "FAIL(correction/guard-timing): no guard-visible pause before cleanup"
+        exit 1
+      fi
+      guard="$guard_case/state/claude/kitty-restore/restore-incomplete"
+      [ "$(cat "$guard_case/cache/kitty-session/pane-sessions.tsv")" \
+          = 'prior typed row' ] \
+        && [ "$(cat "$guard_case/stub")" = 'prior executable stub' ] || {
+        echo "FAIL(correction/guard-timing): cleanup preceded durable guard"
+        exit 1
+      }
+      token=$(jq -er '.generation | select(test("^generation-[0-9a-f]{32}$"))' \
+        "$guard")
+      [ "$(jq -r .stage "$guard")" = planned ] || {
+        echo "FAIL(correction/guard-timing): initial guard stage was not planned"
+        exit 1
+      }
+      : > "$guard_case/guard-visible.release"
+      wait "$wrapper_pid" 2>/dev/null || true
+      for _attempt in $(seq 1 100); do
+        [ -s "$guard_case/state/claude/kitty-restore/current" ] && break
+        sleep 0.01
+      done
+      [ "$(cat "$guard_case/state/claude/kitty-restore/current")" = "$token" ] \
+        && [ "$(jq -r .generation "$guard")" = "$token" ] || {
+        cat "$guard_case/wrapper.err" 2>/dev/null || true
+        echo "FAIL(correction/guard-timing): planned token did not flow into publication"
+        exit 1
+      }
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      fsync_case="$PWD/fsync-failure"
+      mkdir -p "$fsync_case/cache/kitty-session" "$fsync_case/state"
+      printf 'snapshot sentinel\n' > "$fsync_case/cache/kitty-session/snapshot.json"
+      set +e
+      KITTY_RESTORE_TEST=1 \
+        KITTY_RESTORE_TEST_FAIL_DIR_FSYNC='write:restore-incomplete' \
+        XDG_CACHE_HOME="$fsync_case/cache" XDG_STATE_HOME="$fsync_case/state" \
+        kitty-restore-session --begin-restore \
+          > "$fsync_case/token" 2> "$fsync_case/fail.err"
+      fail_rc=$?
+      set -e
+      [ "$fail_rc" -ne 0 ] \
+        && grep -qF 'injected directory fsync failure' "$fsync_case/fail.err" \
+        && [ -f "$fsync_case/state/claude/kitty-restore/restore-incomplete" ] \
+        && grep -qxF 'snapshot sentinel' \
+          "$fsync_case/cache/kitty-session/snapshot.json" || {
+        cat "$fsync_case/fail.err" 2>/dev/null || true
+        echo "FAIL(correction/fsync): atomic replacement ignored directory fsync failure"
+        exit 1
+      }
+      token=$(KITTY_RESTORE_TEST=1 XDG_CACHE_HOME="$fsync_case/cache" \
+        XDG_STATE_HOME="$fsync_case/state" \
+        kitty-restore-session --begin-restore)
+      [ "$(jq -r .generation \
+          "$fsync_case/state/claude/kitty-restore/restore-incomplete")" \
+          = "$token" ] || {
+        echo "FAIL(correction/fsync): uninjected begin-restore control failed"
+        exit 1
+      }
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      prepare_transaction_case delivery-fsync 5
+      export KITTY_RESTORE_TEST_FAIL_DIR_FSYNC=draft-claim
+      start_transaction_restore normal
+      wait "$TX_PARENT_PID" || true
+      unset KITTY_RESTORE_TEST_FAIL_DIR_FSYNC
+      [ -f "$TX_GENERATION/pane-2.md.sending" ] \
+        && [ ! -e "$TX_GENERATION/pane-2.md.pending" ] \
+        && [ -f "$TX_ROOT/restore-incomplete" ] \
+        && grep -qF 'injected directory fsync failure' \
+          "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(correction/draft-fsync): failed claim was treated as durable"
+        exit 1
+      }
+      old_note="$TX_GENERATION/pane-2.md"
+      kitty-restore-session --emit-stub
+      [ -f "$old_note.uncertain" ] \
+        && [ ! -e "$old_note.sending" ] \
+        && [ ! -e "$old_note.pending" ] || {
+        echo "FAIL(correction/draft-fsync): stale claim was not reconciled terminally"
+        exit 1
+      }
+      stop_transaction_child
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      # The immediately preceding post-bound case is the uninjected success
+      # control: it durably removed its guard only after exact settlement.
+      prepare_transaction_case guard-clear 5
+      export KITTY_RESTORE_TEST_FAIL_DIR_FSYNC=guard-clear
+      start_transaction_restore normal
+      wait "$TX_PARENT_PID" || true
+      unset KITTY_RESTORE_TEST_FAIL_DIR_FSYNC
+      [ -f "$TX_ROOT/restore-incomplete" ] \
+        && grep -Fq "generation=$TX_TOKEN ordinal=0 stage=guard-removal" \
+          "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(correction/guard-clear): failed clear lost the incomplete guard"
+        exit 1
+      }
+      stop_transaction_child
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      # If directory fsync and restoration of the primary guard both fail,
+      # the pre-durable clearing marker is the only saver-visible barrier.
+      # A later guarded completion reconciles the fixed marker set and is the
+      # negative control: saving becomes possible again without accumulation.
+      prepare_transaction_case guard-clear-dual 5
+      export KITTY_RESTORE_TEST_FAIL_DIR_FSYNC=guard-clear
+      export KITTY_RESTORE_TEST_FAIL_GUARD_RESTORE=1
+      start_transaction_restore normal
+      wait "$TX_PARENT_PID" || true
+      unset KITTY_RESTORE_TEST_FAIL_DIR_FSYNC
+      unset KITTY_RESTORE_TEST_FAIL_GUARD_RESTORE
+      [ ! -e "$TX_ROOT/restore-incomplete" ] \
+        && [ -f "$TX_ROOT/restore-clearing" ] \
+        && grep -Fq 'injected primary guard restoration failure' \
+          "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(correction/guard-clear-dual): dual failure lost its fallback barrier"
+        exit 1
+      }
+      TX_CALLER=saver bash "$save_bin"
+      [ ! -e "$TX_CONTROL/saver-ls-calls" ] || {
+        echo "FAIL(correction/guard-clear-dual): saver ignored fallback barrier"
+        exit 1
+      }
+      next_token=$(kitty-restore-session --begin-restore)
+      kitty-restore-session --cancel-restore "$next_token"
+      marker_count=$(find "$TX_ROOT" -maxdepth 1 -name 'restore-*' | wc -l)
+      [ "$marker_count" -le 2 ] || {
+        find "$TX_ROOT" -maxdepth 1 -name 'restore-*' -print
+        echo "FAIL(correction/guard-clear-dual): restore markers accumulated"
+        exit 1
+      }
+      TX_CALLER=saver bash "$save_bin"
+      [ -s "$TX_CONTROL/saver-ls-calls" ] || {
+        echo "FAIL(correction/guard-clear-dual): successful completion kept saver blocked"
+        exit 1
+      }
+      stop_transaction_child
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      # Completion is not published until restore-complete itself is durable.
+      # _write_atomic replaces its destination before syncing the directory,
+      # so this injection exercises the dangerous visible-but-unsynced state.
+      prepare_transaction_case completion-fsync 5
+      : > "$TX_CONTROL/saver-ls-calls"
+      export KITTY_RESTORE_TEST_FAIL_DIR_FSYNC=write:restore-complete
+      export KITTY_RESTORE_TEST_FAIL_COMPLETION_CLEANUP=1
+      start_transaction_restore normal
+      set +e
+      wait "$TX_PARENT_PID"
+      completion_rc=$?
+      set -e
+      unset KITTY_RESTORE_TEST_FAIL_DIR_FSYNC
+      unset KITTY_RESTORE_TEST_FAIL_COMPLETION_CLEANUP
+      completion_failures=0
+      [ "$completion_rc" -ne 0 ] \
+        && [ -f "$TX_ROOT/restore-clearing" ] \
+        && grep -Fq 'injected directory fsync failure for write:restore-complete' \
+          "$TX_CONTROL/restore.log" \
+        && grep -Fq 'injected completion receipt cleanup failure' \
+          "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(correction/completion-fsync): injected completion failure was treated as success"
+        completion_failures=$((completion_failures + 1))
+      }
+      TX_CALLER=saver bash "$save_bin" || true
+      [ ! -s "$TX_CONTROL/saver-ls-calls" ] \
+        && [ "$TX_BEFORE" = "$(sha256sum \
+          "$TX_DIR/snapshot.json" "$TX_DIR/last.session")" ] || {
+        echo "FAIL(correction/completion-fsync): saver discovered or published after failed completion"
+        completion_failures=$((completion_failures + 1))
+      }
+
+      # The next planned restore publishes its primary barrier before
+      # reconciling both fixed names. Its successful cancellation is the
+      # negative control: the bounded completion state permits saving again.
+      next_token=$(kitty-restore-session --begin-restore)
+      [ "$(jq -r .generation "$TX_ROOT/restore-incomplete")" \
+          = "$next_token" ] \
+        && [ ! -e "$TX_ROOT/restore-clearing" ] \
+        && [ ! -e "$TX_ROOT/restore-complete" ] || {
+        echo "FAIL(correction/completion-fsync): next begin did not reconcile fixed markers"
+        completion_failures=$((completion_failures + 1))
+      }
+      kitty-restore-session --cancel-restore "$next_token"
+      marker_count=$(find "$TX_ROOT" -maxdepth 1 -name 'restore-*' | wc -l)
+      [ "$marker_count" -le 2 ] || {
+        find "$TX_ROOT" -maxdepth 1 -name 'restore-*' -print
+        echo "FAIL(correction/completion-fsync): restore markers accumulated"
+        completion_failures=$((completion_failures + 1))
+      }
+      : > "$TX_CONTROL/saver-ls-calls"
+      TX_CALLER=saver bash "$save_bin"
+      [ -s "$TX_CONTROL/saver-ls-calls" ] || {
+        echo "FAIL(correction/completion-fsync): successful recovery kept saver blocked"
+        completion_failures=$((completion_failures + 1))
+      }
+      stop_transaction_child
+      [ "$completion_failures" -eq 0 ]
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      prepare_transaction_case publication-abort 5
+      old_token="$TX_TOKEN"
+      old_hashes=$(transaction_hashes)
+      rm -f "$KITTY_STUB_PATH"
+      set +e
+      KITTY_RESTORE_TEST_FAIL_PUBLICATION=reconcile \
+        kitty-restore-session --emit-stub \
+          > "$TX_CONTROL/publish.out" 2> "$TX_CONTROL/publish.err"
+      publish_rc=$?
+      set -e
+      [ "$publish_rc" -ne 0 ] \
+        && grep -qF 'injected publication reconciliation failure' \
+          "$TX_CONTROL/publish.err" \
+        && [ ! -e "$KITTY_STUB_PATH" ] \
+        && [ "$(cat "$TX_ROOT/current")" = "$old_token" ] \
+        && [ "$(transaction_hashes)" = "$old_hashes" ] \
+        && [ -f "$TX_ROOT/restore-incomplete" ] || {
+        cat "$TX_CONTROL/publish.err" 2>/dev/null || true
+        echo "FAIL(correction/publication): cleanup failure proceeded into publication/stub"
+        exit 1
+      }
+      planned_token=$(jq -r .generation "$TX_ROOT/restore-incomplete")
+      : > "$TX_CONTROL/ls-calls"
+      before_failed_restore_ls=$(wc -l < "$TX_CONTROL/ls-calls")
+      set +e
+      kitty-restore-session > "$TX_CONTROL/old-current.out" \
+        2> "$TX_CONTROL/old-current.err"
+      old_current_rc=$?
+      set -e
+      [ "$old_current_rc" -ne 0 ] \
+        && [ "$planned_token" != "$old_token" ] \
+        && [ "$(wc -l < "$TX_CONTROL/ls-calls")" \
+          -eq "$before_failed_restore_ls" ] \
+        && [ "$(jq -r .generation "$TX_ROOT/restore-incomplete")" \
+          = "$planned_token" ] || {
+        cat "$TX_CONTROL/old-current.err" 2>/dev/null || true
+        echo "FAIL(correction/publication): failed generation fell through old current"
+        exit 1
+      }
+      stop_transaction_child
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    if ! (
+      prepare_transaction_case disappear-after-preflight 5
+      start_transaction_restore disappear-after-preflight
+      wait "$TX_PARENT_PID" || true
+      [ -f "$TX_CONTROL/send-zero-after-disappear" ] \
+        && [ "$(wc -l < "$TX_CONTROL/send-calls")" -eq 1 ] \
+        && [ ! -e "$TX_CONTROL/draft-bytes" ] \
+        && [ -f "$TX_GENERATION/pane-2.md.uncertain" ] \
+        && [ ! -e "$TX_GENERATION/pane-2.md.pending" ] \
+        && [ ! -e "$TX_GENERATION/pane-2.md.sending" ] \
+        && grep -qP "^202\\tcodex\\t$tx_sid\\t/tmp\\t[0-9]+$" \
+          "$TX_DIR/pane-sessions.tsv" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(correction/disappeared-send): attempted send was not terminally uncertain"
+        exit 1
+      }
+      # Terminal uncertainty is the negative control for automatic retry:
+      # even another complete parent restore cannot cross the send boundary.
+      stop_transaction_child
+      printf '{"generation":"%s","stage":"launching"}\n' "$TX_TOKEN" \
+        > "$TX_ROOT/restore-incomplete"
+      chmod 600 "$TX_ROOT/restore-incomplete"
+      before_second_ls=$(wc -l < "$TX_CONTROL/ls-calls")
+      start_transaction_restore disappear-after-preflight
+      wait "$TX_PARENT_PID" || true
+      [ "$(wc -l < "$TX_CONTROL/ls-calls")" -gt "$before_second_ls" ] \
+        && [ "$(wc -l < "$TX_CONTROL/send-calls")" -eq 1 ] \
+        && grep -qP "^202\\tcodex\\t$tx_sid\\t/tmp\\t[0-9]+$" \
+          "$TX_DIR/pane-sessions.tsv" || {
+        echo "FAIL(correction/disappeared-send): uncertain draft was sent twice"
+        exit 1
+      }
+      stop_transaction_child
+    ); then correction_failures=$((correction_failures + 1)); fi
+
+    total_failures=$((deadline_failures + correction_failures))
+    [ "$total_failures" -eq 0 ] || {
+      echo "FAIL(correction): $total_failures deadline/durability seam(s) failed"
+      exit 1
+    }
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"
