@@ -2645,10 +2645,10 @@ pkgs.runCommand "kitty-scripts-harness"
       --arg sid2 "$sid_later" '
       [{tabs: [{layout: "splits", windows: [
         {id: 1, cwd: $cwd, title: "codex zero",
-         cmdline: [$safe, "zero"], codex_session_id: $sid0,
+         cmdline: [$safe, "shared"], codex_session_id: $sid0,
          foreground_processes: [{cmdline: [$codex]}]},
         {id: 2, cwd: $cwd, title: "codex later",
-         cmdline: [$safe, "later"], codex_session_id: $sid2,
+         cmdline: [$safe, "shared"], codex_session_id: $sid2,
          foreground_processes: [{cmdline: [$codex, "--dangerously-bypass-approvals-and-sandbox"]}]}
       ]}]}]
     ' > "$bootstrap_cache/kitty-session/snapshot.json"
@@ -2694,12 +2694,12 @@ pkgs.runCommand "kitty-scripts-harness"
       and .panes["1"] == {
         ordinal: 1, kind: "codex", session_id: $sid0, cwd: $cwd,
         note_path: $note0, resume_argv: [$codex, "resume", $sid0],
-        safe_shell_argv: [$safe, "zero"]
+        safe_shell_argv: [$safe, "shared"]
       }
       and .panes["2"] == {
         ordinal: 2, kind: "codex", session_id: $sid2, cwd: $cwd,
         note_path: $note2, resume_argv: [$codex, "resume", $sid2],
-        safe_shell_argv: [$safe, "later"]
+        safe_shell_argv: [$safe, "shared"]
       }
     ' "$manifest" >/dev/null || {
       cat "$manifest" 2>/dev/null || true
@@ -2782,8 +2782,10 @@ pkgs.runCommand "kitty-scripts-harness"
     # before execvp. That boundary is the regression's essential ordering.
     export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-later-exec"
     export KITTY_RESTORE_TEST=1
+    export KITTY_RESTORE_TEST_TRACE="$PWD/state/bootstrap-order"
     export KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND="$PWD/state/bootstrap-pause"
-    rm -f "$BOOTSTRAP_EXEC_LOG" "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND" \
+    rm -f "$BOOTSTRAP_EXEC_LOG" "$KITTY_RESTORE_TEST_TRACE" \
+      "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND" \
       "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND.release" \
       "$generation/pane-2.bootstrap-bound" \
       "$generation/pane-2.bootstrap-failed"
@@ -2810,6 +2812,14 @@ pkgs.runCommand "kitty-scripts-harness"
     }
     [ -f "$generation/pane-2.bootstrap-bound" ] || {
       echo "FAIL(bootstrap): bound receipt missing before exec"; exit 1; }
+    printf '%s\n' file-fsync replace directory-fsync bootstrap-bound \
+      > state/expected-bootstrap-order-before-exec
+    cmp -s state/expected-bootstrap-order-before-exec \
+      "$KITTY_RESTORE_TEST_TRACE" || {
+      cat "$KITTY_RESTORE_TEST_TRACE" 2>/dev/null || true
+      echo "FAIL(bootstrap): registry durability order is incomplete"
+      exit 1
+    }
     [ ! -e "$BOOTSTRAP_EXEC_LOG" ] || {
       echo "FAIL(bootstrap): Codex exec happened before bootstrap-bound pause"
       exit 1
@@ -2822,11 +2832,177 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(bootstrap): later exec was not exact codex resume UUID"
       exit 1
     }
+    printf 'exec\n' >> state/expected-bootstrap-order-before-exec
+    cmp -s state/expected-bootstrap-order-before-exec \
+      "$KITTY_RESTORE_TEST_TRACE" || {
+      cat "$KITTY_RESTORE_TEST_TRACE" 2>/dev/null || true
+      echo "FAIL(bootstrap): exec did not follow durable receipt"
+      exit 1
+    }
+    unset KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND KITTY_RESTORE_TEST_TRACE
 
-    bootstrap_failure() { # <label> <wid> <token> <ord> <note> <resume> <safe> <expected-mode> [cache]
+    # Launch-carried resume and safe-shell argv are an independent copy of
+    # the resolved snapshot. A structurally valid manifest edit after those
+    # inputs are fixed must be detected, not copied into a later launch.
+    manifest_good="$PWD/state/bootstrap-manifest-good.json"
+    cp "$manifest" "$manifest_good"
+    mutated_sid=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+    cat > fakebin/bootstrap-altered <<'STUB'
+    #!/bin/sh
+    printf 'altered\n' >> "$BOOTSTRAP_EXEC_LOG"
+    for arg in "$@"; do printf '%s\n' "$arg" >> "$BOOTSTRAP_EXEC_LOG"; done
+    STUB
+    chmod +x fakebin/bootstrap-altered
+    altered_bin="$PWD/fakebin/bootstrap-altered"
+
+    manifest_mismatch_fails_closed() { # <label>
+      local label="$1"
+      rm -f "$generation/pane-2.bootstrap-bound" \
+        "$generation/pane-2.bootstrap-failed"
+      printf '202\n' > "$generation/pane-2.expected-window"
+      export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-manifest-$label-exec"
+      : > "$BOOTSTRAP_EXEC_LOG"
+      env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
+        KITTY_RESTORE_TEST=1 KITTY_RESTORE_BOOTSTRAP="$token" \
+        KITTY_RESTORE_ORDINAL=2 KITTY_RESTORE_NOTE="$note2" \
+        KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
+        BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+        "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
+          "''${pane2_args[1]}" </dev/null >/dev/null \
+          2> "$PWD/state/bootstrap-manifest-$label.err" || true
+      [ -f "$generation/pane-2.bootstrap-failed" ] || {
+        cat "$PWD/state/bootstrap-manifest-$label.err"
+        echo "FAIL(bootstrap/manifest-$label): failure receipt missing"
+        exit 1
+      }
+      [ ! -s "$BOOTSTRAP_EXEC_LOG" ] || {
+        cat "$BOOTSTRAP_EXEC_LOG"
+        echo "FAIL(bootstrap/manifest-$label): altered argv executed"
+        exit 1
+      }
+      ! grep -q Traceback "$PWD/state/bootstrap-manifest-$label.err" || {
+        cat "$PWD/state/bootstrap-manifest-$label.err"
+        echo "FAIL(bootstrap/manifest-$label): traceback escaped"
+        exit 1
+      }
+    }
+
+    jq --arg altered "$altered_bin" --arg sid "$mutated_sid" '
+      .panes["2"].session_id = $sid
+      | .panes["2"].resume_argv = [$altered, "resume", $sid]
+    ' "$manifest_good" > "$manifest"
+    chmod 600 "$manifest"
+    : > "$KITTY_CMD_LOG"
+    kitty-restore-session
+    grep -Fq -- "$sid_later" "$KITTY_CMD_LOG" \
+      && ! grep -Fq -- "$mutated_sid" "$KITTY_CMD_LOG" \
+      && ! grep -Fq -- "$altered_bin" "$KITTY_CMD_LOG" || {
+      cat "$KITTY_CMD_LOG"
+      echo "FAIL(bootstrap): later launch copied mutated manifest resume argv"
+      exit 1
+    }
+    manifest_mismatch_fails_closed resume
+
+    jq --arg altered "$altered_bin" '
+      .panes["2"].safe_shell_argv = [$altered, "safe"]
+    ' "$manifest_good" > "$manifest"
+    chmod 600 "$manifest"
+    : > "$KITTY_CMD_LOG"
+    kitty-restore-session
+    grep -Fq -- "$safe_bin" "$KITTY_CMD_LOG" \
+      && grep -Fq -- 'shared' "$KITTY_CMD_LOG" \
+      && ! grep -Fq -- "$altered_bin" "$KITTY_CMD_LOG" || {
+      cat "$KITTY_CMD_LOG"
+      echo "FAIL(bootstrap): later launch copied mutated manifest safe argv"
+      exit 1
+    }
+    manifest_mismatch_fails_closed safe
+    cp "$manifest_good" "$manifest"
+    chmod 600 "$manifest"
+
+    malformed_manifest_fails_closed() { # <label> <jq-filter> <receipt>
+      local label="$1" filter="$2" receipt="$3"
+      jq "$filter" "$manifest_good" > "$manifest"
+      chmod 600 "$manifest"
+      rm -f "$generation/pane-2.bootstrap-bound" \
+        "$generation/pane-2.bootstrap-failed"
+      printf '202\n' > "$generation/pane-2.expected-window"
+      export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-malformed-$label-exec"
+      : > "$BOOTSTRAP_EXEC_LOG"
+      env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
+        KITTY_RESTORE_TEST=1 KITTY_RESTORE_BOOTSTRAP="$token" \
+        KITTY_RESTORE_ORDINAL=2 KITTY_RESTORE_NOTE="$note2" \
+        KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
+        BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+        "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
+          "''${pane2_args[1]}" </dev/null >/dev/null \
+          2> "$PWD/state/bootstrap-malformed-$label.err" || true
+      [ ! -s "$BOOTSTRAP_EXEC_LOG" ] || {
+        cat "$BOOTSTRAP_EXEC_LOG"
+        echo "FAIL(bootstrap/malformed-$label): non-system fallback executed"
+        exit 1
+      }
+      ! grep -q Traceback "$PWD/state/bootstrap-malformed-$label.err" || {
+        cat "$PWD/state/bootstrap-malformed-$label.err"
+        echo "FAIL(bootstrap/malformed-$label): traceback escaped"
+        exit 1
+      }
+      if [ "$receipt" = yes ]; then
+        [ -f "$generation/pane-2.bootstrap-failed" ] || {
+          cat "$PWD/state/bootstrap-malformed-$label.err"
+          echo "FAIL(bootstrap/malformed-$label): safe failure receipt missing"
+          exit 1
+        }
+      else
+        [ ! -e "$generation/pane-2.bootstrap-failed" ] || {
+          echo "FAIL(bootstrap/malformed-$label): guessed an unsafe receipt"
+          exit 1
+        }
+      fi
+      [ -f "$note2.pending" ] || {
+        echo "FAIL(bootstrap/malformed-$label): pending marker was claimed"
+        exit 1
+      }
+    }
+    malformed_manifest_fails_closed top-level-array '[.]' no
+    malformed_manifest_fails_closed panes-array '.panes = []' no
+    malformed_manifest_fails_closed scalar-entry \
+      '.panes["2"] = "not-an-entry"' yes
+    cp "$manifest_good" "$manifest"
+    chmod 600 "$manifest"
+
+    # A registry row is not sufficient success: the bound receipt itself
+    # must publish durably before Codex starts.
+    rm -f "$generation/pane-2.bootstrap-bound" \
+      "$generation/pane-2.bootstrap-failed"
+    mkdir "$generation/pane-2.bootstrap-bound"
+    printf '202\n' > "$generation/pane-2.expected-window"
+    export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-receipt-failure-exec"
+    : > "$BOOTSTRAP_EXEC_LOG"
+    env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
+      KITTY_RESTORE_TEST=1 KITTY_RESTORE_BOOTSTRAP="$token" \
+      KITTY_RESTORE_ORDINAL=2 KITTY_RESTORE_NOTE="$note2" \
+      KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
+      BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+      "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
+        "''${pane2_args[1]}" </dev/null >/dev/null \
+        2> state/bootstrap-receipt-failure.err || true
+    rmdir "$generation/pane-2.bootstrap-bound"
+    [ -f "$generation/pane-2.bootstrap-failed" ] || {
+      cat state/bootstrap-receipt-failure.err
+      echo "FAIL(bootstrap/receipt): failure receipt missing"; exit 1; }
+    grep -qx safe-shell "$BOOTSTRAP_EXEC_LOG" \
+      && ! grep -qx codex "$BOOTSTRAP_EXEC_LOG" || {
+      cat "$BOOTSTRAP_EXEC_LOG"
+      echo "FAIL(bootstrap/receipt): Codex ran without a bound receipt"
+      exit 1
+    }
+
+    bootstrap_failure() { # <label> <wid> <token> <ord> <note> <resume> <safe> <expected-mode> <fallback> [cache]
       local label="$1" wid="$2" supplied_token="$3" ordinal="$4"
       local supplied_note="$5" resume_json="$6" safe_json="$7"
-      local expected_mode="$8" supplied_cache="''${9:-$bootstrap_cache}"
+      local expected_mode="$8" fallback="$9"
+      local supplied_cache="''${10:-$bootstrap_cache}"
       rm -f "$generation/pane-2.bootstrap-bound" \
         "$generation/pane-2.bootstrap-failed" \
         "$generation/pane-2.expected-window"
@@ -2852,11 +3028,22 @@ pkgs.runCommand "kitty-scripts-harness"
         echo "FAIL(bootstrap/$label): bootstrap-failed missing"; exit 1; }
       [ -f "$note2.pending" ] || {
         echo "FAIL(bootstrap/$label): pending marker was claimed"; exit 1; }
-      grep -qx safe-shell "$BOOTSTRAP_EXEC_LOG" || {
-        cat "$BOOTSTRAP_EXEC_LOG"
-        echo "FAIL(bootstrap/$label): recorded safe shell did not run"
-        exit 1
-      }
+      case "$fallback" in
+        recorded)
+          grep -qx safe-shell "$BOOTSTRAP_EXEC_LOG" || {
+            cat "$BOOTSTRAP_EXEC_LOG"
+            echo "FAIL(bootstrap/$label): recorded safe shell did not run"
+            exit 1
+          }
+          ;;
+        system)
+          [ ! -s "$BOOTSTRAP_EXEC_LOG" ] || {
+            cat "$BOOTSTRAP_EXEC_LOG"
+            echo "FAIL(bootstrap/$label): unverified fallback argv ran"
+            exit 1
+          }
+          ;;
+      esac
       if grep -qx codex "$BOOTSTRAP_EXEC_LOG"; then
         echo "FAIL(bootstrap/$label): Codex ran after identity failure"
         exit 1
@@ -2868,27 +3055,51 @@ pkgs.runCommand "kitty-scripts-harness"
     altered_safe=$(jq -nc --arg safe "$safe_bin" '[$safe, "changed"]')
     stale_token=generation-ffffffffffffffffffffffffffffffff
     bootstrap_failure missing-window "" "$token" 2 "$note2" \
-      "''${pane2_args[0]}" "''${pane2_args[1]}" match
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match recorded
     bootstrap_failure malformed-window nope "$token" 2 "$note2" \
-      "''${pane2_args[0]}" "''${pane2_args[1]}" match
-    bootstrap_failure stale-token 202 "$stale_token" 2 "$note2" \
-      "''${pane2_args[0]}" "''${pane2_args[1]}" match
-    bootstrap_failure wrong-ordinal 202 "$token" 7 "$note2" \
-      "''${pane2_args[0]}" "''${pane2_args[1]}" match
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match recorded
     bootstrap_failure altered-note 202 "$token" 2 "$note1" \
-      "''${pane2_args[0]}" "''${pane2_args[1]}" match
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match recorded
     bootstrap_failure altered-resume 202 "$token" 2 "$note2" \
-      "$altered_resume" "''${pane2_args[1]}" match
+      "$altered_resume" "''${pane2_args[1]}" match system
     bootstrap_failure altered-safe-shell 202 "$token" 2 "$note2" \
-      "''${pane2_args[0]}" "$altered_safe" match
+      "''${pane2_args[0]}" "$altered_safe" match system
     bootstrap_failure missing-expected 202 "$token" 2 "$note2" \
-      "''${pane2_args[0]}" "''${pane2_args[1]}" missing
+      "''${pane2_args[0]}" "''${pane2_args[1]}" missing recorded
     bootstrap_failure mismatched-expected 202 "$token" 2 "$note2" \
-      "''${pane2_args[0]}" "''${pane2_args[1]}" mismatch
+      "''${pane2_args[0]}" "''${pane2_args[1]}" mismatch recorded
     printf 'not-a-directory\n' > state/registry-cache-file
     bootstrap_failure registry-writer 202 "$token" 2 "$note2" \
-      "''${pane2_args[0]}" "''${pane2_args[1]}" match \
+      "''${pane2_args[0]}" "''${pane2_args[1]}" match recorded \
       "$PWD/state/registry-cache-file"
+
+    bootstrap_unbound_failure() { # <label> <token> <ordinal>
+      local label="$1" supplied_token="$2" ordinal="$3"
+      rm -f "$generation/pane-2.bootstrap-failed" \
+        "$generation/pane-$ordinal.bootstrap-failed"
+      printf '202\n' > "$generation/pane-2.expected-window"
+      export BOOTSTRAP_EXEC_LOG="$PWD/state/bootstrap-unbound-$label"
+      : > "$BOOTSTRAP_EXEC_LOG"
+      env XDG_CACHE_HOME="$bootstrap_cache" XDG_STATE_HOME="$bootstrap_state" \
+        KITTY_RESTORE_BOOTSTRAP="$supplied_token" \
+        KITTY_RESTORE_ORDINAL="$ordinal" KITTY_RESTORE_NOTE="$note2" \
+        KITTY_RESTORE_DEADLINE_MONOTONIC="$deadline" KITTY_WINDOW_ID=202 \
+        BOOTSTRAP_EXEC_LOG="$BOOTSTRAP_EXEC_LOG" \
+        "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
+          "''${pane2_args[1]}" </dev/null >/dev/null \
+          2> "$PWD/state/bootstrap-unbound-$label.err" || true
+      [ ! -s "$BOOTSTRAP_EXEC_LOG" ] || {
+        cat "$BOOTSTRAP_EXEC_LOG"
+        echo "FAIL(bootstrap/$label): unbound argv executed"; exit 1; }
+      [ ! -e "$generation/pane-2.bootstrap-failed" ] \
+        && [ ! -e "$generation/pane-$ordinal.bootstrap-failed" ] || {
+        echo "FAIL(bootstrap/$label): guessed an unbound receipt"; exit 1; }
+      ! grep -q Traceback "$PWD/state/bootstrap-unbound-$label.err" || {
+        cat "$PWD/state/bootstrap-unbound-$label.err"
+        echo "FAIL(bootstrap/$label): traceback escaped"; exit 1; }
+    }
+    bootstrap_unbound_failure stale-token "$stale_token" 2
+    bootstrap_unbound_failure wrong-ordinal "$token" 7
 
     # When neither carried argv identifies a manifest entry, even the
     # alleged safe-shell argv is untrusted. Fall back to /bin/sh; never

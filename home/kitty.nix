@@ -842,6 +842,16 @@ let
           raise SystemExit("kitty-pane-registry-write: " + message)
 
 
+      def test_trace(event):
+          path = os.environ.get("KITTY_RESTORE_TEST_TRACE")
+          if os.environ.get("KITTY_RESTORE_TEST") != "1" or not path:
+              return
+          with open(path, "a") as trace:
+              trace.write(event + "\n")
+              trace.flush()
+              os.fsync(trace.fileno())
+
+
       parser = argparse.ArgumentParser()
       parser.add_argument("--window-id", required=True)
       parser.add_argument("--kind", required=True)
@@ -915,8 +925,20 @@ let
                   )
                   out.flush()
                   os.fsync(out.fileno())
+                  test_trace("file-fsync")
               os.replace(tmp_path, registry)
+              test_trace("replace")
               os.chmod(registry, 0o600)
+              directory_fd = os.open(
+                  directory,
+                  os.O_RDONLY | os.O_CLOEXEC
+                  | getattr(os, "O_DIRECTORY", 0) | nofollow,
+              )
+              try:
+                  os.fsync(directory_fd)
+              finally:
+                  os.close(directory_fd)
+              test_trace("directory-fsync")
           finally:
               if tmp_fd >= 0:
                   os.close(tmp_fd)
@@ -2403,7 +2425,7 @@ let
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-    def load_active_generation():
+    def _active_generation_path():
         root = note_dir_path()
         if root is None or os.path.islink(root) or not os.path.isdir(root):
             raise OSError("unsafe recovery root")
@@ -2414,11 +2436,20 @@ let
         info = os.lstat(generation)
         if not stat.S_ISDIR(info.st_mode):
             raise OSError("active generation is not a real directory")
+        return current, generation
+
+
+    def load_active_generation():
+        current, generation = _active_generation_path()
         manifest = json.loads(_read_regular(
             os.path.join(generation, "manifest.json")
         ))
+        if not isinstance(manifest, dict):
+            raise OSError("manifest is not an object")
         if manifest.get("generation") != current:
             raise OSError("manifest generation mismatch")
+        if not isinstance(manifest.get("panes"), dict):
+            raise OSError("manifest panes is not an object")
         return current, generation, manifest
 
 
@@ -2436,33 +2467,44 @@ let
         return argv
 
 
-    def _receipt_entry(manifest, resume, safe):
-        matches = []
-        for entry in manifest.get("panes", {}).values():
-            if not isinstance(entry, dict) or entry.get("kind") != "codex":
-                continue
-            if (
-                entry.get("resume_argv") == resume
-                or entry.get("safe_shell_argv") == safe
-            ):
-                matches.append(entry)
-        unique = {entry.get("ordinal"): entry for entry in matches}
-        return next(iter(unique.values())) if len(unique) == 1 else None
+    def _is_argv(value):
+        return (
+            isinstance(value, list)
+            and bool(value)
+            and all(isinstance(arg, str) for arg in value)
+        )
 
 
     def _receipt(generation, entry, state):
         if generation is None or entry is None:
-            return
+            raise ValueError("receipt target is unavailable")
         ordinal = entry.get("ordinal")
         if not isinstance(ordinal, int) or ordinal < 1:
-            return
+            raise ValueError("receipt ordinal is invalid")
+        _write_atomic(
+            os.path.join(generation, f"pane-{ordinal}.bootstrap-{state}"),
+            state + "\n",
+        )
+        directory_fd = os.open(
+            generation,
+            os.O_RDONLY | os.O_CLOEXEC
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
         try:
-            _write_atomic(
-                os.path.join(generation, f"pane-{ordinal}.bootstrap-{state}"),
-                state + "\n",
-            )
-        except OSError:
-            pass
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
+    def _test_trace(event):
+        path = os.environ.get("KITTY_RESTORE_TEST_TRACE")
+        if os.environ.get("KITTY_RESTORE_TEST") != "1" or not path:
+            return
+        with open(path, "a") as trace:
+            trace.write(event + "\n")
+            trace.flush()
+            os.fsync(trace.fileno())
 
 
     def _exec_safe(argv):
@@ -2478,32 +2520,71 @@ let
         """Bind a restored Codex pane from inside Kitty, then exec it."""
         resume = _argv_json(resume_json)
         carried_safe = _argv_json(safe_json)
-        # Caller-carried argv is not a fallback authority. Trust the
-        # generation's safe-shell binding only after a unique manifest entry
-        # has been identified; otherwise fail closed to the system shell.
         safe = ["/bin/sh"]
         generation = None
         manifest = None
         entry = None
+        receipt_target = None
         try:
-            active, generation, manifest = load_active_generation()
-            entry = _receipt_entry(manifest, resume, carried_safe)
-            if entry is None:
-                raise ValueError("bootstrap argv matches no unique pane")
-            expected_safe = entry.get("safe_shell_argv")
-            if isinstance(expected_safe, list) and expected_safe:
-                safe = expected_safe
-
+            active, generation = _active_generation_path()
             token = os.environ.get("KITTY_RESTORE_BOOTSTRAP")
-            ordinal = os.environ.get("KITTY_RESTORE_ORDINAL")
+            ordinal_text = os.environ.get("KITTY_RESTORE_ORDINAL")
             note = os.environ.get("KITTY_RESTORE_NOTE")
             deadline_text = os.environ.get("KITTY_RESTORE_DEADLINE_MONOTONIC")
             window_id = os.environ.get("KITTY_WINDOW_ID")
             if token != active:
                 raise ValueError("stale bootstrap generation")
-            if ordinal != str(entry.get("ordinal")):
-                raise ValueError("bootstrap ordinal mismatch")
-            if note != entry.get("note_path"):
+            if not ordinal_text or not re.fullmatch(r"[1-9][0-9]*", ordinal_text):
+                raise ValueError("bootstrap ordinal is invalid")
+            ordinal = int(ordinal_text)
+
+            manifest = json.loads(_read_regular(
+                os.path.join(generation, "manifest.json")
+            ))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest is not an object")
+            if manifest.get("generation") != active:
+                raise ValueError("manifest generation mismatch")
+            panes = manifest.get("panes")
+            if not isinstance(panes, dict):
+                raise ValueError("manifest panes is not an object")
+            if str(ordinal) not in panes:
+                raise ValueError("manifest has no entry for bootstrap ordinal")
+            receipt_target = {"ordinal": ordinal}
+            candidate = panes[str(ordinal)]
+            if not isinstance(candidate, dict):
+                raise ValueError("manifest pane entry is not an object")
+            if (
+                candidate.get("ordinal") != ordinal
+                or candidate.get("kind") != "codex"
+                or not isinstance(candidate.get("session_id"), str)
+                or not UUID_RE.fullmatch(candidate["session_id"])
+                or not isinstance(candidate.get("cwd"), str)
+                or not os.path.isabs(candidate["cwd"])
+                or not isinstance(candidate.get("note_path"), str)
+                or candidate["note_path"] != os.path.join(
+                    generation, f"pane-{ordinal}.md"
+                )
+                or not _is_argv(candidate.get("resume_argv"))
+                or candidate["resume_argv"] != [
+                    candidate["resume_argv"][0],
+                    "resume",
+                    candidate["session_id"],
+                ]
+                or not _is_argv(candidate.get("safe_shell_argv"))
+            ):
+                raise ValueError("manifest Codex binding is malformed")
+
+            # The active token and explicit ordinal choose one candidate.
+            # Both argv copies must then agree before either becomes trusted.
+            if resume != candidate["resume_argv"]:
+                raise ValueError("bootstrap resume argv mismatch")
+            if carried_safe != candidate["safe_shell_argv"]:
+                raise ValueError("bootstrap safe-shell argv mismatch")
+            entry = candidate
+            safe = entry["safe_shell_argv"]
+
+            if note != entry["note_path"]:
                 raise ValueError("bootstrap note mismatch")
             deadline = float(deadline_text)
             if deadline != manifest.get("deadline_monotonic"):
@@ -2512,24 +2593,6 @@ let
                 raise ValueError("bootstrap deadline expired")
             if not window_id or not re.fullmatch(r"[0-9]+", window_id):
                 raise ValueError("Kitty window id is not decimal")
-            if resume != entry.get("resume_argv"):
-                raise ValueError("bootstrap resume argv mismatch")
-            if (
-                safe_json is None
-                or carried_safe != entry.get("safe_shell_argv")
-            ):
-                raise ValueError("bootstrap safe-shell argv mismatch")
-            if (
-                entry.get("kind") != "codex"
-                or not UUID_RE.fullmatch(entry.get("session_id", ""))
-                or resume != [resume[0], "resume", entry["session_id"]]
-                or not os.path.isabs(entry.get("cwd") or "")
-            ):
-                raise ValueError("manifest Codex binding is malformed")
-            if note != os.path.join(
-                generation, f"pane-{entry['ordinal']}.md"
-            ):
-                raise ValueError("manifest note path escapes generation")
             _read_regular(note)
             _read_regular(note + ".pending")
 
@@ -2538,7 +2601,8 @@ let
                     os.path.join(generation, "pane0-launch.json")
                 ))
                 if (
-                    pane0.get("generation") != active
+                    not isinstance(pane0, dict)
+                    or pane0.get("generation") != active
                     or pane0.get("ordinal") != entry["ordinal"]
                     or pane0.get("binding") != entry
                 ):
@@ -2571,6 +2635,7 @@ let
                 "--cwd", entry["cwd"],
             ], check=True)
             _receipt(generation, entry, "bound")
+            _test_trace("bootstrap-bound")
 
             pause = os.environ.get("KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND")
             if os.environ.get("KITTY_RESTORE_TEST") == "1" and pause:
@@ -2580,6 +2645,7 @@ let
                     time.sleep(0.02)
                 if not os.path.exists(release):
                     raise ValueError("after-bound test seam timed out")
+            _test_trace("exec")
             os.execvp(resume[0], resume)
         except (
             IndexError, KeyError, OSError, TypeError, ValueError,
@@ -2589,7 +2655,15 @@ let
                 f"kitty-restore-session: Codex bootstrap failed: {error}",
                 file=sys.stderr,
             )
-            _receipt(generation, entry, "failed")
+            if receipt_target is not None:
+                try:
+                    _receipt(generation, receipt_target, "failed")
+                except (OSError, TypeError, ValueError) as receipt_error:
+                    print(
+                        "kitty-restore-session: could not publish failed "
+                        f"bootstrap receipt: {receipt_error}",
+                        file=sys.stderr,
+                    )
             _exec_safe(safe)
 
 
@@ -2949,12 +3023,16 @@ let
                     manifest.get("panes", {}).get(str(ordinal))
                     if manifest else None
                 )
+                if not isinstance(binding, dict):
+                    binding = None
                 note = binding.get("note_path") if binding else None
                 if note is None or binding.get("kind") != p.get("agent_kind"):
                     cmd = p["shell_cmd"]
                 else:
                     argv += ["--env", "KITTY_RESTORE_NOTE=" + note]
                     if binding["kind"] == "codex":
+                        carried_resume = unwrap_launchers(p.get("cmd") or [])
+                        carried_safe = p.get("shell_cmd") or ["/bin/sh"]
                         argv += [
                             "--env", "KITTY_RESTORE_BOOTSTRAP=" + active,
                             "--env", "KITTY_RESTORE_ORDINAL=" + str(ordinal),
@@ -2966,10 +3044,10 @@ let
                             _self_exe(),
                             BOOTSTRAP_FLAG,
                             json.dumps(
-                                binding["resume_argv"], separators=(",", ":")
+                                carried_resume, separators=(",", ":")
                             ),
                             json.dumps(
-                                binding["safe_shell_argv"],
+                                carried_safe,
                                 separators=(",", ":"),
                             ),
                         ]
