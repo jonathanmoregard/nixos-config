@@ -301,6 +301,17 @@ let
 
     KITTEN = "/nix/store/fake-kitty/bin/kitten"
     SHELL = ["/run/current-system/sw/bin/zsh"]
+    CODEX_SID = "cccc3333-cccc-4333-8333-cccccccccccc"
+
+    codex_with_id = win(1, [
+        "/usr/bin/codex", "--yolo", "touch /tmp/replayed",
+    ])
+    codex_with_id["cmdline"] = SHELL
+    codex_with_id["codex_session_id"] = CODEX_SID
+    codex_without_id = win(1, [
+        "/usr/bin/codex", "touch /tmp/replayed-without-id",
+    ])
+    codex_without_id["cmdline"] = SHELL
 
     cases = {
         # 1 real pane + kitty's config-error overlay. The overlay is
@@ -365,6 +376,11 @@ let
                 "first line\nsecond line\nthird line",
             ]),
         ]),
+        # last.session is executable input to kitty. A live Codex argv can
+        # contain both unsafe flags and a positional prompt, neither of which
+        # may be replayed when this fallback is used.
+        "codex-with-id": tab([codex_with_id]),
+        "codex-without-id": tab([codex_without_id]),
     }
     for name, data in cases.items():
         with open(os.path.join(out, name + ".json"), "w") as fh:
@@ -1220,6 +1236,28 @@ pkgs.runCommand "kitty-scripts-harness"
       exit 1; }
     [ "$(grep -c '^launch' state/multi.session)" -eq 1 ] || {
       echo "FAIL(C/convert): expected exactly one launch directive"
+      exit 1; }
+
+    # The normal cold restore already canonicalizes Codex to
+    # `codex resume <UUID>`. last.session is independently executable and
+    # must enforce the same no-replayed-prompt boundary.
+    kitty-session-convert < grid/codex-with-id.json \
+      > state/codex-with-id.session
+    grep -qxF \
+      'launch --cwd /tmp --title w1 /usr/bin/codex resume cccc3333-cccc-4333-8333-cccccccccccc' \
+      state/codex-with-id.session || {
+      cat state/codex-with-id.session
+      echo "FAIL(C/convert): last.session replayed Codex flags or a"
+      echo "  positional prompt instead of the exact recorded UUID."
+      exit 1; }
+    kitty-session-convert < grid/codex-without-id.json \
+      > state/codex-without-id.session
+    grep -qxF \
+      'launch --cwd /tmp --title w1 /run/current-system/sw/bin/zsh' \
+      state/codex-without-id.session || {
+      cat state/codex-without-id.session
+      echo "FAIL(C/convert): last.session replayed a Codex prompt without"
+      echo "  an exact UUID instead of degrading to the recorded shell."
       exit 1; }
 
     # --- Phase D: snapshot retention ---
