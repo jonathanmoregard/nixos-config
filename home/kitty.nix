@@ -3434,12 +3434,48 @@ let
                     detail += f"; guard restoration: {restore_error}"
                 _stage_failure(generation, 0, "guard-removal", detail)
                 return False
-            # The completed receipt has the same canonical token as the
-            # clearing marker and becomes durable only after primary removal
-            # did. The saver accepts this exact pair; every partial/malformed
-            # state remains blocked. Keeping two fixed names avoids a second
-            # unsafe unlink and bounds retained marker state.
-            _write_atomic(complete, generation + "\n")
+            # The clearing marker remains the authoritative barrier until the
+            # completion receipt is durable. _write_atomic replaces before it
+            # syncs the directory, so a post-replace fsync error may leave a
+            # visible receipt; the saver still refuses it while clearing is
+            # present. Receipt cleanup is only hygiene and cannot weaken that
+            # barrier even when cleanup itself fails.
+            try:
+                _write_atomic(complete, generation + "\n")
+            except OSError as publish_error:
+                cleanup_error = None
+                try:
+                    if (
+                        os.environ.get("KITTY_RESTORE_TEST") == "1"
+                        and os.environ.get(
+                            "KITTY_RESTORE_TEST_FAIL_COMPLETION_CLEANUP"
+                        ) == "1"
+                    ):
+                        raise OSError(
+                            "injected completion receipt cleanup failure"
+                        )
+                    if os.path.lexists(complete):
+                        _remove_state_entry(complete)
+                except OSError as error:
+                    cleanup_error = error
+                detail = str(publish_error)
+                if cleanup_error is not None:
+                    detail += f"; completion cleanup: {cleanup_error}"
+                raise OSError(detail)
+
+            # A durable completion receipt makes this unlink safe: if its
+            # directory fsync fails, the live name is gone and saving is safe;
+            # after a crash the conservative outcome is that clearing returns
+            # and blocks until the next begin reconciles the fixed markers.
+            os.unlink(clearing)
+            try:
+                _fsync_directory(root, "completion-clear")
+            except OSError as cleanup_error:
+                print(
+                    "kitty-restore-session: completion cleanup is not "
+                    f"durable: {cleanup_error}",
+                    file=sys.stderr,
+                )
             return True
         except (OSError, TypeError, ValueError) as error:
             _stage_failure(generation, 0, "guard-removal", str(error))
@@ -4615,18 +4651,18 @@ finally:
       fi
       clearing="$restore_root/restore-clearing"
       complete="$restore_root/restore-complete"
-      if [ -e "$clearing" ] || [ -L "$clearing" ] \
-          || [ -e "$complete" ] || [ -L "$complete" ]; then
-        # A matched, canonical pair is a durable completion receipt. Every
-        # other clearing state is an incomplete restore and must remain a
-        # barrier even when restoration of restore-incomplete itself failed.
-        if [ ! -f "$clearing" ] || [ -L "$clearing" ] \
-            || [ ! -f "$complete" ] || [ -L "$complete" ] \
-            || ! cmp -s "$clearing" "$complete"; then
+      # Clearing is pre-durable and authoritative. A matching completion name
+      # may already be visible when its directory fsync reports failure, so no
+      # completion receipt can override a clearing marker that still exists.
+      if [ -e "$clearing" ] || [ -L "$clearing" ]; then
+        exit 0
+      fi
+      if [ -e "$complete" ] || [ -L "$complete" ]; then
+        if [ ! -f "$complete" ] || [ -L "$complete" ]; then
           exit 0
         fi
-        clearing_token="$(cat "$clearing")"
-        if [[ ! "$clearing_token" =~ ^generation-[0-9a-f]{32}$ ]]; then
+        complete_token="$(cat "$complete")"
+        if [[ ! "$complete_token" =~ ^generation-[0-9a-f]{32}$ ]]; then
           exit 0
         fi
       fi
