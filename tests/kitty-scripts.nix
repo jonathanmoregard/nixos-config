@@ -2735,10 +2735,16 @@ pkgs.runCommand "kitty-scripts-harness"
       --arg resume "$resume_json" --arg safe "$safe_json" '
       [$restore, "--bootstrap", $resume,
        ([$restore, "--bootstrap", $resume, $safe] | tojson)]')
+    mismatched_resume=$(jq -nc --arg codex "$codex_bin" '
+      [$codex, "resume", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"]')
+    mismatched_valid=$(jq -nc --arg restore "$bootstrap_bin" \
+      --arg resume "$mismatched_resume" --arg safe "$safe_json" \
+      '[$restore, "--bootstrap", $resume, $safe]')
     malformed_launcher_fails_closed wrong-count "$wrong_count"
     malformed_launcher_fails_closed bad-json "$bad_json"
     malformed_launcher_fails_closed non-argv "$non_argv"
     malformed_launcher_fails_closed recursion "$recursive_safe"
+    malformed_launcher_fails_closed mismatched-resume "$mismatched_valid"
 
     kitty-restore-session --emit-stub
 

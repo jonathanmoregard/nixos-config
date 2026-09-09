@@ -1711,7 +1711,7 @@ let
         )
 
 
-    def bootstrap_safe_argv(cmdline):
+    def bootstrap_safe_argv(cmdline, expected_resume):
         """Validated safe argv carried beside a canonical Codex resume."""
         cmdline = cmdline or []
         if is_pane0_launcher(cmdline):
@@ -1733,6 +1733,7 @@ let
             and os.path.basename(resume[0]) == "codex"
             and resume[1] == "resume"
             and UUID_RE.fullmatch(resume[2])
+            and resume == expected_resume
             and _is_argv(safe)
         ):
             return None
@@ -2263,7 +2264,7 @@ let
                     raw_wc = win.get("cmdline") or []
                     wc = unwrap_pane0(raw_wc)
                     if is_bootstrap_launcher(raw_wc):
-                        shell_cmd = bootstrap_safe_argv(raw_wc) or ["/bin/sh"]
+                        shell_cmd = ["/bin/sh"]
                     elif wc and _agent_kind(wc) is None:
                         shell_cmd = wc
                     else:
@@ -2280,6 +2281,11 @@ let
                             cmd, shell_cmd, win.get("codex_session_id"),
                             used_codex_sids,
                         )
+                        if is_bootstrap_launcher(raw_wc):
+                            shell_cmd = (
+                                bootstrap_safe_argv(raw_wc, cmd)
+                                or ["/bin/sh"]
+                            )
                     panes.append({
                         "cwd": cwd,
                         "title": win.get("title", ""),
