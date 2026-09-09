@@ -2343,6 +2343,27 @@ let
         return panes
 
 
+    def _fsync_directory(directory, event):
+        """Make one directory-entry transition durable before returning."""
+        if (
+            os.environ.get("KITTY_RESTORE_TEST") == "1"
+            and os.environ.get("KITTY_RESTORE_TEST_FAIL_DIR_FSYNC") == event
+        ):
+            raise OSError(
+                f"injected directory fsync failure for {event}"
+            )
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY | os.O_CLOEXEC
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
     def _write_atomic(path, text):
         """Atomically replace `path` using a unique private temp file.
 
@@ -2367,6 +2388,7 @@ let
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
             os.chmod(path, 0o600)
+            _fsync_directory(parent, "write:" + os.path.basename(path))
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -2440,10 +2462,12 @@ let
 
     def _remove_state_entry(path):
         """Remove one recovery artifact without following a leaf symlink."""
+        parent = os.path.dirname(path) or "."
         if os.path.isdir(path) and not os.path.islink(path):
             shutil.rmtree(path)
         else:
             os.unlink(path)
+        _fsync_directory(parent, "cleanup")
 
 
     def _reconcile_generation_state(root):
@@ -2474,6 +2498,7 @@ let
                     else:
                         os.replace(sending, uncertain)
                         os.chmod(uncertain, 0o600)
+                        _fsync_directory(path, "draft-reconcile")
             elif name.startswith(".generation-"):
                 _remove_state_entry(path)
             elif re.fullmatch(r"pane-[1-9][0-9]*[.]md.*", name):
@@ -2501,15 +2526,57 @@ let
         )
 
 
-    def publish_generation(panes):
+    def _read_restore_guard(root):
+        payload = json.loads(_read_regular(
+            os.path.join(root, "restore-incomplete")
+        ))
+        if not isinstance(payload, dict):
+            raise OSError("restore guard is not an object")
+        return payload
+
+
+    def _require_restore_guard(root, token):
+        payload = _read_restore_guard(root)
+        if payload.get("generation") != token:
+            raise OSError("restore guard generation changed")
+        return payload
+
+
+    def _begin_restore_guard():
+        root = prepare_note_dir()
+        if root is None:
+            raise OSError("unsafe recovery root")
+        token = "generation-" + secrets.token_hex(16)
+        _write_restore_guard(root, token, "planned")
+        return root, token
+
+
+    def publish_generation(panes, token):
         """Stage a complete private recovery generation, then publish it."""
         root = prepare_note_dir()
         if root is None:
             return None
-        token = "generation-" + secrets.token_hex(16)
+        if not re.fullmatch(r"generation-[0-9a-f]{32}", token or ""):
+            print(
+                "kitty-restore-session: invalid planned generation token",
+                file=sys.stderr,
+            )
+            return None
         try:
-            # The guard precedes reconciliation and every destructive cleanup.
+            # The wrapper or direct --emit-stub entrypoint wrote this exact
+            # planned token immediately after locking. Never fall back through
+            # current after a failed publication from a different generation.
+            _require_restore_guard(root, token)
             _write_restore_guard(root, token, "reconciling")
+            if (
+                os.environ.get("KITTY_RESTORE_TEST") == "1"
+                and os.environ.get(
+                    "KITTY_RESTORE_TEST_FAIL_PUBLICATION"
+                ) == "reconcile"
+            ):
+                raise OSError(
+                    "injected publication reconciliation failure"
+                )
             previous = _reconcile_generation_state(root)
         except OSError as error:
             print(
@@ -2574,6 +2641,7 @@ let
                     }, sort_keys=True) + "\n",
                 )
             os.rename(temp_dir, final_dir)
+            _fsync_directory(root, "generation-publish")
             temp_dir = None
             _write_atomic(os.path.join(root, "current"), token + "\n")
             _retain_generations(root, token, previous)
@@ -2926,7 +2994,15 @@ let
         return not cmd or bool(line_argv(cmd))
 
 
-    def emit_stub():
+    def _emit_safe_stub():
+        """Open one plain pane when recovery state cannot be trusted."""
+        if not load_panes():
+            return False
+        _write_atomic(stub_path(), "launch\n")
+        return True
+
+
+    def emit_stub(token):
         """Write kitty's --session stub: pane 0, exactly one line.
 
         Kitty starts directly into this single window (no default
@@ -2940,7 +3016,9 @@ let
         panes = load_panes()
         if not panes:
             return
-        generation_state = publish_generation(panes)
+        generation_state = publish_generation(panes, token)
+        if generation_state is None:
+            return False
         p = panes[0]
         # slice_launch() here and at the kitty-pane-add loop in main(),
         # NOT inside load_panes(): --dump-panes stays a readout of WHICH
@@ -2953,8 +3031,8 @@ let
             parts += ["--cwd", session_token(p["cwd"])]
         if p["title"]:
             parts += ["--title", session_token(p["title"])]
-        manifest = generation_state[1] if generation_state else None
-        binding = manifest["panes"].get("1") if manifest else None
+        manifest = generation_state[1]
+        binding = manifest["panes"].get("1")
         note = binding.get("note_path") if binding else None
         if p.get("agent_kind") and note is None:
             print(
@@ -3027,6 +3105,7 @@ let
         if LINEBREAKS.search(line):
             raise ValueError("stub line is not single-line: " + repr(line))
         _write_atomic(stub_path(), line + "\n")
+        return True
 
 
     def _pane0_record():
@@ -3229,7 +3308,13 @@ let
         try:
             os.replace(pending, sending)
             os.chmod(sending, 0o600)
-        except OSError:
+            _fsync_directory(os.path.dirname(note), "draft-claim")
+        except OSError as error:
+            print(
+                "kitty-restore-session: draft claim is not durable: "
+                f"{error}",
+                file=sys.stderr,
+            )
             return False
         if (
             os.environ.get("KITTY_RESTORE_TEST") == "1"
@@ -3237,6 +3322,8 @@ let
         ):
             try:
                 os.replace(sending, pending)
+                os.chmod(pending, 0o600)
+                _fsync_directory(os.path.dirname(note), "draft-rollback")
             except OSError:
                 pass
             return False
@@ -3245,6 +3332,8 @@ let
         if remaining <= 0:
             try:
                 os.replace(sending, pending)
+                os.chmod(pending, 0o600)
+                _fsync_directory(os.path.dirname(note), "draft-rollback")
             except OSError:
                 pass
             return False
@@ -3275,7 +3364,13 @@ let
             else:
                 os.replace(sending, uncertain)
                 os.chmod(uncertain, 0o600)
-        except OSError:
+            _fsync_directory(os.path.dirname(note), "draft-uncertain")
+        except OSError as error:
+            print(
+                "kitty-restore-session: draft uncertainty is not durable: "
+                f"{error}",
+                file=sys.stderr,
+            )
             return False
         return _regular_marker(uncertain)
 
@@ -3283,20 +3378,29 @@ let
     def _finish_restore_guard(root, generation):
         guard = os.path.join(root, "restore-incomplete")
         try:
-            payload = json.loads(_read_regular(guard))
+            original = _read_regular(guard)
+            payload = json.loads(original)
             if payload.get("generation") != generation:
                 raise OSError("restore guard generation changed")
             os.unlink(guard)
-            directory_fd = os.open(
-                root,
-                os.O_RDONLY | os.O_CLOEXEC
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-            )
             try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+                _fsync_directory(root, "guard-clear")
+            except OSError as clear_error:
+                # An unlink followed by a failed directory fsync has an
+                # unknowable crash outcome. Restore the visible guard before
+                # reporting failure; _write_atomic replaces the name before
+                # its own directory fsync, so even that fsync failing leaves
+                # an incomplete marker rather than a false success claim.
+                restore_error = None
+                try:
+                    _write_atomic(guard, original)
+                except OSError as error:
+                    restore_error = error
+                detail = str(clear_error)
+                if restore_error is not None:
+                    detail += f"; guard restoration: {restore_error}"
+                _stage_failure(generation, 0, "guard-removal", detail)
+                return False
             return True
         except (OSError, TypeError, ValueError) as error:
             _stage_failure(generation, 0, "guard-removal", str(error))
@@ -3306,25 +3410,26 @@ let
     def restore_topology():
         panes = load_panes()
         if not panes:
-            return
+            return False
         try:
             active, generation_dir, manifest = load_active_generation()
             deadline = float(manifest["deadline_monotonic"])
         except (OSError, KeyError, TypeError, ValueError) as error:
             _stage_failure("unknown", 0, "generation", str(error))
-            return
+            return False
         root = os.path.dirname(generation_dir)
         try:
+            _require_restore_guard(root, active)
             _write_restore_guard(root, active, "launching")
         except OSError as error:
             _stage_failure(active, 0, "guard", str(error))
-            return
+            return False
 
         first = 1 if stub_carries_pane0(panes[0]) else 0
         sock = find_socket(deadline=deadline)
         if not sock:
             _stage_failure(active, 0, "socket", "socket never appeared")
-            return
+            return False
 
         codex = {}
         all_success = True
@@ -3430,7 +3535,7 @@ let
             os.environ.get("KITTY_RESTORE_TEST") == "1"
             and os.environ.get("KITTY_RESTORE_TEST_LAUNCH_ONLY") == "1"
         ):
-            return
+            return True
 
         unsettled = set(codex)
         successful = {}
@@ -3502,7 +3607,9 @@ let
                 all_success = False
 
         if all_success and not unsettled:
-            _finish_restore_guard(root, active)
+            if not _finish_restore_guard(root, active):
+                all_success = False
+        return all_success and not unsettled
 
 
     def main():
@@ -3513,10 +3620,50 @@ let
         # the pane.
         mode = sys.argv[1] if len(sys.argv) > 1 else None
 
+        if mode == "--begin-restore":
+            try:
+                with restore_transaction_lock():
+                    _, token = _begin_restore_guard()
+                print(token)
+                return 0
+            except OSError as error:
+                print(
+                    "kitty-restore-session: could not write planned restore "
+                    f"guard: {error}",
+                    file=sys.stderr,
+                )
+                return 1
+
+        if mode == "--cancel-restore":
+            token = sys.argv[2] if len(sys.argv) > 2 else ""
+            try:
+                root = prepare_note_dir()
+                if root is None:
+                    raise OSError("unsafe recovery root")
+                with restore_transaction_lock():
+                    return 0 if _finish_restore_guard(root, token) else 1
+            except OSError as error:
+                _stage_failure(token or "unknown", 0, "guard-removal", str(error))
+                return 1
+
         if mode == "--emit-stub":
             with restore_transaction_lock():
-                emit_stub()
-            return
+                # An unrepresentable or symlinked state root cannot carry a
+                # private generation. Preserve the long-standing safe-shell
+                # fallback without consulting current or launching an agent.
+                root = prepare_note_dir()
+                if root is None:
+                    return 0 if _emit_safe_stub() else 1
+                token = os.environ.get("KITTY_RESTORE_GENERATION")
+                try:
+                    if token:
+                        _require_restore_guard(root, token)
+                    else:
+                        _, token = _begin_restore_guard()
+                except OSError as error:
+                    _stage_failure(token or "unknown", 0, "guard", str(error))
+                    return 1
+                return 0 if emit_stub(token) else 1
 
         if mode == PANE0_FLAG:
             exec_pane0(sys.argv[2:])
@@ -3526,7 +3673,7 @@ let
             resume_json = sys.argv[2] if len(sys.argv) > 2 else None
             safe_json = sys.argv[3] if len(sys.argv) > 3 else None
             bootstrap(resume_json, safe_json)
-            return
+            return 0
 
         if mode == "--dump-panes":
             # Test-only: emit resolved panes JSON so assertions can
@@ -3534,14 +3681,14 @@ let
             # the same-cwd-collision-avoidance fallback) without having
             # to spin up a real kitty.
             json.dump(load_panes(), sys.stdout)
-            return
+            return 0
 
         with restore_transaction_lock():
-            restore_topology()
+            return 0 if restore_topology() else 1
 
 
     if __name__ == "__main__":
-        main()
+        raise SystemExit(main())
   '';
 
   # Claude Code and Codex SessionStart hook: record
@@ -3562,7 +3709,7 @@ let
   claudeKittyPaneRecord = pkgs.writeShellApplication {
     name = "claude-kitty-pane-record";
     runtimeInputs = with pkgs; [
-      jq coreutils util-linux gawk kitty kittyPaneRegistryWrite
+      jq coreutils util-linux gawk kitty python3 kittyPaneRegistryWrite
     ];
     text = ''
       set -euo pipefail
@@ -3725,6 +3872,22 @@ let
         pending="$resolved.pending"
         [ -f "$pending" ] && [ ! -L "$pending" ] || return 0
 
+        sync_marker_dir() {
+          local directory="$1" event="$2"
+          if [ "''${KITTY_RESTORE_TEST:-}" = 1 ] \
+              && [ "''${KITTY_RESTORE_TEST_FAIL_DIR_FSYNC:-}" = "$event" ]; then
+            echo "claude-kitty-pane-record: injected directory fsync failure for $event" >&2
+            return 1
+          fi
+          python3 -c 'import os, sys
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(sys.argv[1], flags)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)' "$directory"
+        }
+
         rc() {
           if declare -F kitten >/dev/null; then
             kitten "$@"
@@ -3743,9 +3906,12 @@ let
         sending="$resolved.sending"
         uncertain="$resolved.uncertain"
         mv -- "$pending" "$sending" 2>/dev/null || return 0
+        sync_marker_dir "$generation" draft-hook-claim || return 0
         if [ "''${KITTY_RESTORE_TEST:-}" = 1 ] \
             && [ "''${KITTY_RESTORE_TEST_FAIL_BEFORE_SEND:-}" = 1 ]; then
-          mv -- "$sending" "$pending" 2>/dev/null || true
+          if mv -- "$sending" "$pending" 2>/dev/null; then
+            sync_marker_dir "$generation" draft-hook-rollback || true
+          fi
           return 0
         fi
         # Literal by design: the TUI expands this environment-variable
@@ -3764,9 +3930,13 @@ let
         # Kitty has no acknowledgement boundary. Once invocation began,
         # success and failure are equally uncertain and neither may retry.
         if [ -e "$uncertain" ] || [ -L "$uncertain" ]; then
-          rm -f -- "$sending"
+          if rm -f -- "$sending"; then
+            sync_marker_dir "$generation" draft-hook-uncertain || true
+          fi
         else
-          mv -- "$sending" "$uncertain" 2>/dev/null || true
+          if mv -- "$sending" "$uncertain" 2>/dev/null; then
+            sync_marker_dir "$generation" draft-hook-uncertain || true
+          fi
         fi
         if [ "$send_rc" -ne 0 ]; then
           echo "claude-kitty-pane-record: failed to send restore-note draft to window $KITTY_WINDOW_ID" >&2
@@ -4551,6 +4721,31 @@ let
         ${pkgs.util-linux}/bin/flock -x 8
       fi
 
+      # A non-empty snapshot means this wrapper may perform a cold restore.
+      # Publish its durable planned-generation guard immediately after taking
+      # restore.lock, before stale socket, TSV, or stub cleanup. The same token
+      # is passed into generation publication; no later process invents a
+      # replacement token or falls back through an older current pointer.
+      restore_token=""
+      if [ -s "\$snap" ]; then
+        if ! restore_token="\$(
+          ${kittyRestoreSession}/bin/kitty-restore-session --begin-restore
+        )"; then
+          echo "kitty: could not create the cold-restore guard; preserving prior state" >&2
+          ${pkgs.util-linux}/bin/flock -u 8
+          exec 8>&-
+          exec ${pkgs.kitty}/bin/kitty -1 "\$@"
+        fi
+        export KITTY_RESTORE_GENERATION="\$restore_token"
+        if [ "\''${KITTY_RESTORE_TEST:-}" = 1 ] \
+            && [ -n "\''${KITTY_RESTORE_TEST_PAUSE_AFTER_GUARD:-}" ]; then
+          : > "\$KITTY_RESTORE_TEST_PAUSE_AFTER_GUARD"
+          while [ ! -e "\$KITTY_RESTORE_TEST_PAUSE_AFTER_GUARD.release" ]; do
+            sleep 0.01
+          done
+        fi
+      fi
+
       # Detect a running kitty by probing each socket — a kitty crash can
       # leave stale /tmp/kitty.sock-PID files behind that would otherwise
       # block restore on next launch. pgrep is unsafe here because the
@@ -4568,6 +4763,14 @@ let
         # Stale socket from a crashed instance — clean it up.
         rm -f "\$f"
       done
+      if [ "\$live" -eq 1 ] && [ -n "\$restore_token" ]; then
+        if ! ${kittyRestoreSession}/bin/kitty-restore-session \
+            --cancel-restore "\$restore_token"; then
+          echo "kitty: live-instance guard cleanup failed; leaving restore incomplete" >&2
+        fi
+        unset KITTY_RESTORE_GENERATION
+        restore_token=""
+      fi
       # Drop the TSV before the new kitty starts: kitty assigns window
       # ids starting at 1 per instance, so the old kitty's wid→sid
       # rows would otherwise alias onto fresh panes in the window
@@ -4610,6 +4813,7 @@ let
         rm -f "\$stub"
         if ${kittyRestoreSession}/bin/kitty-restore-session --emit-stub \
              && [ -s "\$stub" ]; then
+          unset KITTY_RESTORE_GENERATION
           ( ${kittyRestoreSession}/bin/kitty-restore-session \
               >/tmp/kitty-restore.log 2>&1 ) &
           # The background restore owns fd 8 now. Closing our copy lets its
@@ -4618,6 +4822,7 @@ let
           exec ${pkgs.kitty}/bin/kitty --session "\$stub" "\$@"
         fi
       fi
+      unset KITTY_RESTORE_GENERATION
       ${pkgs.util-linux}/bin/flock -u 8
       exec 8>&-
       exec ${pkgs.kitty}/bin/kitty -1 "\$@"

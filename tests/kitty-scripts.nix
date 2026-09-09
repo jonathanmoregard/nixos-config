@@ -3925,6 +3925,24 @@ pkgs.runCommand "kitty-scripts-harness"
         echo "FAIL(correction/publication): cleanup failure proceeded into publication/stub"
         exit 1
       }
+      planned_token=$(jq -r .generation "$TX_ROOT/restore-incomplete")
+      : > "$TX_CONTROL/ls-calls"
+      before_failed_restore_ls=$(wc -l < "$TX_CONTROL/ls-calls")
+      set +e
+      kitty-restore-session > "$TX_CONTROL/old-current.out" \
+        2> "$TX_CONTROL/old-current.err"
+      old_current_rc=$?
+      set -e
+      [ "$old_current_rc" -ne 0 ] \
+        && [ "$planned_token" != "$old_token" ] \
+        && [ "$(wc -l < "$TX_CONTROL/ls-calls")" \
+          -eq "$before_failed_restore_ls" ] \
+        && [ "$(jq -r .generation "$TX_ROOT/restore-incomplete")" \
+          = "$planned_token" ] || {
+        cat "$TX_CONTROL/old-current.err" 2>/dev/null || true
+        echo "FAIL(correction/publication): failed generation fell through old current"
+        exit 1
+      }
       stop_transaction_child
     ); then correction_failures=$((correction_failures + 1)); fi
 
@@ -3947,9 +3965,14 @@ pkgs.runCommand "kitty-scripts-harness"
       # Terminal uncertainty is the negative control for automatic retry:
       # even another complete parent restore cannot cross the send boundary.
       stop_transaction_child
+      printf '{"generation":"%s","stage":"launching"}\n' "$TX_TOKEN" \
+        > "$TX_ROOT/restore-incomplete"
+      chmod 600 "$TX_ROOT/restore-incomplete"
+      before_second_ls=$(wc -l < "$TX_CONTROL/ls-calls")
       start_transaction_restore disappear-after-preflight
       wait "$TX_PARENT_PID" || true
-      [ "$(wc -l < "$TX_CONTROL/send-calls")" -eq 1 ] \
+      [ "$(wc -l < "$TX_CONTROL/ls-calls")" -gt "$before_second_ls" ] \
+        && [ "$(wc -l < "$TX_CONTROL/send-calls")" -eq 1 ] \
         && grep -qP "^202\\tcodex\\t$tx_sid\\t/tmp\\t[0-9]+$" \
           "$TX_DIR/pane-sessions.tsv" || {
         echo "FAIL(correction/disappeared-send): uncertain draft was sent twice"
