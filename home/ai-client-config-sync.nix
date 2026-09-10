@@ -158,18 +158,37 @@ let
         --single-branch
         --branch "$ref"
       )
-      case "$remote" in
-        file://*)
+      remote_normalized="''${remote,,}"
+      if [[ "$remote" == file://* ]]; then
           if [ "''${AI_CLIENT_CONFIG_ALLOW_FILE_REMOTE-}" != "1" ]; then
             echo "ai-client-config sync: file remote requires explicit test adapter" >&2
             exit 64
           fi
           clone_args=(-c protocol.file.allow=always clone "''${clone_args[@]}")
-          ;;
-        *)
-          clone_args=(clone "''${clone_args[@]}")
-          ;;
-      esac
+      elif [[ "$remote_normalized" =~ ^https://([^/@]+@)?github[.]com(:443)?(/|$) ]]; then
+          # This service deliberately cannot see the user's Git config under
+          # ProtectHome=tmpfs. Use gh's existing desktop-keyring credential
+          # explicitly, and scope the helper to github.com so no other remote
+          # can receive it. Environment tokens would shadow that keyring.
+          unset GH_TOKEN GITHUB_TOKEN
+          export GH_CONFIG_DIR="$HOME/.config/gh"
+          stage="authenticate"
+          if ! ${lib.getExe pkgs.gh} auth token --hostname github.com \
+            >/dev/null 2>&1; then
+            echo "ai-client-config sync: GitHub authentication unavailable; run 'gh auth login --hostname github.com --git-protocol https' in your desktop session" >&2
+            exit 69
+          fi
+          clone_args=(
+            -c credential.helper=
+            -c "credential.https://github.com.helper=!${lib.getExe pkgs.gh} auth git-credential"
+            clone
+            "''${clone_args[@]}"
+          )
+      else
+          # Never inherit a system-wide credential helper for an arbitrary
+          # override remote. GitHub gets the only helper above, host-scoped.
+          clone_args=(-c credential.helper= clone "''${clone_args[@]}")
+      fi
 
       stage="prepare"
       mkdir -p "$runtime_root"
@@ -313,9 +332,15 @@ in
       PrivateTmp = "yes";
       ProtectSystem = "strict";
       ProtectHome = "tmpfs";
+      # gh keeps the token in Secret Service. Expose only its config metadata
+      # and the user-bus socket needed for the pre-render credential lookup.
+      # renderInNamespace mounts a fresh tmpfs over XDG_RUNTIME_DIR, so the
+      # fetched repository and its renderer still cannot reach that socket.
       BindReadOnlyPaths = lib.concatStringsSep " " [
         "-%h/.claude"
         "-%h/.claude.json"
+        "-%h/.config/gh"
+        "-%t/bus"
       ];
       BindPaths = lib.concatStringsSep " " [
         "%h/.codex"
