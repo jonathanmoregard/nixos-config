@@ -2469,11 +2469,25 @@ in
     )
     for marker in [
         "ProtectHome=tmpfs",
-        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json",
+        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json -%h/.config/gh -%t/bus",
         "InaccessiblePaths=-%h/.codex/auth.json -%h/.codex/sessions",
     ]:
         assert marker in sync_service, (
             f"ai-client-config-codex-sync.service lost '{marker}':\\n{sync_service}"
+        )
+    sync_script = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat ai-client-config-codex-sync.service' "
+        "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
+    ).strip()
+    sync_script_text = dellan.succeed(f"cat {sync_script}")
+    for marker in [
+        "credential.https://github.com.helper=",
+        "gh auth git-credential",
+    ]:
+        assert marker in sync_script_text, (
+            f"ai-client-config sync lost host-scoped gh helper '{marker}':\\n"
+            f"{sync_script_text}"
         )
 
     # A malformed upstream revision must fail before execution and identify
@@ -2486,6 +2500,9 @@ in
         user_systemctl
         + " set-environment AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS=10'"
     )
+    dellan.succeed(
+        user_systemctl + " reset-failed ai-client-config-codex-sync.service'"
+    )
     dellan.fail(user_systemctl + " start ai-client-config-codex-sync.service'")
     failure_text = dellan.succeed(f"cat {failure}")
     assert "stage=validate-source" in failure_text, failure_text
@@ -2496,6 +2513,9 @@ in
         user_systemctl
         + " set-environment AI_CLIENT_CONFIG_REMOTE= "
         + "AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS=10'"
+    )
+    dellan.succeed(
+        user_systemctl + " reset-failed ai-client-config-codex-sync.service'"
     )
     dellan.fail(user_systemctl + " start ai-client-config-codex-sync.service'")
     failure_text = dellan.succeed(f"cat {failure}")
@@ -2508,6 +2528,50 @@ in
         + "AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS AI_CLIENT_CONFIG_TEST_OUTPUT "
         + "AI_CLIENT_CONFIG_NETWORK_OUTPUT AI_CLIENT_CONFIG_BUS_OUTPUT "
         + "AI_CLIENT_CONFIG_PROC_OUTPUT'"
+    )
+
+    # The feature VM has no desktop keyring. Production's default HTTPS
+    # remote must therefore fail before network access, name authentication
+    # as the stage, and give an actionable desktop-session repair command.
+    dellan.succeed(
+        user_systemctl + " reset-failed ai-client-config-codex-sync.service'"
+    )
+    dellan.fail(user_systemctl + " start ai-client-config-codex-sync.service'")
+    failure_text = dellan.succeed(f"cat {failure}")
+    assert "stage=authenticate" in failure_text, failure_text
+    assert "status=69" in failure_text, failure_text
+    sync_journal = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u ai-client-config-codex-sync.service "
+        "-n 50 --no-pager'"
+    )
+    assert "gh auth login --hostname github.com --git-protocol https" in sync_journal, (
+        "missing GitHub auth must name exact recovery command:\\n"
+        f"{sync_journal}"
+    )
+    # URL userinfo and an explicit default HTTPS port remain valid GitHub
+    # remotes. They must take the same keyring-auth branch, not the generic
+    # no-helper branch.
+    for github_remote in [
+        "https://git@github.com/private/repo.git",
+        "https://github.com:443/private/repo.git",
+    ]:
+        dellan.succeed(
+            user_systemctl
+            + f" set-environment AI_CLIENT_CONFIG_REMOTE={github_remote}'"
+        )
+        dellan.succeed(
+            user_systemctl + " reset-failed ai-client-config-codex-sync.service'"
+        )
+        dellan.fail(user_systemctl + " start ai-client-config-codex-sync.service'")
+        failure_text = dellan.succeed(f"cat {failure}")
+        assert "stage=authenticate" in failure_text, (
+            f"GitHub URL bypassed auth classification: {github_remote}\\n"
+            f"{failure_text}"
+        )
+        assert "status=69" in failure_text, failure_text
+    dellan.succeed(
+        user_systemctl + " unset-environment AI_CLIENT_CONFIG_REMOTE'"
     )
 
     assert "claude-idle-handoff.timer" in timers, (
