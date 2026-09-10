@@ -522,6 +522,7 @@ in
     ./worktree-sweep.nix
     ./router-services.nix
     ./claude-services.nix
+    ./ai-client-config-sync.nix
     ./claude-skills.nix
     ./research-agent-mcp.nix
     ./futuresearch-gate-mcp.nix
