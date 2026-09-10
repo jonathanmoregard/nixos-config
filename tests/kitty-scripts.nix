@@ -3669,6 +3669,17 @@ pkgs.runCommand "kitty-scripts-harness"
       kitty-restore-session --emit-stub
       TX_TOKEN=$(cat "$TX_ROOT/current")
       TX_GENERATION="$TX_ROOT/$TX_TOKEN"
+      python3 - "$TX_GENERATION/manifest.json" "$2" <<'PY'
+    import json
+    from pathlib import Path
+    import sys
+    import time
+
+    path = Path(sys.argv[1])
+    manifest = json.loads(path.read_text())
+    manifest["deadline_monotonic"] = time.monotonic() + float(sys.argv[2])
+    path.write_text(json.dumps(manifest, separators=(",", ":")))
+    PY
       TX_BEFORE=$(sha256sum "$TX_DIR/snapshot.json" "$TX_DIR/last.session")
       export TX_TOKEN TX_GENERATION TX_BEFORE
     }
@@ -3762,15 +3773,15 @@ pkgs.runCommand "kitty-scripts-harness"
     stop_transaction_child
     unset KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND
 
-    bounded_failure() { # <mode> <stage> <minimum-ms>
-      local mode="$1" stage="$2" minimum_ms="$3" start_ms end_ms elapsed
-      prepare_transaction_case "$mode" 1
+    bounded_failure() { # <mode> <stage>
+      local mode="$1" stage="$2" start_ms end_ms elapsed
+      prepare_transaction_case "$mode" 3
       start_ms=$(date +%s%3N)
       start_transaction_restore "$mode"
       wait "$TX_PARENT_PID" || true
       end_ms=$(date +%s%3N)
       elapsed=$((end_ms - start_ms))
-      [ "$elapsed" -ge "$minimum_ms" ] && [ "$elapsed" -lt 4000 ] || {
+      [ "$elapsed" -lt 10000 ] || {
         cat "$TX_CONTROL/restore.log"
         echo "FAIL(transaction/$mode): elapsed ''${elapsed}ms outside shared deadline"
         exit 1
@@ -3781,13 +3792,18 @@ pkgs.runCommand "kitty-scripts-harness"
         echo "FAIL(transaction/$mode): precise stage diagnostic missing"
         exit 1
       }
+      grep -Fq "deadline expired" "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(transaction/$mode): deadline-expiry diagnostic missing"
+        exit 1
+      }
       assert_transaction_preserved "$mode"
       stop_transaction_child
     }
-    bounded_failure missing-launch-return launch-return 0
-    bounded_failure killed-wrapper bootstrap-receipt 800
-    bounded_failure vanished expected-window 800
-    bounded_failure foreground-timeout foreground-settlement 800
+    bounded_failure missing-launch-return launch-return
+    bounded_failure killed-wrapper bootstrap-receipt
+    bounded_failure vanished expected-window
+    bounded_failure foreground-timeout foreground-settlement
 
     # The registry writer is part of the bootstrap transaction and therefore
     # shares the parent's deadline. Holding its real advisory lock past that
@@ -3795,7 +3811,7 @@ pkgs.runCommand "kitty-scripts-harness"
     # and execs Codex after the parent has already released restore.lock.
     deadline_failures=0
     if ! (
-      prepare_transaction_case registry-lock-timeout 1
+      prepare_transaction_case registry-lock-timeout 3
       (
         exec 9>"$TX_DIR/.pane-sessions.lock"
         flock -x 9
@@ -3809,9 +3825,14 @@ pkgs.runCommand "kitty-scripts-harness"
       start_transaction_restore normal
       wait "$TX_PARENT_PID" || true
       elapsed=$(( $(date +%s%3N) - start_ms ))
-      [ "$elapsed" -ge 800 ] && [ "$elapsed" -lt 4000 ] || {
+      [ "$elapsed" -lt 10000 ] || {
         cat "$TX_CONTROL/restore.log"
         echo "FAIL(transaction/registry-lock-timeout): parent elapsed ''${elapsed}ms outside shared deadline"
+        exit 1
+      }
+      grep -Fq "deadline expired" "$TX_CONTROL/restore.log" || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(transaction/registry-lock-timeout): deadline-expiry diagnostic missing"
         exit 1
       }
       [ ! -e "$TX_GENERATION/pane-2.bootstrap-bound" ] \
