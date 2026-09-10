@@ -244,6 +244,12 @@ in
     dellan.wait_for_unit("home-manager-jonathan.service")
     # systemd --user for jonathan comes up via linger
     dellan.wait_for_unit("default.target", "jonathan")
+    # This lane runs longer than OnBootSec. Keep default network sync from
+    # racing fixture-controlled service invocations near test end.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user stop ai-client-config-codex-sync.timer'"
+    )
 
     # home-manager-jonathan TimeoutStartSec floor.
     #
@@ -2322,6 +2328,188 @@ in
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user list-timers --all'"
     )
+
+    # ai-client-config-codex-sync — pull the latest migration code before
+    # rendering Claude config into Codex. Exercise the real systemd unit
+    # against a local Git adapter: no network, no test-only service path.
+    assert "ai-client-config-codex-sync.timer" in timers, (
+        "ai-client-config-codex-sync.timer missing from user timer list:\n"
+        f"{timers}"
+    )
+    sync_timer = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat ai-client-config-codex-sync.timer'"
+    )
+    for marker in [
+        "OnBootSec=5min",
+        "OnCalendar=hourly",
+        "Persistent=true",
+        "Unit=ai-client-config-codex-sync.service",
+    ]:
+        assert marker in sync_timer, (
+            f"ai-client-config-codex-sync.timer lost '{marker}':\n{sync_timer}"
+        )
+    fixture = "/home/jonathan/.local/state/ai-client-config-sync/fixture"
+    output = "/home/jonathan/.codex/claude-setup-mirror/test-output"
+    network_output = "/home/jonathan/.codex/claude-setup-mirror/network-output"
+    bus_output = "/home/jonathan/.codex/claude-setup-mirror/bus-output"
+    proc_output = "/home/jonathan/.codex/claude-setup-mirror/proc-output"
+    failure = "/home/jonathan/.local/state/ai-client-config-sync/last-failure"
+    dellan.succeed(
+        f"install -d -o jonathan -g users {fixture} {fixture}/scripts && "
+        "install -d -o jonathan -g users /home/jonathan/.codex/claude-setup-mirror && "
+        "install -d -o jonathan -g users /home/jonathan/.codex/sessions && "
+        "printf 'stable\\n' > /home/jonathan/.codex/AGENTS.md && "
+        "chown jonathan:users /home/jonathan/.codex/AGENTS.md && "
+        f"su - jonathan -c 'git init -b main {fixture} && "
+        f"git -C {fixture} config user.name vm-test && "
+        f"git -C {fixture} config user.email vm-test@example.invalid'"
+    )
+
+    def commit_renderer(version, body):
+        dellan.succeed(
+            f"printf '%s\\n' {body} > {fixture}/scripts/sync_codex.py && "
+            f"chown jonathan:users {fixture}/scripts/sync_codex.py && "
+            f"su - jonathan -c 'git -C {fixture} add scripts/sync_codex.py && "
+            f"git -C {fixture} commit -m {version}'"
+        )
+
+    commit_renderer(
+        "v1",
+        "'import os' 'from pathlib import Path' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v1\\n\")'",
+    )
+    user_systemctl = (
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user"
+    )
+    dellan.succeed(
+        user_systemctl
+        + " set-environment "
+        + f"AI_CLIENT_CONFIG_REMOTE=file://{fixture} "
+        + "AI_CLIENT_CONFIG_REF=main "
+        + "AI_CLIENT_CONFIG_ALLOW_FILE_REMOTE=1 "
+        + "AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS=10 "
+        + f"AI_CLIENT_CONFIG_NETWORK_OUTPUT={network_output} "
+        + f"AI_CLIENT_CONFIG_BUS_OUTPUT={bus_output} "
+        + f"AI_CLIENT_CONFIG_PROC_OUTPUT={proc_output} "
+        + f"AI_CLIENT_CONFIG_TEST_OUTPUT={output}'"
+    )
+    dellan.succeed(user_systemctl + " start ai-client-config-codex-sync.service'")
+    assert dellan.succeed(f"cat {output}").strip() == "v1"
+
+    # A second invocation must clone again and execute the new remote HEAD,
+    # not a cached checkout or the user's dirty development tree.
+    commit_renderer(
+        "v2",
+        "'import os' 'from pathlib import Path' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v2\\n\")' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_NETWORK_OUTPUT\"]).write_text(\",\".join(sorted(p.name for p in Path(\"/sys/class/net\").iterdir())) + \"\\n\")' "
+        "'bus = Path(os.environ[\"XDG_RUNTIME_DIR\"]) / \"bus\"' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_BUS_OUTPUT\"]).write_text((\"visible\" if bus.exists() else \"hidden\") + \"\\n\")' "
+        "'foreign_root = Path(\"/proc/1/root\")' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_PROC_OUTPUT\"]).write_text((\"visible\" if foreign_root.exists() else \"hidden\") + \"\\n\")' "
+        "'(Path.home() / \".codex\" / \"unmanaged-proof\").write_text(\"persisted\\n\")'",
+    )
+    dellan.succeed(user_systemctl + " start ai-client-config-codex-sync.service'")
+    assert dellan.succeed(f"cat {output}").strip() == "v2"
+    assert dellan.succeed(f"cat {network_output}").strip() == "lo"
+    assert dellan.succeed(f"cat {bus_output}").strip() == "hidden"
+    assert dellan.succeed(f"cat {proc_output}").strip() == "hidden"
+    dellan.fail("test -e /home/jonathan/.codex/unmanaged-proof")
+    expected_commit = dellan.succeed(
+        f"su - jonathan -c 'git -C {fixture} rev-parse --verify HEAD'"
+    ).strip()
+    success_text = dellan.succeed(
+        "cat /home/jonathan/.local/state/ai-client-config-sync/last-success"
+    )
+    assert f"commit={expected_commit}" in success_text, success_text
+    assert "ref=main" in success_text, success_text
+
+    # Renderer failure must surface its exact stage/status while preserving
+    # the last successful output. OnFailure may alert, but recovery data is
+    # durable and machine-readable for the next Claude/Codex session.
+    commit_renderer(
+        "fail",
+        "'import os, shutil' 'from pathlib import Path' 'home = Path.home()' "
+        "'(home / \".codex\" / \"AGENTS.md\").write_text(\"corrupt\\n\")' "
+        "'runtime_root = Path(os.environ[\"XDG_RUNTIME_DIR\"]) / \"ai-client-config-sync\"' "
+        "'if runtime_root.exists():' '    shutil.rmtree(runtime_root)' "
+        "'try:' "
+        "'    (home / \".codex\" / \"sessions\" / \"sentinel\").write_text(\"bad\\n\")' "
+        "'except OSError:' '    pass' 'raise SystemExit(7)'",
+    )
+    dellan.fail(user_systemctl + " start ai-client-config-codex-sync.service'")
+    assert dellan.succeed(f"cat {output}").strip() == "v2"
+    assert dellan.succeed("cat /home/jonathan/.codex/AGENTS.md").strip() == "stable"
+    dellan.fail("test -e /home/jonathan/.codex/sessions/sentinel")
+    failure_text = dellan.succeed(f"cat {failure}")
+    assert "stage=render" in failure_text, failure_text
+    assert "status=7" in failure_text, failure_text
+
+    # A hung renderer cannot hold every later timer tick. Use the same
+    # environment seam to shrink only the test deadline.
+    commit_renderer("hang", "'import time' 'time.sleep(30)'")
+    dellan.succeed(
+        user_systemctl
+        + " set-environment AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS=1'"
+    )
+    dellan.fail(
+        "timeout 10 " + user_systemctl
+        + " start ai-client-config-codex-sync.service'"
+    )
+    failure_text = dellan.succeed(f"cat {failure}")
+    assert "stage=render" in failure_text, failure_text
+    # GNU timeout reports 137 after --kill-after escalates to SIGKILL.
+    assert "status=137" in failure_text, failure_text
+
+    sync_service = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat ai-client-config-codex-sync.service'"
+    )
+    for marker in [
+        "ProtectHome=tmpfs",
+        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json",
+        "InaccessiblePaths=-%h/.codex/auth.json -%h/.codex/sessions",
+    ]:
+        assert marker in sync_service, (
+            f"ai-client-config-codex-sync.service lost '{marker}':\\n{sync_service}"
+        )
+
+    # A malformed upstream revision must fail before execution and identify
+    # the missing contract explicitly.
+    dellan.succeed(
+        f"su - jonathan -c 'git -C {fixture} rm scripts/sync_codex.py && "
+        f"git -C {fixture} commit -m missing-renderer'"
+    )
+    dellan.succeed(
+        user_systemctl
+        + " set-environment AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS=10'"
+    )
+    dellan.fail(user_systemctl + " start ai-client-config-codex-sync.service'")
+    failure_text = dellan.succeed(f"cat {failure}")
+    assert "stage=validate-source" in failure_text, failure_text
+    assert "status=66" in failure_text, failure_text
+
+    # Explicit empty configuration fails before any clone/network attempt.
+    dellan.succeed(
+        user_systemctl
+        + " set-environment AI_CLIENT_CONFIG_REMOTE= "
+        + "AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS=10'"
+    )
+    dellan.fail(user_systemctl + " start ai-client-config-codex-sync.service'")
+    failure_text = dellan.succeed(f"cat {failure}")
+    assert "stage=validate" in failure_text, failure_text
+
+    dellan.succeed(
+        user_systemctl
+        + " unset-environment AI_CLIENT_CONFIG_REMOTE AI_CLIENT_CONFIG_REF "
+        + "AI_CLIENT_CONFIG_ALLOW_FILE_REMOTE "
+        + "AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS AI_CLIENT_CONFIG_TEST_OUTPUT "
+        + "AI_CLIENT_CONFIG_NETWORK_OUTPUT AI_CLIENT_CONFIG_BUS_OUTPUT "
+        + "AI_CLIENT_CONFIG_PROC_OUTPUT'"
+    )
+
     assert "claude-idle-handoff.timer" in timers, (
         "claude-idle-handoff.timer missing from user timer list:\n"
         f"{timers}"
