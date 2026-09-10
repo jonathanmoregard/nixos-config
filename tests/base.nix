@@ -2693,6 +2693,76 @@ in
         f"script would receive a relative path and pull nothing:\n{mkt_env}"
     )
 
+    # klaffat-pull — reuse the fail-closed Claude puller for Klaffat's main
+    # checkout. Klaffat development happens in dedicated worktrees, so this
+    # checkout must remain a clean, current main rather than accumulating
+    # local commits or changes. The script enforces that contract through the
+    # expected-branch and require-clean environment seams; this lane proves
+    # the timer and rendered unit pass those exact values.
+    assert "klaffat-pull.timer" in timers, (
+        f"klaffat-pull.timer missing from user timer list:\n{timers}"
+    )
+    klaffat_timer = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat klaffat-pull.timer'"
+    )
+    for marker in [
+        "OnCalendar=*:2/30",
+        "Persistent=true",
+        "AccuracySec=1min",
+        "RandomizedDelaySec=1min",
+        "Unit=klaffat-pull.service",
+    ]:
+        assert marker in klaffat_timer, (
+            f"klaffat-pull.timer lost '{marker}':\n{klaffat_timer}"
+        )
+    for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
+        got = dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            f"systemctl --user {prop} klaffat-pull.timer'"
+        ).strip()
+        assert got == expected, (
+            f"klaffat-pull.timer {prop}={got!r}, expected {expected!r} "
+            f"— /home/jonathan/Repos/klaffat would stop tracking current main"
+        )
+
+    klaffat_service = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat klaffat-pull.service'"
+    )
+    for marker in [
+        "After=default.target",
+        "Type=oneshot",
+        "ExecStart=%h/.claude/scripts/claude-pull.sh",
+        "Nice=10",
+        "IOSchedulingClass=idle",
+        "TimeoutStartSec=180",
+    ]:
+        assert marker in klaffat_service, (
+            f"klaffat-pull.service lost '{marker}':\n{klaffat_service}"
+        )
+
+    klaffat_env = [
+        line
+        for line in klaffat_service.splitlines()
+        if line.startswith("Environment=")
+    ]
+    for assignment in [
+        "CLAUDE_PULL_REPO=/home/jonathan/Repos/klaffat",
+        "CLAUDE_PULL_EXPECT_BRANCH=main",
+        "CLAUDE_PULL_EXPECT_UPSTREAM=origin/main",
+        "CLAUDE_PULL_REQUIRE_CLEAN=1",
+        "CLAUDE_PULL_UNIT=klaffat-pull",
+    ]:
+        assert f"Environment={assignment}" in klaffat_env, (
+            f"klaffat-pull.service lost exact environment assignment "
+            f"{assignment!r}:\n{klaffat_env}"
+        )
+    assert not any("%h" in line for line in klaffat_env), (
+        f"klaffat-pull.service leaves an unexpanded %h in Environment=; "
+        f"systemd would pass it literally:\n{klaffat_env}"
+    )
+
     # claude-proposals-push — the same split, the other direction.
     #
     # ~/.local/state/claude-proposals is the RSI proposals sink: the nightly
