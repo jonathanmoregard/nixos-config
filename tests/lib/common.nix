@@ -69,11 +69,13 @@ let
     # claude-desktop out of home.packages to fit, PR #175 vm-autodoro
     # still tripped it at 316s. modules/common.nix now raises the ceiling
     # to 20min AND we give the VM more headroom here so the activation
-    # runs faster; leaves ~10 GiB for host + KVM overhead on the runner.
+    # runs faster. The former 8 GiB guest disk also filled nondeterministically
+    # during full Home Manager activation; 12 GiB keeps 50% capacity headroom
+    # while remaining sparse on the host.
     virtualisation = {
       memorySize = 6144;
       cores = 4;
-      diskSize = 8192;
+      diskSize = 12288;
     };
 
     # Do not boot the production microvms inside a test VM, and stub the

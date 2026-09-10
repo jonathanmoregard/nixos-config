@@ -2,17 +2,27 @@
 let
   renderInNamespace = pkgs.writeShellScript "ai-client-config-render-isolated" ''
     set -euo pipefail
-    source_home="$1"
-    staged_home="$2"
-    repo="$3"
+    live_home="$1"
+    source_home="$2"
+    staged_home="$3"
+    repo="$4"
     sandbox_repo=/tmp/ai-client-config-repo
     sandbox_claude=/tmp/ai-client-config-claude
     sandbox_claude_state=/tmp/ai-client-config-claude.json
+    sandbox_repos=/tmp/ai-client-config-repos
 
     mkdir -p "$sandbox_repo" "$sandbox_claude"
     ${pkgs.util-linux}/bin/mount --bind "$repo" "$sandbox_repo"
     ${pkgs.util-linux}/bin/mount --bind "$source_home/.claude" "$sandbox_claude"
     ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$sandbox_claude"
+
+    has_repos=0
+    if [ -d "$source_home/Repos" ]; then
+      mkdir -p "$sandbox_repos"
+      ${pkgs.util-linux}/bin/mount --bind "$source_home/Repos" "$sandbox_repos"
+      ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$sandbox_repos"
+      has_repos=1
+    fi
 
     has_claude_state=0
     if [ -f "$source_home/.claude.json" ]; then
@@ -23,15 +33,20 @@ let
       has_claude_state=1
     fi
 
-    ${pkgs.util-linux}/bin/mount --bind "$staged_home" "$source_home"
-    mkdir -p "$source_home/.claude"
-    ${pkgs.util-linux}/bin/mount --bind "$sandbox_claude" "$source_home/.claude"
-    ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$source_home/.claude"
+    ${pkgs.util-linux}/bin/mount --bind "$staged_home" "$live_home"
+    mkdir -p "$live_home/.claude"
+    ${pkgs.util-linux}/bin/mount --bind "$sandbox_claude" "$live_home/.claude"
+    ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$live_home/.claude"
+    if [ "$has_repos" -eq 1 ]; then
+      mkdir -p "$live_home/Repos"
+      ${pkgs.util-linux}/bin/mount --bind "$sandbox_repos" "$live_home/Repos"
+      ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$live_home/Repos"
+    fi
     if [ "$has_claude_state" -eq 1 ]; then
-      touch "$source_home/.claude.json"
+      touch "$live_home/.claude.json"
       ${pkgs.util-linux}/bin/mount --bind \
-        "$sandbox_claude_state" "$source_home/.claude.json"
-      ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$source_home/.claude.json"
+        "$sandbox_claude_state" "$live_home/.claude.json"
+      ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$live_home/.claude.json"
     fi
 
     ${pkgs.util-linux}/bin/mount -t tmpfs -o mode=0700 \
@@ -213,6 +228,125 @@ let
         exit 66
       fi
 
+      # Materialize only explicit renderer entry points. Nested symlinks stay
+      # symlinks, so they cannot pull hidden credentials into the snapshot.
+      stage="snapshot-source"
+      source_home="$run_dir/source-home"
+      source_entries=(
+        ".claude/CLAUDE.md"
+        ".claude/settings.json"
+        ".claude/mcp-servers.json"
+        ".claude/plugins/installed_plugins.json"
+        ".claude/plugins/known_marketplaces.json"
+        ".claude/plugins/cache"
+        ".claude.json"
+      )
+      source_collections=(
+        ".claude/skills"
+        ".claude/commands"
+        ".claude/agents"
+        ".claude/hooks"
+        ".claude/mcps"
+      )
+
+      snapshot_entry() {
+        local relative="$1"
+        local source="$HOME/$relative"
+        local resolved target
+        if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+          return
+        fi
+        if ! resolved=$(realpath -e -- "$source"); then
+          echo "ai-client-config sync: unresolved source $relative" >&2
+          exit 66
+        fi
+        target="$source_home/$relative"
+        mkdir -p "$(dirname "$target")"
+        if [ -d "$resolved" ]; then
+          mkdir -p "$target"
+          cp -a --no-preserve=ownership -- "$resolved/." "$target/"
+        else
+          cp -a --no-preserve=ownership -- "$resolved" "$target"
+        fi
+      }
+
+      snapshot_collection() {
+        local relative="$1"
+        local source="$HOME/$relative"
+        local entry
+        if [ -L "$source" ] || [ ! -d "$source" ]; then
+          snapshot_entry "$relative"
+          return
+        fi
+        mkdir -p "$source_home/$relative"
+        while IFS= read -r -d "" entry; do
+          snapshot_entry "''${entry#"$HOME/"}"
+        done < <(find -P "$source" -mindepth 1 -maxdepth 1 -print0)
+      }
+
+      mkdir -p "$source_home/.claude"
+      for relative in "''${source_entries[@]}"; do
+        snapshot_entry "$relative"
+      done
+      for relative in "''${source_collections[@]}"; do
+        snapshot_collection "$relative"
+      done
+
+      # Generated wrappers retain absolute install paths. Copy only enabled
+      # plugin roots under ~/Repos and recreate that sparse path read-only in
+      # the renderer namespace. Other home paths remain hidden.
+      settings_file="$HOME/.claude/settings.json"
+      installed_file="$HOME/.claude/plugins/installed_plugins.json"
+      enabled_plugin_paths="$run_dir/enabled-plugin-paths"
+      if [ -f "$settings_file" ] && [ -f "$installed_file" ]; then
+        if ! ${lib.getExe pkgs.jq} -r --slurpfile settings "$settings_file" '
+          (.plugins // {}) as $plugins
+          | (($settings[0].enabledPlugins // {}) | to_entries[])
+          | select(.value == true)
+          | .key as $id
+          | (($plugins[$id] // []) | last | .installPath // empty)
+        ' "$installed_file" | sort -u > "$enabled_plugin_paths"; then
+          echo "ai-client-config sync: invalid plugin metadata" >&2
+          exit 66
+        fi
+
+        while IFS= read -r plugin_path; do
+          [ -n "$plugin_path" ] || continue
+          plugin_normalized=$(realpath -m -- "$plugin_path")
+          case "$plugin_normalized" in
+            "$HOME/.claude"|"$HOME/.claude/"*)
+              ;;
+            "$HOME/Repos")
+              echo "ai-client-config sync: plugin path cannot expose all of ~/Repos" >&2
+              exit 66
+              ;;
+            "$HOME/Repos/"*)
+              if ! repos_root=$(realpath -e -- "$HOME/Repos") ||
+                ! plugin_resolved=$(realpath -e -- "$plugin_normalized"); then
+                echo "ai-client-config sync: unresolved plugin path $plugin_path" >&2
+                exit 66
+              fi
+              case "$plugin_resolved" in
+                "$repos_root"|"$repos_root/"*)
+                  snapshot_entry "''${plugin_normalized#"$HOME/"}"
+                  ;;
+                *)
+                  echo "ai-client-config sync: plugin path escapes ~/Repos: $plugin_path" >&2
+                  exit 66
+                  ;;
+              esac
+              ;;
+            "$HOME"|"$HOME/"*)
+              echo "ai-client-config sync: unsupported hidden plugin path $plugin_path" >&2
+              exit 66
+              ;;
+            *)
+              ;;
+          esac
+        done < "$enabled_plugin_paths"
+      fi
+      chmod -R u+w -- "$source_home"
+
       stage="snapshot"
       mkdir -p "$run_dir/backup"
       staged_home="$run_dir/staged-home"
@@ -237,7 +371,7 @@ let
       if timeout --foreground --signal=TERM --kill-after=2s "$render_timeout" \
         unshare --user --map-root-user --mount --pid --fork --kill-child=KILL --net --ipc --uts \
           ${renderInNamespace} \
-          "$HOME" "$staged_home" "$run_dir/repo"; then
+          "$HOME" "$source_home" "$staged_home" "$run_dir/repo"; then
         :
       else
         status=$?
@@ -334,12 +468,14 @@ in
       ProtectHome = "tmpfs";
       # gh keeps the token in Secret Service. Expose only its config metadata
       # and the user-bus socket needed for the pre-render credential lookup.
-      # renderInNamespace mounts a fresh tmpfs over XDG_RUNTIME_DIR, so the
-      # fetched repository and its renderer still cannot reach that socket.
+      # Trusted wrapper snapshots explicit Claude config entry points and
+      # enabled plugin roots. renderInNamespace masks the live home and runtime
+      # directory, then exposes only the sparse source snapshot read-only.
       BindReadOnlyPaths = lib.concatStringsSep " " [
         "-%h/.claude"
         "-%h/.claude.json"
         "-%h/.config/gh"
+        "-%h/Repos"
         "-%t/bus"
       ];
       BindPaths = lib.concatStringsSep " " [

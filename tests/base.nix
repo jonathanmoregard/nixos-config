@@ -1287,6 +1287,14 @@ in
             f"{expected!r} — the detector is not armed, so nothing is "
             "watching whether recall works"
         )
+    # Later cases drive the service directly and inspect ExecMainStatus.
+    # Stop the wall-clock trigger after proving it is armed; otherwise an
+    # hour boundary can start a second run between those two operations and
+    # temporarily reset ExecMainStatus to 0 while the new run is activating.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user stop aggregator-schema-health.timer'"
+    )
 
     health_unit = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -2354,11 +2362,34 @@ in
     network_output = "/home/jonathan/.codex/claude-setup-mirror/network-output"
     bus_output = "/home/jonathan/.codex/claude-setup-mirror/bus-output"
     proc_output = "/home/jonathan/.codex/claude-setup-mirror/proc-output"
+    source_output = "/home/jonathan/.codex/claude-setup-mirror/source-output"
     failure = "/home/jonathan/.local/state/ai-client-config-sync/last-failure"
     dellan.succeed(
         f"install -d -o jonathan -g users {fixture} {fixture}/scripts && "
         "install -d -o jonathan -g users /home/jonathan/.codex/claude-setup-mirror && "
         "install -d -o jonathan -g users /home/jonathan/.codex/sessions && "
+        "install -d -o jonathan -g users /home/jonathan/.claude/commands && "
+        "install -d -o jonathan -g users /home/jonathan/.claude/plugins/cache && "
+        "install -d -o jonathan -g users /home/jonathan/.config/gh && "
+        "install -d -o jonathan -g users /home/jonathan/Repos/sync-source-fixture && "
+        "install -d -o jonathan -g users "
+        "/home/jonathan/Repos/sync-plugin-fixture/skills/external-plugin && "
+        "printf 'external-source\\n' > /home/jonathan/Repos/sync-source-fixture/external.md && "
+        "printf '%s\\n' 'external-plugin-source' > "
+        "/home/jonathan/Repos/sync-plugin-fixture/skills/external-plugin/SKILL.md && "
+        "printf '%s\\n' '{\"enabledPlugins\":{\"external@test\":true}}' > "
+        "/home/jonathan/.claude/settings.json && "
+        "printf '%s\\n' '{\"plugins\":{\"external@test\":[{\"installPath\":\"/home/jonathan/Repos/sync-plugin-fixture\"}]}}' > "
+        "/home/jonathan/.claude/plugins/installed_plugins.json && "
+        "printf 'credential-sentinel\\n' > /home/jonathan/.config/gh/leak-sentinel && "
+        "ln -s /home/jonathan/.config/gh/leak-sentinel "
+        "/home/jonathan/.claude/plugins/cache/leak-sentinel && "
+        "chown -R jonathan:users /home/jonathan/.claude /home/jonathan/.config/gh "
+        "/home/jonathan/Repos/sync-source-fixture "
+        "/home/jonathan/Repos/sync-plugin-fixture && "
+        "ln -s /home/jonathan/Repos/sync-source-fixture/external.md "
+        "/home/jonathan/.claude/commands/external.md && "
+        "chown -h jonathan:users /home/jonathan/.claude/commands/external.md && "
         "printf 'stable\\n' > /home/jonathan/.codex/AGENTS.md && "
         "chown jonathan:users /home/jonathan/.codex/AGENTS.md && "
         f"su - jonathan -c 'git init -b main {fixture} && "
@@ -2377,7 +2408,15 @@ in
     commit_renderer(
         "v1",
         "'import os' 'from pathlib import Path' "
-        "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v1\\n\")'",
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v1\\n\")' "
+        "'source = Path.home() / \".claude\" / \"commands\" / \"external.md\"' "
+        "'source_state = \"symlink\" if source.is_symlink() else \"materialized\"' "
+        "'repo_state = \"repo-visible\" if Path(\"/home/jonathan/Repos/sync-source-fixture\").exists() else \"repo-hidden\"' "
+        "'plugin = Path(\"/home/jonathan/Repos/sync-plugin-fixture/skills/external-plugin/SKILL.md\")' "
+        "'plugin_state = plugin.read_text().strip() + \"\\nplugin-visible\" if plugin.exists() else \"plugin-hidden\"' "
+        "'leak = Path.home() / \".claude\" / \"plugins\" / \"cache\" / \"leak-sentinel\"' "
+        "'leak_state = leak.read_text().strip() if leak.exists() else \"leak-hidden\"' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_SOURCE_OUTPUT\"]).write_text(source.read_text() + source_state + \"\\n\" + repo_state + \"\\n\" + plugin_state + \"\\n\" + leak_state + \"\\n\")'",
     )
     user_systemctl = (
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -2393,10 +2432,16 @@ in
         + f"AI_CLIENT_CONFIG_NETWORK_OUTPUT={network_output} "
         + f"AI_CLIENT_CONFIG_BUS_OUTPUT={bus_output} "
         + f"AI_CLIENT_CONFIG_PROC_OUTPUT={proc_output} "
+        + f"AI_CLIENT_CONFIG_SOURCE_OUTPUT={source_output} "
         + f"AI_CLIENT_CONFIG_TEST_OUTPUT={output}'"
     )
     dellan.succeed(user_systemctl + " start ai-client-config-codex-sync.service'")
     assert dellan.succeed(f"cat {output}").strip() == "v1"
+    source_text = dellan.succeed(f"cat {source_output}").strip()
+    assert source_text == (
+        "external-source\nmaterialized\nrepo-hidden\n"
+        "external-plugin-source\nplugin-visible\nleak-hidden"
+    ), source_text
 
     # A second invocation must clone again and execute the new remote HEAD,
     # not a cached checkout or the user's dirty development tree.
@@ -2469,7 +2514,7 @@ in
     )
     for marker in [
         "ProtectHome=tmpfs",
-        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json -%h/.config/gh -%t/bus",
+        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json -%h/.config/gh -%h/Repos -%t/bus",
         "InaccessiblePaths=-%h/.codex/auth.json -%h/.codex/sessions",
     ]:
         assert marker in sync_service, (
@@ -2484,6 +2529,10 @@ in
     for marker in [
         "credential.https://github.com.helper=",
         "gh auth git-credential",
+        'stage="snapshot-source"',
+        "cp -a --no-preserve=ownership",
+        'enabled_plugin_paths="$run_dir/enabled-plugin-paths"',
+        'chmod -R u+w -- "$source_home"',
     ]:
         assert marker in sync_script_text, (
             f"ai-client-config sync lost host-scoped gh helper '{marker}':\\n"
@@ -2527,7 +2576,7 @@ in
         + "AI_CLIENT_CONFIG_ALLOW_FILE_REMOTE "
         + "AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS AI_CLIENT_CONFIG_TEST_OUTPUT "
         + "AI_CLIENT_CONFIG_NETWORK_OUTPUT AI_CLIENT_CONFIG_BUS_OUTPUT "
-        + "AI_CLIENT_CONFIG_PROC_OUTPUT'"
+        + "AI_CLIENT_CONFIG_PROC_OUTPUT AI_CLIENT_CONFIG_SOURCE_OUTPUT'"
     )
 
     # The feature VM has no desktop keyring. Production's default HTTPS
