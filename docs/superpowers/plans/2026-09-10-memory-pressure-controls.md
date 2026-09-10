@@ -86,6 +86,7 @@
 - [ ] Define `ram-heavy.slice` with accounting, `MemoryHigh=12G`, swap killing, and pressure killing at 40 percent for 10 seconds.
 - [ ] Add matching managed-OOM settings and `MemoryHigh=12G` to `nix-daemon.service`, relying on `use-cgroups` descendants as candidates and leaving daemon `OOMPolicy` unchanged.
 - [ ] Import the module on dellan. Prove `oomctl` contains the two intended paths and excludes root, system, `user.slice`, `user-1000.slice`, and graphical session scopes.
+- [ ] In the VM only, override the heavy slice to a small `MemoryHigh` and one-second pressure duration. Start one memory hog below it, require OOMD to terminate that scope, and require the outside-session sentinel to remain alive. This is the negative control proving kill scope, not settings presence.
 - [ ] Run `nix build .#checks.x86_64-linux.vm-base -L`.
 
 ### Task 7: Interactive feature-VM smoke
