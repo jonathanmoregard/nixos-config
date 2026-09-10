@@ -316,6 +316,45 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # klaffat-pull — keep the non-development Klaffat checkout on clean,
+  # current main. Feature work happens in dedicated worktrees; requiring the
+  # expected branch and a clean tree makes this unattended pull fail closed
+  # instead of reconciling or overwriting local work.
+  systemd.user.services.klaffat-pull = {
+    Unit = {
+      Description = "Fast-forward the clean Klaffat main checkout to origin";
+      After = [ "default.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      ExecStart = "%h/.claude/scripts/claude-pull.sh";
+      # Environment= does not expand systemd specifiers, so interpolate the
+      # absolute repository path at build time.
+      Environment = [
+        "CLAUDE_PULL_REPO=${config.home.homeDirectory}/Repos/klaffat"
+        "CLAUDE_PULL_EXPECT_BRANCH=main"
+        "CLAUDE_PULL_EXPECT_UPSTREAM=origin/main"
+        "CLAUDE_PULL_REQUIRE_CLEAN=1"
+        "CLAUDE_PULL_UNIT=klaffat-pull"
+      ];
+      Nice = 10;
+      IOSchedulingClass = "idle";
+      TimeoutStartSec = 180;
+    };
+  };
+
+  systemd.user.timers.klaffat-pull = {
+    Unit.Description = "Poll origin for Klaffat main every 30 minutes";
+    Timer = {
+      OnCalendar = "*:2/30";
+      Persistent = true;
+      AccuracySec = "1min";
+      RandomizedDelaySec = "1min";
+      Unit = "klaffat-pull.service";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # claude-proposals-push — the same split as the two pullers above, pointed
   # the other way.
   #
