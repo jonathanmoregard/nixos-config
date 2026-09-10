@@ -10,6 +10,10 @@
 # nothing says which is live. The consumer (the aggregator's ticktick source)
 # now reads the shared store directly.
 #
+# Same ownership rule applies to GitHub. `gh auth` owns its OAuth credential
+# in the desktop keyring. A github-readonly-pat agenix declaration shadowed
+# that live credential through GH_TOKEN, then expired independently.
+#
 # Deliberately an eval check, not a VM assertion. Asserting "the file is
 # absent from /run/agenix" inside the test VM would pass vacuously — the VM
 # has no host key, so no secret decrypts there and every such assertion is
@@ -25,6 +29,9 @@
 let
   # name -> where the real credential lives, quoted verbatim in the failure.
   deadCredentials = {
+    github-readonly-pat =
+      "gh CLI keyring (oauth_token for github.com), refreshed and owned by "
+      + "gh auth; consume it through gh rather than copying it into agenix";
     ticktick-api-token =
       "~/.config/todo/env (TICKTICK_ACCESS_TOKEN), rewritten on refresh by "
       + "~/.claude/todo/backends/ticktick.py; read it from there";

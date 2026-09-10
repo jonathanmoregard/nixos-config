@@ -122,11 +122,10 @@
     # The three uv2nix inputs below were already in flake.lock transitively
     # (tts-tool / substack-url-tool / prose-decorate each pull them); the
     # `follows` lines keep them deduplicated to one copy each.
-    # Bump 9dd36dc -> 14086e9 (2026-09-08): run the long-lived embed worker as
-    # Type=simple so Home Manager activation starts it in the background instead
-    # of waiting for the entire backfill to finish.
+    # Bump 14086e9 -> 472fb55 (2026-09-09): make GitHub ingest structurally
+    # GET-only and reuse gh's keyring credential instead of an expiring PAT.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/14086e97981446ee19dd84ca92dcfd859e1720df";
+      url = "github:jonathanmoregard/aggregator/472fb55d1390304db99e6f1d0a0d0a1346d899ae";
       flake = false;
     };
 

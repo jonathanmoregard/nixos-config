@@ -77,8 +77,8 @@
     # up. The CLI it runs is `pkgs.aggregator` — a uv2nix build of the rev
     # pinned as the `aggregator-src` flake input (overlays/aggregator.nix),
     # NOT the developer checkout the wrapper used to `uv run` against.
-    # Consumes age.secrets.github-readonly-pat declared below; ticktick
-    # reads its own token from ~/.config/todo/env and gets no secret here.
+    # GitHub auth comes from gh's existing keyring entry; ticktick reads its
+    # own token from ~/.config/todo/env. Neither gets a copied secret here.
     ../../modules/nixos/aggregator-ingest-timer.nix
 
     # `aggregator-schema-health` — hourly user timer comparing the cache's
@@ -195,17 +195,9 @@
     group = "users";
     mode = "0400";
   };
-  # GitHub read-only PAT consumed by the aggregator's github source, one
-  # of the nine driven by the `aggregator-ingest` timer above.
-  # Raw token only in the .age file (no `KEY=`
-  # prefix); the wrapper reads it with `cat` and exports GH_TOKEN itself.
-  # owner=jonathan + mode=0400 because the ingest runs as the user.
-  age.secrets.github-readonly-pat = {
-    rekeyFile = ../../secrets/github-readonly-pat.age;
-    owner = "jonathan";
-    group = "users";
-    mode = "0400";
-  };
+  # No github-readonly-pat here. `gh` owns and refreshes the GitHub OAuth
+  # credential in the desktop keyring; aggregator invokes only fixed GET
+  # search endpoints. Enforced by secrets-no-dead-credentials.
   # No ticktick-api-token here on purpose. The aggregator's ticktick ingest
   # reads TICKTICK_ACCESS_TOKEN from ~/.config/todo/env, the same store
   # ~/.claude/todo/backends/ticktick.py rewrites whenever it refreshes the

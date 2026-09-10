@@ -1072,13 +1072,11 @@ in
     # Since 2026-08-16 the CLI itself IS in the VM closure (the unit execs
     # a store path built by overlays/aggregator.nix, not a checkout), so
     # `--help` and the Presidio-path assertion below run the real binary.
-    # A full ingest still cannot run here — no network, no agenix secret,
-    # no ~/.claude/projects — so no run of the real command reaches exit 3
-    # from inside the test. The exit-3 -> OnFailure
-    # edge is therefore driven by overriding ONLY ExecStart via a drop-in
+    # The real all-sources command runs here despite the empty machine: source
+    # isolation lets it finish and report the expected GitHub auth failures.
+    # Synthetic exit-code cases still override ONLY ExecStart via a drop-in
     # (the [Unit] section, and with it the OnFailure edge under test, stays
-    # the production one), while the wrapper half is covered by invoking the
-    # real generated script and by starting the real unit unmodified.
+    # the production one).
     agg_timers = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user list-timers --all'"
@@ -1112,6 +1110,12 @@ in
     # default, which is how a hang becomes an unbounded "activating").
     assert "OnFailure=aggregator-ingest-failure-notify.service" in agg_unit, (
         f"aggregator-ingest.service lost its OnFailure edge:\n{agg_unit}"
+    )
+    assert "GH_TOKEN=" not in agg_unit, (
+        f"aggregator unit must not inject a token ahead of gh's keyring:\n{agg_unit}"
+    )
+    assert "github-readonly-pat" not in agg_unit, (
+        f"aggregator unit still references the retired agenix copy:\n{agg_unit}"
     )
     assert "TimeoutStartSec=" in agg_unit, (
         f"aggregator-ingest.service lost its TimeoutStartSec backstop:\n{agg_unit}"
@@ -1172,6 +1176,14 @@ in
     # unattended systemd unit. `uv` is no longer even in runtimeInputs.
     assert "uv run" not in agg_script, (
         f"aggregator wrapper must not shell out to `uv run`:\n{agg_script}"
+    )
+    # GitHub authentication belongs to gh's keyring. A copied token in the
+    # wrapper would expire independently and shadow that live credential.
+    assert "GH_TOKEN" not in agg_script, (
+        f"aggregator wrapper must not export a copied GitHub token:\n{agg_script}"
+    )
+    assert "github-readonly-pat" not in agg_script, (
+        f"aggregator wrapper still references the retired agenix copy:\n{agg_script}"
     )
     # `exec`, so the CLI's exit status is the unit's exit status. Anything
     # that captures and re-raises the status by hand can zero it (PR #67),
@@ -2095,17 +2107,28 @@ in
 
     agg_baseline = agg_notify_count()
 
-    # (1) The real generated wrapper, invoked directly with the adversarial
-    # input this VM naturally supplies: no decrypted agenix secret. It must
-    # exit non-zero and say which guard tripped, not proceed to ingest
-    # anonymously.
-    agg_guard = dellan.fail(f"su - jonathan -c '{agg_exec}' 2>&1")
-    assert "aggregator-ingest: secret" in agg_guard, (
-        "wrapper must name the failing guard when the agenix secret is not "
-        f"readable:\n{agg_guard}"
+    # (1) The real generated wrapper, invoked directly without any gh
+    # keyring. Supply the same CA environment as the production unit so this
+    # probe reaches authentication instead of stopping at the wrapper's TLS
+    # preflight. It must run the source-isolated all-sources pipeline, report
+    # GitHub's authentication failure, and exit non-zero rather than treating
+    # an empty API result as success.
+    dellan.succeed("install -d -m 0755 /run/aggregator-empty-gh-config")
+    agg_auth_failure = dellan.fail(
+        "su - jonathan -c 'env -u GH_TOKEN -u GITHUB_TOKEN "
+        "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt "
+        "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt "
+        f"GH_CONFIG_DIR=/run/aggregator-empty-gh-config {agg_exec}' 2>&1"
+    )
+    assert (
+        "github: added=0 updated=0 unchanged=0 skipped=0 errors=4"
+        in agg_auth_failure
+    ), (
+        "wrapper must report GitHub as failed when gh has no credential, "
+        f"while still completing the isolated run:\n{agg_auth_failure}"
     )
 
-    # (2) The real unit, unmodified, taking that same guard path: a
+    # (2) The real unit, unmodified, taking that same no-keyring path: a
     # non-zero ExecStart must fail the unit and fire the notifier.
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -2116,18 +2139,17 @@ in
         "systemctl --user is-failed aggregator-ingest.service || true'"
     ).strip()
     assert agg_state == "failed", (
-        f"aggregator-ingest.service should be failed after the guard path; "
+        f"aggregator-ingest.service should be failed without gh auth; "
         f"got is-failed={agg_state!r}"
     )
-    wait_agg_notify(agg_baseline, "the real wrapper's guard-path failure")
+    wait_agg_notify(agg_baseline, "the real wrapper's no-keyring failure")
     agg_baseline = agg_notify_count()
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user reset-failed aggregator-ingest.service'"
     )
 
-    # (3) and (4) inject exit codes the aggregator CLI cannot produce here
-    # (no checkout, no network for `uv`) by overriding ONLY ExecStart. The
+    # (3) and (4) inject exact exit codes by overriding ONLY ExecStart. The
     # [Unit] section — and with it the OnFailure edge under test — stays
     # exactly the production one.
     def agg_dropin(exit_code):
