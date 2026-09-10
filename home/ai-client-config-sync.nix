@@ -8,11 +8,85 @@ let
     sandbox_repo=/tmp/ai-client-config-repo
     sandbox_claude=/tmp/ai-client-config-claude
     sandbox_claude_state=/tmp/ai-client-config-claude.json
+    sandbox_link_targets=/tmp/ai-client-config-link-targets
+    link_paths=()
+    link_sources=()
+    link_kinds=()
 
-    mkdir -p "$sandbox_repo" "$sandbox_claude"
+    mkdir -p "$sandbox_repo" "$sandbox_claude" "$sandbox_link_targets"
     ${pkgs.util-linux}/bin/mount --bind "$repo" "$sandbox_repo"
     ${pkgs.util-linux}/bin/mount --bind "$source_home/.claude" "$sandbox_claude"
     ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$sandbox_claude"
+
+    # ProtectHome hides ~/Repos from the fetched renderer. Preserve only
+    # existing targets explicitly referenced by Claude config symlinks, then
+    # restore those exact paths after staged_home covers the real home.
+    while IFS= read -r -d "" link; do
+      link_path=$(${pkgs.python3}/bin/python3 -c \
+        'import os, sys; link = sys.argv[1]; print(os.path.abspath(os.path.join(os.path.dirname(link), os.readlink(link))))' \
+        "$link")
+      link_source=$(readlink -f -- "$link") || continue
+      case "$link_path" in
+        "$source_home"/Repos/*) ;;
+        *) continue ;;
+      esac
+      case "$link_source" in
+        "$source_home"/Repos/*) ;;
+        *) continue ;;
+      esac
+
+      if [ -d "$link_source" ]; then
+        link_kind=directory
+      elif [ -f "$link_source" ]; then
+        link_kind=file
+      else
+        continue
+      fi
+
+      skip=0
+      for index in "''${!link_paths[@]}"; do
+        if [ "$link_path" = "''${link_paths[$index]}" ] || \
+          { [ "''${link_kinds[$index]}" = directory ] && \
+            [[ "$link_path" == "''${link_paths[$index]}"/* ]]; }; then
+          skip=1
+          break
+        fi
+      done
+      [ "$skip" -eq 0 ] || continue
+
+      if [ "$link_kind" = directory ]; then
+        kept_paths=()
+        kept_sources=()
+        kept_kinds=()
+        for index in "''${!link_paths[@]}"; do
+          if [[ "''${link_paths[$index]}" == "$link_path"/* ]]; then
+            continue
+          fi
+          kept_paths+=("''${link_paths[$index]}")
+          kept_sources+=("''${link_sources[$index]}")
+          kept_kinds+=("''${link_kinds[$index]}")
+        done
+        link_paths=("''${kept_paths[@]}")
+        link_sources=("''${kept_sources[@]}")
+        link_kinds=("''${kept_kinds[@]}")
+      fi
+
+      link_paths+=("$link_path")
+      link_sources+=("$link_source")
+      link_kinds+=("$link_kind")
+    done < <(find "$source_home/.claude" -type l -print0)
+
+    for index in "''${!link_paths[@]}"; do
+      preserved="$sandbox_link_targets/$index"
+      if [ "''${link_kinds[$index]}" = directory ]; then
+        mkdir -p "$preserved"
+      else
+        touch "$preserved"
+      fi
+      ${pkgs.util-linux}/bin/mount --bind \
+        "''${link_sources[$index]}" "$preserved"
+      ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$preserved"
+    done
 
     has_claude_state=0
     if [ -f "$source_home/.claude.json" ]; then
@@ -33,6 +107,18 @@ let
         "$sandbox_claude_state" "$source_home/.claude.json"
       ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$source_home/.claude.json"
     fi
+    for index in "''${!link_paths[@]}"; do
+      link_path="''${link_paths[$index]}"
+      mkdir -p "$(dirname "$link_path")"
+      if [ "''${link_kinds[$index]}" = directory ]; then
+        mkdir -p "$link_path"
+      else
+        touch "$link_path"
+      fi
+      ${pkgs.util-linux}/bin/mount --bind \
+        "$sandbox_link_targets/$index" "$link_path"
+      ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$link_path"
+    done
 
     ${pkgs.util-linux}/bin/mount -t tmpfs -o mode=0700 \
       tmpfs "$XDG_RUNTIME_DIR"
@@ -334,12 +420,15 @@ in
       ProtectHome = "tmpfs";
       # gh keeps the token in Secret Service. Expose only its config metadata
       # and the user-bus socket needed for the pre-render credential lookup.
+      # ~/Repos is visible only to the trusted wrapper, which narrows it to
+      # exact Claude symlink targets before running the fetched renderer.
       # renderInNamespace mounts a fresh tmpfs over XDG_RUNTIME_DIR, so the
       # fetched repository and its renderer still cannot reach that socket.
       BindReadOnlyPaths = lib.concatStringsSep " " [
         "-%h/.claude"
         "-%h/.claude.json"
         "-%h/.config/gh"
+        "-%h/Repos"
         "-%t/bus"
       ];
       BindPaths = lib.concatStringsSep " " [

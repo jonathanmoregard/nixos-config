@@ -2354,11 +2354,21 @@ in
     network_output = "/home/jonathan/.codex/claude-setup-mirror/network-output"
     bus_output = "/home/jonathan/.codex/claude-setup-mirror/bus-output"
     proc_output = "/home/jonathan/.codex/claude-setup-mirror/proc-output"
+    symlink_output = "/home/jonathan/.codex/claude-setup-mirror/symlink-output"
+    repo_sibling_output = "/home/jonathan/.codex/claude-setup-mirror/repo-sibling-output"
     failure = "/home/jonathan/.local/state/ai-client-config-sync/last-failure"
     dellan.succeed(
         f"install -d -o jonathan -g users {fixture} {fixture}/scripts && "
         "install -d -o jonathan -g users /home/jonathan/.codex/claude-setup-mirror && "
         "install -d -o jonathan -g users /home/jonathan/.codex/sessions && "
+        "install -d -o jonathan -g users /home/jonathan/.claude/commands && "
+        "install -d -o jonathan -g users /home/jonathan/Repos/sync-input/commands && "
+        "printf 'external command\\n' > /home/jonathan/Repos/sync-input/commands/evolve.md && "
+        "printf 'must stay hidden\\n' > /home/jonathan/Repos/sync-input/private.txt && "
+        "chown -R jonathan:users /home/jonathan/Repos/sync-input && "
+        "ln -s /home/jonathan/Repos/sync-input/commands/evolve.md "
+        "/home/jonathan/.claude/commands/evolve.md && "
+        "chown -h jonathan:users /home/jonathan/.claude/commands/evolve.md && "
         "printf 'stable\\n' > /home/jonathan/.codex/AGENTS.md && "
         "chown jonathan:users /home/jonathan/.codex/AGENTS.md && "
         f"su - jonathan -c 'git init -b main {fixture} && "
@@ -2377,7 +2387,11 @@ in
     commit_renderer(
         "v1",
         "'import os' 'from pathlib import Path' "
-        "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v1\\n\")'",
+        "'home = Path.home()' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v1\\n\")' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_SYMLINK_OUTPUT\"]).write_text((home / \".claude/commands/evolve.md\").read_text())' "
+        "'sibling = home / \"Repos/sync-input/private.txt\"' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_REPO_SIBLING_OUTPUT\"]).write_text((\"visible\" if sibling.exists() else \"hidden\") + \"\\n\")'",
     )
     user_systemctl = (
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -2393,10 +2407,14 @@ in
         + f"AI_CLIENT_CONFIG_NETWORK_OUTPUT={network_output} "
         + f"AI_CLIENT_CONFIG_BUS_OUTPUT={bus_output} "
         + f"AI_CLIENT_CONFIG_PROC_OUTPUT={proc_output} "
+        + f"AI_CLIENT_CONFIG_SYMLINK_OUTPUT={symlink_output} "
+        + f"AI_CLIENT_CONFIG_REPO_SIBLING_OUTPUT={repo_sibling_output} "
         + f"AI_CLIENT_CONFIG_TEST_OUTPUT={output}'"
     )
     dellan.succeed(user_systemctl + " start ai-client-config-codex-sync.service'")
     assert dellan.succeed(f"cat {output}").strip() == "v1"
+    assert dellan.succeed(f"cat {symlink_output}").strip() == "external command"
+    assert dellan.succeed(f"cat {repo_sibling_output}").strip() == "hidden"
 
     # A second invocation must clone again and execute the new remote HEAD,
     # not a cached checkout or the user's dirty development tree.
@@ -2469,7 +2487,7 @@ in
     )
     for marker in [
         "ProtectHome=tmpfs",
-        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json -%h/.config/gh -%t/bus",
+        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json -%h/.config/gh -%h/Repos -%t/bus",
         "InaccessiblePaths=-%h/.codex/auth.json -%h/.codex/sessions",
     ]:
         assert marker in sync_service, (
@@ -2527,7 +2545,8 @@ in
         + "AI_CLIENT_CONFIG_ALLOW_FILE_REMOTE "
         + "AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS AI_CLIENT_CONFIG_TEST_OUTPUT "
         + "AI_CLIENT_CONFIG_NETWORK_OUTPUT AI_CLIENT_CONFIG_BUS_OUTPUT "
-        + "AI_CLIENT_CONFIG_PROC_OUTPUT'"
+        + "AI_CLIENT_CONFIG_PROC_OUTPUT AI_CLIENT_CONFIG_SYMLINK_OUTPUT "
+        + "AI_CLIENT_CONFIG_REPO_SIBLING_OUTPUT'"
     )
 
     # The feature VM has no desktop keyring. Production's default HTTPS
