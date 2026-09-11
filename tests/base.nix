@@ -369,7 +369,9 @@ in
     dellan.wait_until_succeeds(
         "test \"$(curl --max-time 2 --silent --output /dev/null "
         "--write-out %{http_code} http://127.0.0.1:8765/mcp || true)\" = 401",
-        timeout=30,
+        # Cold package imports vary sharply under CI/host CPU contention.
+        # Keep polling exact authenticated readiness with a generous ceiling.
+        timeout=120,
     )
 
     # Backend TCP is host-local, not user-private. Bearer auth is the actual
@@ -382,9 +384,12 @@ in
         "su -s /bin/sh claude-agent-1 -c '"
         f"cat ${mcpInitializeJson} | "
         "XDG_RUNTIME_DIR=/run/user/$(id -u) HOME=/home/claude-agent-1 "
-        f"timeout 15 {proxy_path}' 2>&1"
+        f"timeout 120 {proxy_path}' 2>&1"
     )
-    assert rc != 0 and "unable to read backend token file" in out, (rc, out)
+    assert rc != 0 and "unable to read backend token file" in out, (
+        "unprivileged aggregator proxy must fail on its unreadable token "
+        f"before serving stdio; got rc={rc}, output={out!r}"
+    )
     unauth_status = dellan.succeed(
         "su -s /bin/sh claude-agent-1 -c '"
         "curl --silent --output /dev/null --write-out %{http_code} "
