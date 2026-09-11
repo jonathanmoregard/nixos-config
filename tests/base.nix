@@ -15,6 +15,10 @@
 # Run: nix build .#checks.x86_64-linux.vm-base -L
 { pkgs, inputs }:
 let
+  mcpInitializeJson = pkgs.writeText "vm-base-mcp-initialize.json" ''
+    {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vm-base","version":"1"}}}
+  '';
+
   # TLS trust-store probe for aggregator-ingest.service.
   #
   # Installed as an ExecStart drop-in on the REAL unit, so it runs inside
@@ -97,6 +101,37 @@ let
       ExecStart=
       ExecStart=${pkgs.coreutils}/bin/sleep 60
     '';
+
+  # Anonymous-memory pressure fixture for the behavioral OOMD assertion. VM
+  # lowers only ram-heavy.slice's runtime threshold before launching this;
+  # production thresholds remain untouched.
+  oomdHogPy = pkgs.writeText "vm-base-oomd-hog.py" ''
+    import time
+
+    chunks = []
+    while True:
+        chunk = bytearray(16 * 1024 * 1024)
+        for offset in range(0, len(chunk), 4096):
+            chunk[offset] = 1
+        chunks.append(chunk)
+        time.sleep(0.01)
+  '';
+
+  coordinatedBuildNix = pkgs.writeText "vm-base-coordinated-build.nix" ''
+    let
+      runtimeShell = builtins.storePath "${pkgs.runtimeShell}";
+      coreutils = builtins.storePath "${pkgs.coreutils}";
+    in
+    derivation {
+      name = "vm-base-coordinated-build";
+      system = "x86_64-linux";
+      builder = runtimeShell;
+      args = [
+        "-c"
+        "''${coreutils}/bin/sleep 15; ''${coreutils}/bin/touch $out"
+      ];
+    }
+  '';
 
   # Stand-in for a hand-edited ~/.claude/dcg.toml inside the VM.
   #
@@ -295,6 +330,255 @@ in
     # tests/lib/common.nix, so a LightDM regression should fail here
     # rather than masquerade as a kitty/desktop-lane failure later.
     dellan.wait_for_x()
+
+    # RAM-pressure controls. These are runtime assertions against the
+    # generated daemon/user-manager state, not source-text checks: a module
+    # whose options render but never enroll a cgroup must fail this lane.
+    nix_config = dellan.succeed("nix config show").splitlines()
+    assert "max-jobs = 1" in nix_config, (
+        "Nix daemon must admit one build at a time; got:\n"
+        + "\n".join(line for line in nix_config if "jobs" in line)
+    )
+    assert "cores = 4" in nix_config
+    assert "use-cgroups = true" in nix_config
+    experimental_features = next(
+        line for line in nix_config if line.startswith("experimental-features = ")
+    )
+    assert "cgroups" in experimental_features.split("=", 1)[1].split(), (
+        "use-cgroups requires Nix's cgroups experimental feature; got: "
+        + experimental_features
+    )
+
+    dellan.succeed("test -x /run/current-system/sw/bin/nix-memory-run")
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat ram-heavy.slice'"
+    )
+    dellan.succeed("test -d /home/jonathan/.local/share/aggregator")
+    dellan.wait_for_unit("aggregator-mcp-backend.service", "jonathan")
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-active aggregator-mcp-backend.service'"
+    )
+    jonathan_uid = dellan.succeed("id -u jonathan").strip()
+    backend_token = f"/run/user/{jonathan_uid}/aggregator-mcp/token"
+    token_stat = dellan.succeed(
+        f"stat -c '%a %U' {backend_token}"
+    ).strip()
+    assert token_stat == "600 jonathan", token_stat
+    dellan.wait_until_succeeds(
+        "test \"$(curl --max-time 2 --silent --output /dev/null "
+        "--write-out %{http_code} http://127.0.0.1:8765/mcp || true)\" = 401",
+        timeout=30,
+    )
+
+    # Backend TCP is host-local, not user-private. Bearer auth is the actual
+    # UID boundary: an unprivileged local agent gets 401 and cannot obtain the
+    # runtime token, while Jonathan's production stdio wrapper initializes.
+    proxy_path = dellan.succeed(
+        "su - jonathan -c 'command -v aggregator-mcp'"
+    ).strip()
+    rc, out = dellan.execute(
+        "su -s /bin/sh claude-agent-1 -c '"
+        f"cat ${mcpInitializeJson} | "
+        "XDG_RUNTIME_DIR=/run/user/$(id -u) HOME=/home/claude-agent-1 "
+        f"timeout 15 {proxy_path}' 2>&1"
+    )
+    assert rc != 0 and "unable to read backend token file" in out, (rc, out)
+    unauth_status = dellan.succeed(
+        "su -s /bin/sh claude-agent-1 -c '"
+        "curl --silent --output /dev/null --write-out %{http_code} "
+        "http://127.0.0.1:8765/mcp'"
+    ).strip()
+    assert unauth_status == "401", unauth_status
+    proxy_init = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "cat ${mcpInitializeJson} | timeout 30 aggregator-mcp'"
+    )
+    assert '"protocolVersion":"2025-06-18"' in proxy_init, proxy_init
+
+    # Helper contract: malformed input and child failure stay distinguishable.
+    rc, out = dellan.execute("nix-memory-run 2>&1")
+    assert rc == 2 and "usage:" in out, (rc, out)
+    rc, out = dellan.execute("nix-memory-run -- 2>&1")
+    assert rc == 2 and "command is required" in out, (rc, out)
+    rc, _ = dellan.execute("nix-memory-run -- sh -c 'exit 42'")
+    assert rc == 42, rc
+
+    # One real lock holder. Nonblocking work must defer; nested work carrying
+    # the ownership marker must bypass; ordinary work must wait then cross.
+    coordination_lock = "/home/jonathan/.nix-memory-pressure/lock"
+    lock_stat = dellan.succeed(
+        f"stat -c '%a %U' {coordination_lock}"
+    ).strip()
+    assert lock_stat == "600 jonathan", lock_stat
+    holder = dellan.succeed(
+        f"sh -c 'exec 9>{coordination_lock}; flock 9; "
+        "echo locked >/tmp/memory-lock-held; sleep 60' "
+        ">/tmp/memory-lock-holder.log 2>&1 & echo $!"
+    ).strip()
+    dellan.wait_until_succeeds("test -f /tmp/memory-lock-held")
+    rc, out = dellan.execute(
+        "su - jonathan -c 'nix-memory-run --nonblock -- true' 2>&1"
+    )
+    assert rc == 75 and "deferred" in out, (rc, out)
+    dellan.succeed(
+        "NIX_MEMORY_COORDINATION_HELD=1 "
+        "nix-memory-run -- sh -c 'echo nested >/tmp/nested-crossed'"
+    )
+    dellan.succeed("test -s /tmp/nested-crossed")
+    waiter = dellan.succeed(
+        "nix-memory-run -- sh -c 'echo waited >/tmp/waiter-crossed' "
+        ">/tmp/memory-waiter.log 2>&1 & echo $!"
+    ).strip()
+    dellan.sleep(1)
+    dellan.fail("test -e /tmp/waiter-crossed")
+    dellan.succeed(f"kill {holder}")
+    dellan.wait_until_succeeds("test -s /tmp/waiter-crossed")
+    dellan.wait_until_succeeds(f"test ! -e /proc/{waiter}")
+
+    # Run one real derivation through the production wrapper. The running Nix
+    # client must live in ram-heavy.slice, while use-cgroups places the builder
+    # in a delegated descendant below nix-daemon.service.
+    # Direct test-script references keep fixture build inputs in the sealed VM
+    # store; references nested only inside writeText contents are not imported.
+    dellan.succeed(
+        "test -x ${pkgs.runtimeShell} && test -x ${pkgs.coreutils}/bin/cat"
+    )
+    nix_client = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "nix build --impure --no-link --file ${coordinatedBuildNix}' "
+        ">/tmp/coordinated-build.log 2>&1 & echo $!"
+    ).strip()
+    builder_pattern = r"^${pkgs.coreutils}/bin/sleep 15$"
+    dellan.wait_until_succeeds(
+        f"pgrep -f '{builder_pattern}' >/dev/null || "
+        f"{{ test -e /proc/{nix_client} && exit 1; "
+        "cat /tmp/coordinated-build.log >&2; exit 2; }",
+        timeout=30,
+    )
+    builder_pid = dellan.succeed(
+        f"pgrep -f '{builder_pattern}' | head -1"
+    ).strip()
+    scope_unit = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user list-units --type=scope --state=running "
+        "--plain --no-legend \"nix-memory-*.scope\"' "
+        "| sed -n '1s/[[:space:]].*//p'"
+    ).strip()
+    assert scope_unit.startswith("nix-memory-") and scope_unit.endswith(".scope"), (
+        scope_unit
+    )
+    evaluator_cgroup = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        f"systemctl --user show -P ControlGroup {scope_unit}'"
+    )
+    assert "ram-heavy.slice/nix-memory-" in evaluator_cgroup, evaluator_cgroup
+    builder_cgroup = dellan.succeed(f"cat /proc/{builder_pid}/cgroup")
+    assert (
+        "/system.slice/nix-daemon.service/nix-build-uid-" in builder_cgroup
+    ), builder_cgroup
+    dellan.wait_until_succeeds(f"test ! -e /proc/{nix_client}", timeout=30)
+    dellan.succeed("grep -q 'vm-base-coordinated-build' /tmp/coordinated-build.log")
+
+    # Lightweight commands remain in caller scope: negative control proves
+    # wrapper classification does not serialize every Nix invocation.
+    version_cgroup = dellan.succeed(
+        "su - jonathan -c 'cat /proc/self/cgroup; nix --version >/dev/null'"
+    )
+    assert "ram-heavy.slice" not in version_cgroup, version_cgroup
+
+    # Two pane-equivalent stdio children stay alive on open pipes. They share
+    # one systemd backend and must not map any local model/NLP stack.
+    backend_pid = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -P MainPID aggregator-mcp-backend.service'"
+    ).strip()
+    assert backend_pid not in ("", "0")
+    proxy_pids = []
+    for index in (1, 2):
+        dellan.succeed(
+            "su - jonathan -c '"
+            f"sleep 60 | aggregator-mcp >/tmp/aggregator-proxy-{index}.out "
+            f"2>/tmp/aggregator-proxy-{index}.err & echo $! "
+            f">/tmp/aggregator-proxy-{index}.pipeline'"
+        )
+        pid = dellan.succeed(
+            f"cat /tmp/aggregator-proxy-{index}.pipeline"
+        ).strip()
+        dellan.wait_until_succeeds(f"test -r /proc/{pid}/maps")
+        proxy_pids.append(pid)
+    assert backend_pid not in proxy_pids, (backend_pid, proxy_pids)
+    assert len(proxy_pids) == 2, proxy_pids
+    for pid in proxy_pids:
+        maps = dellan.succeed(f"cat /proc/{pid}/maps")
+        assert not any(
+            name in maps for name in ("torch", "spacy", "presidio", "transformers")
+        ), f"proxy {pid} mapped local model stack"
+        dellan.fail(f"pgrep -P {pid}")
+        rss_kib = int(dellan.succeed(f"awk '/VmRSS:/ {{print $2}}' /proc/{pid}/status"))
+        assert rss_kib < 400000, f"proxy {pid} uses {rss_kib} KiB RSS"
+        dellan.succeed(f"kill {pid}")
+
+    dellan.wait_for_unit("systemd-oomd.service")
+    oomctl = dellan.succeed("oomctl --no-pager")
+    jonathan_uid = dellan.succeed("id -u jonathan").strip()
+    assert "/system.slice/nix-daemon.service" in oomctl, oomctl
+    assert (
+        f"/user.slice/user-{jonathan_uid}.slice/"
+        f"user@{jonathan_uid}.service/ram.slice/ram-heavy.slice"
+    ) in oomctl, oomctl
+    for unsafe_path in (
+        "\n/\n",
+        "/system.slice\n",
+        "/user.slice\n",
+        f"/user.slice/user-{jonathan_uid}.slice\n",
+        "/session-",
+    ):
+        assert unsafe_path not in oomctl, (
+            f"desktop-wide cgroup unexpectedly enrolled in OOMD: {unsafe_path!r}\n{oomctl}"
+        )
+
+    # Behavioral scope gate. Lower only this running VM's threshold, leave a
+    # sentinel outside ram-heavy.slice, then require OOMD to kill the sole
+    # heavy descendant and name it in the journal. Sentinel survival is the
+    # negative control proving desktop/user session was not a candidate.
+    user_prefix = (
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+    )
+    dellan.succeed(
+        user_prefix
+        + "systemd-run --user --unit=oomd-outside-sentinel "
+        + "--property=Type=exec -- sleep 120'"
+    )
+    outside_cgroup = dellan.succeed(
+        user_prefix
+        + "systemctl --user show -P ControlGroup oomd-outside-sentinel.service'"
+    )
+    assert "ram-heavy.slice" not in outside_cgroup
+    dellan.succeed(
+        user_prefix
+        + "systemctl --user set-property --runtime ram-heavy.slice "
+        + "MemoryHigh=128M ManagedOOMMemoryPressureLimit=1% "
+        + "ManagedOOMMemoryPressureDurationSec=1s'"
+    )
+    dellan.succeed(
+        user_prefix
+        + "systemd-run --user --unit=oomd-hog --slice=ram-heavy.slice "
+        + "--property=Type=exec -- ${pkgs.python3}/bin/python3 ${oomdHogPy}'"
+    )
+    dellan.wait_until_succeeds(
+        user_prefix + "systemctl --user is-failed oomd-hog.service'",
+        timeout=60,
+    )
+    dellan.succeed(
+        user_prefix
+        + "systemctl --user is-active oomd-outside-sentinel.service'"
+    )
+    dellan.succeed(
+        "journalctl -u systemd-oomd.service --no-pager "
+        "| grep -F 'oomd-hog.service'"
+    )
 
     # Crontab source includes the bare-repo main-fetch line so worktrees
     # branched off ~/Repos/nixos-config/main don't start behind origin/main.
@@ -1843,7 +2127,9 @@ in
             f"systemctl --user cat {unit}'"
         ):
             agg_armed.append(unit)
-    # Three armed units now. The health timer is armed on purpose — a detector
+    # Four armed units now. The shared MCP backend is armed on purpose so every
+    # stdio client can remain a tiny proxy, and its process/model behavior is
+    # exercised above. The health timer is also armed on purpose — a detector
     # that only runs when someone remembers to run it is not a detector — and
     # its two services are deliberately NOT here: the check service is started
     # by its timer and the failure-notify service is OnFailure-only, both
@@ -1852,9 +2138,11 @@ in
     assert agg_armed == [
         "aggregator-embed.timer",
         "aggregator-ingest.timer",
+        "aggregator-mcp-backend.service",
         "aggregator-schema-health.timer",
     ], (
-        "the set of ARMED aggregator units changed. Only the three timers may "
+        "the set of ARMED aggregator units changed. Only the three timers and "
+        "the shared MCP backend may "
         f"carry an [Install] WantedBy; got {agg_armed} out of "
         f"{agg_all_units}.\n"
         "A newly armed unit is something an aggregator-src bump added that "

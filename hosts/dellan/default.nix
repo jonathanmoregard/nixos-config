@@ -22,6 +22,7 @@
     # webhook latency optimization.
     ../../modules/nixos/nixos-auto-deploy.nix
     ../../modules/nixos/build-coordination.nix
+    ../../modules/nixos/memory-pressure.nix
     ../../modules/nixos/cachix-push.nix
     ../../modules/nixos/claude-agent-users.nix
 

@@ -15,6 +15,18 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.nixos-auto-deploy;
+  memoryRunner = config.services.buildCoordination.runnerPackage;
+
+  rebuildStarter = pkgs.writeShellApplication {
+    name = "nixos-deploy-rebuild-starter";
+    text = ''
+      set -euo pipefail
+      marker=$1
+      shift
+      printf 'started\n' > "$marker"
+      exec "$@"
+    '';
+  };
 
   deployScript = pkgs.writeShellApplication {
     name = "nixos-deploy";
@@ -142,7 +154,19 @@ let
       # Step 7: deploy.
       echo "deploying $target_sha"
       git reset --hard "$target_sha"
-      if nixos-rebuild switch --flake ".#${cfg.flakeAttr}"; then
+      rebuild_marker=$(mktemp "$STATE/rebuild-started.XXXXXX")
+      trap 'rm -f "$rebuild_marker"' EXIT
+      set +e
+      ${memoryRunner}/bin/nix-memory-run --nonblock -- \
+        ${rebuildStarter}/bin/nixos-deploy-rebuild-starter "$rebuild_marker" \
+        nixos-rebuild switch --flake ".#${cfg.flakeAttr}"
+      deploy_rc=$?
+      set -e
+      rebuild_started=0
+      if [ -s "$rebuild_marker" ]; then
+        rebuild_started=1
+      fi
+      if [ "$deploy_rc" -eq 0 ]; then
         # Record the deployed SHA in `last-good` — both the idempotency
         # input for the next tick AND the operator-facing "what's on the
         # box" record documented in CLAUDE.md's Deploy workflow. The
@@ -154,6 +178,9 @@ let
         # picks this up; notify-send in the user service).
         touch "$STATE/notify-success"
         echo "deploy success: $target_sha"
+        exit 0
+      elif [ "$deploy_rc" -eq 75 ] && [ "$rebuild_started" -eq 0 ]; then
+        echo "deploy deferred: another memory-heavy job is active"
         exit 0
       else
         echo "$target_sha" >> "$STATE/poison-latch"
@@ -243,6 +270,11 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [{
+      assertion = config.services.buildCoordination.enable;
+      message = "services.nixos-auto-deploy requires services.buildCoordination.enable";
+    }];
+
     systemd.services.nixos-deploy = {
       description = "NixOS automated deploy from git";
       path = with pkgs; [ git nixos-rebuild util-linux openssh coreutils gnugrep gnused ];

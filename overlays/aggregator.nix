@@ -191,9 +191,31 @@ in
     # has to land in this same bin/ or the packaged tier never exists and the
     # hook falls back to guessing at a checkout. The spaCy PYTHONPATH is
     # irrelevant to it (stdlib-only by contract) and harmless.
-    for prog in aggregator aggregator-mcp aggregator-schema-probe; do
-      makeWrapper "${venv}/bin/$prog" "$out/bin/$prog" \
-        --prefix PYTHONPATH : "${spacyModel}/${python.sitePackages}"
-    done
+    makeWrapper "${venv}/bin/aggregator" "$out/bin/aggregator" \
+      --prefix PYTHONPATH : "${spacyModel}/${python.sitePackages}"
+
+    # Keep the command path every Claude/Codex manifest and schema-health
+    # probe already resolves, but make each pane a small stdio transport
+    # bridge. No fallback: backend loss must stay visible rather than silently
+    # rebuilding several GiB of private model state in every pane.
+    makeWrapper "${venv}/bin/aggregator-mcp" "$out/bin/aggregator-mcp" \
+      --prefix PYTHONPATH : "${spacyModel}/${python.sitePackages}" \
+      --set AGGREGATOR_MCP_BACKEND_URL "http://127.0.0.1:8765/mcp" \
+      --set FASTMCP_CLIENT_INIT_TIMEOUT "10" \
+      --run 'export AGGREGATOR_MCP_BACKEND_TOKEN_FILE="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/aggregator-mcp/token"'
+
+    # Same artifact, opposite role. FastMCP reads these settings when main()
+    # reaches server.run(); explicitly remove the proxy selector so this
+    # process owns the real tool server and model state exactly once.
+    makeWrapper "${venv}/bin/aggregator-mcp" "$out/bin/aggregator-mcp-backend" \
+      --prefix PYTHONPATH : "${spacyModel}/${python.sitePackages}" \
+      --unset AGGREGATOR_MCP_BACKEND_URL \
+      --set FASTMCP_TRANSPORT "http" \
+      --set FASTMCP_HOST "127.0.0.1" \
+      --set FASTMCP_PORT "8765" \
+      --run 'export AGGREGATOR_MCP_BACKEND_TOKEN_FILE="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/aggregator-mcp/token"'
+
+    makeWrapper "${venv}/bin/aggregator-schema-probe" "$out/bin/aggregator-schema-probe" \
+      --prefix PYTHONPATH : "${spacyModel}/${python.sitePackages}"
   '';
 }
