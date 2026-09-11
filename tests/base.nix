@@ -369,9 +369,8 @@ in
     dellan.wait_until_succeeds(
         "test \"$(curl --max-time 2 --silent --output /dev/null "
         "--write-out %{http_code} http://127.0.0.1:8765/mcp || true)\" = 401",
-        # Cold model imports can exceed 30s when host-wide build coordination
-        # is waiting behind already-running, unwrapped jobs. Keep this bounded
-        # while allowing a loaded VM to prove backend readiness.
+        # Cold package/model imports vary sharply under CI/host CPU contention.
+        # Keep polling exact authenticated readiness with a generous ceiling.
         timeout=120,
     )
 
@@ -387,7 +386,10 @@ in
         "XDG_RUNTIME_DIR=/run/user/$(id -u) HOME=/home/claude-agent-1 "
         f"timeout 120 {proxy_path}' 2>&1"
     )
-    assert rc != 0 and "unable to read backend token file" in out, (rc, out)
+    assert rc != 0 and "unable to read backend token file" in out, (
+        "unprivileged aggregator proxy must fail on its unreadable token "
+        f"before serving stdio; got rc={rc}, output={out!r}"
+    )
     unauth_status = dellan.succeed(
         "su -s /bin/sh claude-agent-1 -c '"
         "curl --silent --output /dev/null --write-out %{http_code} "
@@ -1574,6 +1576,14 @@ in
             f"{expected!r} — the detector is not armed, so nothing is "
             "watching whether recall works"
         )
+    # Later cases drive the service directly and inspect ExecMainStatus.
+    # Stop the wall-clock trigger after proving it is armed; otherwise an
+    # hour boundary can start a second run between those two operations and
+    # temporarily reset ExecMainStatus to 0 while the new run is activating.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user stop aggregator-schema-health.timer'"
+    )
 
     health_unit = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -2740,21 +2750,40 @@ in
     network_output = "/home/jonathan/.codex/claude-setup-mirror/network-output"
     bus_output = "/home/jonathan/.codex/claude-setup-mirror/bus-output"
     proc_output = "/home/jonathan/.codex/claude-setup-mirror/proc-output"
-    symlink_output = "/home/jonathan/.codex/claude-setup-mirror/symlink-output"
-    repo_sibling_output = "/home/jonathan/.codex/claude-setup-mirror/repo-sibling-output"
+    source_output = "/home/jonathan/.codex/claude-setup-mirror/source-output"
+    claude_state_output = "/home/jonathan/.codex/claude-setup-mirror/claude-state-output"
     failure = "/home/jonathan/.local/state/ai-client-config-sync/last-failure"
     dellan.succeed(
         f"install -d -o jonathan -g users {fixture} {fixture}/scripts && "
         "install -d -o jonathan -g users /home/jonathan/.codex/claude-setup-mirror && "
         "install -d -o jonathan -g users /home/jonathan/.codex/sessions && "
         "install -d -o jonathan -g users /home/jonathan/.claude/commands && "
-        "install -d -o jonathan -g users /home/jonathan/Repos/sync-input/commands && "
-        "printf 'external command\\n' > /home/jonathan/Repos/sync-input/commands/evolve.md && "
-        "printf 'must stay hidden\\n' > /home/jonathan/Repos/sync-input/private.txt && "
-        "chown -R jonathan:users /home/jonathan/Repos/sync-input && "
-        "ln -s /home/jonathan/Repos/sync-input/commands/evolve.md "
-        "/home/jonathan/.claude/commands/evolve.md && "
-        "chown -h jonathan:users /home/jonathan/.claude/commands/evolve.md && "
+        "install -d -o jonathan -g users /home/jonathan/.claude/plugins/cache && "
+        "install -d -o jonathan -g users /home/jonathan/.config/gh && "
+        "install -d -o jonathan -g users /home/jonathan/Repos/sync-source-fixture && "
+        "install -d -o jonathan -g users "
+        "/home/jonathan/Repos/sync-plugin-fixture/skills/external-plugin && "
+        "printf 'external-source\\n' > /home/jonathan/Repos/sync-source-fixture/external.md && "
+        "printf '%s\\n' 'external-plugin-source' > "
+        "/home/jonathan/Repos/sync-plugin-fixture/skills/external-plugin/SKILL.md && "
+        "ln -s /home/jonathan/Repos/sync-plugin-fixture "
+        "/home/jonathan/Repos/sync-plugin-link && "
+        "printf '%s\\n' '{\"enabledPlugins\":{\"external@test\":true}}' > "
+        "/home/jonathan/.claude/settings.json && "
+        "printf '%s\\n' '{\"plugins\":{\"external@test\":[{\"installPath\":\"/home/jonathan/Repos/sync-plugin-link\"}]}}' > "
+        "/home/jonathan/.claude/plugins/installed_plugins.json && "
+        "printf 'credential-sentinel\\n' > /home/jonathan/.config/gh/leak-sentinel && "
+        "ln -s /home/jonathan/.config/gh/leak-sentinel "
+        "/home/jonathan/.claude/plugins/cache/leak-sentinel && "
+        "chown -R jonathan:users /home/jonathan/.claude /home/jonathan/.config/gh "
+        "/home/jonathan/Repos/sync-source-fixture "
+        "/home/jonathan/Repos/sync-plugin-fixture && "
+        "chown -h jonathan:users /home/jonathan/Repos/sync-plugin-link && "
+        "ln -s /home/jonathan/Repos/sync-source-fixture/external.md "
+        "/home/jonathan/.claude/commands/external.md && "
+        "chown -h jonathan:users /home/jonathan/.claude/commands/external.md && "
+        "printf '%s\\n' '{\"snapshot\":\"stable\"}' > /home/jonathan/.claude.json && "
+        "chown jonathan:users /home/jonathan/.claude.json && "
         "printf 'stable\\n' > /home/jonathan/.codex/AGENTS.md && "
         "chown jonathan:users /home/jonathan/.codex/AGENTS.md && "
         f"su - jonathan -c 'git init -b main {fixture} && "
@@ -2772,12 +2801,18 @@ in
 
     commit_renderer(
         "v1",
-        "'import os' 'from pathlib import Path' "
-        "'home = Path.home()' "
+        "'import os' 'import time' 'from pathlib import Path' "
+        "'time.sleep(2)' "
         "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v1\\n\")' "
-        "'Path(os.environ[\"AI_CLIENT_CONFIG_SYMLINK_OUTPUT\"]).write_text((home / \".claude/commands/evolve.md\").read_text())' "
-        "'sibling = home / \"Repos/sync-input/private.txt\"' "
-        "'Path(os.environ[\"AI_CLIENT_CONFIG_REPO_SIBLING_OUTPUT\"]).write_text((\"visible\" if sibling.exists() else \"hidden\") + \"\\n\")'",
+        "'source = Path.home() / \".claude\" / \"commands\" / \"external.md\"' "
+        "'source_state = \"symlink\" if source.is_symlink() else \"materialized\"' "
+        "'repo_state = \"repo-visible\" if Path(\"/home/jonathan/Repos/sync-source-fixture\").exists() else \"repo-hidden\"' "
+        "'plugin = Path(\"/home/jonathan/Repos/sync-plugin-link/skills/external-plugin/SKILL.md\")' "
+        "'plugin_state = plugin.read_text().strip() + \"\\nplugin-visible\" if plugin.exists() else \"plugin-hidden\"' "
+        "'leak = Path.home() / \".claude\" / \"plugins\" / \"cache\" / \"leak-sentinel\"' "
+        "'leak_state = leak.read_text().strip() if leak.exists() else \"leak-hidden\"' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_SOURCE_OUTPUT\"]).write_text(source.read_text() + source_state + \"\\n\" + repo_state + \"\\n\" + plugin_state + \"\\n\" + leak_state + \"\\n\")' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_CLAUDE_STATE_OUTPUT\"]).write_text((Path.home() / \".claude.json\").read_text())'",
     )
     user_systemctl = (
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -2793,14 +2828,35 @@ in
         + f"AI_CLIENT_CONFIG_NETWORK_OUTPUT={network_output} "
         + f"AI_CLIENT_CONFIG_BUS_OUTPUT={bus_output} "
         + f"AI_CLIENT_CONFIG_PROC_OUTPUT={proc_output} "
-        + f"AI_CLIENT_CONFIG_SYMLINK_OUTPUT={symlink_output} "
-        + f"AI_CLIENT_CONFIG_REPO_SIBLING_OUTPUT={repo_sibling_output} "
+        + f"AI_CLIENT_CONFIG_SOURCE_OUTPUT={source_output} "
+        + f"AI_CLIENT_CONFIG_CLAUDE_STATE_OUTPUT={claude_state_output} "
         + f"AI_CLIENT_CONFIG_TEST_OUTPUT={output}'"
     )
-    dellan.succeed(user_systemctl + " start ai-client-config-codex-sync.service'")
+    dellan.succeed(
+        user_systemctl + " start --no-block ai-client-config-codex-sync.service'"
+    )
+    dellan.wait_until_succeeds(
+        "test -f /run/user/$(id -u jonathan)/ai-client-config-sync/"
+        "run.*/source-home/.claude.json"
+    )
+    dellan.succeed(
+        "printf '%s\\n' '{\"snapshot\":\"changed\"}' > /home/jonathan/.claude.json"
+    )
+    dellan.wait_until_succeeds(
+        user_systemctl
+        + " show -P SubState ai-client-config-codex-sync.service | grep -qx dead'"
+    )
+    assert dellan.succeed(
+        user_systemctl
+        + " show -P ExecMainStatus ai-client-config-codex-sync.service'"
+    ).strip() == "0"
     assert dellan.succeed(f"cat {output}").strip() == "v1"
-    assert dellan.succeed(f"cat {symlink_output}").strip() == "external command"
-    assert dellan.succeed(f"cat {repo_sibling_output}").strip() == "hidden"
+    assert dellan.succeed(f"cat {claude_state_output}").strip() == '{"snapshot":"stable"}'
+    source_text = dellan.succeed(f"cat {source_output}").strip()
+    assert source_text == (
+        "external-source\nmaterialized\nrepo-hidden\n"
+        "external-plugin-source\nplugin-visible\nleak-hidden"
+    ), source_text
 
     # A second invocation must clone again and execute the new remote HEAD,
     # not a cached checkout or the user's dirty development tree.
@@ -2888,11 +2944,22 @@ in
     for marker in [
         "credential.https://github.com.helper=",
         "gh auth git-credential",
+        'stage="snapshot-source"',
+        "cp -a --no-preserve=ownership",
+        '"$source_home/.claude.json" "$staged_home/.claude.json"',
+        'settings_file="$source_home/.claude/settings.json"',
+        'installed_file="$source_home/.claude/plugins/installed_plugins.json"',
+        'enabled_plugin_paths="$run_dir/enabled-plugin-paths"',
+        'chmod -R u+w -- "$source_home"',
     ]:
         assert marker in sync_script_text, (
             f"ai-client-config sync lost host-scoped gh helper '{marker}':\\n"
             f"{sync_script_text}"
         )
+    assert "ai-client-config-claude.json" not in sync_script_text, (
+        "sync must not bind-mount the live mutable Claude state file:\\n"
+        f"{sync_script_text}"
+    )
 
     # A malformed upstream revision must fail before execution and identify
     # the missing contract explicitly.
@@ -2931,8 +2998,8 @@ in
         + "AI_CLIENT_CONFIG_ALLOW_FILE_REMOTE "
         + "AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS AI_CLIENT_CONFIG_TEST_OUTPUT "
         + "AI_CLIENT_CONFIG_NETWORK_OUTPUT AI_CLIENT_CONFIG_BUS_OUTPUT "
-        + "AI_CLIENT_CONFIG_PROC_OUTPUT AI_CLIENT_CONFIG_SYMLINK_OUTPUT "
-        + "AI_CLIENT_CONFIG_REPO_SIBLING_OUTPUT'"
+        + "AI_CLIENT_CONFIG_PROC_OUTPUT AI_CLIENT_CONFIG_SOURCE_OUTPUT "
+        + "AI_CLIENT_CONFIG_CLAUDE_STATE_OUTPUT'"
     )
 
     # The feature VM has no desktop keyring. Production's default HTTPS
