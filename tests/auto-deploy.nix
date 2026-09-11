@@ -46,8 +46,10 @@
 (import ./lib/common.nix { inherit pkgs inputs; }).mkMinimalTest {
   name = "vm-auto-deploy";
   extraModules = [
+    ../modules/nixos/build-coordination.nix
     ../modules/nixos/nixos-auto-deploy.nix
     {
+      services.buildCoordination.enable = true;
       services.nixos-auto-deploy = {
         enable = true;
         notifyUser = null;
@@ -78,6 +80,7 @@
     dellan.succeed(f"grep -q 'ConnectTimeout=15' {script}")
     dellan.succeed(f"grep -q 'ServerAliveInterval=15' {script}")
     dellan.succeed(f"grep -q 'ServerAliveCountMax=4' {script}")
+    dellan.succeed(f"grep -q 'nix-memory-run --nonblock' {script}")
     # The fetch is wrapped in `timeout` with a POSITIVE bound — the
     # regex rejects `timeout 0 git fetch`, which would disable it.
     dellan.succeed(f"grep -qE 'timeout [1-9][0-9]* git fetch' {script}")
@@ -126,11 +129,29 @@
     target = dellan.succeed("git -C /tmp/origin-repo rev-parse main").strip()
     dellan.succeed("git -C /tmp/deploy-repo remote set-url origin /tmp/origin-repo")
     dellan.succeed(
-        f"sed 's|if nixos-rebuild switch --flake|if true --flake|' {script} "
+        f"sed 's|nixos-rebuild switch --flake|true --flake|' {script} "
         "> /tmp/deploy-stub-ok "
-        "&& grep -q 'if true --flake' /tmp/deploy-stub-ok "
+        "&& grep -q 'true --flake' /tmp/deploy-stub-ok "
         "&& chmod +x /tmp/deploy-stub-ok"
     )
+    # Memory admission is a clean deferral, not a failed target. Hold the
+    # production lock, run the real script with only rebuild stubbed, and
+    # require no success record and no poison latch entry.
+    holder = dellan.succeed(
+        "sh -c 'exec 9>/home/jonathan/.nix-memory-pressure/lock; "
+        "flock 9; "
+        "echo locked >/tmp/deploy-memory-lock-held; sleep 60' "
+        ">/tmp/deploy-memory-lock-holder.log 2>&1 & echo $!"
+    ).strip()
+    dellan.wait_until_succeeds("test -f /tmp/deploy-memory-lock-held")
+    rc, out = dellan.execute("/tmp/deploy-stub-ok 2>&1")
+    assert rc == 0 and "deploy deferred" in out, (rc, out)
+    dellan.fail("test -e /var/lib/nixos-deploy/last-good")
+    latch = dellan.succeed("cat /var/lib/nixos-deploy/poison-latch")
+    assert latch.strip() == "", latch
+    dellan.succeed(f"kill {holder}")
+    dellan.wait_until_succeeds(f"test ! -e /proc/{holder}")
+
     # Seed the pre-rename state file: the script must migrate it to
     # last-good (mv), not leave a second, permanently-stale record —
     # an orphaned state file is exactly the bug class under test.
@@ -148,18 +169,42 @@
     )
     dellan.succeed("test ! -e /var/lib/nixos-deploy/last-deployed-sha")
 
-    # 5. Failure path must NOT advance last-good (it is last-GOOD, not
+    # 5. Exit 75 from a rebuild is a real build failure, not lock contention.
+    #    The runner marks whether it started the child, so this reserved status
+    #    cannot silently turn a bad target into a clean deferral.
+    dellan.succeed(
+        "git -C /tmp/origin-repo -c user.email=t@test -c user.name=t "
+        "commit -q --allow-empty -m exit-75"
+    )
+    target2 = dellan.succeed("git -C /tmp/origin-repo rev-parse main").strip()
+    dellan.succeed(
+        f"sed \"s|nixos-rebuild switch --flake|sh -c 'exit 75' --|\" {script} "
+        "> /tmp/deploy-stub-75 "
+        "&& grep -q \"sh -c 'exit 75'\" /tmp/deploy-stub-75 "
+        "&& chmod +x /tmp/deploy-stub-75"
+    )
+    rc, out = dellan.execute("/tmp/deploy-stub-75 2>&1")
+    print(f"[diag] exit-75-path rc={rc} out={out!r}")
+    assert rc != 0 and "latched as poisoned" in out and "deferred" not in out, (
+        f"a started rebuild exiting 75 was mistaken for contention (rc={rc}): {out!r}"
+    )
+    last_good = dellan.succeed("cat /var/lib/nixos-deploy/last-good").strip()
+    assert last_good == target, (last_good, target)
+    latch = dellan.succeed("cat /var/lib/nixos-deploy/poison-latch").strip()
+    assert latch == target2, (latch, target2)
+
+    # 6. Failure path must NOT advance last-good (it is last-GOOD, not
     #    last-attempted): a new commit whose rebuild fails is latched
     #    as poisoned while last-good keeps the previously-deployed SHA.
     dellan.succeed(
         "git -C /tmp/origin-repo -c user.email=t@test -c user.name=t "
         "commit -q --allow-empty -m next"
     )
-    target2 = dellan.succeed("git -C /tmp/origin-repo rev-parse main").strip()
+    target3 = dellan.succeed("git -C /tmp/origin-repo rev-parse main").strip()
     dellan.succeed(
-        f"sed 's|if nixos-rebuild switch --flake|if false --flake|' {script} "
+        f"sed 's|nixos-rebuild switch --flake|false --flake|' {script} "
         "> /tmp/deploy-stub-fail "
-        "&& grep -q 'if false --flake' /tmp/deploy-stub-fail "
+        "&& grep -q 'false --flake' /tmp/deploy-stub-fail "
         "&& chmod +x /tmp/deploy-stub-fail"
     )
     rc, out = dellan.execute("/tmp/deploy-stub-fail 2>&1")
@@ -172,6 +217,6 @@
         f"failed deploy must not advance last-good; got {last_good!r}, want {target!r}"
     )
     latch = dellan.succeed("cat /var/lib/nixos-deploy/poison-latch").strip()
-    assert latch == target2, f"poison-latch should hold {target2!r}; got {latch!r}"
+    assert latch == target3, f"poison-latch should hold {target3!r}; got {latch!r}"
   '';
 }

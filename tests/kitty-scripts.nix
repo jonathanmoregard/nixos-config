@@ -3762,32 +3762,32 @@ pkgs.runCommand "kitty-scripts-harness"
     stop_transaction_child
     unset KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND
 
-    bounded_failure() { # <mode> <stage> <minimum-ms>
-      local mode="$1" stage="$2" minimum_ms="$3" start_ms end_ms elapsed
+    bounded_failure() { # <mode> <stage>
+      local mode="$1" stage="$2" start_ms end_ms elapsed
       prepare_transaction_case "$mode" 1
       start_ms=$(date +%s%3N)
       start_transaction_restore "$mode"
       wait "$TX_PARENT_PID" || true
       end_ms=$(date +%s%3N)
       elapsed=$((end_ms - start_ms))
-      [ "$elapsed" -ge "$minimum_ms" ] && [ "$elapsed" -lt 4000 ] || {
+      [ "$elapsed" -lt 4000 ] || {
         cat "$TX_CONTROL/restore.log"
-        echo "FAIL(transaction/$mode): elapsed ''${elapsed}ms outside shared deadline"
+        echo "FAIL(transaction/$mode): elapsed ''${elapsed}ms exceeded shared deadline ceiling"
         exit 1
       }
-      grep -Fq "generation=$TX_TOKEN ordinal=2 stage=$stage" \
+      grep -Fq "generation=$TX_TOKEN ordinal=2 stage=$stage deadline expired" \
         "$TX_CONTROL/restore.log" || {
         cat "$TX_CONTROL/restore.log"
-        echo "FAIL(transaction/$mode): precise stage diagnostic missing"
+        echo "FAIL(transaction/$mode): precise deadline diagnostic missing"
         exit 1
       }
       assert_transaction_preserved "$mode"
       stop_transaction_child
     }
-    bounded_failure missing-launch-return launch-return 0
-    bounded_failure killed-wrapper bootstrap-receipt 800
-    bounded_failure vanished expected-window 800
-    bounded_failure foreground-timeout foreground-settlement 800
+    bounded_failure missing-launch-return launch-return
+    bounded_failure killed-wrapper bootstrap-receipt
+    bounded_failure vanished expected-window
+    bounded_failure foreground-timeout foreground-settlement
 
     # The registry writer is part of the bootstrap transaction and therefore
     # shares the parent's deadline. Holding its real advisory lock past that

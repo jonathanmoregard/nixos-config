@@ -49,8 +49,8 @@ From a worktree:
 cd ~/Repos/nixos-config-worktrees/<your-branch>
 
 # Single lane (fastest feedback loop while iterating):
-nix build .#checks.x86_64-linux.vm-base -L
-nix build .#checks.x86_64-linux.vm-kitty -L
+nix build --no-link .#checks.x86_64-linux.vm-base -L
+nix build --no-link .#checks.x86_64-linux.vm-kitty -L
 
 # All lanes (= what CI runs across its matrix):
 nix flake check -L
@@ -108,7 +108,7 @@ cheaper layers first:
 | ~1s | `nix eval --no-warn-dirty .#checks.x86_64-linux.vm-base.drvPath` | Nix syntax + module type errors (any lane works; pick one that builds fast) |
 | ~5-30s | `nix build --no-link --print-out-paths .#nixosConfigurations.dellan.config.home-manager.users.jonathan.home.path` | Generated scripts compile (writeShellApplication shellcheck, writePython3Bin lint) |
 | ~5s | Read `<home-path-out>/bin/<wrapper>` | Heredoc escaping, shebang at byte 0, paths interpolated correctly |
-| ~90-180s | `nix build .#checks.x86_64-linux.vm-<feature> -L` | Real boot, real X session, real systemd-user, real assertions for that lane |
+| ~90-180s | `nix build --no-link .#checks.x86_64-linux.vm-<feature> -L` | Real boot, real X session, real systemd-user, real assertions for that lane |
 
 Always run the first three before queuing a VM. They catch ~80% of
 mistakes in seconds.
@@ -226,4 +226,4 @@ or exercise it for real in the feature VM via `nixos-agent-testing`.
 Corollary for any cached derivation: `nix flake check` prints
 `running 0 flake checks` when the check is already in the store,
 which looks identical to one that just passed. Force it with
-`nix build --rebuild <check>` when you need evidence it ran.
+`nix build --no-link --rebuild <check>` when you need evidence it ran.

@@ -124,8 +124,10 @@
     # `follows` lines keep them deduplicated to one copy each.
     # Bump 14086e9 -> 472fb55 (2026-09-09): make GitHub ingest structurally
     # GET-only and reuse gh's keyring credential instead of an expiring PAT.
+    # Bump 472fb55 -> 08106b1 (2026-09-11): add an authenticated FastMCP
+    # proxy path so deployed MCP children share one model backend.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/472fb55d1390304db99e6f1d0a0d0a1346d899ae";
+      url = "github:jonathanmoregard/aggregator/08106b171681a194691faed6c478df5eca912c6d";
       flake = false;
     };
 
@@ -367,8 +369,8 @@
           prodHook = self.nixosConfigurations.dellan.config
             .nix.settings.post-build-hook;
         };
-        # Not a VM lane: fail-closed contract harness for the merged-and-
-        # stale worktree sweeper (home/worktree-sweep-script.nix). Builds
+        # Not a VM lane: fail-closed contract harness for the merged-or-
+        # inactive worktree sweeper (home/worktree-sweep-script.nix). Builds
         # a fixture bare repo + worktrees with real git, stubs gh, and
         # asserts every keep/delete predicate — destructive automation
         # ships only behind this. Cheap runCommand; seconds.
@@ -380,6 +382,12 @@
           deployedExecStart = self.nixosConfigurations.dellan.config
             .home-manager.users.jonathan
             .systemd.user.services.worktree-sweep.Service.ExecStart;
+        };
+        # Fast evaluated-config contract for scheduled root-storage upkeep.
+        # This checks Dellan's final merged options without booting a VM.
+        nix-maintenance = import ./tests/nix-maintenance.nix {
+          pkgs = pkgsLinux;
+          config = self.nixosConfigurations.dellan.config;
         };
         # Not a VM lane: runtime-invocation harness for the kitty
         # session save/restore scripts (home/kitty.nix) — single-line
@@ -475,6 +483,7 @@
     apps.${linuxSystem} =
       let
         vm = self.nixosConfigurations.dellan.config.system.build.vm;
+        memoryRunner = self.nixosConfigurations.dellan.config.services.buildCoordination.runnerPackage;
 
         mkFeatureVm = { name, displayMode }:
           let
@@ -540,7 +549,12 @@
                 # Don't `exec` — we need bash to stay alive long enough
                 # to run the trap that cleans $TMPDIR on QEMU exit.
                 cd "$TMPDIR"
-                ${vm}/bin/run-dellan-vm "$@"
+                ${memoryRunner}/bin/nix-memory-run -- \
+                  systemd-run --user --scope --quiet --collect \
+                  --unit=feature-vm \
+                  --slice=ram-heavy.slice \
+                  --property=OOMPolicy=kill \
+                  -- ${vm}/bin/run-dellan-vm "$@"
               '';
             };
           in {
