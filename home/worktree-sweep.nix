@@ -1,8 +1,10 @@
 { pkgs, ... }:
-# Daily sweep of merged-and-stale worktrees + local branches, across
+# Daily sweep of merged-or-inactive worktrees + merged local branches, across
 # every repo that has a worktree under one of the roots below. PRs merge
 # by squash, so `git branch --merged` never matches — GitHub PR state is
-# the source of truth. The script's fail-closed predicates live in
+# the source of truth for irreversible branch deletion. Commit age can
+# independently authorize reversible worktree removal after seven days;
+# the branch remains. The script's fail-closed safety predicates live in
 # home/worktree-sweep-script.nix; the contract harness is
 # tests/worktree-sweep.nix (flake check `worktree-sweep`, wired into
 # ci.yml's flake-check job).
@@ -25,7 +27,7 @@ let
 in
 {
   systemd.user.services.worktree-sweep = {
-    Unit.Description = "Sweep merged-and-stale worktrees and local branches";
+    Unit.Description = "Sweep merged-or-inactive worktrees and merged branches";
     Service = {
       Type = "oneshot";
       # tests/worktree-sweep.nix asserts this ExecStart is byte-identical
@@ -42,7 +44,7 @@ in
   };
 
   systemd.user.timers.worktree-sweep = {
-    Unit.Description = "Daily merged-and-stale worktree sweep";
+    Unit.Description = "Daily merged-or-inactive worktree sweep";
     Timer = {
       OnCalendar = "daily";
       # Laptop: catch up after suspend/boot when midnight was missed.

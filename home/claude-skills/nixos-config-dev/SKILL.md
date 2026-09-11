@@ -102,7 +102,7 @@ Body explaining the change.
 Pre-push checklist:
 - Type: risky                                # or 'pure-data'
 - Rebased on origin/main: yes
-- Local gate: nix build .#checks.x86_64-linux.vm-base rc=0   # lane(s) the change touches
+- Local gate: nix build --no-link .#checks.x86_64-linux.vm-base rc=0   # lane(s) the change touches
 - Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>
 - Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>
 - feature-vm.nix modified: no                # MUST match diff
@@ -163,7 +163,7 @@ activationScripts / systemd.services.\*) AND does not touch
 Pre-push checklist:
 - Type: risky
 - Rebased on origin/main: yes
-- Local gate: nix build .#checks.x86_64-linux.<lane> rc=0
+- Local gate: nix build --no-link .#checks.x86_64-linux.<lane> rc=0
 - Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>
 - Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>
 - feature-vm.nix modified: no
@@ -214,7 +214,7 @@ nix eval .#checks.x86_64-linux --apply builtins.attrNames
 | `vm-listen-tools` · `vm-android-dev` · `vm-camera-relay` | the named feature |
 | `vm-claude-egress` · `vm-auto-deploy` | egress policy · deploy pipeline |
 | `egress-init-retry` | the generated nftables script (no VM — fast) |
-| `cachix-push-filter` · `add-secret-smoke` · `secrets-no-dead-credentials` · `signal-expiry` · `worktree-sweep` | script/data assertions (no VM — fast) |
+| `cachix-push-filter` · `add-secret-smoke` · `nix-maintenance` · `secrets-no-dead-credentials` · `signal-expiry` · `worktree-sweep` | script/data assertions (no VM — fast) |
 
 The non-VM lanes run in seconds; the `vm-*` lanes boot a machine. When a
 change spans areas, build each affected lane and record all of them in
@@ -233,7 +233,7 @@ VM via `nixos-agent-testing`).
 |--------------|--------------------|
 | Anything that builds — *required* | `nixos-automated-testing` (the assertion gate CI runs on every PR; runs locally before pushing) |
 | Branching logic (`mkIf`, `optionals`, `if`/`case`), multistep scripts (`writeShellApplication`, activation scripts), GUI changes, daemons that need poking — *required pre-PR* | `nixos-agent-testing` (boot the feature VM, drive via SSH/QMP/screencap, capture proof for the PR body) |
-| Modules emitting executable shell (`pkgs.writeShellScript`, `pkgs.writeShellApplication`, `serviceConfig.ExecStart =`, `nix.settings.post-build-hook`, `system.activationScripts.*`) — *required pre-PR* | **Runtime invocation test** of the generated script with adversarial inputs: empty/missing input, sub-command exits non-zero, sub-command hangs past timeout. Eval validates types; the VM gate validates integration but may not exercise the script (e.g. a post-build-hook whose agenix token is absent in the test VM). Pattern: `nix build` the derivation, run `/nix/store/.../<name>` directly with crafted env; OR write a parameterized analogue in `/tmp` swapping the real binary for `coreutils/false` / `coreutils/sleep`. Past incident (PR #67): a cachix post-build-hook's `if ! cmd; then rc=$?` looked correct on eval but bash zeroed `rc`, hiding timeout-vs-failure distinction from the journal and producing misleading diagnostics. |
+| Modules emitting executable shell (`pkgs.writeShellScript`, `pkgs.writeShellApplication`, `serviceConfig.ExecStart =`, `nix.settings.post-build-hook`, `system.activationScripts.*`) — *required pre-PR* | **Runtime invocation test** of the generated script with adversarial inputs: empty/missing input, sub-command exits non-zero, sub-command hangs past timeout. Eval validates types; the VM gate validates integration but may not exercise the script (e.g. a post-build-hook whose agenix token is absent in the test VM). Pattern: `nix build --no-link` the derivation, run `/nix/store/.../<name>` directly with crafted env; OR write a parameterized analogue in `/tmp` swapping the real binary for `coreutils/false` / `coreutils/sleep`. Past incident (PR #67): a cachix post-build-hook's `if ! cmd; then rc=$?` looked correct on eval but bash zeroed `rc`, hiding timeout-vs-failure distinction from the journal and producing misleading diagnostics. |
 | **Changes to the injection-scanner** — any change to what scanner code the call sites run: a commit landing on injection-scanner origin/main, a scanner pin bump in a consuming repo, a wrapper env change affecting the scanner, a new call site — *required pre-PR (or pre-merge in the injection-scanner repo)* | **Agent-test EVERY call site, at the MOST RECENT scanner version.** Call sites on this host: `research-agent-mcp` (home/research-agent-mcp.nix), `futuresearch-gate-mcp` (home/futuresearch-gate-mcp.nix), `claude-cl-sync-wrap` (home/claude-services.nix). The gate and cl-sync self-update the scanner to origin/main at runtime, so a test against an older pinned rev proves nothing about what prod will run. Test on the real host, not the VM (the VM has no agenix keys and no egress): build the wrappers, then run each built binary directly — `timeout 90 /nix/store/…/research-agent-mcp </dev/null` and the gate equivalent must log `boot smoke ok` and exit 0; for cl-sync run the wrap script or `systemctl --user start claude-cl-sync` post-deploy and check the journal for a clean scan. Past incidents, both from testing only ONE call site: #144 (gate lacked LAKERA_API_KEY — only research-agent-mcp had been smoked) and scanner fb31c84 (stdlib urllib needs SSL_CERT_FILE on NixOS — every call site broke, none had been re-smoked after the pin bump). |
 | Pre-implementation planning for non-trivial work | `brainstorming` |
 | While writing the change | `test-driven-development` — extend the right `tests/<feature>.nix` lane (base / desktop / keyring / kitty / claude-pane) before the code, watch it fail, then make it pass |
@@ -298,20 +298,21 @@ ncfg worktree remove ~/Repos/nixos-config-worktrees/<slug>
 ```
 
 Stale worktrees waste disk; the daily `worktree-sweep` systemd user
-timer (home/worktree-sweep.nix) removes a worktree + its branch only
-when ALL of: its PR is merged with the merged head matching the local
-tip, the tip commit is >7 days old, `git status --porcelain` is empty,
-and no live process has its cwd inside. It also deletes worktree-less
-local branches whose PR is merged and tip is >7 days old. Everything
-else is kept with a journal-logged reason (`journalctl --user -u
-worktree-sweep`); a gh outage means zero deletions. Still tidier to
-remove eagerly.
+timer (home/worktree-sweep.nix) removes a worktree when its exact-tip PR
+is merged OR its tip commit is >7 days old, but only when `git
+status --porcelain` is empty and no live process has its cwd inside.
+Exact-tip merged worktrees lose their local branch; age-only cleanup
+preserves it. Worktree-less branches delete only with exact-tip merged
+PR evidence. A gh outage disables merged-PR decisions while age-only
+cleanup continues. Every keep/delete gets a journal reason
+(`journalctl --user -u worktree-sweep`). Still tidier to remove eagerly.
 
 It is not nixos-config-only: every repo with a worktree under
 `~/Repos/nixos-config-worktrees` or `~/worktrees` is discovered and
 swept under the same predicates, with the repo's slug and default
 branch read from its own git config. A repo whose origin is not GitHub
-is skipped entirely — there is no PR state to fail closed against.
+gets age-only worktree cleanup with every branch preserved, because no
+PR state exists to authorize irreversible branch deletion.
 
 ## Failure-mode quick reference
 

@@ -367,8 +367,8 @@
           prodHook = self.nixosConfigurations.dellan.config
             .nix.settings.post-build-hook;
         };
-        # Not a VM lane: fail-closed contract harness for the merged-and-
-        # stale worktree sweeper (home/worktree-sweep-script.nix). Builds
+        # Not a VM lane: fail-closed contract harness for the merged-or-
+        # inactive worktree sweeper (home/worktree-sweep-script.nix). Builds
         # a fixture bare repo + worktrees with real git, stubs gh, and
         # asserts every keep/delete predicate — destructive automation
         # ships only behind this. Cheap runCommand; seconds.
@@ -380,6 +380,12 @@
           deployedExecStart = self.nixosConfigurations.dellan.config
             .home-manager.users.jonathan
             .systemd.user.services.worktree-sweep.Service.ExecStart;
+        };
+        # Fast evaluated-config contract for scheduled root-storage upkeep.
+        # This checks Dellan's final merged options without booting a VM.
+        nix-maintenance = import ./tests/nix-maintenance.nix {
+          pkgs = pkgsLinux;
+          config = self.nixosConfigurations.dellan.config;
         };
         # Not a VM lane: runtime-invocation harness for the kitty
         # session save/restore scripts (home/kitty.nix) — single-line

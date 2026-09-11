@@ -91,6 +91,21 @@
   systemd.services.home-manager-jonathan.serviceConfig.TimeoutStartSec =
     lib.mkForce "20min";
 
+  # Reclaim old profile generations and unreachable store paths before they
+  # can fill the shared root filesystem again. Separate weekdays keep routine
+  # GC and optimisation from competing; both NixOS timers are persistent by
+  # default, so a laptop asleep at schedule time catches up after resume.
+  nix.gc = {
+    automatic = true;
+    dates = [ "Sun 04:15" ];
+    options = "--delete-older-than 14d";
+  };
+
+  nix.optimise = {
+    automatic = true;
+    dates = [ "Wed 04:15" ];
+  };
+
   nix.settings = {
     experimental-features = [ "nix-command" "flakes" ];
 

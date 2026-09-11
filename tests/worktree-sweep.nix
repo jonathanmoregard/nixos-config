@@ -1,4 +1,4 @@
-# worktree-sweep: runtime-invocation harness for the merged-and-stale
+# worktree-sweep: runtime-invocation harness for the merged-or-inactive
 # worktree sweeper (home/worktree-sweep-script.nix — the exact
 # derivation the systemd user unit execs; asserted below via
 # deployedExecStart, not a copy that can drift).
@@ -9,21 +9,29 @@
 # PATH, so a PATH stub can't shadow it), and asserts every fail-closed
 # predicate:
 #
-#   merged + >7d old + clean + no live cwd → DELETED (worktree AND branch)
+#   merged exact tip + clean + no live cwd → DELETED immediately
+#                                         (worktree AND branch)
+#   unmerged + >7d old + clean + no cwd   → worktree DELETED, branch KEPT
 #   dirty (untracked work)                 → kept, logged
 #   live cwd                               → kept, logged
 #     (via SWEEP_EXTRA_LIVE_CWDS — /proc can't be faked in the nix
 #      sandbox, so the harness injects extra "live" paths; the real
 #      /proc scan still runs in every mode. 2026-07-07 incident class:
 #      deleting a running session's cwd ENOENT-broke all its hooks.)
-#   gh failure on one branch               → kept, logged
-#   unmerged (no merged PR)                → kept, logged
-#   merged but tip younger than 7d         → kept, logged
-#   merged PR head != local tip            → kept, logged (branch reuse)
+#   gh failure on one old branch           → worktree deleted, branch kept
+#   unmerged but younger than 7d            → kept, logged
+#   merged but tip younger than 7d          → deleted immediately
+#   merged PR head != old local tip         → worktree deleted, branch kept
+#   locked / detached                       → kept, logged; detached tip's
+#                                             local branch also stays protected
+#   ignored non-Nix content                 → kept intact, logged
+#   verified /nix/store result links        → unlinked before removal
+#   result-like link outside /nix/store     → kept intact, logged
 #   main worktree                          → never touched
-#   branch w/o worktree: merged + old      → branch DELETED
-#   branch w/o worktree: unmerged / young  → kept, logged
-#   gh outage (auth check fails)           → ZERO deletions
+#   branch w/o worktree: merged exact tip   → branch DELETED immediately
+#   branch w/o worktree: unmerged           → kept, logged
+#   gh outage (auth check fails)            → age-only cleanup still runs;
+#                                             no branch deletion
 #
 # Run 3 covers discovery mode (the production path since 2026-08-17):
 # repos are found from the worktree roots rather than named, so the
@@ -32,7 +40,7 @@
 #   two repos under one root            → both swept in one run
 #   repo's own main checkout            → never a candidate (outside roots)
 #   non-default branch (master) repo    → its default branch protected
-#   non-GitHub origin                   → repo skipped entirely, logged
+#   non-GitHub origin                   → age-only worktree cleanup; branch kept
 #   worktree outside every root         → kept, logged
 #
 # Run: nix build .#checks.x86_64-linux.worktree-sweep -L
@@ -85,7 +93,9 @@ pkgs.runCommand "worktree-sweep-harness"
       local anchor="$wts/main"
       mkdir -p "$root"
       git init -q "$root/seed"
-      git -C "$root/seed" commit -q --allow-empty -m init
+      printf 'result\nresult-*\nignored-*\n' > "$root/seed/.gitignore"
+      git -C "$root/seed" add .gitignore
+      git -C "$root/seed" commit -qm init
       git clone -q --bare "$root/seed" "$bare"
       mkdir -p "$wts"
       # Bootstrap only. Creating the first worktree is the one operation with
@@ -117,7 +127,40 @@ pkgs.runCommand "worktree-sweep-harness"
       mkwt unmerged         "$OLD"
       mkwt merged-recent    "$NEW"
       mkwt tip-mismatch     "$OLD"
+      mkwt locked           "$OLD"
+      mkwt detached         "$OLD"
+      mkwt unsafe-result    "$OLD"
+      mkwt escaped-result   "$OLD"
+      mkwt relative-result  "$OLD"
+      mkwt tracked-result   "$OLD"
+      mkwt nested-result    "$OLD"
+      mkwt ignored-data     "$OLD"
+      mkwt hidden-untracked "$OLD"
+      mkwt assume-unchanged "$OLD"
+      mkwt a-shared-anchor  "$OLD"
       echo "uncommitted work" > "$wts/dirty/scratch.txt"
+      git -C "$anchor" worktree lock "$wts/locked"
+      git -C "$wts/detached" checkout -q --detach
+      git -C "$anchor" worktree add -q --detach "$wts/z-shared-detached" \
+        feat/a-shared-anchor
+      ln -s /nix/store/harness-output "$wts/unmerged/result"
+      ln -s /tmp/not-a-nix-output "$wts/unsafe-result/result-unsafe"
+      ln -s /nix/store/../../tmp/not-a-nix-output \
+        "$wts/escaped-result/result-escape"
+      ln -s ../nix/store/not-a-store-output \
+        "$wts/relative-result/result-relative"
+      ln -s /nix/store/tracked-purpose "$wts/tracked-result/result"
+      git -C "$wts/tracked-result" add -f result
+      GIT_AUTHOR_DATE="$OLD" GIT_COMMITTER_DATE="$OLD" \
+        git -C "$wts/tracked-result" commit -qm "track intentional result link"
+      mkdir "$wts/nested-result/result-cache"
+      ln -s /nix/store/important-reference \
+        "$wts/nested-result/result-cache/valuable-link"
+      echo "must survive" > "$wts/ignored-data/ignored-secret"
+      echo "must survive" > "$wts/hidden-untracked/hidden.txt"
+      git -C "$wts/hidden-untracked" config status.showUntrackedFiles no
+      git -C "$wts/assume-unchanged" update-index --assume-unchanged file.txt
+      echo "local edit must survive" > "$wts/assume-unchanged/file.txt"
 
       mkbranch branch-merged-old "$OLD"
       mkbranch branch-unmerged   "$OLD"
@@ -157,7 +200,9 @@ pkgs.runCommand "worktree-sweep-harness"
         dirs="''${FIXTURE_REPO_DIRS:-$FIXTURE_ANCHOR}"
         tip=""
         for r in $(echo "$dirs" | tr ':' ' '); do
-          t=$(git -C "$r" rev-parse "refs/heads/$head" 2>/dev/null) || continue
+          t=$(git -C "$r" rev-parse "refs/heads/$head" 2>/dev/null \
+            || git --git-dir="$r" rev-parse "refs/heads/$head" 2>/dev/null) \
+            || continue
           tip="$t"; break
         done
         [ -n "$tip" ] || { echo "[]"; exit 0; }
@@ -188,18 +233,29 @@ pkgs.runCommand "worktree-sweep-harness"
 
     has_branch() { git -C "$FIXTURE_ANCHOR" show-ref --verify -q "refs/heads/$1"; }
 
-    # 1. all predicates hold → worktree AND branch deleted
+    # 1. merged-at-tip → worktree AND branch deleted, regardless of age
     [ ! -e "$WTS1/merged-old-clean" ] || fail "merged-old-clean worktree survived"
     if has_branch feat/merged-old-clean; then fail "feat/merged-old-clean branch survived"; fi
     grep -qF "deleted worktree $WTS1/merged-old-clean" run1.log \
       || fail "no deletion log line for merged-old-clean"
+    [ ! -e "$WTS1/merged-recent" ] || fail "merged-recent worktree survived"
+    if has_branch feat/merged-recent; then fail "feat/merged-recent branch survived"; fi
+    grep -qF "deleted worktree $WTS1/merged-recent" run1.log \
+      || fail "no deletion log line for merged-recent"
 
-    # 2. dirty → kept, untracked work intact, logged
-    [ -d "$WTS1/dirty" ] || fail "dirty worktree was deleted"
+    # 2. dirty → kept, including untracked files hidden by repository config
+    # and tracked edits hidden behind assume-unchanged index flags.
+    for name in dirty hidden-untracked assume-unchanged; do
+      [ -d "$WTS1/$name" ] || fail "$name dirty worktree was deleted"
+      has_branch "feat/$name" || fail "feat/$name branch was deleted"
+      grep -qF "kept worktree $WTS1/$name (branch feat/$name): dirty" run1.log \
+        || fail "no kept/dirty log line for $name"
+    done
     [ -f "$WTS1/dirty/scratch.txt" ] || fail "dirty worktree lost its untracked file"
-    has_branch feat/dirty || fail "feat/dirty branch was deleted"
-    grep -qF "kept worktree $WTS1/dirty (branch feat/dirty): dirty" run1.log \
-      || fail "no kept/dirty log line"
+    [ -f "$WTS1/hidden-untracked/hidden.txt" ] \
+      || fail "hidden-untracked worktree lost its untracked file"
+    grep -qF "local edit must survive" "$WTS1/assume-unchanged/file.txt" \
+      || fail "assume-unchanged worktree lost its tracked edit"
 
     # 3. live cwd → kept, logged (the incident-class predicate)
     [ -d "$WTS1/live-cwd" ] || fail "live-cwd worktree was deleted (2026-07-07 incident class)"
@@ -207,51 +263,80 @@ pkgs.runCommand "worktree-sweep-harness"
     grep -qF "kept worktree $WTS1/live-cwd (branch feat/live-cwd): live" run1.log \
       || fail "no kept/live-cwd log line"
 
-    # 4. per-branch gh failure → kept, logged
-    [ -d "$WTS1/gh-fails" ] || fail "gh-fails worktree was deleted on gh error"
-    has_branch feat/gh-fails || fail "feat/gh-fails branch was deleted on gh error"
-    grep -qF "kept worktree $WTS1/gh-fails (branch feat/gh-fails): gh pr list failed" run1.log \
-      || fail "no kept/gh-failure log line"
+    # 4. age-only eligibility removes worktrees but preserves branches.
+    # A gh error, no merged PR, and a mismatched merged tip must never
+    # authorize branch deletion. The ignored Nix out-link on `unmerged`
+    # must not make non-force worktree removal fail.
+    for name in gh-fails unmerged tip-mismatch; do
+      [ ! -e "$WTS1/$name" ] || fail "$name old worktree survived"
+      has_branch "feat/$name" || fail "feat/$name branch was deleted"
+      grep -qF "deleted inactive worktree $WTS1/$name; preserved branch feat/$name" run1.log \
+        || fail "no age-only deletion log line for $name"
+    done
+    grep -qF "preserved branch feat/unmerged (10d old, clean, no live cwd, removed 1 Nix result link(s))" run1.log \
+      || fail "unmerged worktree's verified Nix result link was not removed"
 
-    # 5. unmerged → kept, logged
-    [ -d "$WTS1/unmerged" ] || fail "unmerged worktree was deleted"
-    has_branch feat/unmerged || fail "feat/unmerged branch was deleted"
-    grep -qF "kept worktree $WTS1/unmerged (branch feat/unmerged): no merged PR" run1.log \
-      || fail "no kept/unmerged log line"
+    # 5. locked, detached, non-Nix result-like links, and arbitrary ignored
+    # content fail closed. A branch sharing a detached worktree's exact tip
+    # remains its recovery anchor and must not be deleted in phase 2.
+    for name in locked detached unsafe-result escaped-result relative-result \
+                tracked-result nested-result ignored-data z-shared-detached; do
+      [ -d "$WTS1/$name" ] || fail "$name worktree was deleted"
+    done
+    has_branch feat/locked || fail "feat/locked branch was deleted"
+    has_branch feat/detached || fail "feat/detached branch was deleted"
+    has_branch feat/unsafe-result || fail "feat/unsafe-result branch was deleted"
+    has_branch feat/escaped-result || fail "feat/escaped-result branch was deleted"
+    has_branch feat/relative-result || fail "feat/relative-result branch was deleted"
+    has_branch feat/tracked-result || fail "feat/tracked-result branch was deleted"
+    has_branch feat/nested-result || fail "feat/nested-result branch was deleted"
+    has_branch feat/ignored-data || fail "feat/ignored-data branch was deleted"
+    has_branch feat/a-shared-anchor \
+      || fail "detached worktree did not preserve its matching branch"
+    [ -L "$WTS1/unsafe-result/result-unsafe" ] \
+      || fail "unsafe result-like link was removed"
+    [ -L "$WTS1/escaped-result/result-escape" ] \
+      || fail "lexically escaped result-like link was removed"
+    [ -L "$WTS1/relative-result/result-relative" ] \
+      || fail "relative result-like link was removed"
+    [ -L "$WTS1/tracked-result/result" ] \
+      || fail "tracked result-like link was removed"
+    [ -L "$WTS1/nested-result/result-cache/valuable-link" ] \
+      || fail "nested ignored result-like link was removed"
+    grep -qF "kept worktree $WTS1/locked (branch feat/locked): locked" run1.log \
+      || fail "no kept/locked log line"
+    grep -qF "kept worktree $WTS1/detached: detached HEAD" run1.log \
+      || fail "no kept/detached log line"
+    grep -qF "result-like symlink $WTS1/unsafe-result/result-unsafe targets outside /nix/store" run1.log \
+      || fail "no kept/unsafe-result log line"
+    [ -f "$WTS1/ignored-data/ignored-secret" ] \
+      || fail "ignored non-Nix content was removed"
+    grep -qF "ignored non-Nix content present: ignored-secret" run1.log \
+      || fail "no kept/ignored-data log line"
 
-    # 6. merged but young → kept, logged
-    [ -d "$WTS1/merged-recent" ] || fail "merged-recent worktree was deleted before 7 days"
-    grep -qF "kept worktree $WTS1/merged-recent (branch feat/merged-recent): tip commit only" run1.log \
-      || fail "no kept/young log line"
-
-    # 7. merged PR head != local tip (branch reused post-merge) → kept
-    [ -d "$WTS1/tip-mismatch" ] || fail "tip-mismatch worktree was deleted (post-merge commits lost)"
-    grep -qF "kept worktree $WTS1/tip-mismatch (branch feat/tip-mismatch): merged PR" run1.log \
-      || fail "no kept/tip-mismatch log line"
-
-    # 8. main is sacred
+    # 6. main is sacred
     [ -d "$WTS1/main" ] || fail "main worktree was deleted"
     has_branch main || fail "main branch was deleted"
 
-    # 9. branch without worktree: merged + old → deleted
+    # 7. branches without worktrees: exact-tip merged branches delete
+    # immediately; age alone never deletes an unmerged branch.
     if has_branch feat/branch-merged-old; then fail "feat/branch-merged-old survived"; fi
     grep -qF "deleted branch feat/branch-merged-old" run1.log \
       || fail "no deletion log line for branch-merged-old"
-
-    # 10. branch without worktree: unmerged / young → kept, logged
+    if has_branch feat/branch-recent; then fail "feat/branch-recent survived"; fi
+    grep -qF "deleted branch feat/branch-recent" run1.log \
+      || fail "no deletion log line for branch-recent"
     has_branch feat/branch-unmerged || fail "feat/branch-unmerged was deleted"
     grep -qF "kept branch feat/branch-unmerged: no merged PR" run1.log \
       || fail "no kept log line for branch-unmerged"
-    has_branch feat/branch-recent || fail "feat/branch-recent was deleted before 7 days"
-    grep -qF "kept branch feat/branch-recent: tip commit only" run1.log \
-      || fail "no kept log line for branch-recent"
 
-    # 11. gh queried against the pinned repo slug
+    # 8. gh queried against the pinned repo slug
     grep -q -- "--repo jonathanmoregard/nixos-config" gh.log \
       || fail "gh was not queried with the pinned repo slug"
 
     # =====================================================================
-    # Run 2: gh outage — MUST mean zero deletions
+    # Run 2: gh outage — age-only worktree cleanup continues, while PR
+    # eligibility and every branch deletion fail closed.
     # =====================================================================
     mkfixture "$PWD/fix2"
     FIX2_ANCHOR="$PWD/fix2/nixos-config-worktrees/main"
@@ -262,22 +347,33 @@ pkgs.runCommand "worktree-sweep-harness"
     SWEEP_BARE_REPO="$FIX2_ANCHOR" \
     SWEEP_WORKTREES_DIR="$WTS2" \
     SWEEP_GH_BIN="$PWD/bin/gh" \
+    SWEEP_EXTRA_LIVE_CWDS="$WTS2/live-cwd" \
       "$sweep" > run2.log 2>&1 || fail "sweep exited non-zero during gh outage"
 
     echo "=== run 2 (gh down) decisions ==="
     cat run2.log
 
-    if grep -q "deleted" run2.log; then fail "gh outage produced deletions"; fi
-    for wt in main merged-old-clean dirty live-cwd gh-fails unmerged merged-recent tip-mismatch; do
-      [ -d "$WTS2/$wt" ] || fail "gh-down run removed worktree $wt"
+    for wt in merged-old-clean gh-fails unmerged tip-mismatch; do
+      [ ! -e "$WTS2/$wt" ] || fail "gh-down age cleanup kept old worktree $wt"
+      grep -qF "deleted inactive worktree $WTS2/$wt; preserved branch feat/$wt" run2.log \
+        || fail "gh-down run lacks age-only deletion log for $wt"
+    done
+    for wt in main dirty live-cwd merged-recent locked detached unsafe-result \
+              escaped-result relative-result tracked-result ignored-data \
+              nested-result hidden-untracked assume-unchanged z-shared-detached; do
+      [ -d "$WTS2/$wt" ] || fail "gh-down run removed protected worktree $wt"
     done
     for b in main feat/merged-old-clean feat/dirty feat/live-cwd feat/gh-fails \
              feat/unmerged feat/merged-recent feat/tip-mismatch \
+             feat/locked feat/detached feat/unsafe-result feat/escaped-result \
+             feat/relative-result feat/tracked-result feat/ignored-data \
+             feat/nested-result feat/hidden-untracked feat/assume-unchanged \
+             feat/a-shared-anchor \
              feat/branch-merged-old feat/branch-unmerged feat/branch-recent; do
       git -C "$FIX2_ANCHOR" show-ref --verify -q "refs/heads/$b" \
         || fail "gh-down run deleted branch $b"
     done
-    grep -q "gh auth unavailable" run2.log \
+    grep -q "gh auth unavailable.*age-only cleanup remains active" run2.log \
       || fail "gh-down run did not log the outage reason"
 
     # =====================================================================
@@ -329,11 +425,9 @@ pkgs.runCommand "worktree-sweep-harness"
     }
 
     # A worktree whose OWNER is a bare repo — the ~/Repos/nixos-config shape.
-    # Discovery resolves a linked worktree through --git-common-dir, which for
-    # this layout is the bare directory itself, and safe.bareRepository then
-    # refuses every git call against it. The sweep must skip the repo, and must
-    # report the real reason: `remote get-url` also fails here, so the old code
-    # blamed a missing origin on a repo that demonstrably has one.
+    # Discovery resolves a linked worktree through --git-common-dir to the bare
+    # directory. `safe.bareRepository = explicit` rejects `git -C`, so the
+    # sweeper must address this validated owner via explicit `--git-dir`.
     mkbare3() {  # <worktree-path> <branch> <commit-date>
       local wtpath="$1" branch="$2" date="$3"
       local seed="$PWD/fix3/seed-bare" bare="$PWD/fix3/bare-owner.git"
@@ -353,15 +447,17 @@ pkgs.runCommand "worktree-sweep-harness"
     mkrepo3 repoA main   "git@github.com:jonathanmoregard/nixos-config.git"
     mkrepo3 repoB master "https://github.com/jonathanmoregard/dotclaude.git"
     mkrepo3 repoC main   "$PWD/fix3/seed-repoC"   # not GitHub → no PR state
+    mkrepo3 repoD main   "https://notgithub.com/org/repo.git"
 
     mkwt3 repoA feat/a-merged-old "$ROOT3/a-merged-old" "$OLD"
     mkwt3 repoA feat/a-outside    "$PWD/fix3/outside"   "$OLD"
     mkwt3 repoB feat/b-merged-old "$ROOT3/b-merged-old" "$OLD"
     mkwt3 repoC feat/c-merged-old "$ROOT3/c-merged-old" "$OLD"
+    mkwt3 repoD feat/d-fake-github "$ROOT3/d-fake-github" "$OLD"
     mkstandalone3 "$ROOT3/standalone" feat/d-standalone "$OLD"
     mkbare3 "$ROOT3/bare-owned" feat/e-bare-owned "$OLD"
 
-    FIXTURE_REPO_DIRS="$PWD/fix3/repoA:$PWD/fix3/repoB:$PWD/fix3/repoC:$ROOT3/standalone" \
+    FIXTURE_REPO_DIRS="$PWD/fix3/repoA:$PWD/fix3/repoB:$PWD/fix3/repoC:$PWD/fix3/repoD:$ROOT3/standalone:$PWD/fix3/bare-owner.git" \
     SWEEP_ROOTS="$ROOT3" \
     SWEEP_GH_BIN="$PWD/bin/gh" \
       "$sweep" > run3.log 2>&1 || fail "sweep exited non-zero on run 3"
@@ -383,7 +479,7 @@ pkgs.runCommand "worktree-sweep-harness"
 
     # 14. each repo's own checkout and default branch are untouched —
     #     repoB's default is master, which the old main-only guard missed
-    for r in repoA repoB repoC; do
+    for r in repoA repoB repoC repoD; do
       [ -d "$PWD/fix3/$r" ] || fail "$r checkout was deleted"
     done
     git -C "$PWD/fix3/repoB" show-ref --verify -q refs/heads/master \
@@ -391,12 +487,28 @@ pkgs.runCommand "worktree-sweep-harness"
     git -C "$PWD/fix3/repoA" show-ref --verify -q refs/heads/main \
       || fail "repoA's default branch was deleted"
 
-    # 15. non-GitHub origin → whole repo skipped, nothing deleted, logged
-    [ -d "$ROOT3/c-merged-old" ] || fail "repoC worktree deleted despite non-GitHub origin"
-    grep -q "is not a GitHub repo" run3.log \
-      || fail "no skip log line for the non-GitHub repo"
+    # 15. non-GitHub origin → age-only worktree cleanup, branch preserved.
+    # Missing PR state must not block safe space recovery or authorize
+    # irreversible branch deletion.
+    [ ! -e "$ROOT3/c-merged-old" ] \
+      || fail "repoC old worktree survived age-only cleanup"
+    git -C "$PWD/fix3/repoC" show-ref --verify -q refs/heads/feat/c-merged-old \
+      || fail "repoC branch was deleted without GitHub PR state"
+    grep -qF "deleted inactive worktree $ROOT3/c-merged-old; preserved branch feat/c-merged-old" run3.log \
+      || fail "no age-only deletion log line for non-GitHub repo"
+    grep -q "is not a GitHub repo.*age-only cleanup only" run3.log \
+      || fail "no age-only capability log for the non-GitHub repo"
 
-    # 16. a standalone clone under a root is never its own deletion
+    # 16. A hostname merely containing github.com is not GitHub. It may get
+    # age-only cleanup, but must never get PR-authorized branch deletion.
+    [ ! -e "$ROOT3/d-fake-github" ] \
+      || fail "fake-GitHub old worktree survived age-only cleanup"
+    git -C "$PWD/fix3/repoD" show-ref --verify -q refs/heads/feat/d-fake-github \
+      || fail "fake-GitHub origin authorized branch deletion"
+    grep -qF "origin 'https://notgithub.com/org/repo.git' is not a GitHub repo" run3.log \
+      || fail "fake-GitHub origin was accepted as GitHub"
+
+    # 17. a standalone clone under a root is never its own deletion
     #     candidate, however merged/old/clean its branch looks
     [ -d "$ROOT3/standalone" ] || fail "standalone clone under the root was deleted"
     [ -f "$ROOT3/standalone/file.txt" ] || fail "standalone clone lost its content"
@@ -405,27 +517,22 @@ pkgs.runCommand "worktree-sweep-harness"
     grep -qF "the repo's own checkout" run3.log \
       || fail "no kept log line for the standalone clone"
 
-    # 17. worktree outside every root → kept, logged
+    # 18. worktree outside every root → kept, logged
     [ -d "$PWD/fix3/outside" ] || fail "worktree outside the roots was deleted"
     grep -qF "outside the swept roots" run3.log \
       || fail "no kept log line for the out-of-root worktree"
 
-    # 18. a bare-owned worktree → repo skipped, nothing deleted, and the
-    #     REASON is accurate. Both halves matter: the skip alone was already
-    #     right, it was the explanation that lied, and a fail-closed path that
-    #     misreports why is how the #184 regression stayed invisible for days.
-    [ -d "$ROOT3/bare-owned" ] || fail "bare-owned worktree was deleted"
-    git -C "$ROOT3/bare-owned" show-ref --verify -q refs/heads/feat/e-bare-owned \
-      || fail "bare-owned worktree's branch was deleted"
-    grep -qF "skipped repo $PWD/fix3/bare-owner.git: git refuses to operate here" run3.log \
-      || fail "bare-owned repo was not skipped with the accurate reason"
-    if grep -qF "skipped repo $PWD/fix3/bare-owner.git: no origin remote" run3.log
-      then fail "bare repo skip still blames a missing origin remote"; fi
-    # The origin genuinely exists — proving the old message was false, not
-    # merely imprecise.
+    # 19. a bare-owned worktree is swept through explicit `--git-dir`, despite
+    #     safe.bareRepository rejecting implicit `git -C` access.
+    [ ! -e "$ROOT3/bare-owned" ] || fail "bare-owned worktree survived"
+    if GIT_DIR="$PWD/fix3/bare-owner.git" git show-ref --verify -q \
+      refs/heads/feat/e-bare-owned
+      then fail "bare-owned merged branch survived"; fi
+    grep -qF "deleted worktree $ROOT3/bare-owned + branch feat/e-bare-owned" run3.log \
+      || fail "bare-owned repo was not swept through explicit --git-dir"
     GIT_DIR="$PWD/fix3/bare-owner.git" git remote get-url origin >/dev/null \
-      || fail "fixture is wrong: bare-owner has no origin, so the old message would have been true"
+      || fail "fixture is wrong: bare-owner has no origin"
 
-    echo "ok: delete fired only on merged+old+clean+no-cwd; every failure mode kept + logged; gh outage = zero deletions; discovery sweeps every repo under the roots and skips the rest; a bare-owned repo is skipped for the reason that is actually true"
+    echo "ok: merged-at-tip or old worktrees delete only when safe; age-only cleanup preserves branches; result links are validated; gh outage and non-GitHub repos still age-sweep; protected work remains"
     touch $out
   ''
