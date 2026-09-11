@@ -48,7 +48,7 @@
   extraModules = [
     ../modules/nixos/build-coordination.nix
     ../modules/nixos/nixos-auto-deploy.nix
-    {
+    ({ lib, pkgs, ... }: {
       services.buildCoordination.enable = true;
       services.nixos-auto-deploy = {
         enable = true;
@@ -57,7 +57,36 @@
         # invoked without a populated /etc/nixos git clone.
         workingDir = "/tmp/deploy-repo";
       };
-    }
+
+      # Keep the real deploy service in its start phase while a candidate
+      # configuration changes its unit. This reproduces the production
+      # self-update path without running a nested rebuild from the test unit.
+      systemd.services.nixos-deploy.serviceConfig.ExecStartPre =
+        "${pkgs.coreutils}/bin/sleep 300";
+
+      # Negative control: unlike nixos-deploy, an ordinary changed service
+      # must restart, proving the switch exercised changed-unit handling.
+      systemd.services.deploy-restart-canary = {
+        description = "Deploy restart canary v1";
+        serviceConfig = {
+          Type = "simple";
+          ExecStart = "${pkgs.writeShellScript "deploy-restart-canary-v1" ''
+            exec ${pkgs.coreutils}/bin/sleep 300
+          ''}";
+        };
+      };
+
+      specialisation.deploy-self-update.configuration = {
+        systemd.services.nixos-deploy.serviceConfig = {
+          ExecStartPre = lib.mkForce [ ];
+          ExecStart = lib.mkForce "${pkgs.coreutils}/bin/false";
+        };
+        systemd.services.deploy-restart-canary.serviceConfig.ExecStart =
+          lib.mkForce "${pkgs.writeShellScript "deploy-restart-canary-v2" ''
+            exec ${pkgs.coreutils}/bin/sleep 300
+          ''}";
+      };
+    })
     # git for the testScript's scratch-repo setup (the deploy script
     # brings its own via runtimeInputs; this is for the test harness).
     { environment.systemPackages = [ pkgs.git ]; }
@@ -70,11 +99,49 @@
         "systemctl cat nixos-deploy.service | grep -q 'TimeoutStartSec=60min'"
     )
 
-    # Resolve the deploy script from the unit's ExecStart.
+    # Resolve the original deploy script before switching to the deliberately
+    # broken candidate, whose ExecStart is /bin/false by construction.
     script = dellan.succeed(
         "systemctl cat nixos-deploy.service "
         "| awk -F= '/^ExecStart=/{print $2}'"
     ).strip()
+
+    # A deploy changes this unit whenever its rendered script changes. The
+    # running oneshot must survive its own switch; otherwise its parent dies,
+    # bookkeeping never reaches last-good, and a timer retry collides with the
+    # still-running switch-to-configuration transient unit.
+    dellan.succeed("systemctl start --no-block nixos-deploy.service")
+    dellan.wait_until_succeeds(
+        "test \"$(systemctl show -P ActiveState nixos-deploy.service)\" = activating"
+    )
+    dellan.succeed("systemctl start deploy-restart-canary.service")
+    deploy_invocation_before = dellan.succeed(
+        "systemctl show -P InvocationID nixos-deploy.service"
+    ).strip()
+    canary_invocation_before = dellan.succeed(
+        "systemctl show -P InvocationID deploy-restart-canary.service"
+    ).strip()
+    rc, switch_out = dellan.execute(
+        "timeout 30 /run/current-system/specialisation/deploy-self-update/"
+        "bin/switch-to-configuration test 2>&1"
+    )
+    print(f"[diag] deploy self-update switch rc={rc} out={switch_out!r}")
+    assert rc == 0, switch_out
+    deploy_invocation_after = dellan.succeed(
+        "systemctl show -P InvocationID nixos-deploy.service"
+    ).strip()
+    canary_invocation_after = dellan.succeed(
+        "systemctl show -P InvocationID deploy-restart-canary.service"
+    ).strip()
+    assert deploy_invocation_after == deploy_invocation_before, (
+        "nixos-deploy stopped itself during its own configuration switch: "
+        f"{deploy_invocation_before} -> {deploy_invocation_after}"
+    )
+    assert canary_invocation_after != canary_invocation_before, (
+        "negative control did not restart, so candidate switch did not "
+        "exercise changed-unit handling"
+    )
+    dellan.succeed("systemctl stop nixos-deploy.service deploy-restart-canary.service")
 
     # 2. Script-level network bounds: a stalled connection must abort.
     dellan.succeed(f"grep -q 'ConnectTimeout=15' {script}")

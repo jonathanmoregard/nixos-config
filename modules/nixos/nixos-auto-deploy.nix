@@ -277,6 +277,12 @@ in
 
     systemd.services.nixos-deploy = {
       description = "NixOS automated deploy from git";
+      # The service runs switch-to-configuration itself. Restarting it because
+      # its candidate unit changed kills the parent deploy before bookkeeping
+      # can record success, then a timer retry collides with the still-running
+      # transient switch unit. Let this invocation finish; daemon-reload still
+      # installs the candidate unit for the next timer or webhook run.
+      restartIfChanged = false;
       path = with pkgs; [ git nixos-rebuild util-linux openssh coreutils gnugrep gnused ];
       serviceConfig = {
         Type = "oneshot";

@@ -369,7 +369,10 @@ in
     dellan.wait_until_succeeds(
         "test \"$(curl --max-time 2 --silent --output /dev/null "
         "--write-out %{http_code} http://127.0.0.1:8765/mcp || true)\" = 401",
-        timeout=30,
+        # Cold model imports can exceed 30s when host-wide build coordination
+        # is waiting behind already-running, unwrapped jobs. Keep this bounded
+        # while allowing a loaded VM to prove backend readiness.
+        timeout=120,
     )
 
     # Backend TCP is host-local, not user-private. Bearer auth is the actual
@@ -382,7 +385,7 @@ in
         "su -s /bin/sh claude-agent-1 -c '"
         f"cat ${mcpInitializeJson} | "
         "XDG_RUNTIME_DIR=/run/user/$(id -u) HOME=/home/claude-agent-1 "
-        f"timeout 15 {proxy_path}' 2>&1"
+        f"timeout 120 {proxy_path}' 2>&1"
     )
     assert rc != 0 and "unable to read backend token file" in out, (rc, out)
     unauth_status = dellan.succeed(
@@ -393,7 +396,7 @@ in
     assert unauth_status == "401", unauth_status
     proxy_init = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "cat ${mcpInitializeJson} | timeout 30 aggregator-mcp'"
+        "cat ${mcpInitializeJson} | timeout 120 aggregator-mcp'"
     )
     assert '"protocolVersion":"2025-06-18"' in proxy_init, proxy_init
 
@@ -2240,6 +2243,16 @@ in
         f"MemoryHigh, which throttles instead:\n{agg_embed_unit}"
     )
 
+    # Long transformer batches can take more than Home Manager's service
+    # switch timeout to finish after SIGTERM. Exercise the same sd-switch
+    # engine Home Manager uses: a changed active embed unit must keep its PID,
+    # while an unprotected changed canary must restart.
+    assert "X-RestartIfChanged=false" in agg_embed_unit, (
+        "aggregator-embed.service can be stopped by Home Manager during a "
+        "configuration switch, stranding that switch behind a long batch:\n"
+        f"{agg_embed_unit}"
+    )
+
     # PARSE THE VALUE, NOT THE SECOND `=`-DELIMITED FIELD. `awk -F=` here used
     # to take $2, which silently truncates the moment ExecStart carries an
     # argument containing `=`, and emits one line per ExecStart — so a drop-in
@@ -2306,9 +2319,94 @@ in
     assert "ActiveState=active" in agg_embed_state, agg_embed_state
     assert "SubState=running" in agg_embed_state, agg_embed_state
     assert "MainPID=0" not in agg_embed_state, agg_embed_state
+    agg_embed_pid_before = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -P MainPID aggregator-embed.service'"
+    ).strip()
+    agg_embed_managed_target = dellan.succeed(
+        "readlink -f /home/jonathan/.config/systemd/user/aggregator-embed.service"
+    ).strip()
+    dellan.succeed(
+        "install -d -o jonathan -g users /tmp/sd-switch-old /tmp/sd-switch-new"
+    )
+    dellan.succeed(
+        "cp /home/jonathan/.config/systemd/user/aggregator-embed.service "
+        "/tmp/sd-switch-old/aggregator-embed.service && "
+        "cp /tmp/sd-switch-old/aggregator-embed.service "
+        "/tmp/sd-switch-new/aggregator-embed.service && "
+        "sed -i '/^\\[Service\\]/a Environment=DEPLOY_LIFECYCLE_PROBE=v2' "
+        "/tmp/sd-switch-new/aggregator-embed.service"
+    )
+    dellan.succeed(
+        "printf '%s\\n' '[Unit]' 'Description=Restart canary v1' '[Service]' "
+        "'Type=simple' 'Environment=CANARY_VERSION=v1' "
+        "'ExecStart=${pkgs.coreutils}/bin/sleep 300' "
+        ">/tmp/sd-switch-old/embed-restart-canary.service && "
+        "sed 's/v1/v2/g' /tmp/sd-switch-old/embed-restart-canary.service "
+        ">/tmp/sd-switch-new/embed-restart-canary.service && "
+        "chown jonathan:users /tmp/sd-switch-old/*.service "
+        "/tmp/sd-switch-new/*.service"
+    )
+    dellan.succeed(
+        "ln -sfn /tmp/sd-switch-old/embed-restart-canary.service "
+        "/home/jonathan/.config/systemd/user/embed-restart-canary.service && "
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "systemctl --user daemon-reload && "
+        "systemctl --user start embed-restart-canary.service'"
+    )
+    canary_pid_before = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -P MainPID embed-restart-canary.service'"
+    ).strip()
+    dellan.succeed(
+        "ln -sfn /tmp/sd-switch-new/aggregator-embed.service "
+        "/home/jonathan/.config/systemd/user/aggregator-embed.service && "
+        "ln -sfn /tmp/sd-switch-new/embed-restart-canary.service "
+        "/home/jonathan/.config/systemd/user/embed-restart-canary.service && "
+        "chown -h jonathan:users "
+        "/home/jonathan/.config/systemd/user/aggregator-embed.service "
+        "/home/jonathan/.config/systemd/user/embed-restart-canary.service"
+    )
+    sd_switch_out = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "${pkgs.sd-switch}/bin/sd-switch --timeout 30000 "
+        "--old-units /tmp/sd-switch-old --new-units /tmp/sd-switch-new'"
+    )
+    print(f"[diag] embed sd-switch out={sd_switch_out!r}")
+    agg_embed_pid_after = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -P MainPID aggregator-embed.service'"
+    ).strip()
+    canary_pid_after = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -P MainPID embed-restart-canary.service'"
+    ).strip()
+    assert agg_embed_pid_after == agg_embed_pid_before, (
+        "Home Manager's sd-switch restarted active embed worker: "
+        f"{agg_embed_pid_before} -> {agg_embed_pid_after}; output={sd_switch_out!r}"
+    )
+    assert canary_pid_after != canary_pid_before, (
+        "negative control did not restart, so sd-switch did not exercise "
+        f"changed active units; output={sd_switch_out!r}"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user stop embed-restart-canary.service'"
+    )
     dellan.succeed(
         "timeout 10 su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user stop aggregator-embed.service'"
+    )
+    dellan.succeed(
+        f"ln -sfn {agg_embed_managed_target} "
+        "/home/jonathan/.config/systemd/user/aggregator-embed.service && "
+        "rm -f /home/jonathan/.config/systemd/user/embed-restart-canary.service && "
+        "chown -h jonathan:users "
+        "/home/jonathan/.config/systemd/user/aggregator-embed.service"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user daemon-reload'"
     )
 
     # THE SEED UNIT IS HUMAN-TRIGGERED, and must stay that way. It is the one

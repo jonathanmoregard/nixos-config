@@ -140,5 +140,11 @@
   # Enforced rather than advisory: the memory controller is delegated to this
   # user manager, which is how those OOM records came to name a per-service
   # memcg under user@1000.service in the first place.
-  systemd.user.services.aggregator-embed.Service.MemoryHigh = "6G";
+  systemd.user.services.aggregator-embed = {
+    # Finishing the current claimed row after SIGTERM can exceed Home Manager's
+    # sd-switch timeout. Keep an active worker across configuration switches;
+    # daemon-reload still installs the new unit for the next timer invocation.
+    Unit.X-RestartIfChanged = false;
+    Service.MemoryHigh = "6G";
+  };
 }
