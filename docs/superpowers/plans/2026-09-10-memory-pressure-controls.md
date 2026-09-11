@@ -30,7 +30,7 @@
 - Modify: `flake.lock`
 - Modify: `overlays/aggregator.nix`
 
-- [ ] Pin `aggregator-src` to the pushed shared-backend implementation SHA and run `nix flake lock`.
+- [ ] Pin `aggregator-src` to the pushed authenticated shared-backend implementation SHA and run `nix flake lock`.
 - [ ] Keep `aggregator-mcp` in the existing aggregate package, but wrap it with `AGGREGATOR_MCP_BACKEND_URL=http://127.0.0.1:8765/mcp` and a bounded FastMCP client initialization timeout.
 - [ ] Add `aggregator-mcp-backend`, wrapping the original venv entry point with proxy URL removed and `FASTMCP_TRANSPORT=http`, `FASTMCP_HOST=127.0.0.1`, and `FASTMCP_PORT=8765`.
 - [ ] Keep `aggregator-schema-probe` beside the proxy command so current command-derived probe resolution continues to work.
@@ -43,7 +43,7 @@
 - Modify: `home/jonathan-linux.nix`
 - Modify: `tests/base.nix`
 
-- [ ] Add a user service wanted by `default.target`, with restart-on-failure, loopback-only address families/IP policy, read-only home, writable `%h/.local/share/aggregator`, `MemoryHigh=6G`, and `MemoryMax=8G`.
+- [ ] Add a user service wanted by `default.target`, with restart-on-failure, loopback-only address families/IP policy, read-only home, writable `%h/.local/share/aggregator`, `MemoryHigh=6G`, `MemoryMax=8G`, and bearer auth from a private runtime token.
 - [ ] Import the module only for Jonathan's Linux Home Manager profile.
 - [ ] Extend `vm-base` to stop/start the backend, assert restart and one listening loopback socket, then initialize two production proxy commands against it.
 - [ ] Run `nix eval --no-warn-dirty .#checks.x86_64-linux.vm-base.drvPath` and inspect the generated Home Manager unit and both wrappers in the evaluated closure.
@@ -55,7 +55,7 @@
 - Modify: `tests/base.nix`
 
 - [ ] Add read-only module options exposing `nix-memory-run` and the coordinated Nix package to other modules and flake apps.
-- [ ] Implement `nix-memory-run [--nonblock] -- command ...`: validate argv; bypass when `NIX_MEMORY_COORDINATION_HELD=1`; lock a fixed path under `/run/user/1000`; return 75 on nonblocking contention; otherwise export the marker and preserve child status/signals.
+- [ ] Implement `nix-memory-run [--nonblock] -- command ...`: validate argv; bypass when `NIX_MEMORY_COORDINATION_HELD=1`; lock Jonathan's stable mode-`0600` `~/.nix-memory-pressure/lock`, creating that same path during the first-deployment window and enforcing it through tmpfiles afterward; return 75 on nonblocking contention; otherwise export the marker and preserve child status/signals.
 - [ ] Wrap production Nix. Coordinate `build`, `eval`, `flake check`, and feature-VM app invocations; bypass other commands and `feature-vm-screencap`. When the user manager is reachable, execute coordinated client work in a collected transient scope below `ram-heavy.slice` with group kill policy.
 - [ ] Change daemon settings to `max-jobs=1`, `cores=4`, and `use-cgroups=true`.
 - [ ] Directly exercise the built helper with missing delimiter/command, child exit 42, nested marker, a waiting contender, nonblocking contention, and a timeout-wrapped hanging child. All diagnostics and statuses must match the contract.
@@ -70,7 +70,7 @@
 - Modify: `tests/auto-deploy.nix`
 
 - [ ] Wrap the feature-VM QEMU command with exposed `nix-memory-run` and a named collected `feature-vm.scope` below `ram-heavy.slice`; keep screencap uncoordinated.
-- [ ] Wrap only auto-deploy's rebuild phase with `nix-memory-run --nonblock`; treat status 75 as a clean deferral and leave existing fetch, poison, rollback, and notification behavior unchanged.
+- [ ] Wrap only auto-deploy's rebuild phase with `nix-memory-run --nonblock`; use a child-start marker so pre-start status 75 is a clean deferral while a rebuild's own status 75 is poisoned; leave existing fetch, rollback, and notification behavior unchanged.
 - [ ] Preserve nested marker through `nixos-rebuild`, so its Nix subprocess cannot deadlock on the held lock.
 - [ ] Run `nix build .#checks.x86_64-linux.vm-base -L` and `nix build .#checks.x86_64-linux.vm-auto-deploy -L`.
 

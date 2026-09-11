@@ -31,16 +31,26 @@ A Home Manager user service starts the backend at the user's default target.
 It restarts on failure, writes only to aggregator state, permits only loopback
 network traffic, and applies `MemoryHigh=6G` plus `MemoryMax=8G`. Existing MCP
 manifests remain untouched, preserving schema-health command discovery.
+Loopback is host-local, not user-private, so the service creates a bearer token
+inside its mode-`0700` runtime directory. Both backend and stdio wrappers read
+that mode-`0600` file; other local UIDs cannot authenticate or read personal
+history. Restarts preserve the token so already-running proxies stay valid.
 
 ## Heavy-job coordination
 
 `services.buildCoordination` will provide one fixed `nix-memory-run` helper and
-a high-priority `nix` wrapper. One advisory lock under the user's runtime
-directory admits a single memory-heavy workflow at a time. The wrapper
+a high-priority `nix` wrapper. One advisory lock at
+`~/.nix-memory-pressure/lock`, owned by Jonathan at mode `0600`
+below a mode-`0700` directory, admits a single memory-heavy workflow at a time.
+Root can open that same file for auto-deploy without exposing a lock-based
+denial-of-service primitive to other local users. The wrapper
 coordinates `nix build`, `nix eval`, `nix flake check`, and the feature-VM apps;
 lightweight commands and `feature-vm-screencap` bypass the lock. A marker
 environment variable makes nested Nix calls bypass the same lock, preventing
-self-deadlock.
+self-deadlock. During first deployment, Jonathan creates this exact stable path
+if needed; system tmpfiles later enforces ownership and mode. No fallback lock
+namespace exists, so activation cannot split old and new launchers across two
+simultaneously-unlocked files.
 
 Coordinated interactive commands run in transient scopes below
 `ram-heavy.slice`. Feature VMs always run in a named scope there, so QEMU and
@@ -76,6 +86,9 @@ service with a known steady-state envelope.
 - lock acquisition waits with a clear diagnostic for interactive work;
 - nonblocking deployment exits cleanly as deferred, leaving the next hourly
   tick to retry;
+- deployment writes a child-start marker under its private state directory, so
+  exit 75 means deferral only when lock contention prevented child startup; an
+  actual rebuild that exits 75 remains a failed, poisoned target;
 - malformed helper invocation returns usage status without running anything;
 - child exit status and signals propagate through helper and transient scope;
 - missing user systemd manager falls back to coordinated execution without a
