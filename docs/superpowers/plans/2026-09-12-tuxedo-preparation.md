@@ -157,7 +157,9 @@ Replace the single laptop import in `hosts/dellan/default.nix` with:
 Run:
 
 ```bash
-nixfmt modules/nixos/laptop.nix modules/nixos/dell-latitude-7440.nix hosts/dellan/default.nix tests/base.nix
+nix shell .#nixosConfigurations.dellan.pkgs.nixfmt -c nixfmt modules/nixos/laptop.nix
+nix-instantiate --parse modules/nixos/dell-latitude-7440.nix >/dev/null
+nix-instantiate --parse hosts/dellan/default.nix >/dev/null
 nix eval --raw .#nixosConfigurations.dellan.config.system.build.toplevel.drvPath
 nix build --no-link .#checks.x86_64-linux.vm-base -L
 nix build --no-link .#checks.x86_64-linux.vm-camera-relay -L
@@ -304,7 +306,8 @@ Create the module:
 Run:
 
 ```bash
-nixfmt modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix tests/tuxedo-profile.nix flake.nix
+nix shell .#nixosConfigurations.dellan.pkgs.nixfmt -c nixfmt modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix tests/tuxedo-profile.nix
+nix-instantiate --parse flake.nix >/dev/null
 nix build --no-link .#checks.x86_64-linux.vm-base -L
 ```
 
@@ -379,7 +382,11 @@ git add CLAUDE.md flake.nix hosts/dellan/default.nix modules/nixos/laptop.nix mo
 - [ ] **Step 2: Run format and eval gates**
 
 ```bash
-nixfmt --check flake.nix hosts/dellan/default.nix modules/nixos/laptop.nix modules/nixos/dell-latitude-7440.nix modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix tests/base.nix tests/tuxedo-profile.nix
+nix shell .#nixosConfigurations.dellan.pkgs.nixfmt -c nixfmt --check modules/nixos/laptop.nix modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix tests/tuxedo-profile.nix
+nix-instantiate --parse flake.nix >/dev/null
+nix-instantiate --parse hosts/dellan/default.nix >/dev/null
+nix-instantiate --parse modules/nixos/dell-latitude-7440.nix >/dev/null
+nix-instantiate --parse tests/base.nix >/dev/null
 ./scripts/check-eval-warnings.sh
 nix eval .#checks.x86_64-linux --apply builtins.attrNames
 ```

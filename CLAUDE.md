@@ -12,6 +12,7 @@ Linux Mint 22.2 / Cinnamon migration to NixOS, declarative end to end. PRs are C
 |------|--------|
 | `dellan` | Dell Latitude 7440 (daily driver, auto-deploy target) |
 | `vm` | NixOS x86_64 VM (legacy; being phased out) |
+| `tuxedo` | Planned InfinityBook Pro 15 Gen10 AMD; dormant hardware profile only until arrival evidence exists |
 
 **Manual `nixos-rebuild switch` is no longer the default workflow.** Auto-deploy on push to `main` handles it (see "Deploy workflow" below). Manual rebuilds are reserved for: bootstrap install, hardware-config edits the VM gate can't model, emergency rollback. Use `sudo nixos-rebuild switch --rollback` for emergency rollback.
 
@@ -197,6 +198,23 @@ The Linux Mint daily-driver from which dellan was derived is being returned 2026
 | `/home/jonathan/mint-backup-2026-05-05/` | `~/jonathan/` from Mint host as of 2026-05-05, excluding caches, Dropbox, snap, Trash, node_modules, target/, .next, dist, __pycache__, .venv, Chrome cache |
 
 Use it as a read-only reference when porting drift proposals — every "live Mint state" the proposals reference (autostart .desktop entries, dotfiles, custom systemd unit text, scripts, configs) lives under that backup path. Never reinstate state from the backup blindly into `$HOME`; the backup contains stale paths (e.g. ghostty-mcp tooling that's been replaced by kitty), legacy app caches, and host-specific machine IDs. Always read first, transcribe deliberately into the flake.
+
+## TUXEDO InfinityBook Pro 15 Gen10 AMD preparation
+
+`modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix` is a dormant,
+directly-importable hardware profile. It deliberately is not a
+`nixosConfigurations` host yet: real disk topology, generated hardware config,
+SSH host key, audio devices, kernel stability, and XDNA userspace compatibility
+require the delivered machine.
+
+Use Radeon 890M Vulkan through `whisper-cpp-vulkan` as the first local Voquill
+benchmark. Do not enable XRT/FastFlowLM merely because `amdxdna` loads; require
+an end-to-end workload and review memlock/device permissions first. Keep hostile
+honeypot agents inside the existing microVM + bubblewrap boundary with remote
+inference; never pass GPU/NPU devices into that guest.
+
+Arrival order and evidence sources are recorded in
+`docs/superpowers/specs/2026-09-12-tuxedo-preparation-design.md`.
 
 ## Known gaps / manual steps
 

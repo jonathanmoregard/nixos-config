@@ -275,7 +275,13 @@
           };
         };
       in {
-        vm-base         = mkLane ./tests/base.nix;
+        vm-base = pkgsLinux.symlinkJoin {
+          name = "vm-base-with-tuxedo-profile";
+          paths = [
+            (mkLane ./tests/base.nix)
+            (mkLane ./tests/tuxedo-profile.nix)
+          ];
+        };
         vm-auto-deploy  = mkLane ./tests/auto-deploy.nix;
         vm-camera-relay = mkLane ./tests/camera-relay.nix;
         vm-desktop      = mkLane ./tests/desktop.nix;

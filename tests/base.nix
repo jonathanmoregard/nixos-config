@@ -1157,7 +1157,15 @@ in
         f"claude-cl-sync-wrap lost the LAKERA_PROJECT_ID export:\n{cl_sync_txt}"
     )
 
-    # ── IPU6 camera self-heal watchdog (modules/nixos/laptop.nix) ──
+    # Dell Latitude hardware profile must survive extraction from the generic
+    # laptop module. These are observable contracts, not source-text checks.
+    dellan.succeed("systemctl cat tlp.service >/dev/null")
+    dellan.succeed("systemctl cat thermald.service >/dev/null")
+    dellan.succeed(
+        "grep -q 'export LIBVA_DRIVER_NAME=\"iHD\"' /etc/set-environment"
+    )
+
+    # ── IPU6 camera self-heal watchdog (dell-latitude-7440.nix) ──
     # The real recovery can't be modelled in a VM (no OV02C10 sensor /
     # IVSC), so — like the kindle udev rule above — this asserts the
     # wiring is installed correctly and that the script's healthy/no-op
