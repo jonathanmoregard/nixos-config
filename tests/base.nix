@@ -339,6 +339,8 @@ in
         "Nix daemon must admit one build at a time; got:\n"
         + "\n".join(line for line in nix_config if "jobs" in line)
     )
+    assert "min-free = 134217728" in nix_config
+    assert "max-free = 1073741824" in nix_config
     assert "cores = 4" in nix_config
     assert "use-cgroups = true" in nix_config
     experimental_features = next(

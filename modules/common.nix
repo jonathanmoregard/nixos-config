@@ -92,12 +92,13 @@
     lib.mkForce "20min";
 
   # Reclaim old profile generations and unreachable store paths before they
-  # can fill the shared root filesystem again. Separate weekdays keep routine
-  # GC and optimisation from competing; both NixOS timers are persistent by
-  # default, so a laptop asleep at schedule time catches up after resume.
+  # can fill the shared root filesystem again. Daily GC limits accumulation;
+  # Nix's min-free/max-free guard below also reacts during build spikes.
+  # Optimisation stays on a separate weekday, and persistent NixOS timers
+  # catch up after the laptop resumes.
   nix.gc = {
     automatic = true;
-    dates = [ "Sun 04:15" ];
+    dates = [ "daily" ];
     options = "--delete-older-than 14d";
   };
 
@@ -108,6 +109,12 @@
 
   nix.settings = {
     experimental-features = [ "nix-command" "flakes" ];
+
+    # If a build pushes free space below 200 GiB, collect unreachable paths
+    # until 300 GiB is available or no more garbage remains. The reserve is
+    # intentionally large enough to absorb Dellan's VM/build output bursts.
+    min-free = lib.mkDefault (200 * 1024 * 1024 * 1024);
+    max-free = lib.mkDefault (300 * 1024 * 1024 * 1024);
 
     # Cachix binary cache. Public read; CI pushes via CACHIX_AUTH_TOKEN
     # GitHub repo secret (see .github/workflows/ci.yml + gate.yml). Local
