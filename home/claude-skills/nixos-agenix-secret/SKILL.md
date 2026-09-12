@@ -22,9 +22,11 @@ Layout:
 
 ```bash
 # 1. Get onto a feature branch (the tool refuses on main). Anchor on the
-#    `main` worktree — safe.bareRepository = explicit refuses the bare repo.
+#    `main` worktree, fetch, then branch from origin/main. Unattended sync
+#    never moves shared local main.
+git -C ~/Repos/nixos-config-worktrees/main fetch origin main
 git -C ~/Repos/nixos-config-worktrees/main \
-    worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
+    worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> origin/main
 cd ~/Repos/nixos-config-worktrees/<slug>
 
 # 2a. Preferred: pipe the value in — no flag needed. The tool

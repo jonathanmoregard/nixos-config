@@ -55,9 +55,15 @@ without requesting that discovery. The `ncfg` shell function
 
 ```bash
 ncfg worktree list
-ncfg worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
+ncfg fetch origin main
+ncfg worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> origin/main
 ncfg worktree remove ~/Repos/nixos-config-worktrees/<slug>
 ```
+
+The linked `main` checkout is an anchor, not a freshness source. Fetch
+before branch creation and base new worktrees on `origin/main`.
+Unattended automation updates the remote-tracking ref only; it never
+moves shared local `main`, which may be attached to multiple worktrees.
 
 The single exception is recreating the `main` worktree itself, which has
 no anchor to use yet. Name GIT_DIR explicitly — that is the escape hatch
@@ -78,9 +84,10 @@ change that breaks the flow fails the gate whatever it is called.
 ```bash
 # 1. New worktree off main — anchored on the main worktree, NOT the bare
 #    repo (see "The anchor rule" above). `ncfg` is the same command with
-#    the anchor pre-bound.
+#    the anchor pre-bound. Fetch first; branch from origin/main.
+git -C ~/Repos/nixos-config-worktrees/main fetch origin main
 git -C ~/Repos/nixos-config-worktrees/main \
-    worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
+    worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> origin/main
 cd ~/Repos/nixos-config-worktrees/<slug>
 
 # 2. Plan + edit

@@ -34,16 +34,17 @@ Linux Mint 22.2 / Cinnamon migration to NixOS, declarative end to end. PRs are C
 
 You CANNOT edit `~/Repos/nixos-config/` (no working tree). You CANNOT edit `/etc/nixos/` (root-owned, deploy target). Both fail by construction. **Always work in a worktree.**
 
-**The anchor rule.** `safe.bareRepository = "explicit"` (home/jonathan.nix) stops git from *discovering* a bare directory as a starting point, so `git -C ~/Repos/nixos-config …` is refused outright: `fatal: cannot use bare repository … (safe.bareRepository is 'explicit')`. Address `~/Repos/nixos-config-worktrees/main` instead — same refs, same worktree list, through the same bare repo. `ncfg` is that path pre-bound. The one exception is recreating the `main` worktree itself, which has no anchor to use yet; name GIT_DIR explicitly, which is the escape hatch `explicit` is defined around: `GIT_DIR=~/Repos/nixos-config git worktree add ~/Repos/nixos-config-worktrees/main main`.
+**The anchor rule.** `safe.bareRepository = "explicit"` (home/jonathan.nix) stops git from *discovering* a bare directory as a starting point, so `git -C ~/Repos/nixos-config …` is refused outright: `fatal: cannot use bare repository … (safe.bareRepository is 'explicit')`. Address `~/Repos/nixos-config-worktrees/main` instead — same refs, same worktree list, through the same bare repo. `ncfg` is that path pre-bound. Fetch before creating a branch and base it on `origin/main`; unattended automation updates that remote-tracking ref and never moves shared local `main`. The one exception is recreating the `main` worktree itself, which has no anchor to use yet; name GIT_DIR explicitly, which is the escape hatch `explicit` is defined around: `GIT_DIR=~/Repos/nixos-config git worktree add ~/Repos/nixos-config-worktrees/main main`.
 
 **Standard flow for any change:**
 
 ```bash
 # 1. Open a worktree. Anchor on the `main` worktree, NOT the bare repo:
 #    safe.bareRepository = explicit refuses `git -C ~/Repos/nixos-config`.
-#    Same refs, same worktree list. `ncfg` is this path pre-bound.
+#    Same refs, same worktree list. Fetch, then branch from origin/main.
+git -C ~/Repos/nixos-config-worktrees/main fetch origin main
 git -C ~/Repos/nixos-config-worktrees/main \
-    worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> main
+    worktree add ~/Repos/nixos-config-worktrees/<slug> -b feat/<slug> origin/main
 cd ~/Repos/nixos-config-worktrees/<slug>
 
 # 2. Edit, commit

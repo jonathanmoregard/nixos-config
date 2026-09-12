@@ -147,9 +147,9 @@ Run `nix eval .#checks.x86_64-linux --apply builtins.attrNames`, then `nix build
 
 Run `verification-before-completion` and `advice-refine-test-loop`. Convert valid findings into failing assertions before fixes; rerun behavioral checks.
 
-- [ ] **Step 2: Rebase**
+- [ ] **Step 2: Merge latest main**
 
-Fetch origin main and rebase onto `origin/main`. Resolve only branch-owned changes. Rerun `vm-base` after conflicts.
+Fetch origin main and merge `origin/main`. Resolve only branch-owned changes. Rerun `vm-base` after conflicts.
 
 - [ ] **Step 3: Prepare risky commit trailer**
 

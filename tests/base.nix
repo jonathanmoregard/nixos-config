@@ -21,6 +21,18 @@ let
     {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vm-base","version":"1"}}}
   '';
 
+  worktreeWorkflowSources = {
+    claude = pkgs.writeText "workflow-CLAUDE.md" (builtins.readFile ../CLAUDE.md);
+    nixosConfigDev = pkgs.writeText "workflow-nixos-config-dev.md"
+      (builtins.readFile ../home/claude-skills/nixos-config-dev/SKILL.md);
+    agenixSecret = pkgs.writeText "workflow-nixos-agenix-secret.md"
+      (builtins.readFile ../home/claude-skills/nixos-agenix-secret/SKILL.md);
+    jonathan = pkgs.writeText "workflow-jonathan.nix"
+      (builtins.readFile ../home/jonathan.nix);
+    jonathanLinux = pkgs.writeText "workflow-jonathan-linux.nix"
+      (builtins.readFile ../home/jonathan-linux.nix);
+  };
+
   # TLS trust-store probe for aggregator-ingest.service.
   #
   # Installed as an ExecStart drop-in on the REAL unit, so it runs inside
@@ -594,8 +606,6 @@ in
         "| grep -F 'oomd-hog.service'"
     )
 
-    # Crontab source includes the bare-repo main-fetch line so worktrees
-    # branched off ~/Repos/nixos-config/main don't start behind origin/main.
     # Assert on the home.file source rather than `crontab -l`: the live
     # crontab is installed by an activation hook whose timing relative to
     # /run/wrappers/bin/crontab in this VM image isn't load-bearing for
@@ -603,19 +613,9 @@ in
     crontab_src = dellan.succeed(
         "cat /home/jonathan/.config/crontab"
     )
-    # Must fast-forward THROUGH the main worktree. The old
-    # `fetch origin main:main` against the bare repo failed every run
-    # ("refusing to fetch into branch 'main' checked out at ...") and left
-    # local main 99 files behind, so new worktrees started stale.
-    assert (
-        "git -C /home/jonathan/Repos/nixos-config-worktrees/main pull --ff-only origin main"
-        in crontab_src
-    ), f"nixos-config main-sync line missing from crontab source:\n{crontab_src}"
-    # Comments in this crontab quote the broken form on purpose, so
-    # only the executable half of each non-comment line counts. Split on
-    # `#` after stripping so inline trailing comments are dropped too
-    # (a future edit like `KEY=val # fetch origin main:main` should not
-    # spuriously fail this assertion).
+    # Comments may describe removed commands, so only executable halves of
+    # non-comment lines count. Split on `#` after stripping so inline
+    # trailing comments are dropped too.
     def _cron_command(line):
         s = line.strip()
         if not s or s.startswith("#"):
@@ -623,10 +623,370 @@ in
         return s.split("#", 1)[0]
 
     active_commands = [_cron_command(l) for l in crontab_src.splitlines()]
+    live_crontab = dellan.succeed("su - jonathan -c 'crontab -l'")
+    live_active_commands = [
+        _cron_command(line) for line in live_crontab.splitlines()
+    ]
+    assert not any("mint-drift-agent.sh" in c for c in active_commands), (
+        "obsolete Mint drift job must not remain scheduled:\n"
+        f"{crontab_src}"
+    )
+    assert not any("mint-drift-agent.sh" in c for c in live_active_commands), (
+        "obsolete Mint drift job remains in installed crontab:\n"
+        f"{live_crontab}"
+    )
+    assert not any(
+        "nixos-config-worktrees/main pull" in c for c in active_commands
+    ), (
+        "unattended sync must not move shared local main through a worktree:\n"
+        f"{crontab_src}"
+    )
     assert not any("fetch origin main:main" in c for c in active_commands), (
         "the bare-repo fetch form cannot move a ref a worktree has checked out; "
         f"it must not come back as a live entry:\n{crontab_src}"
     )
+    assert not any(
+        "nixos-config-worktrees/main pull" in c
+        or "fetch origin main:main" in c
+        for c in live_active_commands
+    ), f"unsafe NixOS sync remains in installed crontab:\n{live_crontab}"
+    crontab_activation_source = dellan.succeed(
+        "cat ${worktreeWorkflowSources.jonathanLinux}"
+    )
+    assert (
+        '/run/wrappers/bin/crontab "$HOME/.config/crontab" || true'
+        not in crontab_activation_source
+    ), "crontab activation must fail deployment when installation fails"
+
+    # NixOS config refresh updates only origin/main. Moving local main is
+    # unsafe because all worktrees attached to refs/heads/main share that ref
+    # while keeping independent indexes. Exercise generated runner against a
+    # local remote and a dirty/staged anchor.
+    fetch_timer = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat nixos-config-fetch.timer'"
+    )
+    for marker in [
+        "OnCalendar=*:0/30",
+        "Persistent=true",
+        "AccuracySec=5min",
+        "RandomizedDelaySec=5min",
+    ]:
+        assert marker in fetch_timer, (
+            f"nixos-config-fetch.timer lost {marker!r}:\n{fetch_timer}"
+        )
+
+    fetch_service = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat nixos-config-fetch.service'"
+    )
+    for marker in [
+        "OnFailure=nixos-config-fetch-failure-notify.service",
+        "Type=oneshot",
+        "TimeoutStartSec=180",
+    ]:
+        assert marker in fetch_service, (
+            f"nixos-config-fetch.service lost {marker!r}:\n{fetch_service}"
+        )
+
+    fetch_runner = dellan.succeed(
+        "su - jonathan -c 'command -v nixos-config-fetch'"
+    ).strip()
+    fetch_fixture = "/tmp/nixos-config-fetch-fixture"
+    dellan.succeed(
+        f"install -d -o jonathan -g users {fetch_fixture} && "
+        "su - jonathan -c 'set -eu; "
+        f"root={fetch_fixture}; "
+        "mkdir -p $root/home $root/state; "
+        "git init -q --bare $root/origin.git; "
+        "git clone -q $root/origin.git $root/seed; "
+        "git -C $root/seed config user.name vm-base; "
+        "git -C $root/seed config user.email vm-base@example.invalid; "
+        "printf \"seed\\n\" > $root/seed/tracked.txt; "
+        "git -C $root/seed add tracked.txt; "
+        "git -C $root/seed commit -qm seed; "
+        "git -C $root/seed push -q origin HEAD:refs/heads/main; "
+        "git --git-dir=$root/origin.git symbolic-ref HEAD refs/heads/main; "
+        "git clone -q $root/origin.git $root/anchor; "
+        "git -C $root/anchor config user.name vm-base; "
+        "git -C $root/anchor config user.email vm-base@example.invalid; "
+        "printf \"staged\\n\" > $root/anchor/staged.txt; "
+        "git -C $root/anchor add staged.txt; "
+        "git -C $root/anchor rev-parse HEAD > $root/head-before; "
+        "printf \"remote\\n\" > $root/seed/remote.txt; "
+        "git -C $root/seed add remote.txt; "
+        "git -C $root/seed commit -qm remote; "
+        "git -C $root/seed push -q origin HEAD:refs/heads/main; "
+        "git -C $root/seed rev-parse HEAD > $root/remote-commit'"
+    )
+    fetch_env = (
+        f"HOME={fetch_fixture}/home "
+        f"XDG_STATE_HOME={fetch_fixture}/state "
+        f"NIXOS_CONFIG_FETCH_ANCHOR={fetch_fixture}/anchor "
+    )
+    dellan.succeed(
+        "su - jonathan -c '" + fetch_env + fetch_runner + "'"
+    )
+    fetch_head_before = dellan.succeed(
+        f"cat {fetch_fixture}/head-before"
+    ).strip()
+    fetch_remote_commit = dellan.succeed(
+        f"cat {fetch_fixture}/remote-commit"
+    ).strip()
+    assert dellan.succeed(
+        "su - jonathan -c '"
+        f"git -C {fetch_fixture}/anchor rev-parse HEAD'"
+    ).strip() == fetch_head_before
+    assert dellan.succeed(
+        "su - jonathan -c '"
+        f"git -C {fetch_fixture}/anchor diff --cached --name-only'"
+    ) == "staged.txt\n"
+    assert dellan.succeed(
+        "su - jonathan -c '"
+        f"git -C {fetch_fixture}/anchor rev-parse origin/main'"
+    ).strip() == fetch_remote_commit
+    fetch_success = (
+        f"{fetch_fixture}/state/nixos-config-fetch/last-success"
+    )
+    assert f"commit={fetch_remote_commit}" in dellan.succeed(
+        f"cat {fetch_success}"
+    )
+
+    dellan.succeed(
+        f"cp {fetch_success} {fetch_fixture}/success-before"
+    )
+    fetch_failure = dellan.execute(
+        "su - jonathan -c '"
+        + fetch_env
+        + "NIXOS_CONFIG_FETCH_REMOTE=missing "
+        + fetch_runner
+        + "'"
+    )
+    assert fetch_failure[0] != 0, fetch_failure
+    dellan.succeed(
+        f"cmp {fetch_success} {fetch_fixture}/success-before"
+    )
+
+    # Prove rendered systemd failure edge, not only unit text.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "export XDG_RUNTIME_DIR; "
+        f"systemctl --user set-environment NIXOS_CONFIG_FETCH_ANCHOR={fetch_fixture}/anchor "
+        "NIXOS_CONFIG_FETCH_REMOTE=missing'"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start nixos-config-fetch.service; true'"
+    )
+    dellan.wait_until_succeeds(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u nixos-config-fetch-failure-notify.service --no-pager' "
+        "| grep -q 'NixOS config fetch failed'",
+        timeout=60,
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "export XDG_RUNTIME_DIR; "
+        "systemctl --user unset-environment NIXOS_CONFIG_FETCH_ANCHOR "
+        "NIXOS_CONFIG_FETCH_REMOTE; "
+        "systemctl --user reset-failed nixos-config-fetch.service'"
+    )
+
+    # Deterministic NixOS drift analyzer. This job used to send more than
+    # 100 KiB of configuration to Claude every hour, then redirect stdout
+    # straight over its last good report. A quota failure therefore erased
+    # the report and produced no operator signal. Exercise the replacement's
+    # real generated runner against local fixtures: no network, no model, and
+    # no alternate test-only implementation.
+    drift_timer = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat nixos-drift-analyzer.timer'"
+    )
+    for marker in [
+        "OnCalendar=hourly",
+        "Persistent=true",
+        "AccuracySec=5min",
+        "RandomizedDelaySec=5min",
+    ]:
+        assert marker in drift_timer, (
+            f"nixos-drift-analyzer.timer lost {marker!r}:\n{drift_timer}"
+        )
+
+    drift_service = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat nixos-drift-analyzer.service'"
+    )
+    for marker in [
+        "OnFailure=nixos-drift-analyzer-failure-notify.service",
+        "Type=oneshot",
+        "TimeoutStartSec=120",
+    ]:
+        assert marker in drift_service, (
+            f"nixos-drift-analyzer.service lost {marker!r}:\n{drift_service}"
+        )
+
+    drift_runner = dellan.succeed(
+        "su - jonathan -c 'command -v nixos-drift-analyzer'"
+    ).strip()
+    drift_runner_src = dellan.succeed(f"cat {drift_runner}")
+    for forbidden in ["--print", "claude-code"]:
+        assert forbidden not in drift_runner_src.lower(), (
+            "drift analyzer still carries model-driven runner marker "
+            f"{forbidden!r}:\n{drift_runner_src}"
+        )
+
+    drift_fixture = "/tmp/nixos-drift-fixture"
+    dellan.succeed(
+        f"install -d -o jonathan -g users {drift_fixture} && "
+        "su - jonathan -c 'set -eu; "
+        f"root={drift_fixture}; "
+        "mkdir -p $root/home/.local/bin $root/data $root/state; "
+        "printf \"#!/bin/sh\\nprintf imperative-demo\\n\" > $root/nix-env-ok; "
+        "printf \"#!/bin/sh\\nexit 23\\n\" > $root/nix-env-fail; "
+        "printf \"#!/bin/sh\\ncat $root/installed-crontab\\n\" > $root/crontab; "
+        "printf \"#!/bin/sh\\nexit 0\\n\" > $root/home/.local/bin/manual-tool; "
+        "chmod +x $root/nix-env-ok $root/nix-env-fail $root/crontab "
+        "$root/home/.local/bin/manual-tool; "
+        "printf \"0 1 * * * declared-command\\n\" > $root/declared-crontab; "
+        "printf \"0 2 * * * installed-command\\n\" > $root/installed-crontab; "
+        "git init -q $root/deployed; "
+        "git -C $root/deployed config user.name vm-base; "
+        "git -C $root/deployed config user.email vm-base@example.invalid; "
+        "printf \"declared\\n\" > $root/deployed/config.nix; "
+        "git -C $root/deployed add config.nix; "
+        "git -C $root/deployed commit -qm seed; "
+        "printf \"drift\\n\" >> $root/deployed/config.nix; "
+        "git init -q --bare $root/repo.git; "
+        "git clone -q $root/repo.git $root/seed; "
+        "git -C $root/seed config user.name vm-base; "
+        "git -C $root/seed config user.email vm-base@example.invalid; "
+        "git -C $root/seed commit -q --allow-empty -m seed; "
+        "git -C $root/seed push -q origin HEAD:refs/heads/main; "
+        "GIT_DIR=$root/repo.git git worktree add -q $root/anchor main; "
+        "git -C $root/anchor worktree add -q --force $root/duplicate main'"
+    )
+    drift_env = (
+        f"HOME={drift_fixture}/home "
+        f"XDG_DATA_HOME={drift_fixture}/data "
+        f"XDG_STATE_HOME={drift_fixture}/state "
+        f"NIXOS_DRIFT_NIX_ENV_BIN={drift_fixture}/nix-env-ok "
+        f"NIXOS_DRIFT_DEPLOYED_CONFIG={drift_fixture}/deployed "
+        f"NIXOS_DRIFT_DECLARED_CRONTAB={drift_fixture}/declared-crontab "
+        f"NIXOS_DRIFT_CRONTAB_BIN={drift_fixture}/crontab "
+        f"NIXOS_DRIFT_ANCHOR={drift_fixture}/anchor "
+    )
+    dellan.succeed(
+        "su - jonathan -c '" + drift_env + drift_runner + "'"
+    )
+    drift_report = dellan.succeed(
+        f"cat {drift_fixture}/data/nixos-drift-analyzer/latest.md"
+    )
+    for marker in [
+        "Imperative nix-env packages",
+        "imperative-demo",
+        "Entries outside /nix/store in ~/.local/bin",
+        "manual-tool",
+        "Deployed NixOS checkout has changes",
+        "config.nix",
+        "Installed crontab differs from declaration",
+        "Multiple worktrees share refs/heads/main",
+    ]:
+        assert marker in drift_report, (
+            f"drift fixture finding {marker!r} missing:\n{drift_report}"
+        )
+    drift_success = f"{drift_fixture}/state/nixos-drift-analyzer/last-success"
+    dellan.succeed(f"test -s {drift_success}")
+
+    # Generated runners must carry every command they invoke. Remove the
+    # ambient system profile so undeclared tools such as cmp/awk cannot hide
+    # behind the VM's otherwise rich PATH.
+    dellan.succeed(
+        "su - jonathan -c '"
+        + "PATH=/run/no-ambient-path "
+        + drift_env
+        + drift_runner
+        + "'"
+    )
+
+    # A failed filesystem probe must fail the analyzer. Process substitution
+    # hides producer status from the parent shell, so make the directory
+    # unreadable and prove no false-success report or heartbeat is published.
+    drift_latest = f"{drift_fixture}/data/nixos-drift-analyzer/latest.md"
+    dellan.succeed(
+        f"cp {drift_latest} {drift_fixture}/local-bin-report-before && "
+        f"cp {drift_success} {drift_fixture}/local-bin-success-before && "
+        f"chmod 000 {drift_fixture}/home/.local/bin"
+    )
+    unreadable_local_bin = dellan.execute(
+        "su - jonathan -c '" + drift_env + drift_runner + "'"
+    )
+    dellan.succeed(f"chmod 755 {drift_fixture}/home/.local/bin")
+    assert unreadable_local_bin[0] != 0, unreadable_local_bin
+    dellan.succeed(
+        f"cmp {drift_latest} {drift_fixture}/local-bin-report-before && "
+        f"cmp {drift_success} {drift_fixture}/local-bin-success-before"
+    )
+
+    # Failure after a good run must preserve both published artifacts and the
+    # original exit code. Direct `> latest.md` failed this property by
+    # truncating before the command even started.
+    dellan.succeed(
+        f"printf 'last-good\\n' > {drift_latest} && "
+        f"cp {drift_success} {drift_fixture}/success-before"
+    )
+    failing_drift_env = drift_env.replace("nix-env-ok", "nix-env-fail")
+    drift_failure = dellan.execute(
+        "su - jonathan -c '" + failing_drift_env + drift_runner + "'"
+    )
+    assert drift_failure[0] == 23, drift_failure
+    assert dellan.succeed(f"cat {drift_latest}") == "last-good\n"
+    dellan.succeed(f"cmp {drift_success} {drift_fixture}/success-before")
+
+    # The real systemd edge must fire, not merely exist in rendered text.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        f"systemctl --user set-environment NIXOS_DRIFT_NIX_ENV_BIN={drift_fixture}/nix-env-fail'"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start nixos-drift-analyzer.service; true'"
+    )
+    dellan.wait_until_succeeds(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u nixos-drift-analyzer-failure-notify.service --no-pager' "
+        "| grep -q 'NixOS drift analyzer failed'",
+        timeout=60,
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "export XDG_RUNTIME_DIR; "
+        "systemctl --user unset-environment NIXOS_DRIFT_NIX_ENV_BIN; "
+        "systemctl --user reset-failed nixos-drift-analyzer.service'"
+    )
+
+    # Interactive login warning follows machine-readable finding count, not
+    # report existence: every successful analyzer run publishes latest.md.
+    dellan.succeed(
+        "install -d -o jonathan -g users "
+        "/home/jonathan/.local/share/nixos-drift-analyzer "
+        "/home/jonathan/.local/state/nixos-drift-analyzer && "
+        "printf '# NixOS drift report\\n\\n## No drift detected\\n' "
+        "> /home/jonathan/.local/share/nixos-drift-analyzer/latest.md && "
+        "printf 'timestamp=smoke\\nfindings=0\\n' "
+        "> /home/jonathan/.local/state/nixos-drift-analyzer/last-success && "
+        "chown -R jonathan:users /home/jonathan/.local/share/nixos-drift-analyzer "
+        "/home/jonathan/.local/state/nixos-drift-analyzer"
+    )
+    clean_login = dellan.succeed("su - jonathan -c 'zsh -lic true'")
+    assert "Drift report available" not in clean_login, clean_login
+    dellan.succeed(
+        "printf 'timestamp=smoke\\nfindings=2\\n' "
+        "> /home/jonathan/.local/state/nixos-drift-analyzer/last-success && "
+        "chown jonathan:users "
+        "/home/jonathan/.local/state/nixos-drift-analyzer/last-success"
+    )
+    finding_login = dellan.succeed("su - jonathan -c 'zsh -lic true'")
+    assert "Drift report available" in finding_login, finding_login
 
     # The research-agent MCP server runs straight out of ~/Repos/research-agent
     # (`uv run --project`), and the research microvm bind-mounts that same
@@ -1137,6 +1497,40 @@ in
         "ncfg is present but does not anchor on the main worktree — it must "
         "not point at the bare repo, which safe.bareRepository now refuses"
     )
+
+    # Every active worktree workflow uses the linked main checkout only as a
+    # Git anchor. It fetches first, then bases the new branch on origin/main;
+    # no automation depends on or advances shared refs/heads/main.
+    workflow_sources = {
+        "CLAUDE.md": ("${worktreeWorkflowSources.claude}", "feat/<slug>"),
+        "nixos-config-dev": (
+            "${worktreeWorkflowSources.nixosConfigDev}",
+            "feat/<slug>",
+        ),
+        "nixos-agenix-secret": (
+            "${worktreeWorkflowSources.agenixSecret}",
+            "feat/<slug>",
+        ),
+        "home/jonathan.nix": (
+            "${worktreeWorkflowSources.jonathan}",
+            "feat/foo",
+        ),
+    }
+    for source_name, (source_path, branch_name) in workflow_sources.items():
+        source_text = dellan.succeed(f"cat {source_path}")
+        expected_base = f"-b {branch_name} origin/main"
+        stale_base = f"-b {branch_name} main"
+        assert expected_base in source_text, (
+            f"{source_name} must base new worktrees on origin/main; "
+            f"missing {expected_base!r}"
+        )
+        assert "fetch origin main" in source_text, (
+            f"{source_name} must fetch origin/main before branch creation"
+        )
+        assert stale_base not in source_text, (
+            f"{source_name} still bases new worktrees on shared local main: "
+            f"{stale_base!r}"
+        )
 
     # ── Lakera tuned-project pointer (home/lakera.nix) ──
     # All three injection-scanner call sites must export
