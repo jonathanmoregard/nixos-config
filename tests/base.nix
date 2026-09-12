@@ -15,6 +15,8 @@
 # Run: nix build .#checks.x86_64-linux.vm-base -L
 { pkgs, inputs }:
 let
+  tuxedoProfileContract = import ./tuxedo-profile.nix { inherit pkgs; };
+
   mcpInitializeJson = pkgs.writeText "vm-base-mcp-initialize.json" ''
     {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vm-base","version":"1"}}}
   '';
@@ -276,6 +278,11 @@ in
   name = "vm-base";
   testScript = ''
     dellan.wait_for_unit("multi-user.target")
+    # Keep the dormant TUXEDO profile's eval and package-build contract in
+    # this authoritative lane without wrapping the VM derivation in another
+    # symlinkJoin. Determinate Nix parallel evaluation rejects that wrapper's
+    # inherited NixOS option-documentation source context in a fresh store.
+    dellan.succeed("test -s ${tuxedoProfileContract}/result")
     dellan.wait_for_unit("home-manager-jonathan.service")
     # systemd --user for jonathan comes up via linger
     dellan.wait_for_unit("default.target", "jonathan")
