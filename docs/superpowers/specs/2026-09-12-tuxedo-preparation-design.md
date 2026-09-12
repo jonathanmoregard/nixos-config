@@ -1,0 +1,337 @@
+# TUXEDO InfinityBook Pro 15 Gen10 AMD preparation design
+
+**Date:** 2026-09-12
+
+## Goal
+
+Prepare the reusable, testable NixOS configuration for a TUXEDO InfinityBook
+Pro 15 Gen10 AMD without pretending that unknown hardware facts are known.
+Keep the current Dell Latitude configuration behaviourally unchanged. Record
+how to validate the laptop, local dictation, NPU runtime, and isolated agent
+execution after the hardware arrives.
+
+The selected hardware is product 10900244: Ryzen AI 9 HX 370, Radeon 890M,
+XDNA 2 NPU, 64 GiB DDR5-5600, 2 TiB WD Black SN7100, Intel AX210, and no
+discrete GPU.
+
+## Evidence boundaries
+
+### Verified locally
+
+- The pinned nixpkgs currently supplies Linux 6.18.42, linux-firmware
+  20260622, `tuxedo-drivers` 4.20.1, `tuxedo-rs` 0.3.1,
+  `whisper-cpp-vulkan` 1.9.2, Mesa 26.1.6, and Vulkan tools 1.4.350.0.
+- Linux 6.18.42 contains the in-tree `amdxdna` module and the current firmware
+  closure contains Strix Point `amdnpu/17f0_10` and `17f0_11` images.
+- nixpkgs has upstream `hardware.tuxedo-drivers` and `hardware.tuxedo-rs`
+  NixOS modules. The driver module supports declarative 80%, 90%, or 100%
+  charging profiles.
+- `modules/nixos/laptop.nix` currently mixes generic laptop behaviour with
+  Dell Latitude 7440-specific Intel graphics, TLP, thermald, IPU6, and camera
+  recovery code.
+- The checked-out Voquill application is dictation/STT, not TTS. Its current
+  configuration uses OpenAI transcription. Its local backend supports CPU or
+  Vulkan whisper.cpp, not ROCm or XDNA. Its service launches a repo-local
+  binary that is not built during fresh-host bootstrap.
+- Voquill supports an OpenAI-compatible transcription endpoint, leaving a
+  later seam for a local NPU service without changing desktop capture.
+- Aggregator currently has two embedding backends: sentence-transformers with
+  Qwen3-Embedding-0.6B in fp32, and an optional GGUF path. Neither targets the
+  XDNA NPU. Its index version already distinguishes model, quantization,
+  dimension, chunker, and normalization, and refuses an incompatible index.
+- The pinned nixpkgs tree contains the in-kernel `amdxdna` module and firmware,
+  but no XRT XDNA plugin, Ryzen AI runtime, VitisAI execution provider,
+  FastFlowLM, or Lemonade package.
+- The existing research-agent design already provides the preferred isolation
+  boundary: persistent KVM microVM, default-drop networking, and a fresh
+  bubblewrap jail per request. `repo-check` Phase C's Docker runner is not a
+  sufficient outer boundary for hostile plugins because it runs as root with
+  `NET_ADMIN` and `--dangerously-skip-permissions`.
+
+### Sourced current-state facts
+
+- TUXEDO says current distributions can support the model, but its FAQ also
+  says the selected Intel AX210 cannot use 6 GHz Wi-Fi on an AMD platform and
+  that the Motorcomm YT6801 Ethernet controller needs its vendor driver below
+  Linux 7.0.
+- A community hardware report for this exact Gen10 model records CPU, Radeon
+  890M, Wi-Fi, and keyboard working on Linux 6.18.7; it records Ethernet and
+  XDNA 2 working on Linux 7.0.
+- The upstream `amdxdna` driver first landed in Linux 6.14. Current
+  FastFlowLM/Lemonade Linux guidance requires Linux 7.0 or a matching DKMS
+  driver, sufficiently new NPU firmware, and an XRT userspace matching the
+  kernel ioctl surface.
+- Current reports conflict on kernel stability: one Ryzen AI report describes
+  amdgpu MES freezes on 6.18/6.19, while another describes repeatable s2idle
+  failure on 7.0.9 that disappears on 6.18.7.
+- AMD Ryzen AI Software 1.8.0 lists Strix Point and BF16 encoder-style NLP
+  models as supported on Linux through ONNX Runtime's VitisAI execution
+  provider. Its supported stack is Ubuntu 24.04, Python 3.12, and matched XRT
+  and XDNA plugin builds; no retrieved evidence demonstrates
+  Qwen3-Embedding-0.6B compiling or offloading on that stack.
+- FastFlowLM exposes an OpenAI-compatible NPU embedding endpoint on XDNA 2, but
+  currently supports EmbeddingGemma-300m Q4_1 rather than Qwen3-Embedding. It
+  also requires a concurrently loaded LLM in server mode.
+- No upstream `nixos-hardware` profile exists for this Gen10 model. TUXEDO
+  Control Center is not packaged in nixpkgs; `tuxedo-rs`/Tailor is the
+  packaged alternative.
+- `kylemanna/nix-amd-ai` is the broadest current community NixOS integration
+  for XRT, FastFlowLM, and Lemonade. It is not an upstream nixpkgs stack and
+  carries kernel/runtime, memlock, and device-permission implications.
+
+Sources:
+
+- [TUXEDO model FAQ](https://www.tuxedocomputers.com/en/FAQ-TUXEDO-InfinityBook-Pro-15-Gen10-AMD.tuxedo)
+- [Gentoo hardware report for the Gen10 model](https://wiki.gentoo.org/wiki/TUXEDO_InfinityBook_Pro_15_(Gen10))
+- [Linux amdxdna documentation](https://docs.kernel.org/next/accel/amdxdna/amdnpu.html)
+- [AMD XDNA driver and XRT shim](https://github.com/amd/xdna-driver)
+- [FastFlowLM/Lemonade Linux NPU requirements](https://lemonade-server.ai/flm_npu_linux.html)
+- [AMD Ryzen AI Linux support](https://ryzenai.docs.amd.com/en/latest/linux.html)
+- [AMD Ryzen AI model deployment](https://ryzenai.docs.amd.com/en/latest/modelrun.html)
+- [FastFlowLM embedding model support](https://fastflowlm.com/docs/models/embeddinggemma/)
+- [Qwen3-Embedding model](https://github.com/QwenLM/Qwen3-Embedding)
+- [nix-amd-ai](https://github.com/kylemanna/nix-amd-ai)
+- [nixos-hardware Ryzen AI freeze report](https://github.com/NixOS/nixos-hardware/issues/1801)
+- [s2idle regression report](https://github.com/pop-os/pop/issues/4016)
+
+### Inference and recommendation
+
+- Kernel selection is a hardware test result, not a pre-arrival constant.
+  Forcing 7.0 solely for NPU support risks suspend stability; staying on 6.18
+  may leave Ethernet or current NPU userspace unavailable.
+- Radeon 890M Vulkan is the best first local dictation target because it is
+  supported by Voquill's existing local sidecar and current nixpkgs. NPU
+  dictation should compete against measured CPU and Vulkan latency on short
+  utterances rather than against marketing TOPS.
+- Local agent execution and local model inference are independent. Existing
+  honeypot agents can run inside the current microVM/bubblewrap boundary while
+  inference remains remote. Accelerator access should stay outside an
+  adversarial guest.
+- Aggregator background embedding is the first useful NPU workload after the
+  driver/runtime stack validates. CPU fp32 stays authoritative until an NPU
+  backend proves real offload, retrieval quality, throughput, and power on the
+  actual corpus. Backend selection is explicit per host, never device-node
+  auto-detection.
+
+## Approaches considered
+
+### 1. Verified dormant hardware profile — chosen
+
+Extract the Dell/Intel configuration from the generic laptop module, add a
+model-specific AMD/TUXEDO module, and validate both with existing checks. Do
+not add a bootable host output until generated hardware configuration, disk
+layout, and SSH host key exist.
+
+This produces useful code before arrival while keeping every unverified choice
+reversible.
+
+### 2. Complete host plus experimental NPU stack now
+
+Add a host output with a guessed disk layout, force Linux 7.0+, and pin
+`nix-amd-ai`. This shortens setup on arrival, but turns unknown storage,
+suspend, firmware, and runtime compatibility into production defaults. The
+failure modes are boot-critical, so this approach is rejected.
+
+### 3. Research and checklist only
+
+Leave configuration unchanged and document findings. This has the lowest
+runtime risk but does not remove the Intel coupling that blocks a correct AMD
+laptop profile. It fails the requirement for concrete preparation.
+
+## Configuration design
+
+### Generic laptop module
+
+`modules/nixos/laptop.nix` retains only behaviour shared by both laptops:
+
+- firmware updates;
+- touchpad and Bluetooth;
+- lid/suspend policy;
+- PipeWire with PulseAudio compatibility;
+- printing, fonts, and other genuinely host-neutral laptop facilities.
+
+No existing generic behaviour changes.
+
+### Dell Latitude 7440 module
+
+A new `modules/nixos/dell-latitude-7440.nix` receives the code extracted from
+the generic file:
+
+- Intel microcode and Iris Xe media packages;
+- Intel-specific TLP policy and thermald;
+- IPU6 platform configuration;
+- the v4l2loopback buffer module currently consumed by the IPU6 relay;
+- the IPU6 relay prime, watchdog, and user notification path.
+
+`hosts/dellan/default.nix` imports both generic laptop and Dell-specific
+modules. Existing `vm-base` and `vm-camera-relay` tests remain the behavioural
+regression gate.
+
+### TUXEDO Gen10 AMD module
+
+A new `modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix` provides only
+pre-arrival-safe settings:
+
+- AMD microcode updates;
+- Mesa graphics with 32-bit support;
+- upstream TUXEDO hardware drivers;
+- `stationary` charging profile, corresponding to the driver's 80% longevity
+  mode;
+- power-profiles-daemon instead of Intel-tuned TLP;
+- Vulkan/VA-API diagnostics and Vulkan whisper.cpp tooling needed for arrival
+  measurements.
+
+The module does not force an `amd_pstate` mode, kernel package, watt limit,
+fan curve, Tailor daemon, NPU runtime, unlimited memlock, or permissive NPU
+udev rule. Those settings need evidence from the actual machine.
+
+Importing the file is the activation mechanism; no extra feature flag is
+introduced.
+
+### Contract test
+
+Add a focused Nix evaluation/build contract for the TUXEDO module and attach
+it to an existing CI-built lane without changing CI workflow files. It checks
+the safe settings above and builds the kernel-side TUXEDO driver plus selected
+userspace tools. Add or retain assertions showing Dellan still receives its
+Intel/IPU6 settings after the split.
+
+Implementation follows test-first order: add the contract and observe the
+missing-module failure, then add the modules and restore green checks.
+
+## Dictation direction
+
+Voquill remains the desktop recorder and text-injection UI. Initial local
+validation uses its Vulkan whisper.cpp backend on Radeon 890M. The existing
+PipeWire Pulse compatibility layer remains part of the generic laptop module.
+
+Fresh-install packaging of Voquill is a separate logical change: its flake is
+currently a dev shell, the configured binary is a mutable repo build, and its
+nominal GPU sidecar currently falls back to a byte-identical CPU binary. This
+PR records that blocker and prevents the AMD profile from depending on the
+mutable binary; it does not hide the gap with an activation-time build.
+
+On arrival, clear the Dell-specific saved microphone, select the actual ACP
+input, and compare the same short Swedish and English utterances on CPU and
+Vulkan. An NPU server is considered only if it beats the Vulkan path on
+interactive latency and stability. Voquill's OpenAI-compatible endpoint is
+the integration seam.
+
+## NPU direction
+
+The default profile relies on kernel/firmware autoload only and adds no XRT
+userspace. Experimental NPU enablement is a second phase after these facts are
+captured:
+
+1. actual PCI ID and `/dev/accel` node;
+2. firmware version reported by the driver;
+3. known-good kernel after repeated suspend and GPU stress;
+4. compatible XRT shim and successful FastFlowLM validation;
+5. explicit review of memlock and device-access changes.
+
+Only an end-to-end transcription, generation, or embedding run with measured
+operator offload proves the NPU path. Module load, device-node presence, and
+marketing TOPS do not.
+
+### Aggregator NPU embedding contract
+
+Aggregator background document embedding is the primary sustained NPU
+candidate. Two runtime approaches remain valid experiments after arrival:
+
+1. Export the existing pinned Qwen3-Embedding-0.6B model to ONNX and run a
+   precompiled BF16 graph through AMD's VitisAI execution provider. This keeps
+   the model family but is accepted only after the export compiles, reports
+   non-zero NPU operator placement, and reproduces the query prompt, mean
+   pooling, 768-dimension MRL truncation, then L2 normalization in that order.
+2. Run FastFlowLM's EmbeddingGemma endpoint as a benchmark alternative. This
+   is a different model and vector space, requires its own complete index, and
+   is not a drop-in acceleration of the current Qwen index.
+
+The production backend remains sentence-transformers fp32 until one candidate
+passes the arrival gate. Activation is an explicit TUXEDO host setting after
+kernel, firmware, XRT/plugin, provider, model artifact, and device permissions
+are pinned together. Appearance of `/dev/accel/accel0` never switches the
+backend automatically.
+
+Every NPU backend extends the embedding version with model revision, runtime,
+precision, provider/compiler version, and the output recipe. Any change creates
+a new version and requires explicit full re-indexing; CPU and NPU vectors are
+never mixed. A failed NPU document batch aborts without CPU fallback. If an NPU
+query cannot run against an NPU-built index, semantic search refuses or drops
+to the lexical arm; it never embeds that query with the fp32 backend and
+pretends the spaces match.
+
+Before adoption, run identical held-out documents and real queries through CPU
+and NPU backends. Record paired-vector cosine distribution including tail,
+recall/nDCG at fixed `k`, cold and steady-state throughput, energy use, peak
+memory, provider operator counts, and failure behaviour. NPU wins only if
+recall@10 and nDCG@10 each stay within one percentage point of the current
+fp32 baseline, a 10,000-document soak completes without an incorrect fallback,
+and either steady-state throughput doubles or energy per document falls by at
+least 30% under the same power profile.
+
+## Agent isolation direction
+
+Run `repo-check` Phase C or equivalent hostile-agent workloads inside a
+dedicated microVM based on the existing research-agent boundary. Keep its
+inner Docker runner because Phase C needs Docker semantics, but treat the
+microVM as the security boundary. Permit only DNS and provider HTTPS; expose
+only quarantined output. Never add the host user or an agent account to the
+Docker group.
+
+Keep inference remote initially. If local inference is later useful, run it as
+a separate host service with its own credentials and expose a narrow,
+authenticated endpoint to the guest. Do not pass `/dev/dri` or `/dev/accel`
+into the hostile-agent VM.
+
+## Arrival verification
+
+Before importing the TUXEDO module into a real host output:
+
+1. Generate and review `hardware-configuration.nix`; decide LUKS/Btrfs layout
+   from the real disk names. Never copy Dellan UUIDs or VM device paths.
+2. Capture `lscpu`, `lspci -nnk`, kernel log, input devices, audio devices,
+   display connectors, `/dev/dri`, `/dev/accel`, firmware, sensors, and
+   `fwupdmgr` output.
+3. Test Wi-Fi, Ethernet, keyboard backlight, webcam, microphone, speakers,
+   external displays, brightness, touchpad, suspend, hibernate if configured,
+   and charging profile.
+4. Run at least ten lid and idle suspend/resume cycles. Search kernel logs for
+   amdgpu MES and s2idle errors.
+5. Stress Radeon 890M and record temperatures, fan behaviour, power draw, and
+   errors before setting any watt or fan limit.
+6. Generate the real SSH host key, add its agenix-rekey recipient, and create
+   the per-host rekeyed secret directory.
+7. Add the bootable flake host only after steps 1–6 are known; build its full
+   toplevel before installation.
+8. Benchmark Voquill CPU and Vulkan paths with the same short utterances.
+9. Validate the matched NPU kernel, firmware, XRT/plugin, provider, memlock,
+   and render-group path. Prove non-zero NPU operator placement.
+10. Run the aggregator Qwen ONNX spike and FastFlowLM EmbeddingGemma benchmark
+    against the same held-out corpus and queries. Keep CPU fp32 selected unless
+    one passes the embedding contract above; any accepted backend receives a
+    distinct version stamp and explicit full re-index.
+
+## Failure handling and rollback
+
+- The current Dellan import split must be behaviour-preserving; any existing
+  VM failure blocks the change.
+- The TUXEDO module stays dormant until explicitly imported by a future host,
+  so it cannot alter Dellan at deployment.
+- Kernel experimentation happens through a separate boot generation or
+  specialization after arrival. Keep a known-good generation until repeated
+  suspend and GPU tests pass.
+- NPU runtime, Tailor, fan control, and power limits remain additive follow-up
+  changes that can be reverted without changing storage or the base desktop.
+
+## Out of scope
+
+- guessed disk partitions, filesystem UUIDs, initrd modules, or host SSH key;
+- forcing Linux 7.0 before real suspend/GPU evidence;
+- packaging or forking Voquill;
+- enabling external NPU flakes, unlimited memlock, or broad accelerator
+  permissions before arrival validation;
+- changing aggregator's production model or index before a real-device NPU
+  benchmark;
+- changing CI workflows;
+- replacing remote inference models used by honeypot/scanner evaluation.

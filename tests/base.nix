@@ -15,6 +15,8 @@
 # Run: nix build .#checks.x86_64-linux.vm-base -L
 { pkgs, inputs }:
 let
+  tuxedoProfileContract = import ./tuxedo-profile.nix { inherit pkgs inputs; };
+
   mcpInitializeJson = pkgs.writeText "vm-base-mcp-initialize.json" ''
     {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vm-base","version":"1"}}}
   '';
@@ -276,6 +278,11 @@ in
   name = "vm-base";
   testScript = ''
     dellan.wait_for_unit("multi-user.target")
+    # Keep the dormant TUXEDO profile's eval and package-build contract in
+    # this authoritative lane without wrapping the VM derivation in another
+    # symlinkJoin. Determinate Nix parallel evaluation rejects that wrapper's
+    # inherited NixOS option-documentation source context in a fresh store.
+    dellan.succeed("test -s ${tuxedoProfileContract}/result")
     dellan.wait_for_unit("home-manager-jonathan.service")
     # systemd --user for jonathan comes up via linger
     dellan.wait_for_unit("default.target", "jonathan")
@@ -1159,7 +1166,15 @@ in
         f"claude-cl-sync-wrap lost the LAKERA_PROJECT_ID export:\n{cl_sync_txt}"
     )
 
-    # ── IPU6 camera self-heal watchdog (modules/nixos/laptop.nix) ──
+    # Dell Latitude hardware profile must survive extraction from the generic
+    # laptop module. These are observable contracts, not source-text checks.
+    dellan.succeed("systemctl cat tlp.service >/dev/null")
+    dellan.succeed("systemctl cat thermald.service >/dev/null")
+    dellan.succeed(
+        "grep -q 'export LIBVA_DRIVER_NAME=\"iHD\"' /etc/set-environment"
+    )
+
+    # ── IPU6 camera self-heal watchdog (dell-latitude-7440.nix) ──
     # The real recovery can't be modelled in a VM (no OV02C10 sensor /
     # IVSC), so — like the kindle udev rule above — this asserts the
     # wiring is installed correctly and that the script's healthy/no-op

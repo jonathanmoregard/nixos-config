@@ -271,11 +271,11 @@
         mkLane = path: import path {
           pkgs = pkgsLinux;
           inputs = {
-            inherit home-manager agenix agenix-rekey microvm aggregator-src;
+            inherit nixpkgs home-manager agenix agenix-rekey microvm aggregator-src;
           };
         };
       in {
-        vm-base         = mkLane ./tests/base.nix;
+        vm-base = mkLane ./tests/base.nix;
         vm-auto-deploy  = mkLane ./tests/auto-deploy.nix;
         vm-camera-relay = mkLane ./tests/camera-relay.nix;
         vm-desktop      = mkLane ./tests/desktop.nix;

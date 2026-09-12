@@ -13,6 +13,7 @@
 
     ../../modules/nixos/desktop.nix
     ../../modules/nixos/laptop.nix
+    ../../modules/nixos/dell-latitude-7440.nix
     ../../modules/nixos/tailscale.nix
     ../../modules/nixos/kindle.nix
 
