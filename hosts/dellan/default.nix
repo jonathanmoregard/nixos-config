@@ -120,10 +120,12 @@
     # verification) and in secrets/secrets.nix (no offline recovery
     # recipient yet).
     ../../modules/nixos/klaffat-infra.nix
+    ../../modules/nixos/klaffat-local-google.nix
   ];
 
   services.claudeEgressObserve.enable = true;
   services.klaffatInfra.enable = true;
+  services.klaffatLocalGoogle.enable = true;
 
   # ---------------------------------------------------------------------
   # agenix-rekey per-host config.
