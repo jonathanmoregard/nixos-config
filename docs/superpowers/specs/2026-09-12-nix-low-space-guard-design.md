@@ -17,6 +17,7 @@ Use Nix's built-in daemon pressure controls and make scheduled collection daily:
 - Set `nix.settings.min-free` to 200 GiB. During a build, crossing this threshold asks the Nix daemon to collect unreachable paths.
 - Set `nix.settings.max-free` to 300 GiB. Emergency collection stops once that much space is available or no more garbage remains.
 - Keep weekly store optimisation unchanged.
+- Give disposable VMs scaled 128 MiB/1 GiB thresholds. Their 12–20 GiB disks cannot inherit physical-host reserve values.
 
 The 100 GiB gap gives active builds room to finish while avoiding an unbounded collection target. The values reserve roughly 20% and 30% of the 931 GiB root filesystem and are large enough to react before another one-day build spike exhausts the disk.
 
@@ -28,7 +29,9 @@ Nix performs emergency collection only during Nix build activity. If less than 3
 
 Extend the existing evaluated `nix-maintenance` contract first. It must assert the daily calendar and exact byte values for `min-free` and `max-free`. Run the check before implementation to prove it fails against the weekly, zero-threshold configuration, then rerun it after implementation.
 
-Build the Dellan system derivation to verify the settings render through the full module graph. Interactive VM testing is unnecessary because this change contains no new script, daemon, or repository-side branching logic; behavior belongs to the standard Nix daemon implementation.
+The full-host VM test must assert its scaled values and complete a real Nix build. This catches accidental inheritance of physical-host thresholds: the first integration run with 200/300 GiB on a 12 GiB test disk immediately entered auto-GC, coredumped its Nix daemon while scanning runtime roots, and timed out a later build assertion.
+
+Build the Dellan system derivation to verify production settings through the full module graph. Boot the feature VM and confirm its Nix daemon reports the scaled values and can perform a build, proving the VM override without exercising production-sized disk pressure.
 
 ## Non-Goals
 
