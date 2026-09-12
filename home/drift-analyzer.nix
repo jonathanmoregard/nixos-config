@@ -1,89 +1,213 @@
 { pkgs, ... }:
 let
-  analyzerScript = pkgs.writeShellScript "nixos-drift-analyzer" ''
-    set -euo pipefail
+  analyzerScript = pkgs.writeShellApplication {
+    name = "nixos-drift-analyzer";
+    runtimeInputs = with pkgs; [
+      coreutils
+      diffutils
+      findutils
+      gawk
+      git
+      gnugrep
+      gnused
+      nix
+    ];
+    text = ''
+      set -euo pipefail
 
-    LOG_DIR="$HOME/.local/share/nixos-drift-analyzer"
-    mkdir -p "$LOG_DIR"
-    LATEST="$LOG_DIR/latest.md"
-    RUNLOG="$LOG_DIR/run.log"
+      nix_env_bin="''${NIXOS_DRIFT_NIX_ENV_BIN:-${pkgs.nix}/bin/nix-env}"
+      deployed_config="''${NIXOS_DRIFT_DEPLOYED_CONFIG:-/etc/nixos}"
+      declared_crontab="''${NIXOS_DRIFT_DECLARED_CRONTAB:-$HOME/.config/crontab}"
+      crontab_bin="''${NIXOS_DRIFT_CRONTAB_BIN:-/run/wrappers/bin/crontab}"
+      anchor="''${NIXOS_DRIFT_ANCHOR:-$HOME/Repos/nixos-config-worktrees/main}"
+      report_dir="''${XDG_DATA_HOME:-$HOME/.local/share}/nixos-drift-analyzer"
+      state_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/nixos-drift-analyzer"
+      latest="$report_dir/latest.md"
+      last_success="$state_dir/last-success"
 
-    log() { echo "$(date -Iseconds): $*" >> "$RUNLOG"; }
+      mkdir -p "$report_dir" "$state_dir"
+      scratch=$(mktemp -d "$state_dir/.run.XXXXXX")
+      report_tmp=$(mktemp "$report_dir/.latest.md.XXXXXX")
+      success_tmp=$(mktemp "$state_dir/.last-success.XXXXXX")
+      cleanup() {
+        rm -rf "$scratch"
+        rm -f "$report_tmp" "$success_tmp"
+      }
+      trap cleanup EXIT
 
-    # claude-code is in home.packages — use it directly
-    CLAUDE="${pkgs.claude-code}/bin/claude"
-    if [ ! -x "$CLAUDE" ]; then
-      log "claude not found at $CLAUDE, skipping"
-      exit 0
-    fi
+      findings="$scratch/findings"
+      : > "$findings"
+      finding_count=0
+      add_finding() {
+        heading=$1
+        details=$2
+        finding_count=$((finding_count + 1))
+        {
+          printf '## %s\n\n' "$heading"
+          printf '~~~text\n%s\n~~~\n\n' "$details"
+        } >> "$findings"
+      }
 
-    log "starting drift analysis"
-
-    # Live state: imperative installs
-    IMPERATIVE=$(${pkgs.nix}/bin/nix-env --query 2>/dev/null | grep -v '^$' || true)
-
-    # Live state: manually dropped binaries
-    LOCAL_BIN=$(ls "$HOME/.local/bin" 2>/dev/null | tr '\n' ' ' || true)
-
-    # Inline key nix config files (skip large/generated ones)
-    CONFIG=""
-    for f in /etc/nixos/flake.nix \
-              /etc/nixos/home/jonathan.nix \
-              /etc/nixos/home/jonathan-linux.nix \
-              /etc/nixos/home/desktop-apps.nix \
-              /etc/nixos/home/cinnamon.nix \
-              /etc/nixos/modules/nixos/desktop.nix \
-              /etc/nixos/hosts/vm/default.nix; do
-      if [ -f "$f" ]; then
-        CONFIG+="
-=== ''${f#/etc/nixos/} ===
-$(cat "$f")
-"
+      # A failed probe is an analyzer failure, not a clean bill of health.
+      # Keep last successful report and heartbeat untouched in that case.
+      set +e
+      imperative=$("$nix_env_bin" --query 2> "$scratch/nix-env.err")
+      probe_status=$?
+      set -e
+      if [ "$probe_status" -ne 0 ]; then
+        cat "$scratch/nix-env.err" >&2
+        exit "$probe_status"
       fi
-    done
+      if [ -n "$imperative" ]; then
+        add_finding "Imperative nix-env packages" "$imperative"
+      fi
 
-    PROMPT="You are a NixOS config drift analyzer running on a live NixOS VM (Linux Mint 22.2 / Cinnamon mirror).
-Your goal: find things that will be LOST on the next nixos-rebuild and draft the exact Nix code to capture them.
+      local_bin="$HOME/.local/bin"
+      if [ -d "$local_bin" ]; then
+        : > "$scratch/local-bin"
+        find "$local_bin" -mindepth 1 -maxdepth 1 -print0 \
+          | sort -z > "$scratch/local-bin-entries"
+        while IFS= read -r -d $'\0' entry; do
+          resolved=$(readlink -f "$entry" 2>/dev/null || printf '%s' "$entry")
+          case "$resolved" in
+            /nix/store/*) ;;
+            *) printf '%s\n' "''${entry#"$local_bin"/}" >> "$scratch/local-bin" ;;
+          esac
+        done < "$scratch/local-bin-entries"
+        if [ -s "$scratch/local-bin" ]; then
+          add_finding \
+            "Entries outside /nix/store in ~/.local/bin" \
+            "$(cat "$scratch/local-bin")"
+        fi
+      fi
 
-## Live system state
+      if git -c safe.directory="$deployed_config" -C "$deployed_config" \
+        rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        set +e
+        deployed_status=$(git -c safe.directory="$deployed_config" \
+          -C "$deployed_config" status --porcelain --untracked-files=all \
+          2> "$scratch/deployed-git.err")
+        probe_status=$?
+        set -e
+        if [ "$probe_status" -ne 0 ]; then
+          cat "$scratch/deployed-git.err" >&2
+          exit "$probe_status"
+        fi
+        if [ -n "$deployed_status" ]; then
+          add_finding "Deployed NixOS checkout has changes" "$deployed_status"
+        fi
+      else
+        add_finding \
+          "Deployed NixOS checkout is not a Git worktree" \
+          "$deployed_config"
+      fi
 
-nix-env imperative installs (lost on rebuild):
-''${IMPERATIVE:-none}
+      if [ ! -f "$declared_crontab" ]; then
+        add_finding "Declarative crontab is missing" "$declared_crontab"
+      elif [ ! -x "$crontab_bin" ]; then
+        add_finding "crontab command is unavailable" "$crontab_bin"
+      else
+        set +e
+        "$crontab_bin" -l > "$scratch/crontab-live" 2> "$scratch/crontab.err"
+        probe_status=$?
+        set -e
+        if [ "$probe_status" -ne 0 ]; then
+          crontab_error=$(cat "$scratch/crontab.err")
+          add_finding \
+            "Installed crontab is unavailable" \
+            "''${crontab_error:-crontab -l exited $probe_status}"
+        else
+          sed -E \
+            -e '/^# DO NOT EDIT THIS FILE - edit the master and reinstall\.$/d' \
+            -e '/^# \(.* installed on .*\)$/d' \
+            -e '/^# \(Cron version .*\)$/d' \
+            "$scratch/crontab-live" > "$scratch/crontab-normalized"
+          if ! cmp -s "$declared_crontab" "$scratch/crontab-normalized"; then
+            add_finding \
+              "Installed crontab differs from declaration" \
+              "declared: $declared_crontab
+installed: crontab -l"
+          fi
+        fi
+      fi
 
-~/.local/bin (manually placed, may need home.packages):
-''${LOCAL_BIN:-empty}
+      if git -c safe.directory="$anchor" -C "$anchor" \
+        rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        set +e
+        git -c safe.directory="$anchor" -C "$anchor" worktree list --porcelain \
+          > "$scratch/worktrees" 2> "$scratch/worktrees.err"
+        probe_status=$?
+        set -e
+        if [ "$probe_status" -ne 0 ]; then
+          cat "$scratch/worktrees.err" >&2
+          exit "$probe_status"
+        fi
+        main_worktrees=$(grep -c '^branch refs/heads/main$' "$scratch/worktrees" || true)
+        if [ "$main_worktrees" -gt 1 ]; then
+          main_paths=$(awk '
+            /^worktree / { path = substr($0, 10) }
+            /^branch refs\/heads\/main$/ { print path }
+          ' "$scratch/worktrees")
+          add_finding \
+            "Multiple worktrees share refs/heads/main" \
+            "$main_paths"
+        fi
+      else
+        add_finding "NixOS config anchor is unavailable" "$anchor"
+      fi
 
-## Current NixOS config
-$CONFIG
+      {
+        printf '# NixOS drift report\n\n'
+        printf 'Generated: %s\n\n' "$(date -Iseconds)"
+        if [ "$finding_count" -eq 0 ]; then
+          printf '## No drift detected\n'
+        else
+          printf '%s finding(s) need review.\n\n' "$finding_count"
+          cat "$findings"
+        fi
+      } > "$report_tmp"
+      printf 'timestamp=%s\nfindings=%s\n' \
+        "$(date -Iseconds)" "$finding_count" > "$success_tmp"
 
-## Instructions
+      mv -f "$report_tmp" "$latest"
+      mv -f "$success_tmp" "$last_success"
+      printf 'NixOS drift analyzer completed: %s finding(s); report: %s\n' \
+        "$finding_count" "$latest"
+    '';
+  };
 
-1. Compare live state to what is declared in the config.
-2. Also flag static patterns that commonly cause drift:
-   - ~/.ssh/config, ~/.gnupg/, ~/.config/* paths not managed by home.file or programs.*
-   - Service state dirs not persisted (/var/lib/*, ~/.local/share/*)
-   - PATH entries or env vars set imperatively that belong in home.sessionVariables
-   - TODOs / manual-step comments that could be automated
-   - Incomplete autostart, dconf, or MIME declarations
-3. For each gap, write the exact Nix snippet to fix it (file + attribute path).
-4. Be conservative — only flag things you are confident about from what is visible here.
-5. Output a markdown report with:
-   - ## Drift Report $(date +%Y-%m-%d)
-   - One bullet per finding: problem, then nix code block with the fix
-   - If nothing to report: '## No drift detected $(date +%Y-%m-%d)'"
-
-    "$CLAUDE" --print "$PROMPT" > "$LATEST" 2>> "$RUNLOG"
-    log "done — report at $LATEST"
-  '';
+  failureNotifyScript = pkgs.writeShellApplication {
+    name = "nixos-drift-analyzer-failure-notify";
+    runtimeInputs = [ pkgs.libnotify ];
+    text = ''
+      message="NixOS drift analyzer failed — inspect: journalctl --user -u nixos-drift-analyzer.service"
+      printf '%s\n' "$message"
+      notify-send --urgency=critical "NixOS drift analyzer failed" "$message" || true
+    '';
+  };
 in
 {
-  home.packages = [ pkgs.claude-code ];
+  home.packages = [ analyzerScript ];
 
-  systemd.user.services.nixos-drift-analyzer = {
-    Unit.Description = "NixOS config drift analyzer";
-    Service = {
-      Type = "oneshot";
-      ExecStart = "${analyzerScript}";
+  systemd.user.services = {
+    nixos-drift-analyzer = {
+      Unit = {
+        Description = "Detect undeclared NixOS state drift";
+        OnFailure = [ "nixos-drift-analyzer-failure-notify.service" ];
+      };
+      Service = {
+        Type = "oneshot";
+        ExecStart = "${analyzerScript}/bin/nixos-drift-analyzer";
+        TimeoutStartSec = 120;
+      };
+    };
+
+    nixos-drift-analyzer-failure-notify = {
+      Unit.Description = "Notify when NixOS drift analysis fails";
+      Service = {
+        Type = "oneshot";
+        ExecStart = "${failureNotifyScript}/bin/nixos-drift-analyzer-failure-notify";
+      };
     };
   };
 
@@ -91,6 +215,8 @@ in
     Unit.Description = "NixOS drift analyzer — hourly";
     Timer = {
       OnCalendar = "hourly";
+      AccuracySec = "5min";
+      RandomizedDelaySec = "5min";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];

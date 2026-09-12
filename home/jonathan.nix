@@ -219,11 +219,25 @@
           warnings+=("~/.local/bin has files — check if these should be in home.packages")
         fi
 
-        # Surface latest drift report if it exists
+        # Surface latest drift report only when its successful heartbeat says
+        # findings exist. Every successful run publishes latest.md, including
+        # the clean "No drift detected" case.
         local report="$HOME/.local/share/nixos-drift-analyzer/latest.md"
-        if [[ -f "$report" ]]; then
-          warnings+=("Drift report available: $report")
+        local drift_state="$HOME/.local/state/nixos-drift-analyzer/last-success"
+        local findings_line=""
+        local findings=""
+        if [[ -f "$drift_state" ]]; then
+          findings_line=$(grep -m1 '^findings=' "$drift_state" 2>/dev/null)
+          findings="''${findings_line#findings=}"
         fi
+        case "$findings" in
+          ""|*[!0-9]*|0) ;;
+          *)
+            if [[ -f "$report" ]]; then
+              warnings+=("Drift report available: $report")
+            fi
+            ;;
+        esac
 
         if [[ ''${#warnings[@]} -gt 0 ]]; then
           echo ""
@@ -336,8 +350,11 @@
       # nixos-config git anchor. safe.bareRepository = explicit means
       # `git -C ~/Repos/nixos-config ...` is refused, so worktree operations
       # address the `main` browse worktree instead — same refs, same
-      # worktree list. Here so the long path is not muscle memory:
-      #   ncfg worktree add ~/Repos/nixos-config-worktrees/foo -b feat/foo main
+      # worktree list. Fetch first, then base new branches on origin/main;
+      # unattended sync never moves shared local main. Here so the long path
+      # is not muscle memory:
+      #   ncfg fetch origin main
+      #   ncfg worktree add ~/Repos/nixos-config-worktrees/foo -b feat/foo origin/main
       #   ncfg worktree remove ~/Repos/nixos-config-worktrees/foo
       #   ncfg worktree list
       ncfg() { git -C "$HOME/Repos/nixos-config-worktrees/main" "$@"; }
