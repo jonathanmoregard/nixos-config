@@ -6,6 +6,7 @@
     cores = 1;
     # Trigger GC automatically when store is low on space
     min-free = 134217728;  # 128 MB in bytes
+    max-free = 1073741824; # 1 GiB in bytes
   };
 
   # Compressed RAM swap — good for memory pressure

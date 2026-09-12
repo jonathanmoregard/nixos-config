@@ -73,7 +73,7 @@
 # home-manager block that built the failing configuration. Every site that
 # constructs one must pass it — both host blocks in flake.nix, both builders in
 # tests/lib/common.nix, and tests/microvm.nix, which rolls its own.
-{ pkgs, aggregator-src, ... }:
+{ lib, pkgs, aggregator-src, ... }:
 
 {
   imports = [ "${aggregator-src}/nix/aggregator.nix" ];
@@ -107,6 +107,15 @@
     # assertion, and say why, in a PR of its own.
     tag.enable = false;
   };
+
+  # TEMPORARILY PAUSED. Keep the worker and seed units installed so resuming
+  # needs no model or package rebuild, but remove the timer's target link so
+  # login, reboot, and Home Manager activation cannot start background
+  # embedding. The existing vector backlog and weights remain untouched;
+  # lexical FTS5 search, ingest, and the shared MCP backend keep running.
+  # Resume by deleting this override and updating tests/base.nix in the same
+  # PR.
+  systemd.user.timers.aggregator-embed.Install.WantedBy = lib.mkForce [ ];
 
   # A MEMORY CEILING THAT THROTTLES, AND DELIBERATELY DOES NOT KILL.
   #

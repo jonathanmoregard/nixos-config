@@ -63,6 +63,13 @@ let
 in
 {
   virtualisation.vmVariant = {
+    # Physical-host pressure thresholds exceed this disposable VM's entire
+    # disk. Scale them so a normal build does not trigger GC immediately.
+    nix.settings = {
+      min-free = 128 * 1024 * 1024;
+      max-free = 1024 * 1024 * 1024;
+    };
+
     virtualisation = {
       memorySize = 4096;
       cores = 4;
