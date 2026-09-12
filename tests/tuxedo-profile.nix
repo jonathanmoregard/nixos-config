@@ -1,12 +1,12 @@
-{ pkgs, ... }:
+{ pkgs, inputs }:
 let
   lib = pkgs.lib;
-  # Reuse the flake's configured package set. Re-importing nixpkgs here loses
-  # its flake source context in a clean store when NixOS evaluates options.json.
-  evaluated = import "${pkgs.path}/nixos/lib/eval-config.nix" {
-    system = null;
+  # Use the flake entrypoint so nixpkgs injects its source with proper string
+  # context. Importing eval-config.nix through pkgs.path makes Determinate Nix
+  # synthesize an invalid double-hashed source path during parallel evaluation.
+  evaluated = inputs.nixpkgs.lib.nixosSystem {
+    pkgs = pkgs;
     modules = [
-      { nixpkgs.pkgs = pkgs; }
       ../modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix
       {
         boot.loader.grub.enable = false;

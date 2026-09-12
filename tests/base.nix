@@ -15,7 +15,7 @@
 # Run: nix build .#checks.x86_64-linux.vm-base -L
 { pkgs, inputs }:
 let
-  tuxedoProfileContract = import ./tuxedo-profile.nix { inherit pkgs; };
+  tuxedoProfileContract = import ./tuxedo-profile.nix { inherit pkgs inputs; };
 
   mcpInitializeJson = pkgs.writeText "vm-base-mcp-initialize.json" ''
     {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vm-base","version":"1"}}}

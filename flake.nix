@@ -271,7 +271,7 @@
         mkLane = path: import path {
           pkgs = pkgsLinux;
           inputs = {
-            inherit home-manager agenix agenix-rekey microvm aggregator-src;
+            inherit nixpkgs home-manager agenix agenix-rekey microvm aggregator-src;
           };
         };
       in {
