@@ -35,6 +35,13 @@ discrete GPU.
   binary that is not built during fresh-host bootstrap.
 - Voquill supports an OpenAI-compatible transcription endpoint, leaving a
   later seam for a local NPU service without changing desktop capture.
+- Aggregator currently has two embedding backends: sentence-transformers with
+  Qwen3-Embedding-0.6B in fp32, and an optional GGUF path. Neither targets the
+  XDNA NPU. Its index version already distinguishes model, quantization,
+  dimension, chunker, and normalization, and refuses an incompatible index.
+- The pinned nixpkgs tree contains the in-kernel `amdxdna` module and firmware,
+  but no XRT XDNA plugin, Ryzen AI runtime, VitisAI execution provider,
+  FastFlowLM, or Lemonade package.
 - The existing research-agent design already provides the preferred isolation
   boundary: persistent KVM microVM, default-drop networking, and a fresh
   bubblewrap jail per request. `repo-check` Phase C's Docker runner is not a
@@ -57,6 +64,14 @@ discrete GPU.
 - Current reports conflict on kernel stability: one Ryzen AI report describes
   amdgpu MES freezes on 6.18/6.19, while another describes repeatable s2idle
   failure on 7.0.9 that disappears on 6.18.7.
+- AMD Ryzen AI Software 1.8.0 lists Strix Point and BF16 encoder-style NLP
+  models as supported on Linux through ONNX Runtime's VitisAI execution
+  provider. Its supported stack is Ubuntu 24.04, Python 3.12, and matched XRT
+  and XDNA plugin builds; no retrieved evidence demonstrates
+  Qwen3-Embedding-0.6B compiling or offloading on that stack.
+- FastFlowLM exposes an OpenAI-compatible NPU embedding endpoint on XDNA 2, but
+  currently supports EmbeddingGemma-300m Q4_1 rather than Qwen3-Embedding. It
+  also requires a concurrently loaded LLM in server mode.
 - No upstream `nixos-hardware` profile exists for this Gen10 model. TUXEDO
   Control Center is not packaged in nixpkgs; `tuxedo-rs`/Tailor is the
   packaged alternative.
@@ -71,6 +86,10 @@ Sources:
 - [Linux amdxdna documentation](https://docs.kernel.org/next/accel/amdxdna/amdnpu.html)
 - [AMD XDNA driver and XRT shim](https://github.com/amd/xdna-driver)
 - [FastFlowLM/Lemonade Linux NPU requirements](https://lemonade-server.ai/flm_npu_linux.html)
+- [AMD Ryzen AI Linux support](https://ryzenai.docs.amd.com/en/latest/linux.html)
+- [AMD Ryzen AI model deployment](https://ryzenai.docs.amd.com/en/latest/modelrun.html)
+- [FastFlowLM embedding model support](https://fastflowlm.com/docs/models/embeddinggemma/)
+- [Qwen3-Embedding model](https://github.com/QwenLM/Qwen3-Embedding)
 - [nix-amd-ai](https://github.com/kylemanna/nix-amd-ai)
 - [nixos-hardware Ryzen AI freeze report](https://github.com/NixOS/nixos-hardware/issues/1801)
 - [s2idle regression report](https://github.com/pop-os/pop/issues/4016)
@@ -88,6 +107,11 @@ Sources:
   honeypot agents can run inside the current microVM/bubblewrap boundary while
   inference remains remote. Accelerator access should stay outside an
   adversarial guest.
+- Aggregator background embedding is the first useful NPU workload after the
+  driver/runtime stack validates. CPU fp32 stays authoritative until an NPU
+  backend proves real offload, retrieval quality, throughput, and power on the
+  actual corpus. Backend selection is explicit per host, never device-node
+  auto-detection.
 
 ## Approaches considered
 
@@ -205,8 +229,46 @@ captured:
 4. compatible XRT shim and successful FastFlowLM validation;
 5. explicit review of memlock and device-access changes.
 
-Only an end-to-end transcription or generation proves the NPU path. Module
-load, device-node presence, and marketing TOPS do not.
+Only an end-to-end transcription, generation, or embedding run with measured
+operator offload proves the NPU path. Module load, device-node presence, and
+marketing TOPS do not.
+
+### Aggregator NPU embedding contract
+
+Aggregator background document embedding is the primary sustained NPU
+candidate. Two runtime approaches remain valid experiments after arrival:
+
+1. Export the existing pinned Qwen3-Embedding-0.6B model to ONNX and run a
+   precompiled BF16 graph through AMD's VitisAI execution provider. This keeps
+   the model family but is accepted only after the export compiles, reports
+   non-zero NPU operator placement, and reproduces the query prompt, mean
+   pooling, 768-dimension MRL truncation, then L2 normalization in that order.
+2. Run FastFlowLM's EmbeddingGemma endpoint as a benchmark alternative. This
+   is a different model and vector space, requires its own complete index, and
+   is not a drop-in acceleration of the current Qwen index.
+
+The production backend remains sentence-transformers fp32 until one candidate
+passes the arrival gate. Activation is an explicit TUXEDO host setting after
+kernel, firmware, XRT/plugin, provider, model artifact, and device permissions
+are pinned together. Appearance of `/dev/accel/accel0` never switches the
+backend automatically.
+
+Every NPU backend extends the embedding version with model revision, runtime,
+precision, provider/compiler version, and the output recipe. Any change creates
+a new version and requires explicit full re-indexing; CPU and NPU vectors are
+never mixed. A failed NPU document batch aborts without CPU fallback. If an NPU
+query cannot run against an NPU-built index, semantic search refuses or drops
+to the lexical arm; it never embeds that query with the fp32 backend and
+pretends the spaces match.
+
+Before adoption, run identical held-out documents and real queries through CPU
+and NPU backends. Record paired-vector cosine distribution including tail,
+recall/nDCG at fixed `k`, cold and steady-state throughput, energy use, peak
+memory, provider operator counts, and failure behaviour. NPU wins only if
+recall@10 and nDCG@10 each stay within one percentage point of the current
+fp32 baseline, a 10,000-document soak completes without an incorrect fallback,
+and either steady-state throughput doubles or energy per document falls by at
+least 30% under the same power profile.
 
 ## Agent isolation direction
 
@@ -243,8 +305,12 @@ Before importing the TUXEDO module into a real host output:
 7. Add the bootable flake host only after steps 1–6 are known; build its full
    toplevel before installation.
 8. Benchmark Voquill CPU and Vulkan paths with the same short utterances.
-9. If NPU work proceeds, validate kernel/userspace compatibility and complete
-   an end-to-end workload before enabling it by default.
+9. Validate the matched NPU kernel, firmware, XRT/plugin, provider, memlock,
+   and render-group path. Prove non-zero NPU operator placement.
+10. Run the aggregator Qwen ONNX spike and FastFlowLM EmbeddingGemma benchmark
+    against the same held-out corpus and queries. Keep CPU fp32 selected unless
+    one passes the embedding contract above; any accepted backend receives a
+    distinct version stamp and explicit full re-index.
 
 ## Failure handling and rollback
 
@@ -264,6 +330,8 @@ Before importing the TUXEDO module into a real host output:
 - forcing Linux 7.0 before real suspend/GPU evidence;
 - packaging or forking Voquill;
 - enabling external NPU flakes, unlimited memlock, or broad accelerator
-  permissions;
+  permissions before arrival validation;
+- changing aggregator's production model or index before a real-device NPU
+  benchmark;
 - changing CI workflows;
 - replacing remote inference models used by honeypot/scanner evaluation.
