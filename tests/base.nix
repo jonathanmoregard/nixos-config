@@ -2044,20 +2044,22 @@ in
     # declared in this repo, so upstream's `aggregator-embed-unit-hygiene`
     # check keeps guarding the unit that actually runs. What THIS repo
     # decides, and therefore what is asserted here, is the wiring: that the
-    # worker is armed, that it can never download on a tick, that the seed
+    # worker is installed but deliberately unarmed, that it can never download
+    # on a manual run, that the seed
     # unit is human-triggered only, and that importing the upstream module
     # did not also resurrect its per-source ingest timers.
-    assert "aggregator-embed.timer" in agg_timers, (
-        f"aggregator-embed.timer missing from user timer list:\n{agg_timers}"
+    assert "aggregator-embed.timer" not in agg_timers, (
+        "aggregator-embed.timer is armed despite the temporary embedding "
+        f"pause:\n{agg_timers}"
     )
-    for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
+    for prop, forbidden in [("is-enabled", "enabled"), ("is-active", "active")]:
         got = dellan.succeed(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-            f"systemctl --user {prop} aggregator-embed.timer'"
+            f"systemctl --user {prop} aggregator-embed.timer || true'"
         ).strip()
-        assert got == expected, (
-            f"aggregator-embed.timer {prop}={got!r}, expected {expected!r} — "
-            f"the backfill would never tick"
+        assert got != forbidden, (
+            f"aggregator-embed.timer {prop}={got!r}; temporary pause requires "
+            f"anything except {forbidden!r}"
         )
 
     # THE IMPORT MUST NOT BRING THE PER-SOURCE INGEST TIMERS BACK.
@@ -2142,7 +2144,7 @@ in
             f"systemctl --user cat {unit}'"
         ):
             agg_armed.append(unit)
-    # Four armed units now. The shared MCP backend is armed on purpose so every
+    # Three armed units now. The shared MCP backend is armed on purpose so every
     # stdio client can remain a tiny proxy, and its process/model behavior is
     # exercised above. The health timer is also armed on purpose — a detector
     # that only runs when someone remembers to run it is not a detector — and
@@ -2151,13 +2153,12 @@ in
     # asserted `static` above. That asymmetry is the property worth defending,
     # and it is why this list is about WantedBy rather than about unit count.
     assert agg_armed == [
-        "aggregator-embed.timer",
         "aggregator-ingest.timer",
         "aggregator-mcp-backend.service",
         "aggregator-schema-health.timer",
     ], (
-        "the set of ARMED aggregator units changed. Only the three timers and "
-        "the shared MCP backend may "
+        "the set of ARMED aggregator units changed. Only the ingest and "
+        "schema-health timers plus the shared MCP backend may "
         f"carry an [Install] WantedBy; got {agg_armed} out of "
         f"{agg_all_units}.\n"
         "A newly armed unit is something an aggregator-src bump added that "
