@@ -1,12 +1,18 @@
 { pkgs, ... }:
 let
   lib = pkgs.lib;
+  # Reuse the flake's configured package set. Re-importing nixpkgs here loses
+  # its flake source context in a clean store when NixOS evaluates options.json.
   evaluated = import "${pkgs.path}/nixos/lib/eval-config.nix" {
-    system = pkgs.stdenv.hostPlatform.system;
+    system = null;
     modules = [
+      { nixpkgs.pkgs = pkgs; }
       ../modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix
       {
         boot.loader.grub.enable = false;
+        # This eval-only contract inspects environment.systemPackages. Keep the
+        # unrelated NixOS manual and its options.json derivation out of that list.
+        documentation.enable = false;
         fileSystems."/" = {
           device = "none";
           fsType = "tmpfs";
