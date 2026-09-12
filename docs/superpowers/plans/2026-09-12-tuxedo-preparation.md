@@ -491,3 +491,123 @@ gh pr checks --watch --fail-fast "$tuxedo_pr_number"
 
 Expected: all required checks green. Report PR URL and hardware-only gaps;
 leave merge for deliberate GitHub UI action.
+
+### Task 8: Qualify aggregator NPU embedding after laptop arrival
+
+**Files:**
+
+- Record evidence in: `/home/jonathan/.local/state/claude-tasks/tuexedo/npu-arrival.md`
+- Read: `docs/superpowers/specs/2026-09-12-tuxedo-preparation-design.md`
+- Future aggregator change: `aggregator/core/embed.py`, its focused tests, and
+  `nix/aggregator.nix`
+- Future NixOS change: `hosts/tuxedo/default.nix` and a focused TUXEDO NPU
+  module created only after the winning runtime is known
+
+This task is hardware-gated. Do not execute it on Dellan or add a guessed NPU
+runtime to the dormant profile.
+
+- [ ] **Step 1: Capture the real driver boundary**
+
+Run on the delivered TUXEDO:
+
+```bash
+uname -r
+lspci -nnk -d 1022:17f0
+test -c /dev/accel/accel0
+udevadm info --query=all --name=/dev/accel/accel0
+journalctl -b -k --no-pager | rg -i 'amdxdna|amdnpu|firmware|accel'
+ulimit -l
+```
+
+Expected: PCI device `1022:17f0`, `amdxdna` bound, character device present,
+firmware version visible, and no protocol/ioctl mismatch. A missing node or
+mismatch stops this task; do not widen permissions or memlock to hide it.
+
+- [ ] **Step 2: Validate one pinned userspace stack before model work**
+
+Package the selected XRT/XDNA plugin/provider versions through a dedicated
+NixOS worktree and PR. Keep kernel, firmware, XRT, plugin, and provider version
+in one reviewed module. After deployment, run:
+
+```bash
+xrt-smi examine
+xrt-smi validate
+python - <<'PY'
+import onnxruntime as ort
+providers = ort.get_available_providers()
+print(providers)
+assert "VitisAIExecutionProvider" in providers
+PY
+```
+
+Expected: XRT validation passes and provider exists. Enumeration without a
+passing validation is failure, not partial success.
+
+- [ ] **Step 3: Run both embedding candidates without touching live index**
+
+Use a copied SQLite cache and fixed held-out documents/queries. Candidate A is
+the pinned Qwen3-Embedding-0.6B ONNX BF16 graph through VitisAI. Candidate B is
+FastFlowLM's EmbeddingGemma-300m Q4_1 endpoint. For each candidate, capture:
+
+```text
+model id and immutable revision
+runtime, provider/compiler, XRT, driver, firmware, and kernel versions
+reported CPU/NPU operator partition
+output dimension and exact pooling -> MRL truncation -> L2 recipe
+cold-start and steady-state documents/second
+joules/document under the same power profile
+peak RSS
+recall@10 and nDCG@10 on the same labeled query set
+```
+
+Expected: no writes to the live aggregator cache. Zero NPU operators, a
+provider crash, or transparent all-CPU execution rejects that candidate.
+
+- [ ] **Step 4: Apply the acceptance gate**
+
+Accept a candidate only when all conditions hold:
+
+```text
+recall@10 drop <= 1 percentage point versus Qwen fp32
+nDCG@10 drop <= 1 percentage point versus Qwen fp32
+10,000-document soak completes with no incorrect fallback
+steady-state throughput >= 2x CPU OR energy/document <= 70% of CPU
+```
+
+Expected: one explicit accept/reject record per candidate. If neither passes,
+keep `AGGREGATOR_EMBED_BACKEND=st`; CPU embedding remains correct and no NPU
+code or dependency is shipped.
+
+- [ ] **Step 5: Implement only the accepted backend**
+
+Start with failing aggregator tests that assert:
+
+```text
+backend identity includes model revision, runtime, precision,
+provider/compiler, output dimension, and normalization recipe
+write-side backend failure aborts the batch without CPU fallback
+query-side backend failure never compares a CPU query to an NPU index
+backend/model identity mismatch refuses until explicit reindex
+```
+
+Then add the smallest backend adapter and Nix module needed for the accepted
+runtime. Keep selection explicit in `hosts/tuxedo/default.nix`; never branch on
+the existence of `/dev/accel/accel0`. Run aggregator focused tests, its full
+flake checks, the NixOS feature VM where hardware-independent, and a real-device
+10,000-document smoke before opening the NixOS PR.
+
+- [ ] **Step 6: Re-index explicitly and verify live retrieval**
+
+Back up the live aggregator database, stop the embed timer, and run the
+aggregator's guarded explicit re-index command only after reviewing its row
+count and backend stamp. Resume the timer, then verify:
+
+```bash
+aggregator status
+journalctl --user -u aggregator-embed.service --no-pager -n 200
+```
+
+Expected: one backend/version across every vector, backlog monotonically
+decreasing, non-zero NPU operator count in runtime logs, and lexical search
+remaining available throughout. Keep the CPU-index backup until representative
+queries pass and one full snapshot of the new index exists.
