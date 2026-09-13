@@ -342,7 +342,7 @@ let
 
     # No stable or exact owner signal: two interactive roots are ambiguous,
     # so selecting either by PID order is unsafe.
-    mixed_ambiguous = win(43, SHELL)
+    mixed_ambiguous = win(43, ["/bin/sh"])
     mixed_ambiguous["foreground_processes"] = [
         {"pid": 4301, "cmdline": [
             "/usr/bin/claude", "--resume", CLAUDE_SID,
@@ -1338,7 +1338,7 @@ pkgs.runCommand "kitty-scripts-harness"
       SHELL=/bin/sh kitty-session-convert < "grid/$label.json" \
         > "state/$label.session"
       grep -qxF \
-        "launch --cwd /tmp --title $expected_title /usr/bin/codex resume cccc3333-cccc-4333-cccccccccccc" \
+        "launch --cwd /tmp --title $expected_title /usr/bin/codex resume cccc3333-cccc-4333-8333-cccccccccccc" \
         "state/$label.session" || {
         cat "state/$label.session"
         echo "FAIL(C/$label): background Haiku replaced root Codex in"
@@ -3113,7 +3113,10 @@ pkgs.runCommand "kitty-scripts-harness"
       KITTY_WINDOW_ID=202 \
       "$bootstrap_bin" --bootstrap "''${pane2_args[0]}" \
         "''${pane2_args[1]}" & bootstrap_pid=$!
-    for unused in $(seq 1 100); do
+    # Match transaction harness's 5s cold-start allowance. Bootstrap's own
+    # shared deadline remains stricter, so this wait cannot mask a production
+    # timeout; it only avoids declaring failure before child reports it.
+    for unused in $(seq 1 250); do
       [ -e "$KITTY_RESTORE_TEST_PAUSE_AFTER_BOUND" ] && break
       sleep 0.02
     done
