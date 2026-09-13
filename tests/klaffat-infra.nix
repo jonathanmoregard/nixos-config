@@ -150,14 +150,121 @@ let
   # ResourceNotFoundException, no closure was ever signed, and the demo
   # host could install nothing.
   signingKeySecretId = "klaffat-nix-signing-key";
+
+  localGoogleFixture = "/home/jonathan/worktrees/klaffat-local-google-fixture";
+  endpointOverrideNames = [
+    "KLAFFAT_GOOGLE_AUTH_URL_OVERRIDE"
+    "KLAFFAT_GOOGLE_TOKEN_URL_OVERRIDE"
+    "KLAFFAT_GOOGLE_JWKS_URL_OVERRIDE"
+    "KLAFFAT_GOOGLE_FREEBUSY_URL_OVERRIDE"
+    "KLAFFAT_GOOGLE_EVENTS_URL_OVERRIDE"
+    "KLAFFAT_GOOGLE_REVOKE_URL_OVERRIDE"
+    "KLAFFAT_MS_AUTH_URL_OVERRIDE"
+    "KLAFFAT_MS_TOKEN_URL_OVERRIDE"
+    "KLAFFAT_MS_JWKS_URL_OVERRIDE"
+    "KLAFFAT_MS_EVENTS_URL_OVERRIDE"
+    "KLAFFAT_MS_FREEBUSY_URL_OVERRIDE"
+    "KLAFFAT_MS_CALENDAR_VIEW_URL_OVERRIDE"
+  ];
+  fakeGoogleDecryptor = pkgs.writeShellApplication {
+    name = "fake-klaffat-google-decryptor";
+    runtimeInputs = [ pkgs.coreutils ];
+    text = ''
+      set -euo pipefail
+      encrypted=""
+      for argument in "$@"; do
+        encrypted=$argument
+      done
+      mode=$(cat "$encrypted")
+      case "$mode" in
+        valid)
+          printf '%s\n' \
+            'KLAFFAT_GOOGLE_CLIENT_ID=TEST-google-client.apps.googleusercontent.com' \
+            'KLAFFAT_GOOGLE_CLIENT_SECRET=TEST-google-secret' \
+            'UNRELATED_SECRET=must-not-reach-server'
+          ;;
+        malformed)
+          printf '%s\n' \
+            'KLAFFAT_GOOGLE_CLIENT_ID=TEST-google-client.apps.googleusercontent.com' \
+            'KLAFFAT_GOOGLE_CLIENT_SECRET=bad value with spaces'
+          ;;
+        duplicate)
+          printf '%s\n' \
+            'KLAFFAT_GOOGLE_CLIENT_ID=one' \
+            'KLAFFAT_GOOGLE_CLIENT_ID=two' \
+            'KLAFFAT_GOOGLE_CLIENT_SECRET=TEST-google-secret'
+          ;;
+        fail) exit 23 ;;
+        hang) sleep 30 ;;
+        *) exit 24 ;;
+      esac
+    '';
+  };
+  fakeGoogleBuilder = pkgs.writeShellScript "fake-klaffat-google-builder" ''
+    set -eu
+    test "$#" -eq 1
+    exit 0
+  '';
+  fakeKlaffat = pkgs.writeShellApplication {
+    name = "fake-klaffat";
+    runtimeInputs = [ pkgs.coreutils pkgs.python3 ];
+    text = ''
+      set -euo pipefail
+      state="''${KLAFFAT_LOCAL_GOOGLE_STATE_DIR:?}"
+      if [ "''${1:-}" = migrate ]; then
+        printf 'migrated\n' > "$state/migrated"
+        exit 0
+      fi
+
+      required=0
+      [ -n "''${KLAFFAT_GOOGLE_CLIENT_ID:-}" ] \
+        && [ -n "''${KLAFFAT_GOOGLE_CLIENT_SECRET:-}" ] \
+        && required=1
+      unrelated=0
+      [ -n "''${UNRELATED_SECRET:-}" ] && unrelated=1
+      mock=0
+      for name in ${lib.concatStringsSep " " endpointOverrideNames}; do
+        if printenv "$name" >/dev/null 2>&1; then
+          mock=1
+        fi
+      done
+      printf 'required=%s\nunrelated=%s\nmock=%s\n' \
+        "$required" "$unrelated" "$mock" > "$state/evidence"
+
+      starts=0
+      if [ -f "$state/starts" ]; then
+        starts=$(cat "$state/starts")
+      fi
+      starts=$((starts + 1))
+      printf '%s\n' "$starts" > "$state/starts"
+
+      if [ -e "$state/no-health" ]; then
+        exec sleep infinity
+      fi
+      install -d "$state/http"
+      printf 'ok\n' > "$state/http/healthz"
+      cd "$state/http"
+      exec python3 -m http.server "''${PORT:?}" --bind 127.0.0.1
+    '';
+  };
 in
 common.mkMinimalTest {
   name = "klaffat-infra";
 
   extraModules = [
     ../modules/nixos/klaffat-infra.nix
+    ../modules/nixos/klaffat-local-google.nix
     (_: {
       services.klaffatInfra.enable = true;
+      services.klaffatLocalGoogle = {
+        enable = true;
+        decryptProgram = "${fakeGoogleDecryptor}/bin/fake-klaffat-google-decryptor";
+        decryptTimeoutSeconds = 1;
+        buildProgram = "${fakeGoogleBuilder}";
+        healthAttempts = 3;
+      };
+      systemd.services.klaffat-local-google.environment =
+        lib.genAttrs endpointOverrideNames (_: "http://mock.invalid");
 
       # The pinned remote. In production this is the GitHub HTTPS URL and
       # the token secret goes with it; here it is the lane's own
@@ -225,6 +332,155 @@ common.mkMinimalTest {
 
     def write_file(path, content):
         machine.succeed(f"printf '%s' {shlex.quote(content)} > {path}")
+
+    # ---------------------------------------------------------------
+    # Local real-Google capability. The operator controls one fixed unit;
+    # root alone decrypts; only the dedicated server account sees the pair.
+    # ---------------------------------------------------------------
+    machine.succeed("test -x ${bin}/klaffat-local-google")
+    machine.succeed(
+        "install -d -m 0755 -o jonathan -g users "
+        "${localGoogleFixture}/target/local-google/debug "
+        "${localGoogleFixture}/crates/klaffat-web/static "
+        "${localGoogleFixture}/deploy/secrets "
+        "${localGoogleFixture}/tests/e2e/fixtures"
+    )
+    machine.succeed(
+        "install -m 0755 -o jonathan -g users "
+        "${fakeKlaffat}/bin/fake-klaffat "
+        "${localGoogleFixture}/target/local-google/debug/klaffat"
+    )
+    write_file("${localGoogleFixture}/crates/klaffat-web/static/app.css", "body {}\n")
+    write_file("${localGoogleFixture}/deploy/secrets/klaffat-env.age", "valid\n")
+    write_file("${localGoogleFixture}/tests/e2e/fixtures/test-kek", "0123456789abcdef0123456789abcdef")
+    machine.succeed("chown -R jonathan:users ${localGoogleFixture}")
+    machine.succeed(
+        "runuser -u jonathan -- ${git} -C ${localGoogleFixture} init -q && "
+        "runuser -u jonathan -- ${git} -C ${localGoogleFixture} remote add origin "
+        "https://github.com/jonathanmoregard/klaffat.git"
+    )
+
+    rc, out = run(
+        "runuser -u jonathan -- ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    assert rc == 0, f"operator could not start local Google Klaffat: {rc} {out!r}"
+    assert "http://localhost:3740" in out, f"launcher did not report the URL: {out!r}"
+    machine.wait_for_unit("klaffat-local-google.service")
+    machine.wait_for_open_port(3740)
+    assert machine.succeed("curl -fsS http://localhost:3740/healthz").strip() == "ok"
+
+    evidence = machine.succeed("cat /var/lib/klaffat-local-google/evidence")
+    assert evidence == "required=1\nunrelated=0\nmock=0\n", evidence
+    env_names = machine.succeed(
+        "cut -d= -f1 /run/klaffat-local-google/google.env | sort"
+    )
+    assert env_names == "KLAFFAT_GOOGLE_CLIENT_ID\nKLAFFAT_GOOGLE_CLIENT_SECRET\n", env_names
+    assert machine.succeed(
+        "stat -c '%U:%G:%a' /run/klaffat-local-google/google.env"
+    ).strip() == "root:root:400"
+    assert machine.succeed(
+        "stat -c '%U:%G:%a' /var/lib/klaffat-local-google"
+    ).strip() == "klaffat-local-google:klaffat-local-google:700"
+
+    pid = machine.succeed(
+        "systemctl show -p MainPID --value klaffat-local-google.service"
+    ).strip()
+    assert machine.succeed(f"ps -o user= -p {pid}").strip() == "klaffat-local-google"
+    rc, _ = run(f"runuser -u jonathan -- cat /proc/{pid}/environ")
+    assert rc != 0, "jonathan could read the server process environment"
+    rc, _ = run("runuser -u jonathan -- cat /run/klaffat-local-google/google.env")
+    assert rc != 0, "jonathan could read the root-only Google environment"
+    rc, _ = run("runuser -u jonathan -- cat /var/lib/klaffat-local-google/evidence")
+    assert rc != 0, "jonathan could traverse the isolated server state"
+
+    rc, out = run("runuser -u jonathan -- ${bin}/klaffat-local-google status")
+    assert rc == 0 and "active (running)" in out, f"status failed: {rc} {out!r}"
+    rc, out = run(
+        "runuser -u jonathan -- systemctl --no-ask-password restart lighttpd.service"
+    )
+    assert rc != 0, f"polkit rule allowed an unrelated unit: {out!r}"
+
+    # Restart preserves local state while redoing the root-only preparation.
+    rc, out = run(
+        "runuser -u jonathan -- ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    assert rc == 0, f"second start failed: {rc} {out!r}"
+    assert machine.succeed("cat /var/lib/klaffat-local-google/starts").strip() == "2"
+    assert machine.succeed(
+        "runuser -u postgres -- psql -Atc \"select datname from pg_database "
+        "where datname = 'klaffat-local-google'\""
+    ).strip() == "klaffat-local-google"
+    machine.fail("ss -ltn | grep -q ':5432 '")
+
+    rc, out = run("runuser -u jonathan -- ${bin}/klaffat-local-google stop")
+    assert rc == 0, f"operator could not stop fixed unit: {rc} {out!r}"
+    machine.wait_until_fails("curl -fsS --max-time 1 http://localhost:3740/healthz")
+
+    # The unprivileged origin check catches a mistaken directory before root
+    # receives a restart request.
+    machine.succeed(
+        "runuser -u jonathan -- ${git} -C ${localGoogleFixture} remote set-url origin "
+        "https://example.invalid/not-klaffat.git"
+    )
+    rc, out = run(
+        "runuser -u jonathan -- ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    assert rc == 2 and "unexpected origin" in out, f"wrong origin passed: {rc} {out!r}"
+    machine.succeed(
+        "runuser -u jonathan -- ${git} -C ${localGoogleFixture} remote set-url origin "
+        "https://github.com/jonathanmoregard/klaffat.git"
+    )
+
+    # Root preparation refuses linked executables and every decryptor failure
+    # without leaving a consumable environment behind.
+    machine.succeed(
+        "mv ${localGoogleFixture}/target/local-google/debug/klaffat "
+        "${localGoogleFixture}/target/local-google/debug/klaffat.real && "
+        "ln -s klaffat.real ${localGoogleFixture}/target/local-google/debug/klaffat && "
+        "chown -h jonathan:users ${localGoogleFixture}/target/local-google/debug/klaffat"
+    )
+    rc, out = run(
+        "runuser -u jonathan -- ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    assert rc != 0, f"linked application binary passed root preparation: {out!r}"
+    machine.succeed(
+        "rm ${localGoogleFixture}/target/local-google/debug/klaffat && "
+        "mv ${localGoogleFixture}/target/local-google/debug/klaffat.real "
+        "${localGoogleFixture}/target/local-google/debug/klaffat"
+    )
+
+    for mode in ["malformed", "duplicate", "fail", "hang"]:
+        write_file("${localGoogleFixture}/deploy/secrets/klaffat-env.age", mode + "\n")
+        machine.succeed(
+            "chown jonathan:users ${localGoogleFixture}/deploy/secrets/klaffat-env.age"
+        )
+        rc, out = run(
+            "runuser -u jonathan -- ${bin}/klaffat-local-google "
+            "start ${localGoogleFixture}"
+        )
+        assert rc != 0, f"decrypt mode {mode!r} should fail closed: {out!r}"
+        assert machine.succeed(
+            "systemctl show -p NRestarts --value klaffat-local-google.service"
+        ).strip() == "0", f"decrypt mode {mode!r} retried root preparation"
+        assert "TEST-google-secret" not in out, f"secret leaked for {mode}: {out!r}"
+        machine.fail("test -e /run/klaffat-local-google/google.env")
+
+    # Launcher health polling is bounded and fails loudly if the process never
+    # exposes /healthz.
+    write_file("${localGoogleFixture}/deploy/secrets/klaffat-env.age", "valid\n")
+    machine.succeed("chown jonathan:users ${localGoogleFixture}/deploy/secrets/klaffat-env.age")
+    machine.succeed("touch /var/lib/klaffat-local-google/no-health")
+    rc, out = run(
+        "runuser -u jonathan -- ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    assert rc == 1 and "did not become healthy" in out, f"health timeout wrong: {rc} {out!r}"
+    machine.succeed("rm /var/lib/klaffat-local-google/no-health")
+    machine.succeed("systemctl stop klaffat-local-google.service")
 
     # A LEFTOVER is a per-run TEMPORARY that outlived its trap: the archive
     # directory (`infra-*`), klaffat-publish's scratch (`publish-*`), the
