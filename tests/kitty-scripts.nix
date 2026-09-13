@@ -301,6 +301,7 @@ let
 
     KITTEN = "/nix/store/fake-kitty/bin/kitten"
     SHELL = ["/run/current-system/sw/bin/zsh"]
+    CLAUDE_SID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     CODEX_SID = "cccc3333-cccc-4333-8333-cccccccccccc"
 
     codex_with_id = win(1, [
@@ -319,6 +320,44 @@ let
         "/bin/sh", "-c",
         "exec /usr/bin/codex 'touch /tmp/replayed-indirectly'",
     ]
+
+    # The real 2026-09-13 failure shape: a headless Haiku scorer inherited
+    # the root Codex pane's PTY and appeared first in Kitty's PID-ordered
+    # process list. Stable window argv and exact typed identity are the two
+    # independent owner signals exercised below.
+    mixed_root = win(41, ["/usr/bin/codex", "resume", CODEX_SID])
+    mixed_root["codex_session_id"] = CODEX_SID
+    mixed_root["foreground_processes"] = [
+        {"pid": 4101, "cmdline": [
+            "/usr/bin/claude", "--model", "haiku", "--max-turns", "20",
+            "--print", "score proposals",
+        ]},
+        {"pid": 4102, "cmdline": [
+            "/usr/bin/codex", "resume", CODEX_SID,
+        ]},
+    ]
+    mixed_shell = win(42, SHELL)
+    mixed_shell["codex_session_id"] = CODEX_SID
+    mixed_shell["foreground_processes"] = mixed_root["foreground_processes"]
+
+    # No stable or exact owner signal: two interactive roots are ambiguous,
+    # so selecting either by PID order is unsafe.
+    mixed_ambiguous = win(43, SHELL)
+    mixed_ambiguous["foreground_processes"] = [
+        {"pid": 4301, "cmdline": [
+            "/usr/bin/claude", "--resume", CLAUDE_SID,
+        ]},
+        {"pid": 4302, "cmdline": [
+            "/usr/bin/codex", "resume", CODEX_SID,
+        ]},
+    ]
+
+    headless_modes = {
+        "claude-print-short": ["/usr/bin/claude", "-p", "score"],
+        "claude-print-long": ["/usr/bin/claude", "--print", "score"],
+        "claude-bg-short": ["/usr/bin/claude", "--bg", "score"],
+        "claude-bg-long": ["/usr/bin/claude", "--background", "score"],
+    }
 
     cases = {
         # 1 real pane + kitty's config-error overlay. The overlay is
@@ -389,7 +428,16 @@ let
         "codex-with-id": tab([codex_with_id]),
         "codex-without-id": tab([codex_without_id]),
         "codex-indirect-without-id": tab([codex_indirect_without_id]),
+        "mixed-root": tab([mixed_root]),
+        "mixed-shell": tab([mixed_shell]),
+        "mixed-ambiguous": tab([mixed_ambiguous]),
     }
+    for index, (label, argv) in enumerate(headless_modes.items(), start=44):
+        headless = win(index, argv)
+        headless["foreground_processes"] = [
+            {"pid": 4400 + index, "cmdline": argv},
+        ]
+        cases[label] = tab([headless])
     for name, data in cases.items():
         with open(os.path.join(out, name + ".json"), "w") as fh:
             json.dump(data, fh)
@@ -1277,6 +1325,72 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(C/convert): an indirect shell wrapper replayed a Codex"
       echo "  positional prompt instead of opening a clean user shell."
       exit 1; }
+
+    # A background `claude --print` sharing the PTY must never replace the
+    # root Codex TUI. `mixed-root` carries Kitty's stable launch argv;
+    # `mixed-shell` models an agent entered from zsh and carries only the
+    # exact typed snapshot identity. Converter and restore must agree.
+    for label in mixed-root mixed-shell; do
+      case "$label" in
+        mixed-root) expected_title=w41 ;;
+        mixed-shell) expected_title=w42 ;;
+      esac
+      SHELL=/bin/sh kitty-session-convert < "grid/$label.json" \
+        > "state/$label.session"
+      grep -qxF \
+        "launch --cwd /tmp --title $expected_title /usr/bin/codex resume cccc3333-cccc-4333-cccccccccccc" \
+        "state/$label.session" || {
+        cat "state/$label.session"
+        echo "FAIL(C/$label): background Haiku replaced root Codex in"
+        echo "  last.session instead of exact Codex UUID restore."
+        exit 1; }
+
+      cache="$PWD/state/cache-$label"
+      rm -rf "$cache"
+      mkdir -p "$cache/kitty-session"
+      cp "grid/$label.json" "$cache/kitty-session/snapshot.json"
+      XDG_CACHE_HOME="$cache" SHELL=/bin/sh \
+        kitty-restore-session --dump-panes > "state/$label.panes.json"
+      jq -e --arg sid 'cccc3333-cccc-4333-8333-cccccccccccc' '
+        .[0].agent_kind == "codex"
+        and .[0].cmd == ["/usr/bin/codex", "resume", $sid]
+      ' "state/$label.panes.json" >/dev/null || {
+        cat "state/$label.panes.json"
+        echo "FAIL(C/$label): restore planner selected background Haiku"
+        echo "  instead of exact root Codex UUID."
+        exit 1; }
+      if grep -Eq -- '--print|haiku' \
+          "state/$label.session" "state/$label.panes.json"; then
+        echo "FAIL(C/$label): headless Haiku argv survived owner selection."
+        exit 1
+      fi
+    done
+
+    # Without stable or exact ownership, mixed interactive agents are
+    # ambiguous. All noninteractive Claude entry modes are likewise never
+    # restorable panes. Both paths fail safe to the user's shell.
+    for label in mixed-ambiguous claude-print-short claude-print-long \
+                 claude-bg-short claude-bg-long; do
+      SHELL=/bin/sh kitty-session-convert < "grid/$label.json" \
+        > "state/$label.session"
+      grep -qE '^launch --cwd /tmp --title w[0-9]+ /bin/sh$' \
+        "state/$label.session" || {
+        cat "state/$label.session"
+        echo "FAIL(C/$label): unsafe agent argv replayed instead of shell."
+        exit 1; }
+
+      cache="$PWD/state/cache-$label"
+      rm -rf "$cache"
+      mkdir -p "$cache/kitty-session"
+      cp "grid/$label.json" "$cache/kitty-session/snapshot.json"
+      XDG_CACHE_HOME="$cache" SHELL=/bin/sh \
+        kitty-restore-session --dump-panes > "state/$label.panes.json"
+      jq -e '.[0].agent_kind == null and .[0].cmd == ["/bin/sh"]' \
+        "state/$label.panes.json" >/dev/null || {
+        cat "state/$label.panes.json"
+        echo "FAIL(C/$label): restore planner guessed an unsafe agent."
+        exit 1; }
+    done
 
     # --- Phase D: snapshot retention ---
     #
