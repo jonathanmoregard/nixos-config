@@ -10,7 +10,7 @@ Add `nixosConfigurations.home-server` for a Dell Wyse 5070 while preserving curr
 - encrypted service credentials
 - off-host backup destination
 
-No fake production key, hardware identifier, domain, or backup target is committed. `homeServer.bootstrapReady` defaults false and keeps hardware/secret-dependent services plus auto-deploy disabled. Dedicated VM tests override this with isolated fixtures. Bootstrap documentation gives the exact change that flips readiness after evidence exists.
+No fake production key, hardware identifier, domain, or backup target is committed. Required-value options default to null. Zigbee activates only when a stable serial path exists; Matrix activates only when permanent server name and secret file exist; auto-deploy activates only when host identity and deploy credential exist. Dedicated VM tests supply isolated fixtures. Bootstrap documentation records each value after evidence exists.
 
 ## Existing architecture reused
 
@@ -42,7 +42,7 @@ No reverse proxy, Home Assistant, container runtime, local LLM, Prometheus, Graf
 
 ## Secrets and bootstrap
 
-Host imports shared agenix-rekey master configuration only after real SSH host key is recorded. Source secrets remain encrypted to user master identity; per-host ciphertext lives under `secrets/rekeyed/home-server`. Root-owned service secrets use mode `0400`; only daemon-specific users receive narrower files when required.
+Host always imports shared agenix-rekey module, but sets its per-host public key and declares secrets only after real SSH host key is recorded. Source secrets remain encrypted to user master identity; per-host ciphertext lives under `secrets/rekeyed/home-server`. Root-owned service secrets use mode `0400`; only daemon-specific users receive narrower files when required.
 
 Provisioned names cover deploy SSH key, optional webhook HMAC, MQTT network clients, Matrix secret YAML, TellStick bearer token, future cloud AI environment, and optional backup environment. Existing `add-secret --host home-server` flow is reused once host key and insertion marker exist. No values are generated or displayed during this preparation.
 
@@ -50,7 +50,7 @@ Initial Tailscale enrollment follows current manual `tailscale up` convention. A
 
 ## Deployment and CI
 
-Existing Dellan auto-deploy stays unchanged. Home server reuses pull/reset/rebuild, rollback guard, poison latch, and polling module after bootstrap readiness. Webhook remains disabled initially; hourly polling avoids another public ingress. Flake attribute follows hostname `home-server`.
+Existing Dellan auto-deploy stays unchanged. Home server reuses pull/reset/rebuild, rollback guard, poison latch, and polling module after host identity plus deploy credential are configured. Webhook remains disabled initially; hourly polling avoids another public ingress. Flake attribute follows hostname `home-server`.
 
 CI retains `build dellan toplevel` and adds `build home-server toplevel`; no job is renamed. New `vm-home-server` lane imports only server modules, supplies fake secrets/serial package where needed, and behaviorally checks Mosquitto, PostgreSQL/Synapse, automation health, hardening-relevant unit fields, firewall exposure, persistence directories, and 04:00 reset behavior through daemon test tooling. Branch-protection bootstrap includes new stable check name.
 
@@ -70,4 +70,3 @@ Git covers declarative config and encrypted sources only. README inventories mut
 Documentation gives consistent snapshots/exports: `pg_dump` for Synapse database, filesystem copy for media while service is quiesced or snapshot-consistent, SQLite backup API command for automation, Zigbee2MQTT data/coordinator backup, and adapter state copy. Until encrypted off-host destination and restore drill exist, docs say mutable data is not backed up. No disabled backup provider module is added because repository has no convention or destination.
 
 Recovery covers blank-disk partition labels, NixOS install, generated hardware configuration review, host key recording, agenix rekey, Tailscale enrollment, stable dongle discovery, first build/switch, deploy-target clone, health checks, rollback, and full Git rebuild after disk loss.
-
