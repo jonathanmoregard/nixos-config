@@ -252,9 +252,114 @@ let
     '';
   };
 
+  verifyListener = pkgs.writers.writePython3Bin "klaffat-local-google-verify-listener" { } ''
+    import http.client
+    import os
+    import pathlib
+    import socket
+    import sys
+    import time
+
+
+    def fail(message: str) -> None:
+        print(f"klaffat-local-google: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+    if len(sys.argv) != 4:
+        fail("listener verifier expected a PID, port, and attempt count")
+
+    try:
+        main_pid = int(sys.argv[1])
+        port = int(sys.argv[2])
+        attempts = int(sys.argv[3])
+    except ValueError:
+        fail("listener verifier received an invalid argument")
+
+    process = pathlib.Path(f"/proc/{main_pid}")
+    expected_ipv4_address = f"0100007F:{port:04X}"
+    packed_ipv6_loopback = socket.inet_pton(socket.AF_INET6, "::1")
+    proc_ipv6_loopback = "".join(
+        packed_ipv6_loopback[index:index + 4][::-1].hex()
+        for index in range(0, len(packed_ipv6_loopback), 4)
+    ).upper()
+    expected_ipv6_address = f"{proc_ipv6_loopback}:{port:04X}"
+
+
+    def listener_state() -> tuple[bool, bool]:
+        try:
+            sockets = {
+                os.readlink(entry)
+                for entry in (process / "fd").iterdir()
+                if entry.is_symlink()
+            }
+            tcp4_rows = (process / "net/tcp").read_text(
+                encoding="ascii"
+            ).splitlines()[1:]
+            tcp6_rows = (process / "net/tcp6").read_text(
+                encoding="ascii"
+            ).splitlines()[1:]
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            return False, False
+
+        owns_ipv4 = False
+        for row in tcp4_rows:
+            fields = row.split()
+            if (
+                len(fields) > 9
+                and fields[1].upper() == expected_ipv4_address
+                and fields[3] == "0A"
+                and f"socket:[{fields[9]}]" in sockets
+            ):
+                owns_ipv4 = True
+
+        foreign_ipv6 = False
+        for row in tcp6_rows:
+            fields = row.split()
+            if (
+                len(fields) > 9
+                and fields[1].upper() == expected_ipv6_address
+                and fields[3] == "0A"
+                and f"socket:[{fields[9]}]" not in sockets
+            ):
+                foreign_ipv6 = True
+
+        return owns_ipv4, foreign_ipv6
+
+
+    last_health_error = "health endpoint never became reachable"
+    for _attempt in range(attempts):
+        if not process.exists():
+            fail("server process exited before owning its listener")
+        owns_ipv4, foreign_ipv6 = listener_state()
+        if foreign_ipv6:
+            fail("another process owns localhost's IPv6 listener")
+        if owns_ipv4:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            try:
+                connection.request("GET", "/healthz")
+                response = connection.getresponse()
+                response.read()
+                if response.status == 200:
+                    raise SystemExit(0)
+                last_health_error = (
+                    f"health endpoint returned HTTP {response.status}"
+                )
+            except OSError as error:
+                last_health_error = f"health request failed: {error}"
+            finally:
+                connection.close()
+        time.sleep(1)
+
+    fail(
+        "server process did not expose its own healthy IPv4 listener: "
+        + last_health_error
+    )
+  '';
+
   launcher = pkgs.writeShellApplication {
     name = "klaffat-local-google";
-    runtimeInputs = [ pkgs.coreutils pkgs.curl pkgs.git pkgs.systemd ];
+    runtimeInputs = [ pkgs.coreutils pkgs.curl pkgs.git pkgs.systemd pkgs.util-linux ];
     text = ''
       set -euo pipefail
       usage() {
@@ -296,35 +401,61 @@ let
               exit 2
               ;;
           esac
+          selector=${lib.escapeShellArg cfg.selectionFile}
+          install -d -m 0700 "$(dirname "$selector")"
+          exec 8>"$selector.lock"
+          chmod 0600 "$selector.lock"
+          flock --exclusive 8
           ${lib.escapeShellArg cfg.buildProgram} "$worktree"
           [ -x "$worktree/${expectedBinary}" ] || {
             echo "klaffat-local-google: build did not produce ${expectedBinary}" >&2
             exit 1
           }
-          selector=${lib.escapeShellArg cfg.selectionFile}
-          install -d -m 0700 "$(dirname "$selector")"
           selector_tmp=$(mktemp "$(dirname "$selector")/worktree.XXXXXX")
           trap 'rm -f -- "$selector_tmp"' EXIT
           printf '%s\n' "$worktree" > "$selector_tmp"
           chmod 0600 "$selector_tmp"
           mv -f -- "$selector_tmp" "$selector"
           trap - EXIT
+          # Cancel every previous state, including an in-flight activation,
+          # before checking the fixed IPv4 listener. A static unit that has
+          # never been loaded can make stop return non-zero, so verify the
+          # resulting state instead of trusting that return code alone.
+          systemctl stop ${serviceName}.service 2>/dev/null || true
+          stopped_state=$(systemctl show --property=ActiveState --value ${serviceName}.service 2>/dev/null || true)
+          case "$stopped_state" in
+            ""|inactive|failed) ;;
+            *)
+              echo "klaffat-local-google: could not stop the previous service activation" >&2
+              exit 1
+              ;;
+          esac
+          if (exec 9<>/dev/tcp/127.0.0.1/${toString cfg.port}) 2>/dev/null; then
+            echo "klaffat-local-google: port ${toString cfg.port} is already in use — refusing to start" >&2
+            exit 1
+          fi
+          if (exec 9<>/dev/tcp/::1/${toString cfg.port}) 2>/dev/null; then
+            echo "klaffat-local-google: IPv6 localhost port ${toString cfg.port} is already in use — refusing to start" >&2
+            exit 1
+          fi
+
           # A never-started static unit is discoverable but not yet loaded;
           # reset-failed returns non-zero in that healthy first-start state.
-          # Restart below remains mandatory and carries the real auth/error
+          # Start below remains mandatory and carries the real auth/error
           # signal.
           systemctl reset-failed ${serviceName}.service 2>/dev/null || true
-          systemctl restart ${serviceName}.service
-          for _attempt in $(seq 1 ${toString cfg.healthAttempts}); do
-            if curl --fail --silent --show-error --max-time 2 \
-                http://localhost:${toString cfg.port}/healthz >/dev/null; then
-              echo "Klaffat with real Google Calendar is ready: http://localhost:${toString cfg.port}"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "klaffat-local-google: service did not become healthy; run: systemctl status ${serviceName}.service" >&2
-          exit 1
+          if ! systemctl start ${serviceName}.service; then
+            echo "klaffat-local-google: service did not become healthy; run: systemctl status ${serviceName}.service" >&2
+            exit 1
+          fi
+          if [ "$(systemctl show --property=ActiveState --value ${serviceName}.service 2>/dev/null || true)" != active ]; then
+            echo "klaffat-local-google: service stopped after becoming healthy; run: systemctl status ${serviceName}.service" >&2
+            exit 1
+          fi
+          # systemctl start returns only after ExecStartPost proves that the
+          # main process itself owns 127.0.0.1:${toString cfg.port} and serves health.
+          echo "Klaffat with real Google Calendar is ready: http://localhost:${toString cfg.port}"
+          exit 0
           ;;
         status)
           [ "$#" -eq 0 ] || usage
@@ -490,6 +621,7 @@ in
         ExecStartPre = "+${prepare}/bin/klaffat-local-google-prepare";
         EnvironmentFile = "-${runtimeDir}/google.env";
         ExecStart = "${runServer}/bin/klaffat-local-google-server";
+        ExecStartPost = "${verifyListener}/bin/klaffat-local-google-verify-listener $MAINPID ${toString cfg.port} ${toString cfg.healthAttempts}";
         # This is an explicitly operator-launched development service.
         # Automatic retries would repeat the root-only preparation and
         # decryption path after a malformed selector or ciphertext; the
