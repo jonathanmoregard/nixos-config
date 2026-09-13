@@ -152,6 +152,7 @@ let
   signingKeySecretId = "klaffat-nix-signing-key";
 
   localGoogleFixture = "/home/jonathan/worktrees/klaffat-local-google-fixture";
+  localGoogleFixtureSecond = "/home/jonathan/worktrees/klaffat-local-google-fixture-second";
   endpointOverrideNames = [
     "KLAFFAT_GOOGLE_AUTH_URL_OVERRIDE"
     "KLAFFAT_GOOGLE_TOKEN_URL_OVERRIDE"
@@ -203,6 +204,13 @@ let
   fakeGoogleBuilder = pkgs.writeShellScript "fake-klaffat-google-builder" ''
     set -eu
     test "$#" -eq 1
+    if [ "$1" = ${lib.escapeShellArg localGoogleFixture} ] \
+        && [ -e /tmp/klaffat-hold-build ]; then
+      printf 'entered\n' > /tmp/klaffat-build-entered
+      while [ -e /tmp/klaffat-hold-build ]; do
+        sleep 0.1
+      done
+    fi
     exit 0
   '';
   fakeKlaffat = pkgs.writeShellApplication {
@@ -212,6 +220,12 @@ let
       set -euo pipefail
       state="''${KLAFFAT_LOCAL_GOOGLE_STATE_DIR:?}"
       if [ "''${1:-}" = migrate ]; then
+        if [ -e "$state/hold-migration" ]; then
+          printf 'entered\n' > "$state/migration-entered"
+          while [ -e "$state/hold-migration" ]; do
+            sleep 0.1
+          done
+        fi
         printf 'migrated\n' > "$state/migrated"
         exit 0
       fi
@@ -418,6 +432,30 @@ common.mkMinimalTest {
     assert rc == 0, f"operator could not stop fixed unit: {rc} {out!r}"
     machine.wait_until_fails("curl -fsS --max-time 1 http://localhost:3740/healthz")
 
+    # A different process answering the same health URL must never make the
+    # launcher report its own failed unit as ready. Reproduce the real-host
+    # collision with a competing server, then require readiness to remain
+    # bound to the dedicated systemd unit as well as the HTTP probe.
+    machine.succeed("install -d /tmp/klaffat-competing-health")
+    write_file("/tmp/klaffat-competing-health/healthz", "ok\n")
+    machine.succeed(
+        "systemd-run --unit=klaffat-competing-health.service --collect "
+        "--property=WorkingDirectory=/tmp/klaffat-competing-health "
+        "${pkgs.python3}/bin/python3 -m http.server 3740 --bind 127.0.0.1"
+    )
+    machine.wait_for_open_port(3740)
+    rc, out = run(
+        "runuser -u jonathan -- ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    assert rc == 1, f"competing health server caused false readiness: {rc} {out!r}"
+    assert "port 3740 is already in use" in out, out
+    assert machine.succeed(
+        "systemctl show -p ActiveState --value klaffat-local-google.service"
+    ).strip() != "active"
+    machine.succeed("systemctl stop klaffat-competing-health.service")
+    machine.wait_until_fails("curl -fsS --max-time 1 http://localhost:3740/healthz")
+
     # The unprivileged origin check catches a mistaken directory before root
     # receives a restart request.
     machine.succeed(
@@ -481,6 +519,151 @@ common.mkMinimalTest {
     assert rc == 1 and "did not become healthy" in out, f"health timeout wrong: {rc} {out!r}"
     machine.succeed("rm /var/lib/klaffat-local-google/no-health")
     machine.succeed("systemctl stop klaffat-local-google.service")
+
+    # Close-out review reproducers: all three outcomes below violate the
+    # launcher's claim that its ready message identifies the selected unit.
+    # Collect them before asserting so a red run records every race at once.
+    false_readiness = []
+
+    # localhost can prefer a competing IPv6-only listener even while the
+    # selected service owns a healthy IPv4 listener.
+    machine.succeed("install -d /tmp/klaffat-ipv6-health")
+    write_file("/tmp/klaffat-ipv6-health/healthz", "ok\n")
+    machine.succeed(
+        "systemd-run --unit=klaffat-ipv6-health.service --collect "
+        "--property=WorkingDirectory=/tmp/klaffat-ipv6-health "
+        "${pkgs.python3}/bin/python3 -m http.server 3740 --bind ::1"
+    )
+    machine.wait_until_succeeds(
+        "curl --noproxy '*' -gfsS http://[::1]:3740/healthz"
+    )
+    rc, out = run(
+        "runuser -u jonathan -- ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    if rc == 0:
+        false_readiness.append("ipv6-listener")
+    machine.succeed("systemctl stop klaffat-local-google.service")
+    machine.succeed("systemctl stop klaffat-ipv6-health.service")
+
+    # A competing IPv4 server that appears after the launcher's precheck can
+    # satisfy HTTP while the real app is still blocked in its migration.
+    machine.succeed("touch /var/lib/klaffat-local-google/hold-migration")
+    machine.succeed(
+        "systemd-run --unit=klaffat-race-launch.service "
+        "--property=User=jonathan ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    machine.wait_for_file("/var/lib/klaffat-local-google/migration-entered")
+    machine.succeed(
+        "systemd-run --unit=klaffat-race-health.service --collect "
+        "--property=WorkingDirectory=/tmp/klaffat-competing-health "
+        "${pkgs.python3}/bin/python3 -m http.server 3740 --bind 127.0.0.1"
+    )
+    machine.wait_for_open_port(3740)
+    machine.wait_until_succeeds(
+        "! systemctl is-active --quiet klaffat-race-launch.service"
+    )
+    if machine.succeed(
+        "systemctl show -p ExecMainStatus --value klaffat-race-launch.service"
+    ).strip() == "0":
+        false_readiness.append("post-precheck-ipv4-listener")
+    machine.succeed("systemctl stop klaffat-local-google.service")
+    machine.succeed("systemctl stop klaffat-race-health.service")
+    machine.succeed(
+        "rm /var/lib/klaffat-local-google/hold-migration "
+        "/var/lib/klaffat-local-google/migration-entered"
+    )
+
+    # A second selection must cancel an in-flight activation. Otherwise both
+    # launchers join the first job and the second reports the wrong worktree.
+    machine.succeed(
+        "cp -a ${localGoogleFixture} ${localGoogleFixtureSecond} && "
+        "chown -R jonathan:users ${localGoogleFixtureSecond}"
+    )
+    machine.succeed(
+        "install -d /run/systemd/system/klaffat-local-google.service.d"
+    )
+    write_file(
+        "/run/systemd/system/klaffat-local-google.service.d/hold.conf",
+        "[Service]\nExecStartPre=${pkgs.coreutils}/bin/sleep 3\n",
+    )
+    machine.succeed("systemctl daemon-reload")
+    machine.succeed(
+        "systemd-run --unit=klaffat-first-selection.service "
+        "--property=User=jonathan ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    machine.wait_until_succeeds(
+        "test $(systemctl show -p ActiveState --value klaffat-local-google.service) = activating "
+        "&& test $(cat /run/klaffat-local-google/prepared/source-worktree) "
+        "= ${localGoogleFixture}"
+    )
+    rc, out = run(
+        "runuser -u jonathan -- ${bin}/klaffat-local-google "
+        "start ${localGoogleFixtureSecond}"
+    )
+    selected = machine.succeed(
+        "cat /run/klaffat-local-google/prepared/source-worktree"
+    ).strip()
+    if rc != 0 or selected != "${localGoogleFixtureSecond}":
+        false_readiness.append("activating-selection")
+    machine.succeed("systemctl stop klaffat-local-google.service")
+    machine.succeed(
+        "rm /run/systemd/system/klaffat-local-google.service.d/hold.conf && "
+        "systemctl daemon-reload"
+    )
+
+    # An older invocation paused during its build must not overtake a newer
+    # selection. Serializing the whole start transaction makes invocation
+    # order, the prepared worktree, and each ready message agree.
+    machine.succeed("touch /tmp/klaffat-hold-build")
+    machine.succeed(
+        "systemd-run --unit=klaffat-held-build.service "
+        "--property=User=jonathan ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    machine.wait_for_file("/tmp/klaffat-build-entered")
+    machine.succeed(
+        "systemd-run --unit=klaffat-newer-selection.service "
+        "--property=User=jonathan ${bin}/klaffat-local-google "
+        "start ${localGoogleFixtureSecond}"
+    )
+    machine.sleep(1)
+    newer_waited = machine.execute(
+        "systemctl is-active --quiet klaffat-newer-selection.service"
+    )[0] == 0
+    machine.succeed("rm /tmp/klaffat-hold-build")
+    machine.wait_until_succeeds(
+        "! systemctl is-active --quiet klaffat-newer-selection.service"
+    )
+    machine.wait_until_succeeds(
+        "! systemctl is-active --quiet klaffat-held-build.service"
+    )
+    selected = machine.succeed(
+        "cat /run/klaffat-local-google/prepared/source-worktree"
+    ).strip()
+    old_status = machine.succeed(
+        "systemctl show -p ExecMainStatus --value klaffat-held-build.service"
+    ).strip()
+    new_status = machine.succeed(
+        "systemctl show -p ExecMainStatus --value klaffat-newer-selection.service"
+    ).strip()
+    if (
+        not newer_waited
+        or old_status != "0"
+        or new_status != "0"
+        or selected != "${localGoogleFixtureSecond}"
+    ):
+        false_readiness.append("overlapping-selection")
+    machine.succeed("systemctl stop klaffat-local-google.service")
+    machine.succeed(
+        "rm /tmp/klaffat-build-entered"
+    )
+
+    assert not false_readiness, (
+        "launcher reported false readiness in: " + ", ".join(false_readiness)
+    )
 
     # A LEFTOVER is a per-run TEMPORARY that outlived its trap: the archive
     # directory (`infra-*`), klaffat-publish's scratch (`publish-*`), the
