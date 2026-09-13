@@ -25,7 +25,7 @@
 - Modify: `tests/kitty-scripts.nix:1230-1290`
 - Test: `tests/kitty-scripts.nix`
 
-- [ ] **Step 1: Add exact mixed-agent fixtures**
+- [x] **Step 1: Add exact mixed-agent fixtures**
 
 Extend existing JSON fixture generator with these windows:
 
@@ -71,7 +71,7 @@ for index, (label, argv) in enumerate(headless_modes.items(), start=44):
 Use existing `CODEX_SID` fixture constant or define it once as
 `cccc3333-cccc-4333-8333-cccccccccccc` beside `codex_with_id`.
 
-- [ ] **Step 2: Assert converter and restore outcomes**
+- [x] **Step 2: Assert converter and restore outcomes**
 
 For `mixed-root` and `mixed-shell`, run both production scripts and require
 canonical root UUID:
@@ -105,7 +105,7 @@ done
 Also assert `--print` and `haiku` occur in neither converted output nor
 dumped restore commands.
 
-- [ ] **Step 3: Run fast check and observe RED**
+- [x] **Step 3: Run fast check and observe RED**
 
 Run:
 
@@ -116,7 +116,7 @@ nix build --no-link .#checks.x86_64-linux.kitty-scripts -L
 Expected: FAIL because current `pane_cmd` selects first
 `claude --print` candidate instead of canonical Codex or safe shell.
 
-- [ ] **Step 4: Commit RED checkpoint**
+- [x] **Step 4: Commit RED checkpoint**
 
 ```bash
 git add tests/kitty-scripts.nix
@@ -134,7 +134,7 @@ git commit -m "test: reproduce kitty background-agent restore"
 - Test: `tests/claude-pane.nix`
 - Test: `tests/kitty.nix`
 
-- [ ] **Step 1: Add mixed-process enrichment fixture**
+- [x] **Step 1: Add mixed-process enrichment fixture**
 
 Add separate typed registry and synthetic live window so existing registry
 fixtures stay independent:
@@ -176,7 +176,7 @@ assert "claude_session_id" not in mixed_window
 Add headless-only Claude control with typed Claude row and assert neither
 session field is attached.
 
-- [ ] **Step 2: Build enrichment lane and observe RED**
+- [x] **Step 2: Build enrichment lane and observe RED**
 
 Run:
 
@@ -187,7 +187,7 @@ nix build --no-link .#checks.x86_64-linux.vm-claude-pane -L
 Expected: FAIL at `codex_session_id` because current enricher classifies first
 headless Claude process and rejects typed Codex row.
 
-- [ ] **Step 3: Create live mixed-agent test processes**
+- [x] **Step 3: Create live mixed-agent test processes**
 
 Add real long-lived Claude executable and launcher that starts it before root
 Codex child:
@@ -227,7 +227,7 @@ After `kitty-session-save`, assert that window has
 wrapper restore, guard, exact foreground Codex, and subsequent-save assertions
 remain unchanged.
 
-- [ ] **Step 4: Build real-X lane and observe RED**
+- [x] **Step 4: Build real-X lane and observe RED**
 
 Run:
 
@@ -238,7 +238,7 @@ nix build --no-link .#checks.x86_64-linux.vm-kitty -L
 Expected: FAIL immediately after save because current enrichment picks earlier
 headless Claude process and drops typed Codex identity.
 
-- [ ] **Step 5: Commit remaining RED tests**
+- [x] **Step 5: Commit remaining RED tests**
 
 ```bash
 git add tests/claude-pane.nix tests/kitty.nix
@@ -256,7 +256,7 @@ git commit -m "test: cover mixed-agent kitty restore end to end"
 - Test: `tests/kitty-scripts.nix`
 - Test: `tests/claude-pane.nix`
 
-- [ ] **Step 1: Tighten shared Claude classification**
+- [x] **Step 1: Tighten shared Claude classification**
 
 Add beside current executable classifiers:
 
@@ -282,7 +282,7 @@ Change `_agent_kind()` to use `_is_claude_exe_interactive(inner)` for
 Claude. Keep `_is_claude()` unchanged because slice wrapping and exact-Claude
 recovery still need to recognize canonical Claude argv.
 
-- [ ] **Step 2: Add one shared selector**
+- [x] **Step 2: Add one shared selector**
 
 Add below `_agent_kind()`:
 
@@ -316,7 +316,7 @@ Add shared `_snapshot_agent_kind(win)` returning `claude` or `codex` only
 when exactly one corresponding `*_session_id` is a string accepted by
 `UUID_RE.fullmatch`; both-or-neither returns `None`.
 
-- [ ] **Step 3: Route converter and restore through selector**
+- [x] **Step 3: Route converter and restore through selector**
 
 Replace both duplicated foreground loops with:
 
@@ -343,7 +343,7 @@ otherwise return `clean_user_shell()`. Define same two-line
 `not _is_agent_executable(wc)`, preventing rejected headless agent argv from
 becoming fallback shell.
 
-- [ ] **Step 4: Route enrichment through selector**
+- [x] **Step 4: Route enrichment through selector**
 
 Move TSV lookup before classification and use typed kind as expected kind:
 
@@ -363,7 +363,7 @@ if entry is not None:
 Delete old first-agent loop and separate `_is_claude(window.cmdline)` arm;
 selector's stable-command branch subsumes Claude zombie recovery.
 
-- [ ] **Step 5: Run cheap checks**
+- [x] **Step 5: Run cheap checks**
 
 Run:
 
@@ -378,7 +378,7 @@ nix build --no-link .#checks.x86_64-linux.kitty-scripts -L
 Expected: all exit 0; generated Python lint and shell checks pass; fast mixed
 fixtures select exact Codex or safe shell.
 
-- [ ] **Step 6: Run deterministic VM enrichment gate**
+- [x] **Step 6: Run deterministic VM enrichment gate**
 
 ```bash
 nix build --no-link .#checks.x86_64-linux.vm-claude-pane -L
@@ -386,7 +386,7 @@ nix build --no-link .#checks.x86_64-linux.vm-claude-pane -L
 
 Expected: PASS, including mixed typed-row and headless-only controls.
 
-- [ ] **Step 7: Commit implementation**
+- [x] **Step 7: Commit implementation**
 
 ```bash
 git add home/kitty.nix
@@ -399,7 +399,7 @@ git commit -m "fix: restore kitty pane root agent"
 **Files:**
 - Update: `docs/superpowers/plans/2026-09-13-kitty-root-pane-owner-selection.md`
 
-- [ ] **Step 1: Run full real-X automated E2E**
+- [x] **Step 1: Run full real-X automated E2E**
 
 ```bash
 nix build --no-link .#checks.x86_64-linux.vm-kitty -L
@@ -409,7 +409,7 @@ Expected: PASS after live `kitty @ ls` proves both processes share one pane,
 save retains exact Codex identity, cold restore launches exact
 `codex resume <UUID>`, guard clears, and next save retains same UUID.
 
-- [ ] **Step 2: Run interactive feature-VM smoke**
+- [x] **Step 2: Run interactive feature-VM smoke**
 
 Start headless feature VM:
 
@@ -458,13 +458,27 @@ session conversion: no --print or haiku argv survives
 Stop VM with Ctrl-C after proof capture. Any manual-smoke discrepancy becomes
 new failing automated assertion before changing implementation.
 
-- [ ] **Step 3: Run review and final verification**
+- [x] **Step 3: Run review and final verification**
 
 Invoke `advice-refine-test-loop`, reproduce every finding, fix confirmed
 issues, and rerun affected cheap plus VM gates. Then invoke
 `verification-before-completion` and record fresh command output.
 
-- [ ] **Step 4: Commit plan completion and push**
+Recorded 2026-09-13:
+
+- Deterministic close-out gate: exit 0, no findings, gitleaks clean.
+- Fresh read-only close-out reviewer: PASS, zero material findings.
+- Fast generated-script gate: PASS.
+- Deterministic enrichment/restore VM: PASS.
+- Real-X Kitty E2E: PASS; live process order was headless Haiku before root
+  Codex, first save retained only exact Codex UUID, cold relaunch restored
+  exact `codex resume <UUID>`, restore guard cleared, second save retained
+  same UUID.
+- Interactive feature VM: PASS against installed scripts; enrichment selected
+  Codex, restore planned exact UUID, conversion emitted clean shell and no
+  `--print`/Haiku argv.
+
+- [x] **Step 4: Commit plan completion and push**
 
 Mark completed checkboxes, then:
 
