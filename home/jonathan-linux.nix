@@ -520,6 +520,7 @@ in
     ./drift-analyzer.nix
     ./nixos-config-fetch.nix
     ./sota-watch.nix
+    ./ai-router.nix
     ./worktree-sweep.nix
     ./router-services.nix
     ./claude-services.nix
