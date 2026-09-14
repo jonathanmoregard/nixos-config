@@ -21,7 +21,7 @@ let
 
   controller = pkgs.writeShellApplication {
     name = "klaffat-dependabot-caretaker-controller";
-    runtimeInputs = [ pkgs.bash pkgs.coreutils pkgs.findutils pkgs.git pkgs.gnugrep pkgs.gnused pkgs.jq pkgs.util-linux ];
+    runtimeInputs = [ pkgs.bash pkgs.coreutils pkgs.findutils pkgs.git pkgs.gnugrep pkgs.gnused pkgs.jq pkgs.systemd pkgs.util-linux ];
     text = ''
       set -euo pipefail
       umask 077
@@ -45,7 +45,13 @@ let
       metadata_credential=${lib.escapeShellArg (if cfg.metadataCredentialFile == null then "" else cfg.metadataCredentialFile)}
       checks_credential=${lib.escapeShellArg (if cfg.checksCredentialFile == null then "" else cfg.checksCredentialFile)}
 
-      refuse() { echo "klaffat-dependabot-caretaker: $*" >&2; exit 65; }
+      controller_user=klaffat-caretaker-controller
+      repair_user=klaffat-caretaker-repair
+      verifier_user=klaffat-caretaker-verifier
+      publisher_user=klaffat-caretaker-publisher
+      selected=false
+      refusal=""
+      refuse() { refusal="$*"; echo "klaffat-dependabot-caretaker: $*" >&2; exit 65; }
       atomic_json() {
         local target="$1" json="$2" tmp
         mkdir -p "$(dirname "$target")"
@@ -54,7 +60,11 @@ let
         mv -f -- "$tmp" "$target"
       }
       audit() {
-        atomic_json "$state/audit/latest.json" "$(jq -cn --arg stage "$1" --arg detail "$2" '{stage:$stage,detail:$detail}')"
+        local stage="$1" detail="$2"
+        [[ "$stage" =~ ^[a-z-]+$ ]] || return 0
+        [[ "$detail" =~ ^[A-Za-z0-9._:/-]+$ ]] || detail="sanitized"
+        mkdir -p "$state/audit"
+        jq -cn --arg stage "$stage" --arg detail "$detail" '{stage:$stage,detail:$detail}' >> "$state/audit/events.jsonl"
       }
       require_credential() {
         local label="$1" path="$2"
@@ -62,6 +72,7 @@ let
       }
 
       mkdir -p "$state/attempts" "$state/audit" "$work"
+      trap 'status=$?; if [ "$status" -ne 0 ]; then audit failure "''${refusal:-command-failed}"; fi' EXIT
       exec 9>"$state/controller.lock"
       flock -n 9 || { echo "klaffat-dependabot-caretaker: another invocation is active" >&2; exit 75; }
       run="$(mktemp -d "$work/run.XXXXXX")"
@@ -71,31 +82,46 @@ let
       metadata="$run/metadata.json"
       KLAFFAT_CARETAKER_METADATA_CREDENTIAL_FILE="$metadata_credential" "$metadata_cmd" > "$metadata"
       jq -e '
-        type == "object" and .state == "OPEN" and .author == "dependabot[bot]" and
-        .base == "main" and .head_repo == "jonathanmoregard/klaffat" and
-        (.pr | type == "number" and floor == . and . > 0) and
-        (.head_ref | type == "string" and test("^dependabot/[A-Za-z0-9._/-]+$")) and
-        (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) and
-        (.base_sha | type == "string" and test("^[0-9a-f]{40}$"))
-      ' "$metadata" >/dev/null || refuse "metadata did not identify exactly one trusted open Dependabot PR"
-      pr="$(jq -r .pr "$metadata")"
-      head_ref="$(jq -r .head_ref "$metadata")"
-      head_sha="$(jq -r .head_sha "$metadata")"
-      base_sha="$(jq -r .base_sha "$metadata")"
+        type == "array" and
+        [.[] | select(.author == "dependabot[bot]")] as $bots |
+        all($bots[];
+          type == "object" and .state == "OPEN" and .base == "main" and
+          .head_repo == "jonathanmoregard/klaffat" and
+          (.pr | type == "number" and floor == . and . > 0) and
+          (.head_ref | type == "string" and test("^dependabot/[A-Za-z0-9._/-]+$")) and
+          (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+          (.base_sha | type == "string" and test("^[0-9a-f]{40}$"))
+        ) | $bots | sort_by(.pr)
+      ' "$metadata" > "$run/eligible.json" || refuse "metadata contained invalid Dependabot state"
+      while IFS= read -r entry; do
+        pr="$(jq -r .pr <<<"$entry")"
+        head_ref="$(jq -r .head_ref <<<"$entry")"
+        head_sha="$(jq -r .head_sha <<<"$entry")"
+        base_sha="$(jq -r .base_sha <<<"$entry")"
+        id="pr-$pr-$head_sha-$base_sha"
+        attempt="$state/attempts/$id.json"
+        previous=0
+        if [ -f "$attempt" ]; then previous="$(jq -er '.attempts | numbers' "$attempt")" || refuse "invalid-attempt-state"; fi
+        if [ "$previous" -ge ${toString cfg.maximumAttempts} ]; then
+          audit exhausted "$id"
+          continue
+        fi
+        selected=true
+        break
+      done < <(jq -c '.[]' "$run/eligible.json")
+      if ! "$selected"; then
+        audit idle no-eligible-pr
+        exit 0
+      fi
       [ "$base" = main ] || refuse "only main is supported"
-      id="pr-$pr-$head_sha-$base_sha"
-      attempt="$state/attempts/$id.json"
-      previous=0
-      if [ -f "$attempt" ]; then previous="$(jq -er '.attempts | numbers' "$attempt")" || refuse "invalid attempt state"; fi
-      [ "$previous" -lt ${toString cfg.maximumAttempts} ] || refuse "three attempts already recorded for this PR and exact SHA pair"
       current=$((previous + 1))
       atomic_json "$attempt" "$(jq -cn --argjson pr "$pr" --arg head "$head_sha" --arg base "$base_sha" --argjson attempts "$current" '{pr:$pr,head_sha:$head,base_sha:$base,attempts:$attempts}')"
       audit attempt "$id/$current"
 
-      require_credential git "$git_credential"
-      repo_dir="$run/repo"
-      git -c credential.helper= clone --quiet --no-checkout "$remote" "$repo_dir"
-      git -C "$repo_dir" -c credential.helper= fetch --quiet origin "+refs/heads/$base:refs/remotes/origin/$base" "+refs/heads/$head_ref:refs/remotes/origin/$head_ref"
+      repo_dir="$run/controller-clone"
+      export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_OPTIONAL_LOCKS=0
+      git -c core.hooksPath=/dev/null -c credential.helper= clone --quiet --no-checkout "$remote" "$repo_dir"
+      git -C "$repo_dir" -c core.hooksPath=/dev/null -c credential.helper= fetch --quiet origin "+refs/heads/$base:refs/remotes/origin/$base" "+refs/heads/$head_ref:refs/remotes/origin/$head_ref"
       [ "$(git -C "$repo_dir" rev-parse "refs/remotes/origin/$base")" = "$base_sha" ] || refuse "base SHA changed or metadata was stale"
       [ "$(git -C "$repo_dir" rev-parse "refs/remotes/origin/$head_ref")" = "$head_sha" ] || refuse "Dependabot head changed or metadata was stale"
       # Dependabot intentionally remains allowed to update its branch.  If a
@@ -103,43 +129,84 @@ let
       # that SHA on the next invocation and this fresh clone starts from it.
       # We merge current origin/main normally on every attempt; no rebase,
       # force push, or [dependabot skip] marker is ever used.
-      git -C "$repo_dir" checkout --quiet --detach "$head_sha"
-      git -C "$repo_dir" config user.name "Klaffat Dependabot caretaker"
-      git -C "$repo_dir" config user.email "caretaker@localhost"
-      git -C "$repo_dir" merge --no-edit --no-ff "refs/remotes/origin/$base"
+      git -C "$repo_dir" -c core.hooksPath=/dev/null checkout --quiet --detach "$head_sha"
+      git -C "$repo_dir" -c core.hooksPath=/dev/null -c user.name="Klaffat Dependabot caretaker" -c user.email="caretaker@localhost" merge --no-edit --no-ff "refs/remotes/origin/$base"
+      repair_base="$(git -C "$repo_dir" rev-parse HEAD)"
 
       # The agent only receives fixed validated identifiers and a narrowly
       # worded compatibility objective. PR title/body/comments/repository
       # instructions are deliberately never read into this process.
-      require_credential repair "$repair_credential"
-      env -i PATH="$PATH" HOME="$run/agent-home" XDG_CONFIG_HOME="$run/agent-config" \
-        XDG_DATA_HOME="$run/agent-data" XDG_STATE_HOME="$run/agent-state" \
-        ANTHROPIC_API_KEY_FILE="$repair_credential" \
-        "$repair_cmd" "$pr" "$head_sha" "$base_sha" "$repo_dir"
+      [ -n "$repair_credential" ] || refuse "repair-credential-not-configured"
+      agent_dir="$run/agent-clone"
+      cp -a "$repo_dir" "$agent_dir"
+      chown -R "$repair_user:$repair_user" "$agent_dir"
+      systemd-run --quiet --pipe --wait --collect \
+        --property="User=$repair_user" --property="Group=$repair_user" \
+        --property="WorkingDirectory=$agent_dir" --property="UMask=0077" \
+        --property="RuntimeMaxSec=20min" --property="MemoryMax=2G" --property="TasksMax=128" \
+        --setenv="ANTHROPIC_API_KEY_FILE=$repair_credential" \
+        "${pkgs.coreutils}/bin/env" -i PATH="$PATH" HOME="$agent_dir/.home" \
+        XDG_CONFIG_HOME="$agent_dir/.config" XDG_DATA_HOME="$agent_dir/.data" XDG_STATE_HOME="$agent_dir/.state" \
+        "$repair_cmd" "$pr" "$head_sha" "$base_sha" "$agent_dir"
 
-      before="$run/before-files" after="$run/after-files"
-      git -C "$repo_dir" diff --name-only "$base_sha" "$head_sha" | LC_ALL=C sort -u > "$before"
-      git -C "$repo_dir" diff --name-only "$base_sha" HEAD | LC_ALL=C sort -u > "$after"
-      cmp -s "$before" "$after" || refuse "repair expanded the original mechanical diff"
-      if grep -E '(^\.github/workflows/|^\.git/|(^|/)hooks?/|^modules/nixos/klaffat-dependabot-caretaker|^tests/|^scripts/check)' "$after" >/dev/null; then
-        refuse "dependency update touches protected automation or verifier surfaces"
+      repair_patch="$run/repair.patch"
+      git -C "$agent_dir" -c core.hooksPath=/dev/null diff --binary "$repair_base" > "$repair_patch"
+      git -C "$agent_dir" ls-files --others --exclude-standard -z > "$run/untracked.z"
+      validate_repair_path() {
+        local path="$1"
+        [[ "$path" != /* && "$path" != *".."* && "$path" != .git* ]] || refuse "unsafe-repair-path"
+        [[ "$path" =~ ^\.github/workflows/|^\.git/|(^|/)hooks?/|^modules/nixos/klaffat-dependabot-caretaker|^tests/|^scripts/check ]] && refuse "protected-repair-surface"
+      }
+      while IFS= read -r -d "" path; do validate_repair_path "$path"; done < "$run/untracked.z"
+      git -C "$agent_dir" diff --name-only "$repair_base" | while IFS= read -r path; do validate_repair_path "$path"; done
+      candidate_dir="$run/candidate"
+      cp -a "$repo_dir" "$candidate_dir"
+      git -C "$candidate_dir" -c core.hooksPath=/dev/null apply --index --binary "$repair_patch"
+      while IFS= read -r -d "" path; do
+        mkdir -p "$candidate_dir/$(dirname "$path")"
+        install -m "$(stat -c '%a' "$agent_dir/$path")" "$agent_dir/$path" "$candidate_dir/$path"
+        git -C "$candidate_dir" add -- "$path"
+      done < "$run/untracked.z"
+      git -C "$candidate_dir" add -u
+      if ! git -C "$candidate_dir" diff --cached --quiet; then
+        git -C "$candidate_dir" -c core.hooksPath=/dev/null -c user.name="Klaffat Dependabot caretaker" -c user.email="caretaker@localhost" commit --quiet -m "chore: repair Dependabot compatibility"
       fi
-      mode=affected
-      if grep -E '(^|/)(package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|flake\.lock)$' "$after" >/dev/null; then mode=full; fi
-      env -i PATH="$PATH" HOME="$run/verifier-home" XDG_CONFIG_HOME="$run/verifier-config" \
-        XDG_DATA_HOME="$run/verifier-data" XDG_STATE_HOME="$run/verifier-state" \
-        "$verifier_cmd" "$repo_dir" "$base_sha" "$mode"
+      candidate="$(git -C "$candidate_dir" rev-parse HEAD)"
+
+      verifier_dir="$run/verifier-copy"
+      cp -a "$candidate_dir" "$verifier_dir"
+      chown -R "$verifier_user:$verifier_user" "$verifier_dir"
+      systemd-run --quiet --pipe --wait --collect \
+        --property="User=$verifier_user" --property="Group=$verifier_user" \
+        --property="WorkingDirectory=$verifier_dir" --property="PrivateNetwork=yes" \
+        --property="PrivateTmp=yes" --property="UMask=0077" \
+        --property="RuntimeMaxSec=45min" --property="MemoryMax=3G" --property="TasksMax=256" \
+        "${pkgs.coreutils}/bin/env" -i PATH="$PATH" HOME="$verifier_dir/.home" \
+        XDG_CONFIG_HOME="$verifier_dir/.config" XDG_DATA_HOME="$verifier_dir/.data" XDG_STATE_HOME="$verifier_dir/.state" \
+        "$verifier_cmd" "$verifier_dir" "$base_sha"
 
       # Publish gets a structured, fixed result. It must re-read the remote
       # and reject anything but this exact dependabot branch before push.
-      candidate="$(git -C "$repo_dir" rev-parse HEAD)"
       result="$run/publish.json"
       jq -cn --arg repo "$repo" --argjson pr "$pr" --arg ref "$head_ref" --arg old "$head_sha" --arg new "$candidate" \
         '{repo:$repo,pr:$pr,ref:$ref,expected_head:$old,candidate:$new}' > "$result"
-      "$publisher_cmd" "$repo_dir" "$result"
+      [ -n "$git_credential" ] || refuse "git-credential-not-configured"
+      chown -R "$publisher_user:$publisher_user" "$candidate_dir" "$result"
+      systemd-run --quiet --pipe --wait --collect \
+        --property="User=$publisher_user" --property="Group=$publisher_user" \
+        --property="WorkingDirectory=$candidate_dir" --property="UMask=0077" \
+        --property="RuntimeMaxSec=5min" --property="MemoryMax=512M" --property="TasksMax=64" \
+        --setenv="KLAFFAT_CARETAKER_GIT_CREDENTIAL_FILE=$git_credential" \
+        "${pkgs.coreutils}/bin/env" -i PATH="$PATH" HOME="$candidate_dir/.home" \
+        XDG_CONFIG_HOME="$candidate_dir/.config" XDG_DATA_HOME="$candidate_dir/.data" XDG_STATE_HOME="$candidate_dir/.state" \
+        "$publisher_cmd" "$candidate_dir" "$result"
 
       require_credential checks "$checks_credential"
+      remote_candidate="$(git -C "$repo_dir" ls-remote origin "refs/heads/$head_ref" | ${pkgs.gawk}/bin/awk '{print $1}')"
+      [ "$remote_candidate" = "$candidate" ] || refuse "published-head-stale"
       KLAFFAT_CARETAKER_CHECKS_CREDENTIAL_FILE="$checks_credential" "$check_cmd" "$pr" "$candidate"
+      remote_candidate="$(git -C "$repo_dir" ls-remote origin "refs/heads/$head_ref" | ${pkgs.gawk}/bin/awk '{print $1}')"
+      [ "$remote_candidate" = "$candidate" ] || refuse "head-changed-during-checks"
       ready="$(jq -cn --argjson pr "$pr" --arg sha "$candidate" --arg url "https://github.com/jonathanmoregard/klaffat/pull/$pr" '{state:"ready",pr:$pr,sha:$sha,url:$url}')"
       atomic_json "$state/ready.json" "$ready"
       "$notifier_cmd" <<<"$ready"
@@ -155,11 +222,11 @@ let
       credential="${if cfg.metadataCredentialFile == null then "" else cfg.metadataCredentialFile}"
       test -n "$credential" && test -r "$credential" || exit 69
       GH_TOKEN="$(cat "$credential")" gh api "repos/${cfg.repo}/pulls?state=open&per_page=100" |
-        jq -ce '[.[] | select(.user.login == "dependabot[bot]") | {
+        jq -ce '[.[] | {
           state:.state, author:.user.login, base:.base.ref,
           head_repo:.head.repo.full_name, pr:.number, head_ref:.head.ref,
           head_sha:.head.sha, base_sha:.base.sha
-        }] | if length == 0 then error("no Dependabot PR") else .[0] end'
+        }]'
     '';
   };
   defaultRepair = pkgs.writeShellApplication {
@@ -181,13 +248,9 @@ let
     runtimeInputs = [ pkgs.nix pkgs.bash ];
     text = ''
       set -euo pipefail
-      repo="$1" base_sha="$2" mode="$3"
+      repo="$1" base_sha="$2"
       cd "$repo"
-      case "$mode" in
-        affected) exec nix develop --command bash scripts/check affected --base origin/main ;;
-        full) exec nix develop --command bash scripts/check full --base origin/main ;;
-        *) exit 64 ;;
-      esac
+      exec nix develop --command bash scripts/check full --base origin/main
     '';
   };
   defaultPublisher = pkgs.writeShellApplication {
@@ -196,7 +259,7 @@ let
     text = ''
       set -euo pipefail
       repo_dir="$1" result="$2"
-      credential="${if cfg.gitCredentialFile == null then "" else cfg.gitCredentialFile}"
+      credential="''${KLAFFAT_CARETAKER_GIT_CREDENTIAL_FILE:-}"
       test -n "$credential" && test -r "$credential" || exit 69
       ref="$(jq -er '.ref | select(test("^dependabot/[A-Za-z0-9._/-]+$"))' "$result")"
       old="$(jq -er '.expected_head | select(test("^[0-9a-f]{40}$"))' "$result")"
@@ -223,13 +286,23 @@ let
       test -n "$credential" && test -r "$credential" || exit 69
       required=${lib.escapeShellArg (builtins.toJSON cfg.requiredContexts)}
       test "$(printf '%s' "$required" | jq length)" -gt 0 || exit 69
+      head="$(GH_TOKEN="$(cat "$credential")" gh api "repos/${cfg.repo}/pulls/$pr" | jq -er '.head.sha')"
+      test "$head" = "$sha" || exit 65
       for _ in $(seq 1 20); do
         checks="$(GH_TOKEN="$(cat "$credential")" gh api "repos/${cfg.repo}/commits/$sha/check-runs?per_page=100")"
-        if printf '%s' "$checks" | jq -e --argjson needed "$required" '
-          [.check_runs[] | {name, conclusion}] as $runs |
-          all($needed[]; . as $name | any($runs[]; .name == $name and .conclusion == "success"))
-        ' >/dev/null; then exit 0; fi
-        sleep 30
+        verdict="$(printf '%s' "$checks" | jq -er --argjson needed "$required" '
+          [.check_runs[] | {name, status, conclusion}] as $runs |
+          if any($needed[]; . as $name | ([ $runs[] | select(.name == $name) ] | length) != 1) then "ambiguous"
+          elif any($needed[]; . as $name | ([ $runs[] | select(.name == $name) ][0]) as $run | $run.status == "completed" and $run.conclusion != "success") then "failed"
+          elif all($needed[]; . as $name | ([ $runs[] | select(.name == $name) ][0]) as $run | $run.status == "completed" and $run.conclusion == "success") then "ready"
+          else "pending" end
+        ')" || exit 65
+        case "$verdict" in
+          ready) exit 0 ;;
+          pending) sleep 30 ;;
+          ambiguous|failed) exit 65 ;;
+          *) exit 65 ;;
+        esac
       done
       exit 75
     '';
@@ -266,7 +339,13 @@ in {
     metadataCredentialFile = mkOption { type = types.nullOr types.str; default = null; description = "Dedicated read-only GitHub metadata credential."; };
     checksCredentialFile = mkOption { type = types.nullOr types.str; default = null; description = "Dedicated read-only GitHub checks credential."; };
     requiredContexts = mkOption {
-      type = types.listOf types.str;
+      type = types.listOf (types.enum [
+        "refuse test-endpoints in release"
+        "rust — fmt + clippy + test"
+        "e2e — playwright"
+        "race-condition harness (real-contention, file-backed WAL)"
+        "infra — fmt + validate + guard tests"
+      ]);
       default = [
         "refuse test-endpoints in release"
         "rust — fmt + clippy + test"
@@ -274,6 +353,7 @@ in {
         "race-condition harness (real-contention, file-backed WAL)"
         "infra — fmt + validate + guard tests"
       ];
+      readOnly = true;
       description = "Exact required GitHub check names measured from Klaffat ruleset 22395182 on 2026-09-14.";
     };
   };
@@ -284,26 +364,46 @@ in {
       { assertion = cfg.base == "main"; message = "klaffat caretaker only supports main"; }
     ];
     environment.systemPackages = [ controller ];
-    users.groups.klaffat-caretaker = { };
-    users.users.klaffat-caretaker = {
+    users.groups.klaffat-caretaker-controller = { };
+    users.groups.klaffat-caretaker-repair = { };
+    users.groups.klaffat-caretaker-verifier = { };
+    users.groups.klaffat-caretaker-publisher = { };
+    users.users.klaffat-caretaker-controller = {
       isSystemUser = true;
-      group = "klaffat-caretaker";
+      group = "klaffat-caretaker-controller";
+      home = "/var/empty";
+    };
+    users.users.klaffat-caretaker-repair = {
+      isSystemUser = true;
+      group = "klaffat-caretaker-repair";
+      home = "/var/empty";
+    };
+    users.users.klaffat-caretaker-verifier = {
+      isSystemUser = true;
+      group = "klaffat-caretaker-verifier";
+      home = "/var/empty";
+    };
+    users.users.klaffat-caretaker-publisher = {
+      isSystemUser = true;
+      group = "klaffat-caretaker-publisher";
       home = "/var/empty";
     };
     systemd.tmpfiles.rules = [
-      "d ${cfg.statePath} 0700 klaffat-caretaker klaffat-caretaker -"
-      "d ${cfg.workPath} 0700 klaffat-caretaker klaffat-caretaker -"
+      "d ${cfg.statePath} 0700 klaffat-caretaker-controller klaffat-caretaker-controller -"
+      "d ${cfg.workPath} 0711 klaffat-caretaker-controller klaffat-caretaker-controller -"
     ];
     systemd.services.klaffat-dependabot-caretaker = {
       description = "Prepare one verified Dependabot PR for founder review";
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${controller}/bin/klaffat-dependabot-caretaker-controller";
-        User = "klaffat-caretaker";
-        Group = "klaffat-caretaker";
         UMask = "0077";
         WorkingDirectory = cfg.workPath;
         ReadWritePaths = [ cfg.statePath cfg.workPath ];
+        # Controller is privileged only to ask PID 1 to launch bounded stage
+        # units. Its mount namespace cannot read repair or Git transport
+        # secrets; those paths are exposed only to their respective stage.
+        InaccessiblePaths = lib.filter (path: path != null) [ cfg.repairCredentialFile cfg.gitCredentialFile ];
         NoNewPrivileges = true;
         PrivateTmp = true;
         ProtectSystem = "strict";
