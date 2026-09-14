@@ -676,7 +676,13 @@ let
     repo = Path(sys.argv[1]).resolve(strict=True)
     base_sha = sys.argv[2]
     actual_base = subprocess.run(
-        ["${pkgs.git}/bin/git", "-C", str(repo), "rev-parse", "refs/remotes/origin/main"],
+        [
+            "${pkgs.git}/bin/git",
+            "-C",
+            str(repo),
+            "rev-parse",
+            "refs/remotes/origin/main",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -704,15 +710,18 @@ let
         environment[name] = os.fsdecode(raw_value)
 
     path = environment.get("PATH", "")
-    if not path or any(not item.startswith("/nix/store/") for item in path.split(":")):
+    if not path or any(
+        not item.startswith("/nix/store/") for item in path.split(":")
+    ):
         raise SystemExit(65)
     denied = {
         "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_FILE", "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY", "BASH_ENV", "CDPATH", "ENV", "GH_TOKEN",
         "GITHUB_TOKEN", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
         "GIT_CONFIG_SYSTEM", "GIT_DIR", "GIT_WORK_TREE", "LD_PRELOAD",
-        "NIX_CONFIG", "NIX_PATH", "NIX_REMOTE", "NIX_USER_CONF_FILES",
-        "NODE_OPTIONS", "SSH_AUTH_SOCK",
+        "NIX_BUILD_TOP", "NIX_CONFIG", "NIX_PATH", "NIX_REMOTE",
+        "NIX_USER_CONF_FILES", "NODE_OPTIONS", "OLDPWD", "PWD", "SHLVL",
+        "SSH_AUTH_SOCK", "TEMP", "TEMPDIR", "TMP", "TMPDIR", "_",
     }
     for name in list(environment):
         upper = name.upper()
@@ -725,7 +734,13 @@ let
     environment.update({name: os.environ[name] for name in required[:-1]})
     environment["PATH"] = path
     os.chdir(repo)
-    os.execve("${pkgs.bash}/bin/bash", ["bash", "scripts/check", "full"], environment)
+    bash = "${pkgs.bash}"
+    bash += "/bin/bash"
+    os.execve(
+        bash,
+        ["bash", "scripts/check", "full"],
+        environment,
+    )
   '';
   defaultDependencyPreparation = pkgs.writeShellApplication {
     name = "klaffat-caretaker-dependency-preparation";
@@ -739,7 +754,9 @@ let
       cd "$repo"
       mkdir -p "$CARGO_HOME" "$npm_config_cache"
       rm -f -- "$KLAFFAT_CARETAKER_DEV_ENV"
-      nix develop --command env CARGO_HOME="$CARGO_HOME" npm_config_cache="$npm_config_cache" \
+      # shellcheck disable=SC2016 # Expand path inside the nix develop shell.
+      nix develop --ignore-environment --command env \
+        CARGO_HOME="$CARGO_HOME" npm_config_cache="$npm_config_cache" \
         KLAFFAT_CARETAKER_DEV_ENV="$KLAFFAT_CARETAKER_DEV_ENV" bash -c '
         set -euo pipefail
         cargo fetch --locked
@@ -747,6 +764,10 @@ let
         cd tests/e2e
         npm ci --ignore-scripts --no-audit --no-fund
         cd ../..
+        # --ignore-environment appends this inert sentinel. Remove it so the
+        # verifier receives an exclusively store-backed executable path.
+        PATH="''${PATH%:/no-such-path}"
+        export PATH
         env -0 > "$KLAFFAT_CARETAKER_DEV_ENV"
       '
       test -s "$KLAFFAT_CARETAKER_DEV_ENV"
