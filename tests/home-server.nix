@@ -133,8 +133,11 @@ pkgs.testers.runNixOSTest {
       };
 
       # Static Zigbee2MQTT configuration is evaluated, but no fake character
-      # device pretends to be coordinator hardware in this VM.
+      # device pretends to be coordinator hardware in this VM. Likewise, QEMU's
+      # virtual disk has no SMART interface; keep production SMART enabled while
+      # avoiding an expected failed unit in runtime smoke tests.
       systemd.services.zigbee2mqtt.wantedBy = lib.mkForce [ ];
+      systemd.services.smartd.wantedBy = lib.mkForce [ ];
 
       systemd.services.home-server-test-secrets = {
         description = "Create runtime-only service fixture secrets";
@@ -216,6 +219,7 @@ pkgs.testers.runNixOSTest {
         nixGcOptions = config.nix.gc.options;
         nixOptimiseAutomatic = config.nix.optimise.automatic;
         nixOptimiseDates = config.nix.optimise.dates;
+        smartdEnabled = config.services.smartd.enable;
         autoDeployEnabled = config.services.nixos-auto-deploy.enable;
         automationEnabled = config.services.houseAutomation.enable;
         tellstickEnabled = config.systemd.services.tellstick-mqtt-bridge.wantedBy;
@@ -261,6 +265,7 @@ pkgs.testers.runNixOSTest {
     assert values["nixGcDates"] == ["daily"], values
     assert values["nixGcOptions"] == "--delete-older-than 14d", values
     assert values["nixOptimiseAutomatic"] is True, values
+    assert values["smartdEnabled"] is True, values
     assert values["nixOptimiseDates"] == ["Wed 04:15"], values
     assert values["autoDeployEnabled"] is False, values
     assert values["automationEnabled"] is True, values

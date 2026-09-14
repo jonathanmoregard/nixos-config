@@ -565,17 +565,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1789403299,
-        "narHash": "sha256-TDpNz+2PVzHHPS2jPPEEzDiQs1cY7VBL3d2g74vZHZA=",
+        "lastModified": 1789405949,
+        "narHash": "sha256-UWLh/goN7+yFMG8eRkYejav4PsLPkgJQrNFdpahS1dc=",
         "owner": "jonathanmoregard",
         "repo": "smarthome",
-        "rev": "8abf5c03b77183b23057fc81d19d727978b444e7",
+        "rev": "e16b5d52fbb5b8406af3ba8eb808582d0613f93b",
         "type": "github"
       },
       "original": {
         "owner": "jonathanmoregard",
         "repo": "smarthome",
-        "rev": "8abf5c03b77183b23057fc81d19d727978b444e7",
+        "rev": "e16b5d52fbb5b8406af3ba8eb808582d0613f93b",
         "type": "github"
       }
     },

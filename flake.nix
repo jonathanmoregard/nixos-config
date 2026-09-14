@@ -30,7 +30,7 @@
 
     # Home automation engine and its NixOS service module. Pin the reviewed
     # commit explicitly; flake.lock records the matching source hash.
-    smarthome.url = "github:jonathanmoregard/smarthome/8abf5c03b77183b23057fc81d19d727978b444e7";
+    smarthome.url = "github:jonathanmoregard/smarthome/e16b5d52fbb5b8406af3ba8eb808582d0613f93b";
     smarthome.inputs.nixpkgs.follows = "nixpkgs";
 
     # Anthropic ships an official Linux app since 2026-06-30, but not
