@@ -93,4 +93,3 @@
 - [ ] Run affected fast checks plus `scripts/check-eval-warnings.sh` and `scripts/check-fork-guards.sh`.
 - [ ] Start headless feature VM, SSH in, call automation health, connect/publish/subscribe through Mosquitto, verify Matrix endpoint with fixture, inspect firewall and unit hardening, capture journal evidence, then stop VM.
 - [ ] Record commands/results in progress notes and final commit trailer.
-
