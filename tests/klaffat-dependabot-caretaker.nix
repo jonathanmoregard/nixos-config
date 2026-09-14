@@ -42,8 +42,8 @@ common.mkMinimalTest {
       environment.systemPackages = [ pkgs.git pkgs.jq ];
       environment.etc."klaffat-caretaker/repair-token" = { text = "test-only-repair"; mode = "0440"; group = "klaffat-caretaker-repair"; };
       environment.etc."klaffat-caretaker/git-token" = { text = "test-only-git"; mode = "0440"; group = "klaffat-caretaker-publisher"; };
-      environment.etc."klaffat-caretaker/metadata-token".text = "test-only-metadata";
-      environment.etc."klaffat-caretaker/checks-token".text = "test-only-checks";
+      environment.etc."klaffat-caretaker/metadata-token" = { text = "test-only-metadata"; mode = "0400"; };
+      environment.etc."klaffat-caretaker/checks-token" = { text = "test-only-checks"; mode = "0400"; };
       services.klaffatDependabotCaretaker = {
         enable = true;
         repoRemoteUrl = "file:///var/lib/klaffat-caretaker/remote.git";
@@ -70,6 +70,8 @@ common.mkMinimalTest {
     caretaker.succeed("runuser -u klaffat-caretaker-verifier -- test ! -r /etc/klaffat-caretaker/git-token")
     caretaker.succeed("runuser -u klaffat-caretaker-publisher -- test -r /etc/klaffat-caretaker/git-token")
     caretaker.succeed("runuser -u klaffat-caretaker-publisher -- test ! -r /etc/klaffat-caretaker/repair-token")
+    caretaker.succeed("runuser -u klaffat-caretaker-repair -- test ! -r /etc/klaffat-caretaker/metadata-token")
+    caretaker.succeed("runuser -u klaffat-caretaker-publisher -- test ! -r /etc/klaffat-caretaker/checks-token")
     contexts = caretaker.succeed("nixos-option services.klaffatDependabotCaretaker.requiredContexts")
     for context in [
       "refuse test-endpoints in release",
