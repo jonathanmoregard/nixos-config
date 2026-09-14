@@ -72,12 +72,11 @@ let
       }
 
       mkdir -p "$state/attempts" "$state/audit" "$work"
-      trap 'status=$?; if [ "$status" -ne 0 ]; then audit failure "''${refusal:-command-failed}"; fi' EXIT
       exec 9>"$state/controller.lock"
       flock -n 9 || { echo "klaffat-dependabot-caretaker: another invocation is active" >&2; exit 75; }
       run="$(mktemp -d "$work/run.XXXXXX")"
       chmod 0711 "$run"
-      trap 'rm -rf -- "$run"' EXIT
+      trap 'status=$?; rm -rf -- "$run"; if [ "$status" -ne 0 ]; then audit "failure" "''${refusal:-command-failed}"; fi; exit "$status"' EXIT
 
       require_credential metadata "$metadata_credential"
       metadata="$run/metadata.json"
