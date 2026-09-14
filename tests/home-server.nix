@@ -328,5 +328,51 @@ pkgs.testers.runNixOSTest {
     home_server.succeed("ss -lnt | grep -F '0.0.0.0:8008'")
     home_server.fail("systemctl cat matrix-synapse.service | grep -F vm-macaroon-secret")
     home_server.fail("systemctl cat tellstick-mqtt-bridge.service | grep -F vm-tellstick-token")
+
+    # Exercise the real broker/adapter path without a fake device echo. The
+    # daemon must stop scheduling once its bounded retry budget is exhausted.
+    home_server.succeed(
+        """
+        rm -f /tmp/startup-command.json
+        (timeout 10 mosquitto_sub -h 127.0.0.1 -p 1883 -C 1 \
+          -t zigbee2mqtt/test/room/lamp/set > /tmp/startup-command.json) &
+        subscriber=$!
+        sleep 0.2
+        mosquitto_pub -h 127.0.0.1 -p 1883 -q 1 -r \
+          -t zigbee2mqtt/test/room/lamp/availability -m online
+        wait "$subscriber"
+        jq -e '.state == "OFF"' /tmp/startup-command.json
+        """
+    )
+    home_server.succeed(
+        """
+        rm -f /tmp/toggle-command.json
+        (timeout 10 mosquitto_sub -h 127.0.0.1 -p 1883 -C 1 \
+          -t zigbee2mqtt/test/room/lamp/set > /tmp/toggle-command.json) &
+        subscriber=$!
+        sleep 0.2
+        mosquitto_pub -h 127.0.0.1 -p 1883 -q 1 \
+          -t zigbee2mqtt/test/room/control -m '{"action":"toggle"}'
+        wait "$subscriber"
+        jq -e '.state == "ON"' /tmp/toggle-command.json
+        """
+    )
+    home_server.succeed("sleep 16")
+    before = int(home_server.succeed(
+        "journalctl -u house-automationd.service --no-pager -o cat | "
+        "grep -c 'computed device target' || true"
+    ).strip())
+    home_server.succeed("sleep 1")
+    after = int(home_server.succeed(
+        "journalctl -u house-automationd.service --no-pager -o cat | "
+        "grep -c 'computed device target' || true"
+    ).strip())
+    assert after - before <= 1, (before, after)
+
+    home_server.succeed("systemctl restart house-automationd.service")
+    home_server.wait_until_succeeds(
+        "curl --fail --silent http://127.0.0.1:9876/healthz | jq -e '.ready == true'"
+    )
+    home_server.succeed("test -z \"$(systemctl --failed --no-legend)\"")
   '';
 }
