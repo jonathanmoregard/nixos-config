@@ -20,7 +20,8 @@
 #
 # Fast-path: a `preflight` job runs the same denylist regex as gate.yml
 # and emits `risk=TRIVIAL` for docs-only PRs. Heavy STEPS inside the
-# downstream jobs (flake-check, build-dellan, vm-minimal, vm-graphical)
+# downstream jobs (flake-check, build-dellan, build-home-server, vm-minimal,
+# vm-graphical)
 # are gated `if: needs.preflight.outputs.risk != 'TRIVIAL'`, so the
 # job COMPLETES SUCCESS with no work — that keeps branch-protection
 # required checks satisfied. Skipping the job itself would mark the
@@ -525,6 +526,63 @@ jobs:
         if: always() && needs.preflight.outputs.risk != 'TRIVIAL'
         run: df -h / /mnt /tmp 2>/dev/null || df -h /
 
+  build-home-server:
+    name: build home-server toplevel
+    runs-on: ubuntu-latest
+    needs: [verify-fork-guards, preflight, build-dellan]
+    permissions:
+      contents: read
+    steps:
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Free root disk (dotnet/ghc/android/docker/codeql)
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: ./scripts/free-root-disk.sh
+      - name: Mount /tmp on /mnt bind
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: ./scripts/mount-tmp-loop.sh
+      - name: Mount /nix on /mnt loopback
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: ./scripts/mount-nix-loop.sh
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            max-substitution-jobs = 64
+            http-connections = 64
+            narinfo-cache-positive-ttl = 600
+      # Reuse build-dellan's lock-scoped store snapshot. This job only
+      # realizes the server delta and never owns/saves the shared cache.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/*.nix') }}
+          restore-prefixes-first-match: |
+            nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
+          save: false
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+        with:
+          name: jonathanmoregard
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Build home-server system
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
+        env:
+          TMPDIR: /mnt/tmp
+        run: |
+          set -euo pipefail
+          nix build .#nixosConfigurations.home-server.config.system.build.toplevel \
+            --out-link "$GITHUB_WORKSPACE/result-home-server" \
+            --print-build-logs --keep-going
+      - name: Disk after (post-build)
+        if: always() && needs.preflight.outputs.risk != 'TRIVIAL'
+        run: df -h / /mnt /tmp 2>/dev/null || df -h /
+
   vm-minimal:
     # Matrix fan-out: one lane per feature check derivation. Each lane
     # is independent (own VM boot), so a failure in `kitty` doesn't
@@ -543,18 +601,18 @@ jobs:
     # when adding/removing a lane.
     name: vm-minimal (${{ matrix.lane }})
     runs-on: ubuntu-latest
-    needs: [verify-fork-guards, preflight, discover, build-dellan]
+    needs: [verify-fork-guards, preflight, discover, build-dellan, build-home-server]
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        # `klaffat-infra` and `klaffat-dependabot-caretaker` are matrix-only, like listen-tools / camera-relay /
-        # auto-deploy: it is deliberately absent from `discover`'s LANES, so
-        # it never reports "cached" and always executes. That lane gates
-        # credential handling and the sudo password rule — a cache hit
-        # skipping it is exactly the silence it exists to prevent.
-        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker]
+        # `klaffat-infra`, `klaffat-dependabot-caretaker`, and `home-server`
+        # are matrix-only, like listen-tools / camera-relay / auto-deploy.
+        # They are deliberately absent from `discover`'s LANES, so they never
+        # report "cached" and always execute. They gate credential handling,
+        # caretaker trust boundaries, and the server's secure bootstrap.
+        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker, home-server]
     steps:
       # Read this lane's cache status from the discover job. ALWAYS
       # runs (no `if:`) so subsequent steps can reference
