@@ -52,6 +52,15 @@ common.mkMinimalTest {
     import json, shlex
 
     caretaker.wait_for_unit("multi-user.target")
+    contexts = caretaker.succeed("nixos-option services.klaffatDependabotCaretaker.requiredContexts")
+    for context in [
+      "refuse test-endpoints in release",
+      "rust — fmt + clippy + test",
+      "e2e — playwright",
+      "race-condition harness (real-contention, file-backed WAL)",
+      "infra — fmt + validate + guard tests",
+    ]:
+      assert context in contexts
     caretaker.succeed("mkdir -p /var/lib/klaffat-caretaker/source && git init -q /var/lib/klaffat-caretaker/source && git -C /var/lib/klaffat-caretaker/source config user.email test@example.invalid && git -C /var/lib/klaffat-caretaker/source config user.name test")
     caretaker.succeed("sh -c 'cd /var/lib/klaffat-caretaker/source && echo base > package-lock.json && git add package-lock.json && git commit -qm base && git branch -M main && git clone -q --bare . ../remote.git && git remote add origin ../remote.git && git push -q -u origin main && git checkout -qb dependabot/npm_and_yarn/lodash-4.17.22 && echo update >> package-lock.json && git commit -qam update && git push -q -u origin HEAD'")
     base_sha = caretaker.succeed("git -C /var/lib/klaffat-caretaker/source rev-parse main").strip()
