@@ -76,6 +76,7 @@ let
       exec 9>"$state/controller.lock"
       flock -n 9 || { echo "klaffat-dependabot-caretaker: another invocation is active" >&2; exit 75; }
       run="$(mktemp -d "$work/run.XXXXXX")"
+      chmod 0711 "$run"
       trap 'rm -rf -- "$run"' EXIT
 
       require_credential metadata "$metadata_credential"
@@ -138,15 +139,17 @@ let
       # instructions are deliberately never read into this process.
       [ -n "$repair_credential" ] || refuse "repair-credential-not-configured"
       agent_dir="$run/agent-clone"
+      agent_home="$run/agent-home"
       cp -a "$repo_dir" "$agent_dir"
-      chown -R "$repair_user:$repair_user" "$agent_dir"
+      mkdir -p "$agent_home/.config" "$agent_home/.data" "$agent_home/.state"
+      chown -R "$repair_user:$repair_user" "$agent_dir" "$agent_home"
       systemd-run --quiet --pipe --wait --collect \
         --property="User=$repair_user" --property="Group=$repair_user" \
         --property="WorkingDirectory=$agent_dir" --property="UMask=0077" \
         --property="RuntimeMaxSec=20min" --property="MemoryMax=2G" --property="TasksMax=128" \
         --setenv="ANTHROPIC_API_KEY_FILE=$repair_credential" \
-        "${pkgs.coreutils}/bin/env" -i PATH="$PATH" HOME="$agent_dir/.home" \
-        XDG_CONFIG_HOME="$agent_dir/.config" XDG_DATA_HOME="$agent_dir/.data" XDG_STATE_HOME="$agent_dir/.state" \
+        "${pkgs.coreutils}/bin/env" -i PATH="$PATH" HOME="$agent_home" \
+        XDG_CONFIG_HOME="$agent_home/.config" XDG_DATA_HOME="$agent_home/.data" XDG_STATE_HOME="$agent_home/.state" \
         "$repair_cmd" "$pr" "$head_sha" "$base_sha" "$agent_dir"
 
       repair_patch="$run/repair.patch"
@@ -174,15 +177,17 @@ let
       candidate="$(git -C "$candidate_dir" rev-parse HEAD)"
 
       verifier_dir="$run/verifier-copy"
+      verifier_home="$run/verifier-home"
       cp -a "$candidate_dir" "$verifier_dir"
-      chown -R "$verifier_user:$verifier_user" "$verifier_dir"
+      mkdir -p "$verifier_home/.config" "$verifier_home/.data" "$verifier_home/.state"
+      chown -R "$verifier_user:$verifier_user" "$verifier_dir" "$verifier_home"
       systemd-run --quiet --pipe --wait --collect \
         --property="User=$verifier_user" --property="Group=$verifier_user" \
         --property="WorkingDirectory=$verifier_dir" --property="PrivateNetwork=yes" \
         --property="PrivateTmp=yes" --property="UMask=0077" \
         --property="RuntimeMaxSec=45min" --property="MemoryMax=3G" --property="TasksMax=256" \
-        "${pkgs.coreutils}/bin/env" -i PATH="$PATH" HOME="$verifier_dir/.home" \
-        XDG_CONFIG_HOME="$verifier_dir/.config" XDG_DATA_HOME="$verifier_dir/.data" XDG_STATE_HOME="$verifier_dir/.state" \
+        "${pkgs.coreutils}/bin/env" -i PATH="$PATH" HOME="$verifier_home" \
+        XDG_CONFIG_HOME="$verifier_home/.config" XDG_DATA_HOME="$verifier_home/.data" XDG_STATE_HOME="$verifier_home/.state" \
         "$verifier_cmd" "$verifier_dir" "$base_sha"
 
       # Publish gets a structured, fixed result. It must re-read the remote
@@ -191,14 +196,16 @@ let
       jq -cn --arg repo "$repo" --argjson pr "$pr" --arg ref "$head_ref" --arg old "$head_sha" --arg new "$candidate" \
         '{repo:$repo,pr:$pr,ref:$ref,expected_head:$old,candidate:$new}' > "$result"
       [ -n "$git_credential" ] || refuse "git-credential-not-configured"
-      chown -R "$publisher_user:$publisher_user" "$candidate_dir" "$result"
+      publisher_home="$run/publisher-home"
+      mkdir -p "$publisher_home/.config" "$publisher_home/.data" "$publisher_home/.state"
+      chown -R "$publisher_user:$publisher_user" "$candidate_dir" "$result" "$publisher_home"
       systemd-run --quiet --pipe --wait --collect \
         --property="User=$publisher_user" --property="Group=$publisher_user" \
         --property="WorkingDirectory=$candidate_dir" --property="UMask=0077" \
         --property="RuntimeMaxSec=5min" --property="MemoryMax=512M" --property="TasksMax=64" \
         --setenv="KLAFFAT_CARETAKER_GIT_CREDENTIAL_FILE=$git_credential" \
-        "${pkgs.coreutils}/bin/env" -i PATH="$PATH" HOME="$candidate_dir/.home" \
-        XDG_CONFIG_HOME="$candidate_dir/.config" XDG_DATA_HOME="$candidate_dir/.data" XDG_STATE_HOME="$candidate_dir/.state" \
+        "${pkgs.coreutils}/bin/env" -i PATH="$PATH" HOME="$publisher_home" \
+        XDG_CONFIG_HOME="$publisher_home/.config" XDG_DATA_HOME="$publisher_home/.data" XDG_STATE_HOME="$publisher_home/.state" \
         "$publisher_cmd" "$candidate_dir" "$result"
 
       require_credential checks "$checks_credential"
