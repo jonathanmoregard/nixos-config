@@ -1760,6 +1760,135 @@ in
         "systemctl --user reset-failed sota-watch.service'"
     )
 
+    # ── ai-router ranking timer (home/ai-router.nix) ──
+    # Daily user timer running ~/.claude/tools/ai-router/update_ranking.py.
+    # The updater ships in the ~/.claude repo, which is NOT cloned in this
+    # VM, so what runs here is the wrapper's guard path: missing script →
+    # "skipping" in the log, exit 0, unit NOT failed. The wrapper also
+    # writes a machine-readable outcome file before and after every run;
+    # that file is how a Claude SessionStart hook learns a run failed
+    # (2026-08-31 constraint: a desktop toast reaches nobody who can fix
+    # it), so its SHAPE is asserted, not merely its presence.
+    import json as _ai_router_json
+
+    timers = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user list-timers --all'"
+    )
+    assert "ai-router-ranking.timer" in timers, \
+        f"ai-router-ranking.timer missing from user timer list:\n{timers}"
+
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start ai-router-ranking.service'"
+    )
+    state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed ai-router-ranking.service || true'"
+    ).strip()
+    assert state != "failed", \
+        f"ai-router-ranking.service failed after guard-path run: {state!r}"
+
+    ranking_log = dellan.succeed(
+        "cat /home/jonathan/.local/share/ai-router/ranking.log"
+    )
+    assert "skipping" in ranking_log, \
+        f"guard-path 'skipping' marker missing from ranking.log:\n{ranking_log}"
+
+    outcome_raw = dellan.succeed(
+        "cat /home/jonathan/.local/state/ai-router/ranking.last-run.json"
+    )
+    print("[diag] ai-router outcome after guard-path run: " + outcome_raw)
+    outcome = _ai_router_json.loads(outcome_raw)
+    assert outcome["unit"] == "ai-router-ranking", outcome
+    assert outcome["skipped"] is True, \
+        f"guard-path run must record skipped=true: {outcome}"
+    assert outcome["exit_code"] == 0, \
+        f"guard-path run must record exit_code=0: {outcome}"
+    assert outcome["started_at"] and outcome["finished_at"], \
+        f"guard-path run must record both timestamps: {outcome}"
+    # The state dir is shared with the router CLI and holds job
+    # transcripts + quota snapshots — contract says mode 0700.
+    state_mode = dellan.succeed(
+        "stat -c %a /home/jonathan/.local/state/ai-router"
+    ).strip()
+    assert state_mode == "700", \
+        f"~/.local/state/ai-router must be 0700, got {state_mode!r}"
+
+    # Negative control BEFORE the failure lane: a clean guard-path run
+    # must NOT have tripped the notifier (same vacuous-pass hazard as
+    # the sota-watch block above).
+    notify_log = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u ai-router-ranking-failure-notify.service "
+        "--no-pager' || true"
+    )
+    assert "ai-router ranking updater failed" not in notify_log, (
+        "notify marker present after a SUCCESSFUL guard-path run — "
+        f"OnFailure is mis-wired:\n{notify_log}"
+    )
+
+    # Failure lane: plant an updater that exits 1 at the guarded path,
+    # start the service (expected to fail), and assert (a) the outcome
+    # file records the non-zero exit with skipped=false — the channel a
+    # Claude session reads — and (b) the notifier's journal marker. Root
+    # creates the dir as jonathan (install -d -o) so cleanup below is
+    # exact; the file itself may stay root-owned 0644 — the wrapper only
+    # needs it readable.
+    dellan.succeed(
+        "install -d -o jonathan -g users /home/jonathan/.claude/tools/ai-router && "
+        "printf 'import sys\\nsys.exit(1)\\n' "
+        "> /home/jonathan/.claude/tools/ai-router/update_ranking.py && "
+        "chmod 644 /home/jonathan/.claude/tools/ai-router/update_ranking.py"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start ai-router-ranking.service; true'"
+    )
+    state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed ai-router-ranking.service || true'"
+    ).strip()
+    assert state == "failed", (
+        "fake failing updater should leave ai-router-ranking.service "
+        f"failed; got is-failed={state!r}"
+    )
+    outcome_raw = dellan.succeed(
+        "cat /home/jonathan/.local/state/ai-router/ranking.last-run.json"
+    )
+    print("[diag] ai-router outcome after forced failure: " + outcome_raw)
+    outcome = _ai_router_json.loads(outcome_raw)
+    assert outcome["skipped"] is False and outcome["exit_code"] == 1, \
+        f"forced failure must record skipped=false, exit_code=1: {outcome}"
+    assert outcome["finished_at"], \
+        f"forced failure must still record finished_at: {outcome}"
+    # OnFailure dispatch is asynchronous; poll the notifier's journal.
+    dellan.wait_until_succeeds(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u ai-router-ranking-failure-notify.service "
+        "--no-pager' | grep -q 'ai-router ranking updater failed'",
+        timeout=60,
+    )
+    # Leave the VM clean for later lanes: drop the planted updater and
+    # clear the deliberately-failed unit.
+    dellan.succeed("rm -rf /home/jonathan/.claude/tools/ai-router")
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user reset-failed ai-router-ranking.service'"
+    )
+
+    # home.sessionPath must land on jonathan's PATH: `~/.claude/bin`
+    # holds repo-managed launchers (`ai-router` first). `su -` runs the
+    # login shell, which sources the HM-generated hm-session-vars.sh —
+    # the behavioural check, not a grep of the rendered file.
+    path_var = dellan.succeed(
+        "su - jonathan -c 'echo $PATH'"
+    ).strip()
+    assert "/home/jonathan/.claude/bin" in path_var.split(":"), (
+        "/home/jonathan/.claude/bin missing from jonathan's login-shell "
+        f"PATH:\n{path_var}"
+    )
+
     # ── aggregator all-sources ingest (modules/nixos/aggregator-ingest-timer.nix) ──
     # One user timer walks all nine aggregator sources every 30 min. The
     # predecessor (aggregator-github-ingest) ran one source and had NO

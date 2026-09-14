@@ -367,6 +367,76 @@ in
         "Codex panes were mislabeled as Claude panes"
     )
 
+    # A real 2026-09-13 restore selected a background Haiku proposal scorer
+    # instead of this pane's root Codex session. The scorer inherited the
+    # PTY and appeared first in Kitty's PID-ordered process list. Typed row
+    # kind must select the matching live root, never the first agent process.
+    sid_mixed = "eeee5555-eeee-4555-8555-eeeeeeeeeeee"
+    wid_mixed = 105
+    stage_input(
+        "/tmp/mixed-agent.tsv",
+        f"{wid_mixed}\tcodex\t{sid_mixed}\t/tmp/mixed\t0",
+    )
+    mixed_ls = json.dumps([{"tabs": [{"windows": [{
+        "id": wid_mixed,
+        "cwd": "/tmp/mixed",
+        "title": "mixed-agent",
+        "cmdline": ["/bin/zsh"],
+        "foreground_processes": [
+            {"pid": 1001, "cmdline": [
+                "/usr/bin/claude", "--model", "haiku", "--max-turns",
+                "20", "--print", "score",
+            ]},
+            {"pid": 1002, "cmdline": [
+                "/usr/bin/codex", "resume", sid_mixed,
+            ]},
+        ],
+    }]}]}])
+    stage_input("/tmp/mixed-agent.json", mixed_ls)
+    dellan.succeed(
+        "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
+        "KITTY_ENRICH_TSV=/tmp/mixed-agent.tsv kitty-session-enrich "
+        "< /tmp/mixed-agent.json > /tmp/mixed-agent-enriched.json'"
+    )
+    mixed_window = json.loads(dellan.succeed(
+        "cat /tmp/mixed-agent-enriched.json"
+    ))[0]["tabs"][0]["windows"][0]
+    assert mixed_window.get("codex_session_id") == sid_mixed, (
+        "background Haiku hid the exact root Codex identity: "
+        f"{mixed_window!r}"
+    )
+    assert "claude_session_id" not in mixed_window, (
+        f"background Haiku was mislabeled as pane owner: {mixed_window!r}"
+    )
+
+    # Headless Claude modes do not own a terminal pane even if a stale typed
+    # row exists for the same Kitty window id.
+    wid_headless = 106
+    stage_input(
+        "/tmp/headless-agent.tsv",
+        f"{wid_headless}\tclaude\t{sid_a}\t/tmp/headless\t0",
+    )
+    headless_ls = json.dumps([{"tabs": [{"windows": [{
+        "id": wid_headless,
+        "cwd": "/tmp/headless",
+        "title": "headless-agent",
+        "cmdline": ["/bin/zsh"],
+        "foreground_processes": [{"pid": 1003, "cmdline": [
+            "/usr/bin/claude", "--model", "haiku", "--print", "score",
+        ]}],
+    }]}]}])
+    stage_input("/tmp/headless-agent.json", headless_ls)
+    dellan.succeed(
+        "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
+        "KITTY_ENRICH_TSV=/tmp/headless-agent.tsv kitty-session-enrich "
+        "< /tmp/headless-agent.json > /tmp/headless-agent-enriched.json'"
+    )
+    headless_window = json.loads(dellan.succeed(
+        "cat /tmp/headless-agent-enriched.json"
+    ))[0]["tabs"][0]["windows"][0]
+    assert "claude_session_id" not in headless_window
+    assert "codex_session_id" not in headless_window
+
     # Negative control: with one exact mapping removed, two same-cwd
     # Codex panes are collision-risk and the enricher must fail closed.
     stage_input(

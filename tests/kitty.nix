@@ -139,6 +139,29 @@ let
       for (;;) pause();
     }
   '';
+
+  # Headless subagent stand-in. Its basename and real argv reproduce the
+  # proposal scorer that inherited the interactive Codex pane's PTY.
+  testClaude = pkgs.writeCBin "claude" ''
+    #include <signal.h>
+    #include <unistd.h>
+
+    int main(void) {
+      for (;;) pause();
+    }
+  '';
+
+  # Keep this parent shell alive while its foreground Codex child runs. The
+  # background Claude child is forked first, giving live `kitty @ ls` the
+  # observed order: headless Claude before root Codex in one pane.
+  testMixedAgentPane = pkgs.writeShellScriptBin "mixed-agent-pane" ''
+    set -eu
+    ${testClaude}/bin/claude \
+      --model haiku --max-turns 20 --print score-proposals &
+    claude_pid=$!
+    trap 'kill "$claude_pid" 2>/dev/null || true' EXIT
+    ${testCodex}/bin/codex resume "$1"
+  '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
   name = "vm-kitty";
@@ -248,8 +271,21 @@ in
         f"su jonathan -c 'KITTY_CONF={kitty_conf} ${configParseProbe}'"
     )
 
-    # Persistence timer is active and scheduled
-    dellan.wait_for_unit("kitty-session-save.timer", "jonathan")
+    # Persistence timer is enabled, active, and scheduled. Fresh-home VM boot
+    # has one test-only race: lingering can start the user manager and reach
+    # timers.target while HM is still linking user units; HM then observes no
+    # usable manager bus and skips its reload. Production activation runs
+    # against an established user manager. Converge those two test fixtures
+    # explicitly, after asserting the generated enablement link exists.
+    user_systemctl = "systemctl --machine=jonathan@.host --user"
+    dellan.succeed(
+        f"{user_systemctl} is-enabled --quiet kitty-session-save.timer"
+    )
+    dellan.succeed(f"{user_systemctl} daemon-reload")
+    dellan.succeed(f"{user_systemctl} start kitty-session-save.timer")
+    dellan.succeed(
+        f"{user_systemctl} is-active --quiet kitty-session-save.timer"
+    )
 
     # Save script no-ops cleanly when no kitty is running
     dellan.succeed("su - jonathan -c kitty-session-save")
@@ -402,15 +438,18 @@ in
     # user does ctrl+shift+v on the real desktop — that's the manual
     # verification step the PR description hands them.
     sleep_bin = "/run/current-system/sw/bin/sleep"
+    claude_bin = "${testClaude}/bin/claude"
     codex_bin = "${testCodex}/bin/codex"
+    mixed_agent_bin = "${testMixedAgentPane}/bin/mixed-agent-pane"
     codex_sid = "77777777-aaaa-4777-8777-777777777777"
     panes = [
         ("/tmp", "11111"),
         ("/var", "22222"),
     ]
     # Set up 4 panes via kitty-pane-add — two ordinary commands plus a real
-    # no-hook Codex pane. Default first window acts as pane 1; 3 additional
-    # pane-adds give us 4 total in 2x2.
+    # no-hook Codex root sharing its PTY with a headless Claude scorer.
+    # Default first window acts as pane 1; 3 additional pane-adds give us
+    # 4 total in 2x2.
     for cwd, magic in panes:
         dellan.succeed(
             "su jonathan -c "
@@ -418,7 +457,7 @@ in
         )
     dellan.succeed(
         "su jonathan -c "
-        f"'kitty-pane-add --cwd /etc -- {codex_bin} resume {codex_sid}'"
+        f"'kitty-pane-add --cwd /etc -- {mixed_agent_bin} {codex_sid}'"
     )
     dellan.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls' | "
@@ -466,6 +505,22 @@ in
     dellan.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/ls-before.json'")
     print("[diag] before save:\n" + dellan.succeed("cat /tmp/ls-before.json"))
 
+    # Empirical precondition: real Kitty discovery, not fixture JSON, must
+    # show both agents attached to one PTY and the headless Haiku first.
+    # Without this assertion the restore test could pass because the setup
+    # failed to reproduce the process order that caused the incident.
+    dellan.succeed(
+        "jq -e --arg claude '" + claude_bin
+        + "' --arg codex '" + codex_bin
+        + "' --arg sid '" + codex_sid + "' '"
+        "[.[].tabs[].windows[].foreground_processes "
+        "| map(.cmdline) as $cmds "
+        "| select($cmds[1] == [$claude, \"--model\", \"haiku\", "
+        "\"--max-turns\", \"20\", \"--print\", \"score-proposals\"] "
+        "and $cmds[2] == [$codex, \"resume\", $sid])] "
+        "| length == 1' /tmp/ls-before.json"
+    )
+
     # Model the durable no-hook binding that the restore bootstrap itself
     # must recreate. The live foreground argv selects exactly one window;
     # writing a guessed or cwd-matched ID would let this test pass while the
@@ -488,11 +543,22 @@ in
         f"\"{codex_sid}\" \"$(date +%s)\" > "
         "/home/jonathan/.cache/kitty-session/pane-sessions.tsv'"
     )
+    codex_window_id = int(dellan.succeed(
+        "cat /tmp/codex-window-id"
+    ).strip())
 
     # --- Phase 2: save. Files must materialize and parse cleanly. ---
     dellan.succeed("su jonathan -c kitty-session-save")
     dellan.succeed("test -s /home/jonathan/.cache/kitty-session/snapshot.json")
     dellan.succeed("test -s /home/jonathan/.cache/kitty-session/last.session")
+    dellan.succeed(
+        "jq -e --arg sid '" + codex_sid + "' '"
+        ".[0].tabs[].windows[] "
+        f"| select(.id == {codex_window_id}) "
+        "| .codex_session_id == $sid "
+        "and (has(\"claude_session_id\") | not)' "
+        "/home/jonathan/.cache/kitty-session/snapshot.json"
+    )
     print(
         "[diag] saved session:\n"
         + dellan.succeed("cat /home/jonathan/.cache/kitty-session/last.session")

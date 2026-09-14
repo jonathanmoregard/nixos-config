@@ -399,6 +399,18 @@ let
         return os.path.basename(cmdline[0]) == "claude"
 
 
+    CLAUDE_NONINTERACTIVE_FLAGS = {
+        "-p", "--print", "--bg", "--background",
+    }
+
+
+    def _is_claude_exe_interactive(cmdline):
+        """True only for a Claude conversation that owns a terminal."""
+        return _is_claude_exe(cmdline) and not any(
+            arg in CLAUDE_NONINTERACTIVE_FLAGS for arg in cmdline[1:]
+        )
+
+
     # Codex has both an interactive TUI and one-shot/service subcommands.
     # Only the former is a pane that can safely be resumed. A positional
     # prompt is also an interactive root invocation, so this is a deny-list
@@ -512,11 +524,59 @@ let
     def _agent_kind(cmdline):
         """The interactive agent kind under this module's launchers."""
         inner = unwrap_launchers(cmdline)
-        if _is_claude_exe(inner):
+        if _is_claude_exe_interactive(inner):
             return "claude"
         if _is_codex_exe_interactive(inner):
             return "codex"
         return None
+
+
+    def _is_agent_executable(cmdline):
+        """True for any Claude or Codex argv, interactive or headless."""
+        inner = unwrap_launchers(cmdline)
+        return _is_claude_exe(inner) or _is_codex_exe(inner)
+
+
+    def _snapshot_agent_kind(win):
+        """Exact recorded kind, only when one valid identity exists."""
+        kinds = []
+        for kind in ("claude", "codex"):
+            sid = win.get(kind + "_session_id")
+            if isinstance(sid, str) and UUID_RE.fullmatch(sid):
+                kinds.append(kind)
+        return kinds[0] if len(kinds) == 1 else None
+
+
+    def select_pane_agent(win, expected_kind=None):
+        """Return (kind, argv) for pane owner, or (None, None).
+
+        Kitty's stable window argv is strongest: it records what Kitty
+        launched, not every process that later inherited the PTY. A typed
+        identity can otherwise select its matching live root. With neither,
+        mixed live agent kinds are ambiguous and must not be guessed by PID
+        order.
+        """
+        stable = unwrap_pane0(win.get("cmdline") or [])
+        stable_kind = _agent_kind(stable)
+        if stable_kind:
+            return stable_kind, stable
+
+        candidates = []
+        for process in win.get("foreground_processes") or []:
+            argv = process.get("cmdline") or []
+            kind = _agent_kind(argv)
+            if kind:
+                candidates.append((kind, argv))
+
+        if expected_kind in {"claude", "codex"}:
+            for kind, argv in candidates:
+                if kind == expected_kind:
+                    return kind, argv
+            return None, None
+
+        if candidates and len({kind for kind, _argv in candidates}) == 1:
+            return candidates[0]
+        return None, None
 
 
     def slice_launch(cmdline):
@@ -572,22 +632,18 @@ let
     def pane_cmd(win):
         """The command this pane should be recorded as running.
 
-        Mirrors kitty-restore-session's picker, including the
-        pane-0-launcher unwrap: a `claude` entry anywhere in the
-        pid-ordered foreground list wins, then the cmdline kitty
-        actually launched the window with (minus the --exec-pane0
-        launcher, which is this module's own indirection and not a
-        command anybody can run), then foreground_processes[0]. Keeps
-        last.session an honest rendering of what restore will do —
-        and, since a human can feed last.session back to `kitty
-        --session`, keeps the launcher out of a file that would then
-        exec it as pane 0's command.
+        Mirrors kitty-restore-session's owner selector. Stable Kitty argv
+        wins; exact recorded kind filters live roots; mixed agent kinds with
+        neither signal fail safe. Keeps last.session an honest rendering of
+        restore and keeps pane-0 launchers out of executable session input.
         """
         fg = win.get("foreground_processes") or []
-        for fp in fg:
-            cl = fp.get("cmdline") or []
-            kind = _agent_kind(cl)
+        kind, cl = select_pane_agent(win, _snapshot_agent_kind(win))
+        if cl:
             if kind == "claude":
+                sid = win.get("claude_session_id")
+                if isinstance(sid, str) and UUID_RE.fullmatch(sid):
+                    return [unwrap_launchers(cl)[0], "--resume", sid]
                 return cl
             if kind == "codex":
                 sid = win.get("codex_session_id")
@@ -595,9 +651,12 @@ let
                     return [unwrap_launchers(cl)[0], "resume", sid]
                 return clean_user_shell()
         wc = unwrap_pane0(win.get("cmdline") or [])
-        if wc:
+        if wc and not _is_agent_executable(wc):
             return wc
-        return (fg[0].get("cmdline") or []) if fg else []
+        first = (fg[0].get("cmdline") or []) if fg else []
+        if first and not _is_agent_executable(first):
+            return first
+        return clean_user_shell()
 
 
     data = json.load(sys.stdin)
@@ -1735,6 +1794,11 @@ let
     )
 
 
+    def clean_user_shell():
+        """Open a shell without replaying any recorded command wrapper."""
+        return [os.environ.get("SHELL") or "/bin/sh"]
+
+
     def is_bootstrap_launcher(cmdline):
         """True for a direct or pane-0-carried Codex bootstrap argv."""
         cmdline = cmdline or []
@@ -2250,46 +2314,34 @@ let
     def pane_cmd(win):
         """Resolve the command a restored pane should be launched with.
 
-        Priority:
-          1. a `claude` entry anywhere in foreground_processes. kitty
-             reports that list in pid order, so index 0 is only claude
-             by luck — every MCP-server child claude spawns has a
-             higher pid, but the moment claude itself exits the list
-             starts with whichever child outlived it.
-          2. `window.cmdline` when kitty launched the pane AS claude.
-             This is the ZOMBIE case: claude is gone, an orphaned
-             stdio MCP server still holds the pty open, and fg lists
-             only that orphan. kitty remembers what it spawned, so the
-             pane is still recoverable as a claude pane (the sid comes
-             from the snapshot's claude_session_id, attached by
-             kitty-session-enrich from pane-sessions.tsv).
-          3. `window.cmdline` otherwise — what kitty actually spawned
-             beats whatever happens to be in the foreground right now.
-             Restoring the pane's shell is better than re-running
-             someone's half-finished `nix build`, and strictly better
-             than resurrecting an orphaned MCP server as if the user
-             had asked for it.
-          4. foreground_processes[0], for kitty builds that do not
-             report a per-window `cmdline` at all.
-
-        Arms 2 and 3 read `window.cmdline` — which for a RESTORED pane
-        0 is the --exec-pane0 launcher, this script's own launch line.
-        unwrap_pane0() takes it back off, so what is recorded is the
-        pane's command and never the launcher: without that, arm 3
-        hands the launcher to the next restore as pane 0's command and
-        --exec-pane0 execs itself in a loop. A launcher recorded in the
-        old flagless shape unwraps to nothing and falls through to arm
-        4, which is how an already-poisoned snapshot recovers.
+        Stable Kitty argv wins, including known Claude zombie recovery.
+        Otherwise exact recorded kind filters live roots; an untyped mixed
+        list fails safe instead of guessing by PID order. Pane-0 launchers
+        are unwrapped before either selection or fallback.
         """
         fg = win.get("foreground_processes") or []
-        for fp in fg:
-            cl = fp.get("cmdline") or []
-            if _agent_kind(cl):
+        kind, cl = select_pane_agent(win, _snapshot_agent_kind(win))
+        if cl:
+            if kind == "claude":
+                sid = win.get("claude_session_id")
+                if isinstance(sid, str) and UUID_RE.fullmatch(sid):
+                    return [unwrap_launchers(cl)[0], "--resume", sid]
+                return cl
+            if kind == "codex":
+                sid = win.get("codex_session_id")
+                if isinstance(sid, str) and UUID_RE.fullmatch(sid):
+                    return [unwrap_launchers(cl)[0], "resume", sid]
+                # Keep owner type until load_panes(): maybe_resume_codex
+                # degrades a missing/invalid id to this pane's validated
+                # recorded shell, not a process-wide default shell.
                 return cl
         wc = unwrap_pane0(win.get("cmdline") or [])
-        if wc:
+        if wc and not _is_agent_executable(wc):
             return wc
-        return (fg[0].get("cmdline") or []) if fg else []
+        first = (fg[0].get("cmdline") or []) if fg else []
+        if first and not _is_agent_executable(first):
+            return first
+        return clean_user_shell()
 
 
     def load_panes():
@@ -2329,10 +2381,10 @@ let
                     wc = unwrap_pane0(raw_wc)
                     if is_bootstrap_launcher(raw_wc):
                         shell_cmd = ["/bin/sh"]
-                    elif wc and _agent_kind(wc) is None:
+                    elif wc and not _is_agent_executable(wc):
                         shell_cmd = wc
                     else:
-                        shell_cmd = [os.environ.get("SHELL") or "/bin/sh"]
+                        shell_cmd = clean_user_shell()
                     kind = _agent_kind(cmd)
                     if kind == "claude":
                         cmd = maybe_resume_claude(
@@ -4225,50 +4277,16 @@ finally:
                     wid = win.get("id")
                     if isinstance(wid, int):
                         live.add(wid)
-                    fg = win.get("foreground_processes") or []
-                    # A window counts as a claude pane when claude is
-                    # among its foreground processes OR when claude is
-                    # what kitty launched it with.
-                    #
-                    # The second arm catches a ZOMBIE pane: claude has
-                    # exited but an orphaned stdio MCP server (in
-                    # practice research-agent, sitting in its 60s
-                    # scanner re-check loop and never noticing stdin
-                    # EOF) still holds the pty open, so kitty keeps the
-                    # window alive and reports only the orphan in
-                    # foreground_processes. Keying off fg alone left
-                    # such a window un-enriched, and restore then
-                    # relaunched the ORPHAN as the pane's command — the
-                    # user's session silently dropped, the pane came
-                    # back showing the MCP server's boot log.
-                    #
-                    # `window.cmdline` is what kitty spawned and
-                    # survives the death of that process, so it is the
-                    # stable record of "this pane is a claude pane".
-                    # It stays FALSE for a pane the user launched as a
-                    # shell and then quit claude inside — that window's
-                    # cmdline is the shell, so no resurrection.
-                    #
-                    # After a restore that cmdline is the claude-egress
-                    # launcher rather than claude itself, which is why
-                    # _is_claude() unwraps: without it the FIRST restore
-                    # would strip every pane of its claude identity and
-                    # the second would relaunch the orphan.
-                    # Codex is recoverable only while a live interactive
-                    # TUI appears in foreground_processes. Unlike Claude,
-                    # its stable window cmdline must not resurrect a dead
-                    # `codex exec`/service. Claude retains the stable arm
-                    # for the known orphaned-MCP zombie case above.
-                    kind = None
-                    for fp in fg:
-                        kind = _agent_kind(fp.get("cmdline"))
-                        if kind:
-                            break
-                    if kind is None and _is_claude(win.get("cmdline")):
-                        kind = "claude"
+                    # Typed row selects its matching live root when Kitty's
+                    # stable argv is a shell. Stable interactive argv wins
+                    # outright and preserves Claude zombie recovery. Without
+                    # either signal, mixed kinds fail safe instead of using
+                    # foreground PID order.
+                    entry = tsv.get(wid) if isinstance(wid, int) else None
+                    expected_kind = entry[0] if entry is not None else None
+                    kind, _cmdline = select_pane_agent(win, expected_kind)
                     if kind is None:
                         continue
-                    entry = tsv.get(wid) if isinstance(wid, int) else None
                     sid = None
                     if entry is not None:
                         row_kind, row_sid = entry
