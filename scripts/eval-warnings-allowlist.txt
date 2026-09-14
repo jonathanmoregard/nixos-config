@@ -4,4 +4,6 @@
 # the whole gate: the 2048-MiB microvm outage (PR #117) happened while
 # upstream warned about it on every single eval.
 #
-# (currently empty — keep it that way if you can)
+# home-server hardware does not exist yet, so its age host key cannot be known.
+# Remove this entry when bootstrap records rekey.hostPubkey for home-server.
+^evaluation warning: You have not yet specified rekey\.hostPubkey for your host home-server\.$

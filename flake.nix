@@ -28,6 +28,11 @@
     prose-decorate.url = "github:jonathanmoregard/prose-decorate";
     prose-decorate.inputs.nixpkgs.follows = "nixpkgs";
 
+    # Home automation engine and its NixOS service module. Pin the reviewed
+    # commit explicitly; flake.lock records the matching source hash.
+    smarthome.url = "github:jonathanmoregard/smarthome/e16b5d52fbb5b8406af3ba8eb808582d0613f93b";
+    smarthome.inputs.nixpkgs.follows = "nixpkgs";
+
     # Anthropic ships an official Linux app since 2026-06-30, but not
     # via nixpkgs. `aaddrick/claude-desktop-debian` repackages the
     # upstream Linux app as `.deb`/`.rpm`/AppImage plus a Nix flake
@@ -153,7 +158,7 @@
 
   outputs = { self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
               tts-tool, substack-url-tool, prose-decorate, claude-desktop,
-              aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
+              smarthome, aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
               ... }:
   let
     linuxSystem = "x86_64-linux";
@@ -259,6 +264,21 @@
       ];
     };
 
+    # Dell Wyse 5070 home server. Hardware IDs and service topology stay
+    # disabled/parameterized until bootstrap records physical values.
+    nixosConfigurations.home-server = nixpkgs.lib.nixosSystem {
+      system = linuxSystem;
+      pkgs = pkgsLinux;
+      modules = [
+        ./hosts/home-server/default.nix
+        ./modules/common.nix
+        agenix.nixosModules.default
+        agenix-rekey.nixosModules.default
+        smarthome.nixosModules.default
+        { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
+      ];
+    };
+
     # VM-based e2e tests, one per feature area. Run any single lane:
     #   nix build .#checks.x86_64-linux.vm-base -L
     # Or all five via `nix flake check`.
@@ -271,7 +291,7 @@
         mkLane = path: import path {
           pkgs = pkgsLinux;
           inputs = {
-            inherit nixpkgs home-manager agenix agenix-rekey microvm aggregator-src;
+            inherit nixpkgs home-manager agenix agenix-rekey microvm smarthome aggregator-src;
           };
         };
       in {
@@ -293,6 +313,7 @@
         # rule, and a cache hit skipping it is exactly the silence it
         # exists to prevent.
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
+        vm-home-server = mkLane ./tests/home-server.nix;
 
         # Not a VM lane: an eval-time assertion, because that is when the
         # fault would land. dellan is the machine holding the root-only
