@@ -305,6 +305,29 @@ in
         "systemctl --user stop ai-client-config-codex-sync.timer'"
     )
 
+    # Codex hooks are advisory and fail open on timeout/error. The native OS
+    # sandbox must therefore be a machine-enforced floor, not merely a user
+    # config default that trusted project config or CLI flags can weaken.
+    codex_requirements = dellan.succeed(
+        "cat /etc/codex/requirements.toml"
+    )
+    assert 'allowed_sandbox_modes = ["read-only", "workspace-write"]' in codex_requirements
+    assert 'allowed_approval_policies = ["on-request"]' in codex_requirements
+    assert 'allow_managed_hooks_only = true' in codex_requirements
+    assert '[features]' in codex_requirements
+    assert 'hooks = true' in codex_requirements
+    dellan.succeed(
+        "su - jonathan -c 'cd /tmp && codex "
+        "-c sandbox_mode=\"workspace-write\" sandbox -- "
+        "/run/current-system/sw/bin/true'"
+    )
+    dellan.fail(
+        "su - jonathan -c 'cd /tmp && codex "
+        "-c sandbox_mode=\"danger-full-access\" sandbox -- "
+        "/run/current-system/sw/bin/touch /home/jonathan/codex-policy-escape'"
+    )
+    dellan.fail("test -e /home/jonathan/codex-policy-escape")
+
     # home-manager-jonathan TimeoutStartSec floor.
     #
     # systemd's default TimeoutStartSec is 5min; jonathan's HM closure

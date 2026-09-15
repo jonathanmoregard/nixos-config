@@ -26,6 +26,7 @@
     ../../modules/nixos/memory-pressure.nix
     ../../modules/nixos/cachix-push.nix
     ../../modules/nixos/claude-agent-users.nix
+    ../../modules/nixos/codex-security.nix
 
     # research-agent microvm. The MCP server spawned by Claude Code
     # (via home/research-agent-mcp.nix) ssh's into the long-running
