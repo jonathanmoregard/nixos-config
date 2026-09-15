@@ -77,7 +77,7 @@ let
         [ -n "$path" ] && [ -r "$path" ] || refuse "$label credential is not configured/readable; keep the service disabled until its dedicated agenix secret exists"
       }
 
-      mkdir -p "$state/attempts" "$state/audit" "$state/approved-heads" "$state/days" "$state/ready-tuples" "$state/refresh-tuples" "$work"
+      mkdir -p "$state/attempts" "$state/audit" "$state/approved-heads" "$state/days" "$state/ignored-tuples" "$state/ready-tuples" "$state/refresh-tuples" "$work"
       exec 9>"$state/controller.lock"
       flock -n 9 || { echo "klaffat-dependabot-caretaker: another invocation is active" >&2; exit 75; }
       run="$(mktemp -d "$work/run.XXXXXX")"
@@ -130,12 +130,18 @@ let
         audit ready-resolved "pr-$ready_pr-$ready_sha"
         rm -f -- "$state/ready.json" "$notification/ready.json" "$notification/ready"
       fi
+      export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_OPTIONAL_LOCKS=0
+      repo_dir=""
       while IFS= read -r entry; do
         pr="$(jq -r .pr <<<"$entry")"
         head_ref="$(jq -r .head_ref <<<"$entry")"
         head_sha="$(jq -r .head_sha <<<"$entry")"
         base_sha="$(jq -r .base_sha <<<"$entry")"
         id="pr-$pr-$head_sha-$base_sha"
+        if [ -f "$state/ignored-tuples/$id" ]; then
+          audit ignored "$id"
+          continue
+        fi
         if [ -f "$state/ready-tuples/$id" ]; then
           audit already-ready "$id"
           continue
@@ -151,6 +157,27 @@ let
           audit exhausted "$id"
           continue
         fi
+        candidate_dir="$run/controller-clone-$pr"
+        git -c core.hooksPath=/dev/null -c credential.helper= clone --quiet --no-checkout "$remote" "$candidate_dir"
+        git -C "$candidate_dir" -c core.hooksPath=/dev/null -c credential.helper= fetch --quiet origin "+refs/heads/$base:refs/remotes/origin/$base" "+refs/heads/$head_ref:refs/remotes/origin/$head_ref"
+        [ "$(git -C "$candidate_dir" rev-parse "refs/remotes/origin/$base")" = "$base_sha" ] || refuse "base SHA changed or metadata was stale"
+        [ "$(git -C "$candidate_dir" rev-parse "refs/remotes/origin/$head_ref")" = "$head_sha" ] || refuse "Dependabot head changed or metadata was stale"
+        dependency_base="$(git -C "$candidate_dir" merge-base "$base_sha" "$head_sha")"
+        [ -n "$dependency_base" ] || refuse "dependency-update-has-no-common-base"
+        git -C "$candidate_dir" diff --name-only -z "$dependency_base" "$head_sha" > "$run/dependency-paths.z"
+        unsupported_root=false
+        while IFS= read -r -d "" path; do
+          case "$path" in
+            tests/agent-e2e/package.json|tests/agent-e2e/package-lock.json) unsupported_root=true ;;
+          esac
+        done < "$run/dependency-paths.z"
+        if "$unsupported_root"; then
+          : > "$state/ignored-tuples/$id"
+          audit unsupported-dependency-root "$id"
+          rm -rf -- "$candidate_dir"
+          continue
+        fi
+        repo_dir="$candidate_dir"
         selected=true
         break
       done < <(jq -c '.[]' "$run/eligible.json")
@@ -172,12 +199,6 @@ let
       atomic_json "$attempt" "$(jq -cn --argjson pr "$pr" --arg head "$head_sha" --arg base "$base_sha" --argjson attempts "$current" '{pr:$pr,head_sha:$head,base_sha:$base,attempts:$attempts}')"
       audit attempt "$id/$current"
 
-      repo_dir="$run/controller-clone"
-      export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_OPTIONAL_LOCKS=0
-      git -c core.hooksPath=/dev/null -c credential.helper= clone --quiet --no-checkout "$remote" "$repo_dir"
-      git -C "$repo_dir" -c core.hooksPath=/dev/null -c credential.helper= fetch --quiet origin "+refs/heads/$base:refs/remotes/origin/$base" "+refs/heads/$head_ref:refs/remotes/origin/$head_ref"
-      [ "$(git -C "$repo_dir" rev-parse "refs/remotes/origin/$base")" = "$base_sha" ] || refuse "base SHA changed or metadata was stale"
-      [ "$(git -C "$repo_dir" rev-parse "refs/remotes/origin/$head_ref")" = "$head_sha" ] || refuse "Dependabot head changed or metadata was stale"
       validate_dependency_path() {
         local path="$1"
         if [[ "$path" =~ ^deploy/terraform(/bootstrap)?/[^/]+\.tf$ ]] ||
@@ -191,8 +212,6 @@ let
       }
       if [ ! -f "$state/approved-heads/$head_sha" ]; then
         mkdir -p "$state/approved-heads"
-        dependency_base="$(git -C "$repo_dir" merge-base "$base_sha" "$head_sha")"
-        [ -n "$dependency_base" ] || refuse "dependency-update-has-no-common-base"
         git -C "$repo_dir" diff --quiet "$dependency_base" "$head_sha" && refuse "empty-dependency-update"
         git -C "$repo_dir" diff --summary "$dependency_base" "$head_sha" | grep -q . && refuse "dependency-update-changed-file-type-or-mode"
         git -C "$repo_dir" diff --name-only -z "$dependency_base" "$head_sha" > "$run/dependency-paths.z"
@@ -928,10 +947,28 @@ let
     text = ''
       set -euo pipefail
       ready=${lib.escapeShellArg "${cfg.notificationPath}/ready.json"}
+      ack_dir=${lib.escapeShellArg "${cfg.notificationPath}/ack"}
+      ack="$ack_dir/ready.json"
       [ -f "$ready" ] || exit 0
-      pr="$(jq -er '.pr | numbers' "$ready")"
-      url="$(jq -er '.url | select(test("^https://github.com/jonathanmoregard/klaffat/pull/[0-9]+$"))' "$ready")"
+      record="$(jq -cer '
+        select(type == "object" and keys == ["base_sha", "pr", "sha", "state", "url"]) |
+        select(.state == "ready") |
+        select(.pr | type == "number" and floor == . and . > 0) |
+        select(.sha | type == "string" and test("^[0-9a-f]{40}$")) |
+        select(.base_sha | type == "string" and test("^[0-9a-f]{40}$")) |
+        select(.url == ("https://github.com/jonathanmoregard/klaffat/pull/" + (.pr | tostring)))
+      ' "$ready")"
+      if [ -f "$ack" ] && [ "$(cat "$ack")" = "$record" ]; then
+        exit 0
+      fi
+      pr="$(jq -r .pr <<<"$record")"
+      url="$(jq -r .url <<<"$record")"
       notify-send -u normal "Klaffat dependency update ready" "PR #$pr passed all checks. Review and merge: $url"
+      tmp="$(mktemp "$ack_dir/.ready.XXXXXX")"
+      trap 'rm -f -- "$tmp"' EXIT
+      printf '%s\n' "$record" > "$tmp"
+      mv -f -- "$tmp" "$ack"
+      trap - EXIT
     '';
   };
 in {
@@ -1018,6 +1055,7 @@ in {
       "d ${cfg.statePath} 0700 root root -"
       "d ${cfg.workPath} 0711 root root -"
       "d ${cfg.notificationPath} 0755 root root -"
+      "d ${cfg.notificationPath}/ack 0700 ${cfg.notifyUser} users -"
     ];
     users.users.${cfg.notifyUser}.linger = true;
     systemd.services.klaffat-dependabot-caretaker = {
@@ -1071,6 +1109,14 @@ in {
         ExecStart = "${desktopNotifier}/bin/klaffat-caretaker-desktop-notifier";
         Restart = "on-failure";
         RestartSec = "1min";
+      };
+    };
+    systemd.user.timers.klaffat-dependabot-caretaker-ready = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnStartupSec = "5s";
+        OnUnitActiveSec = "15min";
+        Unit = "klaffat-dependabot-caretaker-ready.service";
       };
     };
   };
