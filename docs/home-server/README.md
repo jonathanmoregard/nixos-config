@@ -308,6 +308,30 @@ service from a tested off-host recovery point. A Git-only rebuild restores
 service definitions, not rooms' offsets, Zigbee network, Matrix history/media,
 or broker persistence.
 
+## CD simulation
+
+Run the target-sized deployment lane from the NixOS configuration worktree:
+
+```console
+nix build --no-link --rebuild .#checks.x86_64-linux.vm-home-server-cd -L
+```
+
+The disposable x86-64 VM has four vCPUs, 8 GiB RAM, and a sparse 128 GiB ext4
+disk. A local bare Git origin and preloaded v1/v2 runtime closures replace
+GitHub/Tailscale and binary-cache transport. Everything after those boundaries
+is real: `nixos-deploy.service` fetches and resets the checkout, passes memory
+admission, runs `nixos-rebuild switch`, advances the system profile, records the
+exact successful commit, preserves Mosquitto and automation health, no-ops on
+replay, and refuses to overwrite a real rollback.
+
+This proves deployment mechanics and target resource shape, not physical
+hardware. The NixOS test harness shares the host Nix store with the guest, so
+it does not benchmark SSD throughput or model full-store capacity pressure.
+QEMU cannot validate J5005 microarchitecture details, SSD SMART,
+ZBDongle-E USB/Ember firmware or RF behavior, BIOS power-after-AC-loss,
+Tailscale identity/enrollment, or real GitHub authentication and routing.
+Complete those checks during bootstrap.
+
 ## Health and debugging
 
 ```console

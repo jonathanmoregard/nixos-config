@@ -156,7 +156,7 @@
     microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
+  outputs = flakeInputs@{ self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
               tts-tool, substack-url-tool, prose-decorate, claude-desktop,
               smarthome, aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
               ... }:
@@ -212,6 +212,25 @@
         })
       ];
     };
+
+    # Keep every direct and transitive flake source available to nested,
+    # network-isolated home-server CD evaluation. Following inputs form a DAG;
+    # unique store paths collapse shared nixpkgs/flake-parts nodes.
+    collectInputSources = input:
+      let
+        source = if builtins.isAttrs input && input ? outPath then input.outPath else input;
+        children =
+          if builtins.isAttrs input && input ? inputs then
+            builtins.attrValues input.inputs
+          else
+            [ ];
+      in
+      [ source ] ++ nixpkgs.lib.concatMap collectInputSources children;
+    homeServerCdInputSources = nixpkgs.lib.unique (
+      nixpkgs.lib.concatMap collectInputSources (
+        builtins.attrValues (builtins.removeAttrs flakeInputs [ "self" ])
+      )
+    );
   in {
     # NixOS VM (headless, QEMU/KVM)
     nixosConfigurations.vm = nixpkgs.lib.nixosSystem {
@@ -279,6 +298,28 @@
       ];
     };
 
+    # Test-only extension used by vm-home-server-cd. It keeps production host
+    # composition intact while adding NixOS test instrumentation so real
+    # generation switches remain observable inside the disposable VM.
+    nixosConfigurations.home-server-cd =
+      self.nixosConfigurations.home-server.extendModules {
+        modules = [
+          ./tests/fixtures/home-server-cd-module.nix
+          { system.extraDependencies = homeServerCdInputSources; }
+        ];
+      };
+
+    # Prebuild the second release used by the CD test. The disposable target
+    # still evaluates and switches through nixos-rebuild; retaining both
+    # runtime closures avoids giving that target a compiler/source universe
+    # solely to manufacture the fixture's one-line release change.
+    nixosConfigurations.home-server-cd-v2 =
+      self.nixosConfigurations.home-server-cd.extendModules {
+        modules = [
+          { environment.etc."cd-release".text = nixpkgs.lib.mkForce "v2\n"; }
+        ];
+      };
+
     # VM-based e2e tests, one per feature area. Run any single lane:
     #   nix build .#checks.x86_64-linux.vm-base -L
     # Or all five via `nix flake check`.
@@ -315,6 +356,14 @@
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
         vm-klaffat-dependabot-caretaker = mkLane ./tests/klaffat-dependabot-caretaker.nix;
         vm-home-server = mkLane ./tests/home-server.nix;
+        vm-home-server-cd = import ./tests/home-server-cd.nix {
+          pkgs = pkgsLinux;
+          inputs = { inherit agenix agenix-rekey smarthome; };
+          inputSources = homeServerCdInputSources;
+          homeServerCdSystem = self.nixosConfigurations.home-server-cd.config.system.build.toplevel;
+          homeServerCdV2System =
+            self.nixosConfigurations.home-server-cd-v2.config.system.build.toplevel;
+        };
 
         # Not a VM lane: an eval-time assertion, because that is when the
         # fault would land. dellan is the machine holding the root-only
