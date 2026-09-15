@@ -970,7 +970,20 @@ common.mkMinimalTest {
         '\'KLAFFAT_INFRA_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-infra\' '
         '\'KLAFFAT_PUBLISH_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-publish\'\n'
         'case "''${1-}" in\n'
-        '  --verify) [ ! -e /tmp/klaffat-iam-seed-fail ] || exit 23 ;;\n'
+        '  --apply)\n'
+        '    if [ -e /tmp/klaffat-iam-seed-classified-fail ]; then\n'
+        '      printf \'seed: role policy readback mismatch: attacker-controlled-detail\\n\' >&2\n'
+        '      printf \'stderr-leak=%s/%s\\n\' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >&2\n'
+        '      exit 1\n'
+        '    fi\n'
+        '    ;;\n'
+        '  --verify)\n'
+        '    if [ -e /tmp/klaffat-iam-seed-drift ]; then\n'
+        '      printf \'seed: drift: replace inline policy klaffat-github-infra/klaffat-github-infra\\n\' >&2\n'
+        '      exit 1\n'
+        '    fi\n'
+        '    [ ! -e /tmp/klaffat-iam-seed-fail ] || exit 23\n'
+        '    ;;\n'
         'esac\n'
     )
 
@@ -1055,6 +1068,30 @@ common.mkMinimalTest {
     assert "TEST-aws-access-key-id" not in out, f"AWS access key leaked from child: {out!r}"
     assert "TEST-aws-secret-access-key" not in out, f"AWS secret key leaked from child: {out!r}"
     machine.succeed("rm /tmp/klaffat-iam-seed-leak")
+
+    machine.succeed("touch /tmp/klaffat-iam-seed-classified-fail")
+    rc, out = run("${bin}/klaffat-iam-seed --apply")
+    assert rc == 1, f"IAM seed validation failure status was not preserved: {rc} {out!r}"
+    assert "seed failed during IAM role policy validation (exit 1)" in out, (
+        f"IAM seed failure was not safely classified: {out!r}"
+    )
+    assert "attacker-controlled-detail" not in out, f"child failure detail escaped: {out!r}"
+    assert "stderr-leak=" not in out, f"child stderr escaped: {out!r}"
+    assert "TEST-aws-access-key-id" not in out, f"AWS access key leaked on failure: {out!r}"
+    assert "TEST-aws-secret-access-key" not in out, f"AWS secret key leaked on failure: {out!r}"
+    machine.fail(f"test -e {report_path}")
+    machine.succeed("rm /tmp/klaffat-iam-seed-classified-fail")
+
+    machine.succeed("touch /tmp/klaffat-iam-seed-drift")
+    rc, out = run("${bin}/klaffat-iam-seed --verify")
+    assert rc == 1, f"IAM seed drift status was not preserved: {rc} {out!r}"
+    assert "seed failed during IAM role policy validation (exit 1)" in out, (
+        f"IAM seed drift was not safely classified: {out!r}"
+    )
+    assert "klaffat-github-infra/klaffat-github-infra" not in out, (
+        f"IAM seed drift detail escaped: {out!r}"
+    )
+    machine.succeed("rm /tmp/klaffat-iam-seed-drift")
 
     machine.succeed("touch /tmp/klaffat-iam-seed-fail")
     rc, out = run(
