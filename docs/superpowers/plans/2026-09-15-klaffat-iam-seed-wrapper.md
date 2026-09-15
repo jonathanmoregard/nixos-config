@@ -113,7 +113,11 @@ AWS_DEFAULT_REGION="eu-north-1"
 ```
 
 Run `${pkgs.bash}/bin/bash "$work/deploy/scripts/seed-aws-ci-identities.sh" "$@"`,
-capture status, and return it after cleanup.
+capture status, and return it after cleanup. On successful `--apply` or
+`--verify`, validate its three exact ARN lines and atomically publish them plus
+the reviewed revision to root-owned mode-0644
+`/run/klaffat-iam-seed/report.env`. Remove stale report before mutation or
+verification; publish none for dry-run or failure.
 
 - [ ] **Step 4: Wire install and password gate**
 
@@ -132,7 +136,8 @@ nix build --no-link --rebuild .#checks.x86_64-linux.vm-klaffat-infra -L
 ```
 
 Expected: eval succeeds; VM lane passes with wrapper mode forwarding, secret
-non-disclosure, provenance, cleanup, and sudo assertions green.
+non-disclosure, provenance, cleanup, sudo, and nonsecret-report assertions
+green.
 
 ### Task 3: Interactive smoke and delivery
 

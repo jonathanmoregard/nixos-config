@@ -29,6 +29,13 @@ own environment and invokes the reviewed seed script with packaged `aws`,
 `jq`, and shell dependencies on `PATH`. Secrets are never accepted as
 arguments, copied into a user-readable file, or printed.
 
+After successful `--apply` or `--verify`, the wrapper atomically publishes
+`/run/klaffat-iam-seed/report.env` as root-owned mode 0644. It contains only
+the reviewed Git revision and three nonsecret role ARNs. A mutation or verify
+attempt removes any stale report before starting and leaves no report on
+failure. This lets the unprivileged agent configure GitHub repository variables
+without copying values through the founder or granting root access to GitHub.
+
 ## Alternatives Rejected
 
 - Extend `klaffat-publish`: smaller diff, but combines unrelated publishing
@@ -42,7 +49,8 @@ arguments, copied into a user-readable file, or printed.
 Invalid arguments, non-root invocation, mirror or archive verification
 failure, missing credentials, missing script, and any seed-script failure all
 fail closed with non-zero status. Cleanup removes only the wrapper's fresh
-temporary extraction directory.
+temporary extraction directory and incomplete report; failed mutation or
+verification cannot leave stale success evidence.
 
 ## Verification
 
@@ -50,5 +58,7 @@ Extend `vm-klaffat-infra` test-first. Prove command installation, root-only and
 argument gates, both sudo path spellings, reviewed-source provenance, dry-run
 execution through a fake AWS CLI, exact `--apply`/`--verify` forwarding,
 failure propagation, and absence of fixture credential values from output.
+Tests also prove successful apply/verify publishes an exact nonsecret report,
+dry-run does not, and failure removes stale report state.
 Then build the lane and invoke the generated wrapper in the interactive feature
 VM.

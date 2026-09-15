@@ -667,6 +667,7 @@ common.mkMinimalTest {
 
     # A LEFTOVER is a per-run TEMPORARY that outlived its trap: the archive
     # directory (`infra-*`), klaffat-publish's scratch (`publish-*`), the
+    # IAM seed wrapper's scratch (`iam-seed-*`), the
     # install wrapper's --extra-files staging dir. This is an allowlist of
     # those three name prefixes, so the durable state the module owns —
     # `klaffat.git`, `terraform.d`, and as of round 8 `plans` and the plan
@@ -677,14 +678,18 @@ common.mkMinimalTest {
     # positive control leaves one there for every later assertion to see.
     def state_leftovers():
         _, ls = machine.execute("ls -A ${stateDir} /run")
-        return [x for x in ls.split() if x.startswith(("infra-", "publish-", "klaffat-extra-files"))]
+        return [
+            x for x in ls.split()
+            if x.startswith(("infra-", "publish-", "iam-seed-", "klaffat-extra-files"))
+        ]
 
     # ---------------------------------------------------------------
-    # 1. All three wrappers reached PATH.
+    # 1. All four wrappers reached PATH.
     # ---------------------------------------------------------------
     machine.succeed("test -x ${bin}/klaffat-infra")
     machine.succeed("test -x ${bin}/klaffat-infra-install")
     machine.succeed("test -x ${bin}/klaffat-publish")
+    machine.succeed("test -x ${bin}/klaffat-iam-seed")
 
     # ---------------------------------------------------------------
     # 2. Secrets decrypted, 0400 root:root, unreadable by jonathan.
@@ -724,6 +729,13 @@ common.mkMinimalTest {
         f"refusal must name the sudo form: {out!r}"
     )
 
+    rc, out = run("runuser -u jonathan -- ${bin}/klaffat-iam-seed")
+    assert rc == 1, f"non-root klaffat-iam-seed should exit 1, got {rc}"
+    assert "this wrapper is root-only" in out, f"unexpected non-root refusal: {out!r}"
+    assert "sudo klaffat-iam-seed [--apply|--verify]" in out, (
+        f"refusal must name the sudo form: {out!r}"
+    )
+
     # ---------------------------------------------------------------
     # 4. What the BUILT scripts render.
     #
@@ -735,7 +747,12 @@ common.mkMinimalTest {
     # ---------------------------------------------------------------
     srcs = {
         w: machine.succeed(f"cat $(readlink -f ${bin}/{w})")
-        for w in ["klaffat-infra", "klaffat-infra-install", "klaffat-publish"]
+        for w in [
+            "klaffat-infra",
+            "klaffat-infra-install",
+            "klaffat-publish",
+            "klaffat-iam-seed",
+        ]
     }
     for w, src in srcs.items():
         # Root must never run git inside a repository jonathan owns: that
@@ -818,6 +835,19 @@ common.mkMinimalTest {
         f"upload-signing-key arity refusal wrong: {rc} {out!r}"
     )
 
+    for args in ["bogus", "--apply extra", "--verify extra"]:
+        rc, out = run(f"${bin}/klaffat-iam-seed {args}")
+        assert rc == 2, f"IAM seed should refuse {args!r} with exit 2: {rc} {out!r}"
+        assert "usage: sudo klaffat-iam-seed [--apply|--verify]" in out, (
+            f"unexpected IAM seed argv refusal for {args!r}: {out!r}"
+        )
+        assert "could not fetch" not in out, f"IAM seed fetched before argv refusal: {out!r}"
+
+    rc, out = run("${bin}/klaffat-iam-seed")
+    assert rc == 2 and "could not fetch ${originUrl}" in out, (
+        f"IAM seed should refuse when the fetch fails: {rc} {out!r}"
+    )
+
     # ---------------------------------------------------------------
     # 6. sudo: password required for the wrapper, NOT for everything else.
     # ---------------------------------------------------------------
@@ -839,6 +869,8 @@ common.mkMinimalTest {
         "$(readlink -f ${bin}/klaffat-infra-install) 10.0.0.1",
         "${bin}/klaffat-publish",
         "$(readlink -f ${bin}/klaffat-publish)",
+        "${bin}/klaffat-iam-seed",
+        "$(readlink -f ${bin}/klaffat-iam-seed)",
     ]:
         rc, out = run(f"runuser -u jonathan -- sudo -n {form}")
         assert rc != 0, f"sudo ran '{form}' without a password"
@@ -922,9 +954,29 @@ common.mkMinimalTest {
 
     cf_ips = '{"ipv4": ["203.0.113.0/24"]}\n'
 
+    seed_fixture = (
+        '#!/usr/bin/env bash\n'
+        'set -euo pipefail\n'
+        'command -v aws >/dev/null\n'
+        'printf \'seed-mode=%s\\n\' "''${1-dry-run}"\n'
+        'printf \'aws-creds=%s/%s\\n\' '
+        '"''${AWS_ACCESS_KEY_ID:+set}" "''${AWS_SECRET_ACCESS_KEY:+set}"\n'
+        'printf \'%s\\n\' '
+        '\'KLAFFAT_IAM_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-iam\' '
+        '\'KLAFFAT_INFRA_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-infra\' '
+        '\'KLAFFAT_PUBLISH_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-publish\'\n'
+        'case "''${1-}" in\n'
+        '  --verify) [ ! -e /tmp/klaffat-iam-seed-fail ] || exit 23 ;;\n'
+        'esac\n'
+    )
+
     machine.succeed(f"install -d -m 0755 {src}/deploy/terraform")
+    machine.succeed(f"install -d -m 0755 {src}/deploy/iam/bootstrap {src}/deploy/iam/runtime {src}/deploy/scripts")
     write_file(f"{src}/deploy/cloudflare-ips.json", cf_ips)
     write_file(f"{src}/deploy/terraform/main.tf", tf_fixture("REMOTE-1"))
+    write_file(f"{src}/deploy/iam/bootstrap/test.json", "{}\n")
+    write_file(f"{src}/deploy/iam/runtime/test.json", "{}\n")
+    write_file(f"{src}/deploy/scripts/seed-aws-ci-identities.sh", seed_fixture)
     # A flake with no inputs, so klaffat-publish's `nix build` gets past
     # fetching (offline) and fails on the missing attribute — which is how
     # the lane tells "fetched the exact rev from the mirror" from "could
@@ -960,6 +1012,42 @@ common.mkMinimalTest {
     )
     assert "hcloud_token_present = true" in squash(out), f"plan did not receive the provider token: {out!r}"
     assert "state_passphrase_present = true" in squash(out), f"plan did not receive the state passphrase: {out!r}"
+
+    report_path = "/run/klaffat-iam-seed/report.env"
+    expected_report = (
+        f"KLAFFAT_IAM_SEED_REV={rev_a}\n"
+        "KLAFFAT_IAM_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-iam\n"
+        "KLAFFAT_INFRA_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-infra\n"
+        "KLAFFAT_PUBLISH_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-publish\n"
+    )
+    for args, expected_mode, publishes_report in [
+        ("", "dry-run", False),
+        ("--apply", "--apply", True),
+        ("--verify", "--verify", True),
+    ]:
+        rc, out = run(f"${bin}/klaffat-iam-seed {args}")
+        assert rc == 0, f"IAM seed {args!r} returned {rc}: {out!r}"
+        assert f"klaffat-iam-seed: ${originUrl} main @ {rev_a}" in out, (
+            f"IAM seed provenance missing or wrong: {out!r}"
+        )
+        assert f"seed-mode={expected_mode}" in out, f"IAM seed mode not forwarded: {out!r}"
+        assert "aws-creds=set/set" in out, f"IAM seed did not receive AWS credentials: {out!r}"
+        assert "TEST-aws-access-key-id" not in out, f"AWS access key leaked: {out!r}"
+        assert "TEST-aws-secret-access-key" not in out, f"AWS secret key leaked: {out!r}"
+        if publishes_report:
+            report = machine.succeed(f"cat {report_path}")
+            assert report == expected_report, f"IAM seed report wrong: {report!r}"
+            mode = machine.succeed(f"stat -c '%a %U %G' {report_path}").strip()
+            assert mode == "644 root root", f"IAM seed report permissions wrong: {mode!r}"
+        else:
+            machine.fail(f"test -e {report_path}")
+        assert state_leftovers() == [], f"IAM seed left temporary files: {state_leftovers()!r}"
+
+    machine.succeed("touch /tmp/klaffat-iam-seed-fail")
+    rc, out = run("${bin}/klaffat-iam-seed --verify")
+    assert rc == 23, f"IAM seed failure status was not preserved: {rc} {out!r}"
+    machine.fail(f"test -e {report_path}")
+    machine.succeed("rm /tmp/klaffat-iam-seed-fail")
 
     mode = machine.succeed("stat -c '%a %U' ${mirror}").strip()
     assert mode == "700 root", f"the mirror should be 700 root, got '{mode}'"
@@ -1107,6 +1195,8 @@ common.mkMinimalTest {
     assert "REMOTE-2" not in out, f"tofu ran on the stale mirror while offline: {out!r}"
     rc, out = run("${bin}/klaffat-publish")
     assert rc == 2 and "could not fetch" in out, f"publish used a stale mirror offline: {rc} {out!r}"
+    rc, out = run("${bin}/klaffat-iam-seed")
+    assert rc == 2 and "could not fetch" in out, f"IAM seed used a stale mirror offline: {rc} {out!r}"
     machine.succeed("systemctl start lighttpd.service")
     machine.wait_for_open_port(${toString originPort})
 
