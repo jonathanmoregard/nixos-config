@@ -137,7 +137,7 @@
 # Every git that runs as root now runs with ROOT's configuration against
 # ROOT's repository. The mirror's `.gitattributes` and
 # `.terraform.lock.hcl` are the committed, reviewed ones. What the founder
-# has checked out is irrelevant to all three wrappers: each prints the sha
+# has checked out is irrelevant to all four wrappers: each prints the sha
 # it is about to use and where it came from, and an unpushed commit simply
 # does not run. There is no `-c safe.directory` anywhere in this file, and
 # the lane asserts there is not.
@@ -339,6 +339,7 @@ let
   stateDir = "/var/lib/klaffat-infra";
   dataDir = "${stateDir}/terraform.d";
   mirrorDir = "${stateDir}/klaffat.git";
+  iamSeedReportDir = "/run/klaffat-iam-seed";
 
   # THE ONLY DIRECTORY ROOT WRITES OR READS A PLAN FILE IN. 0700 root, so
   # nothing jonathan can write is reachable through it, and — because the
@@ -440,7 +441,7 @@ let
     then "that repository is private and services.klaffatInfra.remoteTokenFile is null"
     else "the fetch needs the network and a valid read-only token in ${cfg.remoteTokenFile}";
 
-  # The provenance gate, as shell functions shared by all three wrappers.
+  # The provenance gate, as shell functions shared by all four wrappers.
   # See "What provenance means here" in the header. Every refusal exits 2.
   #
   # Everything here addresses the mirror by `--git-dir`, never by `-C`:
@@ -1450,6 +1451,121 @@ let
     '';
   };
 
+  klaffat-iam-seed = pkgs.writeShellApplication {
+    name = "klaffat-iam-seed";
+    runtimeInputs = [
+      pkgs.awscli2
+      pkgs.git
+      pkgs.jq
+      pkgs.coreutils
+      pkgs.gnutar
+      pkgs.gawk
+      pkgs.gnugrep
+    ];
+    text = ''
+      ${rootOnlyPreamble "klaffat-iam-seed" "[--apply|--verify]"}
+      ${mirrorLib "klaffat-iam-seed"}
+
+      case "$#:''${1-}" in
+        0:|1:--apply|1:--verify)
+          ;;
+        *)
+          echo "klaffat-iam-seed: usage: sudo klaffat-iam-seed [--apply|--verify]" >&2
+          exit 2
+          ;;
+      esac
+
+      publish_report=0
+      report="${iamSeedReportDir}/report.env"
+      if [ "$#" -eq 1 ]; then
+        publish_report=1
+        install -d -o root -g root -m 0755 "${iamSeedReportDir}"
+        rm -f -- "$report"
+      fi
+
+      mirror_sync
+      rev="$(mirror_main_tip)"
+      echo "klaffat-iam-seed: ${cfg.repoRemoteUrl} main @ $rev" >&2
+
+      archive_paths=(deploy/iam deploy/scripts/seed-aws-ci-identities.sh)
+      work="$(mktemp -d "${stateDir}/iam-seed-XXXXXXXX")"
+      report_tmp=""
+      trap 'rm -rf -- "$work"; [ -z "$report_tmp" ] || rm -f -- "$report_tmp"' EXIT
+
+      if git --git-dir="${mirrorDir}" ls-tree -r "$rev" -- "''${archive_paths[@]}" \
+           | awk '$1 != "100644" && $1 != "100755" { found = 1 } END { exit !found }'; then
+        gate_refuse "commit $rev has a symlink or submodule under the IAM seed paths — refusing."
+      fi
+      if ! git --git-dir="${mirrorDir}" archive --format=tar "$rev" -- "''${archive_paths[@]}" \
+           | tar -x -C "$work"; then
+        gate_refuse "commit $rev does not contain the IAM seed paths — refusing."
+      fi
+
+      expected_shas="$(git --git-dir="${mirrorDir}" ls-tree -r "$rev" -- "''${archive_paths[@]}" | awk '{ print $3 }')"
+      if ! actual_shas="$(git --git-dir="${mirrorDir}" ls-tree -r --name-only "$rev" -- "''${archive_paths[@]}" \
+             | (cd "$work" && git --git-dir="${mirrorDir}" hash-object --no-filters --stdin-paths))" \
+         || [ "$expected_shas" != "$actual_shas" ]; then
+        gate_refuse "the extracted IAM seed tree differs from commit $rev — refusing."
+      fi
+      if [ ! -d "$work/deploy/iam" ] \
+         || [ ! -f "$work/deploy/scripts/seed-aws-ci-identities.sh" ]; then
+        gate_refuse "commit $rev has no complete IAM seed tree — refusing."
+      fi
+
+      for _s in \
+        "${secretPath "klaffat-aws-access-key-id"}" \
+        "${secretPath "klaffat-aws-secret-access-key"}"; do
+        if [ ! -r "$_s" ]; then
+          echo "klaffat-iam-seed: cannot read $_s — is the agenix secret provisioned?" >&2
+          exit 3
+        fi
+      done
+      AWS_ACCESS_KEY_ID="$(< "${secretPath "klaffat-aws-access-key-id"}")"
+      AWS_SECRET_ACCESS_KEY="$(< "${secretPath "klaffat-aws-secret-access-key"}")"
+      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+      export AWS_DEFAULT_REGION="${awsRegion}"
+
+      seed_stdout="$work/seed.stdout"
+      seed_stderr="$work/seed.stderr"
+      rc=0
+      ${pkgs.bash}/bin/bash "$work/deploy/scripts/seed-aws-ci-identities.sh" "$@" \
+        > "$seed_stdout" 2> "$seed_stderr" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        exit "$rc"
+      fi
+
+      if [ "$publish_report" -eq 1 ]; then
+        mapfile -t iam_lines < <(grep '^KLAFFAT_IAM_ROLE_ARN=' "$seed_stdout")
+        if [ "''${#iam_lines[@]}" -ne 1 ]; then
+          gate_refuse "successful seed output has no unique expected IAM role ARN — refusing to publish report."
+        fi
+        if [[ "''${iam_lines[0]#*=}" =~ ^arn:aws:iam::([0-9]{12}):role/klaffat-github-iam$ ]]; then
+          account="''${BASH_REMATCH[1]}"
+        else
+          gate_refuse "successful seed output has no expected IAM role ARN — refusing to publish report."
+        fi
+        infra="KLAFFAT_INFRA_ROLE_ARN=arn:aws:iam::$account:role/klaffat-github-infra"
+        publish="KLAFFAT_PUBLISH_ROLE_ARN=arn:aws:iam::$account:role/klaffat-github-publish"
+        if [ "$(grep -Fxc "$infra" "$seed_stdout")" -ne 1 ] \
+           || [ "$(grep -Fxc "$publish" "$seed_stdout")" -ne 1 ]; then
+          gate_refuse "successful seed output has incomplete or inconsistent role ARNs — refusing to publish report."
+        fi
+
+        report_tmp="$(mktemp "${iamSeedReportDir}/report.env.XXXXXXXX")"
+        {
+          printf 'KLAFFAT_IAM_SEED_REV=%s\n' "$rev"
+          printf '%s\n' "''${iam_lines[0]}" "$infra" "$publish"
+        } > "$report_tmp"
+        chmod 0644 "$report_tmp"
+        mv -f -- "$report_tmp" "$report"
+        report_tmp=""
+        echo "klaffat-iam-seed: nonsecret report written to $report" >&2
+      fi
+
+      exit 0
+    '';
+  };
+
   # The command list the sudo rule and the command-scoped Defaults share.
   # Store paths pin the exact binaries; the /run/current-system spellings
   # are what `sudo klaffat-infra` actually resolves to through PATH and
@@ -1462,8 +1578,10 @@ let
   sudoCommands = [
     "${klaffat-infra}/bin/klaffat-infra"
     "${klaffat-publish}/bin/klaffat-publish"
+    "${klaffat-iam-seed}/bin/klaffat-iam-seed"
     "/run/current-system/sw/bin/klaffat-infra"
     "/run/current-system/sw/bin/klaffat-publish"
+    "/run/current-system/sw/bin/klaffat-iam-seed"
   ] ++ installCommands;
 
   # Every secret here shares one shape: encrypted to dellan's host key,
@@ -1571,10 +1689,15 @@ in
     ];
 
     # ── Wrappers on PATH ────────────────────────────────────────────────
-    # On PATH system-wide so `sudo klaffat-infra` resolves; both refuse
+    # On PATH system-wide so each short sudo command resolves; all refuse
     # outright unless euid is 0, so being on jonathan's PATH grants
     # nothing.
-    environment.systemPackages = [ klaffat-infra klaffat-infra-install klaffat-publish ];
+    environment.systemPackages = [
+      klaffat-infra
+      klaffat-infra-install
+      klaffat-publish
+      klaffat-iam-seed
+    ];
 
     # ── sudo ────────────────────────────────────────────────────────────
     # No NOPASSWD, no SETENV. Emitted after the sudo module's own wheel rule
