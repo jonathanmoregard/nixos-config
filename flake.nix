@@ -354,6 +354,7 @@
         # rule, and a cache hit skipping it is exactly the silence it
         # exists to prevent.
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
+        vm-klaffat-dependabot-caretaker = mkLane ./tests/klaffat-dependabot-caretaker.nix;
         vm-home-server = mkLane ./tests/home-server.nix;
         vm-home-server-cd = import ./tests/home-server-cd.nix {
           pkgs = pkgsLinux;

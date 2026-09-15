@@ -607,12 +607,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `klaffat-infra` and `home-server` are matrix-only, like listen-tools /
-        # camera-relay / auto-deploy: they are deliberately absent from
-        # `discover`'s LANES, so they never report "cached" and always execute.
-        # The former gates credential handling; the latter gates this host's
-        # private service stack and secure bootstrap contract.
-        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, home-server]
+        # `klaffat-infra`, `klaffat-dependabot-caretaker`, and `home-server`
+        # are matrix-only, like listen-tools / camera-relay / auto-deploy.
+        # They are deliberately absent from `discover`'s LANES, so they never
+        # report "cached" and always execute. They gate credential handling,
+        # caretaker trust boundaries, and the server's secure bootstrap.
+        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker, home-server]
     steps:
       # Read this lane's cache status from the discover job. ALWAYS
       # runs (no `if:`) so subsequent steps can reference
