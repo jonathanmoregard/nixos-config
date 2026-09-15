@@ -54,7 +54,15 @@ let
     test -r "$KLAFFAT_CARETAKER_REFRESH_CREDENTIAL_FILE"
     test "$1" -gt 0
     test "$(printf '%s' "$2" | wc -c)" = 40
-    printf '%s\n' "$1:$2" >> /var/lib/klaffat-dependabot-caretaker/state/refreshes
+    test "$(printf '%s' "$3" | wc -c)" = 40
+    marker="$1:$2:$3"
+    if ! grep -qxF "$marker" /var/lib/klaffat-dependabot-caretaker/state/refreshes 2>/dev/null; then
+      printf '%s\n' "$marker" >> /var/lib/klaffat-dependabot-caretaker/state/refreshes
+    fi
+    if [ -e /var/lib/klaffat-dependabot-caretaker/state/pause-refresh ]; then
+      touch /var/lib/klaffat-dependabot-caretaker/state/refresh-observed
+      while [ -e /var/lib/klaffat-dependabot-caretaker/state/pause-refresh ]; do sleep 0.1; done
+    fi
   '';
   secretScan = fixture "klaffat-caretaker-secret-scan" ''
     test -d "$1/.git"
@@ -62,7 +70,13 @@ let
     printf '%s:%s\n' "$2" "$3" >> /var/lib/klaffat-dependabot-caretaker/state/secret-scans
     ! git -C "$1" diff "$2" "$3" | grep -q DO_NOT_PUSH
   '';
-  checks = fixture "klaffat-caretaker-checks" ''test ! -e /var/lib/klaffat-dependabot-caretaker/state/fail-checks'';
+  checks = fixture "klaffat-caretaker-checks" ''
+    if [ -e /var/lib/klaffat-dependabot-caretaker/state/pause-checks ]; then
+      touch /var/lib/klaffat-dependabot-caretaker/state/checks-observed
+      while [ -e /var/lib/klaffat-dependabot-caretaker/state/pause-checks ]; do sleep 0.1; done
+    fi
+    test ! -e /var/lib/klaffat-dependabot-caretaker/state/fail-checks
+  '';
   notifier = fixture "klaffat-caretaker-notifier" ''
     test ! -e /var/lib/klaffat-dependabot-caretaker/state/fail-notifier
     cat > /var/lib/klaffat-dependabot-caretaker/state/notified.json
@@ -152,7 +166,7 @@ common.mkMinimalTest {
     dellan.succeed("runuser -u klaffat-caretaker-repair -- test ! -r /etc/klaffat-caretaker/refresh-token")
     dellan.succeed("runuser -u klaffat-caretaker-publisher -- test ! -r /etc/klaffat-caretaker/checks-token")
     dellan.succeed("mkdir -p /var/lib/klaffat-caretaker/source && git init -q /var/lib/klaffat-caretaker/source && git -C /var/lib/klaffat-caretaker/source config user.email test@example.invalid && git -C /var/lib/klaffat-caretaker/source config user.name test")
-    dellan.succeed("sh -c 'cd /var/lib/klaffat-caretaker/source && mkdir -p .github/workflows crates/klaffat-web/src deploy/terraform/bootstrap deploy/terraform/nested tests/e2e && echo base > tests/e2e/package-lock.json && echo base > crates/klaffat-web/src/dependency_compat.rs && echo base > app.rs && echo jobs: > .github/workflows/ci.yml && echo base > deploy/terraform/main.tf && echo base > deploy/terraform/bootstrap/main.tf && echo base > deploy/terraform/nested/evil.tf && git add . && git commit -qm base && git branch -M main && git init -q --bare ../remote.git && git config --global --add safe.directory /var/lib/klaffat-caretaker/remote.git && chown -R klaffat-caretaker-publisher:klaffat-caretaker-publisher ../remote.git && git remote add origin ../remote.git && klaffat-caretaker-fixture-push -q origin main && git checkout -qb dependabot/npm_and_yarn/lodash-4.17.22 && echo update >> tests/e2e/package-lock.json && git commit -qam update && klaffat-caretaker-fixture-push -q origin HEAD'")
+    dellan.succeed("sh -c 'cd /var/lib/klaffat-caretaker/source && mkdir -p .github/workflows crates/klaffat-web/src deploy/terraform/bootstrap deploy/terraform/nested tests/e2e tests/agent-e2e && echo base > tests/e2e/package-lock.json && echo base > tests/agent-e2e/package-lock.json && echo base > crates/klaffat-web/src/dependency_compat.rs && echo base > app.rs && echo jobs: > .github/workflows/ci.yml && echo base > deploy/terraform/main.tf && echo base > deploy/terraform/bootstrap/main.tf && echo base > deploy/terraform/nested/evil.tf && git add . && git commit -qm base && git branch -M main && git init -q --bare ../remote.git && git config --global --add safe.directory /var/lib/klaffat-caretaker/remote.git && chown -R klaffat-caretaker-publisher:klaffat-caretaker-publisher ../remote.git && git remote add origin ../remote.git && klaffat-caretaker-fixture-push -q origin main && git checkout -qb dependabot/npm_and_yarn/lodash-4.17.22 && echo update >> tests/e2e/package-lock.json && git commit -qam update && klaffat-caretaker-fixture-push -q origin HEAD'")
     dellan.succeed("install -o klaffat-caretaker-publisher -g klaffat-caretaker-publisher -m 0755 ${postReceiveHook}/bin/klaffat-caretaker-post-receive /var/lib/klaffat-caretaker/remote.git/hooks/post-receive")
     mcp_requests = "\n".join(json.dumps(value) for value in [
       {"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{}},
@@ -195,6 +209,11 @@ common.mkMinimalTest {
     dellan.succeed("test \"$(stat -c '%U:%G:%a' /var/lib/klaffat-dependabot-caretaker/notification/ready.json)\" = root:root:644")
     dellan.succeed("cmp /var/lib/klaffat-dependabot-caretaker/state/ready.json /var/lib/klaffat-dependabot-caretaker/notification/ready.json")
     dellan.succeed("test -f /var/lib/klaffat-dependabot-caretaker/notification/ready")
+    user_systemctl = "runuser -u jonathan -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user"
+    dellan.succeed(f"test \"$({user_systemctl} show -P Restart klaffat-dependabot-caretaker-ready.service)\" = on-failure")
+    dellan.succeed(f"test \"$({user_systemctl} show -P RestartUSec klaffat-dependabot-caretaker-ready.service)\" = 1min")
+    dellan.succeed(f"test \"$({user_systemctl} show -P StartLimitIntervalUSec klaffat-dependabot-caretaker-ready.service)\" = 0")
+    dellan.wait_until_succeeds(f"test \"$({user_systemctl} show -P SubState klaffat-dependabot-caretaker-ready.service)\" = auto-restart")
     ready_sha = dellan.succeed("jq -r .sha /var/lib/klaffat-dependabot-caretaker/state/ready.json").strip()
     dellan.succeed("test \"$(git -C /var/lib/klaffat-caretaker/remote.git rev-parse refs/heads/dependabot/npm_and_yarn/lodash-4.17.22)\" = %s" % shlex.quote(ready_sha))
     dellan.succeed("git -C /var/lib/klaffat-caretaker/remote.git show %s:crates/klaffat-web/src/dependency_compat.rs | grep -qx repaired-dirty" % shlex.quote(ready_sha))
@@ -374,5 +393,43 @@ common.mkMinimalTest {
     dellan.succeed("jq -e '.pr == 58' /var/lib/klaffat-dependabot-caretaker/state/ready.json")
     dellan.succeed("cmp /var/lib/klaffat-dependabot-caretaker/state/ready.json /var/lib/klaffat-dependabot-caretaker/notification/ready.json")
     dellan.succeed("cmp /var/lib/klaffat-dependabot-caretaker/state/ready.json /var/lib/klaffat-dependabot-caretaker/state/notified.json")
+
+    dellan.succeed("sh -c 'cd /var/lib/klaffat-caretaker/source && git checkout -qb dependabot/npm_and_yarn/agent-harness-1.0.0 main && echo unverified-update >> tests/agent-e2e/package-lock.json && git commit -qam agent-harness && klaffat-caretaker-fixture-push -q origin HEAD'")
+    agent_harness_head = dellan.succeed("git -C /var/lib/klaffat-caretaker/source rev-parse HEAD").strip()
+    write_metadata(valid | {"pr":59, "head_ref":"dependabot/npm_and_yarn/agent-harness-1.0.0", "head_sha":agent_harness_head, "base_sha":advanced_base})
+    next_caretaker_day()
+    dellan.fail("systemctl start klaffat-dependabot-caretaker.service")
+    dellan.succeed("test \"$(git -C /var/lib/klaffat-caretaker/remote.git rev-parse refs/heads/dependabot/npm_and_yarn/agent-harness-1.0.0)\" = %s" % shlex.quote(agent_harness_head))
+
+    dellan.succeed("sh -c 'cd /var/lib/klaffat-caretaker/source && git checkout -qb dependabot/npm_and_yarn/base-race-1.0.0 main && echo already-compatible >> tests/e2e/package-lock.json && git commit -qam base-race && klaffat-caretaker-fixture-push -q origin HEAD'")
+    base_race_head = dellan.succeed("git -C /var/lib/klaffat-caretaker/source rev-parse HEAD").strip()
+    write_metadata(valid | {"pr":60, "head_ref":"dependabot/npm_and_yarn/base-race-1.0.0", "head_sha":base_race_head, "base_sha":advanced_base})
+    next_caretaker_day()
+    dellan.succeed("touch /var/lib/klaffat-dependabot-caretaker/state/pause-checks")
+    dellan.succeed("systemctl start --no-block klaffat-dependabot-caretaker.service")
+    dellan.wait_until_succeeds("test -e /var/lib/klaffat-dependabot-caretaker/state/checks-observed")
+    dellan.succeed("sh -c 'cd /var/lib/klaffat-caretaker/source && git checkout -q main && echo checks-base-advanced >> app.rs && git commit -qam checks-base-advanced && klaffat-caretaker-fixture-push -q origin main'")
+    dellan.succeed("rm /var/lib/klaffat-dependabot-caretaker/state/pause-checks")
+    dellan.succeed("for _ in $(seq 1 100); do systemctl is-failed --quiet klaffat-dependabot-caretaker.service && exit 0; sleep 0.1; done; exit 1")
+    dellan.succeed("test ! -e /var/lib/klaffat-dependabot-caretaker/state/ready.json")
+
+    dellan.succeed("sh -c 'cd /var/lib/klaffat-caretaker/source && git checkout -qb dependabot/npm_and_yarn/refresh-crash-1.0.0 main && echo bot-refresh-crash > tests/e2e/package-lock.json && git commit -qam bot-refresh-crash && klaffat-caretaker-fixture-push -q origin HEAD && git checkout -q main && echo main-refresh-crash > tests/e2e/package-lock.json && git commit -qam main-refresh-crash && klaffat-caretaker-fixture-push -q origin main'")
+    refresh_crash_head = dellan.succeed("git -C /var/lib/klaffat-caretaker/source rev-parse dependabot/npm_and_yarn/refresh-crash-1.0.0").strip()
+    refresh_crash_base = dellan.succeed("git -C /var/lib/klaffat-caretaker/source rev-parse main").strip()
+    refresh_crash_pr = valid | {"pr":61, "head_ref":"dependabot/npm_and_yarn/refresh-crash-1.0.0", "head_sha":refresh_crash_head, "base_sha":refresh_crash_base}
+    write_metadata(refresh_crash_pr)
+    next_caretaker_day()
+    dellan.succeed("touch /var/lib/klaffat-dependabot-caretaker/state/pause-refresh")
+    dellan.succeed("systemctl reset-failed klaffat-dependabot-caretaker.service")
+    dellan.succeed("systemctl start --no-block klaffat-dependabot-caretaker.service")
+    dellan.wait_until_succeeds("test -e /var/lib/klaffat-dependabot-caretaker/state/refresh-observed")
+    dellan.succeed("systemctl kill --signal=KILL klaffat-dependabot-caretaker.service")
+    dellan.succeed("rm /var/lib/klaffat-dependabot-caretaker/state/pause-refresh")
+    dellan.wait_until_succeeds("! systemctl is-active --quiet klaffat-dependabot-caretaker.service")
+    dellan.succeed("systemctl reset-failed klaffat-dependabot-caretaker.service")
+    next_caretaker_day()
+    dellan.succeed("systemctl start klaffat-dependabot-caretaker.service")
+    dellan.succeed("test \"$(grep -c '^61:' /var/lib/klaffat-dependabot-caretaker/state/refreshes)\" = 1")
+    dellan.succeed("jq -s -e 'any(.[]; .stage == \"waiting-for-refresh\")' /var/lib/klaffat-dependabot-caretaker/state/audit/events.jsonl")
   '';
 }

@@ -185,7 +185,7 @@ let
           return
         fi
         case "$path" in
-          Cargo.toml|Cargo.lock|tests/e2e/package.json|tests/e2e/package-lock.json|tests/agent-e2e/package.json|tests/agent-e2e/package-lock.json|.github/workflows/*.yml|.github/workflows/*.yaml) ;;
+          Cargo.toml|Cargo.lock|tests/e2e/package.json|tests/e2e/package-lock.json|.github/workflows/*.yml|.github/workflows/*.yaml) ;;
           *) refuse "non-mechanical-dependency-path" ;;
         esac
       }
@@ -217,7 +217,7 @@ let
         git -C "$repo_dir" merge --abort || true
         require_credential refresh "$refresh_credential"
         KLAFFAT_CARETAKER_REFRESH_CREDENTIAL_FILE="$refresh_credential" \
-          "$refresh_cmd" "$pr" "$head_sha"
+          "$refresh_cmd" "$pr" "$head_sha" "$base_sha"
         : > "$state/refresh-tuples/$id"
         audit refresh-requested "$id"
         exit 0
@@ -391,9 +391,11 @@ let
 
       remote_candidate="$(git -C "$repo_dir" ls-remote origin "refs/heads/$head_ref" | ${pkgs.gawk}/bin/awk '{print $1}')"
       [ "$remote_candidate" = "$candidate" ] || refuse "published-head-stale"
-      KLAFFAT_CARETAKER_CHECKS_CREDENTIAL_FILE="$checks_credential" "$check_cmd" "$pr" "$candidate"
+      KLAFFAT_CARETAKER_CHECKS_CREDENTIAL_FILE="$checks_credential" "$check_cmd" "$pr" "$candidate" "$base_sha"
       remote_candidate="$(git -C "$repo_dir" ls-remote origin "refs/heads/$head_ref" | ${pkgs.gawk}/bin/awk '{print $1}')"
       [ "$remote_candidate" = "$candidate" ] || refuse "head-changed-during-checks"
+      remote_base="$(git -C "$repo_dir" ls-remote origin "refs/heads/$base" | ${pkgs.gawk}/bin/awk '{print $1}')"
+      [ "$remote_base" = "$base_sha" ] || refuse "base-changed-during-checks"
       ready="$(jq -cn --argjson pr "$pr" --arg sha "$candidate" --arg base "$base_sha" --arg url "https://github.com/jonathanmoregard/klaffat/pull/$pr" '{state:"ready",pr:$pr,sha:$sha,base_sha:$base,url:$url}')"
       atomic_json "$notification/ready.json" "$ready"
       chmod 0644 "$notification/ready.json"
@@ -785,19 +787,33 @@ let
     runtimeInputs = [ pkgs.coreutils pkgs.gh pkgs.jq ];
     text = ''
       set -euo pipefail
-      pr="$1" head="$2"
+      pr="$1" head="$2" base="$3"
+      owner=${lib.escapeShellArg (builtins.head (lib.splitString "/" cfg.repo))}
       credential="''${KLAFFAT_CARETAKER_REFRESH_CREDENTIAL_FILE:-}"
-      test "$pr" -gt 0 && [[ "$head" =~ ^[0-9a-f]{40}$ ]] || exit 64
+      test "$pr" -gt 0 && [[ "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ ]] || exit 64
       test -n "$credential" && test -r "$credential" || exit 69
       current="$(GH_TOKEN="$(cat "$credential")" gh api "repos/${cfg.repo}/pulls/$pr")"
-      printf '%s' "$current" | jq -e --arg head "$head" '
+      printf '%s' "$current" | jq -e --arg head "$head" --arg base "$base" '
         .state == "open" and .user.login == "dependabot[bot]" and
-        .base.ref == "main" and .head.repo.full_name == "jonathanmoregard/klaffat" and
+        .base.ref == "main" and .base.sha == $base and
+        .head.repo.full_name == "jonathanmoregard/klaffat" and
         .head.sha == $head
       ' >/dev/null
-      GH_TOKEN="$(cat "$credential")" gh api --method POST \
-        "repos/${cfg.repo}/issues/$pr/comments" --field body='@dependabot rebase' \
-        | jq -e '.id | numbers' >/dev/null
+      printf -v body '@dependabot rebase\n\n<!-- klaffat-caretaker-refresh:%s:%s -->' "$head" "$base"
+      comments="$(GH_TOKEN="$(cat "$credential")" gh api --paginate --slurp \
+        "repos/${cfg.repo}/issues/$pr/comments?per_page=100")"
+      if printf '%s' "$comments" | jq -e --arg body "$body" --arg owner "$owner" '
+        type == "array" and all(.[]; type == "array") and
+        (add | any(.[]; type == "object" and .body == $body and .user.login == $owner))
+      ' >/dev/null; then
+        exit 0
+      fi
+      request="$(jq -cn --arg body "$body" '{body:$body}')"
+      response="$(GH_TOKEN="$(cat "$credential")" gh api --method POST \
+        "repos/${cfg.repo}/issues/$pr/comments" --input - <<<"$request")"
+      printf '%s' "$response" | jq -e --arg body "$body" --arg owner "$owner" '
+        (.id | type == "number") and .body == $body and .user.login == $owner
+      ' >/dev/null
     '';
   };
   defaultSecretScan = pkgs.writeShellApplication {
@@ -860,8 +876,8 @@ let
     runtimeInputs = [ pkgs.coreutils pkgs.gh pkgs.jq ];
     text = ''
       set -euo pipefail
-      pr="$1" sha="$2" credential="${if cfg.checksCredentialFile == null then "" else cfg.checksCredentialFile}"
-      test "$pr" -gt 0 && [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 64
+      pr="$1" sha="$2" base_sha="$3" credential="${if cfg.checksCredentialFile == null then "" else cfg.checksCredentialFile}"
+      test "$pr" -gt 0 && [[ "$sha" =~ ^[0-9a-f]{40}$ && "$base_sha" =~ ^[0-9a-f]{40}$ ]] || exit 64
       test -n "$credential" && test -r "$credential" || exit 69
       required=${lib.escapeShellArg (builtins.toJSON cfg.requiredContexts)}
       test "$(printf '%s' "$required" | jq length)" -gt 0 || exit 69
@@ -869,9 +885,9 @@ let
       test "$head" = "$sha" || exit 65
       for _ in $(seq 1 60); do
         pr_state="$(GH_TOKEN="$(cat "$credential")" gh api "repos/${cfg.repo}/pulls/$pr")"
-        printf '%s' "$pr_state" | jq -e --arg sha "$sha" '
+        printf '%s' "$pr_state" | jq -e --arg sha "$sha" --arg base "$base_sha" '
           .state == "open" and .base.ref == "main" and
-          .head.repo.full_name == "jonathanmoregard/klaffat" and .head.sha == $sha
+          .base.sha == $base and .head.repo.full_name == "jonathanmoregard/klaffat" and .head.sha == $sha
         ' >/dev/null || exit 65
         checks="$(GH_TOKEN="$(cat "$credential")" gh api "repos/${cfg.repo}/commits/$sha/check-runs?per_page=100")"
         verdict="$(printf '%s' "$checks" | jq -er --argjson needed "$required" '
@@ -912,6 +928,7 @@ let
     text = ''
       set -euo pipefail
       ready=${lib.escapeShellArg "${cfg.notificationPath}/ready.json"}
+      [ -f "$ready" ] || exit 0
       pr="$(jq -er '.pr | numbers' "$ready")"
       url="$(jq -er '.url | select(test("^https://github.com/jonathanmoregard/klaffat/pull/[0-9]+$"))' "$ready")"
       notify-send -u normal "Klaffat dependency update ready" "PR #$pr passed all checks. Review and merge: $url"
@@ -1048,9 +1065,12 @@ in {
     };
     systemd.user.services.klaffat-dependabot-caretaker-ready = {
       description = "Desktop notification: verified Klaffat dependency update";
+      unitConfig.StartLimitIntervalSec = 0;
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${desktopNotifier}/bin/klaffat-caretaker-desktop-notifier";
+        Restart = "on-failure";
+        RestartSec = "1min";
       };
     };
   };
