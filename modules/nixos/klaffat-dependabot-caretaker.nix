@@ -112,16 +112,18 @@ let
       ' "$metadata" > "$run/eligible.json" || refuse "metadata contained invalid Dependabot state"
       if [ -f "$state/ready.json" ]; then
         ready_record="$(jq -cer '
-          select(type == "object" and keys == ["pr", "sha", "state", "url"]) |
+          select(type == "object" and keys == ["base_sha", "pr", "sha", "state", "url"]) |
           select(.state == "ready") |
           select(.pr | type == "number" and floor == . and . > 0) |
           select(.sha | type == "string" and test("^[0-9a-f]{40}$")) |
+          select(.base_sha | type == "string" and test("^[0-9a-f]{40}$")) |
           select(.url == ("https://github.com/jonathanmoregard/klaffat/pull/" + (.pr | tostring)))
         ' "$state/ready.json")" || refuse "invalid-ready-state"
         ready_pr="$(jq -r .pr <<<"$ready_record")"
         ready_sha="$(jq -r .sha <<<"$ready_record")"
-        if jq -e --argjson pr "$ready_pr" --arg sha "$ready_sha" \
-          'any(.[]; .pr == $pr and .head_sha == $sha)' "$run/eligible.json" >/dev/null; then
+        ready_base="$(jq -r .base_sha <<<"$ready_record")"
+        if jq -e --argjson pr "$ready_pr" --arg sha "$ready_sha" --arg base "$ready_base" \
+          'any(.[]; .pr == $pr and .head_sha == $sha and .base_sha == $base)' "$run/eligible.json" >/dev/null; then
           audit awaiting-human "pr-$ready_pr-$ready_sha"
           exit 0
         fi
@@ -355,6 +357,13 @@ let
       # mechanical update and any bounded Rust compatibility commit.
       "$secret_scan_cmd" "$candidate_dir" "$base_sha" "$candidate" || refuse "candidate-secret-scan-failed"
 
+      # Persist approval before publication. A remote push can become visible
+      # before its client returns, so a crash after the ref update must not
+      # strand this exact fully verified, secret-scanned candidate as an
+      # untrusted raw Dependabot head on the next invocation.
+      mkdir -p "$state/approved-heads"
+      : > "$state/approved-heads/$candidate"
+
       # Publish gets a structured, fixed result. It must re-read the remote
       # and reject anything but this exact dependabot branch before push.
       result="$run/publish.json"
@@ -382,21 +391,18 @@ let
 
       remote_candidate="$(git -C "$repo_dir" ls-remote origin "refs/heads/$head_ref" | ${pkgs.gawk}/bin/awk '{print $1}')"
       [ "$remote_candidate" = "$candidate" ] || refuse "published-head-stale"
-      # Persist local approval before remote checks. If checks are temporarily
-      # unavailable, next invocation may recognize this caretaker-authored
-      # head instead of misclassifying its bounded Rust repair as a raw
-      # Dependabot change.
-      mkdir -p "$state/approved-heads"
-      : > "$state/approved-heads/$candidate"
       KLAFFAT_CARETAKER_CHECKS_CREDENTIAL_FILE="$checks_credential" "$check_cmd" "$pr" "$candidate"
       remote_candidate="$(git -C "$repo_dir" ls-remote origin "refs/heads/$head_ref" | ${pkgs.gawk}/bin/awk '{print $1}')"
       [ "$remote_candidate" = "$candidate" ] || refuse "head-changed-during-checks"
-      ready="$(jq -cn --argjson pr "$pr" --arg sha "$candidate" --arg url "https://github.com/jonathanmoregard/klaffat/pull/$pr" '{state:"ready",pr:$pr,sha:$sha,url:$url}')"
-      atomic_json "$state/ready.json" "$ready"
+      ready="$(jq -cn --argjson pr "$pr" --arg sha "$candidate" --arg base "$base_sha" --arg url "https://github.com/jonathanmoregard/klaffat/pull/$pr" '{state:"ready",pr:$pr,sha:$sha,base_sha:$base,url:$url}')"
       atomic_json "$notification/ready.json" "$ready"
       chmod 0644 "$notification/ready.json"
       touch "$notification/ready"
       "$notifier_cmd" <<<"$ready"
+      # Ready state blocks further processing, so commit it only after the
+      # handoff succeeds. A crash between notification and this write may
+      # duplicate a notification; writing it earlier can lose handoff forever.
+      atomic_json "$state/ready.json" "$ready"
       audit ready "$id"
       : > "$state/ready-tuples/pr-$pr-$candidate-$base_sha"
     '';
@@ -895,7 +901,7 @@ let
     text = ''
       set -euo pipefail
       input="$(cat)"
-      printf '%s\n' "$input" | jq -e 'keys == ["pr", "sha", "state", "url"] and .state == "ready"' >/dev/null
+      printf '%s\n' "$input" | jq -e 'keys == ["base_sha", "pr", "sha", "state", "url"] and .state == "ready"' >/dev/null
       printf 'Klaffat Dependabot PR %s is ready; Jonathan, please review and merge it: %s\n' \
         "$(printf '%s' "$input" | jq -r .pr)" "$(printf '%s' "$input" | jq -r .url)"
     '';
