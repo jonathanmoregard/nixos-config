@@ -38,16 +38,17 @@ then assert:
 
 ```python
 rc, out = run("${bin}/klaffat-iam-seed")
-assert rc == 0 and "seed-mode=dry-run" in out
-assert "aws-creds=set/set" in out
+assert rc == 0
+assert "seed-mode=" not in out
+assert "aws-creds=" not in out
 assert "TEST-aws-access-key-id" not in out
 assert "TEST-aws-secret-access-key" not in out
 
 rc, out = run("${bin}/klaffat-iam-seed --apply")
-assert rc == 0 and "seed-mode=--apply" in out
+assert rc == 0
 
 rc, out = run("${bin}/klaffat-iam-seed --verify")
-assert rc == 23 and "seed-mode=--verify" in out
+assert rc == 23
 ```
 
 Also assert invalid argument/arity exits 2 before origin access, extracted
@@ -113,7 +114,9 @@ AWS_DEFAULT_REGION="eu-north-1"
 ```
 
 Run `${pkgs.bash}/bin/bash "$work/deploy/scripts/seed-aws-ci-identities.sh" "$@"`,
-capture status, and return it after cleanup. On successful `--apply` or
+capture both child output streams inside the root-only temporary directory,
+capture status, and return it directly after cleanup without replaying child
+output. On successful `--apply` or
 `--verify`, validate its three exact ARN lines and atomically publish them plus
 the reviewed revision to root-owned mode-0644
 `/run/klaffat-iam-seed/report.env`. Remove stale report before mutation or
@@ -150,7 +153,8 @@ Run `nix run .#feature-vm`. Over SSH, invoke
 `runuser -u jonathan -- /run/current-system/sw/bin/klaffat-iam-seed` and verify
 root-only refusal, then invoke as root against the VM fixture origin and verify
 dry-run output, credential presence markers, reviewed revision, and no fixture
-credential value. Stop VM cleanly.
+credential value. Child output is quarantined, so verify only wrapper-authored
+provenance plus successful status. Stop VM cleanly.
 
 - [ ] **Step 2: Review and rebase**
 

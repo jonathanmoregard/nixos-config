@@ -961,6 +961,10 @@ common.mkMinimalTest {
         'printf \'seed-mode=%s\\n\' "''${1-dry-run}"\n'
         'printf \'aws-creds=%s/%s\\n\' '
         '"''${AWS_ACCESS_KEY_ID:+set}" "''${AWS_SECRET_ACCESS_KEY:+set}"\n'
+        'if [ -e /tmp/klaffat-iam-seed-leak ]; then\n'
+        '  printf \'stdout-leak=%s/%s\\n\' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"\n'
+        '  printf \'stderr-leak=%s/%s\\n\' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >&2\n'
+        'fi\n'
         'printf \'%s\\n\' '
         '\'KLAFFAT_IAM_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-iam\' '
         '\'KLAFFAT_INFRA_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-infra\' '
@@ -1020,18 +1024,18 @@ common.mkMinimalTest {
         "KLAFFAT_INFRA_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-infra\n"
         "KLAFFAT_PUBLISH_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-publish\n"
     )
-    for args, expected_mode, publishes_report in [
-        ("", "dry-run", False),
-        ("--apply", "--apply", True),
-        ("--verify", "--verify", True),
+    for args, publishes_report in [
+        ("", False),
+        ("--apply", True),
+        ("--verify", True),
     ]:
         rc, out = run(f"${bin}/klaffat-iam-seed {args}")
         assert rc == 0, f"IAM seed {args!r} returned {rc}: {out!r}"
         assert f"klaffat-iam-seed: ${originUrl} main @ {rev_a}" in out, (
             f"IAM seed provenance missing or wrong: {out!r}"
         )
-        assert f"seed-mode={expected_mode}" in out, f"IAM seed mode not forwarded: {out!r}"
-        assert "aws-creds=set/set" in out, f"IAM seed did not receive AWS credentials: {out!r}"
+        assert "seed-mode=" not in out, f"IAM seed child stdout escaped: {out!r}"
+        assert "aws-creds=" not in out, f"IAM seed child stdout escaped: {out!r}"
         assert "TEST-aws-access-key-id" not in out, f"AWS access key leaked: {out!r}"
         assert "TEST-aws-secret-access-key" not in out, f"AWS secret key leaked: {out!r}"
         if publishes_report:
@@ -1043,8 +1047,19 @@ common.mkMinimalTest {
             machine.fail(f"test -e {report_path}")
         assert state_leftovers() == [], f"IAM seed left temporary files: {state_leftovers()!r}"
 
-    machine.succeed("touch /tmp/klaffat-iam-seed-fail")
+    machine.succeed("touch /tmp/klaffat-iam-seed-leak")
     rc, out = run("${bin}/klaffat-iam-seed --verify")
+    assert rc == 0, f"IAM seed leak fixture failed unexpectedly: {rc} {out!r}"
+    assert "stdout-leak=" not in out, f"IAM seed child stdout escaped: {out!r}"
+    assert "stderr-leak=" not in out, f"IAM seed child stderr escaped: {out!r}"
+    assert "TEST-aws-access-key-id" not in out, f"AWS access key leaked from child: {out!r}"
+    assert "TEST-aws-secret-access-key" not in out, f"AWS secret key leaked from child: {out!r}"
+    machine.succeed("rm /tmp/klaffat-iam-seed-leak")
+
+    machine.succeed("touch /tmp/klaffat-iam-seed-fail")
+    rc, out = run(
+        "${pkgs.bash}/bin/bash -c '${bin}/klaffat-iam-seed --verify > /dev/full'"
+    )
     assert rc == 23, f"IAM seed failure status was not preserved: {rc} {out!r}"
     machine.fail(f"test -e {report_path}")
     machine.succeed("rm /tmp/klaffat-iam-seed-fail")

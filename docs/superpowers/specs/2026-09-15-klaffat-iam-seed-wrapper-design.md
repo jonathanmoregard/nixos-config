@@ -27,7 +27,11 @@ and verifies extracted file hashes against the resolved commit before running
 anything. It then reads the existing root-only agenix AWS credentials into its
 own environment and invokes the reviewed seed script with packaged `aws`,
 `jq`, and shell dependencies on `PATH`. Secrets are never accepted as
-arguments, copied into a user-readable file, or printed.
+arguments or copied into a user-readable file. Both child output streams stay
+inside the root-only temporary directory and are deleted on exit, so even a
+failing or compromised seed script cannot print credential values through the
+wrapper. Only wrapper-authored provenance and a validated public report are
+exposed to the caller.
 
 After successful `--apply` or `--verify`, the wrapper atomically publishes
 `/run/klaffat-iam-seed/report.env` as root-owned mode 0644. It contains only
@@ -57,7 +61,8 @@ verification cannot leave stale success evidence.
 Extend `vm-klaffat-infra` test-first. Prove command installation, root-only and
 argument gates, both sudo path spellings, reviewed-source provenance, dry-run
 execution through a fake AWS CLI, exact `--apply`/`--verify` forwarding,
-failure propagation, and absence of fixture credential values from output.
+failure propagation even when caller output is unwritable, quarantine of both
+child output streams, and absence of fixture credential values from output.
 Tests also prove successful apply/verify publishes an exact nonsecret report,
 dry-run does not, and failure removes stale report state.
 Then build the lane and invoke the generated wrapper in the interactive feature
