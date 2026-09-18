@@ -1544,6 +1544,14 @@ let
           failure_stage="GitHub OIDC provider validation"
         elif grep -Eq '^seed: (managed policy|permissions boundary)|^seed: drift: (create|replace) permissions boundary |when calling the (GetPolicy|GetPolicyVersion|ListPolicyVersions|DeletePolicyVersion|CreatePolicy|CreatePolicyVersion) operation' "$seed_stderr"; then
           failure_stage="IAM permissions boundary validation"
+        elif grep -Fq 'when calling the GetRole operation' "$seed_stderr"; then
+          failure_stage="IAM role lookup (GetRole)"
+        elif grep -Fq 'when calling the CreateRole operation' "$seed_stderr"; then
+          failure_stage="IAM role creation (CreateRole)"
+        elif grep -Fq 'when calling the PutRolePermissionsBoundary operation' "$seed_stderr"; then
+          failure_stage="IAM role permissions boundary update (PutRolePermissionsBoundary)"
+        elif grep -Fq 'when calling the UpdateAssumeRolePolicy operation' "$seed_stderr"; then
+          failure_stage="IAM role trust policy update (UpdateAssumeRolePolicy)"
         elif grep -Eq '^seed: (cannot read back role policy|role policy readback mismatch:)|^seed: drift: replace inline policy klaffat-github-(iam|publish|infra)/|when calling the (GetRolePolicy|PutRolePolicy) operation' "$seed_stderr"; then
           failure_stage="IAM role policy validation"
         elif grep -Eq '^seed: (role metadata mismatch:|role is absent after convergence:|cannot read back role trust:|role trust readback mismatch:)|^seed: drift: (set permissions boundary on role |create dormant role |replace OIDC trust for role )|when calling the (GetRole|CreateRole|PutRolePermissionsBoundary|UpdateAssumeRolePolicy) operation' "$seed_stderr"; then
