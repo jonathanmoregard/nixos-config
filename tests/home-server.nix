@@ -221,6 +221,9 @@ pkgs.testers.runNixOSTest {
         nixOptimiseAutomatic = config.nix.optimise.automatic;
         nixOptimiseDates = config.nix.optimise.dates;
         smartdEnabled = config.services.smartd.enable;
+        ageHostPublicKey = config.homeServer.ageHostPublicKey;
+        deploySecretDeclared = config.age.secrets ? "deploy-ssh-key";
+        deployKeyFile = config.homeServer.deployKeyFile;
         autoDeployEnabled = config.services.nixos-auto-deploy.enable;
         automationEnabled = config.services.houseAutomation.enable;
         tellstickEnabled = config.systemd.services.tellstick-mqtt-bridge.wantedBy;
@@ -272,7 +275,13 @@ pkgs.testers.runNixOSTest {
     assert values["nixOptimiseAutomatic"] is True, values
     assert values["smartdEnabled"] is True, values
     assert values["nixOptimiseDates"] == ["Wed 04:15"], values
-    assert values["autoDeployEnabled"] is False, values
+    assert values["ageHostPublicKey"] == (
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEnGlRJufT9hIgzqFqHujW28DsSX1YDYg/0vGG7BsO1+ "
+        "root@home-server"
+    ), values
+    assert values["deploySecretDeclared"] is True, values
+    assert values["deployKeyFile"] == "/run/agenix/deploy-ssh-key", values
+    assert values["autoDeployEnabled"] is True, values
     assert values["automationEnabled"] is True, values
     assert values["tellstickEnabled"] == ["multi-user.target"], values
     assert values["mqttLocalAcl"] == [
