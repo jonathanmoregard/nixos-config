@@ -92,6 +92,14 @@ these gates with fake production values.
    ssh jonathan@home-server
    ```
 
+   Access uses ordinary OpenSSH over `tailscale0`, not Tailscale SSH. This keeps
+   `PermitRootLogin = "no"` and the declared authorized keys authoritative. For
+   workstation migration, add the Tuxedo public key through a reviewed PR and
+   wait for `nixos-deploy.service` to apply it before retiring the Dellan key.
+   If Dellan is already unavailable, the server-side deploy key and pull-deploy
+   timer provide the recovery path: merge the Tuxedo public-key change, verify
+   the server pulls it, then connect from the Tuxedo over the same tailnet.
+
 8. Record host identity without copying the private key:
 
    ```console

@@ -209,6 +209,7 @@ pkgs.testers.runNixOSTest {
           config.services.openssh.settings.KbdInteractiveAuthentication;
         sshRootLogin = config.services.openssh.settings.PermitRootLogin;
         sshOpenFirewall = config.services.openssh.openFirewall;
+        sshAuthorizedKeys = config.users.users.jonathan.openssh.authorizedKeys.keys;
         globalTcpPorts = config.networking.firewall.allowedTCPPorts;
         tailnetTcpPorts = config.networking.firewall.interfaces.tailscale0.allowedTCPPorts;
         journalConfig = config.services.journald.extraConfig;
@@ -257,6 +258,10 @@ pkgs.testers.runNixOSTest {
     assert values["sshKeyboardInteractiveAuthentication"] is False, values
     assert values["sshRootLogin"] == "no", values
     assert values["sshOpenFirewall"] is False, values
+    assert (
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINT9HeHhu82OoNsAHe/QAh116pSEANuZUr1h5m8R8kpp jonathan@dellan"
+        in values["sshAuthorizedKeys"]
+    ), values
     assert values["globalTcpPorts"] == [], values
     assert values["tailnetTcpPorts"] == [22, 8008], values
     assert "Storage=persistent" in values["journalConfig"], values
