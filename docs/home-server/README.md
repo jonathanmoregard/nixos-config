@@ -296,6 +296,53 @@ Copy exports off-host, encrypt where needed, record retention, and test restore.
 Matrix database and media belong to one recovery point. Do not add databases,
 media, MQTT persistence, or live Zigbee state to Git.
 
+## Direct application delivery
+
+Merged `smarthome/main` commits build on GitHub and publish the exact runtime
+closure to signed Cachix. `smarthome-deploy.timer` polls GitHub from this host,
+evaluates only the package output path with builders disabled, hydrates that
+signed closure, and switches `/nix/var/nix/profiles/smarthome` only after the
+candidate service passes its health check. Failed health rolls back the profile.
+
+```console
+systemctl status smarthome-deploy.timer smarthome-deploy.service
+sudo systemctl start smarthome-deploy.service
+sudo cat /var/lib/smarthome-deploy/last-success
+sudo cat /var/lib/smarthome-deploy/last-failure
+sudo nix-env --profile /nix/var/nix/profiles/smarthome --list-generations
+readlink -f /nix/var/nix/profiles/smarthome
+journalctl -u smarthome-deploy.service -n 200 --no-pager
+nix path-info -Sh /nix/var/nix/profiles/smarthome
+```
+
+Manual application rollback and retry:
+
+```console
+sudo nix-env --profile /nix/var/nix/profiles/smarthome --rollback
+sudo systemctl restart house-automationd.service
+curl --fail-with-body http://127.0.0.1:9876/healthz
+sudo systemctl start smarthome-deploy.service
+```
+
+Rollback is latched: the deployer sees that `last-success` names a different
+active profile path and refuses to overwrite the deliberate rollback. Move
+forward by merging or selecting a known-good release after diagnosis.
+
+Only two application profile generations remain rooted. Nix is configured not
+to retain build derivations or outputs, so normal GC can remove older runtime
+closures and evaluation debris:
+
+```console
+sudo nix-store --gc --print-dead
+```
+
+The server never compiles the application: evaluation uses `max-jobs = 0`,
+`fallback = false`, and no builders; cache hydration fails closed on missing or
+incorrect signatures. Cachix write credentials exist only as a GitHub Actions
+secret. The server receives a repository-specific read-only Git deploy key.
+Dellan's OpenSSH admin key remains a separate access path and is unaffected by
+application delivery.
+
 ## Recovery and rollback
 
 Normal rollback remains standard NixOS:
