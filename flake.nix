@@ -375,6 +375,12 @@
             inherit pkgs;
             script = ./modules/nixos/smarthome-hydrate-release-paths.sh;
           };
+        smarthome-activator =
+          let pkgs = pkgsLinux;
+          in import ./tests/smarthome-activator.nix {
+            inherit pkgs;
+            script = ./modules/nixos/smarthome-activate-package.sh;
+          };
 
         # Not a VM lane: an eval-time assertion, because that is when the
         # fault would land. dellan is the machine holding the root-only
