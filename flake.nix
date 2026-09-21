@@ -381,6 +381,10 @@
             inherit pkgs;
             script = ./modules/nixos/smarthome-activate-package.sh;
           };
+        smarthome-auto-deploy = import ./tests/smarthome-auto-deploy.nix {
+          pkgs = pkgsLinux;
+          inputs = { inherit nixpkgs; };
+        };
 
         # Not a VM lane: an eval-time assertion, because that is when the
         # fault would land. dellan is the machine holding the root-only
