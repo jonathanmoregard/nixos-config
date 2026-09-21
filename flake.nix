@@ -369,6 +369,12 @@
           pkgs = pkgsLinux;
           inputs = { inherit nixpkgs; };
         };
+        smarthome-hydrator =
+          let pkgs = pkgsLinux;
+          in import ./tests/smarthome-hydrator.nix {
+            inherit pkgs;
+            script = ./modules/nixos/smarthome-hydrate-release-paths.sh;
+          };
 
         # Not a VM lane: an eval-time assertion, because that is when the
         # fault would land. dellan is the machine holding the root-only
