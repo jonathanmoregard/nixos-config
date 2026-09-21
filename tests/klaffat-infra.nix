@@ -179,10 +179,32 @@ let
       mode=$(cat "$encrypted")
       case "$mode" in
         valid)
+          # The client id is public configuration and lives in the Klaffat
+          # repo, not in agenix — the encrypted bundle carries the secret
+          # alone. This is what the real klaffat-env.age has looked like since
+          # the repo split public config out of it.
+          printf '%s\n' \
+            'KLAFFAT_GOOGLE_CLIENT_SECRET=TEST-google-secret' \
+            'UNRELATED_SECRET=must-not-reach-server'
+          ;;
+        legacy-pair)
+          # An older bundle that still carries a matching client id: accepted,
+          # because it agrees with the public configuration.
           printf '%s\n' \
             'KLAFFAT_GOOGLE_CLIENT_ID=TEST-google-client.apps.googleusercontent.com' \
             'KLAFFAT_GOOGLE_CLIENT_SECRET=TEST-google-secret' \
             'UNRELATED_SECRET=must-not-reach-server'
+          ;;
+        mismatched-id)
+          # A bundle whose client id contradicts the repo's public config:
+          # refused, because the two sources disagree about which Google client
+          # this is and guessing would pair a secret with the wrong client.
+          printf '%s\n' \
+            'KLAFFAT_GOOGLE_CLIENT_ID=OTHER-google-client.apps.googleusercontent.com' \
+            'KLAFFAT_GOOGLE_CLIENT_SECRET=TEST-google-secret'
+          ;;
+        secretless)
+          printf '%s\n' 'UNRELATED_SECRET=must-not-reach-server'
           ;;
         malformed)
           printf '%s\n' \
@@ -357,6 +379,7 @@ common.mkMinimalTest {
         "${localGoogleFixture}/target/local-google/debug "
         "${localGoogleFixture}/crates/klaffat-web/static "
         "${localGoogleFixture}/deploy/secrets "
+        "${localGoogleFixture}/deploy/klaffat-demo "
         "${localGoogleFixture}/tests/e2e/fixtures"
     )
     machine.succeed(
@@ -366,6 +389,12 @@ common.mkMinimalTest {
     )
     write_file("${localGoogleFixture}/crates/klaffat-web/static/app.css", "body {}\n")
     write_file("${localGoogleFixture}/deploy/secrets/klaffat-env.age", "valid\n")
+    # Public configuration: the Google client id is not a secret, so the repo
+    # carries it in the clear and agenix holds only the client secret.
+    write_file(
+        "${localGoogleFixture}/deploy/klaffat-demo/public-config.json",
+        '{"oauth": {"googleClientId": "TEST-google-client.apps.googleusercontent.com"}}\n',
+    )
     write_file("${localGoogleFixture}/tests/e2e/fixtures/test-kek", "0123456789abcdef0123456789abcdef")
     machine.succeed("chown -R jonathan:users ${localGoogleFixture}")
     machine.succeed(
@@ -491,7 +520,7 @@ common.mkMinimalTest {
         "${localGoogleFixture}/target/local-google/debug/klaffat"
     )
 
-    for mode in ["malformed", "duplicate", "fail", "hang"]:
+    for mode in ["malformed", "duplicate", "mismatched-id", "secretless", "fail", "hang"]:
         write_file("${localGoogleFixture}/deploy/secrets/klaffat-env.age", mode + "\n")
         machine.succeed(
             "chown jonathan:users ${localGoogleFixture}/deploy/secrets/klaffat-env.age"
@@ -969,8 +998,27 @@ common.mkMinimalTest {
         '\'KLAFFAT_IAM_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-iam\' '
         '\'KLAFFAT_INFRA_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-infra\' '
         '\'KLAFFAT_PUBLISH_ROLE_ARN=arn:aws:iam::123456789012:role/klaffat-github-publish\'\n'
+        'if [ -e /tmp/klaffat-iam-seed-role-operation ]; then\n'
+        '  operation=$(cat /tmp/klaffat-iam-seed-role-operation)\n'
+        '  printf \'An error occurred (AccessDenied) when calling the %s operation: attacker-controlled-detail %s/%s\\n\' '
+        '"$operation" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >&2\n'
+        '  exit 254\n'
+        'fi\n'
         'case "''${1-}" in\n'
-        '  --verify) [ ! -e /tmp/klaffat-iam-seed-fail ] || exit 23 ;;\n'
+        '  --apply)\n'
+        '    if [ -e /tmp/klaffat-iam-seed-classified-fail ]; then\n'
+        '      printf \'seed: role policy readback mismatch: attacker-controlled-detail\\n\' >&2\n'
+        '      printf \'stderr-leak=%s/%s\\n\' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >&2\n'
+        '      exit 1\n'
+        '    fi\n'
+        '    ;;\n'
+        '  --verify)\n'
+        '    if [ -e /tmp/klaffat-iam-seed-drift ]; then\n'
+        '      printf \'seed: drift: replace inline policy klaffat-github-infra/klaffat-github-infra\\n\' >&2\n'
+        '      exit 1\n'
+        '    fi\n'
+        '    [ ! -e /tmp/klaffat-iam-seed-fail ] || exit 23\n'
+        '    ;;\n'
         'esac\n'
     )
 
@@ -1055,6 +1103,64 @@ common.mkMinimalTest {
     assert "TEST-aws-access-key-id" not in out, f"AWS access key leaked from child: {out!r}"
     assert "TEST-aws-secret-access-key" not in out, f"AWS secret key leaked from child: {out!r}"
     machine.succeed("rm /tmp/klaffat-iam-seed-leak")
+
+    machine.succeed("touch /tmp/klaffat-iam-seed-classified-fail")
+    rc, out = run("${bin}/klaffat-iam-seed --apply")
+    assert rc == 1, f"IAM seed validation failure status was not preserved: {rc} {out!r}"
+    assert "seed failed during IAM role policy validation (exit 1)" in out, (
+        f"IAM seed failure was not safely classified: {out!r}"
+    )
+    assert "attacker-controlled-detail" not in out, f"child failure detail escaped: {out!r}"
+    assert "stderr-leak=" not in out, f"child stderr escaped: {out!r}"
+    assert "TEST-aws-access-key-id" not in out, f"AWS access key leaked on failure: {out!r}"
+    assert "TEST-aws-secret-access-key" not in out, f"AWS secret key leaked on failure: {out!r}"
+    machine.fail(f"test -e {report_path}")
+    machine.succeed("rm /tmp/klaffat-iam-seed-classified-fail")
+
+    for operation, classification in [
+        ("GetRole", "IAM role lookup (GetRole)"),
+        ("CreateRole", "IAM role creation (CreateRole)"),
+        (
+            "PutRolePermissionsBoundary",
+            "IAM role permissions boundary update (PutRolePermissionsBoundary)",
+        ),
+        (
+            "UpdateAssumeRolePolicy",
+            "IAM role trust policy update (UpdateAssumeRolePolicy)",
+        ),
+    ]:
+        machine.succeed(
+            f"printf '%s\\n' {operation} > /tmp/klaffat-iam-seed-role-operation"
+        )
+        rc, out = run("${bin}/klaffat-iam-seed --apply")
+        assert rc == 254, (
+            f"IAM seed {operation} failure status was not preserved: {rc} {out!r}"
+        )
+        assert f"seed failed during {classification} (exit 254)" in out, (
+            f"IAM seed {operation} failure was not precisely classified: {out!r}"
+        )
+        assert "attacker-controlled-detail" not in out, (
+            f"child {operation} failure detail escaped: {out!r}"
+        )
+        assert "TEST-aws-access-key-id" not in out, (
+            f"AWS access key leaked on {operation} failure: {out!r}"
+        )
+        assert "TEST-aws-secret-access-key" not in out, (
+            f"AWS secret key leaked on {operation} failure: {out!r}"
+        )
+        machine.fail(f"test -e {report_path}")
+    machine.succeed("rm /tmp/klaffat-iam-seed-role-operation")
+
+    machine.succeed("touch /tmp/klaffat-iam-seed-drift")
+    rc, out = run("${bin}/klaffat-iam-seed --verify")
+    assert rc == 1, f"IAM seed drift status was not preserved: {rc} {out!r}"
+    assert "seed failed during IAM role policy validation (exit 1)" in out, (
+        f"IAM seed drift was not safely classified: {out!r}"
+    )
+    assert "klaffat-github-infra/klaffat-github-infra" not in out, (
+        f"IAM seed drift detail escaped: {out!r}"
+    )
+    machine.succeed("rm /tmp/klaffat-iam-seed-drift")
 
     machine.succeed("touch /tmp/klaffat-iam-seed-fail")
     rc, out = run(

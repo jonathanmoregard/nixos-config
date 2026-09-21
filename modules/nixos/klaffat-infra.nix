@@ -1531,6 +1531,39 @@ let
       ${pkgs.bash}/bin/bash "$work/deploy/scripts/seed-aws-ci-identities.sh" "$@" \
         > "$seed_stdout" 2> "$seed_stderr" || rc=$?
       if [ "$rc" -ne 0 ]; then
+        # The fetched script is untrusted for display purposes: even an error
+        # line can contain credentials. Match known fixed phrases locally and
+        # print only a wrapper-owned classification.
+        if grep -Eq '^seed: (caller account is missing or malformed)$|when calling the GetCallerIdentity operation' "$seed_stderr"; then
+          failure_stage="AWS caller identity validation"
+        elif grep -Eq '^seed: signing-secret metadata does not match expected account, region, and name$|when calling the DescribeSecret operation' "$seed_stderr"; then
+          failure_stage="signing secret metadata validation"
+        elif grep -Eq '^seed: invalid JSON:|^seed: (aws|jq|cmp|sha256sum) is required$' "$seed_stderr"; then
+          failure_stage="seed input validation"
+        elif grep -Eq '^seed: (GitHub OIDC provider|cannot read back GitHub OIDC)|^seed: drift: create GitHub OIDC provider$|when calling the (Get|Create)OpenIDConnectProvider operation' "$seed_stderr"; then
+          failure_stage="GitHub OIDC provider validation"
+        elif grep -Eq '^seed: (managed policy|permissions boundary)|^seed: drift: (create|replace) permissions boundary |when calling the (GetPolicy|GetPolicyVersion|ListPolicyVersions|DeletePolicyVersion|CreatePolicy|CreatePolicyVersion) operation' "$seed_stderr"; then
+          failure_stage="IAM permissions boundary validation"
+        elif grep -Fq 'when calling the GetRole operation' "$seed_stderr"; then
+          failure_stage="IAM role lookup (GetRole)"
+        elif grep -Fq 'when calling the CreateRole operation' "$seed_stderr"; then
+          failure_stage="IAM role creation (CreateRole)"
+        elif grep -Fq 'when calling the PutRolePermissionsBoundary operation' "$seed_stderr"; then
+          failure_stage="IAM role permissions boundary update (PutRolePermissionsBoundary)"
+        elif grep -Fq 'when calling the UpdateAssumeRolePolicy operation' "$seed_stderr"; then
+          failure_stage="IAM role trust policy update (UpdateAssumeRolePolicy)"
+        elif grep -Eq '^seed: (cannot read back role policy|role policy readback mismatch:)|^seed: drift: replace inline policy klaffat-github-(iam|publish|infra)/|when calling the (GetRolePolicy|PutRolePolicy) operation' "$seed_stderr"; then
+          failure_stage="IAM role policy validation"
+        elif grep -Eq '^seed: (role metadata mismatch:|role is absent after convergence:|cannot read back role trust:|role trust readback mismatch:)|^seed: drift: (set permissions boundary on role |create dormant role |replace OIDC trust for role )|when calling the (GetRole|CreateRole|PutRolePermissionsBoundary|UpdateAssumeRolePolicy) operation' "$seed_stderr"; then
+          failure_stage="IAM role validation"
+        elif grep -Eq '^seed: (cannot read back user policy|user policy readback mismatch:)|^seed: drift: replace inline policy klaffat-nix-cache-host-reader/|when calling the (GetUserPolicy|PutUserPolicy) operation' "$seed_stderr"; then
+          failure_stage="IAM user policy validation"
+        elif grep -Eq '^seed: user metadata mismatch:|^seed: drift: (set permissions boundary on user |create user )|when calling the (GetUser|CreateUser|PutUserPermissionsBoundary) operation' "$seed_stderr"; then
+          failure_stage="IAM user validation"
+        else
+          failure_stage="unclassified seed execution"
+        fi
+        echo "klaffat-iam-seed: seed failed during $failure_stage (exit $rc); child output withheld." >&2
         exit "$rc"
       fi
 
