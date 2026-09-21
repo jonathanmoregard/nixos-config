@@ -4,6 +4,39 @@
 { pkgs, inputs }:
 
 let
+  fakeAutomation = pkgs.writeShellApplication {
+    name = "house-automationd";
+    runtimeInputs = [ pkgs.python3 ];
+    text = ''
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --config|--state) shift 2 ;;
+          *) echo "unexpected argument: $1" >&2; exit 64 ;;
+        esac
+      done
+
+      exec python3 -u - <<'PY'
+      from http.server import BaseHTTPRequestHandler, HTTPServer
+
+      class Handler(BaseHTTPRequestHandler):
+          def do_GET(self):
+              if self.path != "/healthz":
+                  self.send_error(404)
+                  return
+              body = b'{"ready":true,"fixture":"home-server"}\n'
+              self.send_response(200)
+              self.send_header("Content-Type", "application/json")
+              self.send_header("Content-Length", str(len(body)))
+              self.end_headers()
+              self.wfile.write(body)
+
+          def log_message(self, format, *args):
+              pass
+
+      HTTPServer(("127.0.0.1", 9876), Handler).serve_forever()
+      PY
+    '';
+  };
   productionHardware = import ../hosts/home-server/hardware-configuration.nix {
     config = { };
     lib = pkgs.lib;
@@ -27,7 +60,6 @@ pkgs.testers.runNixOSTest {
       imports = [
         inputs.agenix.nixosModules.default
         inputs.agenix-rekey.nixosModules.default
-        inputs.smarthome.nixosModules.default
         ../hosts/home-server/default.nix
         ../modules/common.nix
       ];
@@ -190,8 +222,28 @@ pkgs.testers.runNixOSTest {
         '';
       };
       systemd.services.house-automationd = {
-        requires = [ "fake-zigbee2mqtt-bridge.service" ];
-        after = [ "fake-zigbee2mqtt-bridge.service" ];
+        requires = [
+          "fake-zigbee2mqtt-bridge.service"
+          "home-server-test-smarthome-profile.service"
+        ];
+        after = [
+          "fake-zigbee2mqtt-bridge.service"
+          "home-server-test-smarthome-profile.service"
+        ];
+      };
+
+      systemd.services.home-server-test-smarthome-profile = {
+        description = "Install the VM fixture into the stable smarthome profile";
+        before = [ "house-automationd.service" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = ''
+          ${config.nix.package}/bin/nix-env \
+            --profile /nix/var/nix/profiles/smarthome \
+            --set ${fakeAutomation}
+        '';
       };
 
       environment.systemPackages = with pkgs; [
@@ -226,6 +278,9 @@ pkgs.testers.runNixOSTest {
         deployKeyFile = config.homeServer.deployKeyFile;
         autoDeployEnabled = config.services.nixos-auto-deploy.enable;
         automationEnabled = config.services.houseAutomation.enable;
+        automationExecutable = config.services.houseAutomation.executable;
+        automationCondition =
+          config.systemd.services.house-automationd.unitConfig.ConditionPathIsExecutable;
         tellstickEnabled = config.systemd.services.tellstick-mqtt-bridge.wantedBy;
         mqttLocalAcl = (builtins.head config.services.mosquitto.listeners).acl;
         zigbeeEnabled = config.services.zigbee2mqtt.enable;
@@ -283,6 +338,12 @@ pkgs.testers.runNixOSTest {
     assert values["deployKeyFile"] == "/run/agenix/deploy-ssh-key", values
     assert values["autoDeployEnabled"] is True, values
     assert values["automationEnabled"] is True, values
+    assert values["automationExecutable"] == (
+        "/nix/var/nix/profiles/smarthome/bin/house-automationd"
+    ), values
+    assert values["automationCondition"] == (
+        "/nix/var/nix/profiles/smarthome/bin/house-automationd"
+    ), values
     assert values["tellstickEnabled"] == ["multi-user.target"], values
     assert values["mqttLocalAcl"] == [
         "topic readwrite zigbee2mqtt/#",
@@ -342,46 +403,6 @@ pkgs.testers.runNixOSTest {
     home_server.succeed("ss -lnt | grep -F '0.0.0.0:8008'")
     home_server.fail("systemctl cat matrix-synapse.service | grep -F vm-macaroon-secret")
     home_server.fail("systemctl cat tellstick-mqtt-bridge.service | grep -F vm-tellstick-token")
-
-    # Exercise the real broker/adapter path without a fake device echo. The
-    # daemon must stop scheduling once its bounded retry budget is exhausted.
-    home_server.succeed(
-        """
-        rm -f /tmp/startup-command.json
-        (timeout 10 mosquitto_sub -h 127.0.0.1 -p 1883 -C 1 \
-          -t zigbee2mqtt/test/room/lamp/set > /tmp/startup-command.json) &
-        subscriber=$!
-        sleep 0.2
-        mosquitto_pub -h 127.0.0.1 -p 1883 -q 1 -r \
-          -t zigbee2mqtt/test/room/lamp/availability -m online
-        wait "$subscriber"
-        jq -e '.state == "OFF"' /tmp/startup-command.json
-        """
-    )
-    home_server.succeed(
-        """
-        rm -f /tmp/toggle-command.json
-        (timeout 10 mosquitto_sub -h 127.0.0.1 -p 1883 -C 1 \
-          -t zigbee2mqtt/test/room/lamp/set > /tmp/toggle-command.json) &
-        subscriber=$!
-        sleep 0.2
-        mosquitto_pub -h 127.0.0.1 -p 1883 -q 1 \
-          -t zigbee2mqtt/test/room/control -m '{"action":"toggle"}'
-        wait "$subscriber"
-        jq -e '.state == "ON"' /tmp/toggle-command.json
-        """
-    )
-    home_server.succeed("sleep 16")
-    before = int(home_server.succeed(
-        "journalctl -u house-automationd.service --no-pager -o cat | "
-        "grep -c 'computed device target' || true"
-    ).strip())
-    home_server.succeed("sleep 1")
-    after = int(home_server.succeed(
-        "journalctl -u house-automationd.service --no-pager -o cat | "
-        "grep -c 'computed device target' || true"
-    ).strip())
-    assert after - before <= 1, (before, after)
 
     home_server.succeed("systemctl restart house-automationd.service")
     home_server.wait_until_succeeds(

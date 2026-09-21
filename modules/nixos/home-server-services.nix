@@ -46,6 +46,7 @@ in
 {
   imports = [
     ./build-coordination.nix
+    ./house-automation-service.nix
     ./nixos-auto-deploy.nix
   ];
 

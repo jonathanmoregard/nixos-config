@@ -293,7 +293,6 @@
         ./modules/common.nix
         agenix.nixosModules.default
         agenix-rekey.nixosModules.default
-        smarthome.nixosModules.default
         { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
       ];
     };
