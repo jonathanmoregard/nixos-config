@@ -4,7 +4,7 @@
 
 **Goal:** Make `home-server` pull signed smarthome package releases directly from GitHub/Cachix, activate them through a two-generation app profile, and never compile or retain build closures locally.
 
-**Architecture:** NixOS owns a local service module plus a cache-only package deployer. The deployer resolves an exact Git commit, evaluates its expected package path, verifies the recursively signed Cachix closure, atomically switches `/nix/var/nix/profiles/smarthome`, checks service health, and rolls back on failure. `nixos-config` removes its smarthome flake input; operating-system and application releases become independent.
+**Architecture:** NixOS owns a local service module plus a cache-only package deployer. The deployer resolves an exact Git commit, evaluates its expected package path, verifies the recursively signed Cachix closure, atomically switches `/nix/var/nix/profiles/smarthome`, checks service health, and rolls back on failure. The first rollout leaves the old smarthome flake input inert as a migration remnant; a separate cleanup PR removes it only after live direct-deploy proof. Operating-system and application releases are already independent because production no longer imports the app module or package through that input.
 
 **Tech Stack:** NixOS modules/tests, Bash, systemd, Nix profiles/store signatures, Git/SSH, agenix-rekey, Cachix
 
@@ -23,7 +23,7 @@
 - `tests/smarthome-activator.nix`: success, rollback, markers, and generation-pruning harness.
 - `tests/home-server-smarthome-cd.nix`: two-node package release VM lane.
 - `tests/home-server.nix`: host integration contract without app source dependency.
-- `flake.{nix,lock}`: remove smarthome input and expose new checks.
+- `flake.nix`: expose new checks while retaining the inert smarthome input until post-deploy cleanup.
 - `docs/home-server/README.md`: operations, disk use, rollback, and credential boundaries.
 
 ### Task 1: Replace imported application module with host-owned service boundary
@@ -354,11 +354,10 @@ Expected: PASS.
 git commit -m "feat(home-server): pull cached smarthome releases"
 ```
 
-### Task 5: Decouple flake and wire low-disk production settings
+### Task 5: Wire low-disk production settings and preserve migration fallback
 
 **Files:**
 - Modify: `flake.nix`
-- Modify: `flake.lock`
 - Modify: `modules/nixos/home-server-services.nix`
 - Modify: `profiles/home-server-base.nix`
 - Modify: `tests/home-server.nix`
@@ -406,27 +405,29 @@ nix.settings = {
 };
 ```
 
-- [ ] **Step 4: Remove smarthome input completely**
+- [ ] **Step 4: Keep the old smarthome input inert until live proof**
 
-Delete `inputs.smarthome`, remove it from output arguments/special arguments,
-remove every `smarthome.nixosModules.default` import, and run:
+Keep `inputs.smarthome` and its lock entry unchanged in this rollout PR. Confirm
+production and tests no longer import `smarthome.nixosModules.default` or read a
+package from the input:
 
 ```bash
-nix flake lock
-rg -n 'inputs\.smarthome|smarthome\.nixosModules|github:jonathanmoregard/smarthome' flake.nix flake.lock tests modules hosts
+rg -n 'smarthome\.nixosModules|inputs\.smarthome' tests modules hosts flake.nix
 ```
 
-Expected: `rg` exits 1 with no matches. Keep the word `smarthome` for local
-service/deployment names.
+Expected: no module imports or production package reads. Flake argument plumbing
+may remain as an inert migration remnant. Remove the input and lock entry in a
+separate cleanup PR only after live direct-deploy verification.
 
 - [ ] **Step 5: Update test fixtures and gates**
 
 Set a fixture deploy-key path plus stub deploy helper in `tests/home-server.nix`.
-Remove smarthome input imports from `tests/home-server-cd.nix`; preserve existing
-operating-system pull-deploy test unchanged otherwise.
+Confirm Task 1 already removed smarthome input imports from
+`tests/home-server-cd.nix`; preserve the existing operating-system pull-deploy
+test unchanged otherwise.
 
 ```bash
-git add flake.nix flake.lock modules/nixos/home-server-services.nix profiles/home-server-base.nix tests/home-server.nix tests/home-server-cd.nix
+git add flake.nix modules/nixos/home-server-services.nix profiles/home-server-base.nix tests/home-server.nix tests/home-server-cd.nix
 nix eval .#checks.x86_64-linux --apply builtins.attrNames
 nix build --no-link .#checks.x86_64-linux.vm-home-server -L
 nix build --no-link --rebuild .#checks.x86_64-linux.vm-home-server-cd -L
@@ -643,7 +644,7 @@ git commit -m "docs(home-server): operate direct app deployment"
 git push -u origin feat/smarthome-direct-deploy
 gh pr create --base main --head feat/smarthome-direct-deploy \
   --title "feat(home-server): deploy smarthome directly from cache" \
-  --body 'Removes the app source pin, adds signed cache-only package deployment with two-generation rollback, preserves dellan SSH, and proves missing/unsigned/unhealthy releases fail closed in VM tests.'
+  --body 'Adds signed cache-only package deployment with two-generation rollback, preserves dellan SSH, leaves the old source pin inert until live proof, and proves missing/unsigned/unhealthy releases fail closed in VM tests.'
 gh pr checks --watch
 ```
 
