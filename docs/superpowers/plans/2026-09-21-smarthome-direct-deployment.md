@@ -362,7 +362,7 @@ git commit -m "feat(home-server): pull cached smarthome releases"
 - Modify: `tests/home-server.nix`
 - Modify: `tests/home-server-cd.nix`
 
-- [ ] **Step 1: Add red production assertions**
+- [x] **Step 1: Add red production assertions**
 
 Extend home-server contract with:
 
@@ -376,7 +376,7 @@ keepOutputs = config.nix.settings.keep-outputs;
 Assert deploy enabled in test fixture, profile path exact, both retention flags
 false, and `jonathan@dellan` key still present.
 
-- [ ] **Step 2: Compose deployment independently of topology**
+- [x] **Step 2: Compose deployment independently of topology**
 
 Import `smarthome-auto-deploy.nix` from `home-server-services.nix`. Add
 `homeServer.smarthomeDeployKeyFile` as a nullable runtime path. Enable deploy
@@ -391,7 +391,7 @@ services.smarthome-auto-deploy = {
 };
 ```
 
-- [ ] **Step 3: Make disk retention explicit**
+- [x] **Step 3: Make disk retention explicit**
 
 Add to `profiles/home-server-base.nix`:
 
@@ -404,7 +404,7 @@ nix.settings = {
 };
 ```
 
-- [ ] **Step 4: Keep the old smarthome input inert until live proof**
+- [x] **Step 4: Keep the old smarthome input inert until live proof**
 
 Keep `inputs.smarthome` and its lock entry unchanged in this rollout PR. Confirm
 production and tests no longer import `smarthome.nixosModules.default` or read a
@@ -418,7 +418,7 @@ Expected: no module imports or production package reads. Flake argument plumbing
 may remain as an inert migration remnant. Remove the input and lock entry in a
 separate cleanup PR only after live direct-deploy verification.
 
-- [ ] **Step 5: Update test fixtures and gates**
+- [x] **Step 5: Update test fixtures and gates**
 
 Set a fixture deploy-key path plus stub deploy helper in `tests/home-server.nix`.
 Confirm Task 1 already removed smarthome input imports from
@@ -436,7 +436,7 @@ git diff --check
 
 Expected: all pass and check list includes three focused script checks.
 
-- [ ] **Step 6: Commit decoupling**
+- [x] **Step 6: Commit decoupling**
 
 ```bash
 git commit -m "refactor(home-server): decouple smarthome releases"
@@ -486,7 +486,7 @@ nix build --no-link --rebuild .#checks.x86_64-linux.vm-home-server -L
 
 Fix any fixture/module gap at its root, then rerun until PASS.
 
-- [ ] **Step 3: Commit VM proof**
+- [x] **Step 3: Commit VM proof**
 
 ```bash
 git commit -m "test(home-server): prove direct smarthome deployment"
@@ -544,7 +544,7 @@ nix build --no-link .#nixosConfigurations.home-server.config.system.build.toplev
 
 Expected path: `/run/agenix/smarthome-deploy-ssh-key`; build passes.
 
-- [ ] **Step 4: Commit encrypted credential wiring**
+- [x] **Step 4: Commit encrypted credential wiring**
 
 ```bash
 git add hosts/home-server secrets/smarthome-deploy-ssh-key.age secrets/rekeyed/home-server
