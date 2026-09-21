@@ -2,6 +2,8 @@
   # Codex documents hooks as advisory: timeout, crash, malformed output, and
   # MCP hook errors can fail open. Keep the native permission profile as a
   # system requirement that user/project config and CLI flags cannot weaken.
+  # User config selects this profile but must not duplicate its definition;
+  # Codex rejects duplicate managed and loaded profile names.
   environment.etc."codex/requirements.toml".text = ''
     default_permissions = "repos_dev"
     allowed_approval_policies = ["never"]
