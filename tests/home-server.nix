@@ -4,14 +4,104 @@
 { pkgs, inputs }:
 
 let
+  mkFakeAutomation = fixture: pkgs.writeShellApplication {
+    name = "house-automationd";
+    runtimeInputs = [ pkgs.python3 ];
+    text = ''
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --config|--state) shift 2 ;;
+          *) echo "unexpected argument: $1" >&2; exit 64 ;;
+        esac
+      done
+
+      exec python3 -u - <<'PY'
+      from http.server import BaseHTTPRequestHandler, HTTPServer
+
+      class Handler(BaseHTTPRequestHandler):
+          def do_GET(self):
+              if self.path != "/healthz":
+                  self.send_error(404)
+                  return
+              body = b'{"ready":true,"fixture":"${fixture}"}\n'
+              self.send_response(200)
+              self.send_header("Content-Type", "application/json")
+              self.send_header("Content-Length", str(len(body)))
+              self.end_headers()
+              self.wfile.write(body)
+
+          def log_message(self, format, *args):
+              pass
+
+      HTTPServer(("127.0.0.1", 9876), Handler).serve_forever()
+      PY
+    '';
+  };
+  fakeAutomation = mkFakeAutomation "home-server";
+  candidateAutomation = mkFakeAutomation "direct-deploy-v2";
+  brokenAutomation = pkgs.writeShellScriptBin "house-automationd" ''
+    exit 1
+  '';
+  fakeNix = pkgs.writeShellScriptBin "nix" ''
+    set -euo pipefail
+    printf 'nix' >> "$STATE_DIRECTORY/nix-invocations"
+    printf ' %q' "$@" >> "$STATE_DIRECTORY/nix-invocations"
+    printf '\n' >> "$STATE_DIRECTORY/nix-invocations"
+    [ "$#" -eq 12 ]
+    [ "$1" = eval ]
+    [ "$2" = --raw ]
+    [ "$3" = --option ] && [ "$4" = max-jobs ] && [ "$5" = 0 ]
+    [ "$6" = --option ] && [ "$7" = fallback ] && [ "$8" = false ]
+    [ "$9" = --option ] && [ "''${10}" = builders ] && [ -z "''${11}" ]
+    reference=''${12}
+    source=''${reference%%#*}
+    attribute=''${reference#*#}
+    [ "$attribute" = packages.x86_64-linux.default.outPath ]
+    cat "$source/release-path"
+  '';
+  fakeHydrator = pkgs.writeShellScriptBin "smarthome-hydrate-release-paths" ''
+    set -euo pipefail
+    [ "$#" -eq 9 ]
+    [ "$1" = --from ]
+    [ "$3" = --trusted-key ]
+    [ "$5" = --timeout-seconds ] && [ "$6" = 300 ]
+    [ "$7" = --interval ] && [ "$8" = 5 ]
+    case "$9" in
+      ${candidateAutomation}|${brokenAutomation}) ;;
+      *) exit 1 ;;
+    esac
+    test -x "$9/bin/house-automationd"
+    printf '%s\n' "$9" > "$STATE_DIRECTORY/hydrated-path"
+  '';
   productionHardware = import ../hosts/home-server/hardware-configuration.nix {
     config = { };
     lib = pkgs.lib;
     modulesPath = "${pkgs.path}/nixos/modules";
   };
   productionRoot = productionHardware.fileSystems."/";
+  deployWithoutTopology = inputs.nixpkgs.lib.nixosSystem {
+    inherit pkgs;
+    modules = [
+      inputs.agenix.nixosModules.default
+      inputs.agenix-rekey.nixosModules.default
+      ../modules/nixos/home-server-services.nix
+      {
+        documentation.enable = false;
+        fileSystems."/" = {
+          device = "none";
+          fsType = "tmpfs";
+        };
+        homeServer.smarthomeDeployKeyFile = "/run/smarthome-test-key";
+        system.stateVersion = "25.11";
+      }
+    ];
+  };
 in
 
+assert !deployWithoutTopology.config.services.houseAutomation.enable;
+assert deployWithoutTopology.config.services.smarthome-auto-deploy.enable;
+assert deployWithoutTopology.config.services.smarthome-auto-deploy.serviceName == null;
+assert deployWithoutTopology.config.services.smarthome-auto-deploy.healthUrl == null;
 pkgs.testers.runNixOSTest {
   name = "vm-home-server";
   skipTypeCheck = true;
@@ -27,16 +117,18 @@ pkgs.testers.runNixOSTest {
       imports = [
         inputs.agenix.nixosModules.default
         inputs.agenix-rekey.nixosModules.default
-        inputs.smarthome.nixosModules.default
         ../hosts/home-server/default.nix
         ../modules/common.nix
       ];
 
-      disabledModules = [ ../hosts/home-server/hardware-configuration.nix ];
+      disabledModules = [
+        ../hosts/home-server/hardware-configuration.nix
+      ];
       boot.loader.systemd-boot.enable = lib.mkForce false;
       boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
 
       homeServer = {
+        smarthomeDeployKeyFile = lib.mkForce "/run/agenix/smarthome-deploy-key";
         zigbeeSerialPort = "/dev/serial/by-id/usb-simulated-zbdongle-e";
         houseSettings = {
           schema_version = 1;
@@ -160,6 +252,7 @@ pkgs.testers.runNixOSTest {
             > /run/agenix/matrix-synapse-secrets.yaml
           printf '%s\n' 'vm-tellstick-token' > /run/agenix/tellstick-token
           chmod 0400 /run/agenix/tellstick-token
+          install -m 0400 /dev/null /run/agenix/smarthome-deploy-key
         '';
       };
       systemd.services.matrix-synapse = {
@@ -190,12 +283,40 @@ pkgs.testers.runNixOSTest {
         '';
       };
       systemd.services.house-automationd = {
-        requires = [ "fake-zigbee2mqtt-bridge.service" ];
-        after = [ "fake-zigbee2mqtt-bridge.service" ];
+        requires = [
+          "fake-zigbee2mqtt-bridge.service"
+          "home-server-test-smarthome-profile.service"
+        ];
+        after = [
+          "fake-zigbee2mqtt-bridge.service"
+          "home-server-test-smarthome-profile.service"
+        ];
       };
+
+      systemd.services.home-server-test-smarthome-profile = {
+        description = "Install the VM fixture into the stable smarthome profile";
+        before = [ "house-automationd.service" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = ''
+          ${config.nix.package}/bin/nix-env \
+            --profile /nix/var/nix/profiles/smarthome \
+            --set ${fakeAutomation}
+        '';
+      };
+
+      services.smarthome-auto-deploy = {
+        repoUrl = "file:///var/lib/smarthome-smoke-origin.git";
+        nixPackage = fakeNix;
+        hydratorPackage = fakeHydrator;
+      };
+      systemd.timers.smarthome-deploy.wantedBy = lib.mkForce [ ];
 
       environment.systemPackages = with pkgs; [
         curl
+        git
         jq
         mosquitto
       ];
@@ -215,6 +336,8 @@ pkgs.testers.runNixOSTest {
         journalConfig = config.services.journald.extraConfig;
         nixMinFree = config.nix.settings.min-free;
         nixMaxFree = config.nix.settings.max-free;
+        nixKeepDerivations = config.nix.settings.keep-derivations;
+        nixKeepOutputs = config.nix.settings.keep-outputs;
         nixGcAutomatic = config.nix.gc.automatic;
         nixGcDates = config.nix.gc.dates;
         nixGcOptions = config.nix.gc.options;
@@ -225,7 +348,12 @@ pkgs.testers.runNixOSTest {
         deploySecretDeclared = config.age.secrets ? "deploy-ssh-key";
         deployKeyFile = config.homeServer.deployKeyFile;
         autoDeployEnabled = config.services.nixos-auto-deploy.enable;
+        smarthomeDeployEnabled = config.services.smarthome-auto-deploy.enable;
+        smarthomeProfile = config.services.smarthome-auto-deploy.profile;
         automationEnabled = config.services.houseAutomation.enable;
+        automationExecutable = config.services.houseAutomation.executable;
+        automationCondition =
+          config.systemd.services.house-automationd.unitConfig.ConditionFileIsExecutable;
         tellstickEnabled = config.systemd.services.tellstick-mqtt-bridge.wantedBy;
         mqttLocalAcl = (builtins.head config.services.mosquitto.listeners).acl;
         zigbeeEnabled = config.services.zigbee2mqtt.enable;
@@ -269,6 +397,8 @@ pkgs.testers.runNixOSTest {
     assert values["tailnetTcpPorts"] == [22, 8008], values
     assert "Storage=persistent" in values["journalConfig"], values
     assert values["nixMinFree"] < values["nixMaxFree"], values
+    assert values["nixKeepDerivations"] is False, values
+    assert values["nixKeepOutputs"] is False, values
     assert values["nixGcAutomatic"] is True, values
     assert values["nixGcDates"] == ["daily"], values
     assert values["nixGcOptions"] == "--delete-older-than 14d", values
@@ -282,7 +412,15 @@ pkgs.testers.runNixOSTest {
     assert values["deploySecretDeclared"] is True, values
     assert values["deployKeyFile"] == "/run/agenix/deploy-ssh-key", values
     assert values["autoDeployEnabled"] is True, values
+    assert values["smarthomeDeployEnabled"] is True, values
+    assert values["smarthomeProfile"] == "/nix/var/nix/profiles/smarthome", values
     assert values["automationEnabled"] is True, values
+    assert values["automationExecutable"] == (
+        "/nix/var/nix/profiles/smarthome/bin/house-automationd"
+    ), values
+    assert values["automationCondition"] == (
+        "/nix/var/nix/profiles/smarthome/bin/house-automationd"
+    ), values
     assert values["tellstickEnabled"] == ["multi-user.target"], values
     assert values["mqttLocalAcl"] == [
         "topic readwrite zigbee2mqtt/#",
@@ -343,50 +481,119 @@ pkgs.testers.runNixOSTest {
     home_server.fail("systemctl cat matrix-synapse.service | grep -F vm-macaroon-secret")
     home_server.fail("systemctl cat tellstick-mqtt-bridge.service | grep -F vm-tellstick-token")
 
-    # Exercise the real broker/adapter path without a fake device echo. The
-    # daemon must stop scheduling once its bounded retry budget is exhausted.
-    home_server.succeed(
-        """
-        rm -f /tmp/startup-command.json
-        (timeout 10 mosquitto_sub -h 127.0.0.1 -p 1883 -C 1 \
-          -t zigbee2mqtt/test/room/lamp/set > /tmp/startup-command.json) &
-        subscriber=$!
-        sleep 0.2
-        mosquitto_pub -h 127.0.0.1 -p 1883 -q 1 -r \
-          -t zigbee2mqtt/test/room/lamp/availability -m online
-        wait "$subscriber"
-        jq -e '.state == "OFF"' /tmp/startup-command.json
-        """
-    )
-    home_server.succeed(
-        """
-        rm -f /tmp/toggle-command.json
-        (timeout 10 mosquitto_sub -h 127.0.0.1 -p 1883 -C 1 \
-          -t zigbee2mqtt/test/room/lamp/set > /tmp/toggle-command.json) &
-        subscriber=$!
-        sleep 0.2
-        mosquitto_pub -h 127.0.0.1 -p 1883 -q 1 \
-          -t zigbee2mqtt/test/room/control -m '{"action":"toggle"}'
-        wait "$subscriber"
-        jq -e '.state == "ON"' /tmp/toggle-command.json
-        """
-    )
-    home_server.succeed("sleep 16")
-    before = int(home_server.succeed(
-        "journalctl -u house-automationd.service --no-pager -o cat | "
-        "grep -c 'computed device target' || true"
-    ).strip())
-    home_server.succeed("sleep 1")
-    after = int(home_server.succeed(
-        "journalctl -u house-automationd.service --no-pager -o cat | "
-        "grep -c 'computed device target' || true"
-    ).strip())
-    assert after - before <= 1, (before, after)
-
     home_server.succeed("systemctl restart house-automationd.service")
     home_server.wait_until_succeeds(
-        "curl --fail --silent http://127.0.0.1:9876/healthz | jq -e '.ready == true'"
+      "curl --fail --silent http://127.0.0.1:9876/healthz | jq -e '.ready == true'"
     )
+
+    baseline_generations = home_server.succeed(
+        "nix-env --profile /nix/var/nix/profiles/smarthome "
+        "--list-generations | awk '$1 ~ /^[0-9]+$/ { print $1 }'"
+    ).strip().splitlines()
+    assert len(baseline_generations) == 1, baseline_generations
+    home_server.succeed(
+        "git init -q /tmp/smarthome-work "
+        "&& git -C /tmp/smarthome-work config user.email smoke@example.invalid "
+        "&& git -C /tmp/smarthome-work config user.name smarthome-smoke "
+        "&& printf '%s\\n' ${candidateAutomation} > /tmp/smarthome-work/release-path "
+        "&& git -C /tmp/smarthome-work add release-path "
+        "&& git -C /tmp/smarthome-work commit -qm v2 "
+        "&& git -C /tmp/smarthome-work branch -M main "
+        "&& git init -q --bare /var/lib/smarthome-smoke-origin.git "
+        "&& git -C /tmp/smarthome-work remote add origin "
+        "file:///var/lib/smarthome-smoke-origin.git "
+        "&& git -C /tmp/smarthome-work push -q -u origin main"
+    )
+    revision = home_server.succeed(
+        "git -C /tmp/smarthome-work rev-parse HEAD"
+    ).strip()
+    home_server.succeed(
+        "test $(stat -c %a /run/agenix/smarthome-deploy-key) = 400"
+    )
+    home_server.succeed("systemctl start smarthome-deploy.service", timeout=300)
+    home_server.succeed("test -s /var/lib/smarthome-deploy/last-success")
+    home_server.wait_until_succeeds(
+        "curl --fail --silent http://127.0.0.1:9876/healthz "
+        "| jq -e '.fixture == \"direct-deploy-v2\"'",
+        timeout=60,
+    )
+    marker = home_server.succeed(
+        "cat /var/lib/smarthome-deploy/last-success"
+    )
+    print(f"[diag] direct deploy revision={revision} marker={marker!r}")
+    assert f"rev={revision}\n" in marker, marker
+    assert "path=${candidateAutomation}\n" in marker, marker
+    home_server.succeed(
+        "test $(readlink -f /nix/var/nix/profiles/smarthome) "
+        "= ${candidateAutomation}"
+    )
+    home_server.succeed(
+        "test $(cat /var/lib/smarthome-deploy/hydrated-path) "
+        "= ${candidateAutomation}"
+    )
+    home_server.succeed(
+        "grep -F -- '--option max-jobs 0 --option fallback false "
+        "--option builders' /var/lib/smarthome-deploy/nix-invocations"
+    )
+    deployed_generations = home_server.succeed(
+        "nix-env --profile /nix/var/nix/profiles/smarthome "
+        "--list-generations | awk '$1 ~ /^[0-9]+$/ { print $1 }'"
+    ).strip().splitlines()
+    assert len(deployed_generations) == 2, deployed_generations
+
+    home_server.succeed("systemctl start smarthome-deploy.service", timeout=300)
+    replay_generations = home_server.succeed(
+        "nix-env --profile /nix/var/nix/profiles/smarthome "
+        "--list-generations | awk '$1 ~ /^[0-9]+$/ { print $1 }'"
+    ).strip().splitlines()
+    assert replay_generations == deployed_generations, (
+        deployed_generations,
+        replay_generations,
+    )
+
+    home_server.succeed(
+        "printf '%s\\n' ${brokenAutomation} > /tmp/smarthome-work/release-path "
+        "&& git -C /tmp/smarthome-work add release-path "
+        "&& git -C /tmp/smarthome-work commit -qm broken-candidate "
+        "&& git -C /tmp/smarthome-work push -q"
+    )
+    broken_revision = home_server.succeed(
+        "git -C /tmp/smarthome-work rev-parse HEAD"
+    ).strip()
+    home_server.fail("systemctl start smarthome-deploy.service", timeout=300)
+    rollback_marker = home_server.succeed(
+        "cat /var/lib/smarthome-deploy/last-failure"
+    )
+    assert f"rev={broken_revision}\n" in rollback_marker, rollback_marker
+    assert "path=${brokenAutomation}\n" in rollback_marker, rollback_marker
+    assert "rollback=complete\n" in rollback_marker, rollback_marker
+    assert home_server.succeed(
+        "cat /var/lib/smarthome-deploy/last-success"
+    ) == marker
+    home_server.succeed(
+        "test $(readlink -f /nix/var/nix/profiles/smarthome) "
+        "= ${candidateAutomation}"
+    )
+    home_server.wait_until_succeeds(
+        "curl --fail --silent http://127.0.0.1:9876/healthz "
+        "| jq -e '.fixture == \"direct-deploy-v2\"'",
+        timeout=60,
+    )
+    rollback_generations = home_server.succeed(
+        "nix-env --profile /nix/var/nix/profiles/smarthome "
+        "--list-generations | awk '$1 ~ /^[0-9]+$/ { print $1 }'"
+    ).strip().splitlines()
+    assert rollback_generations == deployed_generations, (
+        deployed_generations,
+        rollback_generations,
+    )
+    home_server.succeed("systemctl reset-failed smarthome-deploy.service")
+
+    journal = home_server.succeed(
+        "journalctl -u smarthome-deploy.service --no-pager"
+    )
+    print(f"[diag] direct deploy journal:\n{journal}")
+    assert f"already deployed {revision} at ${candidateAutomation}" in journal, journal
     home_server.succeed("test -z \"$(systemctl --failed --no-legend)\"")
   '';
 }

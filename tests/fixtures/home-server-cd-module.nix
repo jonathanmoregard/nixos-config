@@ -1,10 +1,46 @@
 {
+  config,
   lib,
   modulesPath,
   pkgs,
   ...
 }:
 
+let
+  fakeAutomation = pkgs.writeShellApplication {
+    name = "house-automationd";
+    runtimeInputs = [ pkgs.python3 ];
+    text = ''
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --config|--state) shift 2 ;;
+          *) echo "unexpected argument: $1" >&2; exit 64 ;;
+        esac
+      done
+
+      exec python3 -u - <<'PY'
+      from http.server import BaseHTTPRequestHandler, HTTPServer
+
+      class Handler(BaseHTTPRequestHandler):
+          def do_GET(self):
+              if self.path != "/healthz":
+                  self.send_error(404)
+                  return
+              body = b'{"ready":true,"fixture":"home-server-cd"}\n'
+              self.send_response(200)
+              self.send_header("Content-Type", "application/json")
+              self.send_header("Content-Length", str(len(body)))
+              self.end_headers()
+              self.wfile.write(body)
+
+          def log_message(self, format, *args):
+              pass
+
+      HTTPServer(("127.0.0.1", 9876), Handler).serve_forever()
+      PY
+    '';
+  };
+in
 {
   imports = [
     (modulesPath + "/testing/test-instrumentation.nix")
@@ -136,8 +172,31 @@
     '';
   };
   systemd.services.house-automationd = {
-    requires = [ "fake-zigbee2mqtt-bridge.service" ];
-    after = [ "fake-zigbee2mqtt-bridge.service" ];
+    requires = [
+      "fake-zigbee2mqtt-bridge.service"
+      "home-server-cd-smarthome-profile.service"
+    ];
+    after = [
+      "fake-zigbee2mqtt-bridge.service"
+      "home-server-cd-smarthome-profile.service"
+    ];
+  };
+
+  # This lane tests operating-system pull deployment. Seed a stable app
+  # profile fixture so its health checks stay independent of the dedicated
+  # application-release lane.
+  systemd.services.home-server-cd-smarthome-profile = {
+    description = "Install the OS CD fixture into the stable smarthome profile";
+    before = [ "house-automationd.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    script = ''
+      ${config.nix.package}/bin/nix-env \
+        --profile /nix/var/nix/profiles/smarthome \
+        --set ${fakeAutomation}
+    '';
   };
 
   systemd.tmpfiles.rules = [

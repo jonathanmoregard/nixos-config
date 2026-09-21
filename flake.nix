@@ -293,7 +293,6 @@
         ./modules/common.nix
         agenix.nixosModules.default
         agenix-rekey.nixosModules.default
-        smarthome.nixosModules.default
         { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
       ];
     };
@@ -363,6 +362,28 @@
           homeServerCdSystem = self.nixosConfigurations.home-server-cd.config.system.build.toplevel;
           homeServerCdV2System =
             self.nixosConfigurations.home-server-cd-v2.config.system.build.toplevel;
+        };
+        # Fast direct-evaluation contract for the host-owned automation
+        # service: credentials stay runtime-only and the unit remains hardened.
+        house-automation-service = import ./tests/house-automation-service.nix {
+          pkgs = pkgsLinux;
+          inputs = { inherit nixpkgs; };
+        };
+        smarthome-hydrator =
+          let pkgs = pkgsLinux;
+          in import ./tests/smarthome-hydrator.nix {
+            inherit pkgs;
+            script = ./modules/nixos/smarthome-hydrate-release-paths.sh;
+          };
+        smarthome-activator =
+          let pkgs = pkgsLinux;
+          in import ./tests/smarthome-activator.nix {
+            inherit pkgs;
+            script = ./modules/nixos/smarthome-activate-package.sh;
+          };
+        smarthome-auto-deploy = import ./tests/smarthome-auto-deploy.nix {
+          pkgs = pkgsLinux;
+          inputs = { inherit nixpkgs; };
         };
 
         # Not a VM lane: an eval-time assertion, because that is when the

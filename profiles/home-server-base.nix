@@ -83,6 +83,8 @@
   nix.settings = {
     min-free = lib.mkForce (1024 * 1024 * 1024);
     max-free = lib.mkForce (5 * 1024 * 1024 * 1024);
+    keep-derivations = false;
+    keep-outputs = false;
   };
 
   system.stateVersion = "26.05";
