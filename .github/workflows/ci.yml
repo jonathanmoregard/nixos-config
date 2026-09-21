@@ -197,6 +197,10 @@ jobs:
       # bug on every eval, invisibly, while it took the VM down).
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/check-eval-warnings.sh
+      # Runtime-built local host service credential filtering/hardening
+      # contract; `nix flake check --no-build` only evaluates it.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.house-automation-service -L
       # egress-init offline-resilience contract: runtime-invocation
       # harness for the research-agent guest's egress-init script
       # (tests/egress-init-retry.nix). Tiny runCommand — seconds; lives
