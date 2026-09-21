@@ -179,10 +179,32 @@ let
       mode=$(cat "$encrypted")
       case "$mode" in
         valid)
+          # The client id is public configuration and lives in the Klaffat
+          # repo, not in agenix — the encrypted bundle carries the secret
+          # alone. This is what the real klaffat-env.age has looked like since
+          # the repo split public config out of it.
+          printf '%s\n' \
+            'KLAFFAT_GOOGLE_CLIENT_SECRET=TEST-google-secret' \
+            'UNRELATED_SECRET=must-not-reach-server'
+          ;;
+        legacy-pair)
+          # An older bundle that still carries a matching client id: accepted,
+          # because it agrees with the public configuration.
           printf '%s\n' \
             'KLAFFAT_GOOGLE_CLIENT_ID=TEST-google-client.apps.googleusercontent.com' \
             'KLAFFAT_GOOGLE_CLIENT_SECRET=TEST-google-secret' \
             'UNRELATED_SECRET=must-not-reach-server'
+          ;;
+        mismatched-id)
+          # A bundle whose client id contradicts the repo's public config:
+          # refused, because the two sources disagree about which Google client
+          # this is and guessing would pair a secret with the wrong client.
+          printf '%s\n' \
+            'KLAFFAT_GOOGLE_CLIENT_ID=OTHER-google-client.apps.googleusercontent.com' \
+            'KLAFFAT_GOOGLE_CLIENT_SECRET=TEST-google-secret'
+          ;;
+        secretless)
+          printf '%s\n' 'UNRELATED_SECRET=must-not-reach-server'
           ;;
         malformed)
           printf '%s\n' \
@@ -357,6 +379,7 @@ common.mkMinimalTest {
         "${localGoogleFixture}/target/local-google/debug "
         "${localGoogleFixture}/crates/klaffat-web/static "
         "${localGoogleFixture}/deploy/secrets "
+        "${localGoogleFixture}/deploy/klaffat-demo "
         "${localGoogleFixture}/tests/e2e/fixtures"
     )
     machine.succeed(
@@ -366,6 +389,12 @@ common.mkMinimalTest {
     )
     write_file("${localGoogleFixture}/crates/klaffat-web/static/app.css", "body {}\n")
     write_file("${localGoogleFixture}/deploy/secrets/klaffat-env.age", "valid\n")
+    # Public configuration: the Google client id is not a secret, so the repo
+    # carries it in the clear and agenix holds only the client secret.
+    write_file(
+        "${localGoogleFixture}/deploy/klaffat-demo/public-config.json",
+        '{"oauth": {"googleClientId": "TEST-google-client.apps.googleusercontent.com"}}\n',
+    )
     write_file("${localGoogleFixture}/tests/e2e/fixtures/test-kek", "0123456789abcdef0123456789abcdef")
     machine.succeed("chown -R jonathan:users ${localGoogleFixture}")
     machine.succeed(
@@ -491,7 +520,7 @@ common.mkMinimalTest {
         "${localGoogleFixture}/target/local-google/debug/klaffat"
     )
 
-    for mode in ["malformed", "duplicate", "fail", "hang"]:
+    for mode in ["malformed", "duplicate", "mismatched-id", "secretless", "fail", "hang"]:
         write_file("${localGoogleFixture}/deploy/secrets/klaffat-env.age", mode + "\n")
         machine.succeed(
             "chown jonathan:users ${localGoogleFixture}/deploy/secrets/klaffat-env.age"
