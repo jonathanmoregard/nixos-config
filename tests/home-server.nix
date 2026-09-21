@@ -43,8 +43,29 @@ let
     modulesPath = "${pkgs.path}/nixos/modules";
   };
   productionRoot = productionHardware.fileSystems."/";
+  deployWithoutTopology = inputs.nixpkgs.lib.nixosSystem {
+    inherit pkgs;
+    modules = [
+      inputs.agenix.nixosModules.default
+      inputs.agenix-rekey.nixosModules.default
+      ../modules/nixos/home-server-services.nix
+      {
+        documentation.enable = false;
+        fileSystems."/" = {
+          device = "none";
+          fsType = "tmpfs";
+        };
+        homeServer.smarthomeDeployKeyFile = "/run/smarthome-test-key";
+        system.stateVersion = "25.11";
+      }
+    ];
+  };
 in
 
+assert !deployWithoutTopology.config.services.houseAutomation.enable;
+assert deployWithoutTopology.config.services.smarthome-auto-deploy.enable;
+assert deployWithoutTopology.config.services.smarthome-auto-deploy.serviceName == null;
+assert deployWithoutTopology.config.services.smarthome-auto-deploy.healthUrl == null;
 pkgs.testers.runNixOSTest {
   name = "vm-home-server";
   skipTypeCheck = true;
@@ -69,6 +90,7 @@ pkgs.testers.runNixOSTest {
       boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
 
       homeServer = {
+        smarthomeDeployKeyFile = "/run/agenix/smarthome-deploy-key";
         zigbeeSerialPort = "/dev/serial/by-id/usb-simulated-zbdongle-e";
         houseSettings = {
           schema_version = 1;
@@ -246,6 +268,12 @@ pkgs.testers.runNixOSTest {
         '';
       };
 
+      systemd.services.smarthome-deploy.serviceConfig.ExecStart = lib.mkForce (
+        pkgs.writeShellScript "smarthome-deploy-test-stub" ''
+          exit 0
+        ''
+      );
+
       environment.systemPackages = with pkgs; [
         curl
         jq
@@ -267,6 +295,8 @@ pkgs.testers.runNixOSTest {
         journalConfig = config.services.journald.extraConfig;
         nixMinFree = config.nix.settings.min-free;
         nixMaxFree = config.nix.settings.max-free;
+        nixKeepDerivations = config.nix.settings.keep-derivations;
+        nixKeepOutputs = config.nix.settings.keep-outputs;
         nixGcAutomatic = config.nix.gc.automatic;
         nixGcDates = config.nix.gc.dates;
         nixGcOptions = config.nix.gc.options;
@@ -277,10 +307,12 @@ pkgs.testers.runNixOSTest {
         deploySecretDeclared = config.age.secrets ? "deploy-ssh-key";
         deployKeyFile = config.homeServer.deployKeyFile;
         autoDeployEnabled = config.services.nixos-auto-deploy.enable;
+        smarthomeDeployEnabled = config.services.smarthome-auto-deploy.enable;
+        smarthomeProfile = config.services.smarthome-auto-deploy.profile;
         automationEnabled = config.services.houseAutomation.enable;
         automationExecutable = config.services.houseAutomation.executable;
         automationCondition =
-          config.systemd.services.house-automationd.unitConfig.ConditionPathIsExecutable;
+          config.systemd.services.house-automationd.unitConfig.ConditionFileIsExecutable;
         tellstickEnabled = config.systemd.services.tellstick-mqtt-bridge.wantedBy;
         mqttLocalAcl = (builtins.head config.services.mosquitto.listeners).acl;
         zigbeeEnabled = config.services.zigbee2mqtt.enable;
@@ -324,6 +356,8 @@ pkgs.testers.runNixOSTest {
     assert values["tailnetTcpPorts"] == [22, 8008], values
     assert "Storage=persistent" in values["journalConfig"], values
     assert values["nixMinFree"] < values["nixMaxFree"], values
+    assert values["nixKeepDerivations"] is False, values
+    assert values["nixKeepOutputs"] is False, values
     assert values["nixGcAutomatic"] is True, values
     assert values["nixGcDates"] == ["daily"], values
     assert values["nixGcOptions"] == "--delete-older-than 14d", values
@@ -337,6 +371,8 @@ pkgs.testers.runNixOSTest {
     assert values["deploySecretDeclared"] is True, values
     assert values["deployKeyFile"] == "/run/agenix/deploy-ssh-key", values
     assert values["autoDeployEnabled"] is True, values
+    assert values["smarthomeDeployEnabled"] is True, values
+    assert values["smarthomeProfile"] == "/nix/var/nix/profiles/smarthome", values
     assert values["automationEnabled"] is True, values
     assert values["automationExecutable"] == (
         "/nix/var/nix/profiles/smarthome/bin/house-automationd"

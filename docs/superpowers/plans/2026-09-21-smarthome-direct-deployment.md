@@ -39,7 +39,7 @@ Add these values to `/etc/home-server-contract.json` in `tests/home-server.nix`:
 
 ```nix
 automationExecutable = config.services.houseAutomation.executable;
-automationCondition = config.systemd.services.house-automationd.unitConfig.ConditionPathIsExecutable;
+automationCondition = config.systemd.services.house-automationd.unitConfig.ConditionFileIsExecutable;
 ```
 
 Add assertions:
@@ -82,7 +82,7 @@ stable command:
 }
 
 systemd.services.house-automationd = {
-  unitConfig.ConditionPathIsExecutable = cfg.executable;
+  unitConfig.ConditionFileIsExecutable = cfg.executable;
   serviceConfig.ExecStart = "${cfg.executable} --config ${configFile} --state /var/lib/house-automation/state.sqlite3";
 };
 ```

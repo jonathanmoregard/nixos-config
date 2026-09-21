@@ -48,6 +48,7 @@ in
     ./build-coordination.nix
     ./house-automation-service.nix
     ./nixos-auto-deploy.nix
+    ./smarthome-auto-deploy.nix
   ];
 
   options.homeServer = {
@@ -206,6 +207,17 @@ in
       '';
     };
 
+    smarthomeDeployKeyFile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/agenix/smarthome-deploy-ssh-key";
+      description = ''
+        Runtime path to the repository-specific read-only smarthome deploy
+        key. Supplying it enables direct application deployment independently
+        of the house topology.
+      '';
+    };
+
     adminHashedPasswordFile = mkOption {
       type = types.nullOr types.str;
       default = null;
@@ -283,6 +295,10 @@ in
         {
           assertion = isRuntimePath cfg.deployKeyFile;
           message = "homeServer.deployKeyFile must be an absolute runtime path outside the Nix store";
+        }
+        {
+          assertion = isRuntimePath cfg.smarthomeDeployKeyFile;
+          message = "homeServer.smarthomeDeployKeyFile must be an absolute runtime path outside the Nix store";
         }
         {
           assertion = isRuntimePath cfg.adminHashedPasswordFile;
@@ -436,6 +452,15 @@ in
 
       systemd.services.nixos-deploy.unitConfig.ConditionPathIsDirectory =
         "/etc/nixos/.git";
+    })
+
+    (mkIf (cfg.smarthomeDeployKeyFile != null) {
+      services.smarthome-auto-deploy = {
+        enable = true;
+        deployKeyFile = cfg.smarthomeDeployKeyFile;
+        serviceName = if houseAutomationEnabled then "house-automationd.service" else null;
+        healthUrl = if houseAutomationEnabled then "http://127.0.0.1:9876/healthz" else null;
+      };
     })
 
     (mkIf matrixEnabled {

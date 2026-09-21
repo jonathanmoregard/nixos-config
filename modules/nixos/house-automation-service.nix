@@ -134,7 +134,7 @@ in
       after = [ "network-online.target" ];
 
       unitConfig = {
-        ConditionPathIsExecutable = cfg.executable;
+        ConditionFileIsExecutable = cfg.executable;
         StartLimitIntervalSec = 60;
         StartLimitBurst = 5;
       };

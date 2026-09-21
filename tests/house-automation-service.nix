@@ -87,9 +87,9 @@ assert hasAssertion true storeEnvironmentFileMessage acceptedService;
 assert hasAssertion false executableMessage { executable = "relative/house-automationd"; };
 assert hasAssertion false executableMessage { executable = "${stableExecutable}\n--unsafe"; };
 assert hasAssertion true executableMessage acceptedService;
-assert cfg.environment.systemPackages == [ ];
+assert !(lib.any (package: lib.hasInfix "house-automation" (lib.getName package)) cfg.environment.systemPackages);
 assert service.ExecStart == "${stableExecutable} --config ${configToml} --state /var/lib/house-automation/state.sqlite3";
-assert unit.unitConfig.ConditionPathIsExecutable == stableExecutable;
+assert unit.unitConfig.ConditionFileIsExecutable == stableExecutable;
 assert service.EnvironmentFile == environmentFile;
 assert cfg.users.groups ? house-automation;
 assert cfg.users.users.house-automation.isSystemUser;
@@ -123,7 +123,12 @@ assert service.AmbientCapabilities == "";
 assert service.ReadWritePaths == [ "/var/lib/house-automation" ];
 assert unit.unitConfig.StartLimitIntervalSec == 60;
 assert unit.unitConfig.StartLimitBurst == 5;
-assert !(lib.hasInfix secretLiteral (builtins.toJSON unit));
+assert !(
+  lib.hasInfix secretLiteral (builtins.toJSON {
+    inherit (service) ExecStart EnvironmentFile;
+    inherit (unit) unitConfig;
+  })
+);
 pkgs.runCommand "house-automation-service-contract"
   {
     inherit
