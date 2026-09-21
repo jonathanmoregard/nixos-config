@@ -363,6 +363,12 @@
           homeServerCdV2System =
             self.nixosConfigurations.home-server-cd-v2.config.system.build.toplevel;
         };
+        # Fast direct-evaluation contract for the host-owned automation
+        # service: credentials stay runtime-only and the unit remains hardened.
+        house-automation-service = import ./tests/house-automation-service.nix {
+          pkgs = pkgsLinux;
+          inputs = { inherit nixpkgs; };
+        };
 
         # Not a VM lane: an eval-time assertion, because that is when the
         # fault would land. dellan is the machine holding the root-only
