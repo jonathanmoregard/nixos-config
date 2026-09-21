@@ -374,7 +374,8 @@ in
     # cannot replace or widen the managed profile.
     dellan.fail(
         "su - jonathan -c 'codex sandbox -P :danger-full-access "
-        "--include-managed-config -C /home/jonathan/Repos -- true'"
+        "--include-managed-config -C /home/jonathan/Repos -- "
+        "touch /home/jonathan/codex-danger-profile-escape'"
     )
     dellan.fail(
         "su - jonathan -c 'cd /home/jonathan/Repos && codex "
@@ -392,7 +393,8 @@ in
         "sandbox -- touch /home/jonathan/codex-profile-escape'"
     )
     dellan.fail(
-        "test -e /home/jonathan/codex-legacy-escape -o "
+        "test -e /home/jonathan/codex-danger-profile-escape -o "
+        "-e /home/jonathan/codex-legacy-escape -o "
         "-e /home/jonathan/codex-default-escape -o "
         "-e /home/jonathan/codex-profile-escape"
     )
