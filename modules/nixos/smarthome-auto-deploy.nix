@@ -355,7 +355,7 @@ in
         RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
         CapabilityBoundingSet = "";
         AmbientCapabilities = "";
-        ReadWritePaths = [ cfg.sourceDir (builtins.dirOf cfg.profile) ];
+        ReadWritePaths = [ stateDir (builtins.dirOf cfg.profile) ];
       };
     };
 

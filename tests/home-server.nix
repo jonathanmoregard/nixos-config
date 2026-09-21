@@ -4,7 +4,7 @@
 { pkgs, inputs }:
 
 let
-  fakeAutomation = pkgs.writeShellApplication {
+  mkFakeAutomation = fixture: pkgs.writeShellApplication {
     name = "house-automationd";
     runtimeInputs = [ pkgs.python3 ];
     text = ''
@@ -23,7 +23,7 @@ let
               if self.path != "/healthz":
                   self.send_error(404)
                   return
-              body = b'{"ready":true,"fixture":"home-server"}\n'
+              body = b'{"ready":true,"fixture":"${fixture}"}\n'
               self.send_response(200)
               self.send_header("Content-Type", "application/json")
               self.send_header("Content-Length", str(len(body)))
@@ -37,6 +37,36 @@ let
       PY
     '';
   };
+  fakeAutomation = mkFakeAutomation "home-server";
+  candidateAutomation = mkFakeAutomation "direct-deploy-v2";
+  fakeNix = pkgs.writeShellScriptBin "nix" ''
+    set -euo pipefail
+    printf 'nix' >> "$STATE_DIRECTORY/nix-invocations"
+    printf ' %q' "$@" >> "$STATE_DIRECTORY/nix-invocations"
+    printf '\n' >> "$STATE_DIRECTORY/nix-invocations"
+    [ "$#" -eq 12 ]
+    [ "$1" = eval ]
+    [ "$2" = --raw ]
+    [ "$3" = --option ] && [ "$4" = max-jobs ] && [ "$5" = 0 ]
+    [ "$6" = --option ] && [ "$7" = fallback ] && [ "$8" = false ]
+    [ "$9" = --option ] && [ "''${10}" = builders ] && [ -z "''${11}" ]
+    reference=''${12}
+    source=''${reference%%#*}
+    attribute=''${reference#*#}
+    [ "$attribute" = packages.x86_64-linux.default.outPath ]
+    cat "$source/release-path"
+  '';
+  fakeHydrator = pkgs.writeShellScriptBin "smarthome-hydrate-release-paths" ''
+    set -euo pipefail
+    [ "$#" -eq 9 ]
+    [ "$1" = --from ]
+    [ "$3" = --trusted-key ]
+    [ "$5" = --timeout-seconds ] && [ "$6" = 300 ]
+    [ "$7" = --interval ] && [ "$8" = 5 ]
+    [ "$9" = ${candidateAutomation} ]
+    test -x "$9/bin/house-automationd"
+    printf '%s\n' "$9" > "$STATE_DIRECTORY/hydrated-path"
+  '';
   productionHardware = import ../hosts/home-server/hardware-configuration.nix {
     config = { };
     lib = pkgs.lib;
@@ -85,12 +115,14 @@ pkgs.testers.runNixOSTest {
         ../modules/common.nix
       ];
 
-      disabledModules = [ ../hosts/home-server/hardware-configuration.nix ];
+      disabledModules = [
+        ../hosts/home-server/hardware-configuration.nix
+      ];
       boot.loader.systemd-boot.enable = lib.mkForce false;
       boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
 
       homeServer = {
-        smarthomeDeployKeyFile = "/run/agenix/smarthome-deploy-key";
+        smarthomeDeployKeyFile = lib.mkForce "/run/agenix/smarthome-deploy-key";
         zigbeeSerialPort = "/dev/serial/by-id/usb-simulated-zbdongle-e";
         houseSettings = {
           schema_version = 1;
@@ -214,6 +246,7 @@ pkgs.testers.runNixOSTest {
             > /run/agenix/matrix-synapse-secrets.yaml
           printf '%s\n' 'vm-tellstick-token' > /run/agenix/tellstick-token
           chmod 0400 /run/agenix/tellstick-token
+          install -m 0400 /dev/null /run/agenix/smarthome-deploy-key
         '';
       };
       systemd.services.matrix-synapse = {
@@ -268,14 +301,16 @@ pkgs.testers.runNixOSTest {
         '';
       };
 
-      systemd.services.smarthome-deploy.serviceConfig.ExecStart = lib.mkForce (
-        pkgs.writeShellScript "smarthome-deploy-test-stub" ''
-          exit 0
-        ''
-      );
+      services.smarthome-auto-deploy = {
+        repoUrl = "file:///var/lib/smarthome-smoke-origin.git";
+        nixPackage = fakeNix;
+        hydratorPackage = fakeHydrator;
+      };
+      systemd.timers.smarthome-deploy.wantedBy = lib.mkForce [ ];
 
       environment.systemPackages = with pkgs; [
         curl
+        git
         jq
         mosquitto
       ];
@@ -442,8 +477,78 @@ pkgs.testers.runNixOSTest {
 
     home_server.succeed("systemctl restart house-automationd.service")
     home_server.wait_until_succeeds(
-        "curl --fail --silent http://127.0.0.1:9876/healthz | jq -e '.ready == true'"
+      "curl --fail --silent http://127.0.0.1:9876/healthz | jq -e '.ready == true'"
     )
+
+    baseline_generations = home_server.succeed(
+        "nix-env --profile /nix/var/nix/profiles/smarthome "
+        "--list-generations | awk '$1 ~ /^[0-9]+$/ { print $1 }'"
+    ).strip().splitlines()
+    assert len(baseline_generations) == 1, baseline_generations
+    home_server.succeed(
+        "git init -q /tmp/smarthome-work "
+        "&& git -C /tmp/smarthome-work config user.email smoke@example.invalid "
+        "&& git -C /tmp/smarthome-work config user.name smarthome-smoke "
+        "&& printf '%s\\n' ${candidateAutomation} > /tmp/smarthome-work/release-path "
+        "&& git -C /tmp/smarthome-work add release-path "
+        "&& git -C /tmp/smarthome-work commit -qm v2 "
+        "&& git -C /tmp/smarthome-work branch -M main "
+        "&& git init -q --bare /var/lib/smarthome-smoke-origin.git "
+        "&& git -C /tmp/smarthome-work remote add origin "
+        "file:///var/lib/smarthome-smoke-origin.git "
+        "&& git -C /tmp/smarthome-work push -q -u origin main"
+    )
+    revision = home_server.succeed(
+        "git -C /tmp/smarthome-work rev-parse HEAD"
+    ).strip()
+    home_server.succeed(
+        "test $(stat -c %a /run/agenix/smarthome-deploy-key) = 400"
+    )
+    home_server.succeed("systemctl start smarthome-deploy.service", timeout=300)
+    home_server.succeed("test -s /var/lib/smarthome-deploy/last-success")
+    home_server.wait_until_succeeds(
+        "curl --fail --silent http://127.0.0.1:9876/healthz "
+        "| jq -e '.fixture == \"direct-deploy-v2\"'",
+        timeout=60,
+    )
+    marker = home_server.succeed(
+        "cat /var/lib/smarthome-deploy/last-success"
+    )
+    print(f"[diag] direct deploy revision={revision} marker={marker!r}")
+    assert f"rev={revision}\n" in marker, marker
+    assert "path=${candidateAutomation}\n" in marker, marker
+    home_server.succeed(
+        "test $(readlink -f /nix/var/nix/profiles/smarthome) "
+        "= ${candidateAutomation}"
+    )
+    home_server.succeed(
+        "test $(cat /var/lib/smarthome-deploy/hydrated-path) "
+        "= ${candidateAutomation}"
+    )
+    home_server.succeed(
+        "grep -F -- '--option max-jobs 0 --option fallback false "
+        "--option builders' /var/lib/smarthome-deploy/nix-invocations"
+    )
+    deployed_generations = home_server.succeed(
+        "nix-env --profile /nix/var/nix/profiles/smarthome "
+        "--list-generations | awk '$1 ~ /^[0-9]+$/ { print $1 }'"
+    ).strip().splitlines()
+    assert len(deployed_generations) == 2, deployed_generations
+
+    home_server.succeed("systemctl start smarthome-deploy.service", timeout=300)
+    replay_generations = home_server.succeed(
+        "nix-env --profile /nix/var/nix/profiles/smarthome "
+        "--list-generations | awk '$1 ~ /^[0-9]+$/ { print $1 }'"
+    ).strip().splitlines()
+    assert replay_generations == deployed_generations, (
+        deployed_generations,
+        replay_generations,
+    )
+    journal = home_server.succeed(
+        "journalctl -u smarthome-deploy.service --no-pager"
+    )
+    print(f"[diag] direct deploy journal:\n{journal}")
+    assert f"already deployed {revision} at ${candidateAutomation}" in journal, journal
     home_server.succeed("test -z \"$(systemctl --failed --no-legend)\"")
   '';
 }

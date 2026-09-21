@@ -21,8 +21,7 @@
 - `hosts/home-server/{default,deployment-identity}.nix`: encrypted app deploy key declaration and wiring.
 - `tests/smarthome-hydrator.nix`: real signed/unsigned/missing cache harness.
 - `tests/smarthome-activator.nix`: success, rollback, markers, and generation-pruning harness.
-- `tests/home-server-smarthome-cd.nix`: two-node package release VM lane.
-- `tests/home-server.nix`: host integration contract without app source dependency.
+- `tests/home-server.nix`: host integration plus one-node production-systemd smoke.
 - `flake.nix`: expose new checks while retaining the inert smarthome input until post-deploy cleanup.
 - `docs/home-server/README.md`: operations, disk use, rollback, and credential boundaries.
 
@@ -443,62 +442,49 @@ Expected: all pass and check list includes three focused script checks.
 git commit -m "refactor(home-server): decouple smarthome releases"
 ```
 
-### Task 6: Prove cache-only release upgrade and rollback in a VM
+### Task 6: Prove production systemd wiring in a lean VM
 
 **Files:**
-- Create: `tests/home-server-smarthome-cd.nix`
-- Modify: `flake.nix`
+- Modify: `tests/home-server.nix`
 
-- [ ] **Step 1: Add two-node release test**
+- [x] **Step 1: Add one-node systemd smoke**
 
-Create a `cache` node serving a test binary cache and a `home-server` node using
-production service/deploy modules. Produce healthy v1, unhealthy v2, and healthy
-v3 fixture packages. Candidate package paths must not be present in target store
-before deployment. Test sequence:
+Extend the existing production-shaped `vm-home-server` lane. Boot with healthy
+v1 already in the stable profile, then use the production auto-deploy service,
+sandbox, and activator to move to healthy v2 from a local Git origin. Replace
+only the already-focused boundaries (Nix evaluation and cache hydration) with
+deterministic test packages. Test sequence:
 
 ```python
-home_server.fail("nix path-info <v1-path>")
-publish_signed("v1")
-advance_main("v1")
-deploy_success()
-assert_health("v1")
-assert_profile_generations(1)
-
-advance_main("missing")
-deploy_failure("not available")
-assert_health("v1")
-
-publish_unsigned("v2")
-advance_main("v2")
-deploy_failure("signature")
-assert_health("v1")
-
-publish_signed("v2")
-deploy_failure("previous package restored")
-assert_health("v1")
-
-publish_signed("v3")
-advance_main("v3")
-deploy_success()
-assert_health("v3")
-assert_profile_generations(2)
+home_server.wait_for_unit("multi-user.target")
+home_server.succeed("systemctl start smarthome-deploy.service")
+home_server.wait_until_succeeds("curl -fsS http://127.0.0.1:9876/healthz | jq -e '.fixture == \"direct-deploy-v2\"'")
+home_server.succeed("test -s /var/lib/smarthome-deploy/last-success")
+home_server.succeed("test $(nix-env --profile /nix/var/nix/profiles/smarthome --list-generations | wc -l) -eq 2")
+home_server.succeed("systemctl start smarthome-deploy.service")
+home_server.succeed("journalctl -u smarthome-deploy.service | grep -F 'already deployed'")
+home_server.succeed("test -z \"$(systemctl --failed --no-legend)\"")
 ```
 
-Inspect journal and Nix logs to assert no `building` line and no derivation was
-realized on target. Assert `nix show-config` reports `keep-derivations = false`
-and `keep-outputs = false`.
+Also assert the deploy key is mode 0400 and the fixture evaluator receives
+`max-jobs=0`, `fallback=false`, and empty builders. Keep test boundary explicit:
+the focused hydrator harness already proves real signed/unsigned/missing cache
+behavior in an isolated store; the focused activator harness already proves
+health rollback and two-generation pruning. Repeating those cases behind a
+bespoke TLS cache would add runtime, not new coverage.
 
-- [ ] **Step 2: Wire and prove red then green**
+- [x] **Step 2: Prove red then green**
 
-Add `vm-home-server-smarthome-cd` to checks. Stage before every flake run.
+Add the runtime assertions while the old deploy stub remains and record their
+failure. Then replace the stub with deterministic evaluator/hydrator fixtures.
+Stage before every flake run.
 
 ```bash
-git add tests/home-server-smarthome-cd.nix flake.nix
-nix build --no-link --rebuild .#checks.x86_64-linux.vm-home-server-smarthome-cd -L
+git add tests/home-server.nix
+nix build --no-link --rebuild .#checks.x86_64-linux.vm-home-server -L
 ```
 
-First behavioral run should expose any fixture/module gap. Fix root causes in
-production scripts, then rerun until PASS.
+Fix any fixture/module gap at its root, then rerun until PASS.
 
 - [ ] **Step 3: Commit VM proof**
 
@@ -514,14 +500,14 @@ git commit -m "test(home-server): prove direct smarthome deployment"
 - Modify: `hosts/home-server/default.nix`
 - Modify: `hosts/home-server/deployment-identity.nix`
 
-- [ ] **Step 1: Obtain explicit credential authorization**
+- [x] **Step 1: Obtain explicit credential authorization**
 
 Pause before generating or uploading a new SSH credential. Ask one question:
 permission to create a repository-specific read-only smarthome deploy key,
 encrypt its private half through agenix-rekey, and upload only its public half
 to GitHub.
 
-- [ ] **Step 2: Generate without writing plaintext into repository**
+- [x] **Step 2: Generate without writing plaintext into repository**
 
 ```bash
 key_dir="$(mktemp -d)"
@@ -541,7 +527,7 @@ rmdir "$key_dir"
 Expected: GitHub returns `read_only: true`; repository contains only encrypted
 source/rekeyed files.
 
-- [ ] **Step 3: Wire runtime key**
+- [x] **Step 3: Wire runtime key**
 
 Add to `hosts/home-server/deployment-identity.nix`:
 
@@ -570,7 +556,7 @@ git commit -m "secret(home-server): add smarthome deploy identity"
 **Files:**
 - Modify: `docs/home-server/README.md`
 
-- [ ] **Step 1: Document operating commands**
+- [x] **Step 1: Document operating commands**
 
 Add exact commands for status, on-demand deployment, active commit/path,
 generations, failure diagnostics, manual rollback, retry, Cachix availability,
@@ -601,7 +587,6 @@ nix build --no-link .#checks.x86_64-linux.smarthome-hydrator -L
 nix build --no-link .#checks.x86_64-linux.smarthome-activator -L
 nix build --no-link .#checks.x86_64-linux.smarthome-auto-deploy -L
 nix build --no-link .#checks.x86_64-linux.vm-home-server -L
-nix build --no-link --rebuild .#checks.x86_64-linux.vm-home-server-smarthome-cd -L
 nix build --no-link --rebuild .#checks.x86_64-linux.vm-home-server-cd -L
 nix build --no-link .#nixosConfigurations.home-server.config.system.build.toplevel -L
 git diff --check
@@ -614,7 +599,7 @@ Expected: all pass.
 Run:
 
 ```bash
-nix build .#checks.x86_64-linux.vm-home-server-smarthome-cd.driverInteractive \
+nix build .#checks.x86_64-linux.vm-home-server.driverInteractive \
   -o result-smarthome-interactive
 ./result-smarthome-interactive/bin/nixos-test-driver
 ```
@@ -625,7 +610,7 @@ At the driver prompt execute:
 start_all()
 home_server.wait_for_unit("multi-user.target")
 home_server.succeed("systemctl start smarthome-deploy.service", timeout=300)
-home_server.wait_until_succeeds("curl -fsS http://127.0.0.1:9876/healthz", timeout=60)
+home_server.wait_until_succeeds("curl -fsS http://127.0.0.1:9876/healthz | jq -e '.fixture == \"direct-deploy-v2\"'", timeout=60)
 print(home_server.succeed("cat /var/lib/smarthome-deploy/last-success"))
 print(home_server.succeed("nix-env --profile /nix/var/nix/profiles/smarthome --list-generations"))
 home_server.succeed("systemctl start smarthome-deploy.service", timeout=300)
