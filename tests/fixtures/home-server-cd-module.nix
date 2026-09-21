@@ -14,7 +14,10 @@
   # Candidate generations run on the NixOS test disk, not the future Wyse
   # installation. Keep its ext4 label contract and explicitly retain test
   # instrumentation so a real switch leaves the serial backdoor observable.
-  disabledModules = [ ../../hosts/home-server/hardware-configuration.nix ];
+  disabledModules = [
+    ../../hosts/home-server/hardware-configuration.nix
+    ../../hosts/home-server/deployment-identity.nix
+  ];
   boot.loader.systemd-boot.enable = lib.mkForce false;
   boot.loader.grub.enable = lib.mkForce false;
   boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
@@ -97,6 +100,10 @@
       ];
     };
   };
+
+  # Keep this synthetic target out of per-host local ciphertext storage. Its
+  # fixture key is created below and no agenix secret is consumed at runtime.
+  age.rekey.storageMode = lib.mkForce "derivation";
 
   # The production composition selects home-server. This fixture is an
   # extended generation in the same flake and changes only the deploy target.
