@@ -39,6 +39,9 @@ let
   };
   fakeAutomation = mkFakeAutomation "home-server";
   candidateAutomation = mkFakeAutomation "direct-deploy-v2";
+  brokenAutomation = pkgs.writeShellScriptBin "house-automationd" ''
+    exit 1
+  '';
   fakeNix = pkgs.writeShellScriptBin "nix" ''
     set -euo pipefail
     printf 'nix' >> "$STATE_DIRECTORY/nix-invocations"
@@ -63,7 +66,10 @@ let
     [ "$3" = --trusted-key ]
     [ "$5" = --timeout-seconds ] && [ "$6" = 300 ]
     [ "$7" = --interval ] && [ "$8" = 5 ]
-    [ "$9" = ${candidateAutomation} ]
+    case "$9" in
+      ${candidateAutomation}|${brokenAutomation}) ;;
+      *) exit 1 ;;
+    esac
     test -x "$9/bin/house-automationd"
     printf '%s\n' "$9" > "$STATE_DIRECTORY/hydrated-path"
   '';
@@ -544,6 +550,45 @@ pkgs.testers.runNixOSTest {
         deployed_generations,
         replay_generations,
     )
+
+    home_server.succeed(
+        "printf '%s\\n' ${brokenAutomation} > /tmp/smarthome-work/release-path "
+        "&& git -C /tmp/smarthome-work add release-path "
+        "&& git -C /tmp/smarthome-work commit -qm broken-candidate "
+        "&& git -C /tmp/smarthome-work push -q"
+    )
+    broken_revision = home_server.succeed(
+        "git -C /tmp/smarthome-work rev-parse HEAD"
+    ).strip()
+    home_server.fail("systemctl start smarthome-deploy.service", timeout=300)
+    rollback_marker = home_server.succeed(
+        "cat /var/lib/smarthome-deploy/last-failure"
+    )
+    assert f"rev={broken_revision}\n" in rollback_marker, rollback_marker
+    assert "path=${brokenAutomation}\n" in rollback_marker, rollback_marker
+    assert "rollback=complete\n" in rollback_marker, rollback_marker
+    assert home_server.succeed(
+        "cat /var/lib/smarthome-deploy/last-success"
+    ) == marker
+    home_server.succeed(
+        "test $(readlink -f /nix/var/nix/profiles/smarthome) "
+        "= ${candidateAutomation}"
+    )
+    home_server.wait_until_succeeds(
+        "curl --fail --silent http://127.0.0.1:9876/healthz "
+        "| jq -e '.fixture == \"direct-deploy-v2\"'",
+        timeout=60,
+    )
+    rollback_generations = home_server.succeed(
+        "nix-env --profile /nix/var/nix/profiles/smarthome "
+        "--list-generations | awk '$1 ~ /^[0-9]+$/ { print $1 }'"
+    ).strip().splitlines()
+    assert rollback_generations == deployed_generations, (
+        deployed_generations,
+        rollback_generations,
+    )
+    home_server.succeed("systemctl reset-failed smarthome-deploy.service")
+
     journal = home_server.succeed(
         "journalctl -u smarthome-deploy.service --no-pager"
     )

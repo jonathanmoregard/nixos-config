@@ -62,10 +62,26 @@ mkdir -p -- "$state_dir" "$(dirname -- "$profile")" || die 'could not create sta
 chmod 0700 "$state_dir" || die 'could not secure state directory'
 
 old_path=none
+old_generation=
+declare -a original_generations=()
+generations_before=$(nix-env --profile "$profile" --list-generations) || \
+  die 'could not list profile generations before activation'
+while IFS= read -r line; do
+  read -r number _ <<< "$line"
+  [[ "$number" =~ ^[0-9]+$ ]] || continue
+  original_generations+=("$number")
+  if [[ "$line" == *'(current)'* ]]; then
+    [ -z "$old_generation" ] || die 'profile has multiple current generations'
+    old_generation=$number
+  fi
+done <<< "$generations_before"
 if [ -e "$profile" ] || [ -L "$profile" ]; then
   old_path=$(readlink -f -- "$profile") || die 'could not resolve current profile'
   is_store_path "$old_path" || die 'current profile does not resolve to a store path'
   [ -x "$old_path/bin/house-automationd" ] || die 'current profile has no executable bin/house-automationd'
+  [ -n "$old_generation" ] || die 'current profile has no active generation'
+elif [ -n "$old_generation" ]; then
+  die 'profile has an active generation but no current profile link'
 fi
 
 transaction_started=0
@@ -122,17 +138,47 @@ restart_and_check() {
 }
 
 rollback_profile() {
-  local rollback_ok=0
+  local rollback_ok=0 profile_restored=0
   if [ "$old_path" = none ]; then
-    rm -f -- "$profile" || rollback_ok=1
+    if rm -f -- "$profile"; then
+      profile_restored=1
+    else
+      rollback_ok=1
+    fi
   else
-    nix-env --profile "$profile" --set "$old_path" > /dev/null || rollback_ok=1
+    if nix-env --profile "$profile" --switch-generation "$old_generation" > /dev/null; then
+      profile_restored=1
+    else
+      rollback_ok=1
+    fi
   fi
-  if [ "$service" != - ]; then
+  if [ "$profile_restored" -eq 1 ] && [ "$service" != - ]; then
+    systemctl reset-failed "$service" || rollback_ok=1
     systemctl restart "$service" || rollback_ok=1
     health_check || rollback_ok=1
   fi
+  if [ "$profile_restored" -eq 1 ]; then
+    remove_new_generations || rollback_ok=1
+  fi
   return "$rollback_ok"
+}
+
+remove_new_generations() {
+  local generations_output line number original found
+  local -a delete_generations=()
+  generations_output=$(nix-env --profile "$profile" --list-generations) || return 1
+  while IFS= read -r line; do
+    read -r number _ <<< "$line"
+    [[ "$number" =~ ^[0-9]+$ ]] || continue
+    found=0
+    for original in "${original_generations[@]}"; do
+      [ "$number" = "$original" ] && found=1
+    done
+    [ "$found" -eq 1 ] || delete_generations+=("$number")
+  done <<< "$generations_output"
+  if [ "${#delete_generations[@]}" -gt 0 ]; then
+    nix-env --profile "$profile" --delete-generations "${delete_generations[@]}" > /dev/null
+  fi
 }
 
 write_failure_marker() {

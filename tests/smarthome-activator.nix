@@ -22,6 +22,21 @@ let
     printf ' %q' "$@" >> "$ACTIVATOR_TEST_LOG"
     printf '\n' >> "$ACTIVATOR_TEST_LOG"
     current=$(readlink -f "$ACTIVATOR_TEST_PROFILE" || true)
+    if [ "''${1:-}" = reset-failed ] && \
+       [ -n "''${ACTIVATOR_TEST_START_LIMIT_SENTINEL:-}" ]; then
+      rm -f "$ACTIVATOR_TEST_START_LIMIT_SENTINEL"
+      exit 0
+    fi
+    if [ "''${1:-}" = restart ] && \
+       [ "''${ACTIVATOR_TEST_START_LIMIT_PATH:-}" = "$current" ]; then
+      touch "$ACTIVATOR_TEST_START_LIMIT_SENTINEL"
+      exit 0
+    fi
+    if [ "''${1:-}" = restart ] && \
+       [ -n "''${ACTIVATOR_TEST_START_LIMIT_SENTINEL:-}" ] && \
+       [ -e "$ACTIVATOR_TEST_START_LIMIT_SENTINEL" ]; then
+      exit 1
+    fi
     if [ "''${ACTIVATOR_TEST_SIGNAL_PATH:-}" = "$current" ] && \
        [ ! -e "$ACTIVATOR_TEST_SIGNAL_SENTINEL" ]; then
       touch "$ACTIVATOR_TEST_SIGNAL_SENTINEL"
@@ -102,6 +117,19 @@ let
           printf '%s 2026-09-21 00:00:00%s\n' "$generation" "$suffix"
         done < "$ACTIVATOR_TEST_GENERATIONS"
         ;;
+      --switch-generation)
+        [ "$#" -eq 1 ] || exit 64
+        requested_generation=$1
+        found=0
+        while IFS= read -r generation; do
+          [ "$generation" = "$requested_generation" ] && found=1
+        done < "$ACTIVATOR_TEST_GENERATIONS"
+        [ "$found" -eq 1 ] || exit 1
+        generation_link="$profile-$requested_generation-link"
+        temporary_link="$profile.tmp.$$"
+        ln -s "$generation_link" "$temporary_link"
+        mv -Tf "$temporary_link" "$profile"
+        ;;
       --delete-generations)
         [ "$#" -gt 0 ] || exit 64
         temporary_generations="$ACTIVATOR_TEST_GENERATIONS.tmp"
@@ -140,6 +168,7 @@ pkgs.runCommand "smarthome-activator-harness"
     STUB_DIR="$PWD/stubs"
     TEST_LOG="$PWD/activator.log"
     SIGNAL_SENTINEL="$PWD/signal-sent"
+    START_LIMIT_SENTINEL="$PWD/start-limit-exhausted"
     mkdir -p "$HOME" "$STATE_DIR" "$(dirname "$PROFILE")" "$STUB_DIR"
     ln -s ${systemctlStub} "$STUB_DIR/systemctl"
     ln -s ${curlStub} "$STUB_DIR/curl"
@@ -208,12 +237,37 @@ pkgs.runCommand "smarthome-activator-harness"
 
     # Candidate starts but never becomes healthy: restore v1 and leave the
     # successful release marker untouched.
+    generations_before_unhealthy=$(cat "$ACTIVATOR_TEST_GENERATIONS")
     expect_failure unhealthy activate ${v2} "$REV2"
     assert_profile ${v1}
     assert_success_marker "$REV1" ${v1} none
     grep -qxF "rev=$REV2" "$STATE_DIR/last-failure"
     grep -qxF "path=${v2}" "$STATE_DIR/last-failure"
     grep -qxF 'rollback=complete' "$STATE_DIR/last-failure"
+    if ! diff -u \
+      <(printf '%s\n' "$generations_before_unhealthy") \
+      "$ACTIVATOR_TEST_GENERATIONS"; then
+      nix-env --profile "$PROFILE" --list-generations >&2
+      echo 'FAIL(failed-generations): failed activation changed generation set' >&2
+      exit 1
+    fi
+
+    # A crashing candidate can exhaust systemd's start limit while health is
+    # polled. Rollback must clear that limit before restarting the stable unit.
+    export ACTIVATOR_TEST_START_LIMIT_PATH=${v2}
+    export ACTIVATOR_TEST_START_LIMIT_SENTINEL="$START_LIMIT_SENTINEL"
+    expect_failure start-limit activate ${v2} "$REV2"
+    unset ACTIVATOR_TEST_START_LIMIT_PATH ACTIVATOR_TEST_START_LIMIT_SENTINEL
+    assert_profile ${v1}
+    grep -qxF 'rollback=complete' "$STATE_DIR/last-failure" || {
+      cat "$STATE_DIR/last-failure" >&2
+      echo 'FAIL(start-limit): stable service restart was rate-limited' >&2
+      exit 1
+    }
+    [ ! -e "$START_LIMIT_SENTINEL" ] || {
+      echo 'FAIL(start-limit): rollback left service start limit exhausted' >&2
+      exit 1
+    }
 
     # Restart failure follows the same rollback path.
     export ACTIVATOR_TEST_RESTART_FAILURE_PATH=${v3}

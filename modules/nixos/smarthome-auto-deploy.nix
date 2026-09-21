@@ -335,7 +335,7 @@ in
         StateDirectoryMode = "0700";
         RuntimeDirectory = "smarthome-deploy";
         RuntimeDirectoryMode = "0700";
-        TimeoutStartSec = "infinity";
+        TimeoutStartSec = "10min";
         UMask = "0077";
         NoNewPrivileges = true;
         PrivateTmp = true;

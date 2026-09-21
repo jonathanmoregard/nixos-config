@@ -104,7 +104,7 @@ in
 assert service.StateDirectory == "smarthome-deploy";
 assert service.StateDirectoryMode == "0700";
 assert service.RuntimeDirectory == "smarthome-deploy";
-assert service.TimeoutStartSec == "infinity";
+assert service.TimeoutStartSec == "10min";
 assert service.User == "root";
 assert service.Group == "root";
 assert !(unit.environment ? GIT_SSH_COMMAND);
