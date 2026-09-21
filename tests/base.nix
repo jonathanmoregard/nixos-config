@@ -305,6 +305,100 @@ in
         "systemctl --user stop ai-client-config-codex-sync.timer'"
     )
 
+    # Codex hooks are advisory and fail open on timeout/error. The managed
+    # native profile must therefore be the machine-enforced floor; user,
+    # project, and CLI settings cannot widen it.
+    codex_requirements = dellan.succeed(
+        "cat /etc/codex/requirements.toml"
+    )
+    assert 'allowed_sandbox_modes' not in codex_requirements
+    assert 'default_permissions = "repos_dev"' in codex_requirements
+    assert 'allowed_approval_policies = ["never"]' in codex_requirements
+    assert 'allow_managed_hooks_only = true' in codex_requirements
+    assert '[allowed_permission_profiles]' in codex_requirements
+    assert 'repos_dev = true' in codex_requirements
+    assert '[permissions.repos_dev]' in codex_requirements
+    assert 'extends = ":workspace"' in codex_requirements
+    assert '[permissions.repos_dev.workspace_roots]' in codex_requirements
+    assert '"/home/jonathan/Repos" = true' in codex_requirements
+    assert '"/home/jonathan/worktrees" = true' in codex_requirements
+    assert '[permissions.repos_dev.filesystem]' in codex_requirements
+    assert '"/home/jonathan/.local/state/ai-router" = "write"' in codex_requirements
+    assert '[features]' in codex_requirements
+    assert 'hooks = true' in codex_requirements
+
+    # Exact broad source roots work without prompts.
+    dellan.succeed("install -d -o jonathan -g users /home/jonathan/Repos")
+    dellan.succeed("install -d -o jonathan -g users /home/jonathan/worktrees")
+    dellan.succeed(
+        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
+        "-C /home/jonathan/Repos -- touch /home/jonathan/Repos/profile-write'"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
+        "-C /home/jonathan/worktrees -- touch /home/jonathan/worktrees/profile-write'"
+    )
+
+    # Home outside explicit roots stays read-only.
+    dellan.fail(
+        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
+        "-C /home/jonathan/Repos -- touch /home/jonathan/codex-policy-escape'"
+    )
+    dellan.fail("test -e /home/jonathan/codex-policy-escape")
+
+    # :workspace protection covers normal and linked-worktree metadata even
+    # though their source trees live below broad writable roots.
+    dellan.succeed(
+        "su - jonathan -c 'cd /home/jonathan/Repos && mkdir profile-repo && "
+        "cd profile-repo && git init -q && touch tracked && git add tracked && "
+        "git -c user.name=VM -c user.email=vm@example.invalid commit -qm initial && "
+        "git worktree add -q /home/jonathan/worktrees/profile-linked -b linked'"
+    )
+    dellan.fail(
+        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
+        "-C /home/jonathan/Repos/profile-repo -- "
+        "touch /home/jonathan/Repos/profile-repo/.git/escape'"
+    )
+    dellan.fail(
+        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
+        "-C /home/jonathan/worktrees/profile-linked -- "
+        "touch /home/jonathan/worktrees/profile-linked/.git'"
+    )
+    dellan.fail(
+        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
+        "-C /home/jonathan/worktrees/profile-linked -- "
+        "touch /home/jonathan/Repos/profile-repo/.git/worktrees/profile-linked/escape'"
+    )
+
+    # Built-in profile selection plus both legacy and native CLI overrides
+    # cannot replace or widen the managed profile.
+    dellan.fail(
+        "su - jonathan -c 'codex sandbox -P :danger-full-access "
+        "--include-managed-config -C /home/jonathan/Repos -- "
+        "touch /home/jonathan/codex-danger-profile-escape'"
+    )
+    dellan.fail(
+        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
+        "-c sandbox_mode=\"danger-full-access\" sandbox -- "
+        "touch /home/jonathan/codex-legacy-escape'"
+    )
+    dellan.fail(
+        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
+        "-c default_permissions=\":danger-full-access\" sandbox -- "
+        "touch /home/jonathan/codex-default-escape'"
+    )
+    dellan.fail(
+        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
+        "-c permissions.repos_dev.filesystem.\"/home/jonathan\"=\"write\" "
+        "sandbox -- touch /home/jonathan/codex-profile-escape'"
+    )
+    dellan.fail(
+        "test -e /home/jonathan/codex-danger-profile-escape -o "
+        "-e /home/jonathan/codex-legacy-escape -o "
+        "-e /home/jonathan/codex-default-escape -o "
+        "-e /home/jonathan/codex-profile-escape"
+    )
+
     # home-manager-jonathan TimeoutStartSec floor.
     #
     # systemd's default TimeoutStartSec is 5min; jonathan's HM closure
