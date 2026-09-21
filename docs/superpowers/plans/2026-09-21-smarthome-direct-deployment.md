@@ -578,7 +578,7 @@ State that only two app generations remain rooted, GC removes older runtime and
 evaluation paths, server never builds, Cachix write token stays GitHub-only,
 deploy key is read-only, and dellan SSH remains independent.
 
-- [ ] **Step 2: Run automated gates**
+- [x] **Step 2: Run automated gates**
 
 ```bash
 git add -A
@@ -594,7 +594,7 @@ git diff --check
 
 Expected: all pass.
 
-- [ ] **Step 3: Run mandatory interactive smoke**
+- [x] **Step 3: Run mandatory interactive smoke**
 
 Run:
 
@@ -607,14 +607,14 @@ nix build .#checks.x86_64-linux.vm-home-server.driverInteractive \
 At the driver prompt execute:
 
 ```python
-start_all()
-home_server.wait_for_unit("multi-user.target")
-home_server.succeed("systemctl start smarthome-deploy.service", timeout=300)
-home_server.wait_until_succeeds("curl -fsS http://127.0.0.1:9876/healthz | jq -e '.fixture == \"direct-deploy-v2\"'", timeout=60)
+# Run the test script first: it creates the disposable Git origin and stable
+# v1 profile before exercising the production deploy unit.
+run_tests()
 print(home_server.succeed("cat /var/lib/smarthome-deploy/last-success"))
+print(home_server.succeed("readlink -f /nix/var/nix/profiles/smarthome"))
+print(home_server.succeed("curl -fsS http://127.0.0.1:9876/healthz"))
 print(home_server.succeed("nix-env --profile /nix/var/nix/profiles/smarthome --list-generations"))
-home_server.succeed("systemctl start smarthome-deploy.service", timeout=300)
-print(home_server.succeed("journalctl -u smarthome-deploy.service -n 80 --no-pager"))
+print(home_server.succeed("cat /var/lib/smarthome-deploy/nix-invocations"))
 assert home_server.succeed("systemctl --failed --no-legend").strip() == ""
 ```
 
