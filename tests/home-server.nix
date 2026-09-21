@@ -129,7 +129,7 @@ pkgs.testers.runNixOSTest {
 
       homeServer = {
         smarthomeDeployKeyFile = lib.mkForce "/run/agenix/smarthome-deploy-key";
-        zigbeeSerialPort = "/dev/serial/by-id/usb-simulated-zbdongle-e";
+        zigbeeSerialPort = lib.mkForce "/dev/serial/by-id/usb-simulated-zbdongle-e";
         houseSettings = {
           schema_version = 1;
           mqtt = {
@@ -224,10 +224,21 @@ pkgs.testers.runNixOSTest {
         matrixTailnet = true;
       };
 
-      # Static Zigbee2MQTT configuration is evaluated, but no fake character
-      # device pretends to be coordinator hardware in this VM. Likewise, QEMU's
-      # virtual disk has no SMART interface; keep production SMART enabled while
-      # avoiding an expected failed unit in runtime smoke tests.
+      # A QEMU USB serial adapter with a null backend stands in for the
+      # coordinator: the production unit, sandbox, device dependency, and
+      # credential path run for real, while the radio never answers. Zigbee2MQTT
+      # is started explicitly by the test script, never at boot, so it cannot
+      # race the fake bridge below. QEMU's virtual disk has no SMART interface;
+      # keep production SMART enabled while avoiding an expected failed unit.
+      virtualisation.qemu.options = [
+        "-device qemu-xhci,id=zigbee-xhci"
+        "-chardev null,id=zigbee-radio"
+        # A null chardev never reports "connected"; attach regardless.
+        "-device usb-serial,bus=zigbee-xhci.0,chardev=zigbee-radio,always-plugged=on"
+      ];
+      services.udev.extraRules = ''
+        SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="serial/by-id/usb-simulated-zbdongle-e"
+      '';
       systemd.services.zigbee2mqtt.wantedBy = lib.mkForce [ ];
       systemd.services.smartd.wantedBy = lib.mkForce [ ];
 
@@ -236,6 +247,7 @@ pkgs.testers.runNixOSTest {
         before = [
           "matrix-synapse.service"
           "tellstick-mqtt-bridge.service"
+          "zigbee2mqtt.service"
         ];
         serviceConfig = {
           Type = "oneshot";
@@ -253,6 +265,9 @@ pkgs.testers.runNixOSTest {
           printf '%s\n' 'vm-tellstick-token' > /run/agenix/tellstick-token
           chmod 0400 /run/agenix/tellstick-token
           install -m 0400 /dev/null /run/agenix/smarthome-deploy-key
+          printf '%s\n' '[7,1,255,0,42,9,100,3,200,17,66,5,250,13,77,1]' \
+            > /run/agenix/zigbee2mqtt-network-key
+          chmod 0400 /run/agenix/zigbee2mqtt-network-key
         '';
       };
       systemd.services.matrix-synapse = {
@@ -363,6 +378,9 @@ pkgs.testers.runNixOSTest {
         zigbeePermitJoin = config.services.zigbee2mqtt.settings.permit_join;
         zigbeeAvailabilityEnabled = config.services.zigbee2mqtt.settings.availability.enabled;
         zigbeeFrontendHost = config.services.zigbee2mqtt.settings.frontend.host;
+        zigbeeAdvanced = config.services.zigbee2mqtt.settings.advanced or null;
+        zigbeeNetworkKeyFile = config.homeServer.zigbeeNetworkKeyFile;
+        zigbeeNetworkKeyDeclared = config.age.secrets ? "zigbee2mqtt-network-key";
         matrixRegistration = config.services.matrix-synapse.settings.enable_registration;
         matrixServerName = config.services.matrix-synapse.settings.server_name;
         matrixDatabase = config.services.matrix-synapse.settings.database.name;
@@ -433,6 +451,16 @@ pkgs.testers.runNixOSTest {
     assert values["zigbeePermitJoin"] is False, values
     assert values["zigbeeAvailabilityEnabled"] is True, values
     assert values["zigbeeFrontendHost"] == "127.0.0.1", values
+    # Pinned network identity: Zigbee2MQTT defaults these to GENERATE and the
+    # NixOS unit rewrites configuration.yaml on every start, so anything left
+    # unpinned would be regenerated and orphan every paired device.
+    assert values["zigbeeAdvanced"] == {
+        "channel": 25,
+        "pan_id": 50324,
+        "ext_pan_id": [52, 207, 50, 36, 195, 122, 154, 61],
+    }, values
+    assert values["zigbeeNetworkKeyFile"] == "/run/agenix/zigbee2mqtt-network-key", values
+    assert values["zigbeeNetworkKeyDeclared"] is True, values
     assert values["matrixRegistration"] is False, values
     assert values["matrixServerName"] == "matrix.example.invalid", values
     assert values["matrixDatabase"] == "psycopg2", values
@@ -594,6 +622,63 @@ pkgs.testers.runNixOSTest {
     )
     print(f"[diag] direct deploy journal:\n{journal}")
     assert f"already deployed {revision} at ${candidateAutomation}" in journal, journal
+
+    # Real Zigbee2MQTT against the simulated coordinator. It rewrites its
+    # configuration.yaml before touching the radio, so the persisted network
+    # key proves the secret reached it through the unit's credential path.
+    home_server.succeed("systemctl cat zigbee2mqtt.service | grep -F LoadCredential=network-key:/run/agenix/zigbee2mqtt-network-key")
+    store_config = home_server.succeed(
+        "systemctl show zigbee2mqtt.service -P ExecStartPre | "
+        "grep -o '/nix/store/[^ ;]*\\.yaml' | head -1"
+    ).strip()
+    assert store_config.startswith("/nix/store/"), store_config
+    home_server.succeed(f"grep -F 'pan_id: 50324' {store_config}")
+    home_server.fail(f"grep -F network_key {store_config}")
+    home_server.wait_for_unit("dev-serial-by\\x2did-usb\\x2dsimulated\\x2dzbdongle\\x2de.device")
+    home_server.succeed("systemctl start zigbee2mqtt.service")
+    home_server.wait_until_succeeds(
+        "sed -n '/network_key:/,$p' /var/lib/zigbee2mqtt/configuration.yaml | "
+        "tr -s -c '0-9' ' ' | grep -F ' 7 1 255 0 42 9 100 3 200 17 66 5 250 13 77 1 '",
+        timeout=120,
+    )
+    home_server.succeed("grep -F 'pan_id: 50324' /var/lib/zigbee2mqtt/configuration.yaml")
+    home_server.succeed("grep -F 'channel: 25' /var/lib/zigbee2mqtt/configuration.yaml")
+    home_server.fail("grep -F GENERATE /var/lib/zigbee2mqtt/configuration.yaml")
+    home_server.succeed("systemctl stop zigbee2mqtt.service")
+
+    # A malformed key must stop startup before Zigbee2MQTT can fall back to
+    # generating a fresh network identity.
+    home_server.succeed(
+        "printf '%s\\n' '[1,2,3]' > /run/agenix/zigbee2mqtt-network-key && "
+        "systemctl reset-failed zigbee2mqtt.service; "
+        "systemctl start zigbee2mqtt.service || true"
+    )
+    home_server.wait_until_succeeds(
+        "journalctl -u zigbee2mqtt.service --no-pager -o cat | "
+        "grep -F 'refusing to start: network key'"
+    )
+    home_server.fail("grep -F network_key /var/lib/zigbee2mqtt/configuration.yaml")
+    home_server.succeed("systemctl stop zigbee2mqtt.service; systemctl reset-failed zigbee2mqtt.service")
+
+    # Any other invalid setting must exit and let systemd retry, not park an
+    # interactive failure page on port 8080 while the radio stays down.
+    home_server.succeed(
+        "printf '%s\\n' '[7,1,255,0,42,9,100,3,200,17,66,5,250,13,77,1]' "
+        "> /run/agenix/zigbee2mqtt-network-key && "
+        "printf '{:' > /var/lib/zigbee2mqtt/devices.yaml && "
+        "systemctl start zigbee2mqtt.service"
+    )
+    home_server.wait_until_succeeds(
+        "test \"$(journalctl -u zigbee2mqtt.service --no-pager -o cat | "
+        "grep -c 'Refusing to start because configuration is not valid')\" -ge 2",
+        timeout=90,
+    )
+    home_server.fail("ss -lnt | grep -F ':8080'")
+    home_server.succeed(
+        "systemctl stop zigbee2mqtt.service; systemctl reset-failed zigbee2mqtt.service; "
+        "rm /var/lib/zigbee2mqtt/devices.yaml"
+    )
+
     home_server.succeed("test -z \"$(systemctl --failed --no-legend)\"")
   '';
 }

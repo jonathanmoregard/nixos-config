@@ -36,7 +36,9 @@ Production-dependent values default to `null`. Leave them null until evidence
 exists:
 
 - `ageHostPublicKey`: public half of this host's real SSH host key.
-- `zigbeeSerialPort`: real `/dev/serial/by-id/...` coordinator path.
+- `zigbeeSerialPort`: real `/dev/serial/by-id/...` coordinator path. Requires
+  pinned `zigbeePanId`, `zigbeeExtendedPanId`, and an agenix
+  `zigbeeNetworkKeyFile`.
 - Matrix server name and secret source: permanent name and encrypted YAML.
 - optional MQTT network-client password file and TellStick address/token.
 - deploy key and any off-host backup destination.
@@ -206,9 +208,32 @@ Firmware upgrade procedure:
 5. Power-cycle dongle, confirm by-id path, start Zigbee2MQTT, and inspect bridge
    logs/state before pairing or restoring.
 
+Network identity is pinned. Zigbee2MQTT defaults network key and PAN IDs to
+`GENERATE`, and the NixOS unit copies `configuration.yaml` from the store on
+every start, so unpinned values would be regenerated on each restart and
+orphan every paired device. The host sets channel 25 (clear of the Wi-Fi
+channels 1/6/11 observed nearby), a fixed PAN ID and extended PAN ID, and reads
+the network key from agenix secret `zigbee2mqtt-network-key`: a compact JSON
+array of 16 bytes, delivered as a systemd credential and exported as
+`ZIGBEE2MQTT_CONFIG_ADVANCED_NETWORK_KEY`. A missing or malformed key stops
+the unit with `refusing to start: network key ...` rather than forming a new
+network. Changing channel, PAN IDs, or key requires re-pairing every device.
+Zigbee2MQTT also writes the key into `coordinator_backup.json` and its runtime
+`configuration.yaml`, so treat `/var/lib/zigbee2mqtt` backups as secret.
+
 Frontend is private/Tailscale-only. Keep `permit_join = false` normally. Open a
 short pairing window deliberately, pair one device, give it a stable
-`friendly_name`, verify exposed capabilities, then close joining.
+`friendly_name`, verify exposed capabilities, then close joining. Without the
+frontend, drive pairing over an SSH tunnel to the loopback broker:
+
+```console
+ssh -N -L 18830:127.0.0.1:1883 jonathan@home-server &
+mosquitto_sub -p 18830 -t 'zigbee2mqtt/bridge/event' -v &
+mosquitto_pub -p 18830 -t zigbee2mqtt/bridge/request/permit_join -m '{"time":180}'
+# after the interview completes:
+mosquitto_pub -p 18830 -t zigbee2mqtt/bridge/request/device/rename \
+  -m '{"from":"0x<ieee>","to":"<floor>/<room>/<device>"}'
+```
 
 IKEA LED2111G6 and Hue bulbs can join directly without Hue Bridge. Declare only
 reported capabilities. LED2111G6 may need sparse separate brightness and CCT

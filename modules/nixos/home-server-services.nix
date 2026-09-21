@@ -42,6 +42,23 @@ let
       "${utils.escapeSystemdPath cfg.zigbeeSerialPort}.device"
     else
       null;
+
+  # Zigbee2MQTT falls back to GENERATE when the network key override is empty
+  # or unparsable, silently forming a new network. Validate strictly and refuse
+  # to start instead.
+  zigbee2mqttWithNetworkKey = pkgs.writeShellApplication {
+    name = "zigbee2mqtt-with-network-key";
+    text = ''
+      key=$(< "$CREDENTIALS_DIRECTORY/network-key")
+      byte='(0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])'
+      if [[ ! "$key" =~ ^\[$byte(,$byte){15}\]$ ]]; then
+        echo "zigbee2mqtt: refusing to start: network key must be a compact JSON array of 16 bytes" >&2
+        exit 1
+      fi
+      export ZIGBEE2MQTT_CONFIG_ADVANCED_NETWORK_KEY="$key"
+      exec ${lib.getExe' config.services.zigbee2mqtt.package "zigbee2mqtt"}
+    '';
+  };
 in
 {
   imports = [
@@ -69,6 +86,48 @@ in
       description = ''
         Stable by-id path for the Zigbee coordinator. Zigbee2MQTT is disabled
         while this is null; record the real path only after hardware discovery.
+      '';
+    };
+
+    zigbeeChannel = mkOption {
+      type = types.ints.between 11 26;
+      default = 11;
+      description = ''
+        Zigbee radio channel. Changing it after devices have paired requires
+        re-pairing them, so choose it once against local Wi-Fi usage.
+      '';
+    };
+
+    zigbeePanId = mkOption {
+      type = types.nullOr (types.ints.between 1 65534);
+      default = null;
+      description = ''
+        Fixed Zigbee PAN ID. Required with `zigbeeSerialPort`: Zigbee2MQTT
+        defaults it to GENERATE and the NixOS unit rewrites configuration.yaml
+        on every start, so an unpinned value would change on each restart.
+      '';
+    };
+
+    zigbeeExtendedPanId = mkOption {
+      type = types.nullOr (types.listOf types.ints.u8);
+      default = null;
+      example = [ 1 2 3 4 5 6 7 8 ];
+      description = ''
+        Fixed 8-byte Zigbee extended PAN ID. Required with `zigbeeSerialPort`
+        for the same reason as `zigbeePanId`.
+      '';
+    };
+
+    zigbeeNetworkKeyFile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/agenix/zigbee2mqtt-network-key";
+      description = ''
+        Absolute runtime path to the Zigbee network key as a compact JSON array
+        of 16 bytes. Required with `zigbeeSerialPort`. The key reaches
+        Zigbee2MQTT through a systemd credential, never the Nix store, and a
+        missing or malformed key stops the service instead of letting it
+        generate a new network.
       '';
     };
 
@@ -251,6 +310,20 @@ in
           message = "homeServer.zigbeeFrontendTailnet requires homeServer.zigbeeSerialPort";
         }
         {
+          assertion =
+            !zigbeeEnabled
+            || (cfg.zigbeePanId != null && cfg.zigbeeExtendedPanId != null && cfg.zigbeeNetworkKeyFile != null);
+          message = "homeServer.zigbeeSerialPort requires zigbeePanId, zigbeeExtendedPanId, and zigbeeNetworkKeyFile so the Zigbee network survives restarts";
+        }
+        {
+          assertion = cfg.zigbeeExtendedPanId == null || builtins.length cfg.zigbeeExtendedPanId == 8;
+          message = "homeServer.zigbeeExtendedPanId must contain exactly 8 bytes";
+        }
+        {
+          assertion = isRuntimePath cfg.zigbeeNetworkKeyFile;
+          message = "homeServer.zigbeeNetworkKeyFile must be an absolute runtime path outside the Nix store";
+        }
+        {
           assertion = isRuntimePath cfg.mqttNetworkPasswordFile;
           message = "homeServer.mqttNetworkPasswordFile must be an absolute runtime path outside the Nix store";
         }
@@ -365,6 +438,13 @@ in
             host = if cfg.zigbeeFrontendTailnet then "0.0.0.0" else "127.0.0.1";
             port = 8080;
           };
+          # network_key is deliberately absent: it arrives via the
+          # environment from a systemd credential (see ExecStart below).
+          advanced = {
+            channel = cfg.zigbeeChannel;
+            pan_id = cfg.zigbeePanId;
+            ext_pan_id = cfg.zigbeeExtendedPanId;
+          };
         };
       };
 
@@ -377,6 +457,14 @@ in
           "mosquitto.service"
           zigbeeDeviceUnit
         ];
+        # Without this, invalid settings make Zigbee2MQTT park an interactive
+        # failure page on 0.0.0.0:8080 and never exit, so systemd never
+        # retries. Configuration is declarative; there is nothing to onboard.
+        environment.Z2M_ONBOARD_NO_SERVER = "1";
+        serviceConfig = {
+          LoadCredential = "network-key:${cfg.zigbeeNetworkKeyFile}";
+          ExecStart = lib.mkForce (lib.getExe zigbee2mqttWithNetworkKey);
+        };
       };
     })
 
