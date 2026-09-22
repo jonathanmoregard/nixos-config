@@ -5,13 +5,16 @@
 # What this exercises (fast — cheap runCommand, seconds):
 #   - name validation rejects invalid shapes (uppercase, leading digit)
 #   - preflight refuses when not in a nixos-config worktree root
-#   - refuses when the secret is already declared in hosts/<host>/default.nix
+#   - refuses when the secret is already declared in the target file
 #   - happy path (TEST_MODE=1):
 #       - writes secrets/<name>.age (valid age file — starts with the
 #         `age-encryption.org/v1` header)
 #       - inserts age.secrets.<name> block above the marker in
-#         hosts/dellan/default.nix
+#         profiles/workstation/default.nix when the host file (dellan)
+#         has no marker
 #       - refuses to overwrite an existing .age file on rerun
+#   - a host file that carries its own marker (home-server) is the
+#     target instead; no marker anywhere refuses without leaving a .age
 #
 # What is NOT exercised here (requires real nix eval / real gh / real
 # rekey — must be manually tested on dellan; see the PR body):
@@ -51,9 +54,17 @@ pkgs.runCommand "add-secret-smoke"
     git config --global user.name  "harness"
     git config --global init.defaultBranch main
 
+    # Layouts:
+    #   profile  (default) — the real dellan shape: host file has no
+    #            marker; profiles/workstation/default.nix holds the shared
+    #            secrets and the marker.
+    #   host     — the home-server shape: hosts/home-server/default.nix
+    #            carries its own marker.
+    #   nomarker — neither file has a marker.
     mkfixture() {
-      local root="$1"
-      mkdir -p "$root/hosts/dellan" "$root/secrets" "$root/modules/nixos"
+      local root="$1" layout="''${2:-profile}"
+      mkdir -p "$root/hosts/dellan" "$root/hosts/home-server" \
+        "$root/profiles/workstation" "$root/secrets" "$root/modules/nixos"
 
       # flake.nix — presence-only; add-secret only checks the file exists
       # in TEST_MODE (no `nix eval` runs).
@@ -74,8 +85,29 @@ pkgs.runCommand "add-secret-smoke"
 }
 NIXFILE
 
-      # host file — contains an existing secret AND the insertion marker.
+      # Marker-free host files; the layout below adds the declaration file.
       cat > "$root/hosts/dellan/default.nix" <<'NIXFILE'
+{ ... }:
+{
+  imports = [ ../../profiles/workstation ];
+  networking.hostName = "dellan";
+}
+NIXFILE
+      cat > "$root/hosts/home-server/default.nix" <<'NIXFILE'
+{ ... }:
+{
+  networking.hostName = "home-server";
+}
+NIXFILE
+
+      # declaration file — contains an existing secret AND (unless
+      # nomarker) the insertion marker.
+      case "$layout" in
+        profile|nomarker) decl="$root/profiles/workstation/default.nix" ;;
+        host)             decl="$root/hosts/home-server/default.nix" ;;
+        *)                fail "unknown fixture layout: $layout" ;;
+      esac
+      cat > "$decl" <<'NIXFILE'
 { config, ... }:
 {
   age.secrets.pre-existing = {
@@ -88,6 +120,10 @@ NIXFILE
   # add-secret:insert-here
 }
 NIXFILE
+      if [ "$layout" = nomarker ]; then
+        grep -v "add-secret:insert-here" "$decl" > "$decl.tmp"
+        mv "$decl.tmp" "$decl"
+      fi
 
       ( cd "$root" && git init -q && git add -A && git commit -qm init )
     }
@@ -131,20 +167,23 @@ NIXFILE
     head -c 22 "$ageFile" | grep -qF "age-encryption.org/v1" \
       || { echo "--- first 64 bytes of $ageFile ---"; head -c 64 "$ageFile" | od -c | head -4; fail ".age file lacks the age v1 header"; }
 
-    # 4b. host file contains the new declaration block
-    hostFile="$PWD/f-ok/hosts/dellan/default.nix"
-    grep -q "age.secrets.my-new-key = {"          "$hostFile" || fail "host file missing 'age.secrets.my-new-key = {'"
-    grep -q "rekeyFile = ../../secrets/my-new-key.age;" "$hostFile" || fail "host file missing rekeyFile line"
-    grep -q "owner = \"jonathan\";"               "$hostFile" || fail "host file missing owner line"
-    grep -q "group = \"users\";"                  "$hostFile" || fail "host file missing group line"
-    grep -q "mode = \"0400\";"                    "$hostFile" || fail "host file missing mode line"
+    # 4b. the workstation profile (not the marker-free host file)
+    # contains the new declaration block
+    declFile="$PWD/f-ok/profiles/workstation/default.nix"
+    grep -q "age.secrets.my-new-key = {"          "$declFile" || fail "profile missing 'age.secrets.my-new-key = {'"
+    grep -q "rekeyFile = ../../secrets/my-new-key.age;" "$declFile" || fail "profile missing rekeyFile line"
+    grep -q "owner = \"jonathan\";"               "$declFile" || fail "profile missing owner line"
+    grep -q "group = \"users\";"                  "$declFile" || fail "profile missing group line"
+    grep -q "mode = \"0400\";"                    "$declFile" || fail "profile missing mode line"
+    ! grep -q "my-new-key" "$PWD/f-ok/hosts/dellan/default.nix" \
+      || fail "declaration leaked into the marker-free host file"
 
     # 4c. marker survives (still there for the next add-secret run)
-    grep -q "# add-secret:insert-here" "$hostFile" || fail "insertion marker was consumed"
+    grep -q "# add-secret:insert-here" "$declFile" || fail "insertion marker was consumed"
 
     # 4d. block is BEFORE the marker (i.e. inserted above it)
-    block_line=$(grep -n "age.secrets.my-new-key = {" "$hostFile" | cut -d: -f1)
-    marker_line=$(grep -n "# add-secret:insert-here" "$hostFile" | cut -d: -f1)
+    block_line=$(grep -n "age.secrets.my-new-key = {" "$declFile" | cut -d: -f1)
+    marker_line=$(grep -n "# add-secret:insert-here" "$declFile" | cut -d: -f1)
     [ "$block_line" -lt "$marker_line" ] \
       || fail "new block ($block_line) was inserted below marker ($marker_line)"
 
@@ -154,9 +193,9 @@ NIXFILE
         printf 'val\n' | ADD_SECRET_TEST_MODE=1 "$tool" custom-secret \
           --from-stdin --owner root --group wheel --mode 0440 ) \
       >custom.log 2>&1 || fail "custom flags path failed"
-    grep -q "owner = \"root\";"  "$PWD/f-custom/hosts/dellan/default.nix" || fail "custom owner not applied"
-    grep -q "group = \"wheel\";" "$PWD/f-custom/hosts/dellan/default.nix" || fail "custom group not applied"
-    grep -q "mode = \"0440\";"   "$PWD/f-custom/hosts/dellan/default.nix" || fail "custom mode not applied"
+    grep -q "owner = \"root\";"  "$PWD/f-custom/profiles/workstation/default.nix" || fail "custom owner not applied"
+    grep -q "group = \"wheel\";" "$PWD/f-custom/profiles/workstation/default.nix" || fail "custom group not applied"
+    grep -q "mode = \"0440\";"   "$PWD/f-custom/profiles/workstation/default.nix" || fail "custom mode not applied"
 
     # --- 6. rerun with same name in a fresh fixture must refuse ----------
     # (existing .age file guard — the .age file exists but the declaration
@@ -233,6 +272,31 @@ NIXFILE
     [ ! -f "$PWD/f-explicit-prompt/secrets/explicit-prompt.age" ] \
       || fail "--prompt override was ignored — .age file created from piped stdin"
 
-    echo "ok: name-validate, preflight, dup-refuse, happy-path, custom-attrs, exists-refuse, KEY= strip, auto-detect-stdin, auto-detect-empty-refuse, explicit-prompt-override"
+    # --- 11. a host file with its own marker keeps its declarations -----
+    # (home-server shape): --host home-server writes there, never into
+    # the workstation profile.
+    mkfixture "$PWD/f-host" host
+    ( cd "$PWD/f-host" && \
+        printf 'v\n' | ADD_SECRET_TEST_MODE=1 "$tool" server-key --from-stdin --host home-server ) \
+      >host.log 2>&1 || fail "host-marker path failed"
+    grep -q "age.secrets.server-key = {" "$PWD/f-host/hosts/home-server/default.nix" \
+      || fail "host-marker path did not declare in hosts/home-server/default.nix"
+    [ ! -s "$PWD/f-host/profiles/workstation/default.nix" ] \
+      || fail "host-marker path wrote into the workstation profile"
+    ( cd "$PWD/f-host" && ADD_SECRET_TEST_MODE=1 "$tool" pre-existing --from-stdin --host home-server ) \
+      </dev/null >host-dup.log 2>&1 && fail "accepted duplicate host-file declaration" || true
+    grep -q "already declared in hosts/home-server/default.nix" host-dup.log \
+      || fail "no already-declared error naming the host file"
+
+    # --- 12. no marker anywhere: refuse and leave no .age behind --------
+    mkfixture "$PWD/f-nomarker" nomarker
+    ( cd "$PWD/f-nomarker" && printf 'v\n' | ADD_SECRET_TEST_MODE=1 "$tool" lost --from-stdin ) \
+      >nomarker.log 2>&1 && fail "accepted insertion without a marker" || true
+    grep -q "not found in profiles/workstation/default.nix" nomarker.log \
+      || fail "no missing-marker error naming the profile"
+    [ ! -f "$PWD/f-nomarker/secrets/lost.age" ] \
+      || fail "missing-marker refusal left secrets/lost.age behind"
+
+    echo "ok: name-validate, preflight, dup-refuse, happy-path, custom-attrs, exists-refuse, KEY= strip, auto-detect-stdin, auto-detect-empty-refuse, explicit-prompt-override, host-marker, no-marker-refuse"
     touch "$out"
   ''

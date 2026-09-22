@@ -14,7 +14,7 @@
 #
 # Both keys are user-owned agenix secrets decrypted to /run/agenix/<name>
 # (owner jonathan, 0400) — same shape as the other api-key secrets in
-# hosts/dellan/default.nix. The consumer is a user-launched script, not a
+# profiles/workstation/default.nix. The consumer is a user-launched script, not a
 # systemd service, so we follow the listen-tools.nix pattern: a
 # writeShellApplication that reads the secret at exec time and exports it into
 # only this process's env (never the user's shell rc).

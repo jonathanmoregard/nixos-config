@@ -9,9 +9,8 @@
   boot.loader.systemd-boot.configurationLimit = 8;
   boot.loader.efi.canTouchEfiVariables = true;
 
-  # Networking — NetworkManager + hostname
+  # Networking — NetworkManager. hostName is per-machine: hosts/<name>/.
   networking = {
-    hostName = "dellan";
     networkmanager.enable = true;
   };
 

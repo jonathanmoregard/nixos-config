@@ -15,7 +15,7 @@
 # wrapper's process, not the user shell.
 #
 # Why agenix `owner = "jonathan"` on the Fish + Auphonic keys (Anthropic
-# key already declared in hosts/dellan/default.nix with the same shape):
+# key already declared in profiles/workstation/default.nix with the same shape):
 # the binaries are user-launched at the shell, NOT systemd units. No
 # `LoadCredential` path; instead, agenix decrypts to `/run/agenix/<name>`
 # owned by jonathan so the user shell can `cat` it via the wrapper

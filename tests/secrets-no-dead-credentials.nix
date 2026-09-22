@@ -51,7 +51,7 @@ if offenders == [ ] then
   ''
 else
   throw ''
-    hosts/dellan declares age.secrets that duplicate a credential owned
+    nixosConfigurations.dellan declares age.secrets that duplicate a credential owned
     elsewhere:
 
     ${report}
