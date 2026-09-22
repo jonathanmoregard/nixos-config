@@ -168,9 +168,24 @@ let
           has_arg --no-contents "$@" && fail_argv 'local verification skipped contents' "$@"
           require_flag_value --sigs-needed 1 "$@"
           require_nix_option trusted-public-keys "$NIX_WRAPPER_TRUSTED_KEYS" "$@"
+          grep -qxF 'CLASS:closure-snapshot-verify' "$NIX_WRAPPER_LOG" || \
+            fail_argv 'local verification preceded closure snapshot verification' "$@"
           record_class local-verify
         elif [ "$store_url" = "$NIX_WRAPPER_SOURCE_URL" ]; then
           fail_argv 'direct source-store verification is forbidden' "$@"
+        elif has_arg --recursive "$@"; then
+          case "$store_url" in
+            file://*) ;;
+            *) fail_argv 'closure snapshot verification did not use file cache' "$@" ;;
+          esac
+          require_flag_value --store "$store_url" "$@"
+          require_arg_once --recursive "$@"
+          require_arg_once --no-contents "$@"
+          require_flag_value --sigs-needed 1 "$@"
+          require_nix_option trusted-public-keys "$NIX_WRAPPER_TRUSTED_KEYS" "$@"
+          grep -qxF 'CLASS:closure-metadata' "$NIX_WRAPPER_LOG" || \
+            fail_argv 'closure snapshot verification preceded metadata capture' "$@"
+          record_class closure-snapshot-verify
         else
           case "$store_url" in
             file://*) ;;
@@ -207,10 +222,16 @@ let
           exit "$status"
         elif has_arg --json "$@"; then
           require_arg_once --json "$@"
-          has_arg --recursive "$@" && fail_argv 'local root metadata query was recursive' "$@"
-          grep -qxF 'CLASS:snapshot-verify' "$NIX_WRAPPER_LOG" || \
-            fail_argv 'local metadata binding preceded snapshot verification' "$@"
-          record_class metadata-binding
+          if has_arg --recursive "$@"; then
+            require_arg_once --recursive "$@"
+            grep -qxF 'CLASS:copy-sigs' "$NIX_WRAPPER_LOG" || \
+              fail_argv 'closure metadata query preceded signature import' "$@"
+            record_class closure-metadata
+          else
+            grep -qxF 'CLASS:snapshot-verify' "$NIX_WRAPPER_LOG" || \
+              fail_argv 'local metadata binding preceded snapshot verification' "$@"
+            record_class metadata-binding
+          fi
         else
           fail_argv 'unrecognized path-info command' "$@"
         fi
@@ -248,6 +269,9 @@ pkgs.runCommand "smarthome-hydrator-harness"
     SPLIT_ROOT_CACHE="$PWD/split-root-cache"
     UPSTREAM_CACHE="$PWD/upstream-cache"
     COMBINED_CACHE="$PWD/combined-cache"
+    CA_COMPLETE_CACHE="$PWD/ca-complete-cache"
+    CA_ROOT_CACHE="$PWD/ca-root-cache"
+    CA_INPUT="$PWD/ca-dependency-input"
     SECRET_KEY="$PWD/cache-secret-key"
     WRONG_SECRET_KEY="$PWD/cache-wrong-secret-key"
     UPSTREAM_SECRET_KEY="$PWD/upstream-cache-secret-key"
@@ -335,6 +359,21 @@ pkgs.runCommand "smarthome-hydrator-harness"
     SIGNED_CLOSURE_ROOT=$(${pkgs.nix}/bin/nix-store --query --outputs "$CLOSURE_ROOT_DRV")
     realise_with_root "$SIGNED_CLOSURE_ROOT" "$CLOSURE_ROOT_DRV" "$PWD/result-closure-root"
 
+    printf 'content-addressed dependency\n' > "$CA_INPUT"
+    CA_DEPENDENCY_PATH=$(${pkgs.nix}/bin/nix store add-file "$CA_INPUT")
+    CA_ROOT_DRV=$(${pkgs.nix}/bin/nix-instantiate -E '
+      let dependency = builtins.storePath "'"$CA_DEPENDENCY_PATH"'";
+      in derivation {
+        name = "smarthome-hydrator-ca-root";
+        system = builtins.currentSystem;
+        builder = "${pkgs.bash}/bin/bash";
+        args = [ "-c" "printf %s \"$dependency\" > \"$out\"" ];
+        inherit dependency;
+      }
+    ')
+    SIGNED_CA_ROOT=$(${pkgs.nix}/bin/nix-store --query --outputs "$CA_ROOT_DRV")
+    realise_with_root "$SIGNED_CA_ROOT" "$CA_ROOT_DRV" "$PWD/result-ca-root"
+
     # Every signature-sensitive fixture must remain ordinary input-addressed.
     # Content-addressed fixtures could pass verification without a signature.
     ${pkgs.nix}/bin/nix path-info --json \
@@ -347,6 +386,13 @@ pkgs.runCommand "smarthome-hydrator-harness"
         echo 'FAIL: signature fixture is content-addressed' >&2
         exit 1
       }
+    ${pkgs.nix}/bin/nix path-info --json "$CA_DEPENDENCY_PATH" \
+      | ${pkgs.jq}/bin/jq -e \
+        'to_entries | all(.value.ca != null and (.value.signatures | length == 0))' \
+        > /dev/null || {
+      echo 'FAIL: CA dependency fixture is not unsigned content-addressed' >&2
+      exit 1
+    }
 
     ${pkgs.nix}/bin/nix key generate-secret \
       --key-name smarthome-hydrator-test-1 > "$SECRET_KEY"
@@ -388,6 +434,15 @@ pkgs.runCommand "smarthome-hydrator-harness"
     mkdir -p "$COMBINED_CACHE/nar"
     cp -R "$UPSTREAM_CACHE/nar/." "$COMBINED_CACHE/nar/"
     cp "$UPSTREAM_CACHE/"*.narinfo "$COMBINED_CACHE/"
+    ${pkgs.nix}/bin/nix copy --to "file://$CA_COMPLETE_CACHE" "$SIGNED_CA_ROOT"
+    ${pkgs.nix}/bin/nix store sign --store "file://$CA_COMPLETE_CACHE" \
+      --key-file "$SECRET_KEY" "$SIGNED_CA_ROOT"
+    cp -R "$CA_COMPLETE_CACHE" "$CA_ROOT_CACHE"
+    ca_dependency_cache_hash=$(basename "$CA_DEPENDENCY_PATH")
+    ca_dependency_cache_hash=''${ca_dependency_cache_hash%%-*}
+    ca_dependency_narinfo="$CA_ROOT_CACHE/$ca_dependency_cache_hash.narinfo"
+    ca_dependency_nar=$(sed -n 's/^URL: //p' "$ca_dependency_narinfo")
+    rm -f "$CA_ROOT_CACHE/$ca_dependency_nar" "$ca_dependency_narinfo"
     cp -R "$SIGNED_CACHE" "$MUTATION_CACHE"
 
     # Roots guard fixtures from automatic GC until both caches are complete.
@@ -398,7 +453,8 @@ pkgs.runCommand "smarthome-hydrator-harness"
       "$PWD/result-unsigned" \
       "$PWD/result-delayed" \
       "$PWD/result-dependency" \
-      "$PWD/result-closure-root"
+      "$PWD/result-closure-root" \
+      "$PWD/result-ca-root"
     ${pkgs.nix}/bin/nix-store --gc > /dev/null
     for fixture_path in \
       "$SIGNED_PATH" \
@@ -406,11 +462,14 @@ pkgs.runCommand "smarthome-hydrator-harness"
       "$DELAYED_PATH" \
       "$UNSIGNED_DEPENDENCY_PATH" \
       "$SIGNED_CLOSURE_ROOT" \
+      "$CA_DEPENDENCY_PATH" \
+      "$SIGNED_CA_ROOT" \
       "$SIGNED_DRV" \
       "$UNSIGNED_DRV" \
       "$DELAYED_DRV" \
       "$DEPENDENCY_DRV" \
-      "$CLOSURE_ROOT_DRV"; do
+      "$CLOSURE_ROOT_DRV" \
+      "$CA_ROOT_DRV"; do
       if ${pkgs.nix}/bin/nix-store --check-validity "$fixture_path" 2> /dev/null; then
         echo "FAIL(fixture-gc): path remained valid: $fixture_path" >&2
         exit 1
@@ -510,7 +569,7 @@ pkgs.runCommand "smarthome-hydrator-harness"
     }
 
     assert_success_classes() {
-      for class in copy copy-sigs local-verify source-metadata snapshot-verify metadata-binding; do
+      for class in copy copy-sigs closure-metadata closure-snapshot-verify local-verify source-metadata snapshot-verify metadata-binding; do
         assert_wrapper_class_once "$class"
       done
     }
@@ -649,7 +708,7 @@ pkgs.runCommand "smarthome-hydrator-harness"
         echo 'FAIL(preexisting-wrong-key-dependency): expected hydration to fail' >&2
         exit 1
       fi
-      grep -qF 'release closure signature verification failed' \
+      grep -qF 'release closure cache signature verification failed' \
         preexisting-wrong-key-dependency.log || {
         cat preexisting-wrong-key-dependency.log
         echo 'FAIL(preexisting-wrong-key-dependency): expected closure signature diagnostic' >&2
@@ -663,6 +722,92 @@ pkgs.runCommand "smarthome-hydrator-harness"
       ${pkgs.nix}/bin/nix path-info "$SIGNED_CLOSURE_ROOT" > /dev/null || {
         cat preexisting-wrong-key-dependency.log
         echo 'FAIL(preexisting-wrong-key-dependency): root was not copied before trust rejection' >&2
+        exit 1
+      }
+    }
+
+    expect_preexisting_ultimate_dependency_failure() {
+      reset_target
+      : > "$NIX_WRAPPER_LOG"
+      local_dependency_drv=$(${pkgs.nix}/bin/nix-instantiate -E "$DEPENDENCY_EXPR")
+      local_dependency_path=$(${pkgs.nix}/bin/nix-store --query --outputs "$local_dependency_drv")
+      [ "$local_dependency_path" = "$UNSIGNED_DEPENDENCY_PATH" ] || {
+        echo 'FAIL(preexisting-ultimate-dependency): local output path changed' >&2
+        exit 1
+      }
+      ${pkgs.nix}/bin/nix-store --realise "$local_dependency_drv" > /dev/null
+      ${pkgs.nix}/bin/nix path-info --json "$local_dependency_path" \
+        | ${pkgs.jq}/bin/jq -e --arg path "$local_dependency_path" \
+          '.[$path].ultimate == true and (.[$path].signatures | length == 0)' \
+          > /dev/null || {
+        echo 'FAIL(preexisting-ultimate-dependency): fixture is not unsigned and ultimate' >&2
+        exit 1
+      }
+
+      export NIX_WRAPPER_SOURCE_URL="file://$SPLIT_ROOT_CACHE"
+      export NIX_WRAPPER_TRUSTED_KEY="$PUBLIC_KEY"
+      export NIX_WRAPPER_SUBSTITUTERS="$NIX_WRAPPER_SOURCE_URL"
+      export NIX_WRAPPER_CACHE_URLS="$NIX_WRAPPER_SOURCE_URL"
+      export NIX_WRAPPER_TRUSTED_KEYS="$NIX_WRAPPER_TRUSTED_KEY"
+      export NIX_WRAPPER_BUILD_SOURCE_URL="file://$COMBINED_CACHE"
+      unset NIX_WRAPPER_PRECOPY_URL NIX_WRAPPER_PRECOPY_PATH
+      if NIX_STORE_DIR="$TARGET_STORE" \
+        NIX_STATE_DIR="$TARGET_STATE" \
+        NIX_LOG_DIR="$TARGET_LOG" \
+        bash "$script" --timeout-seconds 2 --attempts 1 \
+          --from "$NIX_WRAPPER_SOURCE_URL" \
+          --trusted-key "$PUBLIC_KEY" \
+          "$SIGNED_CLOSURE_ROOT" > preexisting-ultimate-dependency.log 2>&1; then
+        cat preexisting-ultimate-dependency.log
+        echo 'FAIL(preexisting-ultimate-dependency): expected hydration to fail' >&2
+        exit 1
+      fi
+      grep -qF 'release closure contains a path without an allowed cache signature' \
+        preexisting-ultimate-dependency.log || {
+        cat preexisting-ultimate-dependency.log
+        echo 'FAIL(preexisting-ultimate-dependency): expected closure signature diagnostic' >&2
+        exit 1
+      }
+    }
+
+    expect_preexisting_ca_dependency_failure() {
+      reset_target
+      : > "$NIX_WRAPPER_LOG"
+      local_ca_path=$(${pkgs.nix}/bin/nix store add-file "$CA_INPUT")
+      [ "$local_ca_path" = "$CA_DEPENDENCY_PATH" ] || {
+        echo 'FAIL(preexisting-ca-dependency): local CA path changed' >&2
+        exit 1
+      }
+      ${pkgs.nix}/bin/nix path-info --json "$local_ca_path" \
+        | ${pkgs.jq}/bin/jq -e --arg path "$local_ca_path" \
+          '.[$path].ca != null and (.[$path].signatures | length == 0)' \
+          > /dev/null || {
+        echo 'FAIL(preexisting-ca-dependency): fixture is not unsigned content-addressed' >&2
+        exit 1
+      }
+
+      export NIX_WRAPPER_SOURCE_URL="file://$CA_ROOT_CACHE"
+      export NIX_WRAPPER_TRUSTED_KEY="$PUBLIC_KEY"
+      export NIX_WRAPPER_SUBSTITUTERS="$NIX_WRAPPER_SOURCE_URL"
+      export NIX_WRAPPER_CACHE_URLS="$NIX_WRAPPER_SOURCE_URL"
+      export NIX_WRAPPER_TRUSTED_KEYS="$NIX_WRAPPER_TRUSTED_KEY"
+      export NIX_WRAPPER_BUILD_SOURCE_URL="file://$CA_COMPLETE_CACHE"
+      unset NIX_WRAPPER_PRECOPY_URL NIX_WRAPPER_PRECOPY_PATH
+      if NIX_STORE_DIR="$TARGET_STORE" \
+        NIX_STATE_DIR="$TARGET_STATE" \
+        NIX_LOG_DIR="$TARGET_LOG" \
+        bash "$script" --timeout-seconds 2 --attempts 1 \
+          --from "$NIX_WRAPPER_SOURCE_URL" \
+          --trusted-key "$PUBLIC_KEY" \
+          "$SIGNED_CA_ROOT" > preexisting-ca-dependency.log 2>&1; then
+        cat preexisting-ca-dependency.log
+        echo 'FAIL(preexisting-ca-dependency): expected hydration to fail' >&2
+        exit 1
+      fi
+      grep -qF 'release closure contains a path without an allowed cache signature' \
+        preexisting-ca-dependency.log || {
+        cat preexisting-ca-dependency.log
+        echo 'FAIL(preexisting-ca-dependency): expected unsigned closure diagnostic' >&2
         exit 1
       }
     }
@@ -710,7 +855,9 @@ pkgs.runCommand "smarthome-hydrator-harness"
       --trusted-key "$PUBLIC_KEY" \
       "$SIGNED_CLOSURE_ROOT"
     expect_preexisting_wrong_key_dependency_failure
+    expect_preexisting_ultimate_dependency_failure
+    expect_preexisting_ca_dependency_failure
 
-    echo 'ok: signed, delayed, split-cache, and source-mutated closures hydrated; unsigned, wrong-key, missing dependency, and unavailable paths refused'
+    echo 'ok: signed, delayed, split-cache, and source-mutated closures hydrated; unsigned, wrong-key, ultimate, CA, missing dependency, and unavailable paths refused'
     touch "$out"
   ''

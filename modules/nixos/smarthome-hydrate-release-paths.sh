@@ -164,6 +164,111 @@ for path in "${paths[@]}"; do
   is_store_path "$path" || usage
 done
 
+# Render metadata captured from either the local store or the primary cache
+# into an immutable file-cache view. Deliberately omit CA metadata: every path
+# in these snapshots must prove an actual signature from the supplied keys,
+# even when Nix would otherwise trust content-addressed or locally-built data.
+render_metadata_snapshot() {
+  local target_dir=$1 snapshot_entries path_encoded nar_hash_encoded nar_size
+  local references_encoded signatures_encoded source_path nar_hash store_name
+  local cache_hash narinfo_path encoded_reference reference references_line
+  local encoded_signature signature
+  local -a encoded_references reference_names encoded_signatures signatures
+
+  snapshot_entries=$(printf '%s' "$snapshot_metadata" | deadline_run 'release metadata validation' jq -er '
+    if type != "object" or length == 0 then
+      error("release metadata must be a nonempty object")
+    elif all(to_entries[];
+      ((.key | type) == "string") and
+      ((.value | type) == "object") and
+      ((.value.narHash | type) == "string") and
+      ((.value.narHash | test("[\\r\\n]") | not)) and
+      ((.value.narSize | type) == "number") and
+      (.value.narSize >= 0) and
+      (.value.narSize <= 9007199254740991) and
+      (.value.narSize == (.value.narSize | floor)) and
+      ((.value.references | type) == "array") and
+      (all(.value.references[];
+        (type == "string") and (test("[\\r\\n]") | not))) and
+      ((.value.signatures | type) == "array") and
+      (all(.value.signatures[];
+        (type == "string") and (test("[\\r\\n]") | not)))
+    ) then
+      to_entries[] |
+      [
+        (.key | @base64),
+        (.value.narHash | @base64),
+        (.value.narSize | tostring),
+        (.value.references | map(@base64) | join(",")),
+        (.value.signatures | map(@base64) | join(","))
+      ] | join("|")
+    else
+      error("release metadata has invalid field types")
+    end
+  ') || die 'could not validate release metadata'
+  [ -n "$snapshot_entries" ] || die 'release metadata is empty'
+
+  chmod 700 "$target_dir" || die 'could not secure release metadata snapshot'
+  {
+    printf 'StoreDir: %s\n' "$store_dir"
+    printf 'WantMassQuery: 1\n'
+    printf 'Priority: 30\n'
+  } > "$target_dir/nix-cache-info"
+
+  unset captured_paths
+  declare -gA captured_paths=()
+  while IFS='|' read -r path_encoded nar_hash_encoded nar_size references_encoded signatures_encoded; do
+    deadline_run 'release metadata snapshot rendering' true
+    source_path=$(deadline_run 'release metadata path decoding' base64 --decode <<< "$path_encoded") || \
+      die 'could not decode release metadata path'
+    nar_hash=$(deadline_run 'release metadata hash decoding' base64 --decode <<< "$nar_hash_encoded") || \
+      die 'could not decode release metadata hash'
+    is_store_path "$source_path" || die 'release metadata contains an invalid store path'
+    [[ "$nar_size" =~ ^(0|[1-9][0-9]*)$ ]] || die 'release metadata contains an invalid NAR size'
+
+    store_name=${source_path#"$store_dir"/}
+    cache_hash=${store_name%%-*}
+    [[ "$cache_hash" =~ ^[0123456789abcdfghijklmnpqrsvwxyz]{32}$ ]] || \
+      die 'release metadata produced an unsafe cache filename'
+    narinfo_path="$target_dir/$cache_hash.narinfo"
+    [ ! -e "$narinfo_path" ] || die 'release metadata contains a duplicate cache filename'
+
+    reference_names=()
+    IFS=',' read -r -a encoded_references <<< "$references_encoded"
+    for encoded_reference in "${encoded_references[@]}"; do
+      [ -n "$encoded_reference" ] || continue
+      reference=$(deadline_run 'release metadata reference decoding' base64 --decode <<< "$encoded_reference") || \
+        die 'could not decode release metadata reference'
+      is_store_path "$reference" || die 'release metadata contains an invalid reference'
+      reference_names+=("${reference#"$store_dir"/}")
+    done
+    references_line=$(IFS=' '; printf '%s' "${reference_names[*]}")
+
+    signatures=()
+    IFS=',' read -r -a encoded_signatures <<< "$signatures_encoded"
+    for encoded_signature in "${encoded_signatures[@]}"; do
+      [ -n "$encoded_signature" ] || continue
+      signature=$(deadline_run 'release metadata signature decoding' base64 --decode <<< "$encoded_signature") || \
+        die 'could not decode release metadata signature'
+      [[ "$signature" != *$'\n'* && "$signature" != *$'\r'* ]] || \
+        die 'release metadata contains an invalid signature'
+      signatures+=("$signature")
+    done
+
+    {
+      printf 'StorePath: %s\n' "$source_path"
+      printf 'URL: nar/dummy\n'
+      printf 'NarHash: %s\n' "$nar_hash"
+      printf 'NarSize: %s\n' "$nar_size"
+      printf 'References: %s\n' "$references_line"
+      for signature in "${signatures[@]}"; do
+        printf 'Sig: %s\n' "$signature"
+      done
+    } > "$narinfo_path"
+    captured_paths["$source_path"]=1
+  done <<< "$snapshot_entries"
+}
+
 started_at_ms=$(monotonic_milliseconds) || die 'Linux monotonic clock is unavailable or malformed'
 attempt_count=0
 while true; do
@@ -233,7 +338,6 @@ elapsed_ms=$((current_ms - started_at_ms))
 [ "$elapsed_ms" -ge 0 ] || die 'Linux monotonic clock moved backwards'
 remaining_ms=$((timeout_ms - elapsed_ms))
 [ "$remaining_ms" -gt 0 ] || die 'timed out waiting for release signatures from configured caches'
-remaining_duration=$(milliseconds_as_duration "$remaining_ms")
 for source_url in "${source_urls[@]}"; do
   signature_status=0
   signature_diagnostics=$(deadline_run 'release signature import' nix store copy-sigs \
@@ -250,6 +354,65 @@ for source_url in "${source_urls[@]}"; do
       "$source_url" >&2
 done
 
+snapshot_dirs=()
+cleanup_snapshots() {
+  local snapshot
+  for snapshot in "${snapshot_dirs[@]}"; do
+    rm -rf -- "$snapshot"
+  done
+}
+trap cleanup_snapshots EXIT
+trap 'exit 1' HUP INT TERM
+
+allowed_signer_prefixes=()
+for trusted_key in "${trusted_keys[@]}"; do
+  allowed_signer_prefixes+=("${trusted_key%%:*}:")
+done
+allowed_signer_prefixes_json=$(printf '%s\n' "${allowed_signer_prefixes[@]}" | \
+  deadline_run 'allowed signer list encoding' jq -Rsc \
+    'split("\n") | map(select(length > 0))') || die 'could not encode allowed cache signers'
+
+local_closure_metadata=$(deadline_run 'hydrated closure metadata query' \
+  nix path-info --json --recursive "${paths[@]}") || die 'could not read hydrated closure metadata'
+printf '%s' "$local_closure_metadata" | deadline_run 'hydrated closure signer validation' \
+  jq -e --argjson allowed "$allowed_signer_prefixes_json" '
+    type == "object" and length > 0 and
+    all(to_entries[];
+      ((.value.signatures | type) == "array") and
+      (.value.signatures as $signatures |
+        [
+          $signatures[] as $signature |
+          $allowed[] as $prefix |
+          select($signature | startswith($prefix))
+        ] | length > 0)
+    )
+  ' > /dev/null || die 'release closure contains a path without an allowed cache signature'
+
+closure_snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/smarthome-release-closure.XXXXXXXX") || \
+  die 'could not create release closure metadata snapshot'
+snapshot_dirs+=("$closure_snapshot_dir")
+snapshot_metadata=$local_closure_metadata
+render_metadata_snapshot "$closure_snapshot_dir"
+
+closure_snapshot_verify_status=0
+closure_snapshot_verify_diagnostics=$(deadline_run 'release closure cache signature verification' \
+  nix store verify \
+    --store "file://$closure_snapshot_dir" \
+    --recursive \
+    --sigs-needed 1 \
+    --no-contents \
+    --option trusted-public-keys "$all_trusted_keys" \
+    "${paths[@]}" 2>&1) || closure_snapshot_verify_status=$?
+[ -z "$closure_snapshot_verify_diagnostics" ] || \
+  printf '%s\n' "$closure_snapshot_verify_diagnostics" >&2
+case "$closure_snapshot_verify_diagnostics" in
+  *"ignoring the client-specified setting 'trusted-public-keys'"*)
+    die 'Nix refused the configured trusted keys'
+    ;;
+esac
+[ "$closure_snapshot_verify_status" -eq 0 ] || \
+  die 'release closure cache signature verification failed'
+
 verify_status=0
 verify_diagnostics=$(deadline_run 'local recursive verification' nix store verify \
   --recursive \
@@ -265,10 +428,11 @@ case "$verify_diagnostics" in
 esac
 [ "$verify_status" -eq 0 ] || die 'release closure signature verification failed'
 
-# Capture one recursive source view.  That exact JSON is rendered into a
-# private immutable file-cache snapshot for signature verification and reused
-# for the local metadata comparison.  Never make a second source request after
-# the trust decision: doing so would compare metadata that was not verified.
+# Capture one primary-cache view for the requested release roots. That exact
+# JSON is rendered into a private immutable file-cache snapshot for signature
+# verification and reused for the local metadata comparison. Never make a
+# second source request after the trust decision: doing so would compare
+# metadata that was not verified.
 source_metadata=$(deadline_run 'release cache metadata query' nix path-info --refresh --store "$primary_source_url" --json "${paths[@]}") || \
   die 'could not read release cache metadata'
 for path in "${paths[@]}"; do
@@ -278,116 +442,23 @@ for path in "${paths[@]}"; do
       > /dev/null || die 'release root is not signed by the primary cache key'
 done
 
-snapshot_entries=$(printf '%s' "$source_metadata" | deadline_run 'release cache metadata validation' jq -er '
-  if type != "object" or length == 0 then
-    error("release cache metadata must be a nonempty object")
-  elif all(to_entries[];
-    ((.key | type) == "string") and
-    ((.value | type) == "object") and
-    ((.value.narHash | type) == "string") and
-    ((.value.narHash | test("[\\r\\n]") | not)) and
-    ((.value.narSize | type) == "number") and
-    (.value.narSize >= 0) and
-    (.value.narSize <= 9007199254740991) and
-    (.value.narSize == (.value.narSize | floor)) and
-    ((.value.references | type) == "array") and
-    (all(.value.references[];
-      (type == "string") and (test("[\\r\\n]") | not))) and
-    ((.value.signatures | type) == "array") and
-    (all(.value.signatures[];
-      (type == "string") and (test("[\\r\\n]") | not)))
-  ) then
-    to_entries[] |
-    [
-      (.key | @base64),
-      (.value.narHash | @base64),
-      (.value.narSize | tostring),
-      (.value.references | map(@base64) | join(",")),
-      (.value.signatures | map(@base64) | join(","))
-    ] | join("|")
-  else
-    error("release cache metadata has invalid field types")
-  end
-') || die 'could not validate release cache metadata'
-[ -n "$snapshot_entries" ] || die 'release cache metadata is empty'
-
-snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/smarthome-release-cache.XXXXXXXX") || \
-  die 'could not create release cache metadata snapshot'
-cleanup_snapshot() {
-  rm -rf -- "$snapshot_dir"
-}
-trap cleanup_snapshot EXIT
-trap 'exit 1' HUP INT TERM
-chmod 700 "$snapshot_dir" || die 'could not secure release cache metadata snapshot'
-{
-  printf 'StoreDir: %s\n' "$store_dir"
-  printf 'WantMassQuery: 1\n'
-  printf 'Priority: 30\n'
-} > "$snapshot_dir/nix-cache-info"
-
-declare -A captured_paths=()
-while IFS='|' read -r path_encoded nar_hash_encoded nar_size references_encoded signatures_encoded; do
-  deadline_run 'release cache snapshot rendering' true
-  source_path=$(deadline_run 'release cache path decoding' base64 --decode <<< "$path_encoded") || \
-    die 'could not decode release cache path'
-  nar_hash=$(deadline_run 'release cache hash decoding' base64 --decode <<< "$nar_hash_encoded") || \
-    die 'could not decode release cache hash'
-  is_store_path "$source_path" || die 'release cache metadata contains an invalid store path'
-  [[ "$nar_size" =~ ^(0|[1-9][0-9]*)$ ]] || die 'release cache metadata contains an invalid NAR size'
-
-  store_name=${source_path#"$store_dir"/}
-  cache_hash=${store_name%%-*}
-  [[ "$cache_hash" =~ ^[0123456789abcdfghijklmnpqrsvwxyz]{32}$ ]] || \
-    die 'release cache metadata produced an unsafe cache filename'
-  narinfo_path="$snapshot_dir/$cache_hash.narinfo"
-  [ ! -e "$narinfo_path" ] || die 'release cache metadata contains a duplicate cache filename'
-
-  reference_names=()
-  IFS=',' read -r -a encoded_references <<< "$references_encoded"
-  for encoded_reference in "${encoded_references[@]}"; do
-    [ -n "$encoded_reference" ] || continue
-    reference=$(deadline_run 'release cache reference decoding' base64 --decode <<< "$encoded_reference") || \
-      die 'could not decode release cache reference'
-    is_store_path "$reference" || die 'release cache metadata contains an invalid reference'
-    reference_names+=("${reference#"$store_dir"/}")
-  done
-  references_line=$(IFS=' '; printf '%s' "${reference_names[*]}")
-
-  signatures=()
-  IFS=',' read -r -a encoded_signatures <<< "$signatures_encoded"
-  for encoded_signature in "${encoded_signatures[@]}"; do
-    [ -n "$encoded_signature" ] || continue
-    signature=$(deadline_run 'release cache signature decoding' base64 --decode <<< "$encoded_signature") || \
-      die 'could not decode release cache signature'
-    [[ "$signature" != *$'\n'* && "$signature" != *$'\r'* ]] || \
-      die 'release cache metadata contains an invalid signature'
-    signatures+=("$signature")
-  done
-
-  {
-    printf 'StorePath: %s\n' "$source_path"
-    printf 'URL: nar/dummy\n'
-    printf 'NarHash: %s\n' "$nar_hash"
-    printf 'NarSize: %s\n' "$nar_size"
-    printf 'References: %s\n' "$references_line"
-    for signature in "${signatures[@]}"; do
-      printf 'Sig: %s\n' "$signature"
-    done
-  } > "$narinfo_path"
-  captured_paths["$source_path"]=1
-done <<< "$snapshot_entries"
+root_snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/smarthome-release-root.XXXXXXXX") || \
+  die 'could not create release root metadata snapshot'
+snapshot_dirs+=("$root_snapshot_dir")
+snapshot_metadata=$source_metadata
+render_metadata_snapshot "$root_snapshot_dir"
 
 for path in "${paths[@]}"; do
   [ "${captured_paths[$path]+present}" = present ] || \
     die 'release cache metadata omitted a requested path'
 done
 
-# Local paths can be ultimately trusted, so verify the captured cache closure
-# separately against the exact configured key.  --no-contents verifies only
-# signed narinfo; local recursive verification above already hashed contents.
+# Verify captured primary-cache root metadata against the exact primary key.
+# Full closure metadata was verified above against the configured key union;
+# --no-contents here keeps this second check scoped to root-signature policy.
 snapshot_verify_status=0
 snapshot_verify_diagnostics=$(deadline_run 'release cache signature verification' nix store verify \
-  --store "file://$snapshot_dir" \
+  --store "file://$root_snapshot_dir" \
   --sigs-needed 1 \
   --no-contents \
   --option trusted-public-keys "$primary_trusted_key" \
