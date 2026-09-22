@@ -149,8 +149,8 @@
   age.secrets.github-webhook-secret.rekeyFile = ../../secrets/github-webhook-secret.age;
   age.secrets.gh-janitor-token.rekeyFile      = ../../secrets/gh-janitor-token.age;
 
-  # LLM provider + research-agent secrets consumed by claude-cl-sync.service
-  # and the research-agent-mcp wrapper. Both read raw key values with
+  # LLM provider + research-agent secrets consumed by the research-agent-mcp
+  # and futuresearch-gate-mcp wrappers. Both read raw key values with
   # `$(< file)` and export the matching env var themselves — `.age` files
   # contain the raw key only (no `KEY=` prefix). owner=jonathan + mode=0400
   # because the consumers run as the user, not root.
@@ -170,8 +170,8 @@
   # Lakera layer is FAIL-CLOSED: if this key is missing or empty the scan
   # rejects loudly, so this must be provisioned (a real key, not an empty
   # placeholder) before injection-scanner's fail-closed Lakera lands on
-  # main. Consumed by claude-cl-sync.service and the research-agent-mcp
-  # wrapper, same raw-value `$(< file)` pattern as the keys above.
+  # main. Consumed by the research-agent-mcp and futuresearch-gate-mcp
+  # wrappers, same raw-value `$(< file)` pattern as the keys above.
   age.secrets.lakera-api-key = {
     rekeyFile = ../../secrets/lakera-api-key.age;
     owner = "jonathan";

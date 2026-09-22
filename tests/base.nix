@@ -1627,7 +1627,7 @@ in
         )
 
     # ── Lakera tuned-project pointer (home/lakera.nix) ──
-    # All three injection-scanner call sites must export
+    # Both injection-scanner call sites must export
     # LAKERA_PROJECT_ID from the single source in home/lakera.nix, so
     # injection_scanner/lakera.py pins Lakera Guard to the tuned L3
     # project policy instead of the account default. Assert on the
@@ -1641,17 +1641,10 @@ in
         assert lakera_marker in wrapper_txt, (
             f"{wrapper} wrapper lost the LAKERA_PROJECT_ID export:\n{wrapper_txt}"
         )
-    # claude-cl-sync-wrap is not on PATH — resolve the store script from
-    # the user unit's ExecStart (same extraction pattern as the camera
-    # watchdog above; ExecStartPre doesn't match /^ExecStart=/).
-    cl_sync_script = dellan.succeed(
+    # continuous-learning-v2 was removed; its host vetter must stay gone.
+    dellan.fail(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat claude-cl-sync.service' "
-        "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
-    ).strip()
-    cl_sync_txt = dellan.succeed(f"cat {cl_sync_script}")
-    assert lakera_marker in cl_sync_txt, (
-        f"claude-cl-sync-wrap lost the LAKERA_PROJECT_ID export:\n{cl_sync_txt}"
+        "systemctl --user cat claude-cl-sync.service claude-cl-sync.timer'"
     )
 
     # Dell Latitude hardware profile must survive extraction from the generic

@@ -34,7 +34,6 @@ winetricks                    # apt name variant
 ^xbindkeys-autostart          # declared in home/cinnamon.nix
 ^huskyrc                      # declared in home/jonathan.nix as ~/.huskyrc
 ^voquill-autostart            # declared in home/cinnamon.nix
-^claude-cl-sync               # declared in home/claude-services.nix
 ^claude-sandbox-proxy         # declared in home/claude-services.nix
 ^gh-token                     # declared in home/claude-services.nix
 ^cron-superpowers-sync        # declared in home/jonathan-linux.nix crontab
