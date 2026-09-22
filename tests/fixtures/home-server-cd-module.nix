@@ -50,9 +50,13 @@ in
   # Candidate generations run on the NixOS test disk, not the future Wyse
   # installation. Keep its ext4 label contract and explicitly retain test
   # instrumentation so a real switch leaves the serial backdoor observable.
+  # The coordinator module goes too: no dongle exists on this test disk, its
+  # key is encrypted only for the real host, and vm-home-server covers
+  # Zigbee2MQTT against a simulated adapter.
   disabledModules = [
     ../../hosts/home-server/hardware-configuration.nix
     ../../hosts/home-server/deployment-identity.nix
+    ../../hosts/home-server/zigbee-coordinator.nix
   ];
   boot.loader.systemd-boot.enable = lib.mkForce false;
   boot.loader.grub.enable = lib.mkForce false;

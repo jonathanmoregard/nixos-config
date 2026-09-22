@@ -4,6 +4,7 @@
   imports = [
     ./hardware-configuration.nix
     ./deployment-identity.nix
+    ./zigbee-coordinator.nix
     ../../profiles/home-server-base.nix
     ../../modules/nixos/home-server-services.nix
     ../../modules/nixos/agenix-rekey-common.nix
