@@ -17,6 +17,8 @@ let
     NIX_WRAPPER_PRECOPY_URL=''${NIX_WRAPPER_PRECOPY_URL:-}
     NIX_WRAPPER_PRECOPY_PATH=''${NIX_WRAPPER_PRECOPY_PATH:-}
     NIX_WRAPPER_BUILD_SOURCE_URL=''${NIX_WRAPPER_BUILD_SOURCE_URL:-$NIX_WRAPPER_SOURCE_URL}
+    NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_URL=''${NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_URL:-}
+    NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_MARKER=''${NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_MARKER:-}
 
     {
       printf 'nix'
@@ -160,6 +162,16 @@ let
         require_allowed_cache "$substituter" "$@"
         require_flag_value --substituter "$substituter" "$@"
         record_class copy-sigs
+        if [ -n "$NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_URL" ]; then
+          [ -n "$NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_MARKER" ] || \
+            fail_argv 'copy-sigs fail-once URL lacks marker' "$@"
+          if [ "$substituter" = "$NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_URL" ] \
+            && [ ! -e "$NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_MARKER" ]; then
+            : > "$NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_MARKER"
+            exit 1
+          fi
+          exec ${pkgs.nix}/bin/nix "$@"
+        fi
         ;;
       store:verify)
         store_url=$(option_value --store "$@" || true)
@@ -490,7 +502,8 @@ pkgs.runCommand "smarthome-hydrator-harness"
       export NIX_WRAPPER_SUBSTITUTERS="$NIX_WRAPPER_SOURCE_URL"
       export NIX_WRAPPER_CACHE_URLS="$NIX_WRAPPER_SOURCE_URL"
       export NIX_WRAPPER_TRUSTED_KEYS="$NIX_WRAPPER_TRUSTED_KEY"
-      unset NIX_WRAPPER_PRECOPY_URL NIX_WRAPPER_PRECOPY_PATH NIX_WRAPPER_BUILD_SOURCE_URL
+      unset NIX_WRAPPER_PRECOPY_URL NIX_WRAPPER_PRECOPY_PATH NIX_WRAPPER_BUILD_SOURCE_URL \
+        NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_URL NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_MARKER
       if nix --version > unknown-nix.log 2>&1; then
         echo 'FAIL(nix-wrapper): unknown nix command reached real binary' >&2
         exit 1
@@ -770,6 +783,63 @@ pkgs.runCommand "smarthome-hydrator-harness"
       }
     }
 
+    expect_delayed_dependency_signature_success() {
+      reset_target
+      : > "$NIX_WRAPPER_LOG"
+      local_dependency_drv=$(${pkgs.nix}/bin/nix-instantiate -E "$DEPENDENCY_EXPR")
+      local_dependency_path=$(${pkgs.nix}/bin/nix-store --query --outputs "$local_dependency_drv")
+      [ "$local_dependency_path" = "$UNSIGNED_DEPENDENCY_PATH" ] || {
+        echo 'FAIL(delayed-dependency-signature): local output path changed' >&2
+        exit 1
+      }
+      ${pkgs.nix}/bin/nix-store --realise "$local_dependency_drv" > /dev/null
+      ${pkgs.nix}/bin/nix path-info --json "$local_dependency_path" \
+        | ${pkgs.jq}/bin/jq -e --arg path "$local_dependency_path" \
+          '.[$path].ultimate == true and (.[$path].signatures | length == 0)' \
+          > /dev/null || {
+        echo 'FAIL(delayed-dependency-signature): fixture is not unsigned and ultimate' >&2
+        exit 1
+      }
+
+      signature_marker="$PWD/delayed-dependency-signature.marker"
+      rm -f "$signature_marker"
+      export NIX_WRAPPER_SOURCE_URL="file://$SPLIT_ROOT_CACHE"
+      export NIX_WRAPPER_TRUSTED_KEY="$PUBLIC_KEY"
+      export NIX_WRAPPER_SUBSTITUTERS="$NIX_WRAPPER_SOURCE_URL file://$UPSTREAM_CACHE"
+      export NIX_WRAPPER_CACHE_URLS="$NIX_WRAPPER_SUBSTITUTERS"
+      export NIX_WRAPPER_TRUSTED_KEYS="$NIX_WRAPPER_TRUSTED_KEY $UPSTREAM_PUBLIC_KEY"
+      export NIX_WRAPPER_BUILD_SOURCE_URL="file://$COMBINED_CACHE"
+      export NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_URL="file://$UPSTREAM_CACHE"
+      export NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_MARKER="$signature_marker"
+      unset NIX_WRAPPER_PRECOPY_URL NIX_WRAPPER_PRECOPY_PATH
+      if ! NIX_STORE_DIR="$TARGET_STORE" \
+        NIX_STATE_DIR="$TARGET_STATE" \
+        NIX_LOG_DIR="$TARGET_LOG" \
+        bash "$script" --timeout-seconds 6 --interval 1 --attempts 4 \
+          --from "$NIX_WRAPPER_SOURCE_URL" \
+          --trusted-key "$PUBLIC_KEY" \
+          --from "file://$UPSTREAM_CACHE" \
+          --trusted-key "$UPSTREAM_PUBLIC_KEY" \
+          "$SIGNED_CLOSURE_ROOT" > delayed-dependency-signature.log 2>&1; then
+        cat delayed-dependency-signature.log
+        echo 'FAIL(delayed-dependency-signature): transient signature miss was not retried' >&2
+        exit 1
+      fi
+      [ -e "$signature_marker" ] || {
+        echo 'FAIL(delayed-dependency-signature): initial signature miss was not exercised' >&2
+        exit 1
+      }
+      ${pkgs.nix}/bin/nix path-info --json "$local_dependency_path" \
+        | ${pkgs.jq}/bin/jq -e --arg path "$local_dependency_path" \
+          --arg signer "''${UPSTREAM_PUBLIC_KEY%%:*}:" \
+          '.[$path].signatures | any(startswith($signer))' \
+          > /dev/null || {
+        echo 'FAIL(delayed-dependency-signature): retry did not import dependency signature' >&2
+        exit 1
+      }
+      unset NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_URL NIX_WRAPPER_COPY_SIGS_FAIL_ONCE_MARKER
+    }
+
     expect_preexisting_ca_dependency_failure() {
       reset_target
       : > "$NIX_WRAPPER_LOG"
@@ -855,9 +925,10 @@ pkgs.runCommand "smarthome-hydrator-harness"
       --trusted-key "$PUBLIC_KEY" \
       "$SIGNED_CLOSURE_ROOT"
     expect_preexisting_wrong_key_dependency_failure
+    expect_delayed_dependency_signature_success
     expect_preexisting_ultimate_dependency_failure
     expect_preexisting_ca_dependency_failure
 
-    echo 'ok: signed, delayed, split-cache, and source-mutated closures hydrated; unsigned, wrong-key, ultimate, CA, missing dependency, and unavailable paths refused'
+    echo 'ok: signed, delayed-path, delayed-signature, split-cache, and source-mutated closures hydrated; unsigned, wrong-key, ultimate, CA, missing dependency, and unavailable paths refused'
     touch "$out"
   ''

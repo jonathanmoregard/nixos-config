@@ -338,20 +338,54 @@ elapsed_ms=$((current_ms - started_at_ms))
 [ "$elapsed_ms" -ge 0 ] || die 'Linux monotonic clock moved backwards'
 remaining_ms=$((timeout_ms - elapsed_ms))
 [ "$remaining_ms" -gt 0 ] || die 'timed out waiting for release signatures from configured caches'
-for source_url in "${source_urls[@]}"; do
-  signature_status=0
-  signature_diagnostics=$(deadline_run 'release signature import' nix store copy-sigs \
-    --refresh \
-    --substituter "$source_url" \
-    --recursive \
-    "${paths[@]}" 2>&1) || signature_status=$?
-  [ -z "$signature_diagnostics" ] || printf '%s\n' "$signature_diagnostics" >&2
-  # A dependency cache need not contain every closure path. Final recursive
-  # verification below is the authority; this pass only enriches signatures
-  # for paths that predated hydration and were therefore not downloaded.
-  [ "$signature_status" -eq 0 ] || \
-    printf 'smarthome-hydrate-release-paths: signature import from %s was incomplete\n' \
-      "$source_url" >&2
+allowed_signer_prefixes=()
+for trusted_key in "${trusted_keys[@]}"; do
+  allowed_signer_prefixes+=("${trusted_key%%:*}:")
+done
+allowed_signer_prefixes_json=$(printf '%s\n' "${allowed_signer_prefixes[@]}" | \
+  deadline_run 'allowed signer list encoding' jq -Rsc \
+    'split("\n") | map(select(length > 0))') || die 'could not encode allowed cache signers'
+
+signature_attempt=0
+while true; do
+  for source_url in "${source_urls[@]}"; do
+    signature_status=0
+    signature_diagnostics=$(deadline_run 'release signature import' nix store copy-sigs \
+      --refresh \
+      --substituter "$source_url" \
+      --recursive \
+      "${paths[@]}" 2>&1) || signature_status=$?
+    [ -z "$signature_diagnostics" ] || printf '%s\n' "$signature_diagnostics" >&2
+    # A dependency cache need not contain every closure path. Closure-wide
+    # signer validation below decides whether this full import pass succeeded.
+    [ "$signature_status" -eq 0 ] || \
+      printf 'smarthome-hydrate-release-paths: signature import from %s was incomplete\n' \
+        "$source_url" >&2
+  done
+
+  local_closure_metadata=$(deadline_run 'hydrated closure metadata query' \
+    nix path-info --json --recursive "${paths[@]}") || die 'could not read hydrated closure metadata'
+  signer_validation_status=0
+  printf '%s' "$local_closure_metadata" | deadline_run 'hydrated closure signer validation' \
+    jq -e --argjson allowed "$allowed_signer_prefixes_json" '
+      type == "object" and length > 0 and
+      all(to_entries[];
+        ((.value.signatures | type) == "array") and
+        (.value.signatures as $signatures |
+          [
+            $signatures[] as $signature |
+            $allowed[] as $prefix |
+            select($signature | startswith($prefix))
+          ] | length > 0)
+      )
+    ' > /dev/null || signer_validation_status=$?
+  [ "$signer_validation_status" -eq 0 ] && break
+
+  signature_attempt=$((signature_attempt + 1))
+  [ "$attempts" -eq 0 ] || [ "$signature_attempt" -lt "$attempts" ] || \
+    die 'release closure contains a path without an allowed cache signature'
+  deadline_run 'release signature retry delay' sleep \
+    "$(milliseconds_as_duration "$interval_ms")" || true
 done
 
 snapshot_dirs=()
@@ -363,30 +397,6 @@ cleanup_snapshots() {
 }
 trap cleanup_snapshots EXIT
 trap 'exit 1' HUP INT TERM
-
-allowed_signer_prefixes=()
-for trusted_key in "${trusted_keys[@]}"; do
-  allowed_signer_prefixes+=("${trusted_key%%:*}:")
-done
-allowed_signer_prefixes_json=$(printf '%s\n' "${allowed_signer_prefixes[@]}" | \
-  deadline_run 'allowed signer list encoding' jq -Rsc \
-    'split("\n") | map(select(length > 0))') || die 'could not encode allowed cache signers'
-
-local_closure_metadata=$(deadline_run 'hydrated closure metadata query' \
-  nix path-info --json --recursive "${paths[@]}") || die 'could not read hydrated closure metadata'
-printf '%s' "$local_closure_metadata" | deadline_run 'hydrated closure signer validation' \
-  jq -e --argjson allowed "$allowed_signer_prefixes_json" '
-    type == "object" and length > 0 and
-    all(to_entries[];
-      ((.value.signatures | type) == "array") and
-      (.value.signatures as $signatures |
-        [
-          $signatures[] as $signature |
-          $allowed[] as $prefix |
-          select($signature | startswith($prefix))
-        ] | length > 0)
-    )
-  ' > /dev/null || die 'release closure contains a path without an allowed cache signature'
 
 closure_snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/smarthome-release-closure.XXXXXXXX") || \
   die 'could not create release closure metadata snapshot'
