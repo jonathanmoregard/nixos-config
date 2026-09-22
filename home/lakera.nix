@@ -13,8 +13,7 @@
 # Imported by every wrapper that spawns the scanner:
 #   - home/research-agent-mcp.nix   (research-agent-mcp)
 #   - home/futuresearch-gate-mcp.nix (futuresearch-gate-mcp)
-#   - home/claude-services.nix      (claude-cl-sync-wrap)
-# Change the id HERE and all three call sites follow.
+# Change the id HERE and both call sites follow.
 {
   lakeraProjectId = "project-5833252261";
 }
