@@ -5,7 +5,10 @@ umask 077
 
 usage() {
   cat >&2 <<'EOF'
-Usage: smarthome-hydrate-release-paths.sh --from CACHE_URL --trusted-key NAME:BASE64 [--timeout-seconds SECONDS] [--interval SECONDS] [--attempts COUNT] PATH...
+Usage: smarthome-hydrate-release-paths.sh [--from CACHE_URL --trusted-key NAME:BASE64]... [--timeout-seconds SECONDS] [--interval SECONDS] [--attempts COUNT] PATH...
+
+The first cache/key pair is the release-root trust anchor. Later pairs may
+supply recursively referenced dependencies, but cannot authorize a root.
 EOF
   exit 64
 }
@@ -55,8 +58,8 @@ deadline_run() {
   esac
 }
 
-source_url=
-trusted_key=
+source_urls=()
+trusted_keys=()
 timeout=300
 interval=5
 attempts=0
@@ -65,12 +68,12 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --from)
       [ "$#" -ge 2 ] || usage
-      source_url=$2
+      source_urls+=("$2")
       shift 2
       ;;
     --trusted-key)
       [ "$#" -ge 2 ] || usage
-      trusted_key=$2
+      trusted_keys+=("$2")
       shift 2
       ;;
     --timeout-seconds)
@@ -97,22 +100,33 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[ -n "$source_url" ] || usage
-case "$source_url" in
-  https://*|file://*) ;;
-  *) usage ;;
-esac
+[ "${#source_urls[@]}" -gt 0 ] || usage
+[ "${#source_urls[@]}" -eq "${#trusted_keys[@]}" ] || usage
+for index in "${!source_urls[@]}"; do
+  source_url=${source_urls[$index]}
+  trusted_key=${trusted_keys[$index]}
+  case "$source_url" in
+    https://*|file://*) ;;
+    *) usage ;;
+  esac
+  [[ "$source_url" != *$'\n'* && "$source_url" != *$'\r'* && "$source_url" != *' '* ]] || usage
 
-[ -n "$trusted_key" ] || usage
-[[ "$trusted_key" == *:* ]] || usage
-signer=${trusted_key%%:*}
-public_key=${trusted_key#*:}
-[[ "$signer" =~ ^[A-Za-z0-9._-]+$ ]] || usage
-[[ "$public_key" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || usage
-if ! decoded_key_bytes=$(printf '%s' "$public_key" | base64 --decode 2>/dev/null | wc -c); then
-  usage
-fi
-[ "$decoded_key_bytes" -eq 32 ] || usage
+  [[ "$trusted_key" == *:* ]] || usage
+  signer=${trusted_key%%:*}
+  public_key=${trusted_key#*:}
+  [[ "$signer" =~ ^[A-Za-z0-9._-]+$ ]] || usage
+  [[ "$public_key" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || usage
+  if ! decoded_key_bytes=$(printf '%s' "$public_key" | base64 --decode 2>/dev/null | wc -c); then
+    usage
+  fi
+  [ "$decoded_key_bytes" -eq 32 ] || usage
+done
+
+primary_source_url=${source_urls[0]}
+primary_trusted_key=${trusted_keys[0]}
+primary_signer=${primary_trusted_key%%:*}
+substituters=$(IFS=' '; printf '%s' "${source_urls[*]}")
+all_trusted_keys=$(IFS=' '; printf '%s' "${trusted_keys[*]}")
 
 [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || usage
 [[ "$interval" =~ ^[1-9][0-9]*$ ]] || usage
@@ -157,7 +171,7 @@ while true; do
   elapsed_ms=$((current_ms - started_at_ms))
   [ "$elapsed_ms" -ge 0 ] || die 'Linux monotonic clock moved backwards'
   remaining_ms=$((timeout_ms - elapsed_ms))
-  [ "$remaining_ms" -gt 0 ] || die "timed out waiting for release paths from $source_url"
+  [ "$remaining_ms" -gt 0 ] || die 'timed out waiting for release paths from configured caches'
   remaining_duration=$(milliseconds_as_duration "$remaining_ms")
 
   # A cache request can stall inside its transport. Hydration is read-only, so
@@ -167,14 +181,15 @@ while true; do
   copy_diagnostics=$(timeout \
     --signal=KILL \
     "$remaining_duration" \
-    nix copy \
+    nix build \
+      --no-link \
       --refresh \
-      --from "$source_url" \
       --option max-jobs 0 \
       --option fallback false \
       --option builders "" \
       --option always-allow-substitutes true \
-      --option trusted-public-keys "$trusted_key" \
+      --option substituters "$substituters" \
+      --option trusted-public-keys "$all_trusted_keys" \
       "${paths[@]}" 2>&1) || copy_status=$?
   [ -z "$copy_diagnostics" ] || printf '%s\n' "$copy_diagnostics" >&2
   if [ "$copy_status" -eq 0 ]; then
@@ -182,7 +197,7 @@ while true; do
   fi
   case "$copy_status" in
     124|137)
-      die "timed out waiting for release paths from $source_url"
+      die 'timed out waiting for release paths from configured caches'
       ;;
   esac
   case "$copy_diagnostics" in
@@ -192,13 +207,13 @@ while true; do
   esac
 
   attempt_count=$((attempt_count + 1))
-  [ "$attempts" -eq 0 ] || [ "$attempt_count" -lt "$attempts" ] || die "release paths are not available from $source_url"
+  [ "$attempts" -eq 0 ] || [ "$attempt_count" -lt "$attempts" ] || die 'release paths are not available from configured caches'
 
   current_ms=$(monotonic_milliseconds) || die 'Linux monotonic clock is unavailable or malformed'
   elapsed_ms=$((current_ms - started_at_ms))
   [ "$elapsed_ms" -ge 0 ] || die 'Linux monotonic clock moved backwards'
   remaining_ms=$((timeout_ms - elapsed_ms))
-  [ "$remaining_ms" -gt 0 ] || die "timed out waiting for release paths from $source_url"
+  [ "$remaining_ms" -gt 0 ] || die 'timed out waiting for release paths from configured caches'
   sleep_for_ms=$interval_ms
   if [ "$sleep_for_ms" -gt "$remaining_ms" ]; then
     sleep_for_ms=$remaining_ms
@@ -217,10 +232,9 @@ current_ms=$(monotonic_milliseconds) || die 'Linux monotonic clock is unavailabl
 elapsed_ms=$((current_ms - started_at_ms))
 [ "$elapsed_ms" -ge 0 ] || die 'Linux monotonic clock moved backwards'
 remaining_ms=$((timeout_ms - elapsed_ms))
-[ "$remaining_ms" -gt 0 ] || die "timed out waiting for release signatures from $source_url"
+[ "$remaining_ms" -gt 0 ] || die 'timed out waiting for release signatures from configured caches'
 remaining_duration=$(milliseconds_as_duration "$remaining_ms")
-signature_attempt=0
-while true; do
+for source_url in "${source_urls[@]}"; do
   signature_status=0
   signature_diagnostics=$(deadline_run 'release signature import' nix store copy-sigs \
     --refresh \
@@ -228,18 +242,19 @@ while true; do
     --recursive \
     "${paths[@]}" 2>&1) || signature_status=$?
   [ -z "$signature_diagnostics" ] || printf '%s\n' "$signature_diagnostics" >&2
-  [ "$signature_status" -eq 0 ] && break
-  case "$signature_diagnostics" in *signature*|*Signature*) die 'release cache signature verification failed' ;; esac
-  signature_attempt=$((signature_attempt + 1))
-  [ "$attempts" -eq 0 ] || [ "$signature_attempt" -lt "$attempts" ] || die 'release signatures are not available from cache'
-  deadline_run 'release signature retry delay' sleep "$(milliseconds_as_duration "$interval_ms")" || true
+  # A dependency cache need not contain every closure path. Final recursive
+  # verification below is the authority; this pass only enriches signatures
+  # for paths that predated hydration and were therefore not downloaded.
+  [ "$signature_status" -eq 0 ] || \
+    printf 'smarthome-hydrate-release-paths: signature import from %s was incomplete\n' \
+      "$source_url" >&2
 done
 
 verify_status=0
 verify_diagnostics=$(deadline_run 'local recursive verification' nix store verify \
   --recursive \
   --sigs-needed 1 \
-  --option trusted-public-keys "$trusted_key" \
+  --option trusted-public-keys "$all_trusted_keys" \
   "${paths[@]}" 2>&1) || verify_status=$?
 [ -z "$verify_diagnostics" ] || printf '%s\n' "$verify_diagnostics" >&2
 
@@ -254,8 +269,14 @@ esac
 # private immutable file-cache snapshot for signature verification and reused
 # for the local metadata comparison.  Never make a second source request after
 # the trust decision: doing so would compare metadata that was not verified.
-source_metadata=$(deadline_run 'release cache metadata query' nix path-info --refresh --store "$source_url" --json --recursive "${paths[@]}") || \
+source_metadata=$(deadline_run 'release cache metadata query' nix path-info --refresh --store "$primary_source_url" --json "${paths[@]}") || \
   die 'could not read release cache metadata'
+for path in "${paths[@]}"; do
+  printf '%s' "$source_metadata" | deadline_run 'release root signer validation' \
+    jq -e --arg path "$path" --arg signer "$primary_signer:" \
+      'has($path) and (.[$path].signatures | any(startswith($signer)))' \
+      > /dev/null || die 'release root is not signed by the primary cache key'
+done
 
 snapshot_entries=$(printf '%s' "$source_metadata" | deadline_run 'release cache metadata validation' jq -er '
   if type != "object" or length == 0 then
@@ -367,15 +388,14 @@ done
 snapshot_verify_status=0
 snapshot_verify_diagnostics=$(deadline_run 'release cache signature verification' nix store verify \
   --store "file://$snapshot_dir" \
-  --recursive \
   --sigs-needed 1 \
   --no-contents \
-  --option trusted-public-keys "$trusted_key" \
+  --option trusted-public-keys "$primary_trusted_key" \
   "${paths[@]}" 2>&1) || snapshot_verify_status=$?
 [ -z "$snapshot_verify_diagnostics" ] || printf '%s\n' "$snapshot_verify_diagnostics" >&2
 [ "$snapshot_verify_status" -eq 0 ] || die 'release cache signature verification failed'
 
-local_metadata=$(deadline_run 'hydrated release metadata query' nix path-info --json --recursive "${paths[@]}") || \
+local_metadata=$(deadline_run 'hydrated release metadata query' nix path-info --json "${paths[@]}") || \
   die 'could not read hydrated release metadata'
 source_contract=$(printf '%s' "$source_metadata" | deadline_run 'release cache metadata normalization' jq -S \
   'with_entries(.value |= {narHash, narSize, references})') || die 'could not normalize release cache metadata'

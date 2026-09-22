@@ -28,6 +28,9 @@ let
 
   serviceArg = if cfg.serviceName == null then "-" else cfg.serviceName;
   healthArg = if cfg.healthUrl == null then "-" else cfg.healthUrl;
+  hydratorCacheArgs = lib.escapeShellArgs (lib.concatMap
+    (cache: [ "--from" cache.url "--trusted-key" cache.publicKey ])
+    ([ cfg.cache ] ++ cfg.dependencyCaches));
   gitSshCommand =
     "${pkgs.openssh}/bin/ssh -i ${lib.escapeShellArg cfg.deployKeyFile}"
     + " -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes"
@@ -53,8 +56,6 @@ let
       branch=${lib.escapeShellArg cfg.branch}
       profile=${lib.escapeShellArg cfg.profile}
       package_attr=${lib.escapeShellArg cfg.packageAttr}
-      cache_url=${lib.escapeShellArg cfg.cache.url}
-      cache_key=${lib.escapeShellArg cfg.cache.publicKey}
       state="''${STATE_DIRECTORY:-${stateDir}}"
       runtime="''${RUNTIME_DIRECTORY:-${runtimeDir}}"
       lock="$runtime/deploy.lock"
@@ -150,8 +151,7 @@ let
       }
 
       if ! ${lib.getExe cfg.hydratorPackage} \
-        --from "$cache_url" \
-        --trusted-key "$cache_key" \
+        ${hydratorCacheArgs} \
         --timeout-seconds 300 \
         --interval 5 \
         "$package_path"; then
@@ -246,6 +246,31 @@ in
         default = "jonathanmoregard.cachix.org-1:Qzksr/c2ciAaV4j/U2mGFd1HTgOAicks8gJNs1Ztxo8=";
         description = "Exact cache signing public key.";
       };
+    };
+
+    dependencyCaches = lib.mkOption {
+      type = lib.types.listOf (lib.types.submodule {
+        options = {
+          url = lib.mkOption {
+            type = lib.types.str;
+            description = "Binary cache allowed to supply recursive release dependencies.";
+          };
+          publicKey = lib.mkOption {
+            type = lib.types.str;
+            description = "Exact signing public key trusted for dependencies from this cache.";
+          };
+        };
+      });
+      default = [
+        {
+          url = "https://cache.nixos.org";
+          publicKey = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
+        }
+      ];
+      description = ''
+        Additional signed caches used only to hydrate dependencies. Release
+        roots must still be present and signed by cache.publicKey.
+      '';
     };
 
     nixPackage = lib.mkOption {

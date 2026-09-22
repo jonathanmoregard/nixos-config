@@ -11,6 +11,12 @@ let
     : "''${NIX_WRAPPER_LOG:?NIX_WRAPPER_LOG must be set}"
     : "''${NIX_WRAPPER_SOURCE_URL:?NIX_WRAPPER_SOURCE_URL must be set}"
     : "''${NIX_WRAPPER_TRUSTED_KEY:?NIX_WRAPPER_TRUSTED_KEY must be set}"
+    : "''${NIX_WRAPPER_SUBSTITUTERS:?NIX_WRAPPER_SUBSTITUTERS must be set}"
+    : "''${NIX_WRAPPER_TRUSTED_KEYS:?NIX_WRAPPER_TRUSTED_KEYS must be set}"
+    : "''${NIX_WRAPPER_CACHE_URLS:?NIX_WRAPPER_CACHE_URLS must be set}"
+    NIX_WRAPPER_PRECOPY_URL=''${NIX_WRAPPER_PRECOPY_URL:-}
+    NIX_WRAPPER_PRECOPY_PATH=''${NIX_WRAPPER_PRECOPY_PATH:-}
+    NIX_WRAPPER_BUILD_SOURCE_URL=''${NIX_WRAPPER_BUILD_SOURCE_URL:-$NIX_WRAPPER_SOURCE_URL}
 
     {
       printf 'nix'
@@ -100,21 +106,59 @@ let
       printf 'CLASS:%s\n' "$1" >> "$NIX_WRAPPER_LOG"
     }
 
+    require_allowed_cache() {
+      local candidate=$1 allowed
+      for allowed in $NIX_WRAPPER_CACHE_URLS; do
+        [ "$candidate" = "$allowed" ] && return 0
+      done
+      fail_argv "cache is not configured: $candidate" "$@"
+    }
+
     case "''${1:-}:''${2:-}" in
-      copy:*)
+      build:*)
+        require_arg_once --no-link "$@"
         require_arg_once --refresh "$@"
-        require_flag_value --from "$NIX_WRAPPER_SOURCE_URL" "$@"
         require_nix_option max-jobs 0 "$@"
         require_nix_option fallback false "$@"
         require_nix_option builders "" "$@"
         require_nix_option always-allow-substitutes true "$@"
-        require_nix_option trusted-public-keys "$NIX_WRAPPER_TRUSTED_KEY" "$@"
+        require_nix_option substituters "$NIX_WRAPPER_SUBSTITUTERS" "$@"
+        require_nix_option trusted-public-keys "$NIX_WRAPPER_TRUSTED_KEYS" "$@"
         record_class copy
+        target="''${!#}"
+        if [ -n "$NIX_WRAPPER_PRECOPY_URL" ]; then
+          [ -n "$NIX_WRAPPER_PRECOPY_PATH" ] || \
+            fail_argv 'precopy URL lacks path' "$@"
+          ${pkgs.nix}/bin/nix copy \
+            --refresh \
+            --from "$NIX_WRAPPER_PRECOPY_URL" \
+            --option max-jobs 0 \
+            --option fallback false \
+            --option builders "" \
+            --option always-allow-substitutes true \
+            --option trusted-public-keys "$NIX_WRAPPER_TRUSTED_KEYS" \
+            "$NIX_WRAPPER_PRECOPY_PATH"
+        fi
+        # Disposable tests use a nonstandard StoreDir, unlike production.
+        # Validate exact production argv above, then translate hydration into
+        # equivalent signed cache copies against the disposable store.
+        exec ${pkgs.nix}/bin/nix copy \
+          --refresh \
+          --from "$NIX_WRAPPER_BUILD_SOURCE_URL" \
+          --option max-jobs 0 \
+          --option fallback false \
+          --option builders "" \
+          --option always-allow-substitutes true \
+          --option trusted-public-keys "$NIX_WRAPPER_TRUSTED_KEYS" \
+          "$target"
         ;;
       store:copy-sigs)
         require_arg_once --refresh "$@"
         require_arg_once --recursive "$@"
-        require_flag_value --substituter "$NIX_WRAPPER_SOURCE_URL" "$@"
+        substituter=$(option_value --substituter "$@" || true)
+        [ -n "$substituter" ] || fail_argv 'missing --substituter' "$@"
+        require_allowed_cache "$substituter" "$@"
+        require_flag_value --substituter "$substituter" "$@"
         record_class copy-sigs
         ;;
       store:verify)
@@ -123,7 +167,7 @@ let
           require_arg_once --recursive "$@"
           has_arg --no-contents "$@" && fail_argv 'local verification skipped contents' "$@"
           require_flag_value --sigs-needed 1 "$@"
-          require_nix_option trusted-public-keys "$NIX_WRAPPER_TRUSTED_KEY" "$@"
+          require_nix_option trusted-public-keys "$NIX_WRAPPER_TRUSTED_KEYS" "$@"
           record_class local-verify
         elif [ "$store_url" = "$NIX_WRAPPER_SOURCE_URL" ]; then
           fail_argv 'direct source-store verification is forbidden' "$@"
@@ -134,7 +178,7 @@ let
           esac
           require_flag_value --store "$store_url" "$@"
           require_arg_once --no-contents "$@"
-          require_arg_once --recursive "$@"
+          has_arg --recursive "$@" && fail_argv 'root snapshot verification was recursive' "$@"
           require_flag_value --sigs-needed 1 "$@"
           require_nix_option trusted-public-keys "$NIX_WRAPPER_TRUSTED_KEY" "$@"
           grep -qxF 'CLASS:source-metadata' "$NIX_WRAPPER_LOG" || \
@@ -150,7 +194,7 @@ let
           require_flag_value --store "$NIX_WRAPPER_SOURCE_URL" "$@"
           require_arg_once --refresh "$@"
           require_arg_once --json "$@"
-          require_arg_once --recursive "$@"
+          has_arg --recursive "$@" && fail_argv 'primary root metadata query was recursive' "$@"
           if grep -qxF 'CLASS:source-metadata' "$NIX_WRAPPER_LOG"; then
             fail_argv 'source metadata fetched more than once' "$@"
           fi
@@ -161,9 +205,9 @@ let
             rm -f "''${NIX_WRAPPER_MUTATE_SOURCE_DIR}"/*.narinfo
           fi
           exit "$status"
-        elif has_arg --json "$@" && has_arg --recursive "$@"; then
+        elif has_arg --json "$@"; then
           require_arg_once --json "$@"
-          require_arg_once --recursive "$@"
+          has_arg --recursive "$@" && fail_argv 'local root metadata query was recursive' "$@"
           grep -qxF 'CLASS:snapshot-verify' "$NIX_WRAPPER_LOG" || \
             fail_argv 'local metadata binding preceded snapshot verification' "$@"
           record_class metadata-binding
@@ -201,9 +245,14 @@ pkgs.runCommand "smarthome-hydrator-harness"
     DELAYED_CACHE="$PWD/delayed-cache"
     DELAYED_STAGING_CACHE="$PWD/delayed-staging-cache"
     MUTATION_CACHE="$PWD/mutation-cache"
+    SPLIT_ROOT_CACHE="$PWD/split-root-cache"
+    UPSTREAM_CACHE="$PWD/upstream-cache"
+    COMBINED_CACHE="$PWD/combined-cache"
     SECRET_KEY="$PWD/cache-secret-key"
     WRONG_SECRET_KEY="$PWD/cache-wrong-secret-key"
+    UPSTREAM_SECRET_KEY="$PWD/upstream-cache-secret-key"
     PUBLIC_KEY_FILE="$PWD/cache-public-key"
+    UPSTREAM_PUBLIC_KEY_FILE="$PWD/upstream-cache-public-key"
 
     export NIX_STORE_DIR="$TARGET_STORE"
     export NIX_STATE_DIR="$TARGET_STATE"
@@ -303,9 +352,14 @@ pkgs.runCommand "smarthome-hydrator-harness"
       --key-name smarthome-hydrator-test-1 > "$SECRET_KEY"
     ${pkgs.nix}/bin/nix key generate-secret \
       --key-name smarthome-hydrator-test-1 > "$WRONG_SECRET_KEY"
+    ${pkgs.nix}/bin/nix key generate-secret \
+      --key-name smarthome-hydrator-upstream-test-1 > "$UPSTREAM_SECRET_KEY"
     ${pkgs.nix}/bin/nix key convert-secret-to-public \
       < "$SECRET_KEY" > "$PUBLIC_KEY_FILE"
+    ${pkgs.nix}/bin/nix key convert-secret-to-public \
+      < "$UPSTREAM_SECRET_KEY" > "$UPSTREAM_PUBLIC_KEY_FILE"
     PUBLIC_KEY=$(cat "$PUBLIC_KEY_FILE")
+    UPSTREAM_PUBLIC_KEY=$(cat "$UPSTREAM_PUBLIC_KEY_FILE")
 
     ${pkgs.nix}/bin/nix copy --to "file://$SIGNED_CACHE" "$SIGNED_PATH"
     ${pkgs.nix}/bin/nix store sign --store "file://$SIGNED_CACHE" \
@@ -321,6 +375,19 @@ pkgs.runCommand "smarthome-hydrator-harness"
       --key-file "$SECRET_KEY" "$SIGNED_CLOSURE_ROOT"
     ${pkgs.nix}/bin/nix store sign --store "file://$SIGNED_CACHE" \
       --key-file "$WRONG_SECRET_KEY" "$UNSIGNED_DEPENDENCY_PATH"
+    cp -R "$SIGNED_CACHE" "$SPLIT_ROOT_CACHE"
+    dependency_cache_hash=$(basename "$UNSIGNED_DEPENDENCY_PATH")
+    dependency_cache_hash=''${dependency_cache_hash%%-*}
+    dependency_narinfo="$SPLIT_ROOT_CACHE/$dependency_cache_hash.narinfo"
+    dependency_nar=$(sed -n 's/^URL: //p' "$dependency_narinfo")
+    rm -f "$SPLIT_ROOT_CACHE/$dependency_nar" "$dependency_narinfo"
+    ${pkgs.nix}/bin/nix copy --to "file://$UPSTREAM_CACHE" "$UNSIGNED_DEPENDENCY_PATH"
+    ${pkgs.nix}/bin/nix store sign --store "file://$UPSTREAM_CACHE" \
+      --key-file "$UPSTREAM_SECRET_KEY" "$UNSIGNED_DEPENDENCY_PATH"
+    cp -R "$SPLIT_ROOT_CACHE" "$COMBINED_CACHE"
+    mkdir -p "$COMBINED_CACHE/nar"
+    cp -R "$UPSTREAM_CACHE/nar/." "$COMBINED_CACHE/nar/"
+    cp "$UPSTREAM_CACHE/"*.narinfo "$COMBINED_CACHE/"
     cp -R "$SIGNED_CACHE" "$MUTATION_CACHE"
 
     # Roots guard fixtures from automatic GC until both caches are complete.
@@ -361,6 +428,10 @@ pkgs.runCommand "smarthome-hydrator-harness"
     assert_wrapper_rejects_unknown_commands() {
       export NIX_WRAPPER_SOURCE_URL="file://$SIGNED_CACHE"
       export NIX_WRAPPER_TRUSTED_KEY="$PUBLIC_KEY"
+      export NIX_WRAPPER_SUBSTITUTERS="$NIX_WRAPPER_SOURCE_URL"
+      export NIX_WRAPPER_CACHE_URLS="$NIX_WRAPPER_SOURCE_URL"
+      export NIX_WRAPPER_TRUSTED_KEYS="$NIX_WRAPPER_TRUSTED_KEY"
+      unset NIX_WRAPPER_PRECOPY_URL NIX_WRAPPER_PRECOPY_PATH NIX_WRAPPER_BUILD_SOURCE_URL
       if nix --version > unknown-nix.log 2>&1; then
         echo 'FAIL(nix-wrapper): unknown nix command reached real binary' >&2
         exit 1
@@ -394,16 +465,19 @@ pkgs.runCommand "smarthome-hydrator-harness"
     invoke() {
       reset_target
       : > "$NIX_WRAPPER_LOG"
-      export NIX_WRAPPER_SOURCE_URL=
-      export NIX_WRAPPER_TRUSTED_KEY=
+      cache_args=()
+      source_urls=()
+      trusted_keys=()
       while [ "$#" -gt 0 ]; do
         case "$1" in
           --from)
-            NIX_WRAPPER_SOURCE_URL=$2
+            cache_args+=("$1" "$2")
+            source_urls+=("$2")
             shift 2
             ;;
           --trusted-key)
-            NIX_WRAPPER_TRUSTED_KEY=$2
+            cache_args+=("$1" "$2")
+            trusted_keys+=("$2")
             shift 2
             ;;
           *)
@@ -411,12 +485,17 @@ pkgs.runCommand "smarthome-hydrator-harness"
             ;;
         esac
       done
+      export NIX_WRAPPER_SOURCE_URL="''${source_urls[0]}"
+      export NIX_WRAPPER_TRUSTED_KEY="''${trusted_keys[0]}"
+      export NIX_WRAPPER_SUBSTITUTERS="$(IFS=' '; printf '%s' "''${source_urls[*]}")"
+      export NIX_WRAPPER_CACHE_URLS="$NIX_WRAPPER_SUBSTITUTERS"
+      export NIX_WRAPPER_TRUSTED_KEYS="$(IFS=' '; printf '%s' "''${trusted_keys[*]}")"
+      unset NIX_WRAPPER_PRECOPY_URL NIX_WRAPPER_PRECOPY_PATH NIX_WRAPPER_BUILD_SOURCE_URL
       NIX_STORE_DIR="$TARGET_STORE" \
       NIX_STATE_DIR="$TARGET_STATE" \
       NIX_LOG_DIR="$TARGET_LOG" \
         bash "$script" --timeout-seconds 2 --attempts 1 \
-          --from "$NIX_WRAPPER_SOURCE_URL" \
-          --trusted-key "$NIX_WRAPPER_TRUSTED_KEY" \
+          "''${cache_args[@]}" \
           "$@"
     }
 
@@ -468,6 +547,10 @@ pkgs.runCommand "smarthome-hydrator-harness"
       : > "$NIX_WRAPPER_LOG"
       export NIX_WRAPPER_SOURCE_URL="file://$DELAYED_CACHE"
       export NIX_WRAPPER_TRUSTED_KEY="$PUBLIC_KEY"
+      export NIX_WRAPPER_SUBSTITUTERS="$NIX_WRAPPER_SOURCE_URL"
+      export NIX_WRAPPER_CACHE_URLS="$NIX_WRAPPER_SOURCE_URL"
+      export NIX_WRAPPER_TRUSTED_KEYS="$NIX_WRAPPER_TRUSTED_KEY"
+      unset NIX_WRAPPER_PRECOPY_URL NIX_WRAPPER_PRECOPY_PATH NIX_WRAPPER_BUILD_SOURCE_URL
       : > delayed-publication.log
       (
         published=0
@@ -540,6 +623,10 @@ pkgs.runCommand "smarthome-hydrator-harness"
       : > "$NIX_WRAPPER_LOG"
       export NIX_WRAPPER_SOURCE_URL="file://$SIGNED_CACHE"
       export NIX_WRAPPER_TRUSTED_KEY="$PUBLIC_KEY"
+      export NIX_WRAPPER_SUBSTITUTERS="$NIX_WRAPPER_SOURCE_URL"
+      export NIX_WRAPPER_CACHE_URLS="$NIX_WRAPPER_SOURCE_URL"
+      export NIX_WRAPPER_TRUSTED_KEYS="$NIX_WRAPPER_TRUSTED_KEY"
+      unset NIX_WRAPPER_PRECOPY_URL NIX_WRAPPER_PRECOPY_PATH NIX_WRAPPER_BUILD_SOURCE_URL
       ${pkgs.nix}/bin/nix copy \
         --from "file://$SIGNED_CACHE" \
         --option require-sigs false \
@@ -548,12 +635,9 @@ pkgs.runCommand "smarthome-hydrator-harness"
         echo 'FAIL(preexisting-wrong-key-dependency): pre-seed failed' >&2
         exit 1
       }
-      # Model a locally trusted preexisting path while leaving cache metadata
-      # signed only by the same-named wrong key. Local verification must pass;
-      # source-cache exact-key verification must still reject the closure.
-      ${pkgs.nix}/bin/nix store sign \
-        --key-file "$SECRET_KEY" \
-        "$UNSIGNED_DEPENDENCY_PATH"
+      # Model a preexisting dependency carrying only a same-named wrong-key
+      # signature. Hydration skips present paths, so recursive verification
+      # must still reject it rather than trusting the root alone.
       if NIX_STORE_DIR="$TARGET_STORE" \
         NIX_STATE_DIR="$TARGET_STATE" \
         NIX_LOG_DIR="$TARGET_LOG" \
@@ -565,10 +649,10 @@ pkgs.runCommand "smarthome-hydrator-harness"
         echo 'FAIL(preexisting-wrong-key-dependency): expected hydration to fail' >&2
         exit 1
       fi
-      grep -qF 'release cache signature verification failed' \
+      grep -qF 'release closure signature verification failed' \
         preexisting-wrong-key-dependency.log || {
         cat preexisting-wrong-key-dependency.log
-        echo 'FAIL(preexisting-wrong-key-dependency): expected cache signature diagnostic' >&2
+        echo 'FAIL(preexisting-wrong-key-dependency): expected closure signature diagnostic' >&2
         exit 1
       }
       grep -qF 'is untrusted' preexisting-wrong-key-dependency.log || {
@@ -590,6 +674,29 @@ pkgs.runCommand "smarthome-hydrator-harness"
     assert_success_classes
     expect_source_mutation_after_capture_success
     expect_delayed_publication_success
+    reset_target
+    : > "$NIX_WRAPPER_LOG"
+    export NIX_WRAPPER_SOURCE_URL="file://$SPLIT_ROOT_CACHE"
+    export NIX_WRAPPER_TRUSTED_KEY="$PUBLIC_KEY"
+    export NIX_WRAPPER_SUBSTITUTERS="$NIX_WRAPPER_SOURCE_URL file://$UPSTREAM_CACHE"
+    export NIX_WRAPPER_CACHE_URLS="$NIX_WRAPPER_SUBSTITUTERS"
+    export NIX_WRAPPER_TRUSTED_KEYS="$NIX_WRAPPER_TRUSTED_KEY $UPSTREAM_PUBLIC_KEY"
+    export NIX_WRAPPER_PRECOPY_URL="file://$UPSTREAM_CACHE"
+    export NIX_WRAPPER_PRECOPY_PATH="$UNSIGNED_DEPENDENCY_PATH"
+    export NIX_WRAPPER_BUILD_SOURCE_URL="file://$COMBINED_CACHE"
+    if ! NIX_STORE_DIR="$TARGET_STORE" \
+      NIX_STATE_DIR="$TARGET_STATE" \
+      NIX_LOG_DIR="$TARGET_LOG" \
+      bash "$script" --timeout-seconds 2 --attempts 1 \
+        --from "file://$SPLIT_ROOT_CACHE" \
+        --trusted-key "$PUBLIC_KEY" \
+        --from "file://$UPSTREAM_CACHE" \
+        --trusted-key "$UPSTREAM_PUBLIC_KEY" \
+        "$SIGNED_CLOSURE_ROOT" > split-cache.log 2>&1; then
+      cat split-cache.log
+      echo 'FAIL(split-cache): expected root and dependency from separate signed caches to hydrate' >&2
+      exit 1
+    fi
     expect_failure unsigned 'signature verification failed' \
       --from "file://$UNSIGNED_CACHE" \
       --trusted-key "$PUBLIC_KEY" \
@@ -598,8 +705,12 @@ pkgs.runCommand "smarthome-hydrator-harness"
       --from "file://$SIGNED_CACHE" \
       --trusted-key "$PUBLIC_KEY" \
       "$MISSING_PATH"
+    expect_failure missing-dependency 'not available' \
+      --from "file://$SPLIT_ROOT_CACHE" \
+      --trusted-key "$PUBLIC_KEY" \
+      "$SIGNED_CLOSURE_ROOT"
     expect_preexisting_wrong_key_dependency_failure
 
-    echo 'ok: signed, delayed, and source-mutated closures hydrated; unsigned, wrong-key dependency, and unavailable paths refused'
+    echo 'ok: signed, delayed, split-cache, and source-mutated closures hydrated; unsigned, wrong-key, missing dependency, and unavailable paths refused'
     touch "$out"
   ''

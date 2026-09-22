@@ -40,13 +40,16 @@ let
     printf 'HYDRATE' >> "$SMARTHOME_DEPLOY_TEST_LOG"
     printf ' %q' "$@" >> "$SMARTHOME_DEPLOY_TEST_LOG"
     printf '\n' >> "$SMARTHOME_DEPLOY_TEST_LOG"
-    [ "$#" -eq 9 ] || exit 87
+    [ "$#" -eq 13 ] || exit 87
     [ "$1" = --from ] && [ "$2" = https://jonathanmoregard.cachix.org ] || exit 87
     [ "$3" = --trusted-key ] && \
       [ "$4" = 'jonathanmoregard.cachix.org-1:Qzksr/c2ciAaV4j/U2mGFd1HTgOAicks8gJNs1Ztxo8=' ] || exit 87
-    [ "$5" = --timeout-seconds ] && [ "$6" = 300 ] || exit 87
-    [ "$7" = --interval ] && [ "$8" = 5 ] || exit 87
-    case "$9" in
+    [ "$5" = --from ] && [ "$6" = https://cache.nixos.org ] || exit 87
+    [ "$7" = --trusted-key ] && \
+      [ "$8" = 'cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=' ] || exit 87
+    [ "$9" = --timeout-seconds ] && [ "''${10}" = 300 ] || exit 87
+    [ "''${11}" = --interval ] && [ "''${12}" = 5 ] || exit 87
+    case "''${13}" in
       ${v1}|${v2}) ;;
       *) exit 87 ;;
     esac
@@ -113,6 +116,12 @@ assert !(unit.environment ? DEPLOY_KEY);
 assert timer.OnUnitActiveSec == "15min";
 assert timer.Persistent;
 assert config.services.smarthome-auto-deploy.profile == "/build/smarthome-profile";
+assert config.services.smarthome-auto-deploy.dependencyCaches == [
+  {
+    url = "https://cache.nixos.org";
+    publicKey = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
+  }
+];
 assert builtins.length (builtins.attrNames config.programs.ssh.knownHosts) == 3;
 pkgs.runCommand "smarthome-auto-deploy-contract"
   {

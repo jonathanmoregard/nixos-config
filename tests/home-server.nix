@@ -61,17 +61,21 @@ let
   '';
   fakeHydrator = pkgs.writeShellScriptBin "smarthome-hydrate-release-paths" ''
     set -euo pipefail
-    [ "$#" -eq 9 ]
-    [ "$1" = --from ]
-    [ "$3" = --trusted-key ]
-    [ "$5" = --timeout-seconds ] && [ "$6" = 300 ]
-    [ "$7" = --interval ] && [ "$8" = 5 ]
-    case "$9" in
+    [ "$#" -eq 13 ]
+    [ "$1" = --from ] && [ "$2" = https://jonathanmoregard.cachix.org ]
+    [ "$3" = --trusted-key ] && \
+      [ "$4" = 'jonathanmoregard.cachix.org-1:Qzksr/c2ciAaV4j/U2mGFd1HTgOAicks8gJNs1Ztxo8=' ]
+    [ "$5" = --from ] && [ "$6" = https://cache.nixos.org ]
+    [ "$7" = --trusted-key ] && \
+      [ "$8" = 'cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=' ]
+    [ "$9" = --timeout-seconds ] && [ "''${10}" = 300 ]
+    [ "''${11}" = --interval ] && [ "''${12}" = 5 ]
+    case "''${13}" in
       ${candidateAutomation}|${brokenAutomation}) ;;
       *) exit 1 ;;
     esac
-    test -x "$9/bin/house-automationd"
-    printf '%s\n' "$9" > "$STATE_DIRECTORY/hydrated-path"
+    test -x "''${13}/bin/house-automationd"
+    printf '%s\n' "''${13}" > "$STATE_DIRECTORY/hydrated-path"
   '';
   productionHardware = import ../hosts/home-server/hardware-configuration.nix {
     config = { };
