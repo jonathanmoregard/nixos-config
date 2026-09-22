@@ -83,8 +83,10 @@ Examples:
 
 Must be run from a nixos-config worktree root (e.g.
 ~/Repos/nixos-config-worktrees/<slug>). Creates the source .age file,
-inserts the age.secrets.<name> declaration into hosts/<host>/default.nix
-above the `# add-secret:insert-here` marker, rekeys, commits on the
+inserts the age.secrets.<name> declaration above the
+`# add-secret:insert-here` marker (in hosts/<host>/default.nix when that
+file has the marker, else profiles/workstation/default.nix, which every
+workstation host imports), rekeys, commits on the
 current feature branch, pushes, opens a PR, and prints the PR URL.
 HELP
     }
@@ -155,14 +157,23 @@ cd into ~/Repos/nixos-config-worktrees/<slug> and rerun."
       fi
     done
 
+    # Declaration target: the host's own file when it carries the marker
+    # (home-server), otherwise the workstation profile shared by dellan
+    # and its successor hosts.
     HOST_FILE="hosts/$HOST/default.nix"
     [ -f "$HOST_FILE" ] || die "no host file at $HOST_FILE"
+    if grep -qF "$MARKER" "$HOST_FILE"; then
+      DECL_FILE="$HOST_FILE"
+    else
+      DECL_FILE="profiles/workstation/default.nix"
+      [ -f "$DECL_FILE" ] || die "$HOST_FILE has no marker and $DECL_FILE is missing"
+    fi
 
     # -------------------------------------------------------------------
     # refuse if already declared / file already exists
     # -------------------------------------------------------------------
-    if grep -Eq "age\.secrets\.$NAME([.= ]|\$)" "$HOST_FILE"; then
-      die "age.secrets.$NAME is already declared in $HOST_FILE.
+    if grep -Eq "age\.secrets\.$NAME([.= ]|\$)" "$DECL_FILE"; then
+      die "age.secrets.$NAME is already declared in $DECL_FILE.
 To edit its value, use the manual edit path:
   EDITOR=nano nix run .#agenix-rekey.x86_64-linux.edit-view -- edit secrets/$NAME.age"
     fi
@@ -263,14 +274,14 @@ To edit its value, use the manual edit path:
     # -------------------------------------------------------------------
     # insert declaration above the marker line
     # -------------------------------------------------------------------
-    if ! grep -qF "$MARKER" "$HOST_FILE"; then
+    if ! grep -qF "$MARKER" "$DECL_FILE"; then
       rm -f "$AGE_FILE"
-      die "marker '$MARKER' not found in $HOST_FILE — cannot safely insert.
+      die "marker '$MARKER' not found in $DECL_FILE — cannot safely insert.
 Add the marker on its own line where new age.secrets should go, or fall back to the manual path in home/claude-skills/nixos-agenix-secret/SKILL.md."
     fi
 
-    HOST_BACKUP="$HOST_FILE.add-secret-backup"
-    cp "$HOST_FILE" "$HOST_BACKUP"
+    DECL_BACKUP="$DECL_FILE.add-secret-backup"
+    cp "$DECL_FILE" "$DECL_BACKUP"
 
     # awk: write the new block on the first line that contains the marker.
     awk -v name="$NAME" -v owner="$OWNER" -v group="$GROUP" -v mode="$MODE" \
@@ -285,17 +296,17 @@ Add the marker on its own line where new age.secrets should go, or fall back to 
         inserted = 1
       }
       { print }
-    ' "$HOST_BACKUP" > "$HOST_FILE"
+    ' "$DECL_BACKUP" > "$DECL_FILE"
 
-    if ! grep -q "age.secrets.$NAME " "$HOST_FILE"; then
-      mv "$HOST_BACKUP" "$HOST_FILE"
+    if ! grep -q "age.secrets.$NAME " "$DECL_FILE"; then
+      mv "$DECL_BACKUP" "$DECL_FILE"
       rm -f "$AGE_FILE"
       die "insertion produced no age.secrets.$NAME declaration — awk failed. Reverted."
     fi
-    log "inserted age.secrets.$NAME block into $HOST_FILE (above marker)"
+    log "inserted age.secrets.$NAME block into $DECL_FILE (above marker)"
 
     revert_all() {
-      [ -f "$HOST_BACKUP" ] && mv "$HOST_BACKUP" "$HOST_FILE"
+      [ -f "$DECL_BACKUP" ] && mv "$DECL_BACKUP" "$DECL_FILE"
       rm -f "$AGE_FILE"
       # unstage the age file if we staged it
       git rm --cached --quiet "$AGE_FILE" 2>/dev/null || true
@@ -309,20 +320,20 @@ Add the marker on its own line where new age.secrets should go, or fall back to 
     if [ "$TEST_MODE" != "1" ]; then
       # Stage the new .age file so flake eval sees it; untracked files
       # are excluded from the flake source tree.
-      git add -- "$AGE_FILE" "$HOST_FILE"
+      git add -- "$AGE_FILE" "$DECL_FILE"
       if ! nix eval --raw ".#nixosConfigurations.$HOST.config.age.secrets.$NAME.rekeyFile" >/dev/null 2>eval.err; then
         log "nix eval failed after inserting age.secrets.$NAME:"
         sed 's/^/  /' eval.err >&2 || true
         revert_all
         rm -f eval.err
-        die "reverted host file + removed $AGE_FILE — nothing to commit."
+        die "reverted $DECL_FILE + removed $AGE_FILE — nothing to commit."
       fi
       rm -f eval.err
       log "nix eval ok"
     fi
 
     # backup no longer needed — commit path is now the only exit
-    rm -f "$HOST_BACKUP"
+    rm -f "$DECL_BACKUP"
 
     # -------------------------------------------------------------------
     # rekey — regenerate per-host copies under secrets/rekeyed/<host>/
@@ -346,7 +357,7 @@ Add the marker on its own line where new age.secrets should go, or fall back to 
       git add -A
       git commit -m "secret: add $NAME
 
-Adds age.secrets.$NAME on $HOST (owner=$OWNER, group=$GROUP, mode=$MODE).
+Adds age.secrets.$NAME in $DECL_FILE, checked on $HOST (owner=$OWNER, group=$GROUP, mode=$MODE).
 Generated by \`add-secret\`.
 
 Pre-push checklist:
@@ -363,7 +374,7 @@ Pre-push checklist:
       git push -u origin "$branch"
 
       pr_body=$(cat <<PRBODY
-Adds \`age.secrets.$NAME\` on host **$HOST** (owner=$OWNER, group=$GROUP, mode=$MODE).
+Adds \`age.secrets.$NAME\` in \`$DECL_FILE\`, checked on host **$HOST** (owner=$OWNER, group=$GROUP, mode=$MODE).
 
 Generated by \`add-secret\`. Consumers of the secret are not wired in this PR — that lands in a follow-up commit.
 

@@ -231,6 +231,35 @@
         builtins.attrValues (builtins.removeAttrs flakeInputs [ "self" ])
       )
     );
+
+    # Daily-driver workstation: a hosts/<name>/default.nix (hardware +
+    # identity, importing profiles/workstation) plus the flake-level
+    # modules every workstation shares. A replacement laptop is one more
+    # `mkWorkstation ./hosts/<name>/default.nix`.
+    mkWorkstation = hostModule: nixpkgs.lib.nixosSystem {
+      system = linuxSystem;
+      pkgs = pkgsLinux;
+      specialArgs = { inherit microvm; };
+      modules = [
+        hostModule
+        ./modules/common.nix
+        agenix.nixosModules.default
+        agenix-rekey.nixosModules.default
+        { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
+        microvm.nixosModules.host
+        home-manager.nixosModules.home-manager
+        {
+          home-manager.useGlobalPkgs = true;
+          home-manager.useUserPackages = true;
+          # `aggregator-src` reaches the home config because
+          # home/aggregator-embed.nix imports the embed timer straight from
+          # the pinned source tree rather than re-declaring it here. See that
+          # file for why the units are not vendored.
+          home-manager.extraSpecialArgs = { inherit aggregator-src; };
+          home-manager.users.jonathan = import ./home/jonathan-linux.nix;
+        }
+      ];
+    };
   in {
     # NixOS VM (headless, QEMU/KVM)
     nixosConfigurations.vm = nixpkgs.lib.nixosSystem {
@@ -258,30 +287,7 @@
     };
 
     # Dell Latitude 7440 laptop — daily driver
-    nixosConfigurations.dellan = nixpkgs.lib.nixosSystem {
-      system = linuxSystem;
-      pkgs = pkgsLinux;
-      specialArgs = { inherit microvm; };
-      modules = [
-        ./hosts/dellan/default.nix
-        ./modules/common.nix
-        agenix.nixosModules.default
-        agenix-rekey.nixosModules.default
-        { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
-        microvm.nixosModules.host
-        home-manager.nixosModules.home-manager
-        {
-          home-manager.useGlobalPkgs = true;
-          home-manager.useUserPackages = true;
-          # `aggregator-src` reaches the home config because
-          # home/aggregator-embed.nix imports the embed timer straight from
-          # the pinned source tree rather than re-declaring it here. See that
-          # file for why the units are not vendored.
-          home-manager.extraSpecialArgs = { inherit aggregator-src; };
-          home-manager.users.jonathan = import ./home/jonathan-linux.nix;
-        }
-      ];
-    };
+    nixosConfigurations.dellan = mkWorkstation ./hosts/dellan/default.nix;
 
     # Dell Wyse 5070 home server. Hardware IDs and service topology stay
     # disabled/parameterized until bootstrap records physical values.
@@ -523,7 +529,7 @@
         # gh steps that a nix sandbox can't run). Drift-gated: pulls
         # the add-secret derivation out of dellan's
         # environment.systemPackages and asserts its store path equals
-        # the one we smoke. If hosts/dellan swaps it for anything else,
+        # the one we smoke. If profiles/workstation swaps it for anything else,
         # the check fails.
         # See tests/add-secret-smoke.nix for what is NOT covered here.
         add-secret-smoke =
@@ -716,7 +722,7 @@
     #
     # `add-secret <name>` — one-command wrapper for the agenix-rekey add
     # flow (host-file edit → encrypt → rekey → commit → PR). Deployed on
-    # dellan's PATH via environment.systemPackages in hosts/dellan/default.nix;
+    # dellan's PATH via environment.systemPackages in profiles/workstation/default.nix;
     # smoke-tested via checks.x86_64-linux.add-secret-smoke.
     packages.${linuxSystem} = {
       update-beeper = pkgsLinux.beeper-update;

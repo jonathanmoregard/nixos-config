@@ -143,7 +143,7 @@
             # every boot would regenerate keys and the host would hit
             # REMOTE HOST IDENTIFICATION HAS CHANGED on the second call.
             # Backed by /var/lib/research-agent/vm-ssh on the host
-            # (systemd.tmpfiles.rules in hosts/dellan/default.nix).
+            # (systemd.tmpfiles.rules in profiles/workstation/default.nix).
             source = "/var/lib/research-agent/vm-ssh";
             mountPoint = "/etc/ssh/keys";
             tag = "ssh-keys";
@@ -160,7 +160,7 @@
             # (false-negative trademark hits on later calls) but gains
             # no host code execution — same exposure class as /out.
             # Backed by /var/lib/research-agent/tool-cache on the host
-            # (systemd.tmpfiles.rules in hosts/dellan/default.nix).
+            # (systemd.tmpfiles.rules in profiles/workstation/default.nix).
             source = "/var/lib/research-agent/tool-cache";
             mountPoint = "/tool-cache";
             tag = "tool-cache";

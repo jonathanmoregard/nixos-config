@@ -7,7 +7,7 @@ description: Use when creating or editing an agenix-managed NixOS secret. Trigge
 
 This repo uses **agenix-rekey** (oddlama/agenix-rekey), migrated from legacy `agenix` (ryantm/agenix) in commit `e451e78`. `secrets/secrets.nix` was **deleted**; recipients are derived from the flake's `nixosConfigurations` + `age.rekey.masterIdentities` (see `modules/nixos/agenix-rekey-common.nix`).
 
-**Legacy `agenix -e <name>.age` on PATH does NOT work post-migration** — it fails with `path 'secrets/secrets.nix' does not exist` and must not be used. Ignore older tutorials and the comments still in `flake.nix` / `hosts/dellan/default.nix` that reference it; they're stale.
+**Legacy `agenix -e <name>.age` on PATH does NOT work post-migration** — it fails with `path 'secrets/secrets.nix' does not exist` and must not be used. Ignore older tutorials and the comments still in `flake.nix` / `profiles/workstation/default.nix` that reference it; they're stale.
 
 Layout:
 - **Source `.age`** in `secrets/` — encrypted to the master pubkey only.
@@ -16,7 +16,7 @@ Layout:
 
 ## Add a new secret (fast path)
 
-`add-secret <name>` is the canonical way to add a secret. It's on dellan's PATH (via `hosts/dellan/default.nix` → `environment.systemPackages`) and collapses the whole flow — encrypt, insert into the host file, rekey, commit on the current feature branch, push, open PR — into one step. The human still has to click **Merge** in the GitHub UI (deliberate gesture per `nixos-deploy.service`).
+`add-secret <name>` is the canonical way to add a secret. It's on dellan's PATH (via `profiles/workstation/default.nix` → `environment.systemPackages`) and collapses the whole flow — encrypt, insert the declaration, rekey, commit on the current feature branch, push, open PR — into one step. The human still has to click **Merge** in the GitHub UI (deliberate gesture per `nixos-deploy.service`).
 
 **Must run from a worktree root** (`~/Repos/nixos-config-worktrees/<slug>`). Refuses otherwise — see the footgun list.
 
@@ -51,10 +51,10 @@ Auto-detect logs `add-secret: reading value from stdin (piped)` to stderr when i
 Flags: `--host <host>` (default `dellan`), `--owner <user>` (`jonathan`), `--group <group>` (`users`), `--mode <mode>` (`0400`).
 
 What happens:
-1. Refuses if `age.secrets.<name>` already exists in `hosts/<host>/default.nix` (points you at the manual edit-view command for editing existing secrets).
+1. Refuses if `age.secrets.<name>` already exists in the target file (see step 4) (points you at the manual edit-view command for editing existing secrets).
 2. Reads the value; if it's a single-line `KEY=VALUE`, strips the `KEY=` prefix (agenix consumers read raw via `$(< file)` and export the env var themselves — storing `KEY=` would double-wrap). Logs when it strips.
 3. Encrypts to `secrets/<name>.age` with `age -r <master-pubkey>` (pubkey pulled from `modules/nixos/agenix-rekey-common.nix`).
-4. Inserts the `age.secrets.<name> = { … };` block above the `# add-secret:insert-here` marker in `hosts/<host>/default.nix`.
+4. Inserts the `age.secrets.<name> = { … };` block above the `# add-secret:insert-here` marker. Target: `hosts/<host>/default.nix` when that file carries the marker (home-server), else `profiles/workstation/default.nix`, which every workstation host (dellan and its successor) imports.
 5. Runs `nix eval .#nixosConfigurations.<host>.config.age.secrets.<name>.rekeyFile` as a sanity check; reverts everything on failure.
 6. Runs `nix run .#agenix-rekey.x86_64-linux.rekey`.
 7. `git add -A && git commit -m "secret: add <name>"` with the `Pre-push checklist:` trailer.
@@ -93,7 +93,7 @@ git add -A
 
 Use only if `add-secret` is unavailable or the invariants it enforces don't apply (e.g. non-`dellan` host that hasn't wired the wrapper in; deliberately declaring a secret without a value; special file mode / owner combinations the wrapper's flags don't cover).
 
-1. Declare it in the consuming host file (e.g. `hosts/dellan/default.nix`) — agenix-rekey discovers secrets via `nixosConfigurations.<host>.config.age.secrets`, so `edit-view` won't recognise an undeclared name:
+1. Declare it where the consuming host gets its secrets (`profiles/workstation/default.nix` for dellan and other workstations, `hosts/home-server/default.nix` for the server) — agenix-rekey discovers secrets via `nixosConfigurations.<host>.config.age.secrets`, so `edit-view` won't recognise an undeclared name:
    ```nix
    age.secrets.<name> = {
      rekeyFile = ../../secrets/<name>.age;
@@ -128,7 +128,7 @@ All at `nix run .#agenix-rekey.x86_64-linux.<cmd>`:
 
 - Running `add-secret` from anywhere but a worktree root refuses — this is intentional (untracked host-file edits + `.age` writes into `/etc/nixos` would be overwritten on next auto-deploy).
 - `add-secret` also refuses on `main` — always be on a feature branch.
-- The `# add-secret:insert-here` marker in `hosts/<host>/default.nix` is load-bearing — do not delete it; the wrapper refuses to insert without it.
+- The `# add-secret:insert-here` marker (in `profiles/workstation/default.nix` and `hosts/home-server/default.nix`) is load-bearing — do not delete it; the wrapper refuses to insert without it.
 - Without `edit`/`view` subcommand → silent view mode, no editor opens.
 - From `secrets/` dir → "execute from flake root" error.
 - `$EDITOR` unset → falls back unhelpfully; set it explicitly.
