@@ -92,8 +92,11 @@ cd ~/Repos/nixos-config-worktrees/<slug>
 
 # 2. Plan + edit
 #    For anything beyond trivial, lead with the `brainstorming` skill
-#    before code, then the `test-driven-development` skill while
-#    coding (write the assertion first, watch it fail, make it pass).
+#    before code. For logic / scripts / branching, use the
+#    `test-driven-development` skill (assertion first, watch it fail,
+#    make it pass). Declarative-only changes (package add, option set,
+#    pin bump) rely on eval/build + existing lanes — no new assertion
+#    restating the declaration.
 $EDITOR home/whatever.nix
 git add -A
 
@@ -243,7 +246,7 @@ VM via `nixos-agent-testing`).
 | Modules emitting executable shell (`pkgs.writeShellScript`, `pkgs.writeShellApplication`, `serviceConfig.ExecStart =`, `nix.settings.post-build-hook`, `system.activationScripts.*`) — *required pre-PR* | **Runtime invocation test** of the generated script with adversarial inputs: empty/missing input, sub-command exits non-zero, sub-command hangs past timeout. Eval validates types; the VM gate validates integration but may not exercise the script (e.g. a post-build-hook whose agenix token is absent in the test VM). Pattern: `nix build --no-link` the derivation, run `/nix/store/.../<name>` directly with crafted env; OR write a parameterized analogue in `/tmp` swapping the real binary for `coreutils/false` / `coreutils/sleep`. Past incident (PR #67): a cachix post-build-hook's `if ! cmd; then rc=$?` looked correct on eval but bash zeroed `rc`, hiding timeout-vs-failure distinction from the journal and producing misleading diagnostics. |
 | **Changes to the injection-scanner** — any change to what scanner code the call sites run: a commit landing on injection-scanner origin/main, a scanner pin bump in a consuming repo, a wrapper env change affecting the scanner, a new call site — *required pre-PR (or pre-merge in the injection-scanner repo)* | **Agent-test EVERY call site, at the MOST RECENT scanner version.** Call sites on this host: `research-agent-mcp` (home/research-agent-mcp.nix), `futuresearch-gate-mcp` (home/futuresearch-gate-mcp.nix). The gate self-updates the scanner to origin/main at runtime, so a test against an older pinned rev proves nothing about what prod will run. Test on the real host, not the VM (the VM has no agenix keys and no egress): build the wrappers, then run each built binary directly — `timeout 90 /nix/store/…/research-agent-mcp </dev/null` and the gate equivalent must log `boot smoke ok` and exit 0. Past incidents, both from testing only ONE call site: #144 (gate lacked LAKERA_API_KEY — only research-agent-mcp had been smoked) and scanner fb31c84 (stdlib urllib needs SSL_CERT_FILE on NixOS — every call site broke, none had been re-smoked after the pin bump). |
 | Pre-implementation planning for non-trivial work | `brainstorming` |
-| While writing the change | `test-driven-development` — extend the right `tests/<feature>.nix` lane (base / desktop / keyring / kitty / claude-pane) before the code, watch it fail, then make it pass |
+| While writing logic, scripts, or branching | `test-driven-development` — extend the right `tests/<feature>.nix` lane (base / desktop / keyring / kitty / claude-pane) before the code, watch it fail, then make it pass. Assert runtime behaviour or a cross-cutting invariant, never a restatement of the declaration (package on PATH, option value). Declarative-only changes (package add, option set, pin bump): eval/build + existing lanes are the check — no new assertion |
 | Before clicking merge on a medium/high-risk PR | `advice-refine-test-loop` — multi-round Opus review with empirical re-verification |
 
 Do not ask the user whether to run these. The only changes that

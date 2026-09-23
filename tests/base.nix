@@ -2351,9 +2351,9 @@ in
         "test -x /etc/profiles/per-user/jonathan/bin/aggregator-schema-probe"
     )
 
-    # The git-broker MCP resolves `bwrap` from the user's PATH and refuses
-    # every Git op without it. Prove it is there AND that an unprivileged
-    # sandbox actually starts for jonathan.
+    # Invariant: unprivileged user-namespace sandboxing works for jonathan.
+    # The git-broker MCP depends on it; catches e.g. hardening that
+    # disables user namespaces.
     dellan.succeed(
         "su - jonathan -c 'bwrap --ro-bind / / --dev /dev --proc /proc true'"
     )
