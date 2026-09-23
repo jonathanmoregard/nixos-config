@@ -23,6 +23,7 @@ pkgs.testers.runNixOSTest {
       imports = [
         inputs.agenix.nixosModules.default
         inputs.agenix-rekey.nixosModules.default
+        inputs.smarthome.nixosModules.system-deploy
         ../hosts/home-server/default.nix
         ../modules/common.nix
         ./fixtures/home-server-cd-module.nix
