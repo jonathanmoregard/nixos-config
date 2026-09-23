@@ -14,6 +14,9 @@
     gh
     direnv
     jq
+    # The git-broker MCP (~/.claude/mcps/git-broker) runs every Git op
+    # inside bwrap resolved from PATH and fails closed without it.
+    bubblewrap
     # Fonts
     nerd-fonts.jetbrains-mono
     # Dev toolchains
