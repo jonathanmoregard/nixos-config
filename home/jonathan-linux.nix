@@ -509,6 +509,7 @@ in
   imports = [
     ./jonathan.nix
     ./cinnamon.nix
+    ./lid-guard.nix
     ./desktop-apps.nix
     ./calibre-plugins.nix
     ./ghostty.nix

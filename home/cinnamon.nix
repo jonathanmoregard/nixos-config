@@ -260,8 +260,7 @@ in
 
     # --- Power ---
     "org/cinnamon/settings-daemon/plugins/power" = {
-      lid-close-ac-action = "suspend";
-      lid-close-battery-action = "suspend";
+      # lid-close-{ac,battery}-action: owned by home/lid-guard.nix.
       sleep-display-ac = 1800;
       sleep-display-battery = 1800;
       sleep-inactive-ac-timeout = 0;
