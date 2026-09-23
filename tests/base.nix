@@ -2351,6 +2351,13 @@ in
         "test -x /etc/profiles/per-user/jonathan/bin/aggregator-schema-probe"
     )
 
+    # The git-broker MCP resolves `bwrap` from the user's PATH and refuses
+    # every Git op without it. Prove it is there AND that an unprivileged
+    # sandbox actually starts for jonathan.
+    dellan.succeed(
+        "su - jonathan -c 'bwrap --ro-bind / / --dev /dev --proc /proc true'"
+    )
+
     # ── Behavioural: the REAL probe runs from the store, on a bare machine ──
     #
     # No checkout, no ~/.claude.json naming a reader, no cache: the only
