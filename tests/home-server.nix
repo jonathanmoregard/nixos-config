@@ -350,16 +350,10 @@ pkgs.testers.runNixOSTest {
         deployKeyFile = config.homeServer.deployKeyFile;
         autoDeployEnabled = config.services.nixos-auto-deploy.enable;
         legacySystemServiceDefined = config.systemd.services ? nixos-deploy;
-        legacySystemTimerEnabled =
-          if config.systemd.timers ? nixos-deploy then
-            config.systemd.timers.nixos-deploy.enable
-          else
-            false;
-        standaloneSystemTimerEnabled =
-          if config.systemd.timers ? system-deploy then
-            config.systemd.timers.system-deploy.enable
-          else
-            false;
+        legacySystemTimerEnabled = config.systemd.timers.nixos-deploy.enable;
+        legacySystemTimerWantedBy = config.systemd.timers.nixos-deploy.wantedBy;
+        standaloneSystemTimerEnabled = config.systemd.timers.system-deploy.enable;
+        standaloneSystemTimerWantedBy = config.systemd.timers.system-deploy.wantedBy;
         standaloneSystemServiceDefined = config.systemd.services ? system-deploy;
         standaloneSystemExecStart =
           if config.systemd.services ? system-deploy then
@@ -433,10 +427,15 @@ pkgs.testers.runNixOSTest {
     # the in-flight deploy that activates it is not stopped on unit removal.
     assert values["autoDeployEnabled"] is True, values
     assert values["legacySystemServiceDefined"] is True, values
-    assert values["legacySystemTimerEnabled"] is False, values
+    # Timers stay defined (never masked) but unscheduled: the standalone
+    # activator's health contract rejects masked units, and both timers are
+    # candidate/recovery health units.
+    assert values["legacySystemTimerEnabled"] is True, values
+    assert values["legacySystemTimerWantedBy"] == [], values
     # First cutover is invoked once, over pinned SSH, after the legacy deploy
     # exits. The standalone generation then enables its own timer.
-    assert values["standaloneSystemTimerEnabled"] is False, values
+    assert values["standaloneSystemTimerEnabled"] is True, values
+    assert values["standaloneSystemTimerWantedBy"] == [], values
     assert values["standaloneSystemServiceDefined"] is True, values
     assert "/run/agenix" not in values["standaloneSystemExecStart"], values
     assert values["smarthomeDeployEnabled"] is True, values
@@ -471,11 +470,14 @@ pkgs.testers.runNixOSTest {
     home_server.wait_for_unit("tailscaled.service")
     home_server.wait_for_unit("mosquitto.service")
     home_server.succeed("systemctl show nixos-deploy.service -P LoadState | grep -Fx loaded")
-    home_server.succeed("systemctl show nixos-deploy.timer -P LoadState | grep -Fx masked")
-    home_server.fail("systemctl is-active --quiet nixos-deploy.timer")
     home_server.succeed("systemctl show system-deploy.service -P LoadState | grep -Fx loaded")
-    home_server.succeed("systemctl show system-deploy.timer -P LoadState | grep -Fx masked")
-    home_server.fail("systemctl is-active --quiet system-deploy.timer")
+    for timer in ("nixos-deploy.timer", "system-deploy.timer"):
+        # Mirror activate-system.sh reset_health_units: LoadState must be
+        # loaded (masked aborts activation) and is-failed must exit 0 or 1.
+        home_server.succeed(f"systemctl show {timer} -P LoadState | grep -Fx loaded")
+        home_server.fail(f"systemctl is-enabled --quiet {timer}")
+        home_server.fail(f"systemctl is-active --quiet {timer}")
+        assert home_server.execute(f"systemctl is-failed --quiet {timer}")[0] == 1, timer
     home_server.wait_for_unit("house-automationd.service")
     home_server.wait_for_unit("tellstick-mqtt-bridge.service")
     home_server.wait_for_unit("postgresql.service")
