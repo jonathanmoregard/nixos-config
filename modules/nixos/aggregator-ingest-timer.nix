@@ -204,7 +204,9 @@ let
     # `uv` and `git` are deliberately GONE. They were here to run the CLI
     # out of the developer's checkout; keeping them on PATH would leave the
     # tools that made the old failure mode possible one typo away.
-    runtimeInputs = [ pkgs.gh pkgs.coreutils pkgs.libnotify ];
+    # `bash` for the network-wait probe's /dev/tcp connect (run under
+    # `timeout`, which needs a program, not a builtin redirection).
+    runtimeInputs = [ pkgs.gh pkgs.coreutils pkgs.libnotify pkgs.bash ];
     text = ''
       set -euo pipefail
 
@@ -231,6 +233,39 @@ let
         echo "aggregator-ingest: no usable CA bundle (SSL_CERT_FILE='$ca_bundle') — every HTTPS source would fail CERTIFICATE_VERIFY_FAILED against an empty trust store" >&2
         exit 1
       fi
+
+      # Network wait. Persistent=true fires a missed tick the instant the
+      # user manager thaws after suspend — observed 2026-09-23: resume at
+      # 17:39:36.43, ingest started 17:39:36.47, and github (4x `gh api`
+      # exit 1) plus ticktick (`Name or service not known`) failed before
+      # Wi-Fi reassociated, exiting 3 and firing a CRITICAL toast for a
+      # non-problem. `After=network-online.target` cannot fix this: that is
+      # a SYSTEM target the user manager does not see, and it is reached
+      # once per boot, not per resume.
+      #
+      # So probe what the network sources actually need — DNS plus a TCP
+      # route to the internet — with a bash /dev/tcp connect to GitHub's API
+      # (the host the github source calls anyway). Bounded: if the host is
+      # genuinely offline, run regardless after the budget, because seven of
+      # the nine sources are local and still worth indexing; the network
+      # sources then fail and report exactly as before.
+      # Budget is wall-clock (bash SECONDS), so a probe that hangs to its
+      # own 5s timeout still counts against it.
+      wait_budget="''${AGGREGATOR_NETWORK_WAIT_SEC:-120}"
+      wait_start=$SECONDS
+      while true; do
+        if timeout 5 bash -c ': </dev/tcp/api.github.com/443' 2>/dev/null; then
+          if [ $((SECONDS - wait_start)) -gt 0 ]; then
+            echo "aggregator-ingest: network reachable after $((SECONDS - wait_start))s wait" >&2
+          fi
+          break
+        fi
+        if [ $((SECONDS - wait_start)) -ge "$wait_budget" ]; then
+          echo "aggregator-ingest: network not reachable after $((SECONDS - wait_start))s (api.github.com:443) — running anyway; network sources will report errors" >&2
+          break
+        fi
+        sleep 2
+      done
 
       # `exec`, so the CLI's exit status IS the unit's exit status with no
       # wrapper in between. That matters for the aggregator's exit-code

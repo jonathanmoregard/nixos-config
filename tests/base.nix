@@ -3142,7 +3142,15 @@ in
         "su - jonathan -c 'env -u GH_TOKEN -u GITHUB_TOKEN "
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt "
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt "
+        "AGGREGATOR_NETWORK_WAIT_SEC=4 "
         f"GH_CONFIG_DIR=/run/aggregator-empty-gh-config {agg_exec}' 2>&1"
+    )
+    # The VM has no internet, so the wrapper's post-resume network wait must
+    # exhaust its (shortened) budget, say so, and still run the local
+    # sources rather than hanging or exiting early.
+    assert "aggregator-ingest: network not reachable after" in agg_auth_failure, (
+        "wrapper's network wait did not report the offline path:\n"
+        f"{agg_auth_failure}"
     )
     assert (
         "github: added=0 updated=0 unchanged=0 skipped=0 errors=4"
