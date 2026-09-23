@@ -325,6 +325,14 @@ in
       color-scheme = "prefer-dark";
     };
 
+    # xdg-desktop-portal-xapp answers org.freedesktop.appearance color-scheme
+    # from this key, not org/gnome/desktop/interface. Left at "default" the
+    # portal reports "no preference" and Firefox/Chromium/Electron/libadwaita
+    # apps render light despite the dark GTK theme.
+    "org/x/apps/portal" = {
+      color-scheme = "prefer-dark";
+    };
+
     "org/gnome/desktop/sound" = {
       event-sounds = false;
     };
