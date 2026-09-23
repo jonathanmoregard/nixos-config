@@ -23,19 +23,10 @@ let
   };
   cfg = evaluated.config;
 in
-assert cfg.hardware.cpu.amd.updateMicrocode;
-assert cfg.hardware.enableRedistributableFirmware;
-assert cfg.hardware.graphics.enable;
-assert cfg.hardware.graphics.enable32Bit;
-assert cfg.hardware.tuxedo-drivers.enable;
-assert cfg.hardware.tuxedo-drivers.settings.charging-profile == "stationary";
-assert cfg.services.power-profiles-daemon.enable;
-assert !cfg.services.tlp.enable;
-assert !cfg.services.thermald.enable;
-assert lib.elem pkgs.libva-utils cfg.environment.systemPackages;
-assert lib.elem pkgs.lm_sensors cfg.environment.systemPackages;
-assert lib.elem pkgs.vulkan-tools cfg.environment.systemPackages;
-assert lib.elem pkgs.whisper-cpp-vulkan cfg.environment.systemPackages;
+# Option values the module sets are not restated here; evaluating and
+# building this profile is their check. Kept: the kernel-parameter guards
+# (nothing may force these before suspend/GPU stress is measured on the real
+# machine) and the out-of-tree driver build against the profile's kernel.
 assert !(lib.elem "amd_pstate=active" cfg.boot.kernelParams);
 assert !(lib.elem "amdxdna" cfg.boot.kernelModules);
 pkgs.runCommand "tuxedo-profile-contract"

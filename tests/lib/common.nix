@@ -57,7 +57,7 @@ let
 
     # Production's 200/300 GiB guard exceeds this disposable VM's 12 GiB
     # disk and would trigger auto-GC on every build. Keep equivalent scaled
-    # protection here; tests/base.nix asserts the rendered daemon values.
+    # protection here.
     nix.settings = {
       min-free = 128 * 1024 * 1024;
       max-free = 1024 * 1024 * 1024;

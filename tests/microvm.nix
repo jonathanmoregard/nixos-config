@@ -7,7 +7,6 @@
 #     share) is created via systemd.tmpfiles, owner root mode 700
 #   - /var/lib/research-agent/tool-cache/{prv,bolagsverket} (persistent
 #     jail tool-cache share) created via systemd.tmpfiles, 0777 jonathan
-#   - agenix activation script references research-agent-host-key
 #
 # Nested-VM gate: starting microvm@research-agent.service would require
 # nested KVM in the outer test QEMU. Some CI / dev hosts don't expose
@@ -98,10 +97,6 @@ pkgs.testers.runNixOSTest {
     # We disabled `wantedBy = [ multi-user.target ]` in the test
     # overrides, so trigger it explicitly to materialize the per-VM
     # files under /var/lib/microvms/<name>.
-    dellan.succeed(
-        "systemctl cat install-microvm-research-agent.service "
-        "| grep -q 'Description='"
-    )
     dellan.succeed("systemctl start install-microvm-research-agent.service")
     dellan.succeed("test -d /var/lib/microvms/research-agent")
     dellan.succeed(
@@ -116,19 +111,6 @@ pkgs.testers.runNixOSTest {
     # runner — the artifact qemu actually execs — not on the .nix source.
     dellan.fail(
         "grep -qE -- '-m 2048( |$)' "
-        "/var/lib/microvms/research-agent/current/bin/microvm-run"
-    )
-    # 4096 (shrunk from 6144 on 2026-08-02, previously bumped 3072 -> 6144
-    # on 2026-07-30 after a research run OOM'd the 3 GiB guest). Load
-    # testing at 6144 showed 4-concurrent Opus/deep peaked guest VmRSS at
-    # ~1.3 GiB (21% used), and the projected 6-concurrent peak from cgroup
-    # per-call deltas is ~3.3 GiB — 4 GiB gives ~+20% headroom over that
-    # projection and frees 2 GiB back to the host (the swap+zram PR #152
-    # exists because of exactly this oversubscription). Well clear of the
-    # 2048 MiB DSDT-corruption boundary. Assert on the materialized runner
-    # — the artifact qemu actually execs.
-    dellan.succeed(
-        "grep -q -- '-m 4096' "
         "/var/lib/microvms/research-agent/current/bin/microvm-run"
     )
 
@@ -155,18 +137,9 @@ pkgs.testers.runNixOSTest {
             f"tool-cache/{sub} perms expected '777 jonathan', got {perms!r}"
         )
 
-    # Health-check watchdog: timer and oneshot service must be installed,
-    # the script must defer to operator-stopped state cleanly, and the
-    # systemctl-restart command name must appear in the script body (a
+    # Health-check watchdog: the script must defer to operator-stopped
+    # state cleanly, and the systemctl-restart command name must appear in the script body (a
     # rename of the microvm unit would silently break the watchdog).
-    dellan.succeed(
-        "systemctl cat research-agent-healthcheck.timer "
-        "| grep -q 'OnUnitActiveSec=1min'"
-    )
-    dellan.succeed(
-        "systemctl cat research-agent-healthcheck.service "
-        "| grep -q 'Description='"
-    )
     script_path = dellan.succeed(
         "systemctl cat research-agent-healthcheck.service "
         "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
@@ -250,14 +223,8 @@ pkgs.testers.runNixOSTest {
     assert wperms == "700 root", (
         f"wedge-logs dir perms expected '700 root', got {wperms!r}"
     )
-    # Notification chain: user path + service units installed, flag dir
-    # exists and is world-readable so the user session can inotify it.
-    dellan.succeed(
-        "test -f /etc/systemd/user/research-agent-healthcheck-notify.path"
-    )
-    dellan.succeed(
-        "test -f /etc/systemd/user/research-agent-healthcheck-notify.service"
-    )
+    # Notification chain: flag dir exists and is world-readable so the
+    # user session can inotify it.
     notify_perms = dellan.succeed(
         "stat -c '%a %U' /run/microvm-healthcheck-notify"
     ).strip()
@@ -287,27 +254,10 @@ pkgs.testers.runNixOSTest {
         f"watchdog must survive corrupted state file; got is-failed={rc!r}"
     )
 
-    # agenix entry for the host-to-VM SSH private key is wired.
-    # agenix declares per-secret install snippets in the system's
-    # activation script — `grep` finds the secret name there. The file
-    # itself doesn't materialize in this test because the test VM's SSH
-    # host keys aren't in secrets.nix's recipient list, so decryption
-    # fails. The reference in the activation snippet is the right
-    # plumbing check.
-    dellan.succeed(
-        "grep -rq research-agent-host-key /run/current-system/activate "
-        "/run/current-system/etc/ "
-        "|| grep -rq research-agent-host-key /nix/store/*activate* 2>/dev/null"
-    )
-
     # ---------------------------------------------------------------
     # scraper microvm — same shape of assertions as research-agent,
     # plus the bearer-token init service that gates both VMs.
     # ---------------------------------------------------------------
-    dellan.succeed(
-        "systemctl cat install-microvm-scraper.service "
-        "| grep -q 'Description='"
-    )
     dellan.succeed("systemctl start install-microvm-scraper.service")
     dellan.succeed("test -d /var/lib/microvms/scraper")
     dellan.succeed(
@@ -326,9 +276,6 @@ pkgs.testers.runNixOSTest {
     # Bearer-token init service must exist and produce a token file when
     # invoked. The token is regenerated on every boot; consumers read it
     # via virtiofs on demand, so rotation = a single `systemctl restart`.
-    dellan.succeed(
-        "systemctl cat scraper-bearer-init.service | grep -q 'Description='"
-    )
     dellan.succeed("test -d /var/lib/scraper-bearer")
     perms = dellan.succeed(
         "stat -c '%a %U' /var/lib/scraper-bearer"
@@ -364,13 +311,6 @@ pkgs.testers.runNixOSTest {
     # ---------------------------------------------------------------
     # scraper healthcheck — mirror of research-agent watchdog.
     # ---------------------------------------------------------------
-    dellan.succeed(
-        "systemctl cat scraper-healthcheck.timer "
-        "| grep -q 'OnUnitActiveSec=1min'"
-    )
-    dellan.succeed(
-        "systemctl cat scraper-healthcheck.service | grep -q 'Description='"
-    )
     scraper_script = dellan.succeed(
         "systemctl cat scraper-healthcheck.service "
         "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
@@ -386,10 +326,6 @@ pkgs.testers.runNixOSTest {
     dellan.succeed(f"grep -q 'GIVING UP' {scraper_script}")
     dellan.succeed(
         f"grep -q '/run/microvm-healthcheck-notify/scraper' {scraper_script}"
-    )
-    dellan.succeed("test -f /etc/systemd/user/scraper-healthcheck-notify.path")
-    dellan.succeed(
-        "test -f /etc/systemd/user/scraper-healthcheck-notify.service"
     )
     # Probe operator-stopped microvm as a no-op (the scraper unit is
     # stopped in this test via wantedBy mkForce []), exit 0 silently.

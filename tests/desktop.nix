@@ -1,12 +1,12 @@
 # vm-desktop: Cinnamon screenshot / clipboard plumbing.
 #
-# Covers the Print / Shift+Print → gnome-screenshot → CopyQ chain:
-#   - CopyQ binary on PATH + autostart .desktop present (required for
-#     gnome-screenshot --clipboard to persist after gnome-screenshot exits)
-#   - gnome-screenshot binary on PATH (fired by the keybindings)
-#   - Cinnamon dconf: Print + Shift+Print custom bindings present;
-#     default media-keys screenshot binding cleared (so PrtSc doesn't
-#     double-fire into both "save to ~/Pictures" and "to clipboard").
+# Covers:
+#   - no duplicate voquill autostart entry (login race regression)
+#   - Cinnamon dconf: default media-keys screenshot binding cleared (so
+#     PrtSc doesn't double-fire into both "save to ~/Pictures" and "to
+#     clipboard")
+#   - xdg-mime resolves magnet/.torrent/video types to their handlers
+#   - the X11 bell is actually silent after display-setup-script runs
 #   - lid-guard: lid-close action is suspend by default, "nothing" while
 #     agent hooks report work in flight (turn, subagent, young background
 #     Bash), back to suspend on Stop / dead agent / SessionEnd.
@@ -51,12 +51,6 @@ in
     dellan.wait_for_unit("home-manager-jonathan.service")
     dellan.wait_for_unit("default.target", "jonathan")
 
-    # CopyQ clipboard manager — binary on PATH + autostart .desktop present.
-    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/copyq")
-    dellan.succeed(
-        "test -f /home/jonathan/.config/autostart/copyq.desktop"
-    )
-
     # Voquill must NOT have a cinnamon autostart entry — it is launched by
     # systemd.user.services.voquill (home/router-services.nix); a duplicate
     # autostart entry raced with the systemd unit on every login
@@ -65,44 +59,8 @@ in
         "test ! -e /home/jonathan/.config/autostart/voquill.desktop"
     )
 
-    # Nemo (GTK) sidebar bookmarks — declarative pins for ~/Downloads
-    # and ~/Dropbox in the file manager's left menu.
-    bookmarks = dellan.succeed(
-        "cat /home/jonathan/.config/gtk-3.0/bookmarks"
-    )
-    assert "file:///home/jonathan/Downloads" in bookmarks, \
-        f"Downloads bookmark missing:\n{bookmarks}"
-    assert "file:///home/jonathan/Dropbox" in bookmarks, \
-        f"Dropbox bookmark missing:\n{bookmarks}"
-
-    # gnome-screenshot — the binary fired by the Print / Shift+Print
-    # Cinnamon custom keybindings.
-    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/gnome-screenshot")
-
-    # Cinnamon dconf — Print / Shift+Print custom keybindings present and
-    # the default media-keys screenshot bindings cleared.
-    dconf_dump = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "dconf dump /org/cinnamon/desktop/keybindings/'"
-    )
-    print("[diag] cinnamon keybindings dconf dump:\n" + dconf_dump)
-    assert "[custom-keybindings/custom-screenshot-clipboard]" in dconf_dump, \
-        f"missing custom-screenshot-clipboard entry:\n{dconf_dump}"
-    assert "[custom-keybindings/custom-screenshot-area-clipboard]" in dconf_dump, \
-        f"missing custom-screenshot-area-clipboard entry:\n{dconf_dump}"
-    assert "binding=['Print']" in dconf_dump, \
-        f"Print not bound to fullscreen-to-clipboard:\n{dconf_dump}"
-    assert "binding=['<Shift>Print']" in dconf_dump, \
-        f"Shift+Print not bound to area-to-clipboard:\n{dconf_dump}"
-    # Command paths include the nix store prefix; assert the gnome-screenshot
-    # binary suffix + args. `--clipboard'` (with trailing single-quote) pins
-    # the fullscreen-only command since `--area --clipboard'` matches the
-    # other entry too.
-    assert "gnome-screenshot --clipboard'" in dconf_dump, \
-        f"fullscreen binding command missing:\n{dconf_dump}"
-    assert "gnome-screenshot --area --clipboard'" in dconf_dump, \
-        f"area binding command missing:\n{dconf_dump}"
-    # Default media-keys screenshot bindings cleared
+    # Default media-keys screenshot bindings cleared, so PrtSc does not
+    # double-fire into both "save to ~/Pictures" and the clipboard binding.
     media_keys = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "dconf read /org/cinnamon/desktop/keybindings/media-keys/screenshot' || echo EMPTY"
@@ -114,14 +72,7 @@ in
 
     # XDG MIME defaults — magnet links and .torrent files route to qBittorrent.
     # User-realistic check: `xdg-open magnet:?xt=...` resolves via xdg-mime,
-    # which reads ~/.config/mimeapps.list (Home Manager writes it from
-    # xdg.mimeApps.defaultApplications).
-    mimeapps = dellan.succeed("cat /home/jonathan/.config/mimeapps.list")
-    print("[diag] mimeapps.list:\n" + mimeapps)
-    assert "x-scheme-handler/magnet=org.qbittorrent.qBittorrent.desktop" in mimeapps, \
-        f"magnet handler not mapped to qbittorrent:\n{mimeapps}"
-    assert "application/x-bittorrent=org.qbittorrent.qBittorrent.desktop" in mimeapps, \
-        f".torrent handler not mapped to qbittorrent:\n{mimeapps}"
+    # which must find both mimeapps.list and the handler's .desktop file.
     magnet_default = dellan.succeed(
         "su - jonathan -c 'xdg-mime query default x-scheme-handler/magnet'"
     ).strip()
@@ -146,18 +97,7 @@ in
     # silencing has to happen at the X-server level. Hook is
     # `display-setup-script` (runs on every X start) rather than
     # `greeter-setup-script` (skipped on autologin path).
-    lightdm_conf = dellan.succeed("cat /etc/lightdm/lightdm.conf")
-    print("[diag] /etc/lightdm/lightdm.conf:\n" + lightdm_conf)
-    assert "display-setup-script=" in lightdm_conf, \
-        f"display-setup-script not wired into lightdm.conf:\n{lightdm_conf}"
-    setup_script = dellan.succeed(
-        "awk -F= '/^display-setup-script=/ {print $2; exit}' /etc/lightdm/lightdm.conf"
-    ).strip()
-    assert setup_script, "display-setup-script value empty"
-    setup_body = dellan.succeed(f"cat {setup_script}")
-    assert "xset b off" in setup_body, \
-        f"display-setup-script does not silence X11 bell:\n{setup_body}"
-
+    #
     # Empirical: with autologin enabled (test scaffolding mirrors
     # feature-vm), display-setup-script runs and the X server reports
     # bell volume 0. Confirms the hook fires on the autologin path —

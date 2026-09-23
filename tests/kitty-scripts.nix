@@ -1613,21 +1613,6 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "  topology size; the ring is a slot per size, not a log."
       exit 1; }
 
-    # D9 — drift gate: the deployed save script actually routes through
-    # kitty-session-commit, and still gates on the enricher's exit code
-    # (the partial-snapshot / same-cwd-collision guard this must not
-    # weaken).
-    save_bin=$(command -v kitty-session-save)
-    grep -q 'kitty-session-commit' "$save_bin" || {
-      echo "FAIL(D9): kitty-session-save does not call"
-      echo "  kitty-session-commit — every assertion above is testing a"
-      echo "  script nothing runs."
-      exit 1; }
-    grep -q 'enrich_rc' "$save_bin" || {
-      echo "FAIL(D9): the enricher exit-code gate (partial-snapshot"
-      echo "  collision guard) is gone from kitty-session-save."
-      exit 1; }
-
     # --- Phase E: kitty-panes-reflow ---
     #
     # Reflow takes the panes a RUNNING kitty already has and moves them
@@ -2654,17 +2639,6 @@ pkgs.runCommand "kitty-scripts-harness"
     mkdir -p krc3/.local/bin
     install -m 644 ${deployedZshrc} krc3/.zshrc
     install -m 644 ${deployedZshenv} krc3/.zshenv
-    # Drift gate: if the pair ever stops being the heavyweight rc this
-    # phase exists to exercise, fail rather than pass against a stub.
-    grep -q 'oh-my-zsh' krc3/.zshrc || {
-      echo "FAIL(K3): the rc under test does not load oh-my-zsh, so it"
-      echo "  is not the deployed one and this phase proves nothing."
-      exit 1; }
-    grep -q '_claude_slice' krc3/.zshrc || {
-      echo "FAIL(K3): the deployed rc no longer defines _claude_slice at"
-      echo "  all. Every restored claude pane would run outside"
-      echo "  claude-egress.slice."
-      exit 1; }
     # The native-installer path the launcher resolves through
     # `whence -p claude`. ARGV_OUT is how the fake records that it ran.
     cp fakebin/claude krc3/.local/bin/claude

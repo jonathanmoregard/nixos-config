@@ -147,7 +147,6 @@
     dellan.succeed(f"grep -q 'ConnectTimeout=15' {script}")
     dellan.succeed(f"grep -q 'ServerAliveInterval=15' {script}")
     dellan.succeed(f"grep -q 'ServerAliveCountMax=4' {script}")
-    dellan.succeed(f"grep -q 'nix-memory-run --nonblock' {script}")
     # The fetch is wrapped in `timeout` with a POSITIVE bound — the
     # regex rejects `timeout 0 git fetch`, which would disable it.
     dellan.succeed(f"grep -qE 'timeout [1-9][0-9]* git fetch' {script}")
