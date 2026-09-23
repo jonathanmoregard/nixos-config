@@ -45,7 +45,6 @@ read -r -d '' BODY <<'JSON' || true
       "verify fork-guards",
       "flake check (eval)",
       "build dellan toplevel",
-      "build home-server toplevel",
       "vm-minimal"
     ]
   },
