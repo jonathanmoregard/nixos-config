@@ -143,7 +143,12 @@ in
 
   # The production composition selects home-server. This fixture is an
   # extended generation in the same flake and changes only the deploy target.
+  # It deliberately keeps exercising the legacy rollback path while the
+  # production host's bootstrap contract proves that path is unscheduled.
+  services.nixos-auto-deploy.enable = lib.mkForce true;
+  systemd.timers.nixos-deploy.enable = lib.mkOverride 40 true;
   services.nixos-auto-deploy.flakeAttr = lib.mkForce "home-server-cd";
+  services.system-auto-deploy.enable = lib.mkForce false;
   # Prevent wall-clock boundaries from racing the deterministic scenario. The
   # real service stays intact and is invoked explicitly by the test.
   systemd.timers.nixos-deploy.wantedBy = lib.mkForce [ ];

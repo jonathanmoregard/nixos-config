@@ -117,6 +117,7 @@ pkgs.testers.runNixOSTest {
       imports = [
         inputs.agenix.nixosModules.default
         inputs.agenix-rekey.nixosModules.default
+        inputs.smarthome.nixosModules.system-deploy
         ../hosts/home-server/default.nix
         ../modules/common.nix
       ];
@@ -348,6 +349,23 @@ pkgs.testers.runNixOSTest {
         deploySecretDeclared = config.age.secrets ? "deploy-ssh-key";
         deployKeyFile = config.homeServer.deployKeyFile;
         autoDeployEnabled = config.services.nixos-auto-deploy.enable;
+        legacySystemServiceDefined = config.systemd.services ? nixos-deploy;
+        legacySystemTimerEnabled =
+          if config.systemd.timers ? nixos-deploy then
+            config.systemd.timers.nixos-deploy.enable
+          else
+            false;
+        standaloneSystemTimerEnabled =
+          if config.systemd.timers ? system-deploy then
+            config.systemd.timers.system-deploy.enable
+          else
+            false;
+        standaloneSystemServiceDefined = config.systemd.services ? system-deploy;
+        standaloneSystemExecStart =
+          if config.systemd.services ? system-deploy then
+            config.systemd.services.system-deploy.serviceConfig.ExecStart
+          else
+            "";
         smarthomeDeployEnabled = config.services.smarthome-auto-deploy.enable;
         smarthomeProfile = config.services.smarthome-auto-deploy.profile;
         automationEnabled = config.services.houseAutomation.enable;
@@ -411,7 +429,16 @@ pkgs.testers.runNixOSTest {
     ), values
     assert values["deploySecretDeclared"] is True, values
     assert values["deployKeyFile"] == "/run/agenix/deploy-ssh-key", values
+    # Keep the legacy service defined for this one bootstrap generation so
+    # the in-flight deploy that activates it is not stopped on unit removal.
     assert values["autoDeployEnabled"] is True, values
+    assert values["legacySystemServiceDefined"] is True, values
+    assert values["legacySystemTimerEnabled"] is False, values
+    # First cutover is invoked once, over pinned SSH, after the legacy deploy
+    # exits. The standalone generation then enables its own timer.
+    assert values["standaloneSystemTimerEnabled"] is False, values
+    assert values["standaloneSystemServiceDefined"] is True, values
+    assert "/run/agenix" not in values["standaloneSystemExecStart"], values
     assert values["smarthomeDeployEnabled"] is True, values
     assert values["smarthomeProfile"] == "/nix/var/nix/profiles/smarthome", values
     assert values["automationEnabled"] is True, values
@@ -443,6 +470,12 @@ pkgs.testers.runNixOSTest {
 
     home_server.wait_for_unit("tailscaled.service")
     home_server.wait_for_unit("mosquitto.service")
+    home_server.succeed("systemctl show nixos-deploy.service -P LoadState | grep -Fx loaded")
+    home_server.succeed("systemctl show nixos-deploy.timer -P LoadState | grep -Fx masked")
+    home_server.fail("systemctl is-active --quiet nixos-deploy.timer")
+    home_server.succeed("systemctl show system-deploy.service -P LoadState | grep -Fx loaded")
+    home_server.succeed("systemctl show system-deploy.timer -P LoadState | grep -Fx masked")
+    home_server.fail("systemctl is-active --quiet system-deploy.timer")
     home_server.wait_for_unit("house-automationd.service")
     home_server.wait_for_unit("tellstick-mqtt-bridge.service")
     home_server.wait_for_unit("postgresql.service")
