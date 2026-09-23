@@ -146,7 +146,6 @@ in
   # It deliberately keeps exercising the legacy rollback path while the
   # production host's bootstrap contract proves that path is unscheduled.
   services.nixos-auto-deploy.enable = lib.mkForce true;
-  systemd.timers.nixos-deploy.enable = lib.mkOverride 40 true;
   services.nixos-auto-deploy.flakeAttr = lib.mkForce "home-server-cd";
   services.system-auto-deploy.enable = lib.mkForce false;
   # Prevent wall-clock boundaries from racing the deterministic scenario. The
