@@ -13,7 +13,7 @@
 #         profiles/workstation/default.nix when the host file (dellan)
 #         has no marker
 #       - refuses to overwrite an existing .age file on rerun
-#   - a host file that carries its own marker (home-server) is the
+#   - a host file that carries its own marker (example-server) is the
 #     target instead; no marker anywhere refuses without leaving a .age
 #
 # What is NOT exercised here (requires real nix eval / real gh / real
@@ -58,12 +58,12 @@ pkgs.runCommand "add-secret-smoke"
     #   profile  (default) — the real dellan shape: host file has no
     #            marker; profiles/workstation/default.nix holds the shared
     #            secrets and the marker.
-    #   host     — the home-server shape: hosts/home-server/default.nix
+    #   host     — the example-server shape: hosts/example-server/default.nix
     #            carries its own marker.
     #   nomarker — neither file has a marker.
     mkfixture() {
       local root="$1" layout="''${2:-profile}"
-      mkdir -p "$root/hosts/dellan" "$root/hosts/home-server" \
+      mkdir -p "$root/hosts/dellan" "$root/hosts/example-server" \
         "$root/profiles/workstation" "$root/secrets" "$root/modules/nixos"
 
       # flake.nix — presence-only; add-secret only checks the file exists
@@ -93,10 +93,10 @@ NIXFILE
   networking.hostName = "dellan";
 }
 NIXFILE
-      cat > "$root/hosts/home-server/default.nix" <<'NIXFILE'
+      cat > "$root/hosts/example-server/default.nix" <<'NIXFILE'
 { ... }:
 {
-  networking.hostName = "home-server";
+  networking.hostName = "example-server";
 }
 NIXFILE
 
@@ -104,7 +104,7 @@ NIXFILE
       # nomarker) the insertion marker.
       case "$layout" in
         profile|nomarker) decl="$root/profiles/workstation/default.nix" ;;
-        host)             decl="$root/hosts/home-server/default.nix" ;;
+        host)             decl="$root/hosts/example-server/default.nix" ;;
         *)                fail "unknown fixture layout: $layout" ;;
       esac
       cat > "$decl" <<'NIXFILE'
@@ -273,19 +273,19 @@ NIXFILE
       || fail "--prompt override was ignored — .age file created from piped stdin"
 
     # --- 11. a host file with its own marker keeps its declarations -----
-    # (home-server shape): --host home-server writes there, never into
+    # (example-server shape): --host example-server writes there, never into
     # the workstation profile.
     mkfixture "$PWD/f-host" host
     ( cd "$PWD/f-host" && \
-        printf 'v\n' | ADD_SECRET_TEST_MODE=1 "$tool" server-key --from-stdin --host home-server ) \
+        printf 'v\n' | ADD_SECRET_TEST_MODE=1 "$tool" server-key --from-stdin --host example-server ) \
       >host.log 2>&1 || fail "host-marker path failed"
-    grep -q "age.secrets.server-key = {" "$PWD/f-host/hosts/home-server/default.nix" \
-      || fail "host-marker path did not declare in hosts/home-server/default.nix"
+    grep -q "age.secrets.server-key = {" "$PWD/f-host/hosts/example-server/default.nix" \
+      || fail "host-marker path did not declare in hosts/example-server/default.nix"
     [ ! -s "$PWD/f-host/profiles/workstation/default.nix" ] \
       || fail "host-marker path wrote into the workstation profile"
-    ( cd "$PWD/f-host" && ADD_SECRET_TEST_MODE=1 "$tool" pre-existing --from-stdin --host home-server ) \
+    ( cd "$PWD/f-host" && ADD_SECRET_TEST_MODE=1 "$tool" pre-existing --from-stdin --host example-server ) \
       </dev/null >host-dup.log 2>&1 && fail "accepted duplicate host-file declaration" || true
-    grep -q "already declared in hosts/home-server/default.nix" host-dup.log \
+    grep -q "already declared in hosts/example-server/default.nix" host-dup.log \
       || fail "no already-declared error naming the host file"
 
     # --- 12. no marker anywhere: refuse and leave no .age behind --------

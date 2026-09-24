@@ -157,9 +157,9 @@ cd into ~/Repos/nixos-config-worktrees/<slug> and rerun."
       fi
     done
 
-    # Declaration target: the host's own file when it carries the marker
-    # (home-server), otherwise the workstation profile shared by dellan
-    # and its successor hosts.
+    # Declaration target: the host's own file when it carries the marker,
+    # otherwise the workstation profile shared by dellan and its successor
+    # hosts.
     HOST_FILE="hosts/$HOST/default.nix"
     [ -f "$HOST_FILE" ] || die "no host file at $HOST_FILE"
     if grep -qF "$MARKER" "$HOST_FILE"; then

@@ -28,11 +28,6 @@
     prose-decorate.url = "github:jonathanmoregard/prose-decorate";
     prose-decorate.inputs.nixpkgs.follows = "nixpkgs";
 
-    # Home automation engine and its NixOS service module. Pin the reviewed
-    # commit explicitly; flake.lock records the matching source hash.
-    smarthome.url = "github:jonathanmoregard/smarthome/9b83ffe733ef0e9d86ddddd6a516d11e52504ae5";
-    smarthome.inputs.nixpkgs.follows = "nixpkgs";
-
     # Anthropic ships an official Linux app since 2026-06-30, but not
     # via nixpkgs. `aaddrick/claude-desktop-debian` repackages the
     # upstream Linux app as `.deb`/`.rpm`/AppImage plus a Nix flake
@@ -158,7 +153,7 @@
 
   outputs = flakeInputs@{ self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
               tts-tool, substack-url-tool, prose-decorate, claude-desktop,
-              smarthome, aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
+              aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
               ... }:
   let
     linuxSystem = "x86_64-linux";
@@ -212,25 +207,6 @@
         })
       ];
     };
-
-    # Keep every direct and transitive flake source available to nested,
-    # network-isolated home-server CD evaluation. Following inputs form a DAG;
-    # unique store paths collapse shared nixpkgs/flake-parts nodes.
-    collectInputSources = input:
-      let
-        source = if builtins.isAttrs input && input ? outPath then input.outPath else input;
-        children =
-          if builtins.isAttrs input && input ? inputs then
-            builtins.attrValues input.inputs
-          else
-            [ ];
-      in
-      [ source ] ++ nixpkgs.lib.concatMap collectInputSources children;
-    homeServerCdInputSources = nixpkgs.lib.unique (
-      nixpkgs.lib.concatMap collectInputSources (
-        builtins.attrValues (builtins.removeAttrs flakeInputs [ "self" ])
-      )
-    );
 
     # Daily-driver workstation: a hosts/<name>/default.nix (hardware +
     # identity, importing profiles/workstation) plus the flake-level
@@ -289,43 +265,6 @@
     # Dell Latitude 7440 laptop — daily driver
     nixosConfigurations.dellan = mkWorkstation ./hosts/dellan/default.nix;
 
-    # Dell Wyse 5070 home server. Hardware IDs and service topology stay
-    # disabled/parameterized until bootstrap records physical values.
-    nixosConfigurations.home-server = nixpkgs.lib.nixosSystem {
-      system = linuxSystem;
-      pkgs = pkgsLinux;
-      modules = [
-        ./hosts/home-server/default.nix
-        ./modules/common.nix
-        agenix.nixosModules.default
-        agenix-rekey.nixosModules.default
-        smarthome.nixosModules.system-deploy
-        { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
-      ];
-    };
-
-    # Test-only extension used by vm-home-server-cd. It keeps production host
-    # composition intact while adding NixOS test instrumentation so real
-    # generation switches remain observable inside the disposable VM.
-    nixosConfigurations.home-server-cd =
-      self.nixosConfigurations.home-server.extendModules {
-        modules = [
-          ./tests/fixtures/home-server-cd-module.nix
-          { system.extraDependencies = homeServerCdInputSources; }
-        ];
-      };
-
-    # Prebuild the second release used by the CD test. The disposable target
-    # still evaluates and switches through nixos-rebuild; retaining both
-    # runtime closures avoids giving that target a compiler/source universe
-    # solely to manufacture the fixture's one-line release change.
-    nixosConfigurations.home-server-cd-v2 =
-      self.nixosConfigurations.home-server-cd.extendModules {
-        modules = [
-          { environment.etc."cd-release".text = nixpkgs.lib.mkForce "v2\n"; }
-        ];
-      };
-
     # VM-based e2e tests, one per feature area. Run any single lane:
     #   nix build .#checks.x86_64-linux.vm-base -L
     # Or all five via `nix flake check`.
@@ -338,7 +277,7 @@
         mkLane = path: import path {
           pkgs = pkgsLinux;
           inputs = {
-            inherit nixpkgs home-manager agenix agenix-rekey microvm smarthome aggregator-src;
+            inherit nixpkgs home-manager agenix agenix-rekey microvm aggregator-src;
           };
         };
       in {
@@ -361,37 +300,6 @@
         # exists to prevent.
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
         vm-klaffat-dependabot-caretaker = mkLane ./tests/klaffat-dependabot-caretaker.nix;
-        vm-home-server = mkLane ./tests/home-server.nix;
-        vm-home-server-cd = import ./tests/home-server-cd.nix {
-          pkgs = pkgsLinux;
-          inputs = { inherit agenix agenix-rekey smarthome; };
-          inputSources = homeServerCdInputSources;
-          homeServerCdSystem = self.nixosConfigurations.home-server-cd.config.system.build.toplevel;
-          homeServerCdV2System =
-            self.nixosConfigurations.home-server-cd-v2.config.system.build.toplevel;
-        };
-        # Fast direct-evaluation contract for the host-owned automation
-        # service: credentials stay runtime-only and the unit remains hardened.
-        house-automation-service = import ./tests/house-automation-service.nix {
-          pkgs = pkgsLinux;
-          inputs = { inherit nixpkgs; };
-        };
-        smarthome-hydrator =
-          let pkgs = pkgsLinux;
-          in import ./tests/smarthome-hydrator.nix {
-            inherit pkgs;
-            script = ./modules/nixos/smarthome-hydrate-release-paths.sh;
-          };
-        smarthome-activator =
-          let pkgs = pkgsLinux;
-          in import ./tests/smarthome-activator.nix {
-            inherit pkgs;
-            script = ./modules/nixos/smarthome-activate-package.sh;
-          };
-        smarthome-auto-deploy = import ./tests/smarthome-auto-deploy.nix {
-          pkgs = pkgsLinux;
-          inputs = { inherit nixpkgs; };
-        };
 
         # Not a VM lane: an eval-time assertion, because that is when the
         # fault would land. dellan is the machine holding the root-only
