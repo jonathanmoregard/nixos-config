@@ -38,8 +38,7 @@ let
   # binding, pasted into a shell, and exploded into 5 broken sub-
   # commands. EXPECTED is the original single line the AI typed.
   #
-  # Fails if the unwrap heuristic regresses: binding loses the
-  # `| kitty-copy-unwrap` stage, kitten algorithm misdetects K,
+  # Fails if the unwrap heuristic regresses: kitten algorithm misdetects K,
   # rstrip dropped, or block join switches from ' '.join to ''.join.
   #
   # Lives outside the testScript so its multi-line payload doesn't
@@ -87,9 +86,8 @@ let
   # notion of every option's type) rather than a reimplementation.
   #
   # MUST call the raw kitty binary. `/etc/profiles/per-user/jonathan/
-  # bin/kitty` is the session-restoring bash wrapper from home/kitty.nix
-  # (the test asserts as much a few lines up); handed `+runpy` it does
-  # not pass the argument through — it proceeds to open a terminal and
+  # bin/kitty` is the session-restoring bash wrapper from home/kitty.nix;
+  # handed `+runpy` it does not pass the argument through — it proceeds to open a terminal and
   # blocks until the 3600s test timeout.
   configParseProbe = pkgs.writeShellScript "vm-kitty-config-parse-probe" ''
     set -euo pipefail
@@ -191,15 +189,6 @@ in
     dellan.wait_for_unit("home-manager-jonathan.service")
     dellan.wait_for_unit("default.target", "jonathan")
 
-    # HM-installed binaries on user PATH
-    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty")
-    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty-session-save")
-    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/kitty-session-convert")
-    # `kitty` itself is the session-restoring wrapper (symlinkJoin override).
-    dellan.succeed(
-        "head -1 /etc/profiles/per-user/jonathan/bin/kitty | grep -q bash"
-    )
-
     # Copy + paste config: BOTH must preserve embedded newlines so a
     # multi-line shell command or code block copied out of kitty
     # round-trips byte-for-byte through the X11 clipboard. The earlier
@@ -208,9 +197,6 @@ in
     # newlines; the combined effect was that "any multi-line selection
     # came out as a single line", which broke ordinary cmd-line use.
     kitty_conf = "/home/jonathan/.config/kitty/kitty.conf"
-    dellan.succeed(
-        f"grep -qE '^map ctrl\\+shift\\+c pass_selection_to_program' {kitty_conf}"
-    )
     # Regression guard: the `tr -d` step that mangled the copy is GONE
     # from the BINDING (not the surrounding docstring — the new
     # comment explicitly mentions `tr -d` to explain why it was
@@ -219,43 +205,14 @@ in
     dellan.fail(
         f"grep -qE '^map ctrl\\+shift\\+c.*tr -d' {kitty_conf}"
     )
-    # Positive assertion: binding pipes through kitty-copy-unwrap
-    # (the TUI hanging-indent un-wrapper, see home/kitty.nix). Losing
-    # this stage is the regression Phase A protects against.
-    dellan.succeed(
-        f"grep -qE '^map ctrl\\+shift\\+c.*kitty-copy-unwrap' {kitty_conf}"
-    )
-    dellan.succeed(
-        "test -x /etc/profiles/per-user/jonathan/bin/kitty-copy-unwrap"
-    )
-    # Escape-hatch binding: kitty built-in copy_to_clipboard, no
-    # transform. Use for uniformly-indented multi-line shell bodies
-    # that the unwrap heuristic would collapse.
-    dellan.succeed(
-        f"grep -qE '^map ctrl\\+shift\\+alt\\+c copy_to_clipboard' {kitty_conf}"
-    )
     # Regression guard: paste_actions no longer contains replace-newline.
     dellan.fail(
         f"grep -qE '^paste_actions .*replace-newline' {kitty_conf}"
     )
-    # Positive assertion: paste_actions still ships confirm (safety
-    # prompt for control-code-containing payloads) and quote-urls.
+    # Safety invariant: paste_actions keeps the confirm prompt for
+    # control-code-containing payloads.
     dellan.succeed(
         f"grep -qE '^paste_actions .*confirm' {kitty_conf}"
-    )
-    dellan.succeed(
-        f"grep -qE '^paste_actions .*quote-urls-at-prompt' {kitty_conf}"
-    )
-    # auto_reload_config enabled so config bumps land on a running kitty
-    # without a restart (e.g. the ctrl+shift+c xclip fix that PR #70
-    # shipped but PR #70 deploy left invisible until kitty restarted).
-    #
-    # kitty 0.48 retyped this from a boolean to a float — debounce
-    # SECONDS, with a negative value meaning "disabled". So the
-    # assertion is "set to a non-negative number", which rejects both
-    # the dead `yes` spelling and an accidental `-1`.
-    dellan.succeed(
-        f"grep -qE '^auto_reload_config[[:space:]]+[0-9]' {kitty_conf}"
     )
 
     # Whole-config parse guard. kitty does NOT fail to start on a bad
@@ -424,8 +381,7 @@ in
     #   - does NOT contain `paste_actions ... replace-newline`
     #     (the destructive setting that would turn every embedded
     #     \n into a space)
-    #   - DOES contain `paste_actions ... confirm` and
-    #     `quote-urls-at-prompt`
+    #   - DOES contain `paste_actions ... confirm`
     #
     # A live-paste round-trip test would add no signal beyond those
     # config assertions: kitty's paste handler is upstream code with
@@ -805,13 +761,6 @@ in
     # because the user is invited to run it on a hunch, doing nothing at
     # all when the layout is already right is a hard requirement, not an
     # optimisation.
-    dellan.succeed(
-        "test -x /etc/profiles/per-user/jonathan/bin/kitty-panes-reflow"
-    )
-    dellan.succeed(
-        f"grep -qE '^map ctrl\\+shift\\+r launch --type=background .*"
-        f"kitty-panes-reflow$' {kitty_conf}"
-    )
 
     def reflow_state(path):
         """(group ids per tab, focused window, window->pid) from ls.

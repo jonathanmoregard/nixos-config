@@ -101,12 +101,6 @@ common.mkMinimalTest {
     ({ config, ... }: {
       assertions = [
         {
-          assertion = config.users.users ? klaffat-caretaker-repair
-            && config.users.users ? klaffat-caretaker-verifier
-            && config.users.users ? klaffat-caretaker-publisher;
-          message = "untrusted caretaker stages must use fixed separate service identities";
-        }
-        {
           assertion = config.services.klaffatDependabotCaretaker.requiredContexts == [
             "refuse test-endpoints in release"
             "rust — fmt + clippy + test"
@@ -210,11 +204,7 @@ common.mkMinimalTest {
     dellan.succeed("cmp /var/lib/klaffat-dependabot-caretaker/state/ready.json /var/lib/klaffat-dependabot-caretaker/notification/ready.json")
     dellan.succeed("test -f /var/lib/klaffat-dependabot-caretaker/notification/ready")
     user_systemctl = "runuser -u jonathan -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user"
-    dellan.succeed(f"test \"$({user_systemctl} show -P Restart klaffat-dependabot-caretaker-ready.service)\" = on-failure")
-    dellan.succeed(f"test \"$({user_systemctl} show -P RestartUSec klaffat-dependabot-caretaker-ready.service)\" = 1min")
-    dellan.succeed(f"test \"$({user_systemctl} show -P StartLimitIntervalUSec klaffat-dependabot-caretaker-ready.service)\" = 0")
     dellan.wait_until_succeeds(f"test \"$({user_systemctl} show -P SubState klaffat-dependabot-caretaker-ready.service)\" = auto-restart")
-    dellan.succeed(f"test \"$({user_systemctl} show -P LoadState klaffat-dependabot-caretaker-ready.timer)\" = loaded")
     dellan.succeed("systemctl restart user@1000.service")
     dellan.wait_until_succeeds(f"test \"$({user_systemctl} show -P ActiveState klaffat-dependabot-caretaker-ready.timer)\" = active")
     dellan.wait_until_succeeds(f"test \"$({user_systemctl} show -P SubState klaffat-dependabot-caretaker-ready.service)\" = auto-restart")

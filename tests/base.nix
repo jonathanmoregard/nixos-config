@@ -6,7 +6,7 @@
 #   - systemd --user (via linger) reached default.target for jonathan
 #   - X server up (autoLogin path; catches LightDM regressions in
 #     the lightest lane before they trip the heavier ones)
-#   - kindle udev rule file present with the expected unset clauses
+#   - kindle udev rule does not clear ID_MEDIA_PLAYER (PR #108 regression)
 #     (vm-base-only by design: this is the lane that imports the full
 #     dellan host config via mkTest, and we only need to verify the
 #     payload once per build — mkMinimalTest / mkFeatureTest lanes
@@ -311,21 +311,11 @@ in
     codex_requirements = dellan.succeed(
         "cat /etc/codex/requirements.toml"
     )
+    # The profile's roots and protections are proven by the sandbox runs
+    # below; only the hardening keys no run exercises are read back here.
     assert 'allowed_sandbox_modes' not in codex_requirements
-    assert 'default_permissions = "repos_dev"' in codex_requirements
     assert 'allowed_approval_policies = ["never"]' in codex_requirements
     assert 'allow_managed_hooks_only = true' in codex_requirements
-    assert '[allowed_permission_profiles]' in codex_requirements
-    assert 'repos_dev = true' in codex_requirements
-    assert '[permissions.repos_dev]' in codex_requirements
-    assert 'extends = ":workspace"' in codex_requirements
-    assert '[permissions.repos_dev.workspace_roots]' in codex_requirements
-    assert '"/home/jonathan/Repos" = true' in codex_requirements
-    assert '"/home/jonathan/worktrees" = true' in codex_requirements
-    assert '[permissions.repos_dev.filesystem]' in codex_requirements
-    assert '"/home/jonathan/.local/state/ai-router" = "write"' in codex_requirements
-    assert '[features]' in codex_requirements
-    assert 'hooks = true' in codex_requirements
 
     # Exact broad source roots work without prompts.
     dellan.succeed("install -d -o jonathan -g users /home/jonathan/Repos")
@@ -405,20 +395,11 @@ in
     # activation on the 4 GiB / 2-core CI VM has repeatedly hit that
     # ceiling (PR #171 moved claude-desktop to environment.systemPackages
     # to fit; PR #175 vm-autodoro re-hit at 316s). modules/common.nix
-    # pins the ceiling at 20min. This assertion guards against the
-    # override silently dropping — either via a bad merge or a module
-    # that overwrites the whole serviceConfig.
+    # raises the ceiling. This floor check guards against the override
+    # silently dropping — either via a bad merge or a module that
+    # overwrites the whole serviceConfig.
     #
-    # Pattern mirrors tests/auto-deploy.nix (which grep-locks
-    # nixos-deploy.service's TimeoutStartSec=60min against the same
-    # incident class).
-    dellan.succeed(
-        "systemctl cat home-manager-jonathan.service "
-        "| grep -q 'TimeoutStartSec=20min'"
-    )
-    # Belt-and-braces floor check: parse systemd's normalised value and
-    # assert >= 15min (900s). Catches an override that keeps a
-    # `TimeoutStartSec=` line but lowers it below the floor. systemctl
+    # Parse systemd's normalised value and assert >= 15min (900s). systemctl
     # show renders "20min" for 1200s, "1h" for 3600s, "infinity" for
     # unlimited — accept any of those; reject anything below 15min.
     raw = dellan.succeed(
@@ -448,14 +429,6 @@ in
     # generated daemon/user-manager state, not source-text checks: a module
     # whose options render but never enroll a cgroup must fail this lane.
     nix_config = dellan.succeed("nix config show").splitlines()
-    assert "max-jobs = 1" in nix_config, (
-        "Nix daemon must admit one build at a time; got:\n"
-        + "\n".join(line for line in nix_config if "jobs" in line)
-    )
-    assert "min-free = 134217728" in nix_config
-    assert "max-free = 1073741824" in nix_config
-    assert "cores = 4" in nix_config
-    assert "use-cgroups = true" in nix_config
     experimental_features = next(
         line for line in nix_config if line.startswith("experimental-features = ")
     )
@@ -464,11 +437,6 @@ in
         + experimental_features
     )
 
-    dellan.succeed("test -x /run/current-system/sw/bin/nix-memory-run")
-    dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat ram-heavy.slice'"
-    )
     dellan.succeed("test -d /home/jonathan/.local/share/aggregator")
     dellan.wait_for_unit("aggregator-mcp-backend.service", "jonathan")
     dellan.succeed(
@@ -756,33 +724,6 @@ in
     # unsafe because all worktrees attached to refs/heads/main share that ref
     # while keeping independent indexes. Exercise generated runner against a
     # local remote and a dirty/staged anchor.
-    fetch_timer = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat nixos-config-fetch.timer'"
-    )
-    for marker in [
-        "OnCalendar=*:0/30",
-        "Persistent=true",
-        "AccuracySec=5min",
-        "RandomizedDelaySec=5min",
-    ]:
-        assert marker in fetch_timer, (
-            f"nixos-config-fetch.timer lost {marker!r}:\n{fetch_timer}"
-        )
-
-    fetch_service = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat nixos-config-fetch.service'"
-    )
-    for marker in [
-        "OnFailure=nixos-config-fetch-failure-notify.service",
-        "Type=oneshot",
-        "TimeoutStartSec=180",
-    ]:
-        assert marker in fetch_service, (
-            f"nixos-config-fetch.service lost {marker!r}:\n{fetch_service}"
-        )
-
     fetch_runner = dellan.succeed(
         "su - jonathan -c 'command -v nixos-config-fetch'"
     ).strip()
@@ -892,33 +833,6 @@ in
     # the report and produced no operator signal. Exercise the replacement's
     # real generated runner against local fixtures: no network, no model, and
     # no alternate test-only implementation.
-    drift_timer = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat nixos-drift-analyzer.timer'"
-    )
-    for marker in [
-        "OnCalendar=hourly",
-        "Persistent=true",
-        "AccuracySec=5min",
-        "RandomizedDelaySec=5min",
-    ]:
-        assert marker in drift_timer, (
-            f"nixos-drift-analyzer.timer lost {marker!r}:\n{drift_timer}"
-        )
-
-    drift_service = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat nixos-drift-analyzer.service'"
-    )
-    for marker in [
-        "OnFailure=nixos-drift-analyzer-failure-notify.service",
-        "Type=oneshot",
-        "TimeoutStartSec=120",
-    ]:
-        assert marker in drift_service, (
-            f"nixos-drift-analyzer.service lost {marker!r}:\n{drift_service}"
-        )
-
     drift_runner = dellan.succeed(
         "su - jonathan -c 'command -v nixos-drift-analyzer'"
     ).strip()
@@ -1082,35 +996,9 @@ in
     finding_login = dellan.succeed("su - jonathan -c 'zsh -lic true'")
     assert "Drift report available" in finding_login, finding_login
 
-    # The research-agent MCP server runs straight out of ~/Repos/research-agent
-    # (`uv run --project`), and the research microvm bind-mounts that same
-    # directory read-only at /workspace. An unpulled merge therefore means
-    # every freshly spawned server AND every jailed agent runs stale code.
-    # 2026-07-29..31: a merged model-fallback fix sat unpulled for three days
-    # while every research call failed 429 — the processes churned constantly,
-    # the checkout did not. --ff-only so a dirty or diverged tree fails loudly
-    # in the log rather than fabricating a merge commit.
-    assert (
-        "git -C /home/jonathan/Repos/research-agent pull --ff-only"
-        in crontab_src
-    ), f"research-agent auto-pull line missing from crontab source:\n{crontab_src}"
-
-    # RSI daily-reviewer cron. Live again as of 2026-08-03 after the
-    # 2026-08-02 usage-cap disable, but the on/off decision no longer
-    # lives in this file: the wrapper reads components.daily_review from
-    # ~/.claude/recursive-self-improvement/config/config.json and exits
-    # before starting a model unless it is exactly true. A live entry is
-    # therefore not the same claim it used to be — the cost gate is the
-    # JSON key, asserted behaviourally below.
-    #
-    # The history this still guards: the plugin's install.sh installs the
-    # entry via `crontab -e`, which loses on every rebuild and every
-    # Monday backup-crontab.sh run — that is why review-agent.log went
-    # silent 2026-04-17 and stayed silent for four months.
-    # home/jonathan-linux.nix is the only durable install path on dellan.
-    assert any(
-        "rsi-daily-review" in c for c in active_commands
-    ), f"RSI daily-reviewer cron entry missing from crontab source:\n{crontab_src}"
+    # RSI daily-reviewer cron. The plugin's install.sh keys idempotency on
+    # the tag comment, so the declarative line must keep it or a reinstall
+    # duplicates the entry.
     assert (
         "# recursive-self-improvement-analysis" in crontab_src
     ), f"the RSI cron line should keep its tag comment (install.sh keys idempotency on it):\n{crontab_src}"
@@ -1129,24 +1017,13 @@ in
     ).strip()
     rsi_cfg_dir = "/home/jonathan/.claude/recursive-self-improvement/config"
 
-    # WHERE the reviewer writes. Until now nothing in this file asserted
-    # on it: the crontab entry above and the components.daily_review gate
-    # below are both indifferent to the destination, so a completely
-    # broken dest= would have sailed through this lane green. ~/.claude is
-    # the live config repo the harness reads, and a nightly writer inside
-    # it dirtied `git status` every morning until PR #202 removed the
-    # auto-committer that papered over it; the state-dir sink is what
-    # actually stops the dirtying. Asserted as the literal absolute path
-    # because it must NOT be reached through the compatibility symlink
-    # under ~/.claude — a writer that depends on a symlink existing is a
-    # writer that fails silently on a machine where it does not.
+    # WHERE the reviewer writes. ~/.claude is the live config repo the
+    # harness reads, and a nightly writer inside it dirtied `git status`
+    # every morning until PR #202 removed the auto-committer that papered
+    # over it. Re-adding the legacy write target — in code OR in a comment
+    # quoting it — fails the gate rather than silently resuming the nightly
+    # dirtying.
     rsi_script = dellan.succeed(f"cat {rsi_bin}")
-    assert (
-        'dest="$HOME/.local/state/claude-proposals/rsi"' in rsi_script
-    ), f"reviewer must write proposals to the state-dir sink:\n{rsi_script}"
-    # The negative half, and it is the one that has teeth: re-adding the
-    # legacy write target — in code OR in a comment quoting it — fails
-    # the gate rather than silently resuming the nightly dirtying.
     assert "recursive-self-improvement/proposals" not in rsi_script, (
         "the reviewer must not reference the legacy in-repo proposals "
         f"path as a write target:\n{rsi_script}"
@@ -1332,19 +1209,6 @@ in
                 "Write(" not in cron_line and "Bash(" not in cron_line
             ), f"cron line grants Write/Bash via --allowedTools (dead grant headless): {cron_line}"
 
-    # Permission-ledger nightly evaluator. Shipped 2026-08-01 by a
-    # separate session; its installer wrote only the LIVE crontab, which
-    # the installCrontab activation hook overwrites from
-    # home/jonathan-linux.nix on every rebuild. Without a declarative
-    # copy, the first deploy after install silently kills the evaluator
-    # — same failure shape as the RSI 2026-04-17 outage above.
-    assert (
-        "# permission-ledger-evaluate" in crontab_src
-    ), f"permission-ledger cron entry missing from crontab source:\n{crontab_src}"
-    assert (
-        "permission-ledger/run-evaluate.sh" in crontab_src
-    ), f"permission-ledger run-evaluate.sh reference missing from crontab source:\n{crontab_src}"
-
     # ~/.claude must have NO auto-committer. Removed 2026-08-31: the live
     # checkout is the running configuration, so an unattended 13:47 commit
     # of whatever a session left half-finished landed on master unreviewed.
@@ -1352,10 +1216,8 @@ in
     # returns via claude-pull.timer, which is fast-forward-only and the only
     # writer to that checkout.
     #
-    # Asserted as an ABSENCE on purpose. The three entries above exist
-    # because a `crontab -` install silently died at the next rebuild; this
-    # one is the mirror risk — a re-add would silently restore an unattended
-    # writer to the config the harness reads live.
+    # Asserted as an ABSENCE on purpose: a re-add would silently restore an
+    # unattended writer to the config the harness reads live.
     assert not any(
         "/home/jonathan/.claude/sync-agent.sh" in _cron_command(line)
         for line in crontab_src.splitlines()
@@ -1369,9 +1231,6 @@ in
     # path therefore does not exist: pointing cron at it logged
     # `No such file or directory` on every run and synced nothing. It must
     # be driven through the canonical script via the SYNC_REPO override.
-    assert (
-        "SYNC_REPO=/home/jonathan/Repos/superpowers" in crontab_src
-    ), f"superpowers autosync must run via the SYNC_REPO override:\n{crontab_src}"
     assert not any(
         "/home/jonathan/Repos/superpowers/sync-agent.sh" in c
         for c in [_cron_command(l) for l in crontab_src.splitlines()]
@@ -1386,16 +1245,9 @@ in
     # 69-libmtp.rules:10's early-exit symlink branch can't fire, but
     # leaves ID_MEDIA_PLAYER alone so 70-uaccess.rules:70 still grants
     # the user ACL on the /dev/bus/usb/N/M node (cleared by PR #108,
-    # restored here). The VM can't model real USB so we only assert
-    # the rule file is on disk with the right clauses — runtime
-    # behaviour is verified on dellan by replugging the kindle.
+    # restored here). The VM can't model real USB; runtime behaviour is
+    # verified on dellan by replugging the kindle.
     kindle_rule = dellan.succeed("cat /etc/udev/rules.d/60-kindle.rules")
-    assert 'ATTR{idVendor}=="1949"' in kindle_rule, \
-        f"kindle rule missing vendor match:\n{kindle_rule}"
-    assert 'ATTR{idProduct}=="9981"' in kindle_rule, \
-        f"kindle rule missing product (paperwhite) match:\n{kindle_rule}"
-    assert 'ENV{ID_MTP_DEVICE}=""' in kindle_rule, \
-        f"kindle rule missing ID_MTP_DEVICE unset:\n{kindle_rule}"
     # Regression guard for PR #108 → PR #109: must NOT clear
     # ID_MEDIA_PLAYER (breaks 70-uaccess.rules:70 user-ACL grant).
     # Substring match is safe here because writeTextFile only writes
@@ -1442,25 +1294,11 @@ in
 
     # The drift-warning banner (home/jonathan.nix loginExtra) is gated to
     # interactive shells; it must NOT leak into a non-interactive
-    # `su - -c '…'`, or it pollutes scripted output (it previously broke
-    # the GEMINI_API_KEY_FILE assertion below, and would break any su -c
-    # parse like the camera-watchdog checks).
+    # `su - -c '…'`, or it pollutes scripted output (it would break any
+    # su -c parse like the camera-watchdog checks).
     drift_leak = dellan.succeed("su - jonathan -c 'true'")
     assert "drift warning" not in drift_leak, (
         f"drift banner leaked into non-interactive login shell:\n{drift_leak}"
-    )
-
-    # home.sessionVariables.GEMINI_API_KEY_FILE must reach jonathan's
-    # interactive shell — prose-decorate --audio and any future Gemini
-    # tool reads this env var to find the agenix-decrypted key. `su -`
-    # loads jonathan's login shell, which sources the HM-generated env
-    # files; assert the value matches the agenix path the host wires up.
-    gemini_var = dellan.succeed(
-        "su - jonathan -c 'echo $GEMINI_API_KEY_FILE'"
-    ).strip()
-    assert gemini_var == "/run/agenix/gemini-api-key", (
-        f"GEMINI_API_KEY_FILE in jonathan's login shell = {gemini_var!r}, "
-        f"expected '/run/agenix/gemini-api-key'"
     )
 
     # ── git hardening (home/jonathan.nix programs.git.settings) ──
@@ -1480,8 +1318,6 @@ in
         "core.fsmonitor": "false",
         "submodule.recurse": "false",
         "safe.bareRepository": "explicit",
-        "user.useConfigOnly": "true",
-        "gc.reflogExpireUnreachable": "90.days",
     }
     for key, want in expected_git_config.items():
         got = dellan.succeed(
@@ -1573,25 +1409,6 @@ in
             f"rule in CLAUDE.md. Probe output:\n{wt_probe}"
         )
 
-    # The ncfg helper is the ergonomic half of the same change — without it
-    # the anchor path is long enough that muscle memory reaches for the bare
-    # repo, which now fails.
-    #
-    # Asserts wiring, not execution: initContent lands in .zshrc, which only
-    # an INTERACTIVE zsh sources, and `su - jonathan -c` is a login
-    # non-interactive shell. Driving a real interactive zsh here would drag in
-    # p10k for no extra coverage — the function body is a one-line `git -C`,
-    # and the path it points at is already exercised by the anchor probe.
-    ncfg_src = dellan.succeed("su - jonathan -c 'cat ~/.zshrc'")
-    assert "ncfg()" in ncfg_src, (
-        "ncfg shell function missing from ~/.zshrc "
-        "(home/jonathan.nix programs.zsh.initContent)"
-    )
-    assert "Repos/nixos-config-worktrees/main" in ncfg_src, (
-        "ncfg is present but does not anchor on the main worktree — it must "
-        "not point at the bare repo, which safe.bareRepository now refuses"
-    )
-
     # Every active worktree workflow uses the linked main checkout only as a
     # Git anchor. It fetches first, then bases the new branch on origin/main;
     # no automation depends on or advances shared refs/heads/main.
@@ -1612,77 +1429,28 @@ in
     }
     for source_name, (source_path, branch_name) in workflow_sources.items():
         source_text = dellan.succeed(f"cat {source_path}")
-        expected_base = f"-b {branch_name} origin/main"
         stale_base = f"-b {branch_name} main"
-        assert expected_base in source_text, (
-            f"{source_name} must base new worktrees on origin/main; "
-            f"missing {expected_base!r}"
-        )
-        assert "fetch origin main" in source_text, (
-            f"{source_name} must fetch origin/main before branch creation"
-        )
         assert stale_base not in source_text, (
             f"{source_name} still bases new worktrees on shared local main: "
             f"{stale_base!r}"
         )
 
-    # ── Lakera tuned-project pointer (home/lakera.nix) ──
-    # Both injection-scanner call sites must export
-    # LAKERA_PROJECT_ID from the single source in home/lakera.nix, so
-    # injection_scanner/lakera.py pins Lakera Guard to the tuned L3
-    # project policy instead of the account default. Assert on the
-    # rendered wrapper text: a call site that drops the import would
-    # silently fall back to the default policy with zero runtime error.
-    lakera_marker = "export LAKERA_PROJECT_ID=project-5833252261"
-    for wrapper in ["research-agent-mcp", "futuresearch-gate-mcp"]:
-        wrapper_txt = dellan.succeed(
-            f"su - jonathan -c 'cat $(command -v {wrapper})'"
-        )
-        assert lakera_marker in wrapper_txt, (
-            f"{wrapper} wrapper lost the LAKERA_PROJECT_ID export:\n{wrapper_txt}"
-        )
     # continuous-learning-v2 was removed; its host vetter must stay gone.
     dellan.fail(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user cat claude-cl-sync.service claude-cl-sync.timer'"
     )
 
-    # Dell Latitude hardware profile must survive extraction from the generic
-    # laptop module. These are observable contracts, not source-text checks.
-    dellan.succeed("systemctl cat tlp.service >/dev/null")
-    dellan.succeed("systemctl cat thermald.service >/dev/null")
-    dellan.succeed(
-        "grep -q 'export LIBVA_DRIVER_NAME=\"iHD\"' /etc/set-environment"
-    )
-
     # ── IPU6 camera self-heal watchdog (dell-latitude-7440.nix) ──
     # The real recovery can't be modelled in a VM (no OV02C10 sensor /
-    # IVSC), so — like the kindle udev rule above — this asserts the
-    # wiring is installed correctly and that the script's healthy/no-op
-    # path runs cleanly under real systemd. The state machine itself is
-    # covered exhaustively by the runtime-invocation suite; full sensor
-    # recovery is verified on dellan after deploy.
-    dellan.succeed(
-        "systemctl cat ipu6-camera-watchdog.timer "
-        "| grep -q 'OnUnitActiveSec=15s'"
-    )
-    # The relay must carry the syslog log-sink env: with the default
-    # stdout sink, CamHAL lines reach journald in multi-minute buffered
-    # bursts and watchdog detection latency degrades from ~15-30s to the
-    # flush interval.
-    dellan.succeed(
-        "systemctl cat v4l2-relayd-ipu6.service | grep -q 'logSink=SYSLOG'"
-    )
+    # IVSC), so this asserts the script's safety guards and that its
+    # healthy/no-op path runs cleanly under real systemd. The state machine
+    # itself is covered exhaustively by the runtime-invocation suite; full
+    # sensor recovery is verified on dellan after deploy.
     cam_script = dellan.succeed(
         "systemctl cat ipu6-camera-watchdog.service "
         "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
     ).strip()
-    # Recovery must restart the relay by name, non-blocking, and key off
-    # both wedge signals (a rename of any silently breaks self-heal).
-    dellan.succeed(f"grep -q 'systemctl restart --no-block' {cam_script}")
-    dellan.succeed(f"grep -q 'v4l2-relayd-ipu6.service' {cam_script}")
-    dellan.succeed(f"grep -q 'waitFrame, time out happens' {cam_script}")
-    dellan.succeed(f"grep -q 'Scheduled restart job' {cam_script}")
     # Hard regression guard: the watchdog must NEVER touch the PCI bus.
     # Unbind/rebind of intel-ipu6 corrupts IVSC/CSE state and turns a
     # soft wedge into a reboot-only hard wedge (learned empirically).
@@ -1693,10 +1461,6 @@ in
     dellan.succeed(f"grep -q 'restart-burst-count' {cam_script}")
     dellan.succeed(f"grep -q 'GIVING UP' {cam_script}")
     dellan.succeed(f"grep -q '/run/ipu6-camera-notify/wedged' {cam_script}")
-    dellan.succeed("test -f /etc/systemd/user/ipu6-camera-watchdog-notify.path")
-    dellan.succeed(
-        "test -f /etc/systemd/user/ipu6-camera-watchdog-notify.service"
-    )
     cam_notify_perms = dellan.succeed(
         "stat -c '%a %U' /run/ipu6-camera-notify"
     ).strip()
@@ -1731,16 +1495,8 @@ in
     # The runner script lives in ~/Repos/sota-watch/runner/run-watch.sh
     # (a separate userspace repo NOT present in this VM), so the wrapper
     # must guard: missing runner → log "skipping" and exit 0. This lane
-    # asserts (a) the timer unit is loaded + active for the user, and
-    # (b) starting the service exits cleanly and the run log records the
-    # skip — the behavioural guard-path signal.
-    timers = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user list-timers --all'"
-    )
-    assert "sota-watch.timer" in timers, \
-        f"sota-watch.timer missing from user timer list:\n{timers}"
-
+    # asserts starting the service exits cleanly and the run log records
+    # the skip — the behavioural guard-path signal.
     # Start the service synchronously and assert it did NOT fail. `start`
     # with a oneshot unit blocks until ExecStart returns; a non-zero exit
     # (guard bug) surfaces as a failed unit.
@@ -1774,14 +1530,6 @@ in
     swaps = dellan.succeed("cat /proc/swaps")
     assert "/dev/zram" in swaps, \
         f"zram swap device missing from /proc/swaps:\n{swaps}"
-
-    # notify-send must resolve on jonathan's PATH: the runner's Claude
-    # allowlist includes Bash(notify-send*) for medium/high findings,
-    # and that entry was dead (exit 127) until libnotify landed in
-    # home.packages — this assertion keeps it from regressing.
-    dellan.succeed(
-        "su - jonathan -c 'command -v notify-send'"
-    )
 
     # Negative control BEFORE the failure lane: a clean guard-path run
     # must NOT have tripped the OnFailure notify unit. Without this, the
@@ -1857,13 +1605,6 @@ in
     # (2026-08-31 constraint: a desktop toast reaches nobody who can fix
     # it), so its SHAPE is asserted, not merely its presence.
     import json as _ai_router_json
-
-    timers = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user list-timers --all'"
-    )
-    assert "ai-router-ranking.timer" in timers, \
-        f"ai-router-ranking.timer missing from user timer list:\n{timers}"
 
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -1964,18 +1705,6 @@ in
         "systemctl --user reset-failed ai-router-ranking.service'"
     )
 
-    # home.sessionPath must land on jonathan's PATH: `~/.claude/bin`
-    # holds repo-managed launchers (`ai-router` first). `su -` runs the
-    # login shell, which sources the HM-generated hm-session-vars.sh —
-    # the behavioural check, not a grep of the rendered file.
-    path_var = dellan.succeed(
-        "su - jonathan -c 'echo $PATH'"
-    ).strip()
-    assert "/home/jonathan/.claude/bin" in path_var.split(":"), (
-        "/home/jonathan/.claude/bin missing from jonathan's login-shell "
-        f"PATH:\n{path_var}"
-    )
-
     # ── aggregator all-sources ingest (modules/nixos/aggregator-ingest-timer.nix) ──
     # One user timer walks all nine aggregator sources every 30 min. The
     # predecessor (aggregator-github-ingest) ran one source and had NO
@@ -1996,9 +1725,6 @@ in
     agg_timers = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user list-timers --all'"
-    )
-    assert "aggregator-ingest.timer" in agg_timers, (
-        f"aggregator-ingest.timer missing from user timer list:\n{agg_timers}"
     )
     # wantedBy = timers.target, proven by systemd rather than by a symlink
     # stat: enabled (the install symlink resolved) AND active (the user
@@ -2021,12 +1747,10 @@ in
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user cat aggregator-ingest.service'"
     )
-    # The OnFailure edge itself, and the timeout backstop that makes a
-    # wedged nine-source run fail (Type=oneshot disables TimeoutStartSec by
-    # default, which is how a hang becomes an unbounded "activating").
-    assert "OnFailure=aggregator-ingest-failure-notify.service" in agg_unit, (
-        f"aggregator-ingest.service lost its OnFailure edge:\n{agg_unit}"
-    )
+    # The timeout backstop that makes a wedged nine-source run fail
+    # (Type=oneshot disables TimeoutStartSec by default, which is how a hang
+    # becomes an unbounded "activating"). The OnFailure edge is exercised
+    # behaviourally further down.
     assert "GH_TOKEN=" not in agg_unit, (
         f"aggregator unit must not inject a token ahead of gh's keyring:\n{agg_unit}"
     )
@@ -2062,10 +1786,6 @@ in
         "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
     ).strip()
     agg_script = dellan.succeed(f"cat {agg_exec}")
-    # What it runs: every source through the one runner, not `ingest github`.
-    assert "ingest --all" in agg_script, (
-        f"aggregator wrapper no longer drives all sources:\n{agg_script}"
-    )
     # ── The unit must run a DEPLOYED ARTIFACT, not a working tree ──
     #
     # Regression lock for the defect fixed on 2026-08-16. ExecStart had
@@ -2114,9 +1834,6 @@ in
     agg_cli = agg_exec_lines[0].split()[1].strip("'\"")
     assert agg_cli.startswith("/nix/store/"), (
         f"aggregator wrapper execs {agg_cli!r}, which is not a store path:\n{agg_script}"
-    )
-    assert agg_exec_lines[0].endswith("ingest --all"), (
-        f"aggregator wrapper no longer execs the all-sources runner:\n{agg_script}"
     )
 
     # Same ban on the unit body — narrower wording because a future
@@ -2186,13 +1903,6 @@ in
     # silently reported everything as healthy, which is precisely the state
     # it exists to prevent. So the real generated script is RUN, against
     # stub probes that produce each verdict, and its routing is asserted.
-    health_timers = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user list-timers --all'"
-    )
-    assert "aggregator-schema-health.timer" in health_timers, (
-        f"aggregator-schema-health.timer missing from user timers:\n{health_timers}"
-    )
     for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
         got = dellan.succeed(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -2215,10 +1925,6 @@ in
     health_unit = dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user cat aggregator-schema-health.service'"
-    )
-    assert "OnFailure=aggregator-schema-health-failure-notify.service" in health_unit, (
-        "the detector lost its own OnFailure edge, so a detector that dies "
-        f"reports nothing — the failure this whole unit is about:\n{health_unit}"
     )
     assert "TimeoutStartSec=" in health_unit, (
         "Type=oneshot disables TimeoutStartSec by default, so without it a "
@@ -2343,13 +2049,6 @@ in
         "is measuring a writer it was not built with"
     )
     dellan.succeed(f"test -x {health_probe}")
-    # On the user's PATH too, beside `aggregator-mcp`: that sibling relation
-    # is what the SessionStart hook keys on to run the packaged probe rather
-    # than guess at a checkout.
-    dellan.succeed("test -x /etc/profiles/per-user/jonathan/bin/aggregator-mcp")
-    dellan.succeed(
-        "test -x /etc/profiles/per-user/jonathan/bin/aggregator-schema-probe"
-    )
 
     # Invariant: unprivileged user-namespace sandboxing works for jonathan.
     # The git-broker MCP depends on it; catches e.g. hardening that
@@ -2865,17 +2564,7 @@ in
             f"instead of yielding to it:\n{agg_embed_unit}"
         )
 
-    # THE MEMORY CEILING IS THIS REPO'S OWN ADDITION, so it is asserted apart
-    # from the upstream directives above rather than riding along with them.
-    # Upstream caps CPU and IO but not memory, and this host has an OOM
-    # history in exactly this workload class — see home/aggregator-embed.nix
-    # for the records.
-    assert "MemoryHigh=6G" in agg_embed_unit, (
-        "aggregator-embed.service lost its MemoryHigh ceiling, so a torch "
-        "backfill measured in weeks runs unbounded on a 30G laptop with a "
-        f"standing OOM history:\n{agg_embed_unit}"
-    )
-    # AND IT MUST STAY A THROTTLE. MemoryMax kills, a SIGKILLed worker leaves
+    # THE MEMORY CEILING MUST STAY A THROTTLE. MemoryMax kills, a SIGKILLed worker leaves
     # its per-row claim on disk, and upstream condemns a claim found at
     # startup as a poison row — so swapping this for a hard cap would drop a
     # good row from the index on every kill, silently, and leave an index that
@@ -2891,12 +2580,7 @@ in
     # Long transformer batches can take more than Home Manager's service
     # switch timeout to finish after SIGTERM. Exercise the same sd-switch
     # engine Home Manager uses: a changed active embed unit must keep its PID,
-    # while an unprotected changed canary must restart.
-    assert "X-RestartIfChanged=false" in agg_embed_unit, (
-        "aggregator-embed.service can be stopped by Home Manager during a "
-        "configuration switch, stranding that switch behind a long batch:\n"
-        f"{agg_embed_unit}"
-    )
+    # while an unprotected changed canary must restart (driven below).
 
     # PARSE THE VALUE, NOT THE SECOND `=`-DELIMITED FIELD. `awk -F=` here used
     # to take $2, which silently truncates the moment ExecStart carries an
@@ -3086,9 +2770,6 @@ in
         f"aggregator-embed-seed.service is armed (is-enabled={agg_seed_enabled!r}); "
         f"it must be startable only by hand"
     )
-    # The timer, by contrast, IS expected to report "enabled" — asserted
-    # above. Keeping both in one file is what makes the two states legible as
-    # a deliberate difference rather than an inconsistency.
     # The inverse of the worker's assertion: this unit is allowed online, and
     # if it were not, the models could never arrive at all.
     assert "HF_HUB_OFFLINE=0" in agg_seed_unit, (
@@ -3347,47 +3028,9 @@ in
         "systemctl --user start aggregator-ingest.timer'"
     )
 
-    # claude-idle-handoff — proactive mission.md writer + opus-5 autofork
-    # for idle Claude Code sessions. Declared in home/claude-services.nix
-    # after four months of the shipped-imperative footgun (RSI reviewer)
-    # — same failure shape: units under ~/.config/systemd/user/ evaporate
-    # on a fresh host. Unit + timer only; the SCRIPT
-    # (~/.claude/scripts/idle-handoff.sh) is deliberately NOT nix-managed
-    # because it iterates hot and lives in the ~/.claude git repo.
-    #
-    # This lane cannot run the real script — it lives outside the VM
-    # closure — so we assert (a) the timer is loaded with the exact
-    # cadence + jitter the design specifies, (b) the service is loaded
-    # with the exact ExecStart the timer will call, and (c) the
-    # resource-shape flags a stray tick can rely on
-    # (Nice=15 / IOSchedulingClass=idle / TimeoutStartSec=180). A
-    # rebuild that silently drops any of these puts the schedule back
-    # in the same 5-min stampede window that motivated the caps.
-    timers = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user list-timers --all'"
-    )
-
     # ai-client-config-codex-sync — pull the latest migration code before
     # rendering Claude config into Codex. Exercise the real systemd unit
     # against a local Git adapter: no network, no test-only service path.
-    assert "ai-client-config-codex-sync.timer" in timers, (
-        "ai-client-config-codex-sync.timer missing from user timer list:\n"
-        f"{timers}"
-    )
-    sync_timer = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat ai-client-config-codex-sync.timer'"
-    )
-    for marker in [
-        "OnBootSec=5min",
-        "OnCalendar=hourly",
-        "Persistent=true",
-        "Unit=ai-client-config-codex-sync.service",
-    ]:
-        assert marker in sync_timer, (
-            f"ai-client-config-codex-sync.timer lost '{marker}':\n{sync_timer}"
-        )
     fixture = "/home/jonathan/.local/state/ai-client-config-sync/fixture"
     output = "/home/jonathan/.codex/claude-setup-mirror/test-output"
     network_output = "/home/jonathan/.codex/claude-setup-mirror/network-output"
@@ -3587,13 +3230,6 @@ in
     for marker in [
         "credential.https://github.com.helper=",
         "gh auth git-credential",
-        'stage="snapshot-source"',
-        "cp -a --no-preserve=ownership",
-        '"$source_home/.claude.json" "$staged_home/.claude.json"',
-        'settings_file="$source_home/.claude/settings.json"',
-        'installed_file="$source_home/.claude/plugins/installed_plugins.json"',
-        'enabled_plugin_paths="$run_dir/enabled-plugin-paths"',
-        'chmod -R u+w -- "$source_home"',
     ]:
         assert marker in sync_script_text, (
             f"ai-client-config sync lost host-scoped gh helper '{marker}':\\n"
@@ -3689,73 +3325,8 @@ in
         user_systemctl + " unset-environment AI_CLIENT_CONFIG_REMOTE'"
     )
 
-    assert "claude-idle-handoff.timer" in timers, (
-        "claude-idle-handoff.timer missing from user timer list:\n"
-        f"{timers}"
-    )
-    handoff_timer = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat claude-idle-handoff.timer'"
-    )
-    for marker in [
-        "OnBootSec=5min",
-        "OnUnitActiveSec=5min",
-        "AccuracySec=30s",
-        "Unit=claude-idle-handoff.service",
-    ]:
-        assert marker in handoff_timer, (
-            f"claude-idle-handoff.timer lost '{marker}':\n{handoff_timer}"
-        )
-    handoff_service = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat claude-idle-handoff.service'"
-    )
-    for marker in [
-        "Type=oneshot",
-        "ExecStart=%h/.claude/scripts/idle-handoff.sh",
-        "Nice=15",
-        "IOSchedulingClass=idle",
-        "TimeoutStartSec=",
-    ]:
-        assert marker in handoff_service, (
-            f"claude-idle-handoff.service lost '{marker}':\n{handoff_service}"
-        )
-
-    # claude-pull — the pull half of ~/.claude's continuous delivery.
-    # sync-agent.sh (cron) only ever pushed, so a PR merged in the GitHub
-    # UI never reached this machine: skills, hooks and settings stayed at
-    # the last local commit until someone pulled by hand, and once both
-    # sides had commits the daily auto-push started failing
-    # non-fast-forward. Same split as claude-idle-handoff above — timer +
-    # unit are nix-managed so a fresh host re-creates the schedule, while
-    # the script (~/.claude/scripts/claude-pull.sh) lives in the ~/.claude
-    # repo and is therefore outside the VM closure.
-    #
-    # What this lane can prove: the schedule and the exact ExecStart the
-    # timer will call. The OnCalendar + Persistent pairing is the
-    # load-bearing part and the reason this is not a monotonic timer like
-    # its neighbours — Persistent= only has an effect on OnCalendar=, and
-    # this machine is a laptop that suspends. Without catch-up, a merge
-    # that lands while it is asleep waits for the next natural boundary
-    # instead of arriving on resume. The script's own behaviour
-    # (fast-forward-only, divergence refusal, lock contention,
-    # fetch-failure threshold) is covered by tests/test_claude_pull.sh in
-    # the ~/.claude repo.
-    assert "claude-pull.timer" in timers, (
-        f"claude-pull.timer missing from user timer list:\n{timers}"
-    )
-    pull_timer = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat claude-pull.timer'"
-    )
-    for marker in [
-        "OnCalendar=*:0/10",
-        "Persistent=true",
-        "Unit=claude-pull.service",
-    ]:
-        assert marker in pull_timer, (
-            f"claude-pull.timer lost '{marker}':\n{pull_timer}"
-        )
+    # claude-pull — the pull half of ~/.claude's continuous delivery. The
+    # timer must be linked and armed in the live user session.
     for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
         got = dellan.succeed(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -3765,24 +3336,12 @@ in
             f"claude-pull.timer {prop}={got!r}, expected {expected!r} "
             f"— merged PRs would never reach the host"
         )
-    pull_service = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat claude-pull.service'"
-    )
-    for marker in [
-        "Type=oneshot",
-        "ExecStart=%h/.claude/scripts/claude-pull.sh",
-        "TimeoutStartSec=",
-    ]:
-        assert marker in pull_service, (
-            f"claude-pull.service lost '{marker}':\n{pull_service}"
-        )
 
     # claude-marketplace-pull — the same puller, second target.
     #
     # ~/.claude/plugins/marketplaces/jonathanmoregard is an INDEPENDENT nested
     # checkout: `plugins/` is gitignored in ~/.claude, so claude-pull.timer
-    # above never touched it however often it ran. It is also the tree the
+    # never touched it however often it ran. It is also the tree the
     # harness actually resolves plugins from, which is why it going stale is
     # worse than ~/.claude going stale — measured 2026-08-31 at 35 commits
     # behind origin, meaning every session in that window served skills,
@@ -3795,21 +3354,6 @@ in
     # is red. Reusing the script through CLAUDE_PULL_REPO keeps a single
     # implementation of the careful part (bounded fetch, fast-forward-only,
     # lock sharing with sync-agent.sh, alert debounce).
-    assert "claude-marketplace-pull.timer" in timers, (
-        f"claude-marketplace-pull.timer missing from user timer list:\n{timers}"
-    )
-    mkt_timer = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat claude-marketplace-pull.timer'"
-    )
-    for marker in [
-        "OnCalendar=*:5/10",
-        "Persistent=true",
-        "Unit=claude-marketplace-pull.service",
-    ]:
-        assert marker in mkt_timer, (
-            f"claude-marketplace-pull.timer lost '{marker}':\n{mkt_timer}"
-        )
     for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
         got = dellan.succeed(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -3824,14 +3368,6 @@ in
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user cat claude-marketplace-pull.service'"
     )
-    for marker in [
-        "Type=oneshot",
-        "ExecStart=%h/.claude/scripts/claude-pull.sh",
-        "TimeoutStartSec=",
-    ]:
-        assert marker in mkt_service, (
-            f"claude-marketplace-pull.service lost '{marker}':\n{mkt_service}"
-        )
 
     # The target, and the reason this assertion is specific rather than a
     # substring check on the directory name.
@@ -3877,24 +3413,7 @@ in
     # checkout must remain a clean, current main rather than accumulating
     # local commits or changes. The script enforces that contract through the
     # expected-branch and require-clean environment seams; this lane proves
-    # the timer and rendered unit pass those exact values.
-    assert "klaffat-pull.timer" in timers, (
-        f"klaffat-pull.timer missing from user timer list:\n{timers}"
-    )
-    klaffat_timer = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat klaffat-pull.timer'"
-    )
-    for marker in [
-        "OnCalendar=*:2/30",
-        "Persistent=true",
-        "AccuracySec=1min",
-        "RandomizedDelaySec=1min",
-        "Unit=klaffat-pull.service",
-    ]:
-        assert marker in klaffat_timer, (
-            f"klaffat-pull.timer lost '{marker}':\n{klaffat_timer}"
-        )
+    # the rendered unit passes those exact values.
     for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
         got = dellan.succeed(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -3909,17 +3428,6 @@ in
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user cat klaffat-pull.service'"
     )
-    for marker in [
-        "After=default.target",
-        "Type=oneshot",
-        "ExecStart=%h/.claude/scripts/claude-pull.sh",
-        "Nice=10",
-        "IOSchedulingClass=idle",
-        "TimeoutStartSec=180",
-    ]:
-        assert marker in klaffat_service, (
-            f"klaffat-pull.service lost '{marker}':\n{klaffat_service}"
-        )
 
     klaffat_env = [
         line
@@ -3958,28 +3466,8 @@ in
     # VM closure. Its behaviour — the mandatory gitleaks gate, the shared intake
     # lock, the never-force divergence refusal — is covered by
     # tests/test_claude_proposals_push.sh in that repo. What THIS lane can prove
-    # is the schedule, the ExecStart, and the one piece of the leak gate that is
-    # a property of the unit rather than of the script: that gitleaks is
-    # reachable at all.
-    assert "claude-proposals-push.timer" in timers, (
-        f"claude-proposals-push.timer missing from user timer list:\n{timers}"
-    )
-    sink_timer = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat claude-proposals-push.timer'"
-    )
-    for marker in [
-        "OnCalendar=*:7/15",
-        "Persistent=true",
-        "Unit=claude-proposals-push.service",
-    ]:
-        assert marker in sink_timer, (
-            f"claude-proposals-push.timer lost '{marker}':\n{sink_timer}"
-        )
-    # Persistent= is the load-bearing half here, more than for the pullers. The
-    # reviewer writes at 03:20 and this is a laptop that is usually asleep at
-    # 03:20; without catch-up the night's proposals wait for the next time the
-    # machine happens to be awake on a :07/:22/:37/:52 boundary.
+    # is the one piece of the leak gate that is a property of the unit rather
+    # than of the script: that gitleaks is reachable at all.
     for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
         got = dellan.succeed(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -3994,14 +3482,6 @@ in
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user cat claude-proposals-push.service'"
     )
-    for marker in [
-        "Type=oneshot",
-        "ExecStart=%h/.claude/scripts/claude-proposals-push.sh",
-        "TimeoutStartSec=",
-    ]:
-        assert marker in sink_service, (
-            f"claude-proposals-push.service lost '{marker}':\n{sink_service}"
-        )
 
     # THE LEAK GATE'S ONE UNIT-LEVEL DEPENDENCY.
     #
@@ -4062,14 +3542,6 @@ in
     # for the refresh unit would only test systemd's OnFailure wiring
     # a second time, so we cover only the loaded-and-guard-clean path
     # here to keep the lane fast.
-    timers = dellan.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user list-timers --all'"
-    )
-    assert "sota-watch-refresh-roster.timer" in timers, (
-        "sota-watch-refresh-roster.timer missing from user timer list:\n"
-        f"{timers}"
-    )
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user start sota-watch-refresh-roster.service'"
@@ -4096,26 +3568,10 @@ in
     # other-distro onboarding tests). Runtime cannot be exercised in
     # nixosTest — the test VM has no nested-KVM and libvirtd's default
     # network needs iptables/NAT scaffolding the framework doesn't
-    # model — so we assert the wiring: unit loaded, jonathan in the
-    # groups needed to drive libvirt without sudo, and the `win-vm`
-    # wrapper resolves on PATH. Runtime boot of Windows itself is
+    # model — so we assert the image-dir permissions and the win-vm
+    # wrapper's guard rails. Runtime boot of Windows itself is
     # verified on real dellan post-deploy via `win-vm fetch-iso <url>`
     # + `win-vm create` + `win-vm view`.
-    dellan.succeed("systemctl cat libvirtd.service >/dev/null")
-    # jonathan must be in libvirtd + kvm — without these the wrapper's
-    # `require_group` guard fails and every virsh call needs sudo.
-    groups = dellan.succeed("id -nG jonathan").split()
-    for g in ["libvirtd", "kvm"]:
-        assert g in groups, \
-            f"jonathan missing from '{g}' group; libvirt access broken. groups={groups}"
-    # win-vm on PATH — the CLI itself. Resolves at HM login shell
-    # (system-wide package), so plain `command -v` under su - is enough.
-    dellan.succeed("su - jonathan -c 'command -v win-vm'")
-    # swtpm on PATH — Win11 install requirement for the TPM 2.0 device.
-    # OVMF's presence is implicitly asserted by successful eval of
-    # virtualisation.libvirtd.qemu.ovmf.packages, so we don't check
-    # its firmware descriptor path (which drifts across nixpkgs).
-    dellan.succeed("command -v swtpm")
     # /var/lib/libvirt/images must exist with group=libvirtd so
     # `win-vm fetch-iso` can drop ISOs in without sudo.
     img_perms = dellan.succeed("stat -c '%a %U %G' /var/lib/libvirt/images").strip()

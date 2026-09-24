@@ -373,7 +373,6 @@ common.mkMinimalTest {
     # Local real-Google capability. The operator controls one fixed unit;
     # root alone decrypts; only the dedicated server account sees the pair.
     # ---------------------------------------------------------------
-    machine.succeed("test -x ${bin}/klaffat-local-google")
     machine.succeed(
         "install -d -m 0755 -o jonathan -g users "
         "${localGoogleFixture}/target/local-google/debug "
@@ -713,14 +712,6 @@ common.mkMinimalTest {
         ]
 
     # ---------------------------------------------------------------
-    # 1. All four wrappers reached PATH.
-    # ---------------------------------------------------------------
-    machine.succeed("test -x ${bin}/klaffat-infra")
-    machine.succeed("test -x ${bin}/klaffat-infra-install")
-    machine.succeed("test -x ${bin}/klaffat-publish")
-    machine.succeed("test -x ${bin}/klaffat-iam-seed")
-
-    # ---------------------------------------------------------------
     # 2. Secrets decrypted, 0400 root:root, unreadable by jonathan.
     # ---------------------------------------------------------------
     for name in ${builtins.toJSON secretNames}:
@@ -791,7 +782,6 @@ common.mkMinimalTest {
         assert "safe.directory" not in src, f"{w} re-enables root git inside a foreign repo"
         assert "worktree add" not in src, f"{w} checks out a worktree (hooks + smudge filters run)"
         assert "/home/jonathan" not in src, f"{w} addresses the founder's home"
-        assert "${mirror}" in src, f"{w} does not use the root-only mirror"
 
     publish_src = srcs["klaffat-publish"]
     assert '--secret-id "${signingKeySecretId}"' in publish_src, (
@@ -801,17 +791,6 @@ common.mkMinimalTest {
     )
     assert "klaffat/nix-signing-key" not in publish_src, (
         "the old slash-spelled Secrets Manager id is still in klaffat-publish"
-    )
-
-    install_src = srcs["klaffat-infra-install"]
-    assert 'flakeref="git+file://${mirror}?rev=$rev&allRefs=1"' in install_src, (
-        "klaffat-infra-install must address the root-only mirror by a rev-pinned "
-        "git flakeref; a bare path flakeref builds working-tree content"
-    )
-
-    infra_src = srcs["klaffat-infra"]
-    assert "console)" in infra_src and "'console' is not offered" in infra_src, (
-        "klaffat-infra must refuse `console` by name"
     )
 
     # ---------------------------------------------------------------

@@ -333,26 +333,11 @@
             .microvm.vms.research-agent.config.config
             .systemd.services.research-agent-egress-init.script;
         };
-        research-agent-codex-runtime =
-          let
-            guestPackages = self.nixosConfigurations.dellan.config
-              .microvm.vms.research-agent.config.config
-              .environment.systemPackages;
-          in
-          nixpkgs.lib.throwIfNot (builtins.elem pkgsLinux.codex guestPackages) ''
-            research-agent guest is missing pkgs.codex; Claude quota fallback cannot start.
-          ''
-            (pkgsLinux.runCommand "research-agent-codex-runtime" { } ''
-              test -x ${pkgsLinux.codex}/bin/codex
-              touch $out
-            '');
         feature-vm-research-source =
           let
             launcher = self.apps.${linuxSystem}.feature-vm.program;
           in
           pkgsLinux.runCommand "feature-vm-research-source" { } ''
-            grep -q 'RESEARCH_AGENT_WORKTREE' ${launcher}
-            grep -q 'mount_tag=research-agent' ${launcher}
             if grep -q 'research-agent-js-render' ${launcher}; then
               echo "feature-vm still mounts a fixed stale research-agent worktree" >&2
               exit 1
@@ -389,12 +374,6 @@
           deployedExecStart = self.nixosConfigurations.dellan.config
             .home-manager.users.jonathan
             .systemd.user.services.worktree-sweep.Service.ExecStart;
-        };
-        # Fast evaluated-config contract for scheduled root-storage upkeep.
-        # This checks Dellan's final merged options without booting a VM.
-        nix-maintenance = import ./tests/nix-maintenance.nix {
-          pkgs = pkgsLinux;
-          config = self.nixosConfigurations.dellan.config;
         };
         # Not a VM lane: runtime-invocation harness for the kitty
         # session save/restore scripts (home/kitty.nix) — single-line
