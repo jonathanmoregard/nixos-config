@@ -40,10 +40,17 @@
 # — a missing notification daemon (VMs, bare TTY) must not turn the
 # notifier itself red, but the fallback is logged so it's diagnosable.
 let
+  networkOnline = import ./network-online-script.nix { inherit pkgs; };
+
   failureNotifyScript = pkgs.writeShellScript "sota-watch-failure-notify" ''
     set -uo pipefail
 
     echo "SOTA-watch runner failed — inspect: journalctl --user -u sota-watch\\* ; tail ~/.local/share/sota-watch/run.log ~/.local/share/sota-watch/refresh-roster.log"
+    # Offline → no toast; see home/network-online-script.nix.
+    if ! ${networkOnline}/bin/network-online; then
+      echo "network offline — desktop notification suppressed"
+      exit 0
+    fi
     if ! ${pkgs.libnotify}/bin/notify-send -u critical "SOTA-watch FAILED" \
       "A sota-watch* unit exited non-zero. Likely: expired Claude OAuth (run: claude /login), research-agent MCP down, or sheet fetch failure. Details: journalctl --user -u sota-watch\\* + ~/.local/share/sota-watch/*.log"; then
       echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only"

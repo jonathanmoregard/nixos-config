@@ -1,5 +1,7 @@
 { lib, pkgs, ... }:
 let
+  networkOnline = import ./network-online-script.nix { inherit pkgs; };
+
   renderInNamespace = pkgs.writeShellScript "ai-client-config-render-isolated" ''
     set -euo pipefail
     live_home="$1"
@@ -406,7 +408,7 @@ let
 
   failureNotify = pkgs.writeShellApplication {
     name = "ai-client-config-codex-sync-failure-notify";
-    runtimeInputs = [ pkgs.libnotify ];
+    runtimeInputs = [ pkgs.libnotify networkOnline ];
     text = ''
       failure_file="''${XDG_STATE_HOME:-$HOME/.local/state}/ai-client-config-sync/last-failure"
       details="failure details unavailable"
@@ -414,6 +416,11 @@ let
         details=$(tr '\n' ' ' < "$failure_file")
       fi
       echo "ai-client-config sync failed: $details" >&2
+      # Offline → no toast; see home/network-online-script.nix.
+      if ! network-online; then
+        echo "network offline — desktop notification suppressed" >&2
+        exit 0
+      fi
       notify-send --urgency=critical \
         "Claude to Codex sync failed" \
         "See $failure_file" || true

@@ -1,5 +1,7 @@
 { pkgs, ... }:
 let
+  networkOnline = import ./network-online-script.nix { inherit pkgs; };
+
   fetchScript = pkgs.writeShellApplication {
     name = "nixos-config-fetch";
     runtimeInputs = with pkgs; [
@@ -62,10 +64,15 @@ let
 
   failureNotifyScript = pkgs.writeShellApplication {
     name = "nixos-config-fetch-failure-notify";
-    runtimeInputs = [ pkgs.libnotify ];
+    runtimeInputs = [ pkgs.libnotify networkOnline ];
     text = ''
       message="NixOS config fetch failed — inspect: journalctl --user -u nixos-config-fetch.service"
       printf '%s\n' "$message"
+      # Offline → no toast; see home/network-online-script.nix.
+      if ! network-online; then
+        echo "network offline — desktop notification suppressed"
+        exit 0
+      fi
       notify-send --urgency=critical "NixOS config fetch failed" "$message" || true
     '';
   };
