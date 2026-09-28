@@ -177,6 +177,8 @@ let
   # /etc/static/ssl/certs, maintained by security.pki.
   caBundle = "/etc/ssl/certs/ca-bundle.crt";
 
+  networkOnline = import ../../home/network-online-script.nix { inherit pkgs; };
+
   # Activated only via OnFailure. Emits the journal marker FIRST and treats
   # the desktop toast as best-effort: a headless boot or a session with no
   # notification daemon must not turn the notifier itself red (which would
@@ -187,6 +189,11 @@ let
     set -uo pipefail
 
     echo "aggregator ingest run FAILED — inspect: journalctl --user -u aggregator-ingest.service -n 200"
+    # Offline → no toast; see home/network-online-script.nix.
+    if ! ${networkOnline}/bin/network-online; then
+      echo "network offline — desktop notification suppressed"
+      exit 0
+    fi
     if ! ${notifyCommand} -u critical -a aggregator \
       "aggregator ingest FAILED" \
       "The all-sources ingest run exited non-zero. Likely: gh keyring authentication unavailable, no usable CA bundle, or a run that ended with errors (exit 3). Details: journalctl --user -u aggregator-ingest.service -n 200"; then
@@ -262,6 +269,13 @@ let
         fi
         if [ $((SECONDS - wait_start)) -ge "$wait_budget" ]; then
           echo "aggregator-ingest: network not reachable after $((SECONDS - wait_start))s (api.github.com:443) — running anyway; network sources will report errors" >&2
+          # The run will exit 3 on the network sources alone. Drop the
+          # in-process notifier for this run so being offline does not
+          # raise a CRITICAL toast; the OnFailure notifier applies the
+          # same offline gate. The next online run re-reports anything
+          # still wrong, staleness included (recomputed per run).
+          echo "aggregator-ingest: offline run — in-process desktop notifier disabled" >&2
+          unset AGGREGATOR_NOTIFY_COMMAND
           break
         fi
         sleep 2

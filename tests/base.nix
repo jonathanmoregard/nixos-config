@@ -2869,6 +2869,58 @@ in
         "systemctl --user reset-failed aggregator-ingest.service'"
     )
 
+    # Offline gate (home/network-online-script.nix). The VM has no internet,
+    # so an offline run must not raise a desktop toast from either channel:
+    # the wrapper drops the in-process notifier, and the OnFailure notifier
+    # logs its marker but suppresses notify-send.
+    assert "offline run — in-process desktop notifier disabled" in agg_auth_failure, (
+        "wrapper kept the in-process notifier on an offline run:\n"
+        f"{agg_auth_failure}"
+    )
+    SUPPRESSED = "network offline — desktop notification suppressed"
+
+    def agg_notify_journal():
+        return dellan.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            "journalctl --user -u aggregator-ingest-failure-notify.service "
+            "--no-pager' || true"
+        )
+
+    offline_journal = agg_notify_journal()
+    assert SUPPRESSED in offline_journal, (
+        "OnFailure notifier did not suppress its toast while offline:\n"
+        f"{offline_journal}"
+    )
+
+    # Online branch: point the probe at a local listener. The notifier must
+    # log its marker again and must NOT add another suppression line, i.e.
+    # it went on to notify-send. Without this the gate could be stuck on
+    # "offline" and silence every real failure.
+    suppressed_before = offline_journal.count(SUPPRESSED)
+    dellan.succeed(
+        "systemd-run --unit=probe-listener "
+        "${pkgs.python3}/bin/python3 -m http.server 18765 --bind 127.0.0.1"
+    )
+    dellan.wait_for_open_port(18765)
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "export XDG_RUNTIME_DIR; "
+        "systemctl --user set-environment NETWORK_ONLINE_PROBE=127.0.0.1:18765; "
+        "systemctl --user start aggregator-ingest-failure-notify.service; true'"
+    )
+    wait_agg_notify(agg_baseline, "a direct notifier start with the probe online")
+    agg_baseline = agg_notify_count()
+    online_journal = agg_notify_journal()
+    assert online_journal.count(SUPPRESSED) == suppressed_before, (
+        "notifier suppressed its toast although the probe target was reachable:\n"
+        f"{online_journal}"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user unset-environment NETWORK_ONLINE_PROBE'"
+    )
+    dellan.succeed("systemctl stop probe-listener")
+
     # (3) and (4) inject exact exit codes by overriding ONLY ExecStart. The
     # [Unit] section — and with it the OnFailure edge under test — stays
     # exactly the production one.
