@@ -298,6 +298,18 @@
     "d /var/lib/research-agent/tool-cache 0755 jonathan users -"
     "d /var/lib/research-agent/tool-cache/prv 0777 jonathan users -"
     "d /var/lib/research-agent/tool-cache/bolagsverket 0777 jonathan users -"
+    # The research-agent/scraper virtiofs share sources are a git
+    # checkout jonathan owns. On a fresh host (tuxedo, 2026-09-29) they
+    # did not exist yet and got created root-owned — ~/Repos included —
+    # so every later clone/rsync into ~/Repos failed with EACCES.
+    # microvm.nix's own rules (10-microvm.conf) are create-only and name
+    # microvm:kvm; this file (00-nixos.conf) sorts first, so these win
+    # and `d` re-owns a dir that was already created wrong. No hop
+    # through root (/home → jonathan → jonathan), so tmpfiles'
+    # unsafe-path-transition check does not apply.
+    "d /home/jonathan/Repos 0755 jonathan users -"
+    "d /home/jonathan/Repos/research-agent 0755 jonathan users -"
+    "d /home/jonathan/Repos/research-agent/reports 0755 jonathan users -"
   ];
 
   # ---------------------------------------------------------------------
