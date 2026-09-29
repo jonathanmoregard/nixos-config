@@ -253,19 +253,22 @@ To edit its value, use the manual edit path:
     [ -n "$RAW_VALUE" ] || die "value is empty after sanitisation; aborting"
 
     # -------------------------------------------------------------------
-    # extract master pubkey from modules/nixos/agenix-rekey-common.nix
+    # extract master pubkeys from modules/nixos/agenix-rekey-common.nix
+    # — every masterIdentity, so each workstation can rekey/edit the source
     # -------------------------------------------------------------------
     PUBKEY_FILE="modules/nixos/agenix-rekey-common.nix"
     [ -f "$PUBKEY_FILE" ] || die "expected $PUBKEY_FILE — is this really the nixos-config repo?"
-    PUBKEY_LINE=$(grep -E '^[[:space:]]*pubkey[[:space:]]*=[[:space:]]*"' "$PUBKEY_FILE" | head -n1 || true)
-    [ -n "$PUBKEY_LINE" ] || die "no 'pubkey = \"...\"' line found in $PUBKEY_FILE"
-    PUBKEY=$(printf '%s' "$PUBKEY_LINE" | sed -E 's/^[[:space:]]*pubkey[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
-    [ -n "$PUBKEY" ] || die "extracted master pubkey is empty"
+    RECIPIENT_ARGS=()
+    while IFS= read -r pubkey; do
+      [ -n "$pubkey" ] && RECIPIENT_ARGS+=(-r "$pubkey")
+    done < <(grep -E '^[[:space:]]*pubkey[[:space:]]*=[[:space:]]*"' "$PUBKEY_FILE" \
+      | sed -E 's/^[[:space:]]*pubkey[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+    [ "''${#RECIPIENT_ARGS[@]}" -gt 0 ] || die "no 'pubkey = \"...\"' line found in $PUBKEY_FILE"
 
     # -------------------------------------------------------------------
     # encrypt to secrets/<name>.age
     # -------------------------------------------------------------------
-    if ! printf '%s' "$RAW_VALUE" | age -r "$PUBKEY" -o "$AGE_FILE"; then
+    if ! printf '%s' "$RAW_VALUE" | age "''${RECIPIENT_ARGS[@]}" -o "$AGE_FILE"; then
       rm -f "$AGE_FILE"
       die "age encryption failed"
     fi

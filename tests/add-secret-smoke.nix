@@ -80,6 +80,10 @@ pkgs.runCommand "add-secret-smoke"
         identity = "/home/jonathan/.ssh/id_ed25519";
         pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINT9HeHhu82OoNsAHe/QAh116pSEANuZUr1h5m8R8kpp jonathan@dellan";
       }
+      {
+        identity = "/home/jonathan/.ssh/id_ed25519";
+        pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINy+08a1zu6ndn5RQ5TDV2uNrXJ+4lPmlcmmWXI8XH/8 jonathan@tuxedo";
+      }
     ];
   };
 }
@@ -166,6 +170,10 @@ NIXFILE
     [ -f "$ageFile" ] || fail "secrets/my-new-key.age was not created"
     head -c 22 "$ageFile" | grep -qF "age-encryption.org/v1" \
       || { echo "--- first 64 bytes of $ageFile ---"; head -c 64 "$ageFile" | od -c | head -4; fail ".age file lacks the age v1 header"; }
+    # 4a'. encrypted to EVERY master identity, not just the first —
+    # otherwise the other workstation cannot rekey or edit the secret.
+    stanzas=$(grep -ac '^-> ssh-ed25519 ' "$ageFile" || true)
+    [ "$stanzas" = 2 ] || fail "expected 2 ssh-ed25519 recipient stanzas (one per master identity), got $stanzas"
 
     # 4b. the workstation profile (not the marker-free host file)
     # contains the new declaration block
