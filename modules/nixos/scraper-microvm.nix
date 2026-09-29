@@ -181,6 +181,7 @@
           # feature-vm interactive smoke can reach the scraper VM
           # without needing the agenix-decrypted host-key.
           "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINT9HeHhu82OoNsAHe/QAh116pSEANuZUr1h5m8R8kpp jonathan@dellan"
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINy+08a1zu6ndn5RQ5TDV2uNrXJ+4lPmlcmmWXI8XH/8 jonathan@tuxedo"
         ];
       };
 

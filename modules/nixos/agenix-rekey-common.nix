@@ -23,6 +23,13 @@
         identity = "/home/jonathan/.ssh/id_ed25519";
         pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINT9HeHhu82OoNsAHe/QAh116pSEANuZUr1h5m8R8kpp jonathan@dellan";
       }
+      # Same runtime path on each workstation; each host holds its own
+      # private key there. Sources are encrypted to both, so either laptop
+      # can rekey / add-secret while dellan and tuxedo run in parallel.
+      {
+        identity = "/home/jonathan/.ssh/id_ed25519";
+        pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINy+08a1zu6ndn5RQ5TDV2uNrXJ+4lPmlcmmWXI8XH/8 jonathan@tuxedo";
+      }
     ];
     storageMode = "local";
     # Per-host localStorageDir is set in each host's default.nix because
