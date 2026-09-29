@@ -3886,6 +3886,10 @@ pkgs.runCommand "kitty-scripts-harness"
     # and execs Codex after the parent has already released restore.lock.
     deadline_failures=0
     if ! (
+      # --emit-stub inside prepare_transaction_case mints the deadline, so
+      # the clock starts before it: time spent standing up the lock holder
+      # below is already charged against the parent's budget.
+      start_ms=$(date +%s%3N)
       prepare_transaction_case registry-lock-timeout 1
       (
         exec 9>"$TX_DIR/.pane-sessions.lock"
@@ -3896,13 +3900,17 @@ pkgs.runCommand "kitty-scripts-harness"
         done
       ) & registry_lock_pid=$!
       wait_for_file "$TX_CONTROL/registry-lock-held" registry-lock-timeout
-      start_ms=$(date +%s%3N)
       start_transaction_restore normal
       wait "$TX_PARENT_PID" || true
       elapsed=$(( $(date +%s%3N) - start_ms ))
-      [ "$elapsed" -ge 800 ] && [ "$elapsed" -lt 4000 ] || {
+      [ "$elapsed" -ge 800 ] || {
         cat "$TX_CONTROL/restore.log"
-        echo "FAIL(transaction/registry-lock-timeout): parent elapsed ''${elapsed}ms outside shared deadline"
+        echo "FAIL(transaction/registry-lock-timeout): parent gave up after ''${elapsed}ms, before its 1s shared deadline"
+        exit 1
+      }
+      [ "$elapsed" -lt 4000 ] || {
+        cat "$TX_CONTROL/restore.log"
+        echo "FAIL(transaction/registry-lock-timeout): parent ran ''${elapsed}ms, past its 1s shared deadline"
         exit 1
       }
       [ ! -e "$TX_GENERATION/pane-2.bootstrap-bound" ] \
