@@ -269,6 +269,7 @@ interactive VM. When in doubt, run it; the cost is cheap.
 | `docs (eval)` | Doc assertions |
 | `discover` | Computes which `vm-minimal` lanes the diff needs |
 | `build dellan toplevel` | System derivation builds (the slow one, ~15min) |
+| `build tuxedo toplevel` | Tuxedo's system derivation, after dellan's (mostly cache hits) |
 | `vm-minimal (<lane>)` | One job per lane `discover` selected — matrix, not a fixed count |
 | `vm-graphical` | Runs only when desktop files change |
 | `close-fork` | Skipped on non-fork PRs |
