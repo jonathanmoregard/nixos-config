@@ -8,6 +8,13 @@
 # the units will fail at first tick until that scaffolding is set up
 # separately.
 {
+  # ReadWritePaths below must exist or the unit dies at NAMESPACE (226).
+  # ~/.cache is not carried over to a fresh host, so create it here.
+  # 0755 matches dellan's long-lived dir.
+  systemd.user.tmpfiles.rules = [
+    "d %h/.cache/gh-tokens 0755 - - -"
+  ];
+
   # gh-token — rotate GitHub App installation tokens for active sandboxes.
   systemd.user.services.gh-token = {
     Unit.Description = "Rotate GitHub App installation tokens for active Claude sandboxes";
