@@ -12,7 +12,7 @@ Linux Mint 22.2 / Cinnamon migration to NixOS, declarative end to end. PRs are C
 |------|--------|
 | `dellan` | Dell Latitude 7440 (daily driver, auto-deploy target) |
 | `vm` | NixOS x86_64 VM (legacy; being phased out) |
-| `tuxedo` | Planned InfinityBook Pro 15 Gen10 AMD; dormant hardware profile only until arrival evidence exists |
+| `tuxedo` | TUXEDO InfinityBook Pro AMD Gen10 (Dellan's successor; installed 2026-09-29; auto-deploy target, hourly poll — no GitHub webhook yet) |
 
 **Manual `nixos-rebuild switch` is no longer the default workflow.** Auto-deploy on push to `main` handles it (see "Deploy workflow" below). Manual rebuilds are reserved for: bootstrap install, hardware-config edits the VM gate can't model, emergency rollback. Use `sudo nixos-rebuild switch --rollback` for emergency rollback.
 
@@ -131,6 +131,7 @@ Adding a new test: drop `tests/<feature>.nix` (use existing files as templates),
 | `verify-fork-guards` | Asserts every PR-triggered workflow has a fork-guard predicate |
 | `flake check (eval)` | `scripts/check-eval-warnings.sh`: `nix flake check --no-build --all-systems` + **fail on unallowlisted `lib.warn`/`warnIf` output** (allowlist: `scripts/eval-warnings-allowlist.txt`) |
 | `build dellan toplevel` | Builds `nixosConfigurations.dellan.config.system.build.toplevel` |
+| `build tuxedo toplevel` | Builds `nixosConfigurations.tuxedo.config.system.build.toplevel` after dellan, reusing its store snapshot; pushes to cachix for tuxedo's auto-deploy |
 | `vm-minimal (<lane>)` | Ephemeral VM e2e test; one matrix lane per `tests/<feature>.nix` (base / desktop / keyring / kitty / claude-pane) |
 | `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |
 
@@ -202,11 +203,13 @@ Use it as a read-only reference when porting drift proposals — every "live Min
 
 ## TUXEDO InfinityBook Pro 15 Gen10 AMD preparation
 
-`modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix` is a dormant,
-directly-importable hardware profile. It deliberately is not a
-`nixosConfigurations` host yet: real disk topology, generated hardware config,
-SSH host key, audio devices, kernel stability, and XDNA userspace compatibility
-require the delivered machine.
+`nixosConfigurations.tuxedo` (`hosts/tuxedo/`) imports
+`modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix` with the generated
+hardware config and real host key. Audio devices, kernel stability, suspend,
+and XDNA userspace compatibility are still arrival-checklist items. The Motorcomm
+YT6801 Ethernet had no bound driver even on the installer's Linux 7.2; Wi-Fi only
+until that is solved. The `klaffat-*` secrets are encrypted to dellan's host
+key only and do not decrypt here until re-encrypted by root on dellan.
 
 Use Radeon 890M Vulkan through `whisper-cpp-vulkan` as the first local Voquill
 benchmark. Do not enable XRT/FastFlowLM merely because `amdxdna` loads; require

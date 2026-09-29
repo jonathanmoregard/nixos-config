@@ -265,6 +265,9 @@
     # Dell Latitude 7440 laptop — daily driver
     nixosConfigurations.dellan = mkWorkstation ./hosts/dellan/default.nix;
 
+    # TUXEDO InfinityBook Pro AMD Gen10 — Dellan's successor
+    nixosConfigurations.tuxedo = mkWorkstation ./hosts/tuxedo/default.nix;
+
     # VM-based e2e tests, one per feature area. Run any single lane:
     #   nix build .#checks.x86_64-linux.vm-base -L
     # Or all five via `nix flake check`.

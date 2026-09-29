@@ -27,8 +27,8 @@
 #
 # ── Recovery recipient ────────────────────────────────────────────────
 #
-# Right now dellan's host key is the ONLY thing that can decrypt these
-# files. Seven of the eight are merely annoying to lose: reissue the token
+# Right now dellan's and tuxedo's host keys are the ONLY things that can
+# decrypt these files — two laptops in one home, not an offline copy. Seven of the eight are merely annoying to lose: reissue the token
 # at Hetzner, at Cloudflare, at GitHub, in IAM, regenerate the host key,
 # mint a new cache signing key.
 #
@@ -55,11 +55,16 @@ let
   # Same value as `age.rekey.hostPubkey` in hosts/dellan/default.nix.
   dellan-host = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJNvaYqBU7k/iTKPHcfVGYz5WJNVWnf0t26SX6Y7SZ0e root@dellan";
 
+  # tuxedo's SSH host key — same value as `age.rekey.hostPubkey` in
+  # hosts/tuxedo/default.nix. Dellan's successor runs klaffat-infra too.
+  tuxedo-host = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO87IyCf5NBoDUYvRmjqmqa4bB02YItZu3RgeJ/JHgyu root@tuxedo";
+
   # Offline recovery identity — founder to fill in, then re-encrypt.
   # recovery = "age1...";
 
   klaffat = [
     dellan-host
+    tuxedo-host
     # recovery
   ];
 in
