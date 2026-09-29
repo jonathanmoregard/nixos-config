@@ -12,7 +12,7 @@ Linux Mint 22.2 / Cinnamon migration to NixOS, declarative end to end. PRs are C
 |------|--------|
 | `dellan` | Dell Latitude 7440 (daily driver, auto-deploy target) |
 | `vm` | NixOS x86_64 VM (legacy; being phased out) |
-| `tuxedo` | TUXEDO InfinityBook Pro AMD Gen10 (Dellan's successor; installed 2026-09-29, not yet an auto-deploy target) |
+| `tuxedo` | TUXEDO InfinityBook Pro AMD Gen10 (Dellan's successor; installed 2026-09-29; auto-deploy target, hourly poll — no GitHub webhook yet) |
 
 **Manual `nixos-rebuild switch` is no longer the default workflow.** Auto-deploy on push to `main` handles it (see "Deploy workflow" below). Manual rebuilds are reserved for: bootstrap install, hardware-config edits the VM gate can't model, emergency rollback. Use `sudo nixos-rebuild switch --rollback` for emergency rollback.
 
