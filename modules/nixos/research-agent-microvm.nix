@@ -77,6 +77,13 @@ in
         # PASV lands on the same allowed IPs, and outbound
         # ESTABLISHED/RELATED handles the rest.
         "opendata.prv.se"
+        # Shopping-search shims (agent/shims/{ebay,tradera}_shim.py in
+        # the research-agent repo): the marketplaces' own read-only
+        # search APIs. eBay's token endpoint and Browse API share
+        # api.ebay.com. eBay 403s scraped search pages, so without
+        # this host the agent has no eBay route at all.
+        "api.ebay.com"
+        "api.tradera.com"
       ];
 
       # Rendered as a bash array literal for both unit scripts.
