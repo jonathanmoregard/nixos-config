@@ -19,6 +19,21 @@ in
     gnome-screenshot
   ];
 
+  # The dconf cursor-theme below only reaches Cinnamon's own pointer. Apps
+  # that load cursors through libXcursor (kitty's I-beam, Chrome) read
+  # Xcursor.theme / XCURSOR_THEME and otherwise fall back to X's tiny core
+  # font glyphs. This exports the theme to them via ~/.Xresources, the
+  # session env and ~/.icons/default. gtk stays off so the dconf
+  # cursor-size, which Muffin multiplies by the UI scale, is untouched;
+  # hosts with UI scaling raise the size (hosts/tuxedo).
+  home.pointerCursor = {
+    enable = true;
+    package = pkgs.bibata-cursors;
+    name = "Bibata-Modern-Classic";
+    size = lib.mkDefault 24;
+    x11.enable = true;
+  };
+
   # Notification sound
   home.file.".local/share/sounds/tink.oga".source = ../assets/sounds/tink.oga;
 

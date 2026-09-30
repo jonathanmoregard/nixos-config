@@ -117,6 +117,16 @@ in
     assert "bell percent:  0" in bell_q, \
         f"X server bell not silenced after display-setup-script:\n{bell_q}"
 
+    # libXcursor apps (kitty's I-beam, Chrome) only get the cursor theme
+    # through Xcursor.theme; without it they draw X's tiny core glyphs.
+    # home.pointerCursor writes ~/.Xresources and the session start must
+    # merge it into the server's RESOURCE_MANAGER.
+    dellan.wait_until_succeeds(
+        "env DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 "
+        "xrdb -query | grep -qx 'Xcursor.theme:\tBibata-Modern-Classic'",
+        timeout=120,
+    )
+
     # Runs last: it takes ~40 s, and the X-bell check above samples server
     # state at one instant, so running this first shifted that sample past
     # the Cinnamon session's own bell setup.
