@@ -12,6 +12,12 @@
 
   networking.hostName = "dellan";
 
+  # Tuxedo's user key, so the successor can reach this laptop while both
+  # run in parallel. Remove when Dellan is retired.
+  users.users.jonathan.openssh.authorizedKeys.keys = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINy+08a1zu6ndn5RQ5TDV2uNrXJ+4lPmlcmmWXI8XH/8 jonathan@tuxedo"
+  ];
+
   # ---------------------------------------------------------------------
   # agenix-rekey per-host config.
   # hostPubkey = dellan's SSH ed25519 host key. Each .age secret's source
