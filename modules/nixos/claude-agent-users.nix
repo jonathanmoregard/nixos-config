@@ -27,8 +27,8 @@ let
 
   agentUser = n: let name = "claude-agent-${toString n}"; in {
     isNormalUser = true;
-    # Pinned after jonathan's 1000 (profiles/base.nix), matching dellan.
-    uid = 1000 + n;
+    # Pinned for reproducible installs; see uidBase.
+    uid = cfg.uidBase + n;
     description = "AI agent ${name} — unprivileged worker";
     group = "claude-agents";
     extraGroups = [ ];   # explicitly no wheel, no docker, no anything
@@ -45,6 +45,16 @@ in
       type = lib.types.ints.between 1 9;
       default = 3;
       description = "Number of claude-agent-N users (matches concurrent VM lanes).";
+    };
+
+    uidBase = lib.mkOption {
+      type = lib.types.int;
+      default = 1000;
+      description = ''
+        claude-agent-N gets uid uidBase + N. The default puts the agents
+        right after jonathan's 1000. A host whose agents already exist at
+        other uids sets this to match (NixOS never rewrites a live uid).
+      '';
     };
 
     sharedWorktreeRoot = lib.mkOption {

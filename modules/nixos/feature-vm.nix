@@ -187,12 +187,9 @@ in
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINy+08a1zu6ndn5RQ5TDV2uNrXJ+4lPmlcmmWXI8XH/8 jonathan@tuxedo"
       ];
 
-      # Pin UID to match the host's jonathan (1000). Without this, the
-      # claude-agent-* users (declared first by claudeAgentUsers) claim
-      # 1000-1002 and jonathan ends up at 1003, breaking write access
-      # on the /mnt/worktrees 9p share whose host-side files are owned
-      # by host uid 1000.
-      uid = lib.mkForce 1000;
+      # No uid override: vmVariant re-evaluates the host config, so the
+      # VM's jonathan keeps the host's pinned uid and writes on the
+      # /mnt/worktrees 9p share land as the host-side owner.
 
       # Let jonathan `ls /run/agenix/` inside the VM. The agenix
       # generation dir is mode 0750 root:keys; individual secrets

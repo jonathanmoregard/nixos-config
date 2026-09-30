@@ -13,6 +13,12 @@
 
   networking.hostName = "tuxedo";
 
+  # The install created the agents before uids were pinned, so they took
+  # 1000-1002 and jonathan 1003. Pin those live values rather than rewrite
+  # uids on a running system; nothing depends on the number.
+  users.users.jonathan.uid = 1003;
+  services.claudeAgentUsers.uidBase = 999;
+
   # Dellan's user key, so the outgoing laptop can configure this one during
   # the overlap. Remove when Dellan is retired.
   users.users.jonathan.openssh.authorizedKeys.keys = [
