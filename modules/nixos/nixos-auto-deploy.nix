@@ -365,6 +365,47 @@ in
       };
     };
 
+    # Public ingress for the webhook: Tailscale Funnel on the webhook port,
+    # so GitHub reaches https://<host>.<tailnet>.ts.net/hooks/github-deploy.
+    # Previously set once by hand (scripts/install.sh phase 6), which left
+    # a new host (tuxedo) with a listening webhook nobody could reach —
+    # deploys fell back to the hourly timer. Serve config persists in
+    # tailscaled state; re-applying it each boot is idempotent.
+    #
+    # Waits out tailscaled startup. A host that was never
+    # `tailscale up`'d (VM, fresh install) is skipped, not failed: there is
+    # no ingress to configure until a human authenticates the node.
+    systemd.services.nixos-deploy-funnel = lib.mkIf (cfg.webhook.enable && config.services.tailscale.enable) {
+      description = "Tailscale Funnel ingress for the deploy webhook";
+      after = [ "tailscaled.service" "network-online.target" ];
+      wants = [ "tailscaled.service" "network-online.target" ];
+      wantedBy = [ "multi-user.target" ];
+      path = [ config.services.tailscale.package pkgs.jq pkgs.coreutils ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        TimeoutStartSec = "6min";
+      };
+      script = ''
+        state=""
+        for _ in $(seq 60); do
+          state=$(tailscale status --json 2>/dev/null | jq -r '.BackendState // empty' || true)
+          # Only the transient startup states are worth waiting on;
+          # NeedsLogin/Stopped won't change without a human.
+          case "$state" in
+            ""|NoState|Starting) sleep 5 ;;
+            *) break ;;
+          esac
+        done
+        if [ "$state" != Running ]; then
+          echo "tailscale not running (state: ''${state:-unknown}); skipping funnel"
+          exit 0
+        fi
+        tailscale funnel --bg ${toString cfg.webhook.port}
+        tailscale funnel status
+      '';
+    };
+
     # EnvironmentFile feeds WEBHOOK_SECRET into the webhook process env so
     # the {{ getenv "WEBHOOK_SECRET" }} template resolves at request time.
     systemd.services.webhook = lib.mkIf cfg.webhook.enable {
