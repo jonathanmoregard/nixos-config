@@ -28,11 +28,11 @@
   # The 15.3" 2560x1600 panel is ~197 DPI. Muffin only does integer scale on
   # X11 and auto-picks 2x for it (a 1280x800 desktop), where Dellan's
   # ~162 DPI panel gets 1x. Pin the built-in panel to 1x and bring text back
-  # up instead; 1.2 is the DPI ratio between the two panels, so text ends up
-  # Dellan-sized. Muffin reads monitors.xml from XDG_CONFIG_DIRS as the
-  # system default; a layout saved from Display settings
-  # (~/.config/cinnamon-monitors.xml) still overrides it, and layouts with an
-  # external monitor attached are not covered by this entry.
+  # up instead; 1.2 is the DPI ratio between the two panels (Dellan-sized
+  # text), 1.3 is one step above that by taste. Muffin reads monitors.xml
+  # from XDG_CONFIG_DIRS as the system default; a layout saved from Display
+  # settings (~/.config/cinnamon-monitors.xml) still overrides it, and
+  # layouts with an external monitor attached are not covered by this entry.
   environment.etc."xdg/monitors.xml".text = ''
     <monitors version="2">
       <configuration>
@@ -59,8 +59,8 @@
     </monitors>
   '';
   home-manager.users.jonathan.dconf.settings = {
-    "org/cinnamon/desktop/interface".text-scaling-factor = 1.2;
-    "org/gnome/desktop/interface".text-scaling-factor = 1.2;
+    "org/cinnamon/desktop/interface".text-scaling-factor = 1.3;
+    "org/gnome/desktop/interface".text-scaling-factor = 1.3;
   };
 
   # agenix-rekey per-host config — see hosts/dellan/default.nix. The host
