@@ -423,6 +423,15 @@
           libraryServe = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-serve;
           libraryFetch = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-fetch;
         };
+        # Not a VM lane: runs the local-stt router with the exact command
+        # tuxedo's unit starts, against two stub whisper servers — English
+        # stays on the general model, detected Swedish is re-transcribed by
+        # the Swedish one, and a model that is down degrades or errors visibly.
+        local-stt = import ./tests/local-stt.nix {
+          pkgs = pkgsLinux;
+          routerCommand = self.nixosConfigurations.tuxedo.config
+            .systemd.user.services.local-stt.serviceConfig.ExecStart;
+        };
         # Not a VM lane: runtime-invocation harness for `add-secret`
         # (home/add-secret.nix). Exercises name validation, worktree
         # preflight, dup-refuse, happy-path insertion, and KEY=VALUE
