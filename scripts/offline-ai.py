@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -38,6 +39,14 @@ OPTION_FILES = {
     "home-manager": os.environ.get("OFFLINE_AI_HM_OPTIONS", ""),
 }
 LIBRARY_URL = os.environ.get("OFFLINE_AI_LIBRARY_URL", "http://127.0.0.1:8718")
+# Units that give way while the big model is loaded, as "system" and "user"
+# lists (timers before the services they start). Only those that were running
+# are stopped, and exactly those are started again afterwards.
+EVICT = {
+    False: os.environ.get("OFFLINE_AI_EVICT_SYSTEM", "").split(),
+    True: os.environ.get("OFFLINE_AI_EVICT_USER", "").split(),
+}
+EVICTED = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/offline-ai-{os.getuid()}") / "offline-ai" / "evicted.json"
 LIBRARY_UNIT = os.environ.get("OFFLINE_AI_LIBRARY_UNIT", "offline-ai-library.service")
 
 
@@ -270,8 +279,15 @@ def run(argv, timeout=15):
     return (done.stdout + done.stderr).strip() or f"(no output, exit {done.returncode})"
 
 
+def flag(value):
+    """A model may send a boolean as a string; "false" must not count as true."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
 def scope(user):
-    return ["--user"] if user else []
+    return ["--user"] if flag(user) else []
 
 
 def check_unit(unit):
@@ -304,7 +320,7 @@ def matching_units(needle, user):
 def list_units(match, user=None):
     """Units whose name contains the text; both system and user units unless one scope is asked for."""
     needle = str(match).lower()
-    scopes = [False, True] if user is None else [bool(user)]
+    scopes = [False, True] if user is None else [flag(user)]
     parts = []
     for scoped in scopes:
         hits = matching_units(needle, scoped)
@@ -330,8 +346,13 @@ def megabytes(count):
     return f"{count / 1024:.1f} GiB" if count >= 1024 else f"{count} MiB"
 
 
+def absolute(path):
+    """An absolute path: a model-supplied `-delete` must reach find as a path, never an expression."""
+    return str(Path(str(path)).expanduser().resolve())
+
+
 def disk_usage(path="/"):
-    target = str(Path(path).expanduser())
+    target = absolute(path)
     free = run(["df", "-h", "--output=source,fstype,size,used,avail,pcent,target", "--", target])
     listing = quiet(["du", "-x", "-d", "1", "-BM", "--", target], 120)
     if listing is None:
@@ -348,7 +369,7 @@ def disk_usage(path="/"):
 
 
 def big_files(path="~", min_mb=200):
-    target = str(Path(path).expanduser())
+    target = absolute(path)
     floor = max(1, int(min_mb))
     listing = quiet(["find", target, "-xdev", "-type", "f", "-size", f"+{floor}M", "-printf", "%s\t%p\n"], 120)
     if listing is None:
@@ -754,15 +775,15 @@ def search_library(query, book="", limit=6):
     if book and book not in names:
         return f"no book {book!r}; available: {', '.join(names)}"
     count = max(1, min(int(limit), 10))
-    results = []
+    results, failed = [], []
     # One query per book: the server refuses a combined search across books in different languages.
     for name in [book] if book else names:
-        params = urllib.parse.urlencode({"pattern": query, "books.name": name, "format": "xml",
+        params = urllib.parse.urlencode({"pattern": query, "books.filter.name": name, "format": "xml",
                                          "pageLength": count})
         try:
             feed = library_get("/search?" + params)
         except (urllib.error.URLError, OSError) as exc:
-            results.append((0, f"### {name}: search failed ({exc})"))
+            failed.append(f"{name} ({exc})")
             continue
         for rank, item in enumerate(re.findall(r"<item>(.*?)</item>", feed, re.DOTALL)):
             snippet = re.sub(r"<[^>]+>", "", xml_field(item, "description")).strip()
@@ -770,7 +791,10 @@ def search_library(query, book="", limit=6):
             results.append((rank, f"### {xml_field(item, 'title')}\narticle: {link}\n{snippet[:500]}"))
     # Interleave by rank so every book's best hit comes before any book's second hit.
     results.sort(key=lambda item: item[0])
-    return "\n\n".join(text for _, text in results[: count * 2]) or f"nothing in the library matches {query!r}"
+    text = "\n\n".join(text for _, text in results[: count * 2]) or f"nothing in the library matches {query!r}"
+    if failed:
+        text += "\n\n(search failed in: " + "; ".join(failed) + ")"
+    return text
 
 
 def read_article(article, page=1):
@@ -944,6 +968,7 @@ Rules:
 - For disk space, memory, slowness or connectivity, measure first (disk_usage, big_files, processes, network_status) and base the advice on what they show.
 - Before giving a command with flags you are not sure of, check its manual page (search_man, read_man).
 - For how-to knowledge beyond this machine, use search_docs (handbooks and manuals stored here) and search_library (offline wikis), and name the document or article you relied on.
+- The stored documents include first-aid, medical, water, food and shelter handbooks (collections survival and survival-more) and an emergency medicine wiki in the library. For injuries, illness or survival questions, search them before answering, give the steps they give, and say to get professional help when it can be reached.
 - If the tools do not show it, say you could not verify it.
 - Be brief: the answer, the commands, one line of why."""
 
@@ -1026,6 +1051,8 @@ def tools_given_as_commands(text):
     found = set()
     for block, inline in CODE.findall(text or ""):
         for line in (block or inline).splitlines():
+            if re.match(r"^\s*[\w.-]+\s*[=:{]", line):
+                continue  # an assignment such as `processes = 4;`, not a command
             words = line.strip().removeprefix("$").split()
             while words and words[0] in ("sudo", "doas"):
                 words = words[1:]
@@ -1079,10 +1106,14 @@ def answer(messages, out=sys.stdout, log=sys.stderr):
 
 USAGE = """offline-ai — a local assistant for when the internet is down.
 
-  offline-ai                 load the model if needed, then start a conversation
-  offline-ai "question"      ask once and exit
-  offline-ai up              load the model into memory and start the library (about half a minute)
-  offline-ai down            stop the model and the library, freeing the memory
+Two modes. Default mode is the machine as usual. Offline-AI mode stops the
+services listed as giving way (the microVMs, dictation, ingest jobs), loads the
+big model and the library, and gives the memory back when it ends.
+
+  offline-ai                 enter offline-AI mode, then a conversation; leaving it returns to default mode
+  offline-ai "question"      the same for one question
+  offline-ai up              enter offline-AI mode and stay in it (about half a minute)
+  offline-ai down            leave it: stop the model and the library, restart what was stopped
   offline-ai status          what is loaded and which references are present
   offline-ai library         start the browsable reference library and print where to open it
   offline-ai library fetch   download the archives the corpus lists (--list to preview, --all for optional ones)
@@ -1137,6 +1168,75 @@ def systemctl_user(verb, unit):
     return subprocess.run(["systemctl", "--user", verb, "--", unit], capture_output=True, text=True)
 
 
+def systemctl(user, verb, unit):
+    return subprocess.run(["systemctl", *scope(user), verb, "--", unit], capture_output=True, text=True)
+
+
+def read_evicted():
+    try:
+        return [(bool(user), unit) for user, unit in json.loads(EVICTED.read_text())]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def write_evicted(entries):
+    if not entries:
+        EVICTED.unlink(missing_ok=True)
+        return
+    EVICTED.parent.mkdir(parents=True, exist_ok=True)
+    tmp = EVICTED.with_suffix(".tmp")
+    tmp.write_text(json.dumps([[user, unit] for user, unit in entries]))
+    tmp.replace(EVICTED)
+
+
+def evict():
+    """Stop the running units that give way to the model; remember which, for restore()."""
+    stopped = read_evicted()
+    for user in (False, True):
+        for unit in EVICT[user]:
+            if (user, unit) in stopped or run(["systemctl", *scope(user), "is-active", "--", unit]) not in (
+                    "active", "activating", "reloading"):
+                continue
+            done = systemctl(user, "stop", unit)
+            if done.returncode == 0:
+                stopped.append((user, unit))
+                write_evicted(stopped)  # recorded at once, so an interrupted run can still restore it
+                print(f"stopped {unit} to make room", file=sys.stderr)
+            else:
+                print(f"could not stop {unit}: {done.stderr.strip()}", file=sys.stderr)
+
+
+def restore():
+    """Start again what evict() stopped, latest first; keep anything that would not start for next time."""
+    failed = []
+    for user, unit in reversed(read_evicted()):
+        done = systemctl(user, "start", unit)
+        if done.returncode == 0:
+            print(f"restarted {unit}", file=sys.stderr)
+        else:
+            failed.insert(0, (user, unit))
+            print(f"could not restart {unit}: {done.stderr.strip()}", file=sys.stderr)
+    write_evicted(failed)
+    return not failed
+
+
+def enter_offline_mode(force=False):
+    evict()
+    try:
+        up(force=force)
+    except SystemExit:
+        restore()  # the model did not load: give back what was stopped for it
+        raise
+    start_library()
+
+
+def leave_offline_mode():
+    systemctl_user("stop", LIBRARY_UNIT)
+    stopped = systemctl_user("stop", UNIT)
+    restored = restore()
+    return stopped.returncode == 0 and restored
+
+
 def up(force=False):
     if healthy():
         return
@@ -1189,6 +1289,9 @@ def start_library():
 def status_lines():
     index = load_doc_index()
     lines = ["model server: " + ("ready" if healthy() else run(["systemctl", "--user", "is-active", "--", UNIT]))]
+    evicted = read_evicted()
+    lines.append("mode: offline-AI, stopped for it: " + ", ".join(unit for _, unit in evicted) if evicted
+                 else "mode: " + ("offline-AI" if healthy() else "default"))
     for source, path in OPTION_FILES.items():
         lines.append(f"{source} options: " + ("present" if path and os.path.exists(path) else "MISSING"))
     for label in COLLECTIONS:
@@ -1228,8 +1331,7 @@ def main():
         print(USAGE)
         return
     if command == "down":
-        systemctl_user("stop", LIBRARY_UNIT)
-        sys.exit(systemctl_user("stop", UNIT).returncode)
+        sys.exit(0 if leave_offline_mode() else 1)
     if command == "status":
         print("\n".join(status_lines()))
         return
@@ -1252,14 +1354,30 @@ def main():
                 print(f"{label} index: file://{root / 'index.html'}")
         return
 
-    up(force=args.force)
-    start_library()
     if command == "up":
+        enter_offline_mode(force=args.force)
         print("\n".join(status_lines()))
         return
+
+    # A conversation started from default mode enters offline-AI mode and leaves it
+    # again when it ends, however it ends; one started after `up` leaves the mode alone.
+    owns_mode = not healthy()
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, lambda signum, frame: sys.exit(128 + signum))
+    try:
+        if owns_mode:
+            enter_offline_mode(force=args.force)
+        converse(args.question)
+    finally:
+        if owns_mode:
+            print("leaving offline-AI mode...", file=sys.stderr)
+            leave_offline_mode()
+
+
+def converse(question):
     messages = [{"role": "system", "content": system_prompt()}]
-    if args.question:
-        messages.append({"role": "user", "content": with_leads(" ".join(args.question))})
+    if question:
+        messages.append({"role": "user", "content": with_leads(" ".join(question))})
         try:
             answer(messages)
         except MODEL_ERRORS as exc:
@@ -1269,12 +1387,12 @@ def main():
     print("\noffline-ai. Ask a question; empty line or Ctrl-D to quit.", file=sys.stderr)
     while True:
         try:
-            question = input("\n> ").strip()
-        except EOFError:
+            line = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
             break
-        if not question:
+        if not line:
             break
-        messages.append({"role": "user", "content": with_leads(question)})
+        messages.append({"role": "user", "content": with_leads(line)})
         try:
             answer(messages)
         except MODEL_ERRORS as exc:

@@ -16,7 +16,13 @@
 #     stored on the machine, the library, and the operator's notes. It
 #     proposes commands; it never runs any that change state.
 #
-#   offline-ai            # load the model, then a conversation
+# Two modes. Default mode is the machine as usual. Offline-AI mode (entered by
+# `offline-ai`, `offline-ai "question"` or `offline-ai up`) first stops the
+# running units listed in evictSystem/evictUser below, then loads the model
+# and the library; leaving it (end of the conversation, or `offline-ai down`)
+# stops them and starts exactly the units it stopped.
+#
+#   offline-ai            # offline-AI mode for one conversation
 #   offline-ai "how do I stop tailscale until next boot"
 #   offline-ai library    # start the library and print where to open it
 #   offline-ai library fetch --list   # archives the corpus lists; fetch them
@@ -48,6 +54,24 @@ let
   libraryPort = 8718;
   libraryUnit = "offline-ai-library.service";
   corpus = "${home}/Repos/survival-corpus/corpus";
+
+  # What gives way while the big model is loaded (offline-AI mode). All of it
+  # needs the network or only matters online; the microVMs alone can take
+  # 7 GiB. Timers come before the services they start, so nothing restarts
+  # a service while it is stopped. The CLI stops only those that are running
+  # and starts exactly those again when the mode ends.
+  evictSystem = [
+    "research-agent-healthcheck.timer"
+    "scraper-healthcheck.timer"
+    "microvm@research-agent.service"
+    "microvm@scraper.service"
+  ];
+  evictUser = [
+    "aggregator-ingest.timer"
+    "router-ingestor-scan.timer"
+    "router-ingestor.service"
+    "voquill.service"
+  ];
 
   # Document collections the assistant can search, as label=directory. The
   # manuals come from this system's own closure, so they always describe
@@ -125,6 +149,8 @@ let
       export OFFLINE_AI_DOC_DIRS="''${OFFLINE_AI_DOC_DIRS:-${collections}}"
       export OFFLINE_AI_LIBRARY_URL="''${OFFLINE_AI_LIBRARY_URL:-http://127.0.0.1:${toString libraryPort}}"
       export OFFLINE_AI_LIBRARY_UNIT="''${OFFLINE_AI_LIBRARY_UNIT:-${libraryUnit}}"
+      export OFFLINE_AI_EVICT_SYSTEM="''${OFFLINE_AI_EVICT_SYSTEM-${lib.concatStringsSep " " evictSystem}}"
+      export OFFLINE_AI_EVICT_USER="''${OFFLINE_AI_EVICT_USER-${lib.concatStringsSep " " evictUser}}"
       exec python3 ${../../scripts/offline-ai.py} "$@"
     '';
   };
@@ -150,6 +176,19 @@ in
       Restart = "no";
     };
   };
+
+  # The CLI runs as jonathan and must stop and start the system units that give
+  # way to the model, and nothing else: only these units, only start/stop.
+  security.polkit.extraConfig = ''
+    polkit.addRule(function (action, subject) {
+      if (action.id == "org.freedesktop.systemd1.manage-units" &&
+          subject.user == "jonathan" &&
+          ${builtins.toJSON evictSystem}.indexOf(action.lookup("unit")) >= 0 &&
+          ["start", "stop"].indexOf(action.lookup("verb")) >= 0) {
+        return polkit.Result.YES;
+      }
+    });
+  '';
 
   systemd.user.services.offline-ai-library = {
     description = "offline-ai reference library (kiwix-serve)";

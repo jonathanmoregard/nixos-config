@@ -24,6 +24,14 @@
 #     published checksum, continues a partial download instead of starting
 #     over, keeps what arrived when the connection drops mid-file, and leaves
 #     nothing behind for a corrupted one;
+#   - a path such as `-delete` handed to big_files is a path, not a find
+#     expression (nothing in the working directory is deleted);
+#   - offline-AI mode: a conversation started in default mode stops only the
+#     listed units that are running (timers first), loads the model, and on
+#     the way out stops the model and starts exactly those units again, in
+#     reverse order; `up` stays in the mode until `down`; a unit that will not
+#     restart is remembered and reported; if the model cannot load, what was
+#     stopped for it is started again;
 #   - the model's final text reaches stdout.
 #
 # Run: nix build .#checks.x86_64-linux.offline-ai -L
@@ -38,11 +46,12 @@ let
         ("read_file", {"path": "/etc/shadow"}),
         ("no_such_tool", {}),
         ("search_library", {"query": "cantenna waveguide"}),
-        ("read_article", {"article": "fixture_en/antenna.html"}),
-        ("read_article", {"article": "fixture_en/../../etc/passwd"}),
+        ("read_article", {"article": "fixture_en_2026-01/antenna.html"}),
+        ("read_article", {"article": "fixture_en_2026-01/../../etc/passwd"}),
         ("search_docs", {"query": "quillfeather", "collection": "guides"}),
         ("show_option", {"name": "networking.firewall.allowedTCPPorts"}),
         ("read_man", {"name": "ls", "section": "--version"}),
+        ("big_files", {"path": "-delete", "min_mb": 0}),
     ]
 
     class Handler(BaseHTTPRequestHandler):
@@ -146,6 +155,54 @@ let
     server.serve_forever()
   '';
 
+  # Stands in for systemctl in the mode scenarios: units are files in a state
+  # folder (present = active), every call is logged, and units listed in
+  # $FAKE_REFUSE refuse to start. Starting the model unit makes the model
+  # stub report healthy; stopping it makes it unhealthy again.
+  fakeSystemctl = pkgs.writeShellScript "systemctl" ''
+    state="$FAKE_STATE"; scope=system
+    [ "$1" = --user ] && { scope=user; shift; }
+    verb=$1; shift; [ "$1" = -- ] && shift; unit=$1
+    echo "$scope $verb $unit" >> "$state/calls"
+    case "$verb" in
+      is-active) if [ -e "$state/$scope/$unit" ]; then echo active; else echo inactive; exit 3; fi ;;
+      stop) rm -f "$state/$scope/$unit"; [ "$unit" = offline-ai-llm.service ] && rm -f "$state/healthy"; exit 0 ;;
+      start)
+        case " $FAKE_REFUSE " in *" $unit "*) echo "refused $unit" >&2; exit 1 ;; esac
+        touch "$state/$scope/$unit"; [ "$unit" = offline-ai-llm.service ] && touch "$state/healthy"; exit 0 ;;
+      *) exit 0 ;;
+    esac
+  '';
+
+  # A model server that is healthy only while the fake model unit runs.
+  modeStub = pkgs.writeText "offline-ai-mode-stub.py" ''
+    import json, os, sys
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    STATE = sys.argv[2]
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200 if os.path.exists(os.path.join(STATE, "healthy")) else 503)
+            self.end_headers()
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            chunk = {"choices": [{"delta": {"content": "MODE ANSWER"}}]}
+            self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\ndata: [DONE]\n\n")
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    with open(sys.argv[1], "w") as fh:
+        fh.write(str(server.server_address[1]))
+    server.serve_forever()
+  '';
+
   freePort = pkgs.writeText "offline-ai-free-port.py" ''
     import socket
     with socket.socket() as sock:
@@ -173,10 +230,10 @@ pkgs.runCommand "offline-ai-harness"
     echo '<html><head><title>Home</title></head><body><a href="antenna.html">Antennas</a></body></html>' > site/index.html
     python3 ${illustration} site/icon.png
     zimwriterfs --welcome=index.html --illustration=icon.png --language=eng --title=Fixture \
-      --description=fixture --creator=test --publisher=test --name fixture_en site zims/fixture_en.zim > /dev/null \
+      --description=fixture --creator=test --publisher=test --name fixture_en site zims/fixture_en_2026-01.zim > /dev/null \
       || fail "could not build the fixture archive"
-    head -c 20000 zims/fixture_en.zim > zims/damaged.zim
-    head -c 20000 zims/fixture_en.zim > broken/damaged.zim
+    head -c 20000 zims/fixture_en_2026-01.zim > zims/damaged.zim
+    head -c 20000 zims/fixture_en_2026-01.zim > broken/damaged.zim
 
     if OFFLINE_AI_ZIM_DIR="$PWD/broken" ${libraryServe}/bin/offline-ai-library-serve 2> broken.log; then
       fail "the library server started with no readable archive"
@@ -211,7 +268,8 @@ pkgs.runCommand "offline-ai-harness"
     grep -q 'STUB FINAL ANSWER' out.txt || fail "final answer did not reach stdout"
     jq -e '.role == "user" and (.content | contains("big_files") and contains("Those are your tools"))' results.json.last > /dev/null \
       || fail "an answer giving a tool as a shell command was not sent back: $(cat results.json.last 2>/dev/null)"
-    [ "$(jq length results.json)" = 9 ] || fail "expected nine tool results to reach the model"
+    [ "$(jq length results.json)" = 10 ] || fail "expected ten tool results to reach the model"
+    [ -f config/configuration.nix ] || fail "big_files with path -delete deleted files in the working directory"
     jq -e '.[0] | contains("networking.firewall.allowedTCPPorts") and contains("type:")' results.json > /dev/null \
       || fail "option lookup did not return the deployed option reference"
     jq -e '.[1] | contains("outside the readable roots")' results.json > /dev/null \
@@ -220,7 +278,7 @@ pkgs.runCommand "offline-ai-harness"
       || fail "file content from outside the allowed roots reached the model"
     jq -e '.[2] | contains("unknown tool")' results.json > /dev/null \
       || fail "an unknown tool name was not reported back"
-    jq -e '.[3] | contains("article: fixture_en/antenna.html")' results.json > /dev/null \
+    jq -e '.[3] | contains("article: fixture_en_2026-01/antenna.html")' results.json > /dev/null \
       || fail "library search did not return the article: $(jq '.[3]' results.json)"
     jq -e '.[4] | contains("directional waveguide") and (contains("scripttext") | not)' results.json > /dev/null \
       || fail "article text was not returned as visible text only: $(jq '.[4]' results.json)"
@@ -276,6 +334,55 @@ pkgs.runCommand "offline-ai-harness"
       || { ls -l fetched; cat fetch.log; fail "a dropped connection lost the bytes that had arrived"; }
     [ ! -e fetched/short_2026-01.zim ] || fail "an incomplete archive was put in place"
     grep -q 'short_2026-01.zim: connection ended' fetch.log || { cat fetch.log; fail "a dropped connection was not reported"; }
+
+    # --- offline-AI mode, with systemctl replaced by a fake. The deployed
+    # script is run directly: the wrapper would put the real systemctl first.
+    script=$(grep -o '/nix/store/[^ ]*-offline-ai.py' ${offlineAi}/bin/offline-ai | head -1)
+    [ -n "$script" ] || fail "could not find the script in the wrapper"
+    mkdir -p fakebin mode/system mode/user
+    ln -s ${fakeSystemctl} fakebin/systemctl
+    export FAKE_STATE="$PWD/mode"
+    python3 ${modeStub} mode_port "$PWD/mode" &
+    mode_pid=$!
+    trap 'kill $stub_pid $library_pid $mirror_pid $mode_pid 2>/dev/null || true' EXIT
+    for _ in $(seq 1 50); do [ -s mode_port ] && break; sleep 0.1; done
+    reset_units() {
+      rm -rf mode/system mode/user mode/calls mode/healthy; mkdir -p mode/system mode/user
+      touch mode/system/a.timer mode/system/b.service mode/user/d.service   # c.service is not running
+    }
+    mode() {
+      env PATH="$PWD/fakebin:$PATH" XDG_RUNTIME_DIR="$PWD/run" \
+        OFFLINE_AI_URL="http://127.0.0.1:$(cat mode_port)" OFFLINE_AI_LIBRARY_URL="http://127.0.0.1:9" \
+        OFFLINE_AI_UNIT=offline-ai-llm.service OFFLINE_AI_MODEL="''${MODE_MODEL:-}" \
+        OFFLINE_AI_EVICT_SYSTEM="a.timer b.service" OFFLINE_AI_EVICT_USER="c.service d.service" \
+        python3 "$script" "$@"
+    }
+    calls() { grep -E ' (stop|start) ' mode/calls | tr '\n' ';'; }
+
+    reset_units
+    mode "is the disk full" > mode.out 2> mode.err || { cat mode.out mode.err; fail "a conversation in offline-AI mode failed"; }
+    grep -q 'MODE ANSWER' mode.out || fail "no answer in offline-AI mode"
+    expected="system stop a.timer;system stop b.service;user stop d.service;user start offline-ai-llm.service;user start offline-ai-library.service;user stop offline-ai-library.service;user stop offline-ai-llm.service;user start d.service;system start b.service;system start a.timer;"
+    [ "$(calls)" = "$expected" ] || { cat mode.err; fail "mode switch order wrong: $(calls)"; }
+    [ ! -e run/offline-ai/evicted.json ] || fail "the record of stopped units survived a clean return to default mode"
+
+    reset_units
+    mode up > up.out 2>&1 || { cat up.out; fail "offline-ai up failed"; }
+    grep -q 'mode: offline-AI, stopped for it: a.timer, b.service, d.service' up.out || { cat up.out; fail "status does not show the mode"; }
+    [ ! -e mode/system/b.service ] || fail "up did not stop the listed units"
+    mode "still here" > /dev/null 2>&1 || fail "a question while already up failed"
+    [ ! -e mode/system/b.service ] || fail "a conversation after up ended offline-AI mode"
+    FAKE_REFUSE="b.service" mode down > down.out 2>&1 && fail "down reported success although a unit did not restart"
+    grep -q 'could not restart b.service' down.out || { cat down.out; fail "a unit that did not restart was not reported"; }
+    [ -e mode/system/a.timer ] && [ -e mode/user/d.service ] || fail "down did not restart the units that could start"
+    jq -e '. == [[false, "b.service"]]' run/offline-ai/evicted.json > /dev/null || fail "the unit that did not restart was not remembered"
+    mode down > /dev/null 2>&1 || fail "a second down did not restart the remembered unit"
+    [ -e mode/system/b.service ] && [ ! -e run/offline-ai/evicted.json ] || fail "the remembered unit was not restarted"
+
+    reset_units
+    MODE_MODEL=/nonexistent/model.gguf mode "anything" > nomodel.out 2>&1 && fail "a missing model did not fail"
+    [ -e mode/system/a.timer ] && [ -e mode/system/b.service ] && [ -e mode/user/d.service ] \
+      || { cat nomodel.out; fail "units stopped for a model that could not load were not restarted"; }
 
     mkdir -p "$out"
     echo 'offline-ai harness passed' > "$out/result"
