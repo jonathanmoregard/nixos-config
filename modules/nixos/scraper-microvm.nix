@@ -30,6 +30,10 @@
 #   - no operator files (tmpfs $HOME, per-request browser context)
 #   - wide egress (intended cost — that's the security boundary the VM
 #     itself defends)
+let
+  # Captured here: inside the guest module below, `config` is the guest's.
+  hostJonathanUid = config.users.users.jonathan.uid;
+in
 {
   # Per-boot bearer token. Random, never persisted across reboots. The
   # only consumers that need it (scraper-http inside the scraper VM,
@@ -159,15 +163,15 @@
         playwright-driver.browsers
       ];
 
-      # Pin scraper uid to 1000 so any virtiofs writeback (none today,
-      # but consistent with research-agent's pattern) maps to a stable
-      # owner on the host. The user does not need login; restrict shell
+      # Scraper uid = host jonathan's uid so any virtiofs writeback
+      # (none today, but consistent with research-agent's pattern) maps
+      # to a stable owner on the host. The user does not need login; restrict shell
       # to nologin would be cleaner once the openssh authorized_keys
       # below is removed in a follow-up (kept for now to allow manual
       # debug ssh into the VM).
       users.users.scraper = {
         isNormalUser = true;
-        uid = 1000;
+        uid = hostJonathanUid;
         shell = pkgs.bashInteractive;
         openssh.authorizedKeys.keys = [
           # Reuses the research-agent host key — same operator key,

@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ lib, pkgs, ... }:
 {
   # Boot loader (UEFI / systemd-boot). Tests `mkForce false` this in
   # tests/lib/common.nix' minimal node so the framework can boot the
@@ -60,11 +60,13 @@
   # Enforced by checks.x86_64-linux.dellan-initial-password-null.
   users.users.jonathan = {
     isNormalUser = true;
-    # Pinned: UID 1000 is assumed elsewhere (microvm guest users for
-    # virtiofs ownership, feature-vm, autodoro's DBus path). Unpinned,
-    # the first-created normal user takes 1000 — on tuxedo's fresh
-    # install (2026-09-29) that was claude-agent-1, leaving jonathan 1003.
-    uid = 1000;
+    # Pinned so a fresh install is reproducible: unpinned, the
+    # first-created normal user takes 1000 — on tuxedo's install
+    # (2026-09-29) that was claude-agent-1, leaving jonathan 1003.
+    # A host whose live uid differs overrides this with its real value
+    # (NixOS never rewrites an existing uid). Nothing may hardcode the
+    # number: read config.users.users.jonathan.uid, `id -u`, or %t.
+    uid = lib.mkDefault 1000;
     extraGroups = [ "wheel" "networkmanager" "video" ];
     shell = pkgs.zsh;
     openssh.authorizedKeys.keys = [

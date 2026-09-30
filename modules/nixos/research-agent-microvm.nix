@@ -18,6 +18,10 @@
 # Host MCP server reaches the VM via ssh on 127.0.0.1:2223 (port
 # forward from SLIRP user-mode networking). Per-call isolation is
 # enforced by bwrap inside the VM, exactly as in the docker era.
+let
+  # Captured here: inside the guest module below, `config` is the guest's.
+  hostJonathanUid = config.users.users.jonathan.uid;
+in
 {
   microvm.vms.research-agent = {
     # Fully-declarative VM (`config` set inline below). The host's
@@ -206,13 +210,13 @@
         (python3.withPackages (ps: with ps; [ curl-cffi ]))
       ];
 
-      # Pin agent uid to 1000 so virtiofs passthrough lines up with
-      # host jonathan. Without this, files written to /out by the
-      # guest agent land on the host with the wrong owner and the
-      # host MCP server can't unlink them.
+      # Agent uid = host jonathan's uid so virtiofs passthrough lines
+      # up. Without this, files written to /out by the guest agent land
+      # on the host with the wrong owner and the host MCP server can't
+      # unlink them.
       users.users.agent = {
         isNormalUser = true;
-        uid = 1000;
+        uid = hostJonathanUid;
         shell = pkgs.bashInteractive;
         openssh.authorizedKeys.keys = [
           "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJTpnxCppc/riWtTthEqc6FDX3tHoJvPkVjiKACOYZUl research-agent-host-key"
