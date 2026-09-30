@@ -25,15 +25,16 @@
 let
   cfg = config.services.claudeAgentUsers;
 
-  agentUser = name: {
+  agentUser = n: let name = "claude-agent-${toString n}"; in {
     isNormalUser = true;
+    # Pinned after jonathan's 1000 (profiles/base.nix), matching dellan.
+    uid = 1000 + n;
     description = "AI agent ${name} — unprivileged worker";
     group = "claude-agents";
     extraGroups = [ ];   # explicitly no wheel, no docker, no anything
     home = "/home/${name}";
     createHome = true;
     shell = pkgs.bashInteractive;
-    # Optional: pin to a known UID range to make audit easier.
   };
 in
 {
@@ -62,7 +63,7 @@ in
     users.users = lib.mkMerge [
       (lib.listToAttrs (map (n: {
         name = "claude-agent-${toString n}";
-        value = agentUser "claude-agent-${toString n}";
+        value = agentUser n;
       }) (lib.range 1 cfg.count)))
       { jonathan.extraGroups = [ "claude-agents" ]; }
     ];
