@@ -9,6 +9,8 @@
     ./swap.nix
     ../../profiles/workstation
     ../../modules/nixos/tuxedo-infinitybook-pro-15-gen10-amd.nix
+    # Tuxedo only: the model needs ~45 GiB of RAM, which dellan lacks.
+    ../../modules/nixos/offline-ai.nix
   ];
 
   networking.hostName = "tuxedo";

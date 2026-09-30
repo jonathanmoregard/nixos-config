@@ -413,6 +413,16 @@
           declaredSecrets = builtins.attrNames
             self.nixosConfigurations.dellan.config.age.secrets;
         };
+        # Not a VM lane: runs the `offline-ai` wrapper and library server
+        # tuxedo deploys against a stub model server and a fixture archive —
+        # tool results reach the model, reads outside the allowed roots are
+        # refused, library search works end to end, the answer reaches stdout.
+        offline-ai = import ./tests/offline-ai.nix {
+          pkgs = pkgsLinux;
+          offlineAi = self.nixosConfigurations.tuxedo.config.system.build.offline-ai;
+          libraryServe = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-serve;
+          libraryFetch = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-fetch;
+        };
         # Not a VM lane: runtime-invocation harness for `add-secret`
         # (home/add-secret.nix). Exercises name validation, worktree
         # preflight, dup-refuse, happy-path insertion, and KEY=VALUE
