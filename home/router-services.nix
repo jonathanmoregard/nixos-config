@@ -111,7 +111,9 @@ in
     Timer = {
       OnBootSec = "5min";
       OnUnitActiveSec = "1h";
-      Persistent = true;
+      # No Persistent on a monotonic timer — see gh-token in
+      # claude-services.nix: with a prior-boot stamp and an elapsed
+      # OnBootSec it leaves the timer with no next elapse.
       Unit = "router-ingestor-scan.service";
     };
     Install.WantedBy = [ "timers.target" ];

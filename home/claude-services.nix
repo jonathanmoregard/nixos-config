@@ -44,7 +44,11 @@
     Timer = {
       OnBootSec = "1min";
       OnUnitActiveSec = "50min";
-      Persistent = true;
+      # No Persistent: it only belongs on OnCalendar timers. On a monotonic
+      # timer it restores last-trigger from the previous boot's stamp, and if
+      # the user manager starts after OnBootSec has elapsed (login >1min after
+      # boot) systemd treats the boot tick as already fired and the timer
+      # never elapses — observed 2026-09-30, tokens went stale for 3h.
     };
     Install.WantedBy = [ "timers.target" ];
   };
