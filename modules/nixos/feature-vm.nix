@@ -1,49 +1,24 @@
 { config, lib, pkgs, ... }:
-# Feature VM overrides for the dellan host. Active ONLY when building
-# `config.system.build.vm` (i.e. `nix build .#nixosConfigurations.dellan.config.system.build.vm`
-# or `nixos-rebuild build-vm --flake .#dellan`). Prod toplevel on the
-# real laptop is unaffected — `virtualisation.vmVariant.*` lives in a
+# Feature VM overrides for every workstation host (dellan, tuxedo).
+# Active ONLY when building `config.system.build.vm`. Prod toplevel on
+# the real laptop is unaffected — `virtualisation.vmVariant.*` lives in a
 # sub-config that the QEMU VM builder merges in, not the regular system.
 #
-# Usage:
-#   1. Boot the VM (headless, snapshot mode = clean state per launch):
-#        nix run .#feature-vm
-#      (defined in flake.nix; wraps the underlying QEMU launch script
-#      with `-snapshot -display none` and a fresh $TMPDIR.)
-#   2. SSH in from the host in another terminal:
-#        ssh -p 2222 -o StrictHostKeyChecking=no \
-#            -o UserKnownHostsFile=/dev/null \
-#            -i ~/.ssh/id_ed25519 jonathan@localhost
-#   3. The host worktrees dir is mounted at /mnt/worktrees inside the
-#      VM, so edits on the host show up live without rebooting the VM.
+# Drive it with the launcher (scripts/feature-vm.sh, `nix run
+# .#feature-vm -- --help`): `up`, `run`, `apply`, `reset`, `down`. The
+# host shares below are exported by that launcher, not baked in here, so
+# it decides per boot what the guest may see:
 #
-# Persistent qcow2 + graphics window (rarely needed):
-#   nix build .#nixosConfigurations.dellan.config.system.build.vm
-#   ./result/bin/run-dellan-vm
+#   locked (default)  worktrees + research-agent read-only (enforced by
+#                     QEMU on the host, so root in the guest cannot write
+#                     through them); guest network `restrict=on` (the ssh
+#                     port forward still works).
+#   --trusted         shares read-write, guest internet on.
 #
-# Agenix: a copy of the host's `jonathan@dellan` SSH private key is
-# 9p-mounted read-only into the VM at /mnt/host-ssh/id_ed25519, and
-# `age.identityPaths` is pointed at it. jonathan@dellan is already a
-# recipient of every `.age` file (see secrets/secrets.nix), so agenix
-# activation inside the VM decrypts successfully and the runtime
-# secrets dir is populated.
-#
-# The host-side export points at `~/.cache/feature-vm/host-ssh/`
-# rather than `~/.ssh/` so the VM only sees the one file it needs —
-# not `known_hosts`, agent sockets, or other key material that might
-# live in `~/.ssh/`. The launcher (`apps.feature-vm` in flake.nix)
-# populates the cache dir from `~/.ssh/id_ed25519` before booting
-# the VM and refuses to start if the host key is missing.
-#
-# Trust model: the 9p mount uses `security_model=none`, so the 9p
-# server runs filesystem ops as the host user that launched QEMU
-# (jonathan, uid 1000). Root inside the VM thus reads the privkey via
-# the server's host-jonathan credentials. This adds no new
-# decryption capability — `jonathan@dellan`'s privkey is already an
-# age recipient of every `.age` file, so any process that can read
-# that key on the host can already decrypt every secret today. The
-# 9p export reproduces that same trust level inside the VM, no new
-# capability granted.
+# Secrets, in both modes: the VM never receives a host or user key. Every
+# agenix secret is replaced by a throwaway fixture (see below). The real
+# ones could not be opened in here anyway: agenix-rekey encrypts them to
+# each machine's HOST key, which only root on the laptop can read.
 let
   # Throwaway recipient + ciphertexts for the klaffat provisioning
   # secrets — see the `age.identityPaths` block below for why the feature
@@ -60,9 +35,51 @@ let
     "klaffat-nix-signing-key"
     "klaffat-github-token"
   ];
+
+  # Every other secret gets a throwaway ciphertext encrypted to an identity
+  # minted here, the same pattern as klaffatFixtures. agenix then activates
+  # cleanly and services find a file where they expect one, instead of
+  # every boot and `feature-vm apply` failing on "no identity matched".
+  # The plaintexts are the literal strings below; the identity is
+  # world-readable in /nix/store and opens nothing else.
+  fixtureSecretNames = lib.subtractLists klaffatSecretNames (builtins.attrNames config.age.secrets);
+  fixtures = pkgs.runCommand "feature-vm-secrets"
+    {
+      nativeBuildInputs = [ pkgs.age pkgs.openssh ];
+      names = fixtureSecretNames;
+    } ''
+      mkdir -p "$out"
+      ssh-keygen -q -t ed25519 -N "" -C "feature-vm fixture identity" -f "$out/id_ed25519"
+      pub="$(cat "$out/id_ed25519.pub")"
+      for n in $names; do
+        printf 'feature-vm-fixture-%s' "$n" | age -r "$pub" -o "$out/$n.age"
+      done
+    '';
+
+  # A fixed sshd host key for the VM, so the launcher can pin it
+  # (StrictHostKeyChecking=yes against its own known_hosts) instead of
+  # trusting whatever answers on localhost:2222. World-readable in the
+  # store, which is fine: it identifies a throwaway VM and nothing else.
+  sshHostKey = pkgs.runCommand "feature-vm-ssh-host-key"
+    { nativeBuildInputs = [ pkgs.openssh ]; } ''
+      mkdir -p "$out"
+      ssh-keygen -q -t ed25519 -N "" -C "feature-vm" -f "$out/ssh_host_ed25519_key"
+    '';
 in
 {
   virtualisation.vmVariant = {
+    services.openssh.hostKeys = lib.mkForce [
+      { path = "/etc/ssh/feature-vm_host_ed25519_key"; type = "ed25519"; }
+    ];
+    # `mode` makes etc copy the file (root-owned 0600, as sshd requires)
+    # rather than symlink into the store.
+    environment.etc."ssh/feature-vm_host_ed25519_key" = {
+      source = "${sshHostKey}/ssh_host_ed25519_key";
+      mode = "0600";
+    };
+    # The launcher builds this to write its known_hosts entry.
+    system.build.featureVmHostKey = sshHostKey;
+
     # Physical-host pressure thresholds exceed this disposable VM's entire
     # disk. Scale them so a normal build does not trigger GC immediately.
     nix.settings = {
@@ -90,62 +107,25 @@ in
         }
       ];
 
-      # 9p-mount the host worktrees tree read-write into the VM so
-      # edits on the host are visible immediately. Mapping is by host
-      # UID — host `jonathan` (1000) maps to VM `jonathan` (1000).
-      sharedDirectories.worktrees = {
-        source = "/home/jonathan/Repos/nixos-config-worktrees";
-        target = "/mnt/worktrees";
-      };
-
-      # Extra 9p export for jonathan@dellan's SSH private key, so the
-      # in-VM agenix activation can decrypt secrets without baking a
-      # long-lived feature-VM identity into the recipient set.
-      #
-      # `security_model=none` (not the default `mapped-xattr`) so root
-      # inside the VM reads the file via host-jonathan's credentials
-      # — required because the privkey is mode 0600 jonathan-only and
-      # `mapped-xattr` would enforce VM-side uid checks.
-      #
-      # The source path is a launcher-managed cache dir, not `~/.ssh/`,
-      # so the VM only sees the one file it needs. The launcher
-      # (`apps.feature-vm` in flake.nix) populates it before boot. If
-      # this module is used outside the launcher (`run-dellan-vm`
-      # directly), populate `~/.cache/feature-vm/host-ssh/id_ed25519`
-      # manually first or agenix decryption will silently produce
-      # empty secrets.
-      #
-      # The matching mount entry below lives in
-      # `virtualisation.fileSystems` (qemu-vm.nix overrides the
-      # top-level `fileSystems` wholesale with `mkVMOverride`, but
-      # merges siblings of `virtualisation.fileSystems` at the same
-      # priority).
-      qemu.options = [
-        "-virtfs"
-        "local,path=/home/jonathan/.cache/feature-vm/host-ssh,security_model=none,mount_tag=host-ssh"
-      ];
-
-      # Mount the host-ssh 9p export read-only at /mnt/host-ssh.
-      # `neededForBoot = true` ensures it lands in initrd before
-      # agenix activation (stage-1) reads the privkey. The
-      # `x-systemd.requires=modprobe@9pnet_virtio.service` option
-      # mirrors what qemu-vm.nix injects for its own 9p mounts, so
-      # the mount waits for the kernel module to load.
-      fileSystems."/mnt/host-ssh" = {
-        device = "host-ssh";
+      # Host shares, exported by the launcher's QEMU_OPTS (mount tags
+      # worktrees, research-agent) so it can make them read-only.
+      # The mounts live in `virtualisation.fileSystems` because qemu-vm.nix
+      # overrides the top-level `fileSystems` wholesale with `mkVMOverride`.
+      # Mapping is by host UID — host `jonathan` maps to VM `jonathan`.
+      fileSystems."/mnt/worktrees" = {
+        device = "worktrees";
         fsType = "9p";
         options = [
           "trans=virtio"
           "version=9p2000.L"
-          "msize=16384"
-          "ro"
+          "msize=131072"
           "x-systemd.requires=modprobe@9pnet_virtio.service"
         ];
-        neededForBoot = true;
       };
 
-      # research-agent worktree mount. RW so the inner microvm's
-      # virtiofs RW share for /out can write reports into reports/.
+      # research-agent worktree mount. RW under --trusted so the inner
+      # microvm's virtiofs RW share for /out can write reports into
+      # reports/; read-only in locked mode.
       fileSystems."/home/jonathan/Repos/research-agent" = {
         device = "research-agent";
         fsType = "9p";
@@ -158,25 +138,16 @@ in
       };
     };
 
-    # Point agenix at the host privkey 9p-mounted above, PLUS a throwaway
-    # identity for the klaffat provisioning secrets.
-    #
-    # Those eight are the one group deliberately NOT encrypted to any key
-    # jonathan holds (modules/nixos/klaffat-infra.nix explains why), so the
-    # 9p'd user key cannot open them and a smoke run would find
-    # /run/agenix/klaffat-* absent — indistinguishable from the module
-    # being broken. The fixture identity below decrypts ONLY the fixture
-    # ciphertexts substituted underneath it; the real ciphertexts in
-    # secrets/ stay openable by dellan's host key alone.
-    #
-    # agenix tries every identity against every secret, so listing both
-    # here leaves the rekey-managed secrets' behaviour unchanged.
-    age.identityPaths = [
-      "/mnt/host-ssh/id_ed25519"
+    # agenix opens only fixtures here: the klaffat ones (a real-shaped
+    # set shared with the vm-klaffat-infra lane) and the generic ones above.
+    age.identityPaths = lib.mkForce [
+      "${fixtures}/id_ed25519"
       "${klaffatFixtures}/id_ed25519"
     ];
     age.secrets = lib.genAttrs klaffatSecretNames (n: {
       file = lib.mkForce "${klaffatFixtures}/${n}.age";
+    }) // lib.genAttrs fixtureSecretNames (n: {
+      file = lib.mkForce "${fixtures}/${n}.age";
     });
 
     # Add jonathan@dellan as an authorized SSH key inside the VM so
@@ -202,6 +173,10 @@ in
     # `initialPassword` so the QEMU graphics window is usable on first
     # boot before SSH is up.
     users.users.jonathan.initialPassword = lib.mkForce "featurevm"; # pragma: allowlist secret
+
+    # `feature-vm run` / `apply` drive the VM over non-interactive ssh, and
+    # the VM is disposable (-snapshot), so sudo needs no password here.
+    security.sudo.wheelNeedsPassword = lib.mkForce false;
 
     # Disable production-only services that either need real secrets,
     # depend on the dellan host's identity, or just slow the VM boot.

@@ -336,6 +336,9 @@
             .microvm.vms.research-agent.config.config
             .systemd.services.research-agent-egress-init.script;
         };
+        # Not a VM lane: runtime-invocation harness for the feature-vm
+        # launcher (locked-by-default sandbox invariants). Seconds.
+        feature-vm-ctl = import ./tests/feature-vm-ctl.nix { pkgs = pkgsLinux; };
         feature-vm-research-source =
           let
             launcher = self.apps.${linuxSystem}.feature-vm.program;
@@ -460,154 +463,42 @@
         };
       };
 
-    # Feature-VM flake apps. Two interactive modes + a screencap helper.
+    # Feature-VM flake apps — a disposable copy of a workstation host
+    # (scripts/feature-vm.sh; `nix run .#feature-vm -- --help`).
     #
-    #   nix run .#feature-vm           — headless (default). For Claude
-    #                                    Code / agentic flows. SSH on
-    #                                    host:2222 + QMP + serial sockets
-    #                                    exposed under $TMPDIR. Use this
-    #                                    unless a real GUI is needed.
-    #   nix run .#feature-vm-headful   — same boot but QEMU opens a GTK
-    #                                    window. Requires $DISPLAY (i.e.
-    #                                    a logged-in graphical session
-    #                                    on dellan). Use when a human
-    #                                    wants to drive the VM directly.
+    #   nix run .#feature-vm -- up                — boot in the background
+    #   nix run .#feature-vm -- run 'systemctl …' — command in the VM
+    #   nix run .#feature-vm -- apply [mod.nix]   — activate edited config
+    #   nix run .#feature-vm -- reset | down
+    #   nix run .#feature-vm                      — foreground boot
+    #   nix run .#feature-vm-headful              — foreground, GTK window
     #   nix run .#feature-vm-screencap -- <qmp-sock> <out.png>
-    #                                  — capture VM display via QMP
-    #                                    screendump → PNG. Works on the
-    #                                    headless VM since QEMU's VGA
-    #                                    device is still present without
-    #                                    `-display none` driving a host
-    #                                    window.
+    #
+    # Locked down unless `--trusted`: no host key, read-only shares, no
+    # guest internet. `--host tuxedo` boots another host's config.
     apps.${linuxSystem} =
       let
-        vm = self.nixosConfigurations.dellan.config.system.build.vm;
         memoryRunner = self.nixosConfigurations.dellan.config.services.buildCoordination.runnerPackage;
-
-        mkFeatureVm = { name, displayMode }:
-          let
-            runner = pkgsLinux.writeShellApplication {
-              inherit name;
-              text = ''
-                hostKey="$HOME/.ssh/id_ed25519"
-                if [ ! -r "$hostKey" ]; then
-                  echo "[${name}] ERROR: host SSH private key not readable at $hostKey" >&2
-                  echo "[${name}] agenix decryption inside the VM would silently produce empty secrets — refusing to boot." >&2
-                  exit 1
-                fi
-
-                # Stage the privkey into a launcher-owned cache dir so
-                # the 9p export sees only the one file it needs.
-                stagingDir="$HOME/.cache/feature-vm/host-ssh"
-                mkdir -p "$stagingDir"
-                chmod 0700 "$stagingDir"
-                install -m 0400 "$hostKey" "$stagingDir/id_ed25519"
-
-                # Export the actual research-agent checkout selected for this
-                # smoke. The default mirrors production; cross-repo feature
-                # work can point at its exact worktree without rebuilding or
-                # editing feature-vm.nix.
-                researchAgentWorktree="''${RESEARCH_AGENT_WORKTREE:-$HOME/Repos/research-agent}"
-                case "$researchAgentWorktree" in
-                  /*) ;;
-                  *)
-                    echo "[${name}] ERROR: RESEARCH_AGENT_WORKTREE must be absolute: $researchAgentWorktree" >&2
-                    exit 1
-                    ;;
-                esac
-                case "$researchAgentWorktree" in
-                  *,*)
-                    echo "[${name}] ERROR: RESEARCH_AGENT_WORKTREE cannot contain a comma: $researchAgentWorktree" >&2
-                    exit 1
-                    ;;
-                esac
-                if [ ! -f "$researchAgentWorktree/scripts/run-agent.sh" ] || [ ! -d "$researchAgentWorktree/agent" ]; then
-                  echo "[${name}] ERROR: no research-agent checkout at $researchAgentWorktree" >&2
-                  exit 1
-                fi
-
-                TMPDIR="$(mktemp -d -t ${name}.XXXXXX)"
-                export TMPDIR
-                trap 'rm -rf "$TMPDIR"' EXIT INT TERM
-
-                # Control sockets in $TMPDIR so they're auto-cleaned.
-                # QMP    → screendump, send-key, query-status, etc.
-                # Serial → tty access before sshd is up (or after panic).
-                controlOpts="-qmp unix:$TMPDIR/qmp.sock,server=on,wait=off"
-                controlOpts="$controlOpts -serial unix:$TMPDIR/serial.sock,server=on,wait=off"
-
-                researchAgentOpt="-virtfs local,path=$researchAgentWorktree,security_model=mapped-xattr,mount_tag=research-agent"
-                export QEMU_OPTS="''${QEMU_OPTS:-${displayMode} -snapshot $controlOpts} $researchAgentOpt"
-
-                echo "[${name}] tmpdir=$TMPDIR" >&2
-                echo "[${name}] ssh:        ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/id_ed25519 jonathan@localhost" >&2
-                echo "[${name}] qmp:        nix run .#feature-vm-screencap -- $TMPDIR/qmp.sock /tmp/snap.png" >&2
-                echo "[${name}] serial:     socat - UNIX-CONNECT:$TMPDIR/serial.sock" >&2
-                echo "[${name}] research:   $researchAgentWorktree" >&2
-
-                # Don't `exec` — we need bash to stay alive long enough
-                # to run the trap that cleans $TMPDIR on QEMU exit.
-                cd "$TMPDIR"
-                ${memoryRunner}/bin/nix-memory-run -- \
-                  systemd-run --user --scope --quiet --collect \
-                  --unit=feature-vm \
-                  --slice=ram-heavy.slice \
-                  --property=OOMPolicy=kill \
-                  -- ${vm}/bin/run-dellan-vm "$@"
-              '';
-            };
-          in {
-            type = "app";
-            program = "${runner}/bin/${name}";
-          };
-
-        screencap = pkgsLinux.writeShellApplication {
-          name = "feature-vm-screencap";
-          runtimeInputs = with pkgsLinux; [ socat netpbm ];
-          text = ''
-            if [ $# -lt 2 ]; then
-              echo "usage: feature-vm-screencap <qmp-sock> <output.png>" >&2
-              exit 2
-            fi
-            sock="$1"
-            out="$2"
-            if [ ! -S "$sock" ]; then
-              echo "[feature-vm-screencap] no QMP socket at $sock — is the VM running?" >&2
-              exit 1
-            fi
-            # QEMU writes the screendump to a path it can access.
-            # Drop it next to the socket so the path is already
-            # under the launcher's $TMPDIR.
-            ppm="$(dirname "$sock")/screenshot.ppm"
-            rm -f "$ppm"
-            {
-              printf '{"execute":"qmp_capabilities"}\n'
-              printf '{"execute":"screendump","arguments":{"filename":"%s"}}\n' "$ppm"
-              # Give QEMU time to render + write before EOF closes the socket.
-              sleep 2
-            } | socat -t 10 - UNIX-CONNECT:"$sock" >/dev/null
-            if [ ! -s "$ppm" ]; then
-              echo "[feature-vm-screencap] screendump produced no PPM output" >&2
-              exit 1
-            fi
-            pnmtopng "$ppm" > "$out"
-            rm -f "$ppm"
-            echo "$out"
-          '';
-        };
-      in {
-        feature-vm = mkFeatureVm {
-          name = "feature-vm";
-          displayMode = "-display none";
-        };
-        feature-vm-headful = mkFeatureVm {
+        featureVm = import ./scripts/feature-vm.nix { pkgs = pkgsLinux; inherit memoryRunner; };
+        featureVmHeadful = import ./scripts/feature-vm.nix {
+          pkgs = pkgsLinux;
+          inherit memoryRunner;
           name = "feature-vm-headful";
           # No `-display none` → QEMU picks gtk/sdl based on $DISPLAY.
-          displayMode = "";
+          display = "";
+        };
+      in {
+        feature-vm = {
+          type = "app";
+          program = "${featureVm}/bin/feature-vm";
+        };
+        feature-vm-headful = {
+          type = "app";
+          program = "${featureVmHeadful}/bin/feature-vm-headful";
         };
         feature-vm-screencap = {
           type = "app";
-          program = "${screencap}/bin/feature-vm-screencap";
+          program = "${featureVm.screencap}/bin/feature-vm-screencap";
         };
       };
 
