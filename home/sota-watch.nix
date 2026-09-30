@@ -52,7 +52,7 @@ let
       exit 0
     fi
     if ! ${pkgs.libnotify}/bin/notify-send -u critical "SOTA-watch FAILED" \
-      "A sota-watch* unit exited non-zero. Likely: expired Claude OAuth (run: claude /login), research-agent MCP down, or sheet fetch failure. Details: journalctl --user -u sota-watch\\* + ~/.local/share/sota-watch/*.log"; then
+      "A sota-watch* unit exited non-zero. Likely: Claude usage limit, invalid /run/agenix/claude-token (regenerate: claude setup-token), research-agent MCP down, or sheet fetch failure. Details: journalctl --user -u sota-watch\\* + ~/.local/share/sota-watch/*.log"; then
       echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only"
     fi
   '';
