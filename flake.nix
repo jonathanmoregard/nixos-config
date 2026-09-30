@@ -413,6 +413,13 @@
           declaredSecrets = builtins.attrNames
             self.nixosConfigurations.dellan.config.age.secrets;
         };
+        # Not a VM lane: runs the `offline-ai` wrapper tuxedo deploys
+        # against a stub model server — tool results reach the model, reads
+        # outside the allowed roots are refused, the answer reaches stdout.
+        offline-ai = import ./tests/offline-ai.nix {
+          pkgs = pkgsLinux;
+          offlineAi = self.nixosConfigurations.tuxedo.config.system.build.offline-ai;
+        };
         # Not a VM lane: runtime-invocation harness for `add-secret`
         # (home/add-secret.nix). Exercises name validation, worktree
         # preflight, dup-refuse, happy-path insertion, and KEY=VALUE
