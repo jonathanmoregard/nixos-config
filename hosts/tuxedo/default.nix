@@ -67,6 +67,9 @@
   # rejects the entry above and falls back to 2x.
   home-manager.users.jonathan.dconf.settings."org/cinnamon/muffin".experimental-features =
     [ "x11-randr-fractional-scaling" ];
+  # Muffin doubles the dconf cursor-size (24) for its own pointer, but
+  # libXcursor apps (kitty, Chrome) take Xcursor.size as-is; match the 2x.
+  home-manager.users.jonathan.home.pointerCursor.size = 48;
 
   # agenix-rekey per-host config — see hosts/dellan/default.nix. The host
   # key was generated on the machine during install; only its public half
