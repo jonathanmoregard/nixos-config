@@ -298,6 +298,13 @@ in
     dellan.wait_for_unit("home-manager-jonathan.service")
     # systemd --user for jonathan comes up via linger
     dellan.wait_for_unit("default.target", "jonathan")
+    # Deploy-webhook Funnel: this node's tailscale was never `up`'d, so the
+    # unit must skip cleanly (active, not failed) rather than wedge boot.
+    dellan.wait_for_unit("nixos-deploy-funnel.service")
+    dellan.succeed(
+        "journalctl -b -u nixos-deploy-funnel.service "
+        "| grep -q 'skipping funnel'"
+    )
     # This lane runs longer than OnBootSec. Keep default network sync from
     # racing fixture-controlled service invocations near test end.
     dellan.succeed(
