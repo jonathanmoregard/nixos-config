@@ -60,6 +60,11 @@
   # Enforced by checks.x86_64-linux.dellan-initial-password-null.
   users.users.jonathan = {
     isNormalUser = true;
+    # Pinned: UID 1000 is assumed elsewhere (microvm guest users for
+    # virtiofs ownership, feature-vm, autodoro's DBus path). Unpinned,
+    # the first-created normal user takes 1000 — on tuxedo's fresh
+    # install (2026-09-29) that was claude-agent-1, leaving jonathan 1003.
+    uid = 1000;
     extraGroups = [ "wheel" "networkmanager" "video" ];
     shell = pkgs.zsh;
     openssh.authorizedKeys.keys = [
