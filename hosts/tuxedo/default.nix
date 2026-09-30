@@ -27,19 +27,22 @@
 
   # The 15.3" 2560x1600 panel is ~197 DPI. Muffin only does integer scale on
   # X11 and auto-picks 2x for it (a 1280x800 desktop), where Dellan's
-  # ~162 DPI panel gets 1x. Pin the built-in panel to 1x and bring text back
-  # up instead; 1.2 is the DPI ratio between the two panels (Dellan-sized
-  # text), 1.3 is one step above that by taste. Muffin reads monitors.xml
-  # from XDG_CONFIG_DIRS as the system default; a layout saved from Display
-  # settings (~/.config/cinnamon-monitors.xml) still overrides it, and
-  # layouts with an external monitor attached are not covered by this entry.
+  # ~162 DPI panel gets 1x. 1x with larger text was tried first and left the
+  # panel, menu and Qt apps too small, so use Muffin's X11 fractional
+  # scaling at 150% instead: toolkits render at 2x and the output is scaled
+  # down through RandR. The scale must be one Muffin offers for this mode;
+  # 1.502347469329834 is its 150% step for 2560x1600. Muffin reads
+  # monitors.xml from XDG_CONFIG_DIRS as the system default; a layout saved
+  # from Display settings (~/.config/cinnamon-monitors.xml) still overrides
+  # it, and layouts with an external monitor attached are not covered by
+  # this entry.
   environment.etc."xdg/monitors.xml".text = ''
     <monitors version="2">
       <configuration>
         <logicalmonitor>
           <x>0</x>
           <y>0</y>
-          <scale>1</scale>
+          <scale>1.502347469329834</scale>
           <primary>yes</primary>
           <monitor>
             <monitorspec>
@@ -58,10 +61,10 @@
       </configuration>
     </monitors>
   '';
-  home-manager.users.jonathan.dconf.settings = {
-    "org/cinnamon/desktop/interface".text-scaling-factor = 1.3;
-    "org/gnome/desktop/interface".text-scaling-factor = 1.3;
-  };
+  # Fractional scales only validate with this feature on; without it Muffin
+  # rejects the entry above and falls back to 2x.
+  home-manager.users.jonathan.dconf.settings."org/cinnamon/muffin".experimental-features =
+    [ "x11-randr-fractional-scaling" ];
 
   # agenix-rekey per-host config — see hosts/dellan/default.nix. The host
   # key was generated on the machine during install; only its public half
