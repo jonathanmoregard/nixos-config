@@ -86,10 +86,10 @@ let
               coordinate=1
             fi
             ;;
-          *#feature-vm|*#feature-vm-headful)
-            coordinate=1
-            ;;
-          *#feature-vm-screencap)
+          # The feature-VM launcher takes the lock itself, and only for the
+          # VM's lifetime: its control commands (run, apply, status, down)
+          # must not queue behind the very VM they drive.
+          *#feature-vm|*#feature-vm-headful|*#feature-vm-screencap)
             coordinate=0
             break
             ;;

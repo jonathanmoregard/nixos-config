@@ -44,66 +44,77 @@ cheap.
 
 ```bash
 cd ~/Repos/nixos-config-worktrees/<your-branch>
-nix run .#feature-vm                                   # headless (Claude Code default)
+nix run .#feature-vm -- up                 # boot in the background, returns when ssh answers
+nix run .#feature-vm -- run 'systemctl --failed'
+nix run .#feature-vm -- down
 ```
 
-In another terminal (or via the agent's next bash call):
+`up` boots **this machine's** config from the worktree you are in
+(`--host dellan|tuxedo` for another host, `--flake DIR` for another
+checkout). `nix run .#feature-vm -- --help` lists every command.
 
-```bash
-ssh -p 2222 -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    -i ~/.ssh/id_ed25519 jonathan@localhost
-```
+| Command | Does |
+|---|---|
+| `up` / `down` | start in the background / stop and clean up |
+| `run 'CMD'` | shell command in the VM; exit code passes through |
+| `run PROG ARG...` | program + args, each quoted for you |
+| `ssh` | interactive shell |
+| `put SRC DEST` / `get SRC DEST` | copy in / out (recursive) |
+| `apply` | rebuild the VM config from the worktree's current edits and activate it in the running VM — no reboot |
+| `apply mod.nix` | same, with an extra NixOS module layered on (try a change without editing the repo) |
+| `reset` | reboot to the pristine boot config — drops every change and `apply` |
+| `status` | up/down, host, mode |
+| `screencap out.png` | capture the display |
 
-SSH comes up in ~5-10 s after launch. Stop the VM with
-`Ctrl+C` on the launcher (or `systemctl --user stop feature-vm`
-if you launched via `systemd-run`).
+No command (`nix run .#feature-vm`) boots in the foreground as before;
+Ctrl+C stops it.
+
+## Locked (default) vs trusted
+
+| | Locked (default) | `--trusted` |
+|---|---|---|
+| Guest internet | none (`restrict=on`; the ssh forward still works) | on |
+| `/mnt/worktrees`, research-agent share | read-only (enforced by QEMU on the host) | read-write |
+| Your keys / agenix secrets | none; every secret is a throwaway fixture | same |
+
+Use locked for everything that does not need the internet or to write
+host files — including running commands you would not run on the host.
+Pass `--trusted` only when the change under test must reach the network
+or write through a share (e.g. the research-agent microvm writing
+reports), and say so in the PR evidence. The mode is chosen at `up`;
+`reset` keeps it.
 
 ## Headless vs headful
 
 | Mode | Command | When |
 |------|---------|------|
-| Headless (default) | `nix run .#feature-vm` | Agentic flows, scripted smoke. No window. Drive via SSH + QMP + serial. |
-| Headful (GUI) | `nix run .#feature-vm-headful` | Human at the laptop wants to see / drive the GUI. Requires `$DISPLAY` (i.e. logged-in Cinnamon session). Same control sockets still active. |
+| Headless (default) | `nix run .#feature-vm -- up` | Agentic flows, scripted smoke. No window. Drive via `run` + QMP + serial. |
+| Headful (GUI) | `nix run .#feature-vm-headful` | Human at the laptop wants to see / drive the GUI. Foreground. Requires `$DISPLAY`. Same control sockets. |
 
 Claude Code should default to **headless** every time. Only invoke
 headful when the user has explicitly asked for a window.
 
 ## What you get inside the VM
 
-- `dellan` hostname, same modules as prod, agenix-decrypted secrets
-  populated under `/run/agenix/` (jonathan-readable LLM/research
-  keys + root-readable CI/CD secrets — listed in
-  `secrets/secrets.nix`).
+- The host's hostname, same modules as prod. Every secret under
+  `/run/agenix/` is a fixture (see below).
 - `/mnt/worktrees` — host's `~/Repos/nixos-config-worktrees`
-  9p-mounted R/W. Edits on the host appear inside the VM without a
-  reboot.
-- `jonathan` user, UID 1000, in `wheel` + `keys`, sudo without
-  password (`security.sudo.wheelNeedsPassword = false`).
+  (read-only unless `--trusted`).
+- The host `/nix/store`, read-only — anything built on the host is
+  instantly visible in the guest. That is what makes `apply` fast.
+- `jonathan` user, in `wheel` + `keys`, sudo without password.
 - SSH on host:2222, key `~/.ssh/id_ed25519`.
-- `-snapshot` mode → every reboot is clean state. No carryover of
-  dconf, journal, host keys, or test pollution between launches.
+- `-snapshot` mode → every boot (and `reset`) is clean state.
 
-## Control channels (headless and headful both expose these)
+## Control channels
 
-The launcher prints the exact paths on startup as
-`[feature-vm] tmpdir=…`. The per-launch dir is itself the launcher's
-`$TMPDIR` (`/tmp/feature-vm.XXXXXX/`), with `qmp.sock` and
-`serial.sock` directly inside it. Auto-cleaned on exit.
-
-### SSH — shell exec, file transfer, sudo
-
-```bash
-ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -i ~/.ssh/id_ed25519 jonathan@localhost '<command>'
-```
-
-`sudo -n <cmd>` works (no password). `scp -P 2222` for transfer.
+The launcher's run dir is `~/.cache/feature-vm/run/`, holding
+`qmp.sock` and `serial.sock`. It is recreated on every boot.
 
 ### QMP — JSON control over `qmp.sock`
 
 ```bash
-sock=/tmp/feature-vm.<XXX>/qmp.sock
+sock=~/.cache/feature-vm/run/qmp.sock
 { printf '{"execute":"qmp_capabilities"}\n'
   printf '{"execute":"<COMMAND>","arguments":{...}}\n'
   sleep 0.5
@@ -126,41 +137,24 @@ Mouse coordinate space is 0–32767, mapped to the VM's 1024x768
 display. To click pixel (x, y): send `value = x * 32767 / 1024` and
 `value = y * 32767 / 768`.
 
-### Screencap — `feature-vm-screencap` helper
-
-```bash
-nix run .#feature-vm-screencap -- /tmp/feature-vm.<XXX>/qmp.sock /tmp/snap.png
-```
-
-Talks to QMP `screendump`, converts the resulting PPM to PNG via
-`pnmtopng`, and prints the output path. Works on headless because
-QEMU's VGA model is still present without `-display none` driving a
-host-side window.
-
 ### Serial console — getty over a Unix socket
 
 ```bash
-socat - UNIX-CONNECT:/tmp/feature-vm.<XXX>/serial.sock
+socat - UNIX-CONNECT:$HOME/.cache/feature-vm/run/serial.sock
 ```
 
-Send two newlines to get `dellan login:`. Useful before sshd is up,
+Send two newlines to get a login prompt. Useful before sshd is up,
 or when debugging a kernel panic — the kernel `console=ttyS0` arg
 writes here too.
-
-### 9p shared dir — live edits
-
-`/mnt/worktrees/<branch>/...` inside the VM == host's
-`~/Repos/nixos-config-worktrees/<branch>/...`. Bidirectional. Edit a
-file on the host, run it inside the VM, no reboot required.
 
 ## Diagnose-then-act pattern
 
 The interactive VM's value vs. the automated gate is that you can
 **ask questions** of the running system. Pattern:
 
-1. Boot the VM (`nix run .#feature-vm`).
-2. SSH in and `systemctl --failed`, `systemctl is-active <unit>`,
-   `journalctl -u <unit> -n 50`. Understand what's actually there.
+1. Boot the VM (`nix run .#feature-vm -- up`).
+2. `run 'systemctl --failed'`, `run 'journalctl -u <unit> -n 50'`.
+   Understand what's actually there.
 3. Trigger the new behavior the way a user would. CLI command → run
    it as the user. GUI binding → send the keystroke and observe the
    side effect. HTTP endpoint → curl it. Daemon → exercise its actual
@@ -168,14 +162,14 @@ The interactive VM's value vs. the automated gate is that you can
    `systemctl is-active` and call it tested. Press the key. Make the
    request.** (Patterns behind PR #57's render-grep-only and PR #61's
    is-active-only broken merges.)
-4. Capture proof: `journalctl --since`, `systemctl status`, a
+4. Edit, `apply`, poke again — no reboot per iteration. `reset` when
+   state from earlier attempts could be masking the result.
+5. Capture proof: `journalctl --since`, `systemctl status`, a
    screencap if it's UI, the actual artifact the script was supposed
    to produce.
-5. Decide: did the branching code go down the expected path? Are
-   the side effects what you wanted?
-6. Stop the VM, push the PR.
+6. `down`, push the PR.
 
-The proof from step 4 belongs in the PR body. Future humans reading
+The proof from step 5 belongs in the PR body. Future humans reading
 the PR will trust a screencap or a `journalctl` excerpt much more
 than a "verified locally" line.
 
@@ -184,44 +178,50 @@ than a "verified locally" line.
 ### Verify a new systemd unit ran
 
 ```bash
-nix run .#feature-vm &              # headless, fresh state
-ssh -p 2222 ... 'systemctl is-active <unit>; journalctl -u <unit> -n 30 --no-pager'
+nix run .#feature-vm -- up
+nix run .#feature-vm -- run 'systemctl is-active <unit>; journalctl -u <unit> -n 30 --no-pager'
 ```
 
-### Verify a new script's actual output (not just exit code)
+### Try a change without editing the repo
+
+```nix
+# /tmp/probe.nix
+{ ... }: { systemd.services.probe = { wantedBy = [ "multi-user.target" ]; script = "echo hi"; }; }
+```
 
 ```bash
-ssh -p 2222 ... '<wrapper>'         # run it for real
-ssh -p 2222 ... 'ls -la <expected output path>; cat <output>'
+nix run .#feature-vm -- apply /tmp/probe.nix
+nix run .#feature-vm -- run 'systemctl status probe'
+nix run .#feature-vm -- reset       # gone again
 ```
 
 ### Capture a screencap of a login / desktop state
 
 ```bash
-tmpdir=$(ls -d /tmp/feature-vm.*/ | head -1)
-nix run .#feature-vm-screencap -- "$tmpdir/qmp.sock" /tmp/snap.png
-# then attach /tmp/snap.png to the PR
+nix run .#feature-vm -- screencap /tmp/snap.png
 ```
 
 ### Drive a GUI flow without a human (sendkey + screencap)
 
 ```bash
-# QMP send-key, then screencap to verify state change
-sock=/tmp/feature-vm.<XXX>/qmp.sock
+sock=~/.cache/feature-vm/run/qmp.sock
 { printf '{"execute":"qmp_capabilities"}\n'
   printf '{"execute":"send-key","arguments":{"keys":[{"type":"qcode","data":"down"}]}}\n'
   sleep 0.5
 } | socat -t 5 - UNIX-CONNECT:"$sock" >/dev/null
-nix run .#feature-vm-screencap -- "$sock" /tmp/after.png
+nix run .#feature-vm -- screencap /tmp/after.png
 ```
 
-### Test a secret-consuming service end-to-end
+### Secret-consuming services
 
-agenix decrypts in initrd via the host-ssh 9p mount, so
-`/run/agenix/<name>` is populated before any service starts.
-Anything consuming `config.age.secrets.<name>.path` works
-unchanged. If a secret is missing, the launcher's preflight refuses
-to boot — that's the loud-failure mode by design.
+Every `/run/agenix/<name>` in the VM is a throwaway fixture
+(`feature-vm-fixture-<name>`; the klaffat ones are real-shaped keys
+from `tests/lib/klaffat-fixtures.nix`). A service finds its file, reads
+it and starts, so wiring, ownership and modes are testable. Anything
+that authenticates to an outside service with it fails — expected, not
+a regression. The real secrets cannot be opened in a VM: agenix-rekey
+encrypts them to each laptop's host key, which only root there can
+read. Verify the real-credential path on the host after deploy.
 
 ## Caveats — what the feature VM can NOT model
 
@@ -231,7 +231,11 @@ to boot — that's the loud-failure mode by design.
 - `nixos-auto-deploy` (disabled in vmVariant — it's a host-specific
   service).
 - Public-network reachability (other LAN hosts can't see the VM;
-  only `host:2222` is exposed via QEMU usermode `hostfwd`).
+  only `host:2222` is exposed via QEMU usermode `hostfwd`). In locked
+  mode the guest has no outbound network at all.
+- One VM at a time (fixed ssh port 2222). `up` refuses while one runs.
+- While a VM runs it holds the memory-coordination lock, so other
+  memory-heavy Nix jobs (including auto-deploy) wait until `down`.
 - Some services that hard-code paths under `/home/jonathan/.claude/`
   or `/home/jonathan/.local/bin/` will fail to start in the VM
   because those paths aren't populated. Don't panic — the boot
