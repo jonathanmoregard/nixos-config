@@ -704,12 +704,18 @@ in
     dellan.succeed("su - jonathan -c 'systemctl start memory-reserve-vmtest.service'")
     for unit, user in capped:
         assert _memory_high(unit, user) == reserved_cap, (unit, _memory_high(unit, user), reserved_cap)
+    # An active reservation is visible as a path, so units that must not
+    # start into the reserved memory can carry ConditionPathExists=!<path>
+    # (offline-ai hangs its evicted services on /run/memory-reserve/offline-ai).
+    # Any user can see it; it is gone the moment the reservation ends.
+    dellan.succeed("su - jonathan -c 'test -d /run/memory-reserve/vmtest'")
     dellan.succeed("systemctl daemon-reload")
     dellan.succeed("systemctl --user --machine=jonathan@ daemon-reload")
     dellan.succeed("systemctl restart nix-daemon.service")
     for unit, user in capped:
         assert _memory_high(unit, user) == reserved_cap, (unit, _memory_high(unit, user), "after reload/restart")
     dellan.succeed("su - jonathan -c 'systemctl stop memory-reserve-vmtest.service'")
+    dellan.succeed("test ! -e /run/memory-reserve/vmtest")
     # nix-daemon returns to its 50%; the slice to the OOMD check's own runtime
     # override above, which the reservation must neither beat afterwards nor
     # delete.

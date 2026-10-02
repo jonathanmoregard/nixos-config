@@ -19,7 +19,8 @@
 # exits. Starting one writes the cap as a runtime drop-in under /run/systemd,
 # which survives daemon-reload and restarts and is gone after reboot.
 # Stopping the last one removes that drop-in and reloads, so the configured
-# value returns exactly.
+# value returns exactly. While a reservation is active, /run/memory-reserve/<name>
+# exists, for units that must not start into the reserved memory.
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.memoryPressure;
@@ -155,6 +156,13 @@ in
         # ExecStopPost, not ExecStop: it also runs when the start failed, so a
         # half-applied cap is always withdrawn.
         ExecStopPost = "${applyBudget}/bin/memory-budget-apply";
+        # /run/memory-reserve/<name> exists exactly while the reservation is
+        # active (created at start, removed at stop, gone after reboot): a
+        # path any unit, system or user, can test with ConditionPathExists=.
+        # offline-ai hangs its evicted services on it, so a deploy or a timer
+        # cannot start them back into the memory the model is holding.
+        RuntimeDirectory = "memory-reserve/${name}";
+        RuntimeDirectoryPreserve = false;
       };
     }) cfg.reservations;
 
