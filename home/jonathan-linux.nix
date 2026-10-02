@@ -346,9 +346,82 @@ let
         sys.exit(2)
   '';
 
+  # Deterministic inputs for the nightly review, computed here rather than
+  # asked of the model. The review runs with Read/Glob/Grep only, and
+  # Glob caps at 100 matches returned oldest-first: over a sessions dir of
+  # thousands it never reached the newest twelve, so every night spent
+  # turns improvising a different (and day-boundary-drifting) workaround
+  # for prompt.md Step 2. This prints a markdown block with
+  #   1. the Step 2 window: top-level <sessions>/<id>/final.json, mtime
+  #      within 24h, newest first, at most 12; oversize (>32 KiB) ones
+  #      listed as skipped instead;
+  #   2. the proposal inventory (path + status, every category, archived
+  #      and rejected included) so dedup is a comparison, not a sweep.
+  # Exit 3 = nothing in the window: the wrapper skips the model call.
+  # Manifest eligibility (sessionend complete) stays with the model per
+  # prompt.md Step 2.
+  rsiReviewInputs = pkgs.writeShellApplication {
+    name = "rsi-review-inputs";
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.gawk ];
+    text = ''
+      sessions="''${1:?usage: rsi-review-inputs <sessions-dir> <proposals-root>}"
+      proposals="''${2:?usage: rsi-review-inputs <sessions-dir> <proposals-root>}"
+      max_bytes=32768
+      # awk 'NR<=12' rather than head: head closing the pipe early would
+      # SIGPIPE sort, which pipefail turns into a failed run.
+      mapfile -t newest < <(
+        find "$sessions" -mindepth 2 -maxdepth 2 -type f -name final.json \
+          -mmin -1440 -printf '%T@\t%s\t%p\n' 2>/dev/null \
+          | sort -t "$(printf '\t')" -k1,1 -rn | awk 'NR<=12'
+      )
+      window=()
+      skipped=()
+      for row in "''${newest[@]}"; do
+        IFS=$'\t' read -r mtime size path <<<"$row"
+        stamp="$(date -d "@''${mtime%.*}" -Is)"
+        if [ "$size" -gt "$max_bytes" ]; then
+          skipped+=("- \`$path\` (''${size} B, over 32 KiB — do not open)")
+        else
+          window+=("- \`$path\` (modified $stamp)")
+        fi
+      done
+      if [ "''${#window[@]}" -eq 0 ]; then
+        echo "rsi-review-inputs: no readable reflections modified in the last 24h under $sessions" >&2
+        exit 3
+      fi
+      echo "## Precomputed inputs (appended by the rsi-daily-review wrapper)"
+      echo
+      echo "### Step 2 window"
+      echo
+      echo "The wrapper has already selected Step 2's candidates (top-level final.json, modified in the last 24h, newest first, at most 12). Use exactly this list: do not glob, grep or otherwise search for reflections. Apply Step 2's manifest checks to each entry."
+      echo
+      printf '%s\n' "''${window[@]}"
+      if [ "''${#skipped[@]}" -gt 0 ]; then
+        echo
+        echo "Skipped for size — report these in your final summary, never open them:"
+        echo
+        printf '%s\n' "''${skipped[@]}"
+      fi
+      echo
+      echo "### Existing proposal inventory"
+      echo
+      echo "Every proposal file under $proposals, with its status. Compare each candidate finding against these slugs first; read only the bodies that plausibly match, then apply Step 1 item 7's concrete-term search. Rejected entries are decisions and must not be regenerated."
+      echo
+      if [ -d "$proposals" ]; then
+        find "$proposals" -type f -name '*.md' -printf '%P\n' | LC_ALL=C sort \
+          | while IFS= read -r rel; do
+              status="$(awk 'NR==1 && $0!="---" {exit} NR>1 && $0=="---" {exit} /^status:/ {sub(/^status:[ \t]*/, ""); print; exit}' "$proposals/$rel")"
+              echo "- $rel — status: ''${status:-unknown}"
+            done
+      else
+        echo "(no proposal sink at $proposals yet)"
+      fi
+    '';
+  };
+
   rsiDailyReview = pkgs.writeShellApplication {
     name = "rsi-daily-review";
-    runtimeInputs = [ rsiProposalSink pkgs.coreutils pkgs.jq ];
+    runtimeInputs = [ rsiProposalSink rsiReviewInputs pkgs.coreutils pkgs.jq ];
     text = ''
       prompt_file="$HOME/.claude/recursive-self-improvement/config/prompt.md"
       # Proposals land in the state-dir sink, NOT in ~/.claude. ~/.claude
@@ -448,6 +521,24 @@ let
       entirely: a trusted wrapper persists these blocks to the
       proposals directory, and pushing happens behind the proposals
       intake gate."
+      # Window + inventory, selected deterministically (see rsiReviewInputs).
+      # An empty window means there is nothing to review: skip the model
+      # call rather than pay for a pass that can only search in vain.
+      inputs_rc=0
+      inputs="$(rsi-review-inputs "$HOME/.claude/reflections/sessions" \
+        "$(dirname "$dest")")" || inputs_rc=$?
+      if [ "$inputs_rc" -eq 3 ]; then
+        echo "rsi-daily-review: no reflections in the 24h window — skipping (no model call)"
+        exit 0
+      elif [ "$inputs_rc" -ne 0 ]; then
+        echo "rsi-daily-review: rsi-review-inputs failed rc=$inputs_rc" >&2
+        exit "$inputs_rc"
+      fi
+      # Logged so each night's window is auditable next to the run.
+      printf '%s\n' "$inputs" | grep '/final.json' || true
+      override="$override
+
+      $inputs"
       echo "rsi-daily-review: start $(date -Is)"
       # Memory-bound the model call when the user bus is reachable (same
       # per-call cgroup pattern research-agent uses, commit 48447eb

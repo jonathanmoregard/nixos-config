@@ -1173,6 +1173,68 @@ in
         f"nothing may be written on the duplicate night:\n{night2}"
     )
 
+    # The review's window is selected by the WRAPPER, not the model. The
+    # model runs with Read/Glob/Grep only; Glob caps at 100 matches and
+    # returns them oldest-first, so over a corpus of thousands of
+    # sessions it never saw the newest twelve and each night improvised a
+    # different workaround. The helper below is what the wrapper runs;
+    # exercise the real binary against a fixture corpus.
+    inputs_bin = dellan.succeed(
+        "grep -o '/nix/store/[^:\"]*rsi-review-inputs[^:\"]*/bin' "
+        f"{rsi_bin} | head -1"
+    ).strip() + "/rsi-review-inputs"
+    fx = dellan.succeed("mktemp -d").strip()
+    sess = f"{fx}/sessions"
+    # 14 fresh sessions, s00 newest; one stale; one subagent artifact
+    # (newest of all, must still be excluded); one oversize among the
+    # newest twelve.
+    fixture = [f"mkdir -p {sess}"]
+    for i in range(14):
+        fixture.append(
+            f"mkdir -p {sess}/s{i:02d} && echo '{{}}' > {sess}/s{i:02d}/final.json"
+            f" && touch -d '-{i + 1} minutes' {sess}/s{i:02d}/final.json"
+        )
+    fixture += [
+        f"mkdir -p {sess}/old && echo '{{}}' > {sess}/old/final.json"
+        f" && touch -d '-2 days' {sess}/old/final.json",
+        f"mkdir -p {sess}/s00/subagents/a1"
+        f" && echo '{{}}' > {sess}/s00/subagents/a1/final.json",
+        f"head -c 40000 /dev/zero > {sess}/s03/final.json"
+        f" && touch -d '-4 minutes' {sess}/s03/final.json",
+        f"mkdir -p {fx}/proposals/rsi {fx}/proposals/permissions/archived",
+        f"printf -- '---\\nstatus: rejected\\n---\\nbody\\n'"
+        f" > {fx}/proposals/rsi/2026-09-01-probe-rejected.md",
+        f"printf -- '---\\nstatus: pending\\n---\\nbody\\n'"
+        f" > {fx}/proposals/permissions/archived/2026-09-02-probe-pending.md",
+    ]
+    dellan.succeed(" && ".join(fixture))
+    block = dellan.succeed(f"{inputs_bin} {sess} {fx}/proposals")
+    window = [
+        l.split("`")[1] for l in block.splitlines()
+        if l.startswith("- `") and "/final.json" in l and "B, over" not in l
+    ]
+    expected = [f"{sess}/s{i:02d}/final.json" for i in range(12) if i != 3]
+    assert window == expected, (
+        "the window must be the twelve newest top-level final.json files "
+        "modified in the last 24h, newest first, oversize ones moved to the "
+        f"skipped list:\nexpected {expected}\ngot {window}\n{block}"
+    )
+    assert f"{sess}/s03/final.json" in block and "over 32 KiB" in block, (
+        f"an oversize candidate must be reported as skipped:\n{block}"
+    )
+    for leak in ["subagents", f"{sess}/old/", f"{sess}/s12/"]:
+        assert leak not in block, f"{leak} must not reach the window:\n{block}"
+    for entry in [
+        "rsi/2026-09-01-probe-rejected.md — status: rejected",
+        "permissions/archived/2026-09-02-probe-pending.md — status: pending",
+    ]:
+        assert entry in block, (
+            "the proposal inventory must list every proposal, archived and "
+            f"rejected included, with its status ({entry}):\n{block}"
+        )
+    empty_sess = dellan.succeed("mktemp -d").strip()
+    dellan.fail(f"{inputs_bin} {empty_sess} {fx}/proposals")
+
     def run_rsi(expect_ok=True):
         cmd = f"su - jonathan -c {rsi_bin} 2>&1"
         return dellan.succeed(cmd) if expect_ok else dellan.fail(cmd)
