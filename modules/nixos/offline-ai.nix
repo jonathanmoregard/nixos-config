@@ -117,6 +117,10 @@ let
     # 15 GB of GTT after a big batch, which is what thrashed the model).
     "aggregator-embed.service"
     "aggregator-embed-server.service"
+    # local-stt.nix: the router first, then the two models behind it (~2 GB).
+    "local-stt.service"
+    "local-stt-general.service"
+    "local-stt-swedish.service"
   ];
   # The services above (not the timers: their services carry the condition)
   # plus the scan the router timer fires. All home-manager units, so the
