@@ -548,17 +548,25 @@ common.mkMinimalTest {
         machine.fail("test -e /run/klaffat-local-google/google.env")
 
     # Microsoft credentials pass through only with a real public client id.
-    # Without one, a bundled Microsoft secret is refused rather than paired
-    # with nothing; with one, both providers reach the server.
+    # Without one, every Microsoft line in the bundle is ignored and Google
+    # alone reaches the server: the real bundle carried a Microsoft line long
+    # before a Microsoft client existed (regression after #281). With a real
+    # id, both providers reach the server.
     write_file("${localGoogleFixture}/deploy/secrets/klaffat-env.age", "with-microsoft\n")
     machine.succeed("chown jonathan:users ${localGoogleFixture}/deploy/secrets/klaffat-env.age")
     rc, out = run(
         "runuser -u jonathan -- ${bin}/klaffat-local-google "
         "start ${localGoogleFixture}"
     )
-    assert rc != 0, f"Microsoft secret without a public id passed: {out!r}"
+    assert rc == 0, f"bundle with an unconfigured Microsoft line was refused: {rc} {out!r}"
     assert "TEST-microsoft-secret" not in out, f"Microsoft secret leaked: {out!r}"
-    machine.fail("test -e /run/klaffat-local-google/google.env")
+    env_names = machine.succeed(
+        "cut -d= -f1 /run/klaffat-local-google/google.env | sort"
+    )
+    assert env_names == "KLAFFAT_GOOGLE_CLIENT_ID\nKLAFFAT_GOOGLE_CLIENT_SECRET\n", env_names
+    evidence = machine.succeed("cat /var/lib/klaffat-local-google/evidence")
+    assert "required=1" in evidence and "microsoft=0" in evidence, evidence
+    machine.succeed("systemctl stop klaffat-local-google.service")
     write_file(
         "${localGoogleFixture}/deploy/klaffat-demo/public-config.json",
         '{"oauth": {"googleClientId": "TEST-google-client.apps.googleusercontent.com", '
