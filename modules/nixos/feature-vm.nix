@@ -144,18 +144,54 @@ in
         neededForBoot = true;
       };
 
-      # research-agent worktree mount. RW so the inner microvm's
-      # virtiofs RW share for /out can write reports into reports/.
-      fileSystems."/home/jonathan/Repos/research-agent" = {
+      # research-agent worktree, 9p-exported by the launcher. Mounted
+      # read-only at a staging path and copied to local disk by
+      # feature-vm-research-agent-copy below: the inner microvms share
+      # /home/jonathan/Repos/research-agent over virtiofs, and virtiofs
+      # stacked on a 9p mount fails every open() with EOPNOTSUPP, so the
+      # scraper could not read scraper/server.py and crash-looped.
+      fileSystems."/mnt/research-agent-src" = {
         device = "research-agent";
         fsType = "9p";
         options = [
           "trans=virtio"
           "version=9p2000.L"
           "msize=131072"
+          "ro"
           "x-systemd.requires=modprobe@9pnet_virtio.service"
         ];
       };
+    };
+
+    # Local copy of the research-agent checkout for the inner microvms.
+    # Reports they write land in this copy, not on the host. To pick up
+    # host-side edits without a reboot, re-run the same rsync as jonathan.
+    systemd.services.feature-vm-research-agent-copy = {
+      description = "Copy the 9p research-agent checkout to local disk for the microvms";
+      wantedBy = [ "multi-user.target" ];
+      requiredBy = [
+        "microvm-virtiofsd@research-agent.service"
+        "microvm-virtiofsd@scraper.service"
+      ];
+      before = [
+        "microvm-virtiofsd@research-agent.service"
+        "microvm-virtiofsd@scraper.service"
+      ];
+      unitConfig.RequiresMountsFor = [ "/mnt/research-agent-src" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        User = "jonathan";
+        Group = "users";
+      };
+      path = [ pkgs.rsync ];
+      script = ''
+        dest=/home/jonathan/Repos/research-agent
+        mkdir -p "$dest"
+        rsync -a --delete --exclude=.venv --exclude=__pycache__ \
+          /mnt/research-agent-src/ "$dest/"
+        mkdir -p "$dest/reports"
+      '';
     };
 
     # Point agenix at the host privkey 9p-mounted above, PLUS a throwaway
