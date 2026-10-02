@@ -460,6 +460,10 @@ let
       else
         echo "rsi-daily-review: no user bus; running without MemoryMax scope" >&2
       fi
+      # This run is a machine session. The sentinel tells session-reflect
+      # (~/.claude/skills/session-reflect/reflect.sh) not to mint a
+      # reflection of it — otherwise tomorrow's review reads tonight's.
+      export CLAUDE_PIPELINE_INTERNAL=1
       rc=0
       "''${scope[@]}" timeout "''${RSI_REVIEW_TIMEOUT:-3600}" \
         claude --model opus --print --allowedTools "Read Glob Grep" \
