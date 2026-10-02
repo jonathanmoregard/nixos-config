@@ -195,6 +195,9 @@
         # and its absence was silent for months because the consumer
         # failed open. See overlays/dcg.nix.
         (import ./overlays/dcg.nix)
+        # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
+        # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
+        (import ./overlays/claude-code.nix)
         # `pkgs.aggregator` — a real store path for the ingest timer, so
         # modules/nixos/aggregator-ingest-timer.nix needs no flake-input
         # specialArgs threading (same reason the listen-tools tools are
