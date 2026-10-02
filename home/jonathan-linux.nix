@@ -421,7 +421,7 @@ let
 
   rsiDailyReview = pkgs.writeShellApplication {
     name = "rsi-daily-review";
-    runtimeInputs = [ rsiProposalSink rsiReviewInputs pkgs.coreutils pkgs.jq ];
+    runtimeInputs = [ rsiProposalSink rsiReviewInputs pkgs.coreutils pkgs.jq pkgs.util-linux ];
     text = ''
       prompt_file="$HOME/.claude/recursive-self-improvement/config/prompt.md"
       # Proposals land in the state-dir sink, NOT in ~/.claude. ~/.claude
@@ -474,11 +474,6 @@ let
         echo "rsi-daily-review: prompt file missing/unreadable: $prompt_file" >&2
         exit 1
       fi
-      psize="$(stat -c%s "$prompt_file")"
-      if [ "$psize" -gt 102400 ]; then
-        echo "rsi-daily-review: $prompt_file is ''${psize}B (>100KiB cap); refusing (ARG_MAX)" >&2
-        exit 1
-      fi
       # Create the sink up front, before the hour-long model call rather
       # than after it: on a fresh machine the state dir does not exist,
       # and discovering that at the sink step would throw away the run.
@@ -502,7 +497,8 @@ let
       tmpdir="/tmp"
       [ -d "$XDG_RUNTIME_DIR" ] && tmpdir="$XDG_RUNTIME_DIR"
       raw="$(mktemp -p "$tmpdir" rsi-daily-review.XXXXXX)"
-      trap 'rm -f "$raw"' EXIT
+      prompt_tmp="$(mktemp -p "$tmpdir" rsi-daily-review-prompt.XXXXXX)"
+      trap 'rm -f "$raw" "$prompt_tmp"' EXIT
       override="
 
       ## Headless run override (appended by the rsi-daily-review wrapper)
@@ -539,6 +535,29 @@ let
       override="$override
 
       $inputs"
+      # The prompt goes to claude on STDIN, not as an argv string. The
+      # kernel caps one argv string at 128 KiB (MAX_ARG_STRLEN), and the
+      # inventory above grows ~100 B per proposal: as an argument the run
+      # would die with E2BIG ("Argument list too long") once the sink got
+      # big enough. `claude --print` with no prompt argument reads the
+      # prompt from stdin. printf '%s' keeps the bytes identical to what
+      # the old `-p "$(cat ...)$override"` passed (the command
+      # substitution still strips prompt.md's trailing newlines).
+      printf '%s' "$(cat "$prompt_file")$override" > "$prompt_tmp"
+      # Size guard. Stdin has no 128 KiB cap, but a prompt this large
+      # means something is wrong (a runaway inventory or prompt.md) and
+      # would burn an Opus context on it. Fail loudly instead: stderr
+      # lands in review-agent.log, logger puts it in the journal, and the
+      # non-zero exit is the cron entry's failure signal. Today's prompt
+      # is ~23 KB; 256 KiB leaves room for ~2,000 more proposals.
+      prompt_max=262144
+      prompt_bytes="$(stat -c%s "$prompt_tmp")"
+      if [ "$prompt_bytes" -gt "$prompt_max" ]; then
+        msg="rsi-daily-review: composed prompt is ''${prompt_bytes} B (> ''${prompt_max} B cap); refusing to run the model. Check prompt.md size and the proposal inventory under $(dirname "$dest")"
+        echo "$msg" >&2
+        logger -p user.err -t rsi-daily-review "$msg" || true
+        exit 1
+      fi
       echo "rsi-daily-review: start $(date -Is)"
       # Memory-bound the model call when the user bus is reachable (same
       # per-call cgroup pattern research-agent uses, commit 48447eb
@@ -554,7 +573,7 @@ let
       rc=0
       "''${scope[@]}" timeout "''${RSI_REVIEW_TIMEOUT:-3600}" \
         claude --model opus --print --allowedTools "Read Glob Grep" \
-        -p "$(cat "$prompt_file")$override" > "$raw" || rc=$?
+        -p < "$prompt_tmp" > "$raw" || rc=$?
       if [ "$rc" -eq 124 ]; then
         echo "rsi-daily-review: claude timed out after ''${RSI_REVIEW_TIMEOUT:-3600}s" >&2
         exit "$rc"
