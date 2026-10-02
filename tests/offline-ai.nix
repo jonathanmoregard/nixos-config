@@ -31,7 +31,10 @@
 #     the way out stops the model and starts exactly those units again, in
 #     reverse order; `up` stays in the mode until `down`; a unit that will not
 #     restart is remembered and reported; if the model cannot load, what was
-#     stopped for it is started again;
+#     stopped for it is started again; when that is not enough, the user's
+#     other large units (never desktop applications) are frozen, largest
+#     first, only until the model fits, and thawed on the way out or when the
+#     model still cannot load;
 #   - the model's final text reaches stdout.
 #
 # Run: nix build .#checks.x86_64-linux.offline-ai -L
@@ -163,15 +166,51 @@ let
     state="$FAKE_STATE"; scope=system
     [ "$1" = --user ] && { scope=user; shift; }
     verb=$1; shift; [ "$1" = -- ] && shift; unit=$1
+    [ "$verb" = show ] && unit=''${*: -1}
     echo "$scope $verb $unit" >> "$state/calls"
     case "$verb" in
       is-active) if [ -e "$state/$scope/$unit" ]; then echo active; else echo inactive; exit 3; fi ;;
-      stop) rm -f "$state/$scope/$unit"; [ "$unit" = offline-ai-llm.service ] && rm -f "$state/healthy"; exit 0 ;;
+      show)
+        case " $* " in
+          *" LoadState "*) [ -e "$state/gone/$unit" ] && echo not-found || echo loaded ;;
+          *) [ -e "$state/transient/$unit" ] && echo yes || echo no ;;
+        esac
+        exit 0 ;;
+      stop)
+        rm -f "$state/$scope/$unit"; [ "$unit" = offline-ai-llm.service ] && rm -f "$state/healthy"
+        # Stopping a unit that holds GPU memory gives that memory back.
+        if [ -e "$state/gpu/$unit" ]; then
+          avail=$(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' "$FAKE_MEMINFO")
+          sed -i "s/^MemAvailable:.*/MemAvailable:   $((avail + $(cat "$state/gpu/$unit"))) kB/" "$FAKE_MEMINFO"
+        fi
+        exit 0 ;;
       start)
         case " $FAKE_REFUSE " in *" $unit "*) echo "refused $unit" >&2; exit 1 ;; esac
         touch "$state/$scope/$unit"; [ "$unit" = offline-ai-llm.service ] && touch "$state/healthy"; exit 0 ;;
+      freeze|thaw)
+        # A frozen unit's memory goes to swap: it adds to MemAvailable in the
+        # fake meminfo, and thawing takes it back.
+        dir=$(find "$FAKE_CGROUP" -type d -name "$unit" | head -1)
+        [ -n "$dir" ] || { echo "no such unit $unit" >&2; exit 1; }
+        anon=$(cat "$dir/memory.current")
+        avail=$(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' "$FAKE_MEMINFO")
+        if [ "$verb" = freeze ]; then echo 1 > "$dir/cgroup.freeze"; avail=$((avail + anon / 1024))
+        else echo 0 > "$dir/cgroup.freeze"; avail=$((avail - anon / 1024)); fi
+        sed -i "s/^MemAvailable:.*/MemAvailable:   $avail kB/" "$FAKE_MEMINFO"; exit 0 ;;
       *) exit 0 ;;
     esac
+  '';
+
+  # The manager's view of a transient unit, as busctl prints it, and a
+  # systemd-run that records how it was asked to recreate one.
+  fakeBusctl = pkgs.writeShellScript "busctl" ''
+    echo '{"type":"a(sasbttttuii)","data":[["/bin/llama",["/bin/llama","-m","a model.gguf"],false,0,0,0,0,0,0,0]]}'
+    echo '{"type":"as","data":["A=1","B=two words"]}'
+    echo '{"type":"s","data":"!/srv"}'
+    echo '{"type":"s","data":"app.slice"}'
+  '';
+  fakeSystemdRun = pkgs.writeShellScript "systemd-run" ''
+    printf '%s\n' "$@" > "$FAKE_STATE/relaunched"
   '';
 
   # A model server that is healthy only while the fake model unit runs.
@@ -212,7 +251,7 @@ let
 in
 pkgs.runCommand "offline-ai-harness"
   {
-    nativeBuildInputs = [ pkgs.python3 pkgs.jq pkgs.coreutils pkgs.zim-tools ];
+    nativeBuildInputs = [ pkgs.python3 pkgs.jq pkgs.coreutils pkgs.zim-tools pkgs.findutils pkgs.gnused ];
   }
   ''
     fail() { echo "FAIL: $*"; for f in out.txt err.txt library.log; do [ -f "$f" ] && cat "$f"; done; exit 1; }
@@ -341,6 +380,8 @@ pkgs.runCommand "offline-ai-harness"
     [ -n "$script" ] || fail "could not find the script in the wrapper"
     mkdir -p fakebin mode/system mode/user
     ln -s ${fakeSystemctl} fakebin/systemctl
+    ln -s ${fakeBusctl} fakebin/busctl
+    ln -s ${fakeSystemdRun} fakebin/systemd-run
     export FAKE_STATE="$PWD/mode"
     python3 ${modeStub} mode_port "$PWD/mode" &
     mode_pid=$!
@@ -355,9 +396,27 @@ pkgs.runCommand "offline-ai-harness"
         OFFLINE_AI_URL="http://127.0.0.1:$(cat mode_port)" OFFLINE_AI_LIBRARY_URL="http://127.0.0.1:9" \
         OFFLINE_AI_UNIT=offline-ai-llm.service OFFLINE_AI_MODEL="''${MODE_MODEL:-}" \
         OFFLINE_AI_EVICT_SYSTEM="a.timer b.service" OFFLINE_AI_EVICT_USER="c.service d.service" \
+        OFFLINE_AI_MEMINFO="$PWD/meminfo" OFFLINE_AI_USER_CGROUP="$PWD/cg/user@1000.service" \
+        OFFLINE_AI_CGROUP_ROOT="$PWD/cg" OFFLINE_AI_PROC="$PWD/proc" \
         python3 "$script" "$@"
     }
     calls() { grep -E ' (stop|start) ' mode/calls | tr '\n' ';'; }
+    # A user manager's cgroup tree: a desktop application, a large agent job,
+    # a mid-sized service and a small one. Plenty of memory unless a scenario
+    # says otherwise. No process in /proc holds GPU memory yet.
+    export FAKE_CGROUP="$PWD/cg" FAKE_MEMINFO="$PWD/meminfo"
+    cgroup() {  # cgroup <path under the manager> <MiB in RAM>
+      mkdir -p "cg/user@1000.service/$1"
+      echo "$(($2 * 1048576))" > "cg/user@1000.service/$1/memory.current"
+      echo 0 > "cg/user@1000.service/$1/cgroup.freeze"
+    }
+    cgroup app.slice/app-chrome-1.scope 4096
+    cgroup app.slice/run-p1-i2.scope 3072
+    cgroup app.slice/mid.service 1024
+    cgroup app.slice/small.service 100
+    cgroup session.slice/compositor.service 8192   # the desktop session itself: never
+    mkdir -p proc
+    echo "MemAvailable:   99999999 kB" > meminfo
 
     reset_units
     mode "is the disk full" > mode.out 2> mode.err || { cat mode.out mode.err; fail "a conversation in offline-AI mode failed"; }
@@ -375,7 +434,7 @@ pkgs.runCommand "offline-ai-harness"
     FAKE_REFUSE="b.service" mode down > down.out 2>&1 && fail "down reported success although a unit did not restart"
     grep -q 'could not restart b.service' down.out || { cat down.out; fail "a unit that did not restart was not reported"; }
     [ -e mode/system/a.timer ] && [ -e mode/user/d.service ] || fail "down did not restart the units that could start"
-    jq -e '. == [[false, "b.service"]]' run/offline-ai/evicted.json > /dev/null || fail "the unit that did not restart was not remembered"
+    jq -e '. == [[false, "b.service", "stop", null]]' run/offline-ai/evicted.json > /dev/null || fail "the unit that did not restart was not remembered"
     mode down > /dev/null 2>&1 || fail "a second down did not restart the remembered unit"
     [ -e mode/system/b.service ] && [ ! -e run/offline-ai/evicted.json ] || fail "the remembered unit was not restarted"
 
@@ -383,6 +442,86 @@ pkgs.runCommand "offline-ai-harness"
     MODE_MODEL=/nonexistent/model.gguf mode "anything" > nomodel.out 2>&1 && fail "a missing model did not fail"
     [ -e mode/system/a.timer ] && [ -e mode/system/b.service ] && [ -e mode/user/d.service ] \
       || { cat nomodel.out; fail "units stopped for a model that could not load were not restarted"; }
+
+    # --- not enough memory once the listed units are stopped: other large
+    # units of the user are frozen, largest first, until the model fits, and
+    # thawed on the way out. Desktop applications and small units never are.
+    frozen() { cat "cg/user@1000.service/app.slice/$1/cgroup.freeze"; }
+    reset_units
+    truncate -s 2G model-00001-of-00001.gguf
+    echo "MemAvailable:   1048576 kB" > meminfo   # 1 GiB; the model needs 2 GiB plus 1 GiB headroom
+    MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode up > freeze.out 2>&1 || { cat freeze.out; fail "up did not make room by freezing"; }
+    [ "$(frozen run-p1-i2.scope)" = 1 ] || { cat freeze.out; fail "the large agent job was not frozen"; }
+    [ "$(frozen mid.service)" = 0 ] || fail "more was frozen than the model needed"
+    [ "$(frozen app-chrome-1.scope)" = 0 ] || fail "a desktop application was frozen"
+    grep -q 'run-p1-i2.scope (frozen)' freeze.out || { cat freeze.out; fail "status does not show the frozen unit"; }
+    MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode down > /dev/null 2>&1 || fail "down after freezing failed"
+    [ "$(frozen run-p1-i2.scope)" = 0 ] || fail "down did not thaw the frozen unit"
+    [ ! -e run/offline-ai/evicted.json ] || fail "the record survived a clean down after freezing"
+    [ "$(cat "cg/user@1000.service/session.slice/compositor.service/cgroup.freeze")" = 0 ] \
+      || fail "a unit of the desktop session itself was frozen"
+
+    # A frozen unit whose processes ended meanwhile is gone: down still succeeds
+    # and forgets it, instead of failing on it for ever.
+    reset_units
+    echo "MemAvailable:   1048576 kB" > meminfo
+    MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode up > /dev/null 2>&1 || fail "up before the vanished-unit case failed"
+    [ "$(frozen run-p1-i2.scope)" = 1 ] || fail "the vanished-unit case did not freeze"
+    mkdir -p mode/gone && touch mode/gone/run-p1-i2.scope
+    MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode down > gone.out 2>&1 || { cat gone.out; fail "down failed on a unit that had gone"; }
+    [ ! -e run/offline-ai/evicted.json ] || fail "a unit that had gone stayed in the record"
+    rm -rf mode/gone; echo 0 > "cg/user@1000.service/app.slice/run-p1-i2.scope/cgroup.freeze"
+
+    reset_units
+    echo "MemAvailable:   0 kB" > meminfo   # even with everything frozen the model does not fit
+    truncate -s 8G model-00001-of-00001.gguf
+    MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode up > short.out 2>&1 && fail "up succeeded without the memory for the model"
+    grep -q 'not enough memory' short.out || { cat short.out; fail "no message when memory stays short"; }
+    [ "$(frozen run-p1-i2.scope)" = 0 ] && [ "$(frozen mid.service)" = 0 ] \
+      || { cat short.out; fail "units frozen for a model that could not load were not thawed"; }
+    [ -e mode/system/b.service ] || fail "units stopped for a model that could not load were not restarted"
+    if grep -q 'small.service' mode/calls; then fail "a unit too small to matter was frozen"; fi
+
+    # --- a transient model server holding GPU memory (pinned RAM on an APU,
+    # which freezing cannot free) is stopped and, on the way out, recreated
+    # from its recorded command line. A desktop application holding more GPU
+    # memory is left alone. One GPU client seen through two descriptors counts once.
+    cgroup app.slice/gpu-llm.service 200
+    gpu_proc() {  # gpu_proc <pid> <cgroup under the manager> <client id> <GiB>
+      mkdir -p "proc/$1/fdinfo"
+      echo "0::/user@1000.service/$2" > "proc/$1/cgroup"
+      for fd in 3 4; do
+        printf 'drm-pdev:\t0000:65:00.0\ndrm-client-id:\t%s\ndrm-total-gtt:\t1024 KiB\ndrm-resident-gtt:\t%s KiB\ndrm-resident-vram:\t0 KiB\n' \
+          "$3" "$(($4 * 1048576))" > "proc/$1/fdinfo/$fd"
+      done
+    }
+    gpu_proc 4242 app.slice/gpu-llm.service 7 6
+    gpu_proc 4343 app.slice/app-chrome-1.scope 8 8
+    mkdir -p mode/transient mode/gpu
+    touch mode/transient/gpu-llm.service
+    echo $((6 * 1048576)) > mode/gpu/gpu-llm.service
+    reset_units
+    touch mode/user/gpu-llm.service
+    truncate -s 4G model-00001-of-00001.gguf
+    echo "MemAvailable:   1048576 kB" > meminfo
+    MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode up > gpu.out 2>&1 || { cat gpu.out; fail "up did not make room by stopping the GPU holder"; }
+    grep -q 'stopped gpu-llm.service (6.0 GiB of GPU memory)' gpu.out || { cat gpu.out; fail "the GPU holder was not stopped, or its memory was miscounted"; }
+    [ "$(frozen run-p1-i2.scope)" = 0 ] || fail "more gave way than the model needed"
+    if grep -q 'app-chrome' mode/calls; then fail "a desktop application was touched"; fi
+    MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode down > /dev/null 2>&1 || fail "down after stopping the GPU holder failed"
+    [ "$(tr '\n' '|' < mode/relaunched)" = "--user|--unit=gpu-llm.service|--collect|--slice=app.slice|--working-directory=/srv|--setenv=A=1|--setenv=B=two words|--|/bin/llama|-m|a model.gguf|" ] \
+      || fail "the transient unit was not recreated as it was: $(tr '\n' '|' < mode/relaunched 2>/dev/null)"
+
+    # --- what stopping and freezing cannot free, the kernel may move to swap:
+    # the model loads when idle anonymous memory that swap can take covers
+    # the rest, and says how much will move.
+    reset_units
+    touch mode/user/gpu-llm.service
+    printf 'MemAvailable:   0 kB\nAnonPages:      %s kB\nSwapFree:       %s kB\n' $((20 * 1048576)) $((30 * 1048576)) > meminfo
+    truncate -s 30G model-00001-of-00001.gguf
+    MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode up > swap.out 2>&1 || { cat swap.out; fail "up refused although swap could take the rest"; }
+    grep -q '20 GiB of other programs. idle memory will move to swap' swap.out || { cat swap.out; fail "no word on what moves to swap"; }
+    MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode down > /dev/null 2>&1 || fail "down after a load that relied on swap failed"
 
     mkdir -p "$out"
     echo 'offline-ai harness passed' > "$out/result"
