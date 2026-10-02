@@ -1762,6 +1762,71 @@ in
         "systemctl --user reset-failed ai-router-ranking.service'"
     )
 
+    # ── session-reflect backfill drain (home/session-reflect-backfill.nix) ──
+    # Friday timer running ~/.claude/skills/session-reflect/backfill.sh. The
+    # ~/.claude repo is not cloned here, so the clean run is the guard path
+    # (missing script -> "skipping", unit NOT failed, notifier silent); a
+    # planted failing script must turn the unit red and fire the notifier.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start session-reflect-backfill.service'"
+    )
+    state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed session-reflect-backfill.service || true'"
+    ).strip()
+    assert state != "failed", \
+        f"session-reflect-backfill.service failed on the guard path: {state!r}"
+    backfill_log = dellan.succeed(
+        "cat /home/jonathan/.local/share/session-reflect/backfill.log"
+    )
+    assert "skipping" in backfill_log, \
+        f"guard-path 'skipping' marker missing from backfill.log:\n{backfill_log}"
+    notify_log = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u session-reflect-backfill-failure-notify.service "
+        "--no-pager' || true"
+    )
+    assert "session-reflect backfill drain failed" not in notify_log, (
+        "notify marker present after a SUCCESSFUL guard-path run — "
+        f"OnFailure is mis-wired:\n{notify_log}"
+    )
+    # The drain must see the user's own launchers (claude, ai-router); the
+    # planted script records its PATH, then fails.
+    dellan.succeed(
+        "install -d -o jonathan -g users /home/jonathan/.claude/skills/session-reflect && "
+        "printf 'echo \"PATH=$PATH\"\\nexit 1\\n' "
+        "> /home/jonathan/.claude/skills/session-reflect/backfill.sh && "
+        "chmod 644 /home/jonathan/.claude/skills/session-reflect/backfill.sh"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start session-reflect-backfill.service; true'"
+    )
+    state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed session-reflect-backfill.service || true'"
+    ).strip()
+    assert state == "failed", \
+        f"failing drain should leave the unit failed; got {state!r}"
+    backfill_log = dellan.succeed(
+        "cat /home/jonathan/.local/share/session-reflect/backfill.log"
+    )
+    assert "/home/jonathan/.local/bin" in backfill_log and \
+        "/home/jonathan/.claude/bin" in backfill_log, \
+        f"drain PATH lacks the user's launcher dirs:\n{backfill_log}"
+    dellan.wait_until_succeeds(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u session-reflect-backfill-failure-notify.service "
+        "--no-pager' | grep -q 'session-reflect backfill drain failed'",
+        timeout=60,
+    )
+    dellan.succeed("rm -rf /home/jonathan/.claude/skills/session-reflect")
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user reset-failed session-reflect-backfill.service'"
+    )
+
     # ── aggregator all-sources ingest (modules/nixos/aggregator-ingest-timer.nix) ──
     # One user timer walks all nine aggregator sources every 30 min. The
     # predecessor (aggregator-github-ingest) ran one source and had NO
