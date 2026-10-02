@@ -294,6 +294,13 @@
   # ABOVE this marker. Do not remove — the tool refuses to insert
   # without it. See home/add-secret.nix + skill doc
   # home/claude-skills/nixos-agenix-secret/SKILL.md.
+  age.secrets.gcal-ical-url = {
+    rekeyFile = ../../secrets/gcal-ical-url.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   # add-secret:insert-here
 
   # ---------------------------------------------------------------------
