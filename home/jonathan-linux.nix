@@ -370,7 +370,7 @@ let
       # awk 'NR<=12' rather than head: head closing the pipe early would
       # SIGPIPE sort, which pipefail turns into a failed run.
       mapfile -t newest < <(
-        find "$sessions" -mindepth 2 -maxdepth 2 -type f -name final.json \
+        find -H "$sessions" -mindepth 2 -maxdepth 2 -type f -name final.json \
           -mmin -1440 -printf '%T@\t%s\t%p\n' 2>/dev/null \
           | sort -t "$(printf '\t')" -k1,1 -rn | awk 'NR<=12'
       )
@@ -408,7 +408,7 @@ let
       echo "Every proposal file under $proposals, with its status. Compare each candidate finding against these slugs first; read only the bodies that plausibly match, then apply Step 1 item 7's concrete-term search. Rejected entries are decisions and must not be regenerated."
       echo
       if [ -d "$proposals" ]; then
-        find "$proposals" -type f -name '*.md' -printf '%P\n' | LC_ALL=C sort \
+        find -H "$proposals" -type f -name '*.md' -printf '%P\n' | LC_ALL=C sort \
           | while IFS= read -r rel; do
               status="$(awk 'NR==1 && $0!="---" {exit} NR>1 && $0=="---" {exit} /^status:/ {sub(/^status:[ \t]*/, ""); print; exit}' "$proposals/$rel")"
               echo "- $rel — status: ''${status:-unknown}"

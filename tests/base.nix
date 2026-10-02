@@ -1232,6 +1232,21 @@ in
             "the proposal inventory must list every proposal, archived and "
             f"rejected included, with its status ({entry}):\n{block}"
         )
+    # A symlinked sessions dir or proposals root (the compat-symlink
+    # pattern this config already uses for proposals) must yield the
+    # same window and inventory, not a silent "nothing to review" skip.
+    dellan.succeed(f"ln -s {sess} {fx}/sess-link && ln -s {fx}/proposals {fx}/prop-link")
+    linked = dellan.succeed(f"{inputs_bin} {fx}/sess-link {fx}/prop-link")
+    linked_window = [
+        l.split("`")[1].replace(f"{fx}/sess-link", sess) for l in linked.splitlines()
+        if l.startswith("- `") and "/final.json" in l and "B, over" not in l
+    ]
+    assert linked_window == expected, (
+        f"a symlinked sessions dir must select the same window:\n{linked}"
+    )
+    assert "rsi/2026-09-01-probe-rejected.md — status: rejected" in linked, (
+        f"a symlinked proposals root must still be inventoried:\n{linked}"
+    )
     empty_sess = dellan.succeed("mktemp -d").strip()
     dellan.fail(f"{inputs_bin} {empty_sess} {fx}/proposals")
 
