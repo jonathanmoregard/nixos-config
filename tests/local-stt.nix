@@ -1,0 +1,155 @@
+# local-stt: runtime harness for the router tuxedo deploys
+# (modules/nixos/local-stt.nix), run against two stub whisper servers. No VM,
+# no model, no GPU: the stubs answer like whisper-server does, each with its
+# own text, and record what they were asked.
+#
+# What must hold, whatever the models are:
+#   - English audio is answered by the general model alone;
+#   - audio the general model detects as Swedish is answered by the Swedish
+#     model, with the caller's prompt passed on;
+#   - a caller that says the audio is Swedish goes straight to the Swedish
+#     model, and one that names another language is not re-routed;
+#   - with the Swedish model down, Swedish audio still gets the general
+#     model's text; with the general model down, the caller gets a 502, not a
+#     hang or an empty 200;
+#   - the detected language is the most probable candidate, wherever it
+#     sits in whisper-server's list;
+#   - text whisper-server split mid-word across segments comes back whole;
+#   - the model list and a request without audio are answered like the
+#     OpenAI API would.
+#
+# Run: nix build .#checks.x86_64-linux.local-stt -L
+{ pkgs, routerCommand }:
+let
+  stub = pkgs.writeText "whisper-stub.py" ''
+    import json, sys
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    port, name, log = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            audio = body.split(b"\r\n\r\n")[-1].split(b"\r\n--")[0].decode()
+            asked = {"audio": audio, "prompt": b'name="prompt"' in body,
+                     "language": body.split(b'name="language"\r\n\r\n')[1].split(b"\r\n")[0].decode()}
+            with open(log, "a") as f:
+                f.write(json.dumps(asked) + "\n")
+            lang = "sv" if audio.startswith("SV") else "en"
+            if asked["language"] not in ("auto", ""):
+                lang = asked["language"]
+            # Like whisper-server: several candidates, the detected one not first.
+            reply = {"language_probabilities": {"no": 0.001, "en": 0.004, lang: 0.99},
+                     "segments": [{"text": " " + name + " hear"}, {"text": "d it"}]}
+            data = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+  '';
+
+  client = pkgs.writeText "local-stt-client.py" ''
+    import json, sys, urllib.error, urllib.request, uuid
+
+    def call(audio, language=None, prompt=None, with_file=True):
+        b = uuid.uuid4().hex
+        body = f'--{b}\r\nContent-Disposition: form-data; name="model"\r\n\r\nlocal-stt\r\n'.encode()
+        if language:
+            body += f'--{b}\r\nContent-Disposition: form-data; name="language"\r\n\r\n{language}\r\n'.encode()
+        if prompt:
+            body += f'--{b}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n{prompt}\r\n'.encode()
+        if with_file:
+            body += (f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+                     f'Content-Type: audio/wav\r\n\r\n{audio}\r\n').encode()
+        body += f'--{b}--\r\n'.encode()
+        req = urllib.request.Request("http://127.0.0.1:18765/v1/audio/transcriptions", data=body,
+                                     headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+
+    what = sys.argv[1]
+    if what == "models":
+        with urllib.request.urlopen("http://127.0.0.1:18765/v1/models", timeout=10) as r:
+            print(json.dumps(json.load(r)))
+    elif what == "nofile":
+        print(json.dumps(call("", with_file=False)))
+    else:
+        audio, language, prompt = (sys.argv[1:] + ["", ""])[:3]
+        print(json.dumps(call(audio, language or None, prompt or None)))
+  '';
+in
+pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]; } ''
+  set -euo pipefail
+  export LOCAL_STT_PORT=18765
+  export LOCAL_STT_GENERAL=http://127.0.0.1:18763
+  export LOCAL_STT_SWEDISH=http://127.0.0.1:18764
+  log=$PWD/asked
+  fail() { echo "FAIL: $*" >&2; exit 1; }
+
+  start_stub() { python3 ${stub} "$1" "$2" "$log.$2" > /dev/null 2>&1 & echo $!; }
+  wait_port() {
+    for _ in $(seq 100); do
+      python3 -c "import socket; socket.create_connection(('127.0.0.1', $1), 1)" 2>/dev/null && return 0
+      sleep 0.1
+    done
+    fail "nothing listening on $1"
+  }
+  ask() { python3 ${client} "$@"; }
+  asked_count() { if [ -f "$log.$1" ]; then wc -l < "$log.$1"; else echo 0; fi; }
+
+  general=$(start_stub 18763 general)
+  swedish=$(start_stub 18764 swedish)
+  ${routerCommand} &
+  router=$!
+  wait_port 18763; wait_port 18764; wait_port 18765
+
+  # English: general model only, and the split word comes back whole.
+  res=$(ask EN-hello)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "English: $res"
+  [ "$(asked_count swedish)" = 0 ] || fail "English audio reached the Swedish model"
+
+  # Detected Swedish: re-transcribed by the Swedish model, prompt passed on.
+  res=$(ask SV-hej "" "Klaffat, Voquill")
+  [ "$(jq -r '.[1].text' <<< "$res")" = "swedish heard it" ] || fail "Swedish: $res"
+  [ "$(tail -1 "$log.swedish" | jq -r '.language')" = sv ] || fail "Swedish model not told sv"
+  [ "$(tail -1 "$log.swedish" | jq -r '.prompt')" = true ] || fail "prompt not passed to the Swedish model"
+
+  # Caller says Swedish: the general model is not asked at all.
+  before=$(asked_count general)
+  res=$(ask EN-anything sv)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "swedish heard it" ] || fail "language=sv: $res"
+  [ "$(asked_count general)" = "$before" ] || fail "language=sv still asked the general model"
+
+  # Caller names another language: no re-routing even if detection would.
+  res=$(ask SV-hej en)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "language=en re-routed: $res"
+
+  # API surface.
+  [ "$(ask models | jq -r '.data[0].id')" = local-stt ] || fail "model list"
+  [ "$(ask nofile | jq -r '.[0]')" = 400 ] || fail "request without audio not refused"
+
+  # Swedish model down: Swedish audio still answered, by the general model.
+  kill "$swedish"; wait "$swedish" 2>/dev/null || true
+  res=$(ask SV-hej)
+  [ "$(jq -r '.[0]' <<< "$res")" = 200 ] || fail "Swedish with its model down: $res"
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "fallback text: $res"
+  res=$(ask EN-anything sv)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "language=sv with its model down: $res"
+
+  # General model down: an error the caller can see.
+  kill "$general"; wait "$general" 2>/dev/null || true
+  res=$(ask EN-hello)
+  [ "$(jq -r '.[0]' <<< "$res")" = 502 ] || fail "general model down: $res"
+
+  kill "$router"
+  echo "local-stt: all assertions passed"
+  touch $out
+''

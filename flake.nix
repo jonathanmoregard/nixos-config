@@ -368,6 +368,10 @@
           prodHook = self.nixosConfigurations.dellan.config
             .nix.settings.post-build-hook;
         };
+        # Not a VM lane: ai-throttle / host-telemetry runtime harness
+        # (modules/nixos/ai-throttle.nix) — fake sysfs, cgroup and systemctl,
+        # driven tick by tick. Seconds.
+        ai-throttle = import ./tests/ai-throttle.nix { pkgs = pkgsLinux; };
         # Not a VM lane: fail-closed contract harness for the merged-or-
         # inactive worktree sweeper (home/worktree-sweep-script.nix). Builds
         # a fixture bare repo + worktrees with real git, stubs gh, and
@@ -426,6 +430,15 @@
           offlineAi = self.nixosConfigurations.tuxedo.config.system.build.offline-ai;
           libraryServe = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-serve;
           libraryFetch = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-fetch;
+        };
+        # Not a VM lane: runs the local-stt router with the exact command
+        # tuxedo's unit starts, against two stub whisper servers — English
+        # stays on the general model, detected Swedish is re-transcribed by
+        # the Swedish one, and a model that is down degrades or errors visibly.
+        local-stt = import ./tests/local-stt.nix {
+          pkgs = pkgsLinux;
+          routerCommand = self.nixosConfigurations.tuxedo.config
+            .systemd.user.services.local-stt.serviceConfig.ExecStart;
         };
         # Not a VM lane: runtime-invocation harness for `add-secret`
         # (home/add-secret.nix). Exercises name validation, worktree

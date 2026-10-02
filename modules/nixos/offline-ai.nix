@@ -98,6 +98,10 @@ let
     # The embed worker, then the llama-server it talks to (iGPU, ~1.5 GB).
     "aggregator-embed.service"
     "aggregator-embed-server.service"
+    # local-stt.nix: the router first, then the two models behind it (~2 GB).
+    "local-stt.service"
+    "local-stt-general.service"
+    "local-stt-swedish.service"
   ];
 
   # Document collections the assistant can search, as label=directory. The

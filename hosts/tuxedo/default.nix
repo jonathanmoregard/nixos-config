@@ -12,6 +12,10 @@
     # Tuxedo only: the model needs ~45 GiB of RAM, which dellan lacks.
     ../../modules/nixos/offline-ai.nix
     ../../modules/nixos/offline-tools.nix
+    # Tuxedo only: speech-to-text on the Radeon 890M for Voquill.
+    ../../modules/nixos/local-stt.nix
+    # Tuxedo only: quiet background AI (freeze when hot/battery/dictating) + telemetry.
+    ../../modules/nixos/ai-throttle.nix
   ];
 
   networking.hostName = "tuxedo";
