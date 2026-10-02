@@ -54,6 +54,8 @@ EVICTED = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/offline-ai-{os.getuid
 # applications, terminals, the session bus and whatever this CLI itself runs
 # inside are never touched.
 MEMINFO = Path(os.environ.get("OFFLINE_AI_MEMINFO", "/proc/meminfo"))
+SWAPS = Path(os.environ.get("OFFLINE_AI_SWAPS", "/proc/swaps"))
+SYS_BLOCK = Path(os.environ.get("OFFLINE_AI_SYS_BLOCK", "/sys/block"))  # zramN/mm_stat lives here
 CGROUP_ROOT = Path(os.environ.get("OFFLINE_AI_CGROUP_ROOT", "/sys/fs/cgroup"))
 PROC = Path(os.environ.get("OFFLINE_AI_PROC", "/proc"))  # where GPU use is read from
 USER_CGROUP = os.environ.get("OFFLINE_AI_USER_CGROUP", "")  # the user manager's cgroup; found from /proc by default
@@ -80,7 +82,16 @@ DOC_DIRS = list(COLLECTIONS.values())
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "offline-ai"
 
 MAX_STEPS = 8
-MAX_TOOL_CHARS = 6000
+# Tool output is budgeted so a conversation stays inside the model's context
+# (32k tokens on this host): one result is cut at MAX_TOOL_CHARS, and once the
+# results kept in the conversation add up to more than TOOL_BUDGET_CHARS the
+# oldest are replaced by a stub naming the call (trim_tool_results). Measured
+# 2026-10-02: 61k chars of tool results (layout-extracted PDF pages, about 5
+# chars per token) made a 16k-token prompt; the model spent the other 16k
+# tokens thinking and was cut off with nothing said. 40k chars keeps the
+# prompt near 12k tokens and leaves the rest for the answer.
+MAX_TOOL_CHARS = int(os.environ.get("OFFLINE_AI_TOOL_CHARS", 6000))
+TOOL_BUDGET_CHARS = int(os.environ.get("OFFLINE_AI_TOOL_BUDGET_CHARS", 40000))
 UNIT_NAME = re.compile(r"^[A-Za-z0-9@:._\\-]+$")
 WORD = re.compile(r"[a-z0-9]+")
 
@@ -88,7 +99,8 @@ WORD = re.compile(r"[a-z0-9]+")
 def clip(text, limit=MAX_TOOL_CHARS):
     if len(text) <= limit:
         return text
-    return text[:limit] + f"\n[... truncated, {len(text) - limit} more characters]"
+    return text[:limit] + (f"\n[... {len(text) - limit} more characters not shown; ask for a narrower range "
+                           "or a later start, or search for the part you need]")
 
 
 # ---------------------------------------------------------------- options
@@ -947,6 +959,65 @@ def call_tool(name, raw_arguments):
         return f"tool error: {type(exc).__name__}: {exc}"
 
 
+DROPPED = "dropped to save context; call it again if needed]"
+
+
+def describe_call(call):
+    """`name key=value ...`: what was asked, for a stub standing in for the result."""
+    function = call.get("function") or {}
+    try:
+        arguments = json.loads(function.get("arguments") or "{}")
+    except ValueError:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {"arguments": arguments}
+    pairs = " ".join(f"{key}={value}" for key, value in arguments.items())
+    return f"{function.get('name') or '?'} {pairs}".strip()[:160]
+
+
+def dropped_stub(call, content):
+    """What stands in for a dropped result: the call it answered, plus the
+    document and article names it listed, so an answer can still cite them."""
+    names = [line for line in content.splitlines() if line.startswith(("### ", "article: "))]
+    return "\n".join([f"[{describe_call(call)} — result {DROPPED}", *names[:16]])
+
+
+def is_dropped(message):
+    return message.get("role") == "tool" and (message.get("content") or "").split("\n", 1)[0].endswith(DROPPED)
+
+
+def result_of(messages, call_id):
+    """The tool message answering a call, or None."""
+    return next((m for m in messages if m.get("role") == "tool" and m.get("tool_call_id") == call_id), None)
+
+
+def trim_tool_results(messages, budget=TOOL_BUDGET_CHARS):
+    """Keep the tool results held in the conversation within the budget: the
+    oldest are replaced by stubs until the rest fit. The model's own turns
+    stay as they are. llama-server reuses its prompt cache up to the first
+    changed token, so a result rewritten this far back costs one re-prompt of
+    everything after it; that is the price of staying inside the context at
+    all. Returns how many were dropped."""
+    calls, results = {}, []
+    for message in messages:
+        if message.get("role") == "assistant":  # ids may repeat across turns: the latest assistant turn owns them
+            calls.update({call.get("id"): call for call in message.get("tool_calls") or []})
+        elif message.get("role") == "tool":
+            results.append((message, calls.get(message.get("tool_call_id"), {})))
+    total = sum(len(message.get("content") or "") for message, _ in results)
+    dropped = 0
+    for message, call in results:
+        if total <= budget:
+            break
+        if is_dropped(message):
+            continue
+        stub = dropped_stub(call, message.get("content") or "")
+        total -= len(message.get("content") or "") - len(stub)
+        message["content"] = stub
+        dropped += 1
+    return dropped
+
+
 # ------------------------------------------------------------------- chat
 
 
@@ -1016,11 +1087,13 @@ def post(payload):
 
 
 def complete(messages, use_tools, out):
-    """One streamed model turn. Returns the assistant message."""
+    """One streamed model turn. Returns the assistant message and the server's
+    finish_reason: "stop" or "tool_calls" when the model ended its turn,
+    "length" when the server cut it off (the context filled up)."""
     payload = {"messages": messages, "stream": True, "temperature": 0.2}
     if use_tools:
         payload["tools"] = TOOLS
-    content, calls = [], {}
+    content, calls, finish = [], {}, None
     with post(payload) as response:
         for raw in response:
             line = raw.decode("utf-8", errors="replace").strip()
@@ -1032,6 +1105,7 @@ def complete(messages, use_tools, out):
             choices = json.loads(data).get("choices") or []
             if not choices:
                 continue
+            finish = choices[0].get("finish_reason") or finish
             delta = choices[0].get("delta") or {}
             if delta.get("content"):
                 content.append(delta["content"])
@@ -1050,7 +1124,7 @@ def complete(messages, use_tools, out):
              "function": {"name": c["name"], "arguments": c["arguments"]}}
             for i, c in sorted(calls.items())
         ]
-    return message
+    return message, finish
 
 
 CODE = re.compile(r"```[^\n]*\n(.*?)```|`([^`\n]+)`", re.DOTALL)
@@ -1119,18 +1193,52 @@ def cited(answer, sources):
     return any(plain(name) in tail for name in sources)
 
 
+CUT_OFF = ("[cut off] The answer was cut short by the model's context limit. Ask a narrower question, "
+           "or for fewer pages or documents at a time.")
+
+
+def cut_off(message, finish, out, log):
+    """True when the reply ended at the context limit or said nothing at all.
+    Said on both streams: the operator must never get silence and exit 0 after
+    the model has run (a thinking model can spend the whole context thinking,
+    and that part is never printed)."""
+    text = message.get("content") or ""
+    if finish != "length" and text.strip():
+        return False
+    why = "the model hit its context limit" if finish == "length" else "the model answered with nothing"
+    print(f"[context] {why} (finish_reason={finish}); the answer is incomplete", file=log)
+    out.write(CUT_OFF + "\n")
+    out.flush()
+    if not text.strip():
+        # An assistant turn with neither text nor tool calls is refused by the
+        # server's chat template; keep the conversation valid for the next question.
+        message["content"] = "(no answer: the reply was cut off by the context limit)"
+    return True
+
+
+def within_budget(messages, log):
+    dropped = trim_tool_results(messages)
+    if dropped:
+        print(f"[context] dropped the text of {dropped} older tool result(s) to stay within the model's context; "
+              "they are named in place and can be fetched again", file=log)
+
+
 def answer(messages, out=sys.stdout, log=sys.stderr):
-    """Run the tool loop for the question already appended to messages."""
-    asked, nudged, cite_nudged = set(), False, False
+    """Run the tool loop for the question already appended to messages.
+    Returns False when the final reply was cut off by the context limit."""
+    asked, nudged, cite_nudged = {}, False, False
     # The operator's own words, without the reminder and option-name leads with_leads() appends.
     question = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
     question = question.split("\n\n" + REMINDER)[0]
     for _ in range(MAX_STEPS):
-        message = complete(messages, True, out)
+        within_budget(messages, log)
+        message, finish = complete(messages, True, out)
         messages.append(message)
         calls = message.get("tool_calls")
         if not calls:
             out.write("\n")
+            if cut_off(message, finish, out, log):
+                return False
             misused = tools_given_as_commands(message["content"])
             if misused and not nudged:
                 # Told in prose, a small model still hands its own tools to the operator as
@@ -1164,25 +1272,26 @@ def answer(messages, out=sys.stdout, log=sys.stderr):
                                + (f"look it up yourself in: {'; '.join(sorted(sources)[:8])}." if sources else
                                   "look it up yourself with `offline-ai library` or the survival documents.") + "\n")
                     out.write(warning)
-                    return (content or "") + warning
-            return content
+            return True
         for call in calls:
             name, arguments = call["function"]["name"], call["function"]["arguments"]
             print(f"[tool] {name} {arguments}", file=log)
-            if (name, arguments) in asked:
+            earlier = result_of(messages, asked.get((name, arguments)))
+            if earlier is not None and not is_dropped(earlier):
                 # A small model can loop on one lookup; the answer would be the same.
                 result = ("You already made this exact call and its result is above; it has not changed. "
                           "Answer from what you have, or look somewhere else.")
-            else:
-                asked.add((name, arguments))
+            else:  # new, or its earlier result was dropped to save context
+                asked[(name, arguments)] = call["id"]
                 result = call_tool(name, arguments)
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
     messages.append({"role": "user", "content": "Stop looking things up and give your best answer now, "
                      "saying plainly what you could not verify."})
-    message = complete(messages, False, out)
+    within_budget(messages, log)
+    message, finish = complete(messages, False, out)
     messages.append(message)
     out.write("\n")
-    return message["content"]
+    return not cut_off(message, finish, out, log)
 
 
 # ---------------------------------------------------------------- service
@@ -1205,7 +1314,10 @@ big model and the library, and gives the memory back when it ends.
 
 The assistant only looks things up (options, this machine's flake, units and logs, disk,
 processes, network, manual pages, documents, the library, your notes). It never changes
-anything: it gives commands and Nix code for you to run."""
+anything: it gives commands and Nix code for you to run.
+
+Exit status of `offline-ai "question"`: 0 answered; 1 the model could not be loaded or
+reached; 2 the answer was cut off by the model's context limit (ask something narrower)."""
 
 
 MODEL_ERRORS = (urllib.error.URLError, OSError, ValueError, http.client.HTTPException)
@@ -1251,11 +1363,78 @@ def available_bytes():
     return meminfo("MemAvailable")
 
 
-def swappable_bytes():
-    """Anonymous memory the kernel can move to swap to make room: no more than
-    there is of it, and no more than swap can take. Pinned GPU memory is not
-    anonymous memory and never counts."""
-    return min(meminfo("AnonPages") or 0, meminfo("SwapFree") or 0)
+ZRAM = re.compile(r"^/dev/(zram\d+)$")
+
+
+def text_of(path):
+    try:
+        return Path(path).read_text()
+    except OSError:
+        return None
+
+
+def zram_mm_stat(name):
+    return text_of(SYS_BLOCK / name / "mm_stat")
+
+
+def swap_areas(swaps, mm_stat):
+    """The active swap areas of /proc/swaps as (free bytes, RAM freed per byte
+    swapped into it), highest priority first: the order the kernel fills them.
+
+    A swap file or partition frees a page of RAM for every page it takes. A
+    zram device is RAM: a page swapped into it stays resident, compressed, so
+    only what compression saves is freed, 1 - 1/ratio. The ratio is read from
+    the device's mm_stat (bytes stored / bytes they compress to, fields 1 and
+    2) and taken as 2 while nothing is in it yet."""
+    areas = []
+    for line in (swaps or "").splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 5 or not (fields[2].isdigit() and fields[3].isdigit()):
+            continue
+        free = max(0, int(fields[2]) - int(fields[3])) * 1024
+        share = 1.0
+        zram = ZRAM.match(fields[0])
+        if zram:
+            stat = (mm_stat(zram[1]) or "").split()
+            stored, compressed = (int(stat[0]), int(stat[1])) if stat[:2] and all(f.isdigit() for f in stat[:2]) else (0, 0)
+            ratio = stored / compressed if stored and compressed else 2.0
+            share = max(0.0, 1 - 1 / ratio)
+        priority = int(fields[4]) if fields[4].lstrip("-").isdigit() else 0
+        areas.append((priority, free, share))
+    return [(free, share) for _, free, share in sorted(areas, key=lambda area: -area[0])]
+
+
+def host_swap():
+    return meminfo("AnonPages") or 0, swap_areas(text_of(SWAPS), zram_mm_stat)
+
+
+def swappable_bytes(anon=None, areas=None):
+    """RAM that moving idle anonymous memory to swap would free: each area,
+    in the order the kernel fills them, takes what is left of the anonymous
+    memory up to its free space and frees its share of that. Pinned GPU
+    memory is not anonymous memory and never counts."""
+    if anon is None or areas is None:
+        anon, areas = host_swap()
+    freed = 0
+    for free, share in areas:
+        moved = min(anon, free)
+        anon -= moved
+        freed += moved * share
+    return int(freed)
+
+
+def swap_needed(shortfall, anon=None, areas=None):
+    """How much anonymous memory must move to swap to free `shortfall` bytes
+    of RAM: more than that where zram keeps a compressed copy in RAM."""
+    if anon is None or areas is None:
+        anon, areas = host_swap()
+    moved = 0
+    for free, share in areas:
+        if shortfall <= 0 or anon <= 0 or share <= 0:
+            continue
+        take = min(anon, free, shortfall / share)
+        anon, shortfall, moved = anon - take, shortfall - take * share, moved + take
+    return int(moved)
 
 
 def systemctl_user(verb, unit):
@@ -1572,15 +1751,22 @@ def up(force=False):
                  "--local-dir ~/.local/share/llm-models/qwen3-coder-next")
     loading = run(["systemctl", "--user", "is-active", "--", UNIT]) in ("active", "activating")
     if MODEL and not force and not loading:
-        need, free, swappable = model_bytes(), available_bytes(), swappable_bytes()
+        need, free = model_bytes(), available_bytes()
+        anon, areas = host_swap()
+        swappable = swappable_bytes(anon, areas)
         if free is not None and need > free + swappable:
             sys.exit(f"not enough memory: the model needs about {need / 2**30:.0f} GiB; "
-                     f"{free / 2**30:.0f} GiB is available and {swappable / 2**30:.0f} GiB more could go to swap.\n"
+                     f"{free / 2**30:.0f} GiB is available and {swappable / 2**30:.0f} GiB more could go to swap"
+                     + (" (zram keeps swapped pages in RAM, compressed, so it frees less than it takes)"
+                        if any(share < 1 for _, share in areas) else "") + ".\n"
                      "Close something large first (`ps -eo rss,comm --sort=-rss | head`), "
                      "or run `offline-ai up --force` to load anyway.")
         if free is not None and need > free:
-            print(f"{(need - free) / 2**30:.0f} GiB of other programs' idle memory will move to swap "
-                  "while the model loads", file=sys.stderr)
+            moving = swap_needed(need - free, anon, areas)
+            print(f"{moving / 2**30:.0f} GiB of other programs' idle memory will move to swap while the model "
+                  f"loads, to free the {(need - free) / 2**30:.0f} GiB it still needs"
+                  + (" (zram keeps a compressed copy of what it takes in RAM)" if moving > need - free else ""),
+                  file=sys.stderr)
     print(f"loading the model ({UNIT})...", file=sys.stderr)
     started = systemctl_user("start", UNIT)
     if started.returncode != 0:
@@ -1708,9 +1894,11 @@ def converse(question):
     if question:
         messages.append({"role": "user", "content": with_leads(" ".join(question))})
         try:
-            answer(messages)
+            finished = answer(messages)
         except MODEL_ERRORS as exc:
             sys.exit(model_error(exc))
+        if not finished:
+            sys.exit(2)  # said on stdout already; a distinct status so a script can tell it from an error
         return
     print("\n".join(status_lines()), file=sys.stderr)
     print("\noffline-ai. Ask a question; empty line or Ctrl-D to quit.", file=sys.stderr)
