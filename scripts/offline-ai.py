@@ -63,6 +63,14 @@ FREEZE_MIN = 512 * 2**20  # units holding less than this are not worth freezing
 HEADROOM = 2**30  # free memory left over once the model is in
 NEVER_FREEZE = re.compile(r"^(app-|kitty-|tmux-|dbus|offline-ai|init\.scope|session-)")
 LIBRARY_UNIT = os.environ.get("OFFLINE_AI_LIBRARY_UNIT", "offline-ai-library.service")
+# While the model's memory reservation (a system unit the model unit starts
+# and stops around itself) is active, this path exists, and the units that
+# gave way refuse to start (ConditionPathExists=!MARKER): a deploy or a timer
+# cannot bring them back into the model's memory. restore() must therefore
+# only run once the marker is gone, and must notice when it is not.
+MARKER = os.environ.get("OFFLINE_AI_MODE_MARKER", "/run/memory-reserve/offline-ai")
+RESERVATION = os.environ.get("OFFLINE_AI_RESERVATION", "memory-reserve-offline-ai.service")
+READY_TIMEOUT = int(os.environ.get("OFFLINE_AI_READY_TIMEOUT", "900"))  # seconds to wait for the model
 
 
 def parse_collections(spec):
@@ -1725,6 +1733,21 @@ def bring_back(user, unit, how, spec):
     return systemctl(user, "start", unit)
 
 
+def clear_marker():
+    """The mode marker must be gone before anything is started again. Stopping
+    the model unit normally stops the reservation that holds it; when that
+    did not happen (the stop is best-effort inside the unit), stop the
+    reservation here, and say so if the marker still stands."""
+    if not os.path.exists(MARKER):
+        return True
+    systemctl(False, "stop", RESERVATION)
+    if os.path.exists(MARKER):
+        print(f"the mode marker {MARKER} still exists: what gave way to the model cannot start until it is gone "
+              f"(`systemctl stop {RESERVATION}`)", file=sys.stderr)
+        return False
+    return True
+
+
 def restore():
     """Bring back what gave way, latest first; keep anything that failed for next time."""
     failed = []
@@ -1735,7 +1758,14 @@ def restore():
             continue
         done = bring_back(*entry)
         word = {"freeze": "thaw", "relaunch": "relaunch"}.get(how, "restart")
-        if done.returncode == 0:
+        if done.returncode == 0 and how == "stop" and run(
+                ["systemctl", *scope(user), "show", "-p", "ConditionResult", "--value", "--", unit]) == "no":
+            # `systemctl start` returns 0 for a unit whose condition refused:
+            # it was not started. Nothing in the record may be forgotten that way.
+            failed.insert(0, entry)
+            print(f"{unit} did not start: its condition refused (the mode marker {MARKER} still exists)",
+                  file=sys.stderr)
+        elif done.returncode == 0:
             print(f"{word.rstrip('e')}ed {unit}", file=sys.stderr)
         else:
             failed.insert(0, entry)
@@ -1753,7 +1783,13 @@ def enter_offline_mode(force=False):
             make_room(model_bytes() + HEADROOM)
         up(force=force)
     except SystemExit:
-        restore()  # the model did not load: give back what was stopped for it
+        # The model did not load: give back what was stopped for it. The unit
+        # may still be running (a load that never became ready) and holding
+        # the reservation whose marker keeps those units from starting, so it
+        # goes first, then the marker, then what gave way.
+        systemctl_user("stop", UNIT)
+        clear_marker()
+        restore()
         raise
     start_library()
 
@@ -1761,8 +1797,9 @@ def enter_offline_mode(force=False):
 def leave_offline_mode():
     systemctl_user("stop", LIBRARY_UNIT)
     stopped = systemctl_user("stop", UNIT)
+    cleared = clear_marker()
     restored = restore()
-    return stopped.returncode == 0 and restored
+    return stopped.returncode == 0 and cleared and restored
 
 
 def up(force=False):
@@ -1797,15 +1834,22 @@ def up(force=False):
     if started.returncode != 0:
         sys.exit(f"could not start {UNIT}: {started.stderr.strip()}")
     began = time.time()
-    while time.time() - began < 900:
+    while time.time() - began < READY_TIMEOUT:
         if healthy():
             print(f"model ready after {time.time() - began:.0f} s", file=sys.stderr)
+            if not os.path.exists(MARKER):
+                # The unit starts its reservation best-effort, so the model
+                # answers either way; but without the marker a deploy or a
+                # timer can start what gave way, and builds are not capped.
+                print(f"warning: no mode marker at {MARKER}: the memory reservation ({RESERVATION}) did not "
+                      "start, so what gave way to the model may be started again by a deploy or a timer, "
+                      f"and builds are not capped; see: journalctl -u {RESERVATION} -b -n 20", file=sys.stderr)
             return
         state = run(["systemctl", "--user", "is-active", "--", UNIT])
         if state in ("failed", "inactive"):
             sys.exit(f"{UNIT} is {state}; see: journalctl --user -u {UNIT} -b -n 40")
-        time.sleep(3)
-    sys.exit(f"{UNIT} did not become ready within 15 minutes")
+        time.sleep(min(3, READY_TIMEOUT))
+    sys.exit(f"{UNIT} did not become ready within {READY_TIMEOUT // 60 or 1} minutes")
 
 
 def start_library():

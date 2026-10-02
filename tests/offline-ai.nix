@@ -181,11 +181,18 @@ let
       show)
         case " $* " in
           *" LoadState "*) [ -e "$state/gone/$unit" ] && echo not-found || echo loaded ;;
+          # A gated unit started while the marker stands was refused by its condition.
+          *" ConditionResult "*) [ -e "$state/marker" ] && [ -e "$state/gated/$unit" ] && echo no || echo yes ;;
           *) [ -e "$state/transient/$unit" ] && echo yes || echo no ;;
         esac
         exit 0 ;;
       stop)
         rm -f "$state/$scope/$unit"; [ "$unit" = offline-ai-llm.service ] && rm -f "$state/healthy"
+        # The model unit's ExecStopPost stops the reservation, which removes the
+        # marker; FAKE_STICKY_MARKER=1 is that stop failing, =2 the reservation
+        # refusing to stop at all.
+        [ "$unit" = offline-ai-llm.service ] && [ "''${FAKE_STICKY_MARKER:-0}" = 0 ] && rm -f "$state/marker"
+        [ "$unit" = memory-reserve-offline-ai.service ] && [ "''${FAKE_STICKY_MARKER:-0}" != 2 ] && rm -f "$state/marker"
         # Stopping a unit that holds GPU memory gives that memory back.
         if [ -e "$state/gpu/$unit" ]; then
           avail=$(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' "$FAKE_MEMINFO")
@@ -194,7 +201,16 @@ let
         exit 0 ;;
       start)
         case " $FAKE_REFUSE " in *" $unit "*) echo "refused $unit" >&2; exit 1 ;; esac
-        touch "$state/$scope/$unit"; [ "$unit" = offline-ai-llm.service ] && touch "$state/healthy"; exit 0 ;;
+        # ConditionPathExists=!marker: start returns 0 and does nothing.
+        if [ -e "$state/marker" ] && [ -e "$state/gated/$unit" ]; then exit 0; fi
+        touch "$state/$scope/$unit"
+        if [ "$unit" = offline-ai-llm.service ]; then
+          # ExecStartPre starts the reservation (the marker), unless it fails;
+          # the server becomes healthy, unless it never does.
+          [ "''${FAKE_NO_MARKER:-0}" = 1 ] || touch "$state/marker"
+          [ "''${FAKE_NEVER_HEALTHY:-0}" = 1 ] || touch "$state/healthy"
+        fi
+        exit 0 ;;
       freeze|thaw)
         # A frozen unit's memory goes to swap: it adds to MemAvailable in the
         # fake meminfo, and thawing takes it back.
@@ -659,13 +675,16 @@ pkgs.runCommand "offline-ai-harness"
     trap 'kill $stub_pid $library_pid $mirror_pid $mode_pid 2>/dev/null || true' EXIT
     for _ in $(seq 1 50); do [ -s mode_port ] && break; sleep 0.1; done
     reset_units() {
-      rm -rf mode/system mode/user mode/calls mode/healthy; mkdir -p mode/system mode/user
+      rm -rf mode/system mode/user mode/calls mode/healthy mode/marker mode/gated; mkdir -p mode/system mode/user mode/gated
       touch mode/system/a.timer mode/system/b.service mode/user/d.service   # c.service is not running
+      touch mode/gated/d.service mode/gated/b.service   # these carry ConditionPathExists=!marker
     }
     mode() {
       env PATH="$PWD/fakebin:$PATH" XDG_RUNTIME_DIR="$PWD/run" \
         OFFLINE_AI_URL="http://127.0.0.1:$(cat mode_port)" OFFLINE_AI_LIBRARY_URL="http://127.0.0.1:9" \
         OFFLINE_AI_UNIT=offline-ai-llm.service OFFLINE_AI_MODEL="''${MODE_MODEL:-}" \
+        OFFLINE_AI_MODE_MARKER="$PWD/mode/marker" OFFLINE_AI_RESERVATION=memory-reserve-offline-ai.service \
+        OFFLINE_AI_READY_TIMEOUT="''${MODE_READY:-900}" \
         OFFLINE_AI_EVICT_SYSTEM="a.timer b.service" OFFLINE_AI_EVICT_USER="c.service d.service" \
         OFFLINE_AI_MEMINFO="$PWD/meminfo" OFFLINE_AI_SWAPS="$PWD/swaps" OFFLINE_AI_SYS_BLOCK="$PWD/sysblock" \
         OFFLINE_AI_USER_CGROUP="$PWD/cg/user@1000.service" \
@@ -714,6 +733,50 @@ pkgs.runCommand "offline-ai-harness"
     MODE_MODEL=/nonexistent/model.gguf mode "anything" > nomodel.out 2>&1 && fail "a missing model did not fail"
     [ -e mode/system/a.timer ] && [ -e mode/system/b.service ] && [ -e mode/user/d.service ] \
       || { cat nomodel.out; fail "units stopped for a model that could not load were not restarted"; }
+
+    # --- the model unit starts but never answers: the wait gives up, and
+    # what gave way comes back. The unit is still running and holding the
+    # reservation whose marker keeps those units from starting, so it must be
+    # stopped first; otherwise their `systemctl start` returns 0 having done
+    # nothing, and the record of them is wiped.
+    reset_units
+    FAKE_NEVER_HEALTHY=1 MODE_READY=2 mode up > notready.out 2>&1 && fail "a model that never became ready did not fail"
+    grep -q 'did not become ready' notready.out || { cat notready.out; fail "the wait did not report giving up"; }
+    [ ! -e mode/marker ] || fail "the marker outlived a failed load"
+    case "$(calls)" in
+      *"user stop offline-ai-llm.service;"*"start d.service;"*) ;;
+      *) fail "the model unit was not stopped before what gave way was restarted: $(calls)" ;;
+    esac
+    [ -e mode/system/b.service ] && [ -e mode/user/d.service ] || { cat notready.out; fail "units did not come back after a failed load"; }
+    [ ! -e run/offline-ai/evicted.json ] || fail "the record survived a failed load that restored everything"
+
+    # The reservation's stop failed inside the unit: the CLI stops it itself.
+    reset_units
+    mode up > /dev/null 2>&1 || fail "up before the sticky-marker case failed"
+    [ -e mode/marker ] || fail "up did not leave the marker"
+    FAKE_STICKY_MARKER=1 mode down > sticky1.out 2>&1 || { cat sticky1.out; fail "down failed when only the unit's own reservation stop had failed"; }
+    [ ! -e mode/marker ] || fail "down did not stop the reservation itself"
+    [ -e mode/user/d.service ] && [ -e mode/system/b.service ] || fail "gated units did not come back once the marker was cleared"
+    # The reservation will not stop at all: nothing gated is forgotten.
+    reset_units
+    mode up > /dev/null 2>&1 || fail "up before the stuck-marker case failed"
+    FAKE_STICKY_MARKER=2 mode down > sticky2.out 2>&1 && fail "down reported success while the marker kept units from starting"
+    grep -q 'did not start: its condition refused' sticky2.out || { cat sticky2.out; fail "a condition-refused start was taken for a restart"; }
+    grep -q 'still exists' sticky2.out || fail "the standing marker was not named"
+    [ ! -e mode/user/d.service ] || fail "the fake started a gated unit although the marker stood"
+    [ -e mode/system/a.timer ] || fail "the ungated timer did not come back"
+    jq -e 'map(.[1]) | sort == ["b.service", "d.service"]' run/offline-ai/evicted.json > /dev/null \
+      || { cat run/offline-ai/evicted.json; fail "the gated units were forgotten"; }
+    rm -f mode/marker
+    mode down > /dev/null 2>&1 || fail "down after the marker was cleared did not restart the remembered units"
+    [ -e mode/user/d.service ] && [ -e mode/system/b.service ] && [ ! -e run/offline-ai/evicted.json ] || fail "remembered gated units were not restarted"
+
+    # The reservation did not start (the unit tolerates that): the model
+    # answers, and the operator is told the mode is unguarded.
+    reset_units
+    FAKE_NO_MARKER=1 mode up > nomarker.out 2>&1 || { cat nomarker.out; fail "up failed when only the reservation had failed"; }
+    grep -q 'no mode marker' nomarker.out || { cat nomarker.out; fail "a missing marker was not reported"; }
+    mode down > /dev/null 2>&1 || fail "down after the no-marker case failed"
 
     # --- not enough memory once the listed units are stopped: other large
     # units of the user are frozen, largest first, until the model fits, and

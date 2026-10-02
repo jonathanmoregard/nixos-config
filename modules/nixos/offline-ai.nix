@@ -127,6 +127,7 @@ let
   # condition goes in as a drop-in beside each unit file; a drop-in appends
   # to any ConditionPathExists= the unit already has.
   gatedUserServices = [
+    "aggregator-ingest.service"
     "aggregator-embed.service"
     "aggregator-embed-server.service"
     "router-ingestor.service"
@@ -214,6 +215,8 @@ let
       export OFFLINE_AI_DOC_DIRS="''${OFFLINE_AI_DOC_DIRS:-${collections}}"
       export OFFLINE_AI_LIBRARY_URL="''${OFFLINE_AI_LIBRARY_URL:-http://127.0.0.1:${toString libraryPort}}"
       export OFFLINE_AI_LIBRARY_UNIT="''${OFFLINE_AI_LIBRARY_UNIT:-${libraryUnit}}"
+      export OFFLINE_AI_MODE_MARKER="''${OFFLINE_AI_MODE_MARKER:-${modeMarker}}"
+      export OFFLINE_AI_RESERVATION="''${OFFLINE_AI_RESERVATION:-memory-reserve-offline-ai.service}"
       export OFFLINE_AI_EVICT_SYSTEM="''${OFFLINE_AI_EVICT_SYSTEM-${lib.concatStringsSep " " evictSystem}}"
       export OFFLINE_AI_EVICT_USER="''${OFFLINE_AI_EVICT_USER-${lib.concatStringsSep " " evictUser}}"
       exec python3 ${../../scripts/offline-ai.py} "$@"
