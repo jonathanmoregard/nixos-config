@@ -4,16 +4,17 @@
 #
 # Lifecycle: microvm.nix synthesizes microvm@research-agent.service
 # from this declaration. Boot order inside the guest:
-#   network-online.target → nftables.service →
-#   research-agent-egress-init.service → sshd.service
+#   nftables.service → dnsmasq.service → sshd.service
 #
-# sshd is gated on egress-init via Requires=/After=. egress-init never
-# hard-fails on DNS: it retries forever with capped backoff, so a host
-# that is offline at guest boot surfaces as `Connection refused` (sshd
-# not up YET) and self-heals the moment connectivity returns — no
-# operator, no watchdog restart needed. (2026-07-07 incident: the old
-# 5-retry/exit-1 design turned an offline laptop into a failed sshd,
-# a give-up-latched watchdog, and a false "VM DOWN" alert.)
+# Egress is an nftables IP allowlist that the guest's own resolver
+# fills in as names are looked up (research-agent-egress.nix). sshd
+# waits for the firewall, not for DNS: a host that is offline at guest
+# boot gives a reachable VM whose outbound calls fail fast at name
+# resolution, and they work again the moment connectivity returns.
+# (History: until 2026-10 a retry-forever egress-init resolved the
+# allowlist at boot and held sshd back until it could — see the
+# 2026-07-07 offline-boot incident — and a 10-min refresh timer chased
+# rotating IPs. Neither could keep up with Akamai's sub-minute TTLs.)
 #
 # Host MCP server reaches the VM via ssh on 127.0.0.1:2223 (port
 # forward from SLIRP user-mode networking). Per-call isolation is
@@ -30,70 +31,11 @@ in
     # define `microvm.runner.qemu` twice. `flake = ...` is mutually
     # exclusive with `config` and would fail assertion
     # `Fully-declarative VMs cannot also set a flake!`.
-    config = { config, pkgs, ... }: let
+    config = { config, pkgs, ... }: {
 
-      # Egress allowlist — SINGLE SOURCE OF TRUTH. Consumed by both
-      # research-agent-egress-init (resolves at boot, gates sshd) and
-      # research-agent-egress-refresh (re-resolves on a timer). Keep it
-      # one list: a domain added to init but not refresh would be
-      # silently dropped from the set at the next refresh, which is a
-      # worse failure than the drift this exists to fix.
-      egressAllowlist = [
-        "api.anthropic.com"
-        # Codex fallback endpoints: ChatGPT sessions call chatgpt.com and
-        # refresh managed OAuth tokens through auth.openai.com. The host
-        # loader also accepts Codex's OPENAI_API_KEY auth shape, whose
-        # responses endpoint is api.openai.com.
-        "chatgpt.com"
-        "auth.openai.com"
-        "api.openai.com"
-        "api.exa.ai"
-        "mcp.exa.ai"
-        # api.tavily.com is AWS ELB-backed and its A records rotate on a
-        # scale of hours-to-days — this is the domain that motivated the
-        # refresh timer (2026-08-24; see research-agent-egress-refresh).
-        "api.tavily.com"
-        "mcp.tavily.com"
-        # Trademark-clearance shims (agent/shims/{trademark,bolagsverket}
-        # _shim.py in the research-agent repo). Added to the agent in
-        # 2026-06 but never to this allowlist — every call dialled out,
-        # hit dropped packets, and hung to its client timeout (EUIPO
-        # curl-28 after 30s, bolagsverket urllib after 120s), burning
-        # whole research budgets on dead waits.
-        # EUIPO sandbox (in use until the production subscription is
-        # approved):
-        "auth-sandbox.euipo.europa.eu"
-        "api-sandbox.euipo.europa.eu"
-        # EUIPO production (pre-added so the sandbox->prod flip is a
-        # shim-env change, not another firewall PR):
-        "euipo.europa.eu"
-        "api.euipo.europa.eu"
-        # Bolagsverket open-data bulk file (CC-BY, weekly refresh):
-        "vardefulla-datamangder.bolagsverket.se"
-        # PRV open-data FTP (Swedish national trademark register;
-        # sanctioned bulk channel used by prv_shim). NOTE: FTP —
-        # control on :21 plus PASV data connections to the same
-        # host on ephemeral ports; the allowlist is IP-based so
-        # PASV lands on the same allowed IPs, and outbound
-        # ESTABLISHED/RELATED handles the rest.
-        "opendata.prv.se"
-        # Shopping-search shims (agent/shims/{ebay,tradera}_shim.py in
-        # the research-agent repo): the marketplaces' own read-only
-        # search APIs. eBay's token endpoint and Browse API share
-        # api.ebay.com. eBay 403s scraped search pages, so without
-        # this host the agent has no eBay route at all.
-        "api.ebay.com"
-        "api.tradera.com"
-      ];
-
-      # Rendered as a bash array literal for both unit scripts.
-      allowedArray = ''
-        ALLOWED=(
-          ${lib.concatStringsSep "\n          " egressAllowlist}
-        )
-      '';
-
-    in {
+      # Egress allowlist + the resolver that fills it (dnsmasq nftset).
+      # The allowlist itself lives there.
+      imports = [ ./research-agent-egress.nix ];
 
       microvm = {
         hypervisor = "qemu";
@@ -250,273 +192,37 @@ in
         };
       };
 
-      # SSH only listens after the egress allowlist is populated.
-      # Requires= (not Wants=) means a failed egress-init transitions
-      # sshd to `failed`, surfacing as `Connection refused` at the host
-      # MCP server rather than a silent 10-minute timeout.
+      # sshd (the host MCP's only way in) never serves without the
+      # firewall: Requires=/BindsTo= nftables, so a ruleset that failed
+      # to load means no agent runs at all rather than one running with
+      # an open output chain. It deliberately does NOT wait for DNS any
+      # more: the allowlist is filled per lookup by dnsmasq
+      # (research-agent-egress.nix), so there is nothing to pre-resolve,
+      # and an offline host now means calls fail fast at name
+      # resolution instead of sshd being held back.
       systemd.services.sshd = {
-        after = [ "research-agent-egress-init.service" ];
-        requires = [ "research-agent-egress-init.service" ];
-        # Requires= propagates explicit restarts (verified empirically
-        # with toy units 2026-07-07: restarting the dependency restarts
-        # the dependent), so an nftables reload can never leave sshd
-        # serving against a flushed allowlist. bindsTo additionally
-        # covers non-job deactivations of egress-init — belt and braces.
-        bindsTo = [ "research-agent-egress-init.service" ];
-      };
-
-      # Egress allowlist — declarative nftables, populated at boot.
-      networking.nftables = {
-        enable = true;
-        ruleset = ''
-          table inet filter {
-            set research_allowed {
-              type ipv4_addr
-              flags interval
-            }
-
-            chain input {
-              type filter hook input priority 0; policy drop;
-              iif lo accept
-              ct state established,related accept
-              tcp dport 22 accept
-            }
-
-            chain output {
-              type filter hook output priority 0; policy drop;
-              oif lo accept
-              ct state established,related accept
-              udp dport 53 accept
-              tcp dport 53 accept
-              ip daddr @research_allowed tcp dport 443 accept
-              # Scraper microvm HTTP API. 10.0.2.2 is the SLIRP host
-              # gateway from inside this VM (qemu user-mode default).
-              # The host's forwardPorts rule on the scraper VM exposes
-              # the scraper's guest port 8000 at host loopback :8123,
-              # so this rule lets the agent's render_shim reach the
-              # scraper without widening the broader egress allowlist.
-              ip daddr 10.0.2.2 tcp dport 8123 accept
-            }
-          }
-        '';
-      };
-
-      systemd.services.research-agent-egress-init = {
-        description = "Resolve allowlist FQDNs and populate nftables set";
-        wantedBy = [ "multi-user.target" "nftables.service" ];
-        after = [ "network-online.target" "nftables.service" ];
-        wants = [ "network-online.target" ];
+        after = [ "nftables.service" "dnsmasq.service" ];
         requires = [ "nftables.service" ];
-        # PartOf=nftables.service so when nftables reloads (every
-        # nixos-rebuild switch atomically re-applies the ruleset and
-        # recreates the `research_allowed` set empty), egress-init is
-        # restarted in the same transaction and repopulates the set
-        # before the new ruleset goes live. Without this, a switch
-        # mid-flight on the host wipes the allowlist; ESTABLISHED
-        # flows survive via conntrack, but new outbound connections
-        # hit policy=drop until the operator manually restarts
-        # egress-init.
-        partOf = [ "nftables.service" ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          # The retry-forever loop in the script may legitimately run
-          # for hours (laptop offline). The 90s default would kill the
-          # unit and re-create the dead-sshd incident this design
-          # exists to prevent.
-          TimeoutStartSec = "infinity";
-        };
-        # pkgs.getent (a separate small derivation) provides the
-        # `getent` binary. `glibc.bin` on current nixpkgs does NOT
-        # ship getent — it has gencat/getconf/iconv/locale/etc. but
-        # the resolver tool lives in its own attr. Verified by
-        # `ls $(nix eval --raw .#pkgs.glibc.bin)/bin`.
-        # Without this, the script fails on every domain with
-        # `getent: command not found`, exhausts retries, exits 1, and
-        # cascades sshd into `failed` via the Requires= above.
-        path = [ pkgs.nftables pkgs.getent pkgs.coreutils pkgs.gawk ];
-        script = ''
-          # -e deliberately absent: a failing getent inside the retry
-          # loop IS the expected offline case, not an error. -u and
-          # pipefail stay.
-          set -uo pipefail
-
-          ${allowedArray}
-
-          # Never hard-fail on DNS. This unit gates sshd (Requires=),
-          # so exiting non-zero turns a flaky uplink into a VM that
-          # needs an operator. Instead: insert what resolves
-          # incrementally (partial connectivity opens what it can) and
-          # retry the rest forever with capped backoff. sshd starts
-          # only once the FULL allowlist is populated — the security
-          # posture is unchanged, just patient. Pairs with
-          # TimeoutStartSec=infinity above and the host watchdog's
-          # offline gate (research-agent-microvm-healthcheck.nix).
-          # Contract enforced by checks.egress-init-retry.
-
-          # Idempotent: flush the set so re-runs don't accumulate.
-          nft flush set inet filter research_allowed || true
-
-          declare -A RESOLVED=()
-          attempt=0
-          while :; do
-            missing=0
-            for d in "''${ALLOWED[@]}"; do
-              [ -n "''${RESOLVED[$d]:-}" ] && continue
-              # /STREAM/ filter: getent ahostsv4 emits STREAM/DGRAM/RAW
-              # triplets per IP; unfiltered $1 would also swallow any
-              # oddball non-address lines.
-              if ips=$(getent ahostsv4 "$d" | awk '/STREAM/{print $1}' | sort -u) \
-                 && [ -n "$ips" ]; then
-                while IFS= read -r ip; do
-                  [ -z "$ip" ] && continue
-                  # Log nft failures instead of swallowing them — a set
-                  # that's missing mid-reload is worth seeing in the
-                  # journal even though the retry architecture and
-                  # sshd's BindsTo make it non-fatal.
-                  nft add element inet filter research_allowed { $ip } \
-                    || echo "[egress-init] WARN: nft add $ip ($d) failed" >&2
-                  echo "[egress-init] allow $d -> $ip"
-                done <<< "$ips"
-                RESOLVED[$d]=1
-              else
-                missing=$((missing + 1))
-              fi
-            done
-            [ "$missing" -eq 0 ] && break
-            attempt=$((attempt + 1))
-            if [ "$attempt" -lt 12 ]; then
-              sleep_s=$((attempt * 5))
-            else
-              sleep_s=60
-            fi
-            echo "[egress-init] $missing domain(s) unresolved (attempt $attempt) — host offline? retrying in ''${sleep_s}s" >&2
-            sleep "$sleep_s"
-          done
-
-          echo "[egress-init] firewall active"
-        '';
+        bindsTo = [ "nftables.service" ];
+        wants = [ "dnsmasq.service" ];
       };
 
-      # Egress allowlist REFRESH — the counterpart to egress-init.
-      #
-      # egress-init resolves each FQDN exactly once (`[ -n "$RESOLVED[$d]" ]
-      # && continue`) and the unit is Type=oneshot/RemainAfterExit, so the
-      # nftables set is pinned to whatever DNS said at guest boot. Hosts
-      # behind rotating IPs drift out of it, and because the output chain
-      # is policy=drop the drift is SILENT: packets are blackholed and the
-      # client hangs to its own timeout rather than getting a refusal.
-      #
-      # Found 2026-08-24: the VM had been up 11.5 days (zero restarts) and
-      # every mcp__tavily call in three consecutive research runs timed out
-      # at 30s, while Exa worked throughout. The difference is CDN, not
-      # code — api.exa.ai is Cloudflare anycast (172.66.x, stable for
-      # years) whereas api.tavily.com is AWS ELB-backed (3.211.x/44.216.x,
-      # rotates in hours-to-days). Exa had been surviving this bug by luck.
-      #
-      # Deliberately a SEPARATE unit rather than a rewrite of egress-init:
-      # egress-init gates sshd via Requires=, so a regression there makes
-      # the VM unreachable and takes the whole research path down with it.
-      # This unit can only ever leave the set as it found it.
-      #
-      # Contract enforced by checks.egress-refresh.
-      systemd.services.research-agent-egress-refresh = {
-        description = "Re-resolve allowlist FQDNs, atomically replace nftables set";
-        # Ordering only. No Requires=: if egress-init is somehow not up,
-        # `nft -f` fails on the missing set, gets logged, and the unit
-        # still exits 0 — the timer must not latch into failed state.
-        after = [ "research-agent-egress-init.service" "network-online.target" ];
-        wants = [ "network-online.target" ];
-        serviceConfig.Type = "oneshot";
-        path = [ pkgs.nftables pkgs.getent pkgs.coreutils pkgs.gawk ];
-        script = ''
-          # -e absent for the same reason as egress-init: a failing getent
-          # is the expected offline case, not an error.
-          set -uo pipefail
-
-          ${allowedArray}
-
-          # Resolve EVERYTHING before touching the live set.
-          #
-          # This ordering is the whole safety argument for running on a
-          # timer unattended. The bug being fixed is a STALE set (some
-          # calls hang). The bug that must not be introduced is an EMPTY
-          # set (every call hangs, including the agent's own Anthropic
-          # API traffic). So a partial DNS answer produces no mutation at
-          # all — worst case we keep today's behaviour until the next tick.
-          txn=$(mktemp)
-          pool=$(mktemp)
-          trap 'rm -f "$txn" "$pool"' EXIT
-
-          for d in "''${ALLOWED[@]}"; do
-            # /STREAM/ filter: getent ahostsv4 emits STREAM/DGRAM/RAW
-            # triplets per IP; unfiltered $1 would also swallow any
-            # oddball non-address lines.
-            if ips=$(getent ahostsv4 "$d" | awk '/STREAM/{print $1}' | sort -u) \
-               && [ -n "$ips" ]; then
-              printf '%s\n' "$ips" >> "$pool"
-            else
-              echo "[egress-refresh] $d unresolved — live set left untouched" >&2
-              exit 0
-            fi
-          done
-
-          # GLOBAL de-dup, not per-domain. Distinct FQDNs routinely share
-          # an address — euipo.europa.eu and api.euipo.europa.eu both
-          # resolve to 169.50.35.246 today — and `add element` on an
-          # already-present element is an error, which inside a single
-          # `nft -f` transaction aborts the WHOLE batch. egress-init is
-          # immune because it issues one `nft add` per IP with a
-          # `|| warn` fallback; an atomic transaction has no such luck,
-          # so the duplicate must be removed before it is emitted.
-          # (Caught 2026-08-24 by running the generated script against
-          # live DNS; a stub that always returns 0 hides this.)
-          count=$(sort -u "$pool" | grep -c '[^[:space:]]' || true)
-
-          {
-            echo "flush set inet filter research_allowed"
-            sort -u "$pool" | while IFS= read -r ip; do
-              [ -z "$ip" ] && continue
-              echo "add element inet filter research_allowed { $ip }"
-            done
-          } > "$txn"
-
-          # Belt and braces: every domain "resolved" but produced nothing.
-          [ "$count" -gt 0 ] || {
-            echo "[egress-refresh] resolved zero addresses — live set left untouched" >&2
-            exit 0
-          }
-
-          # flush + adds in ONE `nft -f` transaction. Applied atomically,
-          # so no concurrent connection ever observes a half-built set.
-          if nft -f "$txn"; then
-            echo "[egress-refresh] allowlist refreshed: $count addresses"
-          else
-            echo "[egress-refresh] WARN: nft -f failed (set missing mid-reload?) — live set left as-is" >&2
-          fi
-          exit 0
-        '';
-      };
-
-      systemd.timers.research-agent-egress-refresh = {
-        description = "Periodically re-resolve the research-agent egress allowlist";
-        wantedBy = [ "timers.target" ];
-        timerConfig = {
-          # First tick 10min after boot — egress-init has just resolved,
-          # so there is nothing to correct before then.
-          OnBootSec = "10min";
-          OnUnitActiveSec = "10min";
-          # Monotonic timers already fire on resume if the interval
-          # elapsed while suspended, which is the laptop-lid case.
-          AccuracySec = "1min";
-        };
+      # SLIRP uplink. Same DHCP the default 99-ethernet-default-dhcp
+      # network would do (this one sorts first, so networkd uses it),
+      # minus the DHCP-offered DNS server: resolved must ask dnsmasq
+      # and only dnsmasq, or its answers bypass the egress set (see
+      # research-agent-egress.nix). IPv4 only, matching enableIPv6 below.
+      systemd.network.networks."10-uplink" = {
+        matchConfig.Type = "ether";
+        networkConfig.DHCP = "ipv4";
+        dhcpV4Config.UseDNS = false;
       };
 
       networking.hostName = "research-agent";
 
       # Disable IPv6 inside the guest. The egress allowlist set
       # (research_allowed, type ipv4_addr) only covers v4, and
-      # egress-init resolves with `getent ahostsv4`. If SLIRP ever
+      # dnsmasq only inserts A records into it (nftset `4#`). If SLIRP ever
       # advertised a v6 resolver (some QEMU configs expose fec0::3),
       # the agent's resolver would prefer AAAA per RFC 6724, wait for
       # the v6 connect to time out against the chain's default drop,

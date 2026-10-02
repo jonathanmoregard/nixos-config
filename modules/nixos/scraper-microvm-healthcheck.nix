@@ -54,10 +54,10 @@ in
 # clears the latch and re-arms.
 #
 # INTENTIONAL DIVERGENCE from the research-agent twin: this watchdog has
-# NO host-offline gate. The research-agent guest gates sshd on an
-# egress-init that waits for DNS, so a host without network means a
-# probe that fails "legitimately" and self-heals — restarting there is
-# harmful noise. The scraper guest's sshd has no such network
+# NO host-offline gate. The research-agent gate dates from when that
+# guest held sshd back until DNS worked (egress-init, removed 2026-10),
+# so a host without network meant a probe that failed "legitimately"
+# and self-healed — restarting there was harmful noise. The scraper guest's sshd has no such network
 # dependency and the ssh-keyscan probe is loopback-only, so a probe
 # failure here means the VM itself is unhealthy REGARDLESS of host
 # connectivity, and restarting is exactly right. Porting the offline
