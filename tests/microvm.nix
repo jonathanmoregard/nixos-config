@@ -7,6 +7,14 @@
 #     share) is created via systemd.tmpfiles, owner root mode 700
 #   - /var/lib/research-agent/tool-cache/{prv,bolagsverket} (persistent
 #     jail tool-cache share) created via systemd.tmpfiles, 0777 jonathan
+#   - the guest's egress policy AT RUNTIME (nodes `agent` + `upstream`):
+#     the agent node imports the very module the guest imports
+#     (modules/nixos/research-agent-egress.nix) and resolves through a
+#     fake upstream that serves api.ebay.com's real CNAME-chain shape
+#     onto an "edge" address the test rotates. Asserted: a freshly
+#     rotated address is connectable as soon as the agent resolves it;
+#     an address the resolver never handed out is not, even for an
+#     allowlisted name; an unlisted name resolves but cannot connect.
 #
 # Nested-VM gate: starting microvm@research-agent.service would require
 # nested KVM in the outer test QEMU. Some CI / dev hosts don't expose
@@ -88,6 +96,55 @@ pkgs.testers.runNixOSTest {
     systemd.services."install-microvm-scraper".wantedBy = lib.mkForce [ ];
     systemd.services."microvm@scraper".wantedBy = lib.mkForce [ ];
     systemd.services."microvm-virtiofsd@scraper".wantedBy = lib.mkForce [ ];
+  };
+
+  # The research-agent guest's egress policy, run for real. Same module
+  # the guest imports; only the upstream resolver differs (the guest's is
+  # SLIRP's 10.0.2.3). IPv6 off as in the guest.
+  nodes.agent = { nodes, pkgs, ... }: {
+    imports = [ ../modules/nixos/research-agent-egress.nix ];
+    researchAgent.egress.upstreamDns = nodes.upstream.networking.primaryIPAddress;
+    networking.enableIPv6 = false;
+    environment.systemPackages = [ pkgs.curl ];
+  };
+
+  # Stands in for "the internet": an authoritative-enough resolver plus a
+  # TCP :443 listener on several addresses. api.ebay.com is served with
+  # its real shape — a CNAME chain whose final A record (the Akamai edge)
+  # the test rewrites to simulate rotation. evil.example is not on the
+  # allowlist. Plain HTTP on :443 is enough: the guest rule is
+  # `tcp dport 443`, TLS is irrelevant to the firewall.
+  nodes.upstream = { pkgs, ... }: {
+    networking.firewall.enable = false;
+    networking.interfaces.eth1.ipv4.addresses = lib.mkAfter (map
+      (n: { address = "192.168.1.${toString n}"; prefixLength = 24; })
+      [ 10 11 12 13 ]);
+    services.dnsmasq = {
+      enable = true;
+      resolveLocalQueries = false;
+      settings = {
+        no-resolv = true;
+        no-hosts = true;
+        addn-hosts = "/run/fake-dns/hosts";
+        cname = [
+          "api.ebay.com,global-api.ebaycdn.net"
+          "global-api.ebaycdn.net,ebay-edge.akamaiedge.net"
+        ];
+        local-ttl = 1;
+      };
+    };
+    systemd.tmpfiles.rules = [ "d /run/fake-dns 0755 root root -" ];
+    systemd.services.dnsmasq.preStart = lib.mkBefore ''
+      printf '192.168.1.10 ebay-edge.akamaiedge.net\n192.168.1.12 evil.example\n' \
+        > /run/fake-dns/hosts
+    '';
+    systemd.services.fake-cdn = {
+      wantedBy = [ "multi-user.target" ];
+      script = ''
+        mkdir -p /srv/cdn && echo ok > /srv/cdn/index.html
+        exec ${pkgs.python3}/bin/python3 -m http.server 443 --bind 0.0.0.0 --directory /srv/cdn
+      '';
+    };
   };
 
   testScript = ''
@@ -187,10 +244,9 @@ pkgs.testers.runNixOSTest {
         f"grep -q '/run/microvm-healthcheck-notify/research-agent' {script_path}"
     )
     # Offline gate: probe failures while the HOST is offline must not
-    # count toward restarts/give-up — the guest self-heals when the
-    # network returns (retry-forever egress-init; contract enforced by
-    # checks.egress-init-retry). Removing this gate regresses to the
-    # 2026-07-07 false "VM DOWN" incident.
+    # count toward restarts/give-up (2026-07-07 false "VM DOWN"
+    # incident). Precautionary since the guest stopped holding sshd
+    # back on DNS; see research-agent-microvm-healthcheck.nix.
     dellan.succeed(f"grep -q 'host is offline' {script_path}")
     dellan.succeed(f"grep -q 'getent ahostsv4' {script_path}")
     # Busy gate: while a research call is dialing the VM the MCP keeps a
@@ -348,5 +404,79 @@ pkgs.testers.runNixOSTest {
     assert rc != "failed", (
         f"scraper watchdog must survive corrupted state; got is-failed={rc!r}"
     )
+
+    # ---------------------------------------------------------------
+    # research-agent guest egress, at runtime (nodes agent + upstream).
+    # ---------------------------------------------------------------
+    upstream.start()
+    agent.start()
+    upstream.wait_for_unit("dnsmasq.service")
+    upstream.wait_for_unit("fake-cdn.service")
+    upstream.wait_for_open_port(443)
+    agent.wait_for_unit("multi-user.target")
+    agent.wait_for_unit("dnsmasq.service")
+    agent.wait_for_unit("systemd-resolved.service")
+
+    def set_edge(ip):
+        # Rotate api.ebay.com's final A record, as Akamai does every few
+        # seconds. local-ttl=1 + no caching on the agent side means the
+        # next lookup sees it; sleep past the TTL anyway.
+        upstream.succeed(
+            f"printf '{ip} ebay-edge.akamaiedge.net\\n192.168.1.12 evil.example\\n' "
+            "> /run/fake-dns/hosts && systemctl reload dnsmasq.service"
+        )
+        agent.sleep(2)
+
+    def connect(name, extra=""):
+        # %{remote_ip}: which address the agent actually reached.
+        return agent.succeed(
+            f"curl -sS -m 5 -o /dev/null -w '%{{remote_ip}}' {extra} http://{name}:443/"
+        ).strip()
+
+    def egress_set():
+        return agent.succeed("nft list set inet filter research_allowed")
+
+    # Nothing has been resolved yet, so nothing is allowed yet.
+    print("[diag] set at boot:\n" + egress_set())
+    assert "192.168.1." not in egress_set(), "egress set must start empty"
+
+    # 1. Allowlisted name behind a CNAME chain: reachable, via the edge.
+    ip = connect("api.ebay.com")
+    assert ip == "192.168.1.10", f"expected edge 192.168.1.10, reached {ip!r}"
+
+    # 2. The edge rotates to an address nobody has seen before. The
+    #    boot-time/10-min-refresh design failed exactly here.
+    set_edge("192.168.1.11")
+    ip = connect("api.ebay.com")
+    assert ip == "192.168.1.11", f"rotated edge not reached, got {ip!r}"
+
+    # 3. Rotate again, but connect to the new address WITHOUT asking the
+    #    resolver: allowlisted name or not, an address the resolver never
+    #    handed out stays closed. Then resolve normally: open.
+    set_edge("192.168.1.13")
+    agent.fail(
+        "curl -sS -m 5 -o /dev/null --resolve api.ebay.com:443:192.168.1.13 "
+        "http://api.ebay.com:443/"
+    )
+    ip = connect("api.ebay.com")
+    assert ip == "192.168.1.13", f"edge not opened by resolution, got {ip!r}"
+
+    # 4. Unlisted name: it resolves through the same resolver (so the
+    #    failure below is the firewall, not DNS) and its address serves
+    #    (control from the upstream side), yet the agent cannot connect.
+    agent.succeed("getent ahostsv4 evil.example | grep -q 192.168.1.12")
+    upstream.succeed("curl -sS -m 5 -o /dev/null http://192.168.1.12:443/")
+    agent.fail("curl -sS -m 5 -o /dev/null http://evil.example:443/")
+
+    # 5. Port 53 is open only towards the configured upstream resolver.
+    #    upstream's dnsmasq listens on every address, so .12:53 accepts
+    #    TCP from an unfiltered node (dellan, same vlan) — not from the
+    #    agent.
+    dellan.succeed("timeout 6 bash -c 'exec 3<>/dev/tcp/192.168.1.12/53'")
+    agent.fail("timeout 6 bash -c 'exec 3<>/dev/tcp/192.168.1.12/53'")
+
+    final = egress_set()
+    print("[diag] set after test:\n" + final)
+    assert "192.168.1.12" not in final, "unlisted name's address leaked into the egress set"
   '';
 }

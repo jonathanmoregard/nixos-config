@@ -77,9 +77,12 @@ in
 # clears the latch and re-arms everything automatically.
 #
 # Offline gate: a probe failure while the HOST has no DNS is not
-# counted at all — the guest is just waiting for the network (see the
-# retry-forever egress-init) and heals itself on reconnect; restarting
-# or latching would manufacture a false outage out of a missing WiFi.
+# counted at all; restarting or latching would manufacture a false
+# outage out of a missing WiFi. It was introduced (2026-07-07) when the
+# guest's egress-init held sshd back until DNS worked. Since 2026-10
+# the guest no longer waits for DNS before sshd (egress is filled per
+# lookup, research-agent-egress.nix), so the gate is now only
+# precautionary and could be dropped like the scraper twin's.
 # NOTE: the scraper twin deliberately has NO such gate — its sshd has
 # no egress dependency, so offline cannot cause a false probe failure
 # there and the gate would only mask real breakage. See the divergence
@@ -331,10 +334,10 @@ in
         exit 0
       fi
 
-      # Probe failed. If the HOST itself can't resolve, we're offline —
-      # the guest's egress-init (retry-forever; research-agent-microvm.nix)
-      # is deliberately holding sshd back until connectivity returns and
-      # will self-heal on its own. A VM restart cannot help and would
+      # Probe failed. If the HOST itself can't resolve, we're offline.
+      # (Until 2026-10 the guest's egress-init held sshd back until
+      # connectivity returned; see the header for why this gate is now
+      # only precautionary.) A VM restart cannot help and would
       # burn the give-up budget on a false alarm (2026-07-07 incident:
       # offline boot → 26 failed probes → 2 futile restarts → give-up
       # latch + CRITICAL "VM DOWN" while the only real problem was no
@@ -355,7 +358,7 @@ in
         return 0
       }
       if ! host_online; then
-        echo "healthcheck: probe failed but host is offline; guest egress-init is waiting for network — not counting"
+        echo "healthcheck: probe failed but host is offline; not counting"
         echo 0 > "$COUNT_FILE"
         exit 0
       fi

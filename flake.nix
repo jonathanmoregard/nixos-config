@@ -331,15 +331,6 @@
             `hashedPasswordFile` — do not put a plaintext default back in profiles/base.nix.
           ''
             (pkgsLinux.runCommand "dellan-initial-password-null" { } "touch $out");
-        # Not a VM lane: runtime-invocation harness for the research-agent
-        # guest's egress-init script (offline-resilience contract). Cheap
-        # runCommand; seconds, not minutes.
-        egress-init-retry = import ./tests/egress-init-retry.nix {
-          pkgs = pkgsLinux;
-          script = self.nixosConfigurations.dellan.config
-            .microvm.vms.research-agent.config.config
-            .systemd.services.research-agent-egress-init.script;
-        };
         feature-vm-research-source =
           let
             launcher = self.apps.${linuxSystem}.feature-vm.program;
@@ -351,15 +342,6 @@
             fi
             touch $out
           '';
-        # Not a VM lane: runtime-invocation harness for the research-agent
-        # guest's egress-refresh script (atomic-replace + never-shrink
-        # contract). Cheap runCommand; seconds, not minutes.
-        egress-refresh = import ./tests/egress-refresh.nix {
-          pkgs = pkgsLinux;
-          script = self.nixosConfigurations.dellan.config
-            .microvm.vms.research-agent.config.config
-            .systemd.services.research-agent-egress-refresh.script;
-        };
         # Not a VM lane: runtime-invocation harness for the cachix
         # post-build-hook's push-budget filter (skip microvm erofs +
         # >256MiB paths; never fail the build). Cheap runCommand.
