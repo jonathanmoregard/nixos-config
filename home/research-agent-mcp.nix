@@ -67,9 +67,18 @@ in
         # paths keep working with the secrets unset.
         EUIPO_CLIENT_ID=$(< /run/agenix/euipo-client-id)
         EUIPO_CLIENT_SECRET=$(< /run/agenix/euipo-client-secret)
+        # eBay + Tradera keys for the shopping shim. Same placeholder
+        # model as EUIPO: empty until the developer keys are filled in,
+        # and an empty value reads as "not configured".
+        EBAY_CLIENT_ID=$(< /run/agenix/ebay-client-id)
+        EBAY_CLIENT_SECRET=$(< /run/agenix/ebay-client-secret)
+        TRADERA_APP_ID=$(< /run/agenix/tradera-app-id)
+        TRADERA_APP_KEY=$(< /run/agenix/tradera-app-key)
         export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY \
                EXA_API_KEY TAVILY_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
-               EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET
+               EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET \
+               EBAY_CLIENT_ID EBAY_CLIENT_SECRET \
+               TRADERA_APP_ID TRADERA_APP_KEY
 
         # Lakera Guard tuned-policy project (not a secret — see
         # home/lakera.nix). injection_scanner/lakera.py sends

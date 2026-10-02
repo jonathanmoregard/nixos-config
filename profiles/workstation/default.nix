@@ -231,6 +231,38 @@
     mode = "0400";
   };
 
+  # eBay Browse API (client_credentials) and Tradera API keys for the
+  # research-agent's shopping shim (ebay_search / tradera_search). Same
+  # placeholder model as EUIPO above: the files decrypt to empty strings
+  # until the developer keys exist, and the shim answers "not configured"
+  # for an empty value. Fill with
+  # `nix run .#agenix-rekey.x86_64-linux.edit-view -- edit secrets/<name>.age`
+  # then `rekey`.
+  age.secrets.ebay-client-id = {
+    rekeyFile = ../../secrets/ebay-client-id.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.ebay-client-secret = {
+    rekeyFile = ../../secrets/ebay-client-secret.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.tradera-app-id = {
+    rekeyFile = ../../secrets/tradera-app-id.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.tradera-app-key = {
+    rekeyFile = ../../secrets/tradera-app-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   # Private half of the SSH keypair the MCP server uses to ssh into the
   # research-agent microvm. Matching public key is plaintext inside
   # modules/nixos/research-agent-microvm.nix as authorized_keys.
