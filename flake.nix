@@ -131,7 +131,7 @@
     # a unix socket. New embedding stamp: a new index is built beside the old
     # fp32 vectors, which stay on disk unused.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/bdb7228deaaa56e80bade39930a05771ef303299";
+      url = "github:jonathanmoregard/aggregator/0c580d8afe4a8f87b84e6576e72cfbb9c87a6c11";
       flake = false;
     };
 
