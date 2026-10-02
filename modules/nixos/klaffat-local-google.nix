@@ -60,10 +60,11 @@ let
   # repo, and refused when it does not, because a secret paired with the wrong
   # client is worth stopping for rather than guessing between two sources.
   #
-  # Google is required. Microsoft is optional: it is passed through only when
-  # the bundle holds its secret, and then the public id must be a real one.
-  # A Microsoft secret next to a placeholder id is refused for the same reason
-  # as a mismatched id.
+  # Google is required. Microsoft is optional and keyed on public
+  # configuration: while its public id is missing or a placeholder
+  # ("demo-unused"), every Microsoft line in the bundle is ignored, whatever it
+  # holds, so a bundle that predates this provider keeps working. Once a real
+  # id is configured, the Microsoft lines get the same checks as Google's.
   extractGoogleEnvironment = pkgs.writeText "extract-klaffat-google-environment.py" ''
     import json
     import pathlib
@@ -109,31 +110,43 @@ let
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
-        if name in values:
+        values.setdefault(name, []).append(value)
+
+    def bundled(name):
+        found = values.get(name, [])
+        if len(found) > 1:
             raise SystemExit(f"duplicate {name} assignment")
+        if not found:
+            return None
+        value = found[0]
         if not value or safe_value.fullmatch(value) is None:
             raise SystemExit(f"invalid {name} assignment")
-        values[name] = value
+        return value
 
     output_values = {}
     for prefix, (public_key, required) in providers.items():
         id_name = f"KLAFFAT_{prefix}_CLIENT_ID"
         secret_name = f"KLAFFAT_{prefix}_CLIENT_SECRET"
-        secret = values.get(secret_name)
+        public_client_id = public_oauth.get(public_key)
+        if isinstance(public_client_id, str):
+            public_client_id = public_client_id.strip()
+        configured = (
+            isinstance(public_client_id, str)
+            and public_client_id not in placeholder_ids
+        )
+        if not configured:
+            if required:
+                raise SystemExit(f"public {public_key} is missing or a placeholder")
+            continue
+        if safe_value.fullmatch(public_client_id) is None:
+            raise SystemExit(f"invalid public {public_key}")
+        secret = bundled(secret_name)
         if secret is None:
             if required:
                 raise SystemExit(f"missing required {secret_name} assignment")
-            # An id with no secret is inert: nothing can authenticate with it.
+            # A configured provider without its secret stays off.
             continue
-        public_client_id = public_oauth.get(public_key)
-        if not isinstance(public_client_id, str):
-            raise SystemExit(f"public {public_key} is not a string")
-        public_client_id = public_client_id.strip()
-        if public_client_id in placeholder_ids:
-            raise SystemExit(f"public {public_key} is a placeholder")
-        if safe_value.fullmatch(public_client_id) is None:
-            raise SystemExit(f"invalid public {public_key}")
-        bundled_client_id = values.get(id_name)
+        bundled_client_id = bundled(id_name)
         if bundled_client_id is not None and bundled_client_id != public_client_id:
             raise SystemExit(f"bundled {id_name} contradicts public configuration")
         output_values[id_name] = public_client_id
