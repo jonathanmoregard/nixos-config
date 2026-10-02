@@ -242,6 +242,53 @@ let
     server.serve_forever()
   '';
 
+  # A model asked how to treat a burn: it searches the documents, then answers
+  # without naming a source ("nocite", every time) or with one ("cite"). It
+  # records whether it was sent back to cite.
+  citeStub = pkgs.writeText "offline-ai-cite-stub.py" ''
+    import json, sys
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    MODE, LOG = sys.argv[2], sys.argv[3]
+
+    class Handler(BaseHTTPRequestHandler):
+        turns = 0
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def sse(self, delta):
+            self.wfile.write(b"data: " + json.dumps({"choices": [{"delta": delta}]}).encode() + b"\n\n")
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            Handler.turns += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            if Handler.turns == 1:
+                self.sse({"tool_calls": [{"index": 0, "id": "c0", "function": {
+                    "name": "search_docs", "arguments": json.dumps({"query": "burn cool water", "collection": "guides"})}}]})
+            else:
+                last = body["messages"][-1]
+                with open(LOG, "a") as fh:
+                    fh.write(json.dumps({"turn": Handler.turns, "role": last["role"], "content": last["content"]}) + "\n")
+                cite = MODE == "cite"
+                self.sse({"content": "Cool the burn under running water for 20 minutes."
+                          + ("\nSources: burns, page 1" if cite else "")})
+            self.wfile.write(b"data: [DONE]\n\n")
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    with open(sys.argv[1], "w") as fh:
+        fh.write(str(server.server_address[1]))
+    server.serve_forever()
+  '';
+
   freePort = pkgs.writeText "offline-ai-free-port.py" ''
     import socket
     with socket.socket() as sock:
@@ -331,6 +378,26 @@ pkgs.runCommand "offline-ai-harness"
 
     jq -e '.[8] | contains("not a manual section")' results.json > /dev/null \
       || fail "an option-like manual section reached man: $(jq '.[8]' results.json)"
+
+    # --- a medical answer must cite a stored reference the tools returned:
+    # without one it is sent back once, and if it still names none it is
+    # marked NOT VERIFIED; with one it goes through untouched.
+    echo '<html><head><title>Burns</title></head><body><h1>Burns</h1>
+      <p>Cool a burn under cool running water for 20 minutes.</p></body></html>' > guides/burns.html
+    for mode in nocite cite; do
+      rm -f cite_port cite.log
+      python3 ${citeStub} cite_port "$mode" "$PWD/cite.log" &
+      cite_pid=$!
+      for _ in $(seq 1 50); do [ -s cite_port ] && break; sleep 0.1; done
+      OFFLINE_AI_URL="http://127.0.0.1:$(cat cite_port)" ${offlineAi}/bin/offline-ai "how do I treat a burn" \
+        > "cite-$mode.out" 2> "cite-$mode.err" || { cat "cite-$mode.err"; fail "the burn question ($mode) failed"; }
+      kill $cite_pid
+    done
+    [ "$(grep -c '"role": "user"' cite.log)" = 0 ] || fail "a cited medical answer was sent back"
+    if grep -q 'NOT VERIFIED' cite-cite.out; then fail "a cited medical answer was marked not verified"; fi
+    grep -q 'NOT VERIFIED' cite-nocite.out || { cat cite-nocite.out; fail "an uncited medical answer was not marked"; }
+    grep -q 'revising: a medical or electrical answer' cite-nocite.out || fail "an uncited medical answer was not sent back first"
+    grep -q 'burns' cite-nocite.out || fail "the warning does not name the reference that was retrieved"
 
     # --- archive fetcher, against a local mirror
     mkdir -p mirror fetched

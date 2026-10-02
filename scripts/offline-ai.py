@@ -981,7 +981,7 @@ Rules:
 - For disk space, memory, slowness or connectivity, measure first (disk_usage, big_files, processes, network_status) and base the advice on what they show.
 - Before giving a command with flags you are not sure of, check its manual page (search_man, read_man).
 - For how-to knowledge beyond this machine, use search_docs (handbooks and manuals stored here) and search_library (offline wikis), and name the document or article you relied on.
-- The stored documents include first-aid, medical, water, food and shelter handbooks (collections survival and survival-more) and an emergency medicine wiki in the library. For injuries, illness or survival questions, search them before answering, give the steps they give, and say to get professional help when it can be reached.
+- The stored documents include first-aid, medical, water, food and shelter handbooks (collections survival and survival-more) and an emergency medicine wiki in the library. For injuries, illness, medicine or electricity, search them before answering, give only the steps they give, say to get professional help when it can be reached, and end with a line `Sources:` naming each document with its page, or each library article. Nothing from memory: if the references do not cover it, say so.
 - If the tools do not show it, say you could not verify it.
 - Be brief: the answer, the commands, one line of why."""
 
@@ -1074,9 +1074,57 @@ def tools_given_as_commands(text):
     return found
 
 
+# Questions where a wrong answer can hurt someone: injuries, illness, medicine,
+# electricity. English and Swedish word starts. Answers to them must cite the
+# stored references they came from; a false alarm only costs a citation.
+SAFETY = re.compile(r"\b(" + "|".join([
+    "bleed", "blöd", "blod", "wound", "sår", "burn", "bränn", "fractur", "fraktur", "broken bone", "bruten",
+    "sprain", "stuk", "cpr", "hlr", "resuscitat", "unconscious", "medvetslös", "chok", "kvävn", "satt i halsen",
+    "poison", "förgift", "fever", "feber", "diarrh", "diarré", "vomit", "kräk", "dehydrat", "uttork", "ors\\b",
+    "vätskeersätt", "infect", "infektion", "sepsis", "hypotherm", "nedkyl", "frostbite", "köldskad", "heat stroke",
+    "värmeslag", "allerg", "anaphyla", "anafyla", "asthma", "astma", "stroke", "heart attack", "hjärtinfarkt",
+    "hjärtstopp", "seizure", "epilep", "kramp", "pregnan", "gravid", "childbirth", "förlossning", "medicin",
+    "medication", "läkemedel", "dose\\b", "dosage", "dosering", "antibiot", "painkill", "värktablett", "pain\\b",
+    "smärta", "injur", "skadad", "sick", "sjuk", "symptom", "cholera", "kolera", "first aid", "första hjälpen",
+    "carbon monoxide", "kolmonoxid", "electric", "elektri", "elsäker", "elstöt", "shock", "chock", "fuse box",
+    "fusebox", "blown fuse", "power line", "live wire", "kraftledning", "elledning", "elinstallation", "wiring",
+    "säkring", "breaker", "jordfels", "voltage", "spänning", "generator", "elverk", "outlet", "eluttag",
+]) + ")", re.IGNORECASE)
+SOURCE_LINE = re.compile(r"^\W*(sources?|references?|källa|källor)\b", re.IGNORECASE | re.MULTILINE)
+
+
+def plain(text):
+    return " ".join(re.sub(r"[\W_]+", " ", str(text).lower()).split())
+
+
+def retrieved_sources(messages):
+    """Documents and articles the tools returned in this conversation, as names to cite."""
+    names = set()
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content") or ""
+        names.update(Path(doc).stem for doc in re.findall(r"^### (.+?), page \d+$", content, re.MULTILINE))
+        for title, article in re.findall(r"^### (.+)\narticle: (\S+)", content, re.MULTILINE):
+            names.update((title, Path(article).stem))
+    return {name for name in names if plain(name)}
+
+
+def cited(answer, sources):
+    """True when the answer has a Sources line naming at least one retrieved document or article."""
+    found = SOURCE_LINE.search(answer or "")
+    if not found:
+        return False
+    tail = plain(answer[found.start():])
+    return any(plain(name) in tail for name in sources)
+
+
 def answer(messages, out=sys.stdout, log=sys.stderr):
     """Run the tool loop for the question already appended to messages."""
-    asked, nudged = set(), False
+    asked, nudged, cite_nudged = set(), False, False
+    # The operator's own words, without the reminder and option-name leads with_leads() appends.
+    question = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    question = question.split("\n\n" + REMINDER)[0]
     for _ in range(MAX_STEPS):
         message = complete(messages, True, out)
         messages.append(message)
@@ -1095,7 +1143,29 @@ def answer(messages, out=sys.stdout, log=sys.stderr):
                                  f"You gave {names} as commands for me to run. Those are your tools; I cannot run "
                                  "them. Call them yourself now, then answer with real shell commands only."})
                 continue
-            return message["content"]
+            content = message["content"]
+            if SAFETY.search(question):
+                sources = retrieved_sources(messages)
+                if not cited(content, sources):
+                    if not cite_nudged:
+                        cite_nudged = True
+                        print("[check] safety answer without a cited stored source; asking again", file=log)
+                        out.write("\n[revising: a medical or electrical answer must name the stored reference it "
+                                  "comes from]\n\n")
+                        listed = "; ".join(sorted(sources)[:8])
+                        messages.append({"role": "user", "content": (
+                            "This is a medical or electrical question: give only what the stored references say, "
+                            "and end with a line 'Sources:' naming each document with its page, or each library "
+                            "article. " + (f"References you have retrieved: {listed}." if sources else
+                                           "You have not retrieved any yet: search_docs and search_library first."))})
+                        continue
+                    warning = ("\n\n!! NOT VERIFIED: this answer names no stored reference it was checked "
+                               "against. Do not rely on it for injuries, illness or electricity; "
+                               + (f"look it up yourself in: {'; '.join(sorted(sources)[:8])}." if sources else
+                                  "look it up yourself with `offline-ai library` or the survival documents.") + "\n")
+                    out.write(warning)
+                    return (content or "") + warning
+            return content
         for call in calls:
             name, arguments = call["function"]["name"], call["function"]["arguments"]
             print(f"[tool] {name} {arguments}", file=log)
