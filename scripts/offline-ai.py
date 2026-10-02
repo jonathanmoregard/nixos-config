@@ -54,6 +54,8 @@ EVICTED = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/offline-ai-{os.getuid
 # applications, terminals, the session bus and whatever this CLI itself runs
 # inside are never touched.
 MEMINFO = Path(os.environ.get("OFFLINE_AI_MEMINFO", "/proc/meminfo"))
+SWAPS = Path(os.environ.get("OFFLINE_AI_SWAPS", "/proc/swaps"))
+SYS_BLOCK = Path(os.environ.get("OFFLINE_AI_SYS_BLOCK", "/sys/block"))  # zramN/mm_stat lives here
 CGROUP_ROOT = Path(os.environ.get("OFFLINE_AI_CGROUP_ROOT", "/sys/fs/cgroup"))
 PROC = Path(os.environ.get("OFFLINE_AI_PROC", "/proc"))  # where GPU use is read from
 USER_CGROUP = os.environ.get("OFFLINE_AI_USER_CGROUP", "")  # the user manager's cgroup; found from /proc by default
@@ -61,6 +63,14 @@ FREEZE_MIN = 512 * 2**20  # units holding less than this are not worth freezing
 HEADROOM = 2**30  # free memory left over once the model is in
 NEVER_FREEZE = re.compile(r"^(app-|kitty-|tmux-|dbus|offline-ai|init\.scope|session-)")
 LIBRARY_UNIT = os.environ.get("OFFLINE_AI_LIBRARY_UNIT", "offline-ai-library.service")
+# While the model's memory reservation (a system unit the model unit starts
+# and stops around itself) is active, this path exists, and the units that
+# gave way refuse to start (ConditionPathExists=!MARKER): a deploy or a timer
+# cannot bring them back into the model's memory. restore() must therefore
+# only run once the marker is gone, and must notice when it is not.
+MARKER = os.environ.get("OFFLINE_AI_MODE_MARKER", "/run/memory-reserve/offline-ai")
+RESERVATION = os.environ.get("OFFLINE_AI_RESERVATION", "memory-reserve-offline-ai.service")
+READY_TIMEOUT = int(os.environ.get("OFFLINE_AI_READY_TIMEOUT", "900"))  # seconds to wait for the model
 
 
 def parse_collections(spec):
@@ -80,7 +90,16 @@ DOC_DIRS = list(COLLECTIONS.values())
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "offline-ai"
 
 MAX_STEPS = 8
-MAX_TOOL_CHARS = 6000
+# Tool output is budgeted so a conversation stays inside the model's context
+# (32k tokens on this host): one result is cut at MAX_TOOL_CHARS, and once the
+# results kept in the conversation add up to more than TOOL_BUDGET_CHARS the
+# oldest are replaced by a stub naming the call (trim_tool_results). Measured
+# 2026-10-02: 61k chars of tool results (layout-extracted PDF pages, about 5
+# chars per token) made a 16k-token prompt; the model spent the other 16k
+# tokens thinking and was cut off with nothing said. 40k chars keeps the
+# prompt near 12k tokens and leaves the rest for the answer.
+MAX_TOOL_CHARS = int(os.environ.get("OFFLINE_AI_TOOL_CHARS", 6000))
+TOOL_BUDGET_CHARS = int(os.environ.get("OFFLINE_AI_TOOL_BUDGET_CHARS", 40000))
 UNIT_NAME = re.compile(r"^[A-Za-z0-9@:._\\-]+$")
 WORD = re.compile(r"[a-z0-9]+")
 
@@ -88,7 +107,8 @@ WORD = re.compile(r"[a-z0-9]+")
 def clip(text, limit=MAX_TOOL_CHARS):
     if len(text) <= limit:
         return text
-    return text[:limit] + f"\n[... truncated, {len(text) - limit} more characters]"
+    return text[:limit] + (f"\n[... {len(text) - limit} more characters not shown; ask for a narrower range "
+                           "or a later start, or search for the part you need]")
 
 
 # ---------------------------------------------------------------- options
@@ -947,6 +967,65 @@ def call_tool(name, raw_arguments):
         return f"tool error: {type(exc).__name__}: {exc}"
 
 
+DROPPED = "dropped to save context; call it again if needed]"
+
+
+def describe_call(call):
+    """`name key=value ...`: what was asked, for a stub standing in for the result."""
+    function = call.get("function") or {}
+    try:
+        arguments = json.loads(function.get("arguments") or "{}")
+    except ValueError:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {"arguments": arguments}
+    pairs = " ".join(f"{key}={value}" for key, value in arguments.items())
+    return f"{function.get('name') or '?'} {pairs}".strip()[:160]
+
+
+def dropped_stub(call, content):
+    """What stands in for a dropped result: the call it answered, plus the
+    document and article names it listed, so an answer can still cite them."""
+    names = [line for line in content.splitlines() if line.startswith(("### ", "article: "))]
+    return "\n".join([f"[{describe_call(call)} — result {DROPPED}", *names[:16]])
+
+
+def is_dropped(message):
+    return message.get("role") == "tool" and (message.get("content") or "").split("\n", 1)[0].endswith(DROPPED)
+
+
+def result_of(messages, call_id):
+    """The tool message answering a call, or None."""
+    return next((m for m in messages if m.get("role") == "tool" and m.get("tool_call_id") == call_id), None)
+
+
+def trim_tool_results(messages, budget=TOOL_BUDGET_CHARS):
+    """Keep the tool results held in the conversation within the budget: the
+    oldest are replaced by stubs until the rest fit. The model's own turns
+    stay as they are. llama-server reuses its prompt cache up to the first
+    changed token, so a result rewritten this far back costs one re-prompt of
+    everything after it; that is the price of staying inside the context at
+    all. Returns how many were dropped."""
+    calls, results = {}, []
+    for message in messages:
+        if message.get("role") == "assistant":  # ids may repeat across turns: the latest assistant turn owns them
+            calls.update({call.get("id"): call for call in message.get("tool_calls") or []})
+        elif message.get("role") == "tool":
+            results.append((message, calls.get(message.get("tool_call_id"), {})))
+    total = sum(len(message.get("content") or "") for message, _ in results)
+    dropped = 0
+    for message, call in results:
+        if total <= budget:
+            break
+        if is_dropped(message):
+            continue
+        stub = dropped_stub(call, message.get("content") or "")
+        total -= len(message.get("content") or "") - len(stub)
+        message["content"] = stub
+        dropped += 1
+    return dropped
+
+
 # ------------------------------------------------------------------- chat
 
 
@@ -981,7 +1060,7 @@ Rules:
 - For disk space, memory, slowness or connectivity, measure first (disk_usage, big_files, processes, network_status) and base the advice on what they show.
 - Before giving a command with flags you are not sure of, check its manual page (search_man, read_man).
 - For how-to knowledge beyond this machine, use search_docs (handbooks and manuals stored here) and search_library (offline wikis), and name the document or article you relied on.
-- The stored documents include first-aid, medical, water, food and shelter handbooks (collections survival and survival-more) and an emergency medicine wiki in the library. For injuries, illness or survival questions, search them before answering, give the steps they give, and say to get professional help when it can be reached.
+- The stored documents include first-aid, medical, water, food and shelter handbooks (collections survival and survival-more) and an emergency medicine wiki in the library. For injuries, illness, medicine or electricity, search them before answering, give only the steps they give, say to get professional help when it can be reached, and end with a line `Sources:` naming each document with its page, or each library article. Nothing from memory: if the references do not cover it, say so.
 - If the tools do not show it, say you could not verify it.
 - Be brief: the answer, the commands, one line of why."""
 
@@ -1016,11 +1095,13 @@ def post(payload):
 
 
 def complete(messages, use_tools, out):
-    """One streamed model turn. Returns the assistant message."""
+    """One streamed model turn. Returns the assistant message and the server's
+    finish_reason: "stop" or "tool_calls" when the model ended its turn,
+    "length" when the server cut it off (the context filled up)."""
     payload = {"messages": messages, "stream": True, "temperature": 0.2}
     if use_tools:
         payload["tools"] = TOOLS
-    content, calls = [], {}
+    content, calls, finish = [], {}, None
     with post(payload) as response:
         for raw in response:
             line = raw.decode("utf-8", errors="replace").strip()
@@ -1032,6 +1113,7 @@ def complete(messages, use_tools, out):
             choices = json.loads(data).get("choices") or []
             if not choices:
                 continue
+            finish = choices[0].get("finish_reason") or finish
             delta = choices[0].get("delta") or {}
             if delta.get("content"):
                 content.append(delta["content"])
@@ -1050,7 +1132,7 @@ def complete(messages, use_tools, out):
              "function": {"name": c["name"], "arguments": c["arguments"]}}
             for i, c in sorted(calls.items())
         ]
-    return message
+    return message, finish
 
 
 CODE = re.compile(r"```[^\n]*\n(.*?)```|`([^`\n]+)`", re.DOTALL)
@@ -1074,15 +1156,134 @@ def tools_given_as_commands(text):
     return found
 
 
+# Questions where a wrong answer can hurt someone: injuries, illness, medicine,
+# electricity. English and Swedish word starts. Answers to them must cite the
+# stored references they came from; a false alarm only costs a citation.
+SAFETY = re.compile(r"\b(" + "|".join([
+    # "brän" covers bränna, bränt, brände; "brut" covers bruten, brutit.
+    "bleed", "blöd", "blod", "wound", "sår", "burn", "brän", "fractur", "fraktur", "broken bone", "brut",
+    "sprain", "stuk", "cpr", "hlr", "resuscitat", "unconscious", "medvetslös", "chok", "kvävn", "satt i halsen",
+    "poison", "förgift", "fever", "feber", "diarrh", "diarré", "vomit", "kräk", "dehydrat", "uttork", "ors\\b",
+    "vätskeersätt", "infect", "infektion", "sepsis", "hypotherm", "nedkyl", "frostbite", "köldskad", "heat stroke",
+    "värmeslag", "allerg", "anaphyla", "anafyla", "asthma", "astma", "stroke", "heart attack", "hjärtinfarkt",
+    "hjärtstopp", "seizure", "epilep", "kramp", "pregnan", "gravid", "childbirth", "förlossning", "medicin",
+    "medication", "läkemedel", "dose\\b", "dosage", "dosering", "antibiot", "painkill", "värktablett", "pain\\b",
+    "smärta", "injur", "skadad", "sick", "sjuk", "symptom", "cholera", "kolera", "first aid", "första hjälpen",
+    "carbon monoxide", "kolmonoxid", "electric", "elektri", "elsäker", "elstöt", "stöt", "shock", "chock",
+    "fuse box", "fusebox", "blown fuse", "power line", "live wire", "kraftledning", "elledning",
+    "elinstallation", "wiring", "säkring", "circuit breaker", "breaker box", "jordfels", "voltage", "spänning",
+    # Not a bare "generator" or "breaker": systemd has generators and a sysadmin
+    # question about them is not an electrical one.
+    "petrol generator", "diesel generator", "gasoline generator", "bensindriv", "dieseldriv", "elverk",
+    "outlet", "eluttag",
+]) + ")", re.IGNORECASE)
+# A citation line, not prose that happens to open with the word: the colon is
+# what "Sources of infection are ..." lacks. Markdown bold around it is fine.
+SOURCE_LINE = re.compile(r"^\W*(sources?|references?|källa|källor)\s*\**\s*:", re.IGNORECASE | re.MULTILINE)
+
+
+def plain(text):
+    return " ".join(re.sub(r"[\W_]+", " ", str(text).lower()).split())
+
+
+def retrieved_sources(messages):
+    """Documents and articles the tools returned in this conversation, as names to cite."""
+    names = set()
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content") or ""
+        names.update(Path(doc).stem for doc in re.findall(r"^### (.+?), page \d+$", content, re.MULTILINE))
+        for title, article in re.findall(r"^### (.+)\narticle: (\S+)", content, re.MULTILINE):
+            names.update((title, Path(article).stem))
+    return {name for name in names if plain(name)}
+
+
+def cited(answer, sources):
+    """True when the answer has a Sources line naming at least one retrieved document or article.
+    Names match as whole words or phrases, so "burn" does not vouch for "burns";
+    a one-word article title that is also the topic word can still be echoed by
+    a made-up citation, which only a structured citation format would catch."""
+    found = SOURCE_LINE.search(answer or "")
+    if not found:
+        return False
+    tail = plain(answer[found.start():])
+    return any(re.search(r"\b" + re.escape(plain(name)) + r"\b", tail) for name in sources)
+
+
+def safety_gate(question, content, messages, out, log, may_nudge):
+    """For a medical or electrical question, the answer must cite a retrieved
+    reference. Returns True when the model should be asked once more (the
+    nudge is appended to messages); otherwise the warning, if any, is written."""
+    if not SAFETY.search(question):
+        return False
+    sources = retrieved_sources(messages)
+    if cited(content, sources):
+        return False
+    if may_nudge:
+        print("[check] safety answer without a cited stored source; asking again", file=log)
+        out.write("\n[revising: a medical or electrical answer must name the stored reference it "
+                  "comes from]\n\n")
+        listed = "; ".join(sorted(sources)[:8])
+        messages.append({"role": "user", "content": (
+            "This is a medical or electrical question: give only what the stored references say, "
+            "and end with a line 'Sources:' naming each document with its page, or each library "
+            "article. " + (f"References you have retrieved: {listed}." if sources else
+                           "You have not retrieved any yet: search_docs and search_library first."))})
+        return True
+    out.write("\n\n!! NOT VERIFIED: this answer names no stored reference it was checked "
+              "against. Do not rely on it for injuries, illness or electricity; "
+              + (f"look it up yourself in: {'; '.join(sorted(sources)[:8])}." if sources else
+                 "look it up yourself with `offline-ai library` or the survival documents.") + "\n")
+    return False
+
+
+CUT_OFF = ("[cut off] The answer was cut short by the model's context limit. Ask a narrower question, "
+           "or for fewer pages or documents at a time.")
+
+
+def cut_off(message, finish, out, log):
+    """True when the reply ended at the context limit or said nothing at all.
+    Said on both streams: the operator must never get silence and exit 0 after
+    the model has run (a thinking model can spend the whole context thinking,
+    and that part is never printed)."""
+    text = message.get("content") or ""
+    if finish != "length" and text.strip():
+        return False
+    why = "the model hit its context limit" if finish == "length" else "the model answered with nothing"
+    print(f"[context] {why} (finish_reason={finish}); the answer is incomplete", file=log)
+    out.write(CUT_OFF + "\n")
+    out.flush()
+    if not text.strip():
+        # An assistant turn with neither text nor tool calls is refused by the
+        # server's chat template; keep the conversation valid for the next question.
+        message["content"] = "(no answer: the reply was cut off by the context limit)"
+    return True
+
+
+def within_budget(messages, log):
+    dropped = trim_tool_results(messages)
+    if dropped:
+        print(f"[context] dropped the text of {dropped} older tool result(s) to stay within the model's context; "
+              "they are named in place and can be fetched again", file=log)
+
+
 def answer(messages, out=sys.stdout, log=sys.stderr):
-    """Run the tool loop for the question already appended to messages."""
-    asked, nudged = set(), False
+    """Run the tool loop for the question already appended to messages.
+    Returns False when the final reply was cut off by the context limit."""
+    asked, nudged, cite_nudged = {}, False, False
+    # The operator's own words, without the reminder and option-name leads with_leads() appends.
+    question = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    question = question.split("\n\n" + REMINDER)[0]
     for _ in range(MAX_STEPS):
-        message = complete(messages, True, out)
+        within_budget(messages, log)
+        message, finish = complete(messages, True, out)
         messages.append(message)
         calls = message.get("tool_calls")
         if not calls:
             out.write("\n")
+            if cut_off(message, finish, out, log):
+                return False
             misused = tools_given_as_commands(message["content"])
             if misused and not nudged:
                 # Told in prose, a small model still hands its own tools to the operator as
@@ -1095,24 +1296,35 @@ def answer(messages, out=sys.stdout, log=sys.stderr):
                                  f"You gave {names} as commands for me to run. Those are your tools; I cannot run "
                                  "them. Call them yourself now, then answer with real shell commands only."})
                 continue
-            return message["content"]
+            if safety_gate(question, message["content"], messages, out, log, may_nudge=not cite_nudged):
+                cite_nudged = True
+                continue
+            return True
         for call in calls:
             name, arguments = call["function"]["name"], call["function"]["arguments"]
             print(f"[tool] {name} {arguments}", file=log)
-            if (name, arguments) in asked:
+            earlier = result_of(messages, asked.get((name, arguments)))
+            if earlier is not None and not is_dropped(earlier):
                 # A small model can loop on one lookup; the answer would be the same.
                 result = ("You already made this exact call and its result is above; it has not changed. "
                           "Answer from what you have, or look somewhere else.")
-            else:
-                asked.add((name, arguments))
+            else:  # new, or its earlier result was dropped to save context
+                asked[(name, arguments)] = call["id"]
                 result = call_tool(name, arguments)
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
     messages.append({"role": "user", "content": "Stop looking things up and give your best answer now, "
                      "saying plainly what you could not verify."})
-    message = complete(messages, False, out)
+    within_budget(messages, log)
+    message, finish = complete(messages, False, out)
     messages.append(message)
     out.write("\n")
-    return message["content"]
+    if cut_off(message, finish, out, log):
+        return False
+    # The same gate as above: an answer forced out of the model after it ran
+    # out of steps is the one most likely to be uncited, and it must not pass
+    # as checked. No second round: there are no steps left.
+    safety_gate(question, message["content"], messages, out, log, may_nudge=False)
+    return True
 
 
 # ---------------------------------------------------------------- service
@@ -1135,7 +1347,10 @@ big model and the library, and gives the memory back when it ends.
 
 The assistant only looks things up (options, this machine's flake, units and logs, disk,
 processes, network, manual pages, documents, the library, your notes). It never changes
-anything: it gives commands and Nix code for you to run."""
+anything: it gives commands and Nix code for you to run.
+
+Exit status of `offline-ai "question"`: 0 answered; 1 the model could not be loaded or
+reached; 2 the answer was cut off by the model's context limit (ask something narrower)."""
 
 
 MODEL_ERRORS = (urllib.error.URLError, OSError, ValueError, http.client.HTTPException)
@@ -1181,11 +1396,78 @@ def available_bytes():
     return meminfo("MemAvailable")
 
 
-def swappable_bytes():
-    """Anonymous memory the kernel can move to swap to make room: no more than
-    there is of it, and no more than swap can take. Pinned GPU memory is not
-    anonymous memory and never counts."""
-    return min(meminfo("AnonPages") or 0, meminfo("SwapFree") or 0)
+ZRAM = re.compile(r"^/dev/(zram\d+)$")
+
+
+def text_of(path):
+    try:
+        return Path(path).read_text()
+    except OSError:
+        return None
+
+
+def zram_mm_stat(name):
+    return text_of(SYS_BLOCK / name / "mm_stat")
+
+
+def swap_areas(swaps, mm_stat):
+    """The active swap areas of /proc/swaps as (free bytes, RAM freed per byte
+    swapped into it), highest priority first: the order the kernel fills them.
+
+    A swap file or partition frees a page of RAM for every page it takes. A
+    zram device is RAM: a page swapped into it stays resident, compressed, so
+    only what compression saves is freed, 1 - 1/ratio. The ratio is read from
+    the device's mm_stat (bytes stored / bytes they compress to, fields 1 and
+    2) and taken as 2 while nothing is in it yet."""
+    areas = []
+    for line in (swaps or "").splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 5 or not (fields[2].isdigit() and fields[3].isdigit()):
+            continue
+        free = max(0, int(fields[2]) - int(fields[3])) * 1024
+        share = 1.0
+        zram = ZRAM.match(fields[0])
+        if zram:
+            stat = (mm_stat(zram[1]) or "").split()
+            stored, compressed = (int(stat[0]), int(stat[1])) if stat[:2] and all(f.isdigit() for f in stat[:2]) else (0, 0)
+            ratio = stored / compressed if stored and compressed else 2.0
+            share = max(0.0, 1 - 1 / ratio)
+        priority = int(fields[4]) if fields[4].lstrip("-").isdigit() else 0
+        areas.append((priority, free, share))
+    return [(free, share) for _, free, share in sorted(areas, key=lambda area: -area[0])]
+
+
+def host_swap():
+    return meminfo("AnonPages") or 0, swap_areas(text_of(SWAPS), zram_mm_stat)
+
+
+def swappable_bytes(anon=None, areas=None):
+    """RAM that moving idle anonymous memory to swap would free: each area,
+    in the order the kernel fills them, takes what is left of the anonymous
+    memory up to its free space and frees its share of that. Pinned GPU
+    memory is not anonymous memory and never counts."""
+    if anon is None or areas is None:
+        anon, areas = host_swap()
+    freed = 0
+    for free, share in areas:
+        moved = min(anon, free)
+        anon -= moved
+        freed += moved * share
+    return int(freed)
+
+
+def swap_needed(shortfall, anon=None, areas=None):
+    """How much anonymous memory must move to swap to free `shortfall` bytes
+    of RAM: more than that where zram keeps a compressed copy in RAM."""
+    if anon is None or areas is None:
+        anon, areas = host_swap()
+    moved = 0
+    for free, share in areas:
+        if shortfall <= 0 or anon <= 0 or share <= 0:
+            continue
+        take = min(anon, free, shortfall / share)
+        anon, shortfall, moved = anon - take, shortfall - take * share, moved + take
+    return int(moved)
 
 
 def systemctl_user(verb, unit):
@@ -1451,6 +1733,21 @@ def bring_back(user, unit, how, spec):
     return systemctl(user, "start", unit)
 
 
+def clear_marker():
+    """The mode marker must be gone before anything is started again. Stopping
+    the model unit normally stops the reservation that holds it; when that
+    did not happen (the stop is best-effort inside the unit), stop the
+    reservation here, and say so if the marker still stands."""
+    if not os.path.exists(MARKER):
+        return True
+    systemctl(False, "stop", RESERVATION)
+    if os.path.exists(MARKER):
+        print(f"the mode marker {MARKER} still exists: what gave way to the model cannot start until it is gone "
+              f"(`systemctl stop {RESERVATION}`)", file=sys.stderr)
+        return False
+    return True
+
+
 def restore():
     """Bring back what gave way, latest first; keep anything that failed for next time."""
     failed = []
@@ -1461,7 +1758,14 @@ def restore():
             continue
         done = bring_back(*entry)
         word = {"freeze": "thaw", "relaunch": "relaunch"}.get(how, "restart")
-        if done.returncode == 0:
+        if done.returncode == 0 and how == "stop" and run(
+                ["systemctl", *scope(user), "show", "-p", "ConditionResult", "--value", "--", unit]) == "no":
+            # `systemctl start` returns 0 for a unit whose condition refused:
+            # it was not started. Nothing in the record may be forgotten that way.
+            failed.insert(0, entry)
+            print(f"{unit} did not start: its condition refused (the mode marker {MARKER} still exists)",
+                  file=sys.stderr)
+        elif done.returncode == 0:
             print(f"{word.rstrip('e')}ed {unit}", file=sys.stderr)
         else:
             failed.insert(0, entry)
@@ -1479,7 +1783,13 @@ def enter_offline_mode(force=False):
             make_room(model_bytes() + HEADROOM)
         up(force=force)
     except SystemExit:
-        restore()  # the model did not load: give back what was stopped for it
+        # The model did not load: give back what was stopped for it. The unit
+        # may still be running (a load that never became ready) and holding
+        # the reservation whose marker keeps those units from starting, so it
+        # goes first, then the marker, then what gave way.
+        systemctl_user("stop", UNIT)
+        clear_marker()
+        restore()
         raise
     start_library()
 
@@ -1487,8 +1797,9 @@ def enter_offline_mode(force=False):
 def leave_offline_mode():
     systemctl_user("stop", LIBRARY_UNIT)
     stopped = systemctl_user("stop", UNIT)
+    cleared = clear_marker()
     restored = restore()
-    return stopped.returncode == 0 and restored
+    return stopped.returncode == 0 and cleared and restored
 
 
 def up(force=False):
@@ -1496,35 +1807,49 @@ def up(force=False):
         return
     if MODEL and not os.path.exists(MODEL):
         sys.exit(f"the model is not on this machine: {MODEL}\n"
-                 "Fetch it while online (46 GB):\n"
+                 "Fetch it while online (23 GB):\n"
                  "  nix shell nixpkgs#python3Packages.huggingface-hub -c hf download "
-                 "Qwen/Qwen3-Coder-Next-GGUF --include 'Qwen3-Coder-Next-Q4_K_M/*' "
-                 "--local-dir ~/.local/share/llm-models/qwen3-coder-next")
+                 "unsloth/Qwen3.6-35B-A3B-GGUF --include 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' "
+                 "--local-dir ~/.local/share/llm-models/qwen3.6-35b-a3b-mtp")
     loading = run(["systemctl", "--user", "is-active", "--", UNIT]) in ("active", "activating")
     if MODEL and not force and not loading:
-        need, free, swappable = model_bytes(), available_bytes(), swappable_bytes()
+        need, free = model_bytes(), available_bytes()
+        anon, areas = host_swap()
+        swappable = swappable_bytes(anon, areas)
         if free is not None and need > free + swappable:
             sys.exit(f"not enough memory: the model needs about {need / 2**30:.0f} GiB; "
-                     f"{free / 2**30:.0f} GiB is available and {swappable / 2**30:.0f} GiB more could go to swap.\n"
+                     f"{free / 2**30:.0f} GiB is available and {swappable / 2**30:.0f} GiB more could go to swap"
+                     + (" (zram keeps swapped pages in RAM, compressed, so it frees less than it takes)"
+                        if any(share < 1 for _, share in areas) else "") + ".\n"
                      "Close something large first (`ps -eo rss,comm --sort=-rss | head`), "
                      "or run `offline-ai up --force` to load anyway.")
         if free is not None and need > free:
-            print(f"{(need - free) / 2**30:.0f} GiB of other programs' idle memory will move to swap "
-                  "while the model loads", file=sys.stderr)
+            moving = swap_needed(need - free, anon, areas)
+            print(f"{moving / 2**30:.0f} GiB of other programs' idle memory will move to swap while the model "
+                  f"loads, to free the {(need - free) / 2**30:.0f} GiB it still needs"
+                  + (" (zram keeps a compressed copy of what it takes in RAM)" if moving > need - free else ""),
+                  file=sys.stderr)
     print(f"loading the model ({UNIT})...", file=sys.stderr)
     started = systemctl_user("start", UNIT)
     if started.returncode != 0:
         sys.exit(f"could not start {UNIT}: {started.stderr.strip()}")
     began = time.time()
-    while time.time() - began < 900:
+    while time.time() - began < READY_TIMEOUT:
         if healthy():
             print(f"model ready after {time.time() - began:.0f} s", file=sys.stderr)
+            if not os.path.exists(MARKER):
+                # The unit starts its reservation best-effort, so the model
+                # answers either way; but without the marker a deploy or a
+                # timer can start what gave way, and builds are not capped.
+                print(f"warning: no mode marker at {MARKER}: the memory reservation ({RESERVATION}) did not "
+                      "start, so what gave way to the model may be started again by a deploy or a timer, "
+                      f"and builds are not capped; see: journalctl -u {RESERVATION} -b -n 20", file=sys.stderr)
             return
         state = run(["systemctl", "--user", "is-active", "--", UNIT])
         if state in ("failed", "inactive"):
             sys.exit(f"{UNIT} is {state}; see: journalctl --user -u {UNIT} -b -n 40")
-        time.sleep(3)
-    sys.exit(f"{UNIT} did not become ready within 15 minutes")
+        time.sleep(min(3, READY_TIMEOUT))
+    sys.exit(f"{UNIT} did not become ready within {READY_TIMEOUT // 60 or 1} minutes")
 
 
 def start_library():
@@ -1638,9 +1963,11 @@ def converse(question):
     if question:
         messages.append({"role": "user", "content": with_leads(" ".join(question))})
         try:
-            answer(messages)
+            finished = answer(messages)
         except MODEL_ERRORS as exc:
             sys.exit(model_error(exc))
+        if not finished:
+            sys.exit(2)  # said on stdout already; a distinct status so a script can tell it from an error
         return
     print("\n".join(status_lines()), file=sys.stderr)
     print("\noffline-ai. Ask a question; empty line or Ctrl-D to quit.", file=sys.stderr)

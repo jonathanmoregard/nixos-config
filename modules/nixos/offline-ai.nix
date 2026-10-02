@@ -29,37 +29,76 @@
 #   offline-ai down       # stop both servers and free the RAM
 #   offline-ai help
 #
-# WHY CPU AND NOT THE iGPU OR NPU. Measured on this machine 2026-09-30 with
-# this exact model (Qwen3-Coder-Next 80B-A3B, Q4_K_M): 12-13 tok/s on CPU
-# alone, 12.9 tok/s with as many layers as fit on the Radeon 890M. The
-# model is a sparse mixture-of-experts, so generation is bound by memory
-# bandwidth, which CPU and iGPU share. CPU-only needs no GTT kernel
-# parameter and leaves the iGPU free. A 27B dense model managed 1-4 tok/s
-# and answered worse. The NPU cannot run a model this size.
+# THE MODEL AND WHERE IT RUNS. Qwen3.6-35B-A3B (Unsloth UD-Q4_K_M, 22.7 GB,
+# with its multi-token-prediction head), the whole of it on the Radeon 890M
+# iGPU. Chosen 2026-10-02 over Qwen3-Coder-Next (80B-A3B, 46 GB, CPU-only)
+# on measurements from this machine:
+#   - it fits the iGPU's 33 GB GTT window, so every layer goes there
+#     (-ngl 99) and the MTP head drafts tokens (--spec-type draft-mtp,
+#     60-80% of drafts accepted). Served that way under the desktop's normal
+#     load: prompt 236-281 tok/s and generation 18-23 tok/s, against 148-153
+#     and 12-13 for the same model CPU-only — 1.5-1.8x end to end. The 46 GB
+#     model cannot be offloaded and measured 12-13 tok/s on CPU (2026-09-30).
+#   - half the memory: 23 GB resident instead of 46, so less of the desktop
+#     has to give way for it (make_room in scripts/offline-ai.py).
+#   - it answered the same 13-ask test set as well: 10 good, 2 partial,
+#     every medical answer cited its stored pages (bench 2026-10-02-small-v3).
+#   - 64k of context instead of 32k. The model is hybrid attention (10 of 40
+#     layers keep a KV cache), so the extra context costs ~0.7 GB; the
+#     CLI's tool-output budget is what keeps conversations inside it.
 #
-# THE MODEL IS NOT IN THE NIX STORE. It is 46 GB of weights fetched once
+# WHAT MAKES IT SLOW IS THE REST OF THE MACHINE. Measured 2026-10-02
+# (llama-bench tg64): 13-14 tok/s CPU-only with the box quiet, 6-7 tok/s
+# with a cargo build or a busy Chrome tab running, 2-4 tok/s while memory
+# was short and the weights were being re-read from disk. Two things in
+# the unit below follow from that:
+#   - CPUWeight=1000. The server's threads spin while they wait for each
+#     other, so one stolen core stalls every token; at the default weight
+#     of 100 the model shares the CPU equally with every tab and build.
+#     With weight 1000, two busy threads and another session's build
+#     alongside: 12.9 tok/s against 5.8 at the default weight (iGPU path),
+#     6.8 against 3.5 (CPU path). nice does not help: it only ranks
+#     processes inside one cgroup, and every app scope is its own.
+#   - -t 8, not 12. The chip has 4 Zen 5 and 8 Zen 5c cores; 12 threads
+#     leave nothing for the rest of the desktop and are no faster when it
+#     is idle (13.2 tok/s at 12 threads, 14.4 at 8, 14.1 at 4). On the iGPU
+#     path the threads only feed the GPU, and 8 still leaves the desktop
+#     responsive.
+#
+# THE MODEL IS NOT IN THE NIX STORE. It is 23 GB of weights fetched once
 # into the home directory; putting it in the store would copy it into every
 # closure and every VM test. ConditionPathExists keeps the unit inert on a
 # machine that has not fetched it, and the CLI says how to fetch:
 #
 #   nix shell nixpkgs#python3Packages.huggingface-hub -c hf download \
-#     Qwen/Qwen3-Coder-Next-GGUF --include 'Qwen3-Coder-Next-Q4_K_M/*' \
-#     --local-dir ~/.local/share/llm-models/qwen3-coder-next
+#     unsloth/Qwen3.6-35B-A3B-GGUF --include 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' \
+#     --local-dir ~/.local/share/llm-models/qwen3.6-35b-a3b-mtp
 { config, lib, pkgs, ... }:
 let
   home = config.users.users.jonathan.home;
-  model = "${home}/.local/share/llm-models/qwen3-coder-next/Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf";
+  model = "${home}/.local/share/llm-models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
+  # While the model is loaded this path exists (memory-pressure.nix creates
+  # it for the reservation below); the services that gave way to the model
+  # refuse to start while it does, so a deploy or a timer cannot bring them
+  # back into the memory the model is holding. restore() runs after the
+  # reservation ends, so it still starts them.
+  modeMarker = "/run/memory-reserve/offline-ai";
   port = 8717;
   unit = "offline-ai-llm.service";
   libraryPort = 8718;
   libraryUnit = "offline-ai-library.service";
   corpus = "${home}/Repos/survival-corpus/corpus";
 
-  # What gives way while the big model is loaded (offline-AI mode). All of it
+  # What gives way while the model is loaded (offline-AI mode). All of it
   # needs the network or only matters online; the microVMs alone can take
   # 7 GiB. Timers come before the services they start, so nothing restarts
   # a service while it is stopped. The CLI stops only those that are running
-  # and starts exactly those again when the mode ends.
+  # and starts exactly those again when the mode ends. The services also
+  # carry ConditionPathExists=!${modeMarker} (below), because a
+  # `nixos-rebuild switch` restarts every enabled unit it finds stopped and
+  # a timer tick starts its service: measured 2026-10-02, a deploy brought
+  # the embed server back into the model's memory three minutes after it
+  # had given way.
   evictSystem = [
     "research-agent-healthcheck.timer"
     "scraper-healthcheck.timer"
@@ -74,7 +113,8 @@ let
     "router-ingestor-scan.timer"
     "router-ingestor.service"
     "voquill.service"
-    # The embed worker, then the llama-server it talks to (iGPU, ~1.5 GB).
+    # The embed worker, then the llama-server it talks to (iGPU; it has held
+    # 15 GB of GTT after a big batch, which is what thrashed the model).
     "aggregator-embed.service"
     "aggregator-embed-server.service"
     # local-stt.nix: the router first, then the two models behind it (~2 GB).
@@ -82,6 +122,22 @@ let
     "local-stt-general.service"
     "local-stt-swedish.service"
   ];
+  # The services above (not the timers: their services carry the condition)
+  # plus the scan the router timer fires. All home-manager units, so the
+  # condition goes in as a drop-in beside each unit file; a drop-in appends
+  # to any ConditionPathExists= the unit already has.
+  gatedUserServices = [
+    "aggregator-ingest.service"
+    "aggregator-embed.service"
+    "aggregator-embed-server.service"
+    "router-ingestor.service"
+    "router-ingestor-scan.service"
+    "voquill.service"
+    "local-stt.service"
+    "local-stt-general.service"
+    "local-stt-swedish.service"
+  ];
+  gatedSystemServices = [ "microvm@research-agent" "microvm@scraper" ];
 
   # Document collections the assistant can search, as label=directory. The
   # manuals come from this system's own closure, so they always describe
@@ -159,6 +215,8 @@ let
       export OFFLINE_AI_DOC_DIRS="''${OFFLINE_AI_DOC_DIRS:-${collections}}"
       export OFFLINE_AI_LIBRARY_URL="''${OFFLINE_AI_LIBRARY_URL:-http://127.0.0.1:${toString libraryPort}}"
       export OFFLINE_AI_LIBRARY_UNIT="''${OFFLINE_AI_LIBRARY_UNIT:-${libraryUnit}}"
+      export OFFLINE_AI_MODE_MARKER="''${OFFLINE_AI_MODE_MARKER:-${modeMarker}}"
+      export OFFLINE_AI_RESERVATION="''${OFFLINE_AI_RESERVATION:-memory-reserve-offline-ai.service}"
       export OFFLINE_AI_EVICT_SYSTEM="''${OFFLINE_AI_EVICT_SYSTEM-${lib.concatStringsSep " " evictSystem}}"
       export OFFLINE_AI_EVICT_USER="''${OFFLINE_AI_EVICT_USER-${lib.concatStringsSep " " evictUser}}"
       exec python3 ${../../scripts/offline-ai.py} "$@"
@@ -176,9 +234,10 @@ in
   home-manager.users.jonathan.manual.json.enable = true;
   home-manager.users.jonathan.manual.html.enable = true;
 
-  # The model's weights and 32k context, held while the server runs. Builds
-  # shrink to what is left (memory-pressure.nix) so they cannot evict it.
-  services.memoryPressure.reservations.offline-ai = 45 * 1024 * 1024 * 1024;
+  # The model's weights (22.7 GB, pinned in GTT while on the iGPU), its 64k
+  # context and compute buffers, held while the server runs. Builds shrink
+  # to what is left (memory-pressure.nix) so they cannot evict it.
+  services.memoryPressure.reservations.offline-ai = 24 * 1024 * 1024 * 1024;
 
   systemd.user.services.offline-ai-llm = {
     description = "offline-ai local model server (llama.cpp)";
@@ -189,12 +248,37 @@ in
       # crash or a failed start, so the reservation never outlives the model.
       ExecStartPre = "-${pkgs.systemd}/bin/systemctl start memory-reserve-offline-ai.service";
       ExecStopPost = "-${pkgs.systemd}/bin/systemctl stop memory-reserve-offline-ai.service";
-      # -np 1: one conversation at a time, so the whole 32k context belongs
-      # to it instead of being divided between server slots.
-      ExecStart = "${pkgs.llama-cpp-vulkan}/bin/llama-server -m ${model} -ngl 0 -t 12 -c 32768 -np 1 --jinja -fa on --host 127.0.0.1 --port ${toString port}";
+      # -np 1: one conversation at a time, so the whole 64k context belongs
+      # to it instead of being divided between server slots. -ngl 99 and
+      # --spec-type draft-mtp: see the header; both need this model.
+      # --reasoning-budget 8192: this is a thinking model, and left alone it
+      # once thought through the last 16k tokens of its context on a
+      # first-aid question and had nothing left for the answer (bench
+      # 2026-10-02-small-v3, q10). 8k of thought is plenty for a step-by-step
+      # answer; the CLI reports a cut-off answer if it still happens.
+      ExecStart = "${pkgs.llama-cpp-vulkan}/bin/llama-server -m ${model} -ngl 99 -t 8 -c 65536 -np 1 --jinja -fa on --spec-type draft-mtp --reasoning-budget 8192 --host 127.0.0.1 --port ${toString port}";
+      # Wins the CPU against the rest of the desktop while it answers; see
+      # the header. The cpu controller is delegated to the user manager, so
+      # the weight applies between this unit and every app scope beside it.
+      CPUWeight = 1000;
       Restart = "no";
     };
   };
+
+  # While the model holds its memory, what gave way for it stays down even
+  # if a deploy or a timer tries to start it; see evictSystem/evictUser.
+  home-manager.users.jonathan.xdg.configFile = lib.listToAttrs (map (unit:
+    lib.nameValuePair "systemd/user/${unit}.d/offline-ai.conf" {
+      text = ''
+        [Unit]
+        ConditionPathExists=!${modeMarker}
+      '';
+    }) gatedUserServices);
+  systemd.services = lib.genAttrs gatedSystemServices (_: {
+    # A list, so it joins the template's own ConditionPathExists instead of
+    # replacing it (the instance units are drop-ins over microvm@.service).
+    unitConfig.ConditionPathExists = [ "!${modeMarker}" ];
+  });
 
   # The CLI runs as jonathan and must stop and start the system units that give
   # way to the model, and nothing else: only these units, only start/stop.
