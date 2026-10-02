@@ -68,9 +68,15 @@ let
   ];
   evictUser = [
     "aggregator-ingest.timer"
+    # The embed timer first: its worker Wants= the embed server and would
+    # start it again on the next tick.
+    "aggregator-embed.timer"
     "router-ingestor-scan.timer"
     "router-ingestor.service"
     "voquill.service"
+    # The embed worker, then the llama-server it talks to (iGPU, ~1.5 GB).
+    "aggregator-embed.service"
+    "aggregator-embed-server.service"
     # local-stt.nix: the router first, then the two models behind it (~2 GB).
     "local-stt.service"
     "local-stt-general.service"
