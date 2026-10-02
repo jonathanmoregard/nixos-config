@@ -47,6 +47,19 @@ EVICT = {
     True: os.environ.get("OFFLINE_AI_EVICT_USER", "").split(),
 }
 EVICTED = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/offline-ai-{os.getuid()}") / "offline-ai" / "evicted.json"
+# When the listed units are not enough, other large units of this user give
+# way too, largest first, until the model fits: frozen with their memory
+# pushed to swap, or, when they hold GPU memory (pinned RAM on this APU, which
+# only goes with the process), stopped and started again afterwards. Desktop
+# applications, terminals, the session bus and whatever this CLI itself runs
+# inside are never touched.
+MEMINFO = Path(os.environ.get("OFFLINE_AI_MEMINFO", "/proc/meminfo"))
+CGROUP_ROOT = Path(os.environ.get("OFFLINE_AI_CGROUP_ROOT", "/sys/fs/cgroup"))
+PROC = Path(os.environ.get("OFFLINE_AI_PROC", "/proc"))  # where GPU use is read from
+USER_CGROUP = os.environ.get("OFFLINE_AI_USER_CGROUP", "")  # the user manager's cgroup; found from /proc by default
+FREEZE_MIN = 512 * 2**20  # units holding less than this are not worth freezing
+HEADROOM = 2**30  # free memory left over once the model is in
+NEVER_FREEZE = re.compile(r"^(app-|kitty-|tmux-|dbus|offline-ai|init\.scope|session-)")
 LIBRARY_UNIT = os.environ.get("OFFLINE_AI_LIBRARY_UNIT", "offline-ai-library.service")
 
 
@@ -1151,17 +1164,28 @@ def model_bytes():
     return sum(f.stat().st_size for f in files if f.is_file())
 
 
-def available_bytes():
-    """MemAvailable in bytes, or None where /proc/meminfo does not report it."""
+def meminfo(key):
+    """A /proc/meminfo field in bytes, or None where it is not reported."""
     try:
-        lines = Path("/proc/meminfo").read_text().splitlines()
+        lines = MEMINFO.read_text().splitlines()
     except OSError:
         return None
     for line in lines:
         fields = line.split()
-        if fields[:1] == ["MemAvailable:"] and len(fields) > 1 and fields[1].isdigit():
+        if fields[:1] == [key + ":"] and len(fields) > 1 and fields[1].isdigit():
             return int(fields[1]) * 1024
     return None
+
+
+def available_bytes():
+    return meminfo("MemAvailable")
+
+
+def swappable_bytes():
+    """Anonymous memory the kernel can move to swap to make room: no more than
+    there is of it, and no more than swap can take. Pinned GPU memory is not
+    anonymous memory and never counts."""
+    return min(meminfo("AnonPages") or 0, meminfo("SwapFree") or 0)
 
 
 def systemctl_user(verb, unit):
@@ -1173,9 +1197,16 @@ def systemctl(user, verb, unit):
 
 
 def read_evicted():
+    """What gave way to the model, oldest first, as (user, unit, how, spec) entries.
+
+    how is "stop" (start it again), "freeze" (thaw it) or "relaunch" (a
+    transient unit, recreated from spec: argv, working directory, environment,
+    slice). Records from older versions have only (user, unit) and were stops."""
     try:
-        return [(bool(user), unit) for user, unit in json.loads(EVICTED.read_text())]
-    except (OSError, ValueError, TypeError):
+        return [(bool(entry[0]), entry[1], entry[2] if len(entry) > 2 else "stop",
+                 entry[3] if len(entry) > 3 else None)
+                for entry in json.loads(EVICTED.read_text())]
+    except (OSError, ValueError, TypeError, IndexError):
         return []
 
 
@@ -1185,44 +1216,267 @@ def write_evicted(entries):
         return
     EVICTED.parent.mkdir(parents=True, exist_ok=True)
     tmp = EVICTED.with_suffix(".tmp")
-    tmp.write_text(json.dumps([[user, unit] for user, unit in entries]))
+    tmp.write_text(json.dumps([list(entry) for entry in entries]))
     tmp.replace(EVICTED)
+
+
+def record(entry):
+    """Append one entry at once, so an interrupted run can still restore it."""
+    write_evicted(read_evicted() + [entry])
+
+
+def unrecord(entry):
+    entries = read_evicted()
+    if entry in entries:
+        entries.remove(entry)
+    write_evicted(entries)
 
 
 def evict():
     """Stop the running units that give way to the model; remember which, for restore()."""
-    stopped = read_evicted()
     for user in (False, True):
         for unit in EVICT[user]:
-            if (user, unit) in stopped or run(["systemctl", *scope(user), "is-active", "--", unit]) not in (
-                    "active", "activating", "reloading"):
+            if any(entry[:2] == (user, unit) for entry in read_evicted()) or run(
+                    ["systemctl", *scope(user), "is-active", "--", unit]) not in ("active", "activating", "reloading"):
                 continue
             done = systemctl(user, "stop", unit)
             if done.returncode == 0:
-                stopped.append((user, unit))
-                write_evicted(stopped)  # recorded at once, so an interrupted run can still restore it
+                record((user, unit, "stop", None))
                 print(f"stopped {unit} to make room", file=sys.stderr)
             else:
                 print(f"could not stop {unit}: {done.stderr.strip()}", file=sys.stderr)
 
 
+def own_cgroups():
+    """The cgroups of this process and every process above it (terminal, shell, session)."""
+    groups, pid = set(), os.getpid()
+    while pid > 1:
+        try:
+            for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines():
+                if line.startswith("0::"):
+                    groups.add(line[3:])
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return groups
+
+
+def cgroup_bytes(group):
+    """Memory the cgroup holds in RAM (anonymous and page cache)."""
+    try:
+        return int((group / "memory.current").read_text())
+    except (OSError, ValueError):
+        return 0
+
+
+def gpu_bytes():
+    """GPU memory per cgroup, from the DRM fdinfo of this user's processes.
+
+    On an APU the GPU's buffers are ordinary RAM, pinned: not charged to any
+    cgroup, not swappable, not released by freezing. A model server with its
+    layers on the iGPU can hold tens of GiB this way. Each client is counted
+    once however many descriptors share it."""
+    seen, held = set(), {}
+    for proc in PROC.iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            group = next((line[3:] for line in (proc / "cgroup").read_text().splitlines()
+                          if line.startswith("0::")), None)
+            fdinfos = list((proc / "fdinfo").iterdir())
+        except OSError:
+            continue
+        for fdinfo in fdinfos:
+            try:
+                text = fdinfo.read_text()
+            except OSError:
+                continue
+            if "drm-client-id" not in text:
+                continue
+            fields = dict(line.split(":", 1) for line in text.splitlines() if ":" in line)
+            client = (fields.get("drm-pdev", "").strip(), fields.get("drm-client-id", "").strip())
+            if client in seen or group is None:
+                continue
+            seen.add(client)
+            # What is resident, wherever it sits: on an APU a buffer allotted as
+            # VRAM can live in GTT, so drm-total-gtt alone undercounts. Older
+            # amdgpu kernels report only drm-memory-<region>.
+            kind = "drm-resident-" if any(key.startswith("drm-resident-") for key in fields) else "drm-memory-"
+            for key, value in fields.items():
+                parts = value.split()
+                if key.startswith(kind) and parts and parts[0].isdigit():
+                    scale = {"KiB": 2**10, "MiB": 2**20, "GiB": 2**30}.get(parts[1] if len(parts) > 1 else "", 1)
+                    held[group] = held.get(group, 0) + int(parts[0]) * scale
+    return held
+
+
+def user_manager():
+    """The cgroup directory of this user's systemd manager, or None outside one."""
+    manager = Path(USER_CGROUP) if USER_CGROUP else None
+    marker = f"user@{os.getuid()}.service"
+    for group in own_cgroups() if manager is None else ():
+        if marker in group:
+            manager = CGROUP_ROOT / (group.lstrip("/").split(marker)[0] + marker)
+            break
+    if manager is None:  # run from an SSH login or cron: not below the manager, which is still there
+        manager = CGROUP_ROOT / "user.slice" / f"user-{os.getuid()}.slice" / marker
+    return manager if manager is not None and manager.is_dir() else None
+
+
+def user_units():
+    """This user's units that may give way, as (unit, cgroup dir). Desktop
+    applications, terminals, the session bus, offline-ai's own units and
+    whatever this CLI runs inside are left alone."""
+    manager = user_manager()
+    if manager is None:
+        return []
+    protected = [CGROUP_ROOT / group.lstrip("/") for group in own_cgroups()]
+    found = []
+    for group in manager.rglob("*"):
+        name = group.name
+        if not group.is_dir() or not name.endswith((".service", ".scope")) or NEVER_FREEZE.match(name):
+            continue
+        if group.parent.name.endswith((".service", ".scope")):
+            continue  # a unit's own sub-cgroup, not a unit
+        if "session.slice" in group.relative_to(manager).parts:
+            continue  # what the desktop session itself runs on (compositor, shell)
+        if any(p == group or group in p.parents for p in protected):
+            continue
+        found.append((name, group))
+    return found
+
+
+def bus_path(unit):
+    """The D-Bus object path of a unit: every byte outside [A-Za-z0-9] as _xx."""
+    return "/org/freedesktop/systemd1/unit/" + "".join(
+        c if c.isascii() and c.isalnum() else "".join(f"_{b:02x}" for b in c.encode()) for c in unit)
+
+
+def relaunch_spec(unit):
+    """How to start a transient unit again once it is gone: its exact argv,
+    working directory, environment and slice, read from the manager."""
+    done = subprocess.run(["busctl", "--user", "--json=short", "get-property", "org.freedesktop.systemd1",
+                           bus_path(unit), "org.freedesktop.systemd1.Service",
+                           "ExecStart", "Environment", "WorkingDirectory", "Slice"],
+                          capture_output=True, text=True)
+    if done.returncode != 0:
+        return None
+    try:
+        execs, env, workdir, slice_ = (json.loads(line)["data"] for line in done.stdout.splitlines() if line.strip())
+        # WorkingDirectory reads "!/path" when a missing directory is allowed.
+        return {"argv": execs[0][1], "env": env, "workdir": workdir.lstrip("!"), "slice": slice_}
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
+def give_way(unit, group, gpu):
+    """Free what one unit holds. GPU memory goes only when the process does, so
+    a unit holding it is stopped, to be started again later (recreated from
+    its recorded command line if it was transient). Anything else is frozen
+    and its memory pushed to swap; thawing it later brings it back as it was."""
+    if gpu:
+        if unit.endswith(".scope"):
+            # A scope's processes were started outside systemd: nothing could start them again.
+            print(f"left {unit} running ({gpu / 2**30:.1f} GiB of GPU memory): it could not be started again",
+                  file=sys.stderr)
+            return False
+        transient = run(["systemctl", "--user", "show", "-p", "Transient", "--value", "--", unit]) == "yes"
+        spec = relaunch_spec(unit) if transient else None
+        if transient and spec is None:
+            print(f"left {unit} running: could not record how to start it again", file=sys.stderr)
+            return False
+        # Recorded before acting, so a run killed in between still knows how to bring it back.
+        entry = (True, unit, "relaunch" if transient else "stop", spec)
+        record(entry)
+        done = systemctl(True, "stop", unit)
+        if done.returncode != 0:
+            unrecord(entry)
+            print(f"could not stop {unit}: {done.stderr.strip()}", file=sys.stderr)
+            return False
+        print(f"stopped {unit} ({gpu / 2**30:.1f} GiB of GPU memory) to make room", file=sys.stderr)
+        return True
+    size = cgroup_bytes(group)
+    entry = (True, unit, "freeze", None)
+    record(entry)
+    done = systemctl(True, "freeze", unit)
+    if done.returncode != 0:
+        unrecord(entry)
+        print(f"could not freeze {unit}: {done.stderr.strip()}", file=sys.stderr)
+        return False
+    try:
+        (group / "memory.reclaim").write_text(str(size))
+    except OSError:
+        pass  # EAGAIN: less than asked could be reclaimed; what was is still freed
+    print(f"froze {unit} ({size / 2**30:.1f} GiB moved to swap) to make room", file=sys.stderr)
+    return True
+
+
+def make_room(need):
+    """Free memory until `need` bytes are available: this user's large units
+    give way, largest first, and stop as soon as there is enough."""
+    held = gpu_bytes()
+    candidates = []
+    for unit, group in user_units():
+        try:
+            if (group / "cgroup.freeze").read_text().strip() == "1":
+                continue  # already frozen, by us or anyone
+        except OSError:
+            continue
+        gpu = sum(size for path, size in held.items()
+                  if CGROUP_ROOT / path.lstrip("/") == group or group in (CGROUP_ROOT / path.lstrip("/")).parents)
+        size = gpu + cgroup_bytes(group)
+        if size >= FREEZE_MIN:
+            candidates.append((size, unit, group, gpu if gpu >= FREEZE_MIN else 0))
+    for size, unit, group, gpu in sorted(candidates, key=lambda item: item[0], reverse=True):
+        free = available_bytes()
+        if free is None or free >= need:
+            return
+        give_way(unit, group, gpu)
+    # What is still short is left to the kernel: as the model loads it moves
+    # the coldest pages of everything else to swap, which up() allows for.
+
+
+def bring_back(user, unit, how, spec):
+    if how == "freeze":
+        return systemctl(user, "thaw", unit)
+    if how == "relaunch":
+        argv = ["systemd-run", "--user", f"--unit={unit}", "--collect"]
+        if spec.get("slice"):
+            argv.append(f"--slice={spec['slice']}")
+        if spec.get("workdir"):
+            argv.append(f"--working-directory={spec['workdir']}")
+        argv += [f"--setenv={pair}" for pair in spec.get("env") or []]
+        return subprocess.run([*argv, "--", *spec["argv"]], capture_output=True, text=True)
+    return systemctl(user, "start", unit)
+
+
 def restore():
-    """Start again what evict() stopped, latest first; keep anything that would not start for next time."""
+    """Bring back what gave way, latest first; keep anything that failed for next time."""
     failed = []
-    for user, unit in reversed(read_evicted()):
-        done = systemctl(user, "start", unit)
+    for entry in reversed(read_evicted()):
+        user, unit, how, spec = entry
+        if how == "freeze" and run(["systemctl", *scope(user), "show", "-p", "LoadState", "--value", "--", unit]) != "loaded":
+            print(f"{unit} is gone; nothing to thaw", file=sys.stderr)  # its processes ended while frozen
+            continue
+        done = bring_back(*entry)
+        word = {"freeze": "thaw", "relaunch": "relaunch"}.get(how, "restart")
         if done.returncode == 0:
-            print(f"restarted {unit}", file=sys.stderr)
+            print(f"{word.rstrip('e')}ed {unit}", file=sys.stderr)
         else:
-            failed.insert(0, (user, unit))
-            print(f"could not restart {unit}: {done.stderr.strip()}", file=sys.stderr)
+            failed.insert(0, entry)
+            print(f"could not {word} {unit}: {done.stderr.strip()}", file=sys.stderr)
     write_evicted(failed)
     return not failed
+
+
 
 
 def enter_offline_mode(force=False):
     evict()
     try:
+        if MODEL and os.path.exists(MODEL) and not healthy():
+            make_room(model_bytes() + HEADROOM)
         up(force=force)
     except SystemExit:
         restore()  # the model did not load: give back what was stopped for it
@@ -1248,11 +1502,15 @@ def up(force=False):
                  "--local-dir ~/.local/share/llm-models/qwen3-coder-next")
     loading = run(["systemctl", "--user", "is-active", "--", UNIT]) in ("active", "activating")
     if MODEL and not force and not loading:
-        need, free = model_bytes(), available_bytes()
+        need, free, swappable = model_bytes(), available_bytes(), swappable_bytes()
+        if free is not None and need > free + swappable:
+            sys.exit(f"not enough memory: the model needs about {need / 2**30:.0f} GiB; "
+                     f"{free / 2**30:.0f} GiB is available and {swappable / 2**30:.0f} GiB more could go to swap.\n"
+                     "Close something large first (`ps -eo rss,comm --sort=-rss | head`), "
+                     "or run `offline-ai up --force` to load anyway.")
         if free is not None and need > free:
-            sys.exit(f"not enough free memory: the model needs about {need / 2**30:.0f} GiB and "
-                     f"{free / 2**30:.0f} GiB is available.\nClose something large first "
-                     "(`ps -eo rss,comm --sort=-rss | head`), or run `offline-ai up --force` to load anyway.")
+            print(f"{(need - free) / 2**30:.0f} GiB of other programs' idle memory will move to swap "
+                  "while the model loads", file=sys.stderr)
     print(f"loading the model ({UNIT})...", file=sys.stderr)
     started = systemctl_user("start", UNIT)
     if started.returncode != 0:
@@ -1290,7 +1548,8 @@ def status_lines():
     index = load_doc_index()
     lines = ["model server: " + ("ready" if healthy() else run(["systemctl", "--user", "is-active", "--", UNIT]))]
     evicted = read_evicted()
-    lines.append("mode: offline-AI, stopped for it: " + ", ".join(unit for _, unit in evicted) if evicted
+    lines.append("mode: offline-AI, stopped for it: " + ", ".join(
+        unit + (" (frozen)" if how == "freeze" else "") for _, unit, how, _spec in evicted) if evicted
                  else "mode: " + ("offline-AI" if healthy() else "default"))
     for source, path in OPTION_FILES.items():
         lines.append(f"{source} options: " + ("present" if path and os.path.exists(path) else "MISSING"))
