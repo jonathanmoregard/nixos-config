@@ -928,7 +928,20 @@ in
         "git -C $root/seed commit -q --allow-empty -m seed; "
         "git -C $root/seed push -q origin HEAD:refs/heads/main; "
         "GIT_DIR=$root/repo.git git worktree add -q $root/anchor main; "
-        "git -C $root/anchor worktree add -q --force $root/duplicate main'"
+        "git -C $root/anchor worktree add -q --force $root/duplicate main; "
+        # User-unit surface: a hand-authored unit, an imperative
+        # `systemctl --user enable` link (points at the unit path under
+        # ~/.config, not into the store), and a store-owned link of the
+        # shape home-manager writes, which must stay silent.
+        "u=$root/home/.config/systemd/user; mkdir -p $u/timers.target.wants; "
+        "printf \"[Timer]\\nOnCalendar=hourly\\n\" > $u/hand-made.timer; "
+        "ln -s $u/hand-made.timer $u/timers.target.wants/hand-made.timer; "
+        "ln -s /nix/store/00000000000000000000000000000000-hm/x.service $u/hm-owned.service; "
+        # Claude Code native installer: a deliberate, documented exception
+        # (home/claude-egress-slice.nix), not drift.
+        "mkdir -p $root/home/.local/share/claude/versions; "
+        "printf \"#!/bin/sh\\n\" > $root/home/.local/share/claude/versions/9.9.9; "
+        "ln -s $root/home/.local/share/claude/versions/9.9.9 $root/home/.local/bin/claude'"
     )
     drift_env = (
         f"HOME={drift_fixture}/home "
@@ -959,6 +972,23 @@ in
         assert marker in drift_report, (
             f"drift fixture finding {marker!r} missing:\n{drift_report}"
         )
+    def drift_section(heading):
+        parts = drift_report.split(f"## {heading}\n", 1)
+        assert len(parts) == 2, f"section {heading!r} missing:\n{drift_report}"
+        return parts[1].split("~~~", 2)[1].split()
+
+    user_units = drift_section("Unmanaged entries in ~/.config/systemd/user")
+    for entry in ["hand-made.timer", "timers.target.wants/hand-made.timer"]:
+        assert entry in user_units, (
+            f"user unit drift {entry!r} missing:\n{drift_report}"
+        )
+    assert "hm-owned.service" not in user_units, (
+        f"store-owned user unit reported as drift:\n{drift_report}"
+    )
+    local_bin = drift_section("Entries outside /nix/store in ~/.local/bin")
+    assert "claude" not in local_bin, (
+        f"Claude Code native installer reported as drift:\n{drift_report}"
+    )
     drift_success = f"{drift_fixture}/state/nixos-drift-analyzer/last-success"
     dellan.succeed(f"test -s {drift_success}")
 
