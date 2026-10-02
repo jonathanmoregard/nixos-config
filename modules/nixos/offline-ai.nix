@@ -132,6 +132,9 @@ let
     "router-ingestor.service"
     "router-ingestor-scan.service"
     "voquill.service"
+    "local-stt.service"
+    "local-stt-general.service"
+    "local-stt-swedish.service"
   ];
   gatedSystemServices = [ "microvm@research-agent" "microvm@scraper" ];
 
