@@ -1,4 +1,5 @@
-# Local Klaffat development server with real Google Calendar OAuth.
+# Local Klaffat development server with real Google (and optionally
+# Microsoft) Calendar OAuth.
 #
 # The user-facing launcher never reads OAuth credentials. Root decrypts the
 # existing agenix-compatible ciphertext during ExecStartPre, extracts only the
@@ -14,7 +15,7 @@ let
   stateDir = "/var/lib/${serviceName}";
   databaseName = serviceName;
   expectedBinary = "target/local-google/debug/klaffat";
-  expectedStatic = "crates/klaffat-web/static";
+  expectedStatic = "crates/klaffat-web/dist";
   expectedKek = "tests/e2e/fixtures/test-kek";
   endpointOverrideNames = [
     "KLAFFAT_GOOGLE_AUTH_URL_OVERRIDE"
@@ -51,24 +52,34 @@ let
     '';
   };
 
-  # The client id is public configuration and the client secret is not, so they
-  # live in different places: the id in the Klaffat repo's public-config.json,
-  # the secret alone inside the agenix bundle. This script joins them back into
-  # the one environment file the server reads. An older bundle may still carry
-  # the id; that is accepted while it agrees with the repo, and refused when it
-  # does not, because a secret paired with the wrong client is worth stopping
-  # for rather than guessing between two sources.
+  # Each client id is public configuration and each client secret is not, so
+  # they live in different places: the ids in the Klaffat repo's
+  # public-config.json, the secrets alone inside the agenix bundle. This script
+  # joins them back into the one environment file the server reads. An older
+  # bundle may still carry an id; that is accepted while it agrees with the
+  # repo, and refused when it does not, because a secret paired with the wrong
+  # client is worth stopping for rather than guessing between two sources.
+  #
+  # Google is required. Microsoft is optional: it is passed through only when
+  # the bundle holds its secret, and then the public id must be a real one.
+  # A Microsoft secret next to a placeholder id is refused for the same reason
+  # as a mismatched id.
   extractGoogleEnvironment = pkgs.writeText "extract-klaffat-google-environment.py" ''
     import json
     import pathlib
     import re
     import sys
 
-    allowed = {
-        "KLAFFAT_GOOGLE_CLIENT_ID",
-        "KLAFFAT_GOOGLE_CLIENT_SECRET",
+    providers = {
+        "GOOGLE": ("googleClientId", True),
+        "MS": ("microsoftClientId", False),
     }
-    required = {"KLAFFAT_GOOGLE_CLIENT_SECRET"}
+    placeholder_ids = {"", "demo-unused"}
+    allowed = {
+        f"KLAFFAT_{prefix}_{part}"
+        for prefix in providers
+        for part in ("CLIENT_ID", "CLIENT_SECRET")
+    }
     values = {}
     assignment = re.compile(r"^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
     safe_value = re.compile(r"^[A-Za-z0-9._~+:/=-]+$")
@@ -78,15 +89,14 @@ let
         public_config = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
         destination = pathlib.Path(sys.argv[3])
     except (OSError, UnicodeError, IndexError):
-        raise SystemExit("Google OAuth environment could not be read")
+        raise SystemExit("OAuth environment could not be read")
 
     try:
-        public_client_id = json.loads(public_config)["oauth"]["googleClientId"]
+        public_oauth = json.loads(public_config)["oauth"]
     except (ValueError, TypeError, KeyError):
-        raise SystemExit("public configuration has no Google client id")
-    if not isinstance(public_client_id, str):
-        raise SystemExit("public Google client id is not a string")
-    public_client_id = public_client_id.strip()
+        raise SystemExit("public configuration has no oauth section")
+    if not isinstance(public_oauth, dict):
+        raise SystemExit("public oauth configuration is not an object")
 
     for raw_line in source.splitlines():
         line = raw_line.strip()
@@ -105,23 +115,36 @@ let
             raise SystemExit(f"invalid {name} assignment")
         values[name] = value
 
-    if not public_client_id or safe_value.fullmatch(public_client_id) is None:
-        raise SystemExit("invalid public Google client id")
-    bundled_client_id = values.get("KLAFFAT_GOOGLE_CLIENT_ID")
-    if bundled_client_id is not None and bundled_client_id != public_client_id:
-        raise SystemExit("bundled Google client id contradicts public configuration")
-    values["KLAFFAT_GOOGLE_CLIENT_ID"] = public_client_id
-
-    missing = sorted(required - values.keys())
-    if missing:
-        raise SystemExit("missing required Google OAuth assignment")
+    output_values = {}
+    for prefix, (public_key, required) in providers.items():
+        id_name = f"KLAFFAT_{prefix}_CLIENT_ID"
+        secret_name = f"KLAFFAT_{prefix}_CLIENT_SECRET"
+        secret = values.get(secret_name)
+        if secret is None:
+            if required:
+                raise SystemExit(f"missing required {secret_name} assignment")
+            # An id with no secret is inert: nothing can authenticate with it.
+            continue
+        public_client_id = public_oauth.get(public_key)
+        if not isinstance(public_client_id, str):
+            raise SystemExit(f"public {public_key} is not a string")
+        public_client_id = public_client_id.strip()
+        if public_client_id in placeholder_ids:
+            raise SystemExit(f"public {public_key} is a placeholder")
+        if safe_value.fullmatch(public_client_id) is None:
+            raise SystemExit(f"invalid public {public_key}")
+        bundled_client_id = values.get(id_name)
+        if bundled_client_id is not None and bundled_client_id != public_client_id:
+            raise SystemExit(f"bundled {id_name} contradicts public configuration")
+        output_values[id_name] = public_client_id
+        output_values[secret_name] = secret
 
     try:
         with destination.open("w", encoding="ascii", newline="\n") as output:
-            for name in sorted(allowed):
-                output.write(f"{name}={values[name]}\n")
+            for name in sorted(output_values):
+                output.write(f"{name}={output_values[name]}\n")
     except OSError:
-        raise SystemExit("Google OAuth environment could not be written")
+        raise SystemExit("OAuth environment could not be written")
   '';
 
   prepare = pkgs.writeShellApplication {
@@ -240,7 +263,7 @@ let
 
       environment_tmp=$(mktemp ${lib.escapeShellArg "${runtimeDir}/google.env.XXXXXX"})
       if ! python3 ${extractGoogleEnvironment} "$plaintext" "$public_config" "$environment_tmp" 2>/dev/null; then
-        refuse "the decrypted environment does not contain one valid Google OAuth pair"
+        refuse "the decrypted environment does not contain valid OAuth client pairs"
       fi
       chown root:root "$environment_tmp"
       chmod 0400 "$environment_tmp"
