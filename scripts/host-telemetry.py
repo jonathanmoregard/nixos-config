@@ -210,8 +210,10 @@ def prune():
         try:
             if p.stat().st_mtime < cutoff:
                 p.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            # A day file that cannot be pruned is not worth losing a sample
+            # over, but it must be visible in the journal.
+            print(f"host-telemetry: cannot prune {p}: {e}", file=sys.stderr, flush=True)
 
 
 def main(argv):
