@@ -1,5 +1,7 @@
 { pkgs, lib, ... }:
 {
+  imports = [ ./nixos/nix-gc.nix ];
+
   # NB: `nixpkgs.config.allowUnfree` and `nixpkgs.overlays` live in
   # flake.nix at the pkgs-construction level. Setting them here would
   # make the test framework's externally-injected pkgs read-only conflict
@@ -91,16 +93,10 @@
   systemd.services.home-manager-jonathan.serviceConfig.TimeoutStartSec =
     lib.mkForce "20min";
 
-  # Reclaim old profile generations and unreachable store paths before they
-  # can fill the shared root filesystem again. Daily GC limits accumulation;
-  # Nix's min-free/max-free guard below also reacts during build spikes.
+  # Scheduled GC (daily, 14d generations, recent-build retention) lives in
+  # ./nixos/nix-gc.nix so tests/nix-gc.nix boots the exact policy.
   # Optimisation stays on a separate weekday, and persistent NixOS timers
   # catch up after the laptop resumes.
-  nix.gc = {
-    automatic = true;
-    dates = [ "daily" ];
-    options = "--delete-older-than 14d";
-  };
 
   nix.optimise = {
     automatic = true;
