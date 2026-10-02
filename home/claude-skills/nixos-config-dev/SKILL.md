@@ -219,11 +219,10 @@ nix eval .#checks.x86_64-linux --apply builtins.attrNames
 |---|---|
 | `vm-base` | HM activation, systemd user units, binaries on PATH — the default lane |
 | `vm-desktop` | X session, Cinnamon, graphical bits |
-| `vm-microvm` | research-agent microvm, virtiofs shares, egress init |
+| `vm-microvm` | research-agent microvm, virtiofs shares, DNS-filled egress allowlist (runtime) |
 | `vm-keyring` · `vm-kitty` · `vm-claude-pane` · `vm-autodoro` | the named feature |
 | `vm-listen-tools` · `vm-android-dev` · `vm-camera-relay` | the named feature |
 | `vm-claude-egress` · `vm-auto-deploy` | egress policy · deploy pipeline |
-| `egress-init-retry` | the generated nftables script (no VM — fast) |
 | `cachix-push-filter` · `add-secret-smoke` · `secrets-no-dead-credentials` · `signal-expiry` · `worktree-sweep` | script/data assertions (no VM — fast) |
 
 The non-VM lanes run in seconds; the `vm-*` lanes boot a machine. When a
