@@ -1152,7 +1152,8 @@ def tools_given_as_commands(text):
 # electricity. English and Swedish word starts. Answers to them must cite the
 # stored references they came from; a false alarm only costs a citation.
 SAFETY = re.compile(r"\b(" + "|".join([
-    "bleed", "blöd", "blod", "wound", "sår", "burn", "bränn", "fractur", "fraktur", "broken bone", "bruten",
+    # "brän" covers bränna, bränt, brände; "brut" covers bruten, brutit.
+    "bleed", "blöd", "blod", "wound", "sår", "burn", "brän", "fractur", "fraktur", "broken bone", "brut",
     "sprain", "stuk", "cpr", "hlr", "resuscitat", "unconscious", "medvetslös", "chok", "kvävn", "satt i halsen",
     "poison", "förgift", "fever", "feber", "diarrh", "diarré", "vomit", "kräk", "dehydrat", "uttork", "ors\\b",
     "vätskeersätt", "infect", "infektion", "sepsis", "hypotherm", "nedkyl", "frostbite", "köldskad", "heat stroke",
@@ -1160,11 +1161,17 @@ SAFETY = re.compile(r"\b(" + "|".join([
     "hjärtstopp", "seizure", "epilep", "kramp", "pregnan", "gravid", "childbirth", "förlossning", "medicin",
     "medication", "läkemedel", "dose\\b", "dosage", "dosering", "antibiot", "painkill", "värktablett", "pain\\b",
     "smärta", "injur", "skadad", "sick", "sjuk", "symptom", "cholera", "kolera", "first aid", "första hjälpen",
-    "carbon monoxide", "kolmonoxid", "electric", "elektri", "elsäker", "elstöt", "shock", "chock", "fuse box",
-    "fusebox", "blown fuse", "power line", "live wire", "kraftledning", "elledning", "elinstallation", "wiring",
-    "säkring", "breaker", "jordfels", "voltage", "spänning", "generator", "elverk", "outlet", "eluttag",
+    "carbon monoxide", "kolmonoxid", "electric", "elektri", "elsäker", "elstöt", "stöt", "shock", "chock",
+    "fuse box", "fusebox", "blown fuse", "power line", "live wire", "kraftledning", "elledning",
+    "elinstallation", "wiring", "säkring", "circuit breaker", "breaker box", "jordfels", "voltage", "spänning",
+    # Not a bare "generator" or "breaker": systemd has generators and a sysadmin
+    # question about them is not an electrical one.
+    "petrol generator", "diesel generator", "gasoline generator", "bensindriv", "dieseldriv", "elverk",
+    "outlet", "eluttag",
 ]) + ")", re.IGNORECASE)
-SOURCE_LINE = re.compile(r"^\W*(sources?|references?|källa|källor)\b", re.IGNORECASE | re.MULTILINE)
+# A citation line, not prose that happens to open with the word: the colon is
+# what "Sources of infection are ..." lacks. Markdown bold around it is fine.
+SOURCE_LINE = re.compile(r"^\W*(sources?|references?|källa|källor)\s*\**\s*:", re.IGNORECASE | re.MULTILINE)
 
 
 def plain(text):
@@ -1185,12 +1192,42 @@ def retrieved_sources(messages):
 
 
 def cited(answer, sources):
-    """True when the answer has a Sources line naming at least one retrieved document or article."""
+    """True when the answer has a Sources line naming at least one retrieved document or article.
+    Names match as whole words or phrases, so "burn" does not vouch for "burns";
+    a one-word article title that is also the topic word can still be echoed by
+    a made-up citation, which only a structured citation format would catch."""
     found = SOURCE_LINE.search(answer or "")
     if not found:
         return False
     tail = plain(answer[found.start():])
-    return any(plain(name) in tail for name in sources)
+    return any(re.search(r"\b" + re.escape(plain(name)) + r"\b", tail) for name in sources)
+
+
+def safety_gate(question, content, messages, out, log, may_nudge):
+    """For a medical or electrical question, the answer must cite a retrieved
+    reference. Returns True when the model should be asked once more (the
+    nudge is appended to messages); otherwise the warning, if any, is written."""
+    if not SAFETY.search(question):
+        return False
+    sources = retrieved_sources(messages)
+    if cited(content, sources):
+        return False
+    if may_nudge:
+        print("[check] safety answer without a cited stored source; asking again", file=log)
+        out.write("\n[revising: a medical or electrical answer must name the stored reference it "
+                  "comes from]\n\n")
+        listed = "; ".join(sorted(sources)[:8])
+        messages.append({"role": "user", "content": (
+            "This is a medical or electrical question: give only what the stored references say, "
+            "and end with a line 'Sources:' naming each document with its page, or each library "
+            "article. " + (f"References you have retrieved: {listed}." if sources else
+                           "You have not retrieved any yet: search_docs and search_library first."))})
+        return True
+    out.write("\n\n!! NOT VERIFIED: this answer names no stored reference it was checked "
+              "against. Do not rely on it for injuries, illness or electricity; "
+              + (f"look it up yourself in: {'; '.join(sorted(sources)[:8])}." if sources else
+                 "look it up yourself with `offline-ai library` or the survival documents.") + "\n")
+    return False
 
 
 CUT_OFF = ("[cut off] The answer was cut short by the model's context limit. Ask a narrower question, "
@@ -1251,27 +1288,9 @@ def answer(messages, out=sys.stdout, log=sys.stderr):
                                  f"You gave {names} as commands for me to run. Those are your tools; I cannot run "
                                  "them. Call them yourself now, then answer with real shell commands only."})
                 continue
-            content = message["content"]
-            if SAFETY.search(question):
-                sources = retrieved_sources(messages)
-                if not cited(content, sources):
-                    if not cite_nudged:
-                        cite_nudged = True
-                        print("[check] safety answer without a cited stored source; asking again", file=log)
-                        out.write("\n[revising: a medical or electrical answer must name the stored reference it "
-                                  "comes from]\n\n")
-                        listed = "; ".join(sorted(sources)[:8])
-                        messages.append({"role": "user", "content": (
-                            "This is a medical or electrical question: give only what the stored references say, "
-                            "and end with a line 'Sources:' naming each document with its page, or each library "
-                            "article. " + (f"References you have retrieved: {listed}." if sources else
-                                           "You have not retrieved any yet: search_docs and search_library first."))})
-                        continue
-                    warning = ("\n\n!! NOT VERIFIED: this answer names no stored reference it was checked "
-                               "against. Do not rely on it for injuries, illness or electricity; "
-                               + (f"look it up yourself in: {'; '.join(sorted(sources)[:8])}." if sources else
-                                  "look it up yourself with `offline-ai library` or the survival documents.") + "\n")
-                    out.write(warning)
+            if safety_gate(question, message["content"], messages, out, log, may_nudge=not cite_nudged):
+                cite_nudged = True
+                continue
             return True
         for call in calls:
             name, arguments = call["function"]["name"], call["function"]["arguments"]
@@ -1291,7 +1310,13 @@ def answer(messages, out=sys.stdout, log=sys.stderr):
     message, finish = complete(messages, False, out)
     messages.append(message)
     out.write("\n")
-    return not cut_off(message, finish, out, log)
+    if cut_off(message, finish, out, log):
+        return False
+    # The same gate as above: an answer forced out of the model after it ran
+    # out of steps is the one most likely to be uncited, and it must not pass
+    # as checked. No second round: there are no steps left.
+    safety_gate(question, message["content"], messages, out, log, may_nudge=False)
+    return True
 
 
 # ---------------------------------------------------------------- service

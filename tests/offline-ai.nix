@@ -252,7 +252,9 @@ let
 
   # A model asked how to treat a burn: it searches the documents, then answers
   # without naming a source ("nocite", every time) or with one ("cite"). It
-  # records whether it was sent back to cite.
+  # records whether it was sent back to cite. In "exhaust" mode it keeps
+  # looking things up until the CLI runs out of steps and forces an answer
+  # (a request without tools), then answers without a source.
   citeStub = pkgs.writeText "offline-ai-cite-stub.py" ''
     import json, sys
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -279,9 +281,9 @@ let
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
-            if Handler.turns == 1:
-                self.sse({"tool_calls": [{"index": 0, "id": "c0", "function": {
-                    "name": "search_docs", "arguments": json.dumps({"query": "burn cool water", "collection": "guides"})}}]})
+            if Handler.turns == 1 or (MODE == "exhaust" and "tools" in body):
+                self.sse({"tool_calls": [{"index": 0, "id": "c%d" % Handler.turns, "function": {
+                    "name": "search_docs", "arguments": json.dumps({"query": "burn cool water %d" % Handler.turns, "collection": "guides"})}}]})
             else:
                 last = body["messages"][-1]
                 with open(LOG, "a") as fh:
@@ -348,6 +350,48 @@ let
   # mm_stat files: a disk swap area frees RAM one for one; a zram area is RAM
   # itself and frees only what compression saves; what is free in swap and
   # what there is to swap both bound it; zram fills first (priority).
+  # The citation gate's rules, on the functions themselves: what counts as a
+  # safety question, what counts as a Sources line, what a name must match.
+  # Each row is a way the gate was shown to be fooled or to misfire
+  # (close-out review, 2026-10-02).
+  citeUnit = pkgs.writeText "offline-ai-cite-unit.py" ''
+    import importlib.util, sys
+
+    spec = importlib.util.spec_from_file_location("offline_ai", sys.argv[1])
+    oai = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oai)
+
+    failed = []
+    def check(label, cond):
+        if not cond:
+            failed.append(label)
+
+    for q in ("jag har bränt mig på handen", "jag brände mig", "han har brutit armen",
+              "min son har 39 graders feber", "fick en stöt av kabeln", "how do I treat a burn",
+              "is it safe to run a petrol generator in the garage"):
+        check("safety question not recognised: " + q, oai.SAFETY.search(q))
+    for q in ("why does my systemd generator unit fail", "temp pause autodoro",
+              "long boot list, limit to 8", "print both sides", "ingest failed"):
+        check("sysadmin question taken for a safety one: " + q, not oai.SAFETY.search(q))
+
+    doc = {"where_there_is_no_doctor"}
+    check("prose opening with 'Sources of' passed as a citation line",
+          not oai.cited("Sources of infection are dirt.\nSee where there is no doctor, page 96.", doc))
+    check("a Sources: line naming the retrieved document is a citation",
+          oai.cited("Cool it.\n\nSources: Where There Is No Doctor, page 96", doc))
+    check("a bold **Källor:** line is a citation",
+          oai.cited("Kyl.\n**Källor:** Where there is no doctor s. 76", doc))
+    check("'burn' does not vouch for a retrieved 'burns'",
+          not oai.cited("Sources: burn", {"burns"}))
+    check("a Sources line naming nothing retrieved is not a citation",
+          not oai.cited("Sources: Mayo Clinic", doc))
+
+    if failed:
+        print("citation rules:\n  " + "\n  ".join(failed), file=sys.stderr)
+        sys.exit(1)
+    print("citation rules ok")
+  '';
+
   swapUnit = pkgs.writeText "offline-ai-swap-unit.py" ''
     import importlib.util, sys
 
@@ -493,20 +537,29 @@ pkgs.runCommand "offline-ai-harness"
     # marked NOT VERIFIED; with one it goes through untouched.
     echo '<html><head><title>Burns</title></head><body><h1>Burns</h1>
       <p>Cool a burn under cool running water for 20 minutes.</p></body></html>' > guides/burns.html
-    for mode in nocite cite; do
-      rm -f cite_port cite.log
-      python3 ${citeStub} cite_port "$mode" "$PWD/cite.log" &
+    for mode in nocite cite exhaust; do
+      rm -f cite_port
+      python3 ${citeStub} cite_port "$mode" "$PWD/cite-$mode.log" &
       cite_pid=$!
       for _ in $(seq 1 50); do [ -s cite_port ] && break; sleep 0.1; done
       OFFLINE_AI_URL="http://127.0.0.1:$(cat cite_port)" ${offlineAi}/bin/offline-ai "how do I treat a burn" \
         > "cite-$mode.out" 2> "cite-$mode.err" || { cat "cite-$mode.err"; fail "the burn question ($mode) failed"; }
       kill $cite_pid
     done
-    [ "$(grep -c '"role": "user"' cite.log)" = 0 ] || fail "a cited medical answer was sent back"
+    [ "$(grep -c '"role": "user"' cite-cite.log)" = 0 ] || fail "a cited medical answer was sent back"
     if grep -q 'NOT VERIFIED' cite-cite.out; then fail "a cited medical answer was marked not verified"; fi
     grep -q 'NOT VERIFIED' cite-nocite.out || { cat cite-nocite.out; fail "an uncited medical answer was not marked"; }
     grep -q 'revising: a medical or electrical answer' cite-nocite.out || fail "an uncited medical answer was not sent back first"
     grep -q 'burns' cite-nocite.out || fail "the warning does not name the reference that was retrieved"
+    # The answer forced out after the step limit goes through the same gate:
+    # it is the one most likely to be uncited, and it must not pass as checked.
+    grep -q 'Stop looking things up' cite-exhaust.log || fail "the exhaust stub was never forced to answer: $(cat cite-exhaust.log)"
+    grep -q 'NOT VERIFIED' cite-exhaust.out || { cat cite-exhaust.out; fail "an uncited answer forced after the step limit was not marked"; }
+    if grep -q 'revising: a medical or electrical answer' cite-exhaust.out; then fail "the forced answer was sent back although no steps were left"; fi
+
+    # --- the gate's own rules, on the functions themselves.
+    python3 ${citeUnit} "$(grep -o '/nix/store/[^ ]*-offline-ai.py' ${offlineAi}/bin/offline-ai | head -1)" \
+      || fail "citation rules"
 
     # --- tool output is budgeted so a long conversation stays inside the
     # model's context: one result is capped, and its tail says how much was
