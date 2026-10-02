@@ -37,6 +37,27 @@
 # parameter and leaves the iGPU free. A 27B dense model managed 1-4 tok/s
 # and answered worse. The NPU cannot run a model this size.
 #
+# WHAT MAKES IT SLOW IS THE REST OF THE MACHINE, NOT THE FLAGS. Measured
+# 2026-10-02 (Qwen3.6-35B-A3B, same architecture, llama-bench tg64): 13-14
+# tok/s with the box quiet, 6-7 tok/s with a cargo build or a busy Chrome
+# tab running, 2-4 tok/s while memory was short and the weights were being
+# re-read from disk. Two things in the unit below follow from that:
+#   - CPUWeight=1000. The server's threads spin while they wait for each
+#     other, so one stolen core stalls every token; at the default weight
+#     of 100 the model shares the CPU equally with every tab and build.
+#     With weight 1000, two busy threads and another session's build
+#     alongside: 12.9 tok/s against 5.8 at the default weight (iGPU path),
+#     6.8 against 3.5 (CPU path). nice does not help: it only ranks
+#     processes inside one cgroup, and every app scope is its own.
+#   - -t 8, not 12. The chip has 4 Zen 5 and 8 Zen 5c cores; 12 threads
+#     leave nothing for the rest of the desktop and are no faster when it
+#     is idle (13.2 tok/s at 12 threads, 14.4 at 8, 14.1 at 4).
+# A model that fits the 33 GB GTT window is a different case: Qwen3.6-35B-A3B
+# fully on the iGPU (-ngl 99) with its MTP head as a draft (--spec-type
+# draft-mtp) answered 1.5-1.8x faster end to end than these flags (prompt
+# 236-281 vs 148-153 tok/s, generation 18-23 vs 12-13). The 46 GB model
+# here does not fit, so that stays with the model choice.
+#
 # THE MODEL IS NOT IN THE NIX STORE. It is 46 GB of weights fetched once
 # into the home directory; putting it in the store would copy it into every
 # closure and every VM test. ConditionPathExists keeps the unit inert on a
@@ -187,7 +208,11 @@ in
       ExecStopPost = "-${pkgs.systemd}/bin/systemctl stop memory-reserve-offline-ai.service";
       # -np 1: one conversation at a time, so the whole 32k context belongs
       # to it instead of being divided between server slots.
-      ExecStart = "${pkgs.llama-cpp-vulkan}/bin/llama-server -m ${model} -ngl 0 -t 12 -c 32768 -np 1 --jinja -fa on --host 127.0.0.1 --port ${toString port}";
+      ExecStart = "${pkgs.llama-cpp-vulkan}/bin/llama-server -m ${model} -ngl 0 -t 8 -c 32768 -np 1 --jinja -fa on --host 127.0.0.1 --port ${toString port}";
+      # Wins the CPU against the rest of the desktop while it answers; see
+      # the header. The cpu controller is delegated to the user manager, so
+      # the weight applies between this unit and every app scope beside it.
+      CPUWeight = 1000;
       Restart = "no";
     };
   };
