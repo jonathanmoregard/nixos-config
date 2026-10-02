@@ -6,11 +6,14 @@
 # latency depend on whatever else happens to be running.
 #
 # Two user units:
-#   - `ai-throttle.service` (scripts/ai-throttle.py) freezes the background
-#     units while the CPU is hot, the laptop is on battery, or speech-to-text
-#     was used in the last minute, and thaws them afterwards. The cgroup
-#     freezer pauses without killing, so the embed worker resumes mid-row and
-#     no row is condemned as poison the way a kill would condemn it.
+#   - `ai-throttle.service` (scripts/ai-throttle.py) pauses the background
+#     units (SIGSTOP) while the CPU is hot, the laptop is on battery, or
+#     speech-to-text was used in the last minute, and resumes them (SIGCONT)
+#     afterwards. Pausing never kills, so the embed worker resumes mid-row and
+#     no row is condemned as poison the way a kill would condemn it. Not the
+#     cgroup freezer: systemd refuses to stop a frozen unit, which would break
+#     offline-ai's eviction and Home Manager restarts; a SIGSTOPped unit still
+#     stops cleanly, because systemd follows SIGTERM with SIGCONT.
 #   - `host-telemetry.service` (scripts/host-telemetry.py) writes one JSON line
 #     a minute to ~/.local/state/host-telemetry/: temperatures, package power,
 #     iGPU busy, AC, memory, the top units by CPU and by iGPU time, and the
@@ -29,7 +32,7 @@ in
     units = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ "aggregator-embed.service" "aggregator-embed-server.service" ];
-      description = "Background user units to freeze while the machine should be quiet.";
+      description = "Background user units to pause (SIGSTOP) while the machine should be quiet.";
     };
     foreground = lib.mkOption {
       type = lib.types.listOf lib.types.str;
@@ -73,9 +76,9 @@ in
       };
       serviceConfig = {
         ExecStart = "${pkgs.python3}/bin/python3 ${../../scripts/ai-throttle.py}";
-        # The script thaws on SIGTERM; this covers a crash, so a dead throttle
-        # can never leave the backfill frozen.
-        ExecStopPost = "-${pkgs.systemd}/bin/systemctl --user thaw ${units}";
+        # The script resumes the units on SIGTERM; this covers a crash, so a
+        # dead throttle can never leave the backfill paused.
+        ExecStopPost = "-${pkgs.systemd}/bin/systemctl --user kill --signal=SIGCONT ${units}";
         Restart = "always";
         RestartSec = 10;
         Nice = 10;

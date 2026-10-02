@@ -1,6 +1,6 @@
 # Not a VM lane: runtime-invocation harness for scripts/ai-throttle.py and
 # scripts/host-telemetry.py. Builds fake /sys, cgroup and /proc trees plus a
-# fake `systemctl` that records freeze/thaw calls, then drives the scripts'
+# fake `systemctl` that records the SIGSTOP/SIGCONT it is asked to send, then drives the scripts'
 # `--once` mode tick by tick: heat with hysteresis, battery, a recent
 # dictation, an inactive unit, and the telemetry record shape. Seconds.
 { pkgs }:
@@ -24,12 +24,20 @@ pkgs.runCommand "ai-throttle-check" {
   temp() { echo "$(( $1 * 1000 ))" > $W/sys/class/hwmon/hwmon0/temp1_input; }
   ac() { echo "$1" > $W/sys/class/power_supply/AC0/online; }
   stt_usage() { printf 'usage_usec %s\n' "$1" > $STT/cpu.stat; }
-  unit() { mkdir -p $W/units/$1; echo "$2" > $W/units/$1/ActiveState; echo "$3" > $W/units/$1/FreezerState; }
-  freezer() { cat $W/units/$1/FreezerState; }
+  # unit NAME ACTIVESTATE PROCSTATE PID: one process per unit, its state letter
+  # in the fake /proc/<pid>/stat (S running, T stopped).
+  unit() {
+    mkdir -p $W/units/$1 $W/cg/units/$1 $W/proc/$4
+    echo "$2" > $W/units/$1/ActiveState
+    echo "$4" > $W/cg/units/$1/cgroup.procs
+    echo "$4 (fake) $3 1 1" > $W/proc/$4/stat
+  }
+  freezer() { pid=$(cat $W/cg/units/$1/cgroup.procs); awk '{print $3}' $W/proc/$pid/stat; }
   fail() { echo "FAIL: $*"; exit 1; }
 
-  # Fake systemctl: unit state lives in $W/units/<unit>/{ActiveState,FreezerState};
-  # every freeze/thaw is appended to $W/calls.
+  # Fake systemctl: ActiveState lives in $W/units/<unit>/ActiveState, the
+  # unit's cgroup in $W/cg/units/<unit>; every kill is appended to $W/calls
+  # and flips the fake process state like the real signal would.
   cat > $W/bin/systemctl <<'EOF'
   #!${pkgs.bash}/bin/bash
   [ "$1" = --user ] && shift
@@ -37,9 +45,13 @@ pkgs.runCommand "ai-throttle-check" {
   case $cmd in
     show) u=''${@: -1}
           echo "ActiveState=$(cat $FAKE/units/$u/ActiveState 2>/dev/null || echo inactive)"
-          echo "FreezerState=$(cat $FAKE/units/$u/FreezerState 2>/dev/null || echo running)" ;;
-    freeze) echo "freeze $1" >> $FAKE/calls; echo frozen > $FAKE/units/$1/FreezerState ;;
-    thaw) echo "thaw $1" >> $FAKE/calls; echo running > $FAKE/units/$1/FreezerState ;;
+          [ -d $FAKE/cg/units/$u ] && echo "ControlGroup=/units/$u" ;;
+    kill) sig=''${1#--signal=}; u=$2
+          echo "$sig $u" >> $FAKE/calls
+          new=S; [ "$sig" = SIGSTOP ] && new=T
+          for pid in $(cat $FAKE/cg/units/$u/cgroup.procs); do
+            echo "$pid (fake) $new 1 1" > $FAKE/proc/$pid/stat
+          done ;;
   esac
   EOF
   chmod +x $W/bin/systemctl
@@ -52,24 +64,24 @@ pkgs.runCommand "ai-throttle-check" {
   tick() { python3 ${../scripts/ai-throttle.py} --once --now "$1" > $W/last.json; }
   paused() { jq -e '.paused' $W/last.json > /dev/null; }
 
-  unit aggregator-embed.service active running
-  unit aggregator-embed-server.service active running
+  unit aggregator-embed.service active S 101
+  unit aggregator-embed-server.service active S 102
   temp 50; ac 1; stt_usage 1000
 
   tick 1000
   paused && fail "cool, on mains, nobody dictating: must run"
-  [ "$(freezer aggregator-embed.service)" = running ] || fail "froze while cool"
+  [ "$(freezer aggregator-embed.service)" = S ] || fail "paused while cool"
 
   temp 72; tick 1010
   paused || fail "72 C >= 70 C must pause"
-  [ "$(freezer aggregator-embed.service)" = frozen ] || fail "worker not frozen when hot"
-  [ "$(freezer aggregator-embed-server.service)" = frozen ] || fail "server not frozen when hot"
+  [ "$(freezer aggregator-embed.service)" = T ] || fail "worker not stopped when hot"
+  [ "$(freezer aggregator-embed-server.service)" = T ] || fail "server not stopped when hot"
 
   temp 65; tick 1020
   paused || fail "65 C is above the 60 C resume point: must stay paused (hysteresis)"
   temp 59; tick 1030
   paused && fail "59 C is below 60 C: must resume"
-  [ "$(freezer aggregator-embed.service)" = running ] || fail "worker not thawed after cooling"
+  [ "$(freezer aggregator-embed.service)" = S ] || fail "worker not resumed after cooling"
 
   ac 0; tick 1040
   paused || fail "on battery must pause"
@@ -89,15 +101,18 @@ pkgs.runCommand "ai-throttle-check" {
   stt_usage 205000; tick 1130
   paused && fail "4 ms of foreground CPU is below the 50 ms threshold"
 
-  # An inactive worker (between timer runs) is never frozen; the server is.
-  unit aggregator-embed.service inactive running
+  # An inactive worker (between timer runs) is never signalled; the server is.
+  unit aggregator-embed.service inactive S 101
   : > $W/calls
   temp 75; tick 1140
-  grep -q 'freeze aggregator-embed.service' $W/calls && fail "froze an inactive unit"
-  grep -q 'freeze aggregator-embed-server.service' $W/calls || fail "active server not frozen"
-  # Already frozen: no repeated freeze calls.
+  grep -q 'SIGSTOP aggregator-embed.service' $W/calls && fail "signalled an inactive unit"
+  grep -q 'SIGSTOP aggregator-embed-server.service' $W/calls || fail "active server not stopped"
+  # Already stopped: no repeated signals.
   : > $W/calls; tick 1150
-  [ -s $W/calls ] && fail "re-froze an already frozen unit: $(cat $W/calls)"
+  [ -s $W/calls ] && fail "re-signalled an already stopped unit: $(cat $W/calls)"
+  # A unit restarted while paused (new process, running) is stopped again.
+  unit aggregator-embed.service active S 103; tick 1160
+  [ "$(freezer aggregator-embed.service)" = T ] || fail "a new worker run started while paused was not stopped"
 
   # host-telemetry: two samples, the second carries deltas.
   export HOST_TELEMETRY_DIR=$W/tel

@@ -3,7 +3,7 @@
 Background units (the embedding backfill) share the iGPU and the memory bus
 with interactive ones (speech-to-text). The iGPU has no scheduler priority a
 cgroup can set, so this watcher does the only thing that works: it FREEZES the
-background units (cgroup freezer, `systemctl --user freeze`) while
+background units (SIGSTOP via `systemctl --user kill`) while
 
   - the CPU package is hot  (Tctl >= PAUSE_AT_C; resumes only once it has
     cooled below RESUME_BELOW_C, so it does not flap at one temperature),
@@ -11,16 +11,16 @@ background units (cgroup freezer, `systemctl --user freeze`) while
   - a foreground unit used CPU within the last FOREGROUND_HOLD_S seconds
     (someone is dictating; the next dictation is likely close behind),
 
-and THAWS them once none of that holds. Freezing never kills: a frozen
-embed worker resumes mid-row, so no row is set aside as poison the way a
-kill would. On exit every unit it froze is thawed again.
+and resumes them (SIGCONT) once none of that holds. Pausing never kills: a
+paused embed worker resumes mid-row, so no row is set aside as poison the way
+a kill would. On exit every paused unit is resumed.
 
 Configuration is environment (see modules/nixos/ai-throttle.nix):
   AI_THROTTLE_UNITS, AI_THROTTLE_FOREGROUND   space-separated unit names
   AI_THROTTLE_PAUSE_AT_C, AI_THROTTLE_RESUME_BELOW_C, AI_THROTTLE_FOREGROUND_HOLD_S,
   AI_THROTTLE_FOREGROUND_CPU_MS, AI_THROTTLE_REQUIRE_AC, AI_THROTTLE_INTERVAL_S
   AI_THROTTLE_STATE        state file (default $XDG_RUNTIME_DIR/ai-throttle/state.json)
-  SYSFS_ROOT, CGROUP_ROOT  for tests (default /sys, /sys/fs/cgroup)
+  SYSFS_ROOT, CGROUP_ROOT, PROC_ROOT  for tests (default /sys, /sys/fs/cgroup, /proc)
 
 `ai-throttle --once [--now EPOCH]` runs one decision against the state file
 and exits; that is what tests/ai-throttle.nix drives.
@@ -35,6 +35,7 @@ from pathlib import Path
 
 SYSFS = Path(os.environ.get("SYSFS_ROOT", "/sys"))
 CGROUP = Path(os.environ.get("CGROUP_ROOT", "/sys/fs/cgroup"))
+PROC = Path(os.environ.get("PROC_ROOT", "/proc"))
 
 
 def env_float(name, default):
@@ -108,20 +109,39 @@ def systemctl(*args):
                           capture_output=True, text=True, check=False)
 
 
-def unit_state(unit):
-    out = systemctl("show", "-p", "ActiveState", "-p", "FreezerState", unit).stdout
+def unit_procs(unit):
+    """(ActiveState, [process states]) for every process in the unit's cgroup."""
+    out = systemctl("show", "-p", "ActiveState", "-p", "ControlGroup", unit).stdout
     props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
-    return props.get("ActiveState", ""), props.get("FreezerState", "")
+    states = []
+    cg = props.get("ControlGroup", "")
+    if cg:
+        for pid in (read(CGROUP / cg.lstrip("/") / "cgroup.procs") or "").split():
+            stat = read(PROC / pid / "stat") or ""
+            # The state is the field after the parenthesised command name.
+            rest = stat.rsplit(")", 1)[-1].split()
+            if rest:
+                states.append(rest[0])
+    return props.get("ActiveState", ""), states
 
 
 def apply(paused):
-    """Bring every background unit to the wanted freezer state."""
+    """Bring every background unit to the wanted run state.
+
+    SIGSTOP / SIGCONT, NOT the cgroup freezer: systemd refuses to stop a
+    frozen unit ("Cannot stop frozen unit"), which would break offline-ai's
+    eviction and a Home Manager switch that restarts the unit. A stopped
+    process is still stoppable: on stop systemd sends SIGTERM followed by
+    SIGCONT, so the unit shuts down through its normal handler.
+    """
     for u in UNITS:
-        active, freezer = unit_state(u)
-        if paused and active == "active" and freezer == "running":
-            systemctl("freeze", u)
-        elif not paused and freezer in ("frozen", "freezing"):
-            systemctl("thaw", u)
+        active, states = unit_procs(u)
+        if active != "active" or not states:
+            continue
+        if paused and any(st != "T" for st in states):
+            systemctl("kill", "--signal=SIGSTOP", u)
+        elif not paused and any(st == "T" for st in states):
+            systemctl("kill", "--signal=SIGCONT", u)
 
 
 def decide(st, now):
