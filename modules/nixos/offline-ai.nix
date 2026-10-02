@@ -172,10 +172,19 @@ in
   home-manager.users.jonathan.manual.json.enable = true;
   home-manager.users.jonathan.manual.html.enable = true;
 
+  # The model's weights and 32k context, held while the server runs. Builds
+  # shrink to what is left (memory-pressure.nix) so they cannot evict it.
+  services.memoryPressure.reservations.offline-ai = 45 * 1024 * 1024 * 1024;
+
   systemd.user.services.offline-ai-llm = {
     description = "offline-ai local model server (llama.cpp)";
     unitConfig.ConditionPathExists = model;
     serviceConfig = {
+      # "-": failing to shrink the build cap should not keep the assistant
+      # from answering during an outage. ExecStopPost also runs after a
+      # crash or a failed start, so the reservation never outlives the model.
+      ExecStartPre = "-${pkgs.systemd}/bin/systemctl start memory-reserve-offline-ai.service";
+      ExecStopPost = "-${pkgs.systemd}/bin/systemctl stop memory-reserve-offline-ai.service";
       # -np 1: one conversation at a time, so the whole 32k context belongs
       # to it instead of being divided between server slots.
       ExecStart = "${pkgs.llama-cpp-vulkan}/bin/llama-server -m ${model} -ngl 0 -t 12 -c 32768 -np 1 --jinja -fa on --host 127.0.0.1 --port ${toString port}";

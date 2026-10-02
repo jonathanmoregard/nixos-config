@@ -288,6 +288,13 @@ let
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
   name = "vm-base";
+  # A reservation only this lane declares; dellan and tuxedo have their own.
+  extraModules = [{
+    services.memoryPressure = {
+      reservations.vmtest = 2 * 1024 * 1024 * 1024;
+      desktopReserve = 2 * 1024 * 1024 * 1024;
+    };
+  }];
   testScript = ''
     dellan.wait_for_unit("multi-user.target")
     # Keep the dormant TUXEDO profile's eval and package-build contract in
@@ -674,6 +681,43 @@ in
         "journalctl -u systemd-oomd.service --no-pager "
         "| grep -F 'oomd-hog.service'"
     )
+
+    # Memory reservation (memory-pressure.nix). jonathan starts it the way
+    # offline-ai-llm does (polkit, no password); while active both build
+    # cgroups are capped at half of MemTotal - reservation - desktopReserve,
+    # and the cap survives daemon-reload (every switch) and a daemon restart.
+    # Stopping it restores each unit's configured MemoryHigh exactly.
+    def _memory_high(unit, user=False):
+        scope = "--user --machine=jonathan@ " if user else ""
+        group = dellan.succeed(f"systemctl {scope}show -P ControlGroup {unit}").strip()
+        return int(dellan.succeed(f"cat /sys/fs/cgroup{group}/memory.high").strip())
+
+    def _configured_high(unit, user=False):
+        scope = "--user --machine=jonathan@ " if user else ""
+        return int(dellan.succeed(f"systemctl {scope}show -P MemoryHigh {unit}").strip())
+
+    mem_total = int(dellan.succeed("awk '/^MemTotal:/ {print $2}' /proc/meminfo")) * 1024
+    share = max((mem_total - 2 * 2**30 - 2 * 2**30) // 2, 2**30)
+    reserved_cap = min(share, mem_total * 50 // 100) // 4096 * 4096
+    capped = [("nix-daemon.service", False), ("ram-heavy.slice", True)]
+    dellan.succeed("systemctl start nix-daemon.service")
+    dellan.succeed("su - jonathan -c 'systemctl start memory-reserve-vmtest.service'")
+    for unit, user in capped:
+        assert _memory_high(unit, user) == reserved_cap, (unit, _memory_high(unit, user), reserved_cap)
+    dellan.succeed("systemctl daemon-reload")
+    dellan.succeed("systemctl --user --machine=jonathan@ daemon-reload")
+    dellan.succeed("systemctl restart nix-daemon.service")
+    for unit, user in capped:
+        assert _memory_high(unit, user) == reserved_cap, (unit, _memory_high(unit, user), "after reload/restart")
+    dellan.succeed("su - jonathan -c 'systemctl stop memory-reserve-vmtest.service'")
+    # nix-daemon returns to its 50%; the slice to the OOMD check's own runtime
+    # override above, which the reservation must neither beat afterwards nor
+    # delete.
+    unreserved = (mem_total * 50 // 100) // 4096 * 4096
+    assert _configured_high("nix-daemon.service") // 4096 * 4096 == unreserved
+    assert _configured_high("ram-heavy.slice", True) == 128 * 2**20
+    for unit, user in capped:
+        assert _memory_high(unit, user) == _configured_high(unit, user) // 4096 * 4096, unit
 
     # Assert on the home.file source rather than `crontab -l`: the live
     # crontab is installed by an activation hook whose timing relative to

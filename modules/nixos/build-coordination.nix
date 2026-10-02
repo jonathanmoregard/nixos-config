@@ -120,6 +120,20 @@ in
   options.services.buildCoordination = {
     enable = lib.mkEnableOption "memory coordination for Nix and feature-VM jobs";
 
+    maxJobs = lib.mkOption {
+      type = lib.types.ints.positive;
+      # 24-thread / 64 GiB host. Parallel builders share nix-daemon's
+      # MemoryHigh (memory-pressure.nix), which throttles before OOMD kills.
+      default = 4;
+      description = "nix.settings.max-jobs: derivations built in parallel.";
+    };
+
+    cores = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 6;
+      description = "nix.settings.cores: build threads per derivation.";
+    };
+
     runnerPackage = lib.mkOption {
       type = lib.types.package;
       readOnly = true;
@@ -157,8 +171,8 @@ in
 
     nix.settings = {
       experimental-features = [ "cgroups" ];
-      max-jobs = 1;
-      cores = 4;
+      max-jobs = cfg.maxJobs;
+      cores = cfg.cores;
       use-cgroups = true;
     };
   };

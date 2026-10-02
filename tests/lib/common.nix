@@ -209,10 +209,10 @@ in
   # skipTypeCheck mirrors the original monolith — mypy mis-parses some
   # of the testScript heredocs (e.g. `import json` indent in claude-pane);
   # keeping it uniform across lanes avoids surprise when blocks move.
-  mkTest = { name, testScript }: pkgs.testers.runNixOSTest {
+  mkTest = { name, testScript, extraModules ? [] }: pkgs.testers.runNixOSTest {
     inherit name testScript;
     skipTypeCheck = true;
-    nodes.dellan = node;
+    nodes.dellan = { imports = [ node ] ++ extraModules; };
   };
 
   mkMinimalTest = { name, testScript, extraModules ? [] }:

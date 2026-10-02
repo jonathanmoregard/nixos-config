@@ -531,7 +531,6 @@ in
     ./futuresearch-gate-mcp.nix
     ./aggregator-embed.nix
     ./aggregator-mcp-backend.nix
-    ./ram-heavy-slice.nix
     # Must stay AFTER ./jonathan.nix: it redefines claude()/claudee()
     # through `programs.zsh.initContent = lib.mkAfter`, and the later
     # definition is the one the shell keeps.

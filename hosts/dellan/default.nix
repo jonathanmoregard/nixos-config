@@ -12,6 +12,13 @@
 
   networking.hostName = "dellan";
 
+  # 12 threads: keep the pre-tuxedo build parallelism. The shared defaults
+  # are sized for tuxedo; this block goes when Dellan is retired.
+  services.buildCoordination = {
+    maxJobs = 1;
+    cores = 4;
+  };
+
   # Tuxedo's user key, so the successor can reach this laptop while both
   # run in parallel. Remove when Dellan is retired.
   users.users.jonathan.openssh.authorizedKeys.keys = [
