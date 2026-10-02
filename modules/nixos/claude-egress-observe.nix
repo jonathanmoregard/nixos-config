@@ -642,9 +642,10 @@ in
 
     systemd.services.claude-egress-bind = {
       description = "Bind the claude_egress log rule to ${sliceUnit}'s live cgroup";
-      # wantedBy the table service mirrors research-agent-egress-init's
-      # `wantedBy = [ … "nftables.service" ]`: a reload of the table must
-      # pull the rule back in rather than leave the chain empty.
+      # wantedBy the table service, the pattern the former
+      # research-agent-egress-init used (`wantedBy = [ … "nftables.service" ]`):
+      # a reload of the table must pull the rule back in rather than
+      # leave the chain empty.
       wantedBy = [ "multi-user.target" "claude-egress-table.service" ];
       after = [ "claude-egress-table.service" ];
       requires = [ "claude-egress-table.service" ];

@@ -1,0 +1,213 @@
+{ config, lib, ... }:
+# research-agent GUEST egress policy: an IP allowlist that DNS fills in.
+#
+# Imported by the guest config in research-agent-microvm.nix, and by the
+# `agent` node of tests/microvm.nix, which runs this exact module against
+# a fake upstream to prove the runtime behaviour (see that file).
+#
+# How it works:
+#
+#   agent process ─getaddrinfo─▶ systemd-resolved stub (127.0.0.53)
+#     ─▶ dnsmasq (127.0.0.1:53) ─▶ upstream (SLIRP resolver 10.0.2.3)
+#
+# dnsmasq's `nftset=` directive inserts every IPv4 address in the answer
+# to a query for an allowlisted name into `inet filter research_allowed`
+# BEFORE it hands the answer back. So an address becomes connectable at
+# the exact moment the agent learns it, whatever the CDN did since boot.
+#
+# Why (2026-10-02): api.ebay.com is a CNAME chain onto Akamai
+# (e333426.a.akamaiedge.net) with 8-29 s A-record TTLs; the whole answer
+# set turned over inside 30 s. The previous design resolved the
+# allowlist with getent at boot (egress-init) and every 10 min
+# (egress-refresh), so the agent was almost always handed an address the
+# set had never seen — policy=drop blackholed it and `ebay_search` died
+# with `network error: TimeoutError`. No refresh interval fixes that;
+# only resolving and allowing in the same step does.
+#
+# Load-bearing details:
+#
+#   - CNAME chains: dnsmasq picks the set by the QUESTION name, then adds
+#     every A record in the answer, including the ones owned by the CNAME
+#     targets (forward.c process_reply → rfc1035.c extract_addresses).
+#     So only the name the agent asks for has to be listed. Matching is
+#     suffix-wise: `api.ebay.com` also covers `*.api.ebay.com` — names
+#     under the same owner, and much narrower than what any CDN IP
+#     allowlist already implies (an Akamai edge IP serves every Akamai
+#     customer by SNI).
+#   - No caching anywhere on the path (dnsmasq cache-size=0, resolved
+#     Cache=no). dnsmasq only touches the set on an UPSTREAM reply, never
+#     on a cache hit; with caching, a set emptied by an nftables reload
+#     would stay empty for any name still cached. Uncached, every lookup
+#     re-inserts, so the set heals itself on the next lookup however it
+#     got emptied. The lookups are loopback + one SLIRP hop to the host,
+#     whose own resolver caches.
+#   - No element timeouts. Measured on this kernel (6.18): `add element`
+#     on an existing element does NOT refresh its timeout, and dnsmasq
+#     only ever issues plain `add element`. With a timeout, an address in
+#     continuous use would expire on schedule while clients still hold it
+#     (libcurl caches DNS for 60 s) — the same silent drop this design
+#     removes. The set therefore only grows, bounded by guest uptime and
+#     holding only addresses an allowlisted name actually resolved to;
+#     it resets on every VM boot.
+#   - Every lookup must go through dnsmasq. resolved's only server is
+#     127.0.0.1; the guest's uplink must not hand resolved a per-link DNS
+#     server (research-agent-microvm.nix sets UseDNS=false), or resolved
+#     would also ask 10.0.2.3 directly and its answers would never reach
+#     the set. Fail-closed if it ever happens: the address is simply not
+#     allowed. resolved stays (rather than pointing resolv.conf straight
+#     at dnsmasq) because the agent jail (research-agent
+#     scripts/run-agent.sh) bind-mounts /run/systemd/resolve.
+#   - What this does NOT stop: DNS itself. dnsmasq forwards lookups for
+#     any name, so data encoded in query labels still reaches whatever
+#     nameserver is authoritative for a name the agent invents (as it
+#     did before this module existed). Port 53 is open only towards the
+#     upstream resolver, not to arbitrary addresses.
+#   - IPv4 only, as before: the set is ipv4_addr, nftset is tagged `4#`,
+#     and research-agent-microvm.nix disables IPv6 in the guest.
+let
+  cfg = config.researchAgent.egress;
+
+  # Egress allowlist — SINGLE SOURCE OF TRUTH. Rendered into dnsmasq's
+  # nftset directive below; nothing else consumes it.
+  egressAllowlist = [
+    "api.anthropic.com"
+    # Codex fallback endpoints: ChatGPT sessions call chatgpt.com and
+    # refresh managed OAuth tokens through auth.openai.com. The host
+    # loader also accepts Codex's OPENAI_API_KEY auth shape, whose
+    # responses endpoint is api.openai.com.
+    "chatgpt.com"
+    "auth.openai.com"
+    "api.openai.com"
+    "api.exa.ai"
+    "mcp.exa.ai"
+    # api.tavily.com is AWS ELB-backed and its A records rotate on a
+    # scale of hours-to-days (2026-08-24: the incident that first showed
+    # a boot-time snapshot of DNS cannot hold a rotating host).
+    "api.tavily.com"
+    "mcp.tavily.com"
+    # Trademark-clearance shims (agent/shims/{trademark,bolagsverket}
+    # _shim.py in the research-agent repo). Added to the agent in
+    # 2026-06 but never to this allowlist — every call dialled out,
+    # hit dropped packets, and hung to its client timeout (EUIPO
+    # curl-28 after 30s, bolagsverket urllib after 120s), burning
+    # whole research budgets on dead waits.
+    # EUIPO sandbox (in use until the production subscription is
+    # approved):
+    "auth-sandbox.euipo.europa.eu"
+    "api-sandbox.euipo.europa.eu"
+    # EUIPO production (pre-added so the sandbox->prod flip is a
+    # shim-env change, not another firewall PR):
+    "euipo.europa.eu"
+    "api.euipo.europa.eu"
+    # Bolagsverket open-data bulk file (CC-BY, weekly refresh):
+    "vardefulla-datamangder.bolagsverket.se"
+    # PRV open-data FTP (Swedish national trademark register;
+    # sanctioned bulk channel used by prv_shim).
+    "opendata.prv.se"
+    # Shopping-search shims (agent/shims/{ebay,tradera}_shim.py in
+    # the research-agent repo): the marketplaces' own read-only
+    # search APIs. eBay's token endpoint and Browse API share
+    # api.ebay.com. eBay 403s scraped search pages, so without
+    # this host the agent has no eBay route at all. api.ebay.com is
+    # the fast-rotating Akamai host described above.
+    "api.ebay.com"
+    "api.tradera.com"
+  ];
+in
+{
+  options.researchAgent.egress.upstreamDns = lib.mkOption {
+    type = lib.types.str;
+    # qemu user-mode (SLIRP) networking's built-in resolver.
+    default = "10.0.2.3";
+    description = ''
+      The DNS server dnsmasq forwards to. Every answer from it for an
+      allowlisted name opens egress to the returned addresses.
+    '';
+  };
+
+  config = {
+    networking.nftables = {
+      enable = true;
+      ruleset = ''
+        table inet filter {
+          # Filled at resolution time by dnsmasq (nftset= below).
+          set research_allowed {
+            type ipv4_addr
+            flags interval
+          }
+
+          chain input {
+            type filter hook input priority 0; policy drop;
+            iif lo accept
+            ct state established,related accept
+            tcp dport 22 accept
+          }
+
+          chain output {
+            type filter hook output priority 0; policy drop;
+            oif lo accept
+            ct state established,related accept
+            # DNS only to the one upstream, which only dnsmasq talks to
+            # (everything local reaches dnsmasq over lo). A bare
+            # `dport 53 accept` would be a raw TCP/UDP pipe to any
+            # address on :53, around the allowlist entirely.
+            ip daddr ${cfg.upstreamDns} udp dport 53 accept
+            ip daddr ${cfg.upstreamDns} tcp dport 53 accept
+            ip daddr @research_allowed tcp dport 443 accept
+            # Scraper microvm HTTP API. 10.0.2.2 is the SLIRP host
+            # gateway from inside this VM (qemu user-mode default).
+            # The host's forwardPorts rule on the scraper VM exposes
+            # the scraper's guest port 8000 at host loopback :8123,
+            # so this rule lets the agent's render_shim reach the
+            # scraper without widening the broader egress allowlist.
+            ip daddr 10.0.2.2 tcp dport 8123 accept
+          }
+        }
+      '';
+    };
+
+    # resolved forwards to dnsmasq and nothing else, and never answers
+    # from a cache (see header).
+    networking.nameservers = [ "127.0.0.1" ];
+    services.resolved = {
+      enable = true;
+      settings.Resolve = {
+        Cache = "no";
+        # An empty FallbackDNS disables systemd's compiled-in public
+        # resolvers, which resolved would otherwise query directly —
+        # bypassing dnsmasq — whenever it believes it has no DNS server.
+        FallbackDNS = "";
+      };
+    };
+
+    services.dnsmasq = {
+      enable = true;
+      # We wire resolv.conf/resolved ourselves; this option would route
+      # dnsmasq's upstreams through resolvconf instead of `server` below.
+      resolveLocalQueries = false;
+      settings = {
+        listen-address = "127.0.0.1";
+        bind-interfaces = true;
+        no-resolv = true;
+        no-poll = true;
+        server = [ cfg.upstreamDns ];
+        cache-size = 0;
+        nftset = [
+          "/${lib.concatStringsSep "/" egressAllowlist}/4#inet#filter#research_allowed"
+        ];
+        # One journal line per inserted address — the audit trail of what
+        # egress was opened and for which allowlisted name.
+        log-queries = true;
+      };
+    };
+
+    # The set must exist before the first answer arrives, or the insert
+    # fails (logged) and the agent is handed an address it can't reach.
+    # Requires= also takes dnsmasq down with nftables: no resolver
+    # answers while the ruleset is absent.
+    systemd.services.dnsmasq = {
+      after = [ "nftables.service" ];
+      requires = [ "nftables.service" ];
+    };
+  };
+}
