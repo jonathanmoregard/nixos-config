@@ -195,6 +195,9 @@
         # and its absence was silent for months because the consumer
         # failed open. See overlays/dcg.nix.
         (import ./overlays/dcg.nix)
+        # `pkgs.prompt-injection-scan` — offline PIGuard classifier for the
+        # ~/.claude injection scans. See overlays/prompt-injection-scan.nix.
+        (import ./overlays/prompt-injection-scan.nix)
         # `pkgs.aggregator` — a real store path for the ingest timer, so
         # modules/nixos/aggregator-ingest-timer.nix needs no flake-input
         # specialArgs threading (same reason the listen-tools tools are
@@ -453,6 +456,12 @@
         # app.asar fixtures — pins max-selection over the zero decoys,
         # "expired still measures", and "unreadable fails loud". Cheap
         # runCommand; seconds.
+        # Not a VM lane: drives the built `prompt-injection-scan` (real
+        # model, offline) over benign tool-argument text and injection
+        # payloads, incl. one buried past the model's 512-token window.
+        prompt-injection-scan = import ./tests/prompt-injection-scan.nix {
+          pkgs = pkgsLinux;
+        };
         signal-expiry = import ./tests/signal-expiry.nix {
           pkgs = pkgsLinux;
           checkScript = pkgsLinux.signal-expiry-check;

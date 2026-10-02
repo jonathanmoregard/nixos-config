@@ -544,6 +544,12 @@ in
   # reach interactive shells (which is where prose-decorate runs).
   home.sessionVariables.GEMINI_API_KEY_FILE = "/run/agenix/gemini-api-key";
 
+  # Offline prompt-injection classifier behind ~/.claude's scan_content.py
+  # (permission-ledger injection pass, RSI research cron). Without it those
+  # passes report "unavailable" and emit samples unscanned.
+  # See overlays/prompt-injection-scan.nix.
+  home.packages = [ pkgs.prompt-injection-scan ];
+
   # User crontab — declarative source of truth. Re-applied on every rebuild
   # (overwrites any ad-hoc `crontab -e` edits).
   # Several cron entries redirect into ~/.claude/logs/ before their
