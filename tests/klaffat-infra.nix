@@ -206,6 +206,14 @@ let
         secretless)
           printf '%s\n' 'UNRELATED_SECRET=must-not-reach-server'
           ;;
+        with-microsoft)
+          # Microsoft is optional: its secret rides in the same bundle and its
+          # id comes from public configuration, exactly like Google's.
+          printf '%s\n' \
+            'KLAFFAT_GOOGLE_CLIENT_SECRET=TEST-google-secret' \
+            'KLAFFAT_MS_CLIENT_SECRET=TEST-microsoft-secret' \
+            'UNRELATED_SECRET=must-not-reach-server'
+          ;;
         malformed)
           printf '%s\n' \
             'KLAFFAT_GOOGLE_CLIENT_ID=TEST-google-client.apps.googleusercontent.com' \
@@ -256,6 +264,10 @@ let
       [ -n "''${KLAFFAT_GOOGLE_CLIENT_ID:-}" ] \
         && [ -n "''${KLAFFAT_GOOGLE_CLIENT_SECRET:-}" ] \
         && required=1
+      microsoft=0
+      [ -n "''${KLAFFAT_MS_CLIENT_ID:-}" ] \
+        && [ -n "''${KLAFFAT_MS_CLIENT_SECRET:-}" ] \
+        && microsoft=1
       unrelated=0
       [ -n "''${UNRELATED_SECRET:-}" ] && unrelated=1
       mock=0
@@ -264,8 +276,8 @@ let
           mock=1
         fi
       done
-      printf 'required=%s\nunrelated=%s\nmock=%s\n' \
-        "$required" "$unrelated" "$mock" > "$state/evidence"
+      printf 'required=%s\nmicrosoft=%s\nunrelated=%s\nmock=%s\n' \
+        "$required" "$microsoft" "$unrelated" "$mock" > "$state/evidence"
 
       starts=0
       if [ -f "$state/starts" ]; then
@@ -376,7 +388,7 @@ common.mkMinimalTest {
     machine.succeed(
         "install -d -m 0755 -o jonathan -g users "
         "${localGoogleFixture}/target/local-google/debug "
-        "${localGoogleFixture}/crates/klaffat-web/static "
+        "${localGoogleFixture}/crates/klaffat-web/dist "
         "${localGoogleFixture}/deploy/secrets "
         "${localGoogleFixture}/deploy/klaffat-demo "
         "${localGoogleFixture}/tests/e2e/fixtures"
@@ -386,7 +398,7 @@ common.mkMinimalTest {
         "${fakeKlaffat}/bin/fake-klaffat "
         "${localGoogleFixture}/target/local-google/debug/klaffat"
     )
-    write_file("${localGoogleFixture}/crates/klaffat-web/static/app.css", "body {}\n")
+    write_file("${localGoogleFixture}/crates/klaffat-web/dist/app.css", "body {}\n")
     write_file("${localGoogleFixture}/deploy/secrets/klaffat-env.age", "valid\n")
     # Public configuration: the Google client id is not a secret, so the repo
     # carries it in the clear and agenix holds only the client secret.
@@ -413,7 +425,7 @@ common.mkMinimalTest {
     assert machine.succeed("curl -fsS http://localhost:3740/healthz").strip() == "ok"
 
     evidence = machine.succeed("cat /var/lib/klaffat-local-google/evidence")
-    assert evidence == "required=1\nunrelated=0\nmock=0\n", evidence
+    assert evidence == "required=1\nmicrosoft=0\nunrelated=0\nmock=0\n", evidence
     env_names = machine.succeed(
         "cut -d= -f1 /run/klaffat-local-google/google.env | sort"
     )
@@ -534,6 +546,58 @@ common.mkMinimalTest {
         ).strip() == "0", f"decrypt mode {mode!r} retried root preparation"
         assert "TEST-google-secret" not in out, f"secret leaked for {mode}: {out!r}"
         machine.fail("test -e /run/klaffat-local-google/google.env")
+
+    # Microsoft credentials pass through only with a real public client id.
+    # Without one, every Microsoft line in the bundle is ignored and Google
+    # alone reaches the server: the real bundle carried a Microsoft line long
+    # before a Microsoft client existed (regression after #281). With a real
+    # id, both providers reach the server.
+    write_file("${localGoogleFixture}/deploy/secrets/klaffat-env.age", "with-microsoft\n")
+    machine.succeed("chown jonathan:users ${localGoogleFixture}/deploy/secrets/klaffat-env.age")
+    rc, out = run(
+        "runuser -u jonathan -- ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    assert rc == 0, f"bundle with an unconfigured Microsoft line was refused: {rc} {out!r}"
+    assert "TEST-microsoft-secret" not in out, f"Microsoft secret leaked: {out!r}"
+    env_names = machine.succeed(
+        "cut -d= -f1 /run/klaffat-local-google/google.env | sort"
+    )
+    assert env_names == "KLAFFAT_GOOGLE_CLIENT_ID\nKLAFFAT_GOOGLE_CLIENT_SECRET\n", env_names
+    evidence = machine.succeed("cat /var/lib/klaffat-local-google/evidence")
+    assert "required=1" in evidence and "microsoft=0" in evidence, evidence
+    machine.succeed("systemctl stop klaffat-local-google.service")
+    write_file(
+        "${localGoogleFixture}/deploy/klaffat-demo/public-config.json",
+        '{"oauth": {"googleClientId": "TEST-google-client.apps.googleusercontent.com", '
+        '"microsoftClientId": "11111111-2222-3333-4444-555555555555"}}\n',
+    )
+    machine.succeed(
+        "chown jonathan:users ${localGoogleFixture}/deploy/klaffat-demo/public-config.json"
+    )
+    rc, out = run(
+        "runuser -u jonathan -- ${bin}/klaffat-local-google "
+        "start ${localGoogleFixture}"
+    )
+    assert rc == 0, f"Google + Microsoft start failed: {rc} {out!r}"
+    env_names = machine.succeed(
+        "cut -d= -f1 /run/klaffat-local-google/google.env | sort"
+    )
+    assert env_names == (
+        "KLAFFAT_GOOGLE_CLIENT_ID\nKLAFFAT_GOOGLE_CLIENT_SECRET\n"
+        "KLAFFAT_MS_CLIENT_ID\nKLAFFAT_MS_CLIENT_SECRET\n"
+    ), env_names
+    evidence = machine.succeed("cat /var/lib/klaffat-local-google/evidence")
+    assert "required=1" in evidence and "microsoft=1" in evidence, evidence
+    assert "unrelated=0" in evidence, evidence
+    machine.succeed("systemctl stop klaffat-local-google.service")
+    write_file(
+        "${localGoogleFixture}/deploy/klaffat-demo/public-config.json",
+        '{"oauth": {"googleClientId": "TEST-google-client.apps.googleusercontent.com"}}\n',
+    )
+    machine.succeed(
+        "chown jonathan:users ${localGoogleFixture}/deploy/klaffat-demo/public-config.json"
+    )
 
     # Launcher health polling is bounded and fails loudly if the process never
     # exposes /healthz.
