@@ -2382,23 +2382,19 @@ in
     # declared in this repo, so upstream's `aggregator-embed-unit-hygiene`
     # check keeps guarding the unit that actually runs. What THIS repo
     # decides, and therefore what is asserted here, is the wiring: that the
-    # worker is installed but deliberately unarmed, that it can never download
+    # worker is installed and armed, that it can never download
     # on a manual run, that the seed
     # unit is human-triggered only, and that importing the upstream module
     # did not also resurrect its per-source ingest timers.
-    assert "aggregator-embed.timer" not in agg_timers, (
-        "aggregator-embed.timer is armed despite the temporary embedding "
-        f"pause:\n{agg_timers}"
+    assert "aggregator-embed.timer" in agg_timers, (
+        "aggregator-embed.timer is not armed; the embed worker would never "
+        f"run:\n{agg_timers}"
     )
-    for prop, forbidden in [("is-enabled", "enabled"), ("is-active", "active")]:
-        got = dellan.succeed(
-            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-            f"systemctl --user {prop} aggregator-embed.timer || true'"
-        ).strip()
-        assert got != forbidden, (
-            f"aggregator-embed.timer {prop}={got!r}; temporary pause requires "
-            f"anything except {forbidden!r}"
-        )
+    got = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-enabled aggregator-embed.timer || true'"
+    ).strip()
+    assert got == "enabled", f"aggregator-embed.timer is-enabled={got!r}"
 
     # THE IMPORT MUST NOT BRING THE PER-SOURCE INGEST TIMERS BACK.
     # `services.aggregator.enable = true` switches on the whole upstream
@@ -2482,7 +2478,7 @@ in
             f"systemctl --user cat {unit}'"
         ):
             agg_armed.append(unit)
-    # Three armed units now. The shared MCP backend is armed on purpose so every
+    # Five armed units now. The shared MCP backend is armed on purpose so every
     # stdio client can remain a tiny proxy, and its process/model behavior is
     # exercised above. The health timer is also armed on purpose — a detector
     # that only runs when someone remembers to run it is not a detector — and
@@ -2490,13 +2486,20 @@ in
     # by its timer and the failure-notify service is OnFailure-only, both
     # asserted `static` above. That asymmetry is the property worth defending,
     # and it is why this list is about WantedBy rather than about unit count.
+    # The embed timer and embed server joined with the 9e99864 bump (embedding
+    # on the iGPU): the timer is the deliberate second writer to cache.db
+    # (vectors only; the ingest timer writes rows), and the server is
+    # llama-server behind a unix socket, which never opens cache.db.
     assert agg_armed == [
+        "aggregator-embed-server.service",
+        "aggregator-embed.timer",
         "aggregator-ingest.timer",
         "aggregator-mcp-backend.service",
         "aggregator-schema-health.timer",
     ], (
-        "the set of ARMED aggregator units changed. Only the ingest and "
-        "schema-health timers plus the shared MCP backend may "
+        "the set of ARMED aggregator units changed. Only the ingest, embed "
+        "and schema-health timers, the embed server and the shared MCP "
+        "backend may "
         f"carry an [Install] WantedBy; got {agg_armed} out of "
         f"{agg_all_units}.\n"
         "A newly armed unit is something an aggregator-src bump added that "
@@ -2524,9 +2527,12 @@ in
     # THE ENV VAR IS THE WEAKEST HALF OF "OFFLINE", and asserting only it is
     # how this check quietly stops covering anything. HF_HUB_OFFLINE is a
     # REQUEST: a library that does not read it, or any subprocess spawned
-    # along the way, still has the network. The load-bearing lines are the
-    # seccomp address-family restriction — which makes an AF_INET socket()
-    # fail outright — and the IP filter behind it.
+    # along the way, still has the network. The load-bearing line is the
+    # seccomp address-family restriction, which makes an AF_INET socket()
+    # fail outright. (The IPAddressDeny=any filter that used to sit behind it
+    # was dropped in the 9e99864 bump: in this host's user manager it did not
+    # stop a connect to the machine's own LAN address, so it guaranteed
+    # nothing. The worker reaches the embed server over a unix socket.)
     #
     # AND THIS REPO'S CI IS THE ONLY PLACE THAT CAN CATCH THEIR LOSS.
     # `aggregator-src` is a `flake = false` input, so upstream's own
@@ -2536,12 +2542,24 @@ in
     for directive in [
         "TRANSFORMERS_OFFLINE=1",
         "RestrictAddressFamilies=AF_UNIX AF_NETLINK",
-        "IPAddressDeny=any",
     ]:
         assert directive in agg_embed_unit, (
             f"aggregator-embed.service no longer carries {directive!r}, so the "
             "worker's offline guarantee rests on every library agreeing to "
             f"read an environment variable:\n{agg_embed_unit}"
+        )
+    # The embed server reads what the worker sends it (untrusted corpus text)
+    # and has no reason to reach any network either.
+    agg_embed_server_unit = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat aggregator-embed-server.service'"
+    )
+    for unit_text, name in [(agg_embed_unit, "aggregator-embed.service"),
+                            (agg_embed_server_unit, "aggregator-embed-server.service")]:
+        families = [l for l in unit_text.splitlines() if l.startswith("RestrictAddressFamilies=")]
+        assert families and all("AF_INET" not in l for l in families), (
+            f"{name} may open IP sockets (RestrictAddressFamilies: {families}); "
+            "the embed worker and server talk over a unix socket only"
         )
 
     # The one opt-in that lets a run fetch weights. It belongs to the seed

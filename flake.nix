@@ -126,8 +126,12 @@
     # GET-only and reuse gh's keyring credential instead of an expiring PAT.
     # Bump 472fb55 -> 08106b1 (2026-09-11): add an authenticated FastMCP
     # proxy path so deployed MCP children share one model backend.
+    # Bump 08106b1 -> 9e99864 (2026-10-01): embeddings move from torch on the
+    # CPU to llama-server (Qwen3-Embedding-0.6B Q8_0) on the iGPU, reached over
+    # a unix socket. New embedding stamp: a new index is built beside the old
+    # fp32 vectors, which stay on disk unused.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/08106b171681a194691faed6c478df5eca912c6d";
+      url = "github:jonathanmoregard/aggregator/9e99864a354083f4c54a2a20089afde5e2e304a8";
       flake = false;
     };
 
