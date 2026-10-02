@@ -241,7 +241,12 @@ in
       # -np 1: one conversation at a time, so the whole 64k context belongs
       # to it instead of being divided between server slots. -ngl 99 and
       # --spec-type draft-mtp: see the header; both need this model.
-      ExecStart = "${pkgs.llama-cpp-vulkan}/bin/llama-server -m ${model} -ngl 99 -t 8 -c 65536 -np 1 --jinja -fa on --spec-type draft-mtp --host 127.0.0.1 --port ${toString port}";
+      # --reasoning-budget 8192: this is a thinking model, and left alone it
+      # once thought through the last 16k tokens of its context on a
+      # first-aid question and had nothing left for the answer (bench
+      # 2026-10-02-small-v3, q10). 8k of thought is plenty for a step-by-step
+      # answer; the CLI reports a cut-off answer if it still happens.
+      ExecStart = "${pkgs.llama-cpp-vulkan}/bin/llama-server -m ${model} -ngl 99 -t 8 -c 65536 -np 1 --jinja -fa on --spec-type draft-mtp --reasoning-budget 8192 --host 127.0.0.1 --port ${toString port}";
       # Wins the CPU against the rest of the desktop while it answers; see
       # the header. The cpu controller is delegated to the user manager, so
       # the weight applies between this unit and every app scope beside it.

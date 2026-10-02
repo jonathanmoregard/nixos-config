@@ -1745,10 +1745,10 @@ def up(force=False):
         return
     if MODEL and not os.path.exists(MODEL):
         sys.exit(f"the model is not on this machine: {MODEL}\n"
-                 "Fetch it while online (46 GB):\n"
+                 "Fetch it while online (23 GB):\n"
                  "  nix shell nixpkgs#python3Packages.huggingface-hub -c hf download "
-                 "Qwen/Qwen3-Coder-Next-GGUF --include 'Qwen3-Coder-Next-Q4_K_M/*' "
-                 "--local-dir ~/.local/share/llm-models/qwen3-coder-next")
+                 "unsloth/Qwen3.6-35B-A3B-GGUF --include 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' "
+                 "--local-dir ~/.local/share/llm-models/qwen3.6-35b-a3b-mtp")
     loading = run(["systemctl", "--user", "is-active", "--", UNIT]) in ("active", "activating")
     if MODEL and not force and not loading:
         need, free = model_bytes(), available_bytes()
