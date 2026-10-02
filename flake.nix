@@ -368,6 +368,10 @@
           prodHook = self.nixosConfigurations.dellan.config
             .nix.settings.post-build-hook;
         };
+        # Not a VM lane: ai-throttle / host-telemetry runtime harness
+        # (modules/nixos/ai-throttle.nix) — fake sysfs, cgroup and systemctl,
+        # driven tick by tick. Seconds.
+        ai-throttle = import ./tests/ai-throttle.nix { pkgs = pkgsLinux; };
         # Not a VM lane: fail-closed contract harness for the merged-or-
         # inactive worktree sweeper (home/worktree-sweep-script.nix). Builds
         # a fixture bare repo + worktrees with real git, stubs gh, and

@@ -14,6 +14,8 @@
     ../../modules/nixos/offline-tools.nix
     # Tuxedo only: speech-to-text on the Radeon 890M for Voquill.
     ../../modules/nixos/local-stt.nix
+    # Tuxedo only: quiet background AI (freeze when hot/battery/dictating) + telemetry.
+    ../../modules/nixos/ai-throttle.nix
   ];
 
   networking.hostName = "tuxedo";
