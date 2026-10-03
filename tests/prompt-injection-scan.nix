@@ -10,7 +10,7 @@
 #   - input the scanner could not read is "unscanned" (2), never clean (0)
 { pkgs }:
 pkgs.runCommand "prompt-injection-scan-check" {
-  nativeBuildInputs = [ pkgs.prompt-injection-scan ];
+  nativeBuildInputs = [ pkgs.prompt-injection-scan pkgs.jq ];
 } ''
   set -uo pipefail
   fail() { echo "FAIL: $*"; exit 1; }
@@ -64,6 +64,30 @@ pkgs.runCommand "prompt-injection-scan-check" {
   expect 1 --text "$docs
   ---
   $payload"
+
+  # --json names WHICH documents flagged, so a caller can attribute a hit
+  # to one sample instead of the whole batch. Indices count every
+  # `---`-separated document, blank ones included, so they line up with
+  # the caller's own split. Exit codes are unchanged.
+  json() {
+    local want=$1 filter=$2; shift 2
+    local got=0
+    prompt-injection-scan --json "$@" >out.json 2>err || got=$?
+    [ "$got" = "$want" ] || { cat err >&2; fail "--json: want exit $want, got $got"; }
+    jq -e "$filter" out.json >/dev/null || { cat out.json >&2; fail "--json: $filter"; }
+  }
+  json 0 '.flagged == [] and .documents == 6 and (.scores | length) == 6' --text "$docs"
+  json 1 '.flagged == [7] and .documents == 8 and .scores[7] >= 0.5 and ([.scores[0:7][] | select(. >= 0.5)] | length) == 0' --text "$docs
+  ---
+
+  ---
+  $payload"
+  # over stdin too, with the threshold echoed back
+  rc=0
+  printf '%s\n---\n%s\n' "$payload" "git status --short" | prompt-injection-scan --json --threshold 0.5 >out.json 2>/dev/null || rc=$?
+  [ "$rc" = 1 ] || fail "--json stdin: want exit 1, got $rc"
+  jq -e '.flagged == [0] and .threshold == 0.5' out.json >/dev/null || { cat out.json >&2; fail "--json stdin attribution"; }
+  json 0 '.flagged == [] and .verdict == "clean"' --text "   "
 
   expect 0 --text "   "
   expect 2 --file /nonexistent/input.txt

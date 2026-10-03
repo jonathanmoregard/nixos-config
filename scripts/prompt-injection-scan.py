@@ -12,6 +12,11 @@ Same contract as the RSI plugin's scan_content.py, which delegates here:
     exit 2  scanner unusable (bad input, model missing) - caller must treat
             the text as UNSCANNED
 
+    --json  replaces the echoed text on stdout with one JSON object:
+            {"verdict": "clean"|"injection", "threshold": T, "documents": N,
+             "scores": [per-document score], "flagged": [document indices]}
+            Exit codes are unchanged.
+
 The model sees at most 512 tokens, so long input is scored in overlapping
 windows and the verdict is the highest window score. Truncating instead
 (what llm-guard's MatchType.FULL does) would let a payload placed after the
@@ -20,9 +25,12 @@ first few hundred tokens pass unseen.
 Input may hold several independent documents separated by lines that are
 just `---` (the permission-ledger aggregator joins its samples that way).
 Each document is windowed and scored on its own: in one shared window, a
-few benign neighbours dilute a payload's score far below threshold.
+few benign neighbours dilute a payload's score far below threshold. --json
+reports which documents flagged; indices count every document, blank ones
+included, so they line up with the caller's own split.
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -70,30 +78,34 @@ def load(model_dir):
 
 
 def score(text, model_dir):
-    """Highest INJECTION probability over every document's windows, and its index."""
+    """INJECTION probability of every `---`-separated document.
+
+    One float per document, in input order, blank documents included (as
+    0.0), so callers can map an index back to what they joined. A
+    document's score is its highest window score.
+    """
+    docs = DOC_SEPARATOR.split(text)
+    scores = [0.0] * len(docs)
     np, tok, sess = load(model_dir)
     cls_id = tok.token_to_id("[CLS]")
     sep_id = tok.token_to_id("[SEP]")
     pad_id = tok.token_to_id("[PAD]")
     if cls_id is None or sep_id is None or pad_id is None:
         fail("tokenizer lacks [CLS]/[SEP]/[PAD]")
-    chunks = []
-    for doc in DOC_SEPARATOR.split(text):
+    chunks = []  # (document index, token ids)
+    for d, doc in enumerate(docs):
         if not doc.strip():
             continue
         ids = tok.encode(doc, add_special_tokens=False).ids
-        chunks += [[cls_id] + w + [sep_id] for w in windows(ids, MAX_TOKENS - 2, STRIDE)]
-    if not chunks:
-        return 0.0, 0, 0
+        chunks += [(d, [cls_id] + w + [sep_id]) for w in windows(ids, MAX_TOKENS - 2, STRIDE)]
     input_names = {i.name for i in sess.get_inputs()}
 
-    best, best_at = 0.0, 0
     for b in range(0, len(chunks), BATCH):
         batch = chunks[b:b + BATCH]
-        width = max(len(c) for c in batch)
+        width = max(len(c) for _, c in batch)
         input_ids = np.full((len(batch), width), pad_id, dtype=np.int64)
         mask = np.zeros((len(batch), width), dtype=np.int64)
-        for row, c in enumerate(batch):
+        for row, (_, c) in enumerate(batch):
             input_ids[row, :len(c)] = c
             mask[row, :len(c)] = 1
         feed = {"input_ids": input_ids, "attention_mask": mask}
@@ -102,10 +114,34 @@ def score(text, model_dir):
         logits = sess.run(None, feed)[0]
         exp = np.exp(logits - logits.max(axis=1, keepdims=True))
         probs = (exp / exp.sum(axis=1, keepdims=True))[:, 1]
-        i = int(probs.argmax())
-        if float(probs[i]) > best:
-            best, best_at = float(probs[i]), b + i
-    return best, best_at, len(chunks)
+        for (d, _), p in zip(batch, probs):
+            scores[d] = max(scores[d], float(p))
+    return scores
+
+
+def report(scores, threshold, as_json, text):
+    """Print the result and exit 0 (clean) or 1 (injection)."""
+    flagged = [i for i, s in enumerate(scores) if s >= threshold]
+    if as_json:
+        print(json.dumps({
+            "verdict": "injection" if flagged else "clean",
+            "threshold": threshold,
+            "documents": len(scores),
+            "scores": [round(s, 4) for s in scores],
+            "flagged": flagged,
+        }))
+    else:
+        print(text)
+    if not flagged:
+        sys.exit(0)
+    top = max(flagged, key=lambda i: scores[i])
+    print(
+        "WARNING: Prompt injection detected (score=%.2f, document %d of %d; "
+        "%d document(s) flagged). Content may contain adversarial instructions."
+        % (scores[top], top + 1, len(scores), len(flagged)),
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def main():
@@ -114,6 +150,9 @@ def main():
     parser.add_argument("--text", help="Inline text to scan")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Detection threshold (0-1)")
+    parser.add_argument("--json", action="store_true",
+                        help="Print a JSON verdict naming the flagged documents "
+                             "instead of echoing the text")
     args = parser.parse_args()
 
     if args.file:
@@ -130,28 +169,17 @@ def main():
         fail("no input; use --file, --text, or pipe to stdin")
 
     if not text.strip():
-        print(text)
-        sys.exit(0)
+        report([0.0] * len(DOC_SEPARATOR.split(text)), args.threshold, args.json, text)
 
     model_dir = os.environ.get("PROMPT_INJECTION_MODEL_DIR", "")
     if not model_dir or not os.path.isfile(os.path.join(model_dir, "model.onnx")):
         fail("PROMPT_INJECTION_MODEL_DIR does not hold model.onnx: %r" % model_dir)
 
     try:
-        best, at, n = score(text, model_dir)
+        scores = score(text, model_dir)
     except Exception as exc:  # any inference failure means "not scanned"
         fail("inference failed: %s: %s" % (type(exc).__name__, exc))
-
-    print(text)
-    if best >= args.threshold:
-        print(
-            "WARNING: Prompt injection detected (score=%.2f, window %d of %d). "
-            "Content may contain adversarial instructions." % (best, at + 1, n),
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    sys.exit(0)
-
+    report(scores, args.threshold, args.json, text)
 
 if __name__ == "__main__":
     main()
