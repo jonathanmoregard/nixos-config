@@ -165,7 +165,7 @@ in
 
     # Local copy of the research-agent checkout for the inner microvms.
     # Reports they write land in this copy, not on the host. To pick up
-    # host-side edits without a reboot, re-run the same rsync as jonathan.
+    # host-side edits without a reboot, `sudo systemctl restart` this unit.
     systemd.services.feature-vm-research-agent-copy = {
       description = "Copy the 9p research-agent checkout to local disk for the microvms";
       wantedBy = [ "multi-user.target" ];
@@ -181,16 +181,28 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        User = "jonathan";
-        Group = "users";
+        # Root, not jonathan: the 9p export is mapped-xattr, so the VM
+        # sees host ownership. Host jonathan is uid 1003 on tuxedo while
+        # the VM's jonathan is uid 1000, and most reports are mode 0600 —
+        # as jonathan the copy failed with exit 23 on every one of them.
+        # Root bypasses the VM-side check; the host side still reads as
+        # the qemu process's own user. --chown hands the copy to jonathan.
+        User = "root";
       };
       path = [ pkgs.rsync ];
+      # reports/_quarantine/ is kept as an EMPTY directory (its contents
+      # are never copied into the VM). The anchored exclude matches the
+      # directory itself, so rsync never opendir()s it — an include-dir +
+      # exclude-contents pair still lists it. The mkdir recreates it.
       script = ''
         dest=/home/jonathan/Repos/research-agent
         mkdir -p "$dest"
-        rsync -a --delete --exclude=.venv --exclude=__pycache__ \
+        rsync -a --delete --chown=jonathan:users \
+          --exclude=.venv --exclude=__pycache__ \
+          --exclude=/reports/_quarantine/ \
           /mnt/research-agent-src/ "$dest/"
-        mkdir -p "$dest/reports"
+        mkdir -p "$dest/reports/_quarantine"
+        chown jonathan:users "$dest" "$dest/reports" "$dest/reports/_quarantine"
       '';
     };
 
