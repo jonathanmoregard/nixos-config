@@ -57,18 +57,31 @@
 #     allowed. resolved stays (rather than pointing resolv.conf straight
 #     at dnsmasq) because the agent jail (research-agent
 #     scripts/run-agent.sh) bind-mounts /run/systemd/resolve.
-#   - What this does NOT stop: DNS itself. dnsmasq forwards lookups for
-#     any name, so data encoded in query labels still reaches whatever
-#     nameserver is authoritative for a name the agent invents (as it
-#     did before this module existed). Port 53 is open only towards the
-#     upstream resolver, not to arbitrary addresses.
+#   - DNS is allowlisted too (2026-10-02). dnsmasq forwards a query
+#     upstream ONLY if its name is under an allowlisted domain (one
+#     `server=/<domain>/<upstream>` per entry, rendered from the same
+#     list as nftset); every other name (`address=/#/`, the catch-all
+#     that the longer `server=` matches beat) is answered NXDOMAIN
+#     locally and never leaves the guest. Before, any name was
+#     forwarded, so data encoded in query labels (`<secret>.attacker.
+#     tld`) reached whatever nameserver was authoritative for a name the
+#     agent invented. AAAA and PTR follow the same rule: forwarded only
+#     for allowlisted names, NXDOMAIN otherwise. Residual: labels UNDER
+#     an allowlisted domain (`x.api.ebay.com`) are still forwarded,
+#     because matching is suffix-wise (as for nftset) — they reach only
+#     that domain owner's own nameservers, not an attacker's.
+#   - Only dnsmasq may talk to the upstream resolver. The port-53 rule
+#     is pinned to dnsmasq's uid (`meta skuid`), so a guest process
+#     cannot skip the filter above by sending its query to the upstream
+#     directly.
 #   - IPv4 only, as before: the set is ipv4_addr, nftset is tagged `4#`,
 #     and research-agent-microvm.nix disables IPv6 in the guest.
 let
   cfg = config.researchAgent.egress;
 
   # Egress allowlist — SINGLE SOURCE OF TRUTH. Rendered into dnsmasq's
-  # nftset directive below; nothing else consumes it.
+  # per-domain `server=` forwards and its nftset directive below; nothing
+  # else consumes it.
   egressAllowlist = [
     "api.anthropic.com"
     # Codex fallback endpoints: ChatGPT sessions call chatgpt.com and
@@ -147,12 +160,14 @@ in
             type filter hook output priority 0; policy drop;
             oif lo accept
             ct state established,related accept
-            # DNS only to the one upstream, which only dnsmasq talks to
+            # DNS only to the one upstream, and only from dnsmasq
             # (everything local reaches dnsmasq over lo). A bare
             # `dport 53 accept` would be a raw TCP/UDP pipe to any
-            # address on :53, around the allowlist entirely.
-            ip daddr ${cfg.upstreamDns} udp dport 53 accept
-            ip daddr ${cfg.upstreamDns} tcp dport 53 accept
+            # address on :53, around the allowlist entirely; without
+            # skuid, any guest process could query the upstream directly
+            # and skip dnsmasq's name allowlist (see header).
+            ip daddr ${cfg.upstreamDns} udp dport 53 meta skuid "dnsmasq" accept
+            ip daddr ${cfg.upstreamDns} tcp dport 53 meta skuid "dnsmasq" accept
             ip daddr @research_allowed tcp dport 443 accept
             # Scraper microvm HTTP API. 10.0.2.2 is the SLIRP host
             # gateway from inside this VM (qemu user-mode default).
@@ -163,6 +178,11 @@ in
             ip daddr 10.0.2.2 tcp dport 8123 accept
           }
         }
+      '';
+      # The build-time ruleset check runs in a sandbox with no dnsmasq
+      # user; check the same ruleset against one that exists there.
+      preCheckRuleset = ''
+        sed -i 's/skuid "dnsmasq"/skuid "root"/g' ruleset.conf
       '';
     };
 
@@ -190,7 +210,11 @@ in
         bind-interfaces = true;
         no-resolv = true;
         no-poll = true;
-        server = [ cfg.upstreamDns ];
+        # Forward ONLY allowlisted domains; answer every other name
+        # NXDOMAIN without asking anyone (see header). dnsmasq picks the
+        # longest matching domain, so each `server=` beats `/#/`.
+        server = map (domain: "/${domain}/${cfg.upstreamDns}") egressAllowlist;
+        address = [ "/#/" ];
         cache-size = 0;
         nftset = [
           "/${lib.concatStringsSep "/" egressAllowlist}/4#inet#filter#research_allowed"
