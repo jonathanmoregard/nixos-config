@@ -226,10 +226,14 @@ def hard_reasons(st, now, temp, ac):
     st["fg_ts"] = now
     # The router's record-start hint: foreground use at the file's mtime,
     # which lands this tick instead of the one after the CPU time shows.
-    # A hint from the future (clock step) counts as now, not longer.
+    # A hint dated more than a couple of seconds into the future is a clock
+    # step, not a dictation: ignored, so the pause can never outlast HOLD_S
+    # (clamping it to now would re-arm it every tick until the clock caught up).
     try:
-        hinted = min(HINT.stat().st_mtime, now)
+        hinted = HINT.stat().st_mtime
     except OSError:
+        hinted = None
+    if hinted is not None and hinted > now + 2:
         hinted = None
     if hinted is not None and now - hinted < HOLD_S:
         st["fg_last_active"] = max(st.get("fg_last_active") or 0, hinted)

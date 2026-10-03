@@ -198,6 +198,16 @@ pkgs.runCommand "ai-throttle-check" {
   unit aggregator-embed.service active S 103; tick 1620
   [ "$(freezer aggregator-embed.service)" = T ] || fail "a new worker run started while paused was not stopped"
 
+  # A hint dated well into the future is a clock step, not a dictation: it
+  # must not count (clamped to now it would re-arm every tick until the clock
+  # caught up, and the pause would outlast the hold). Inside the tolerance it
+  # is just an ordinary fresh hint. The heat pause stays; only the reason moves.
+  touch -d @1800 $W/foreground-hint; tick 1700
+  jq -e '.reasons | index("foreground") == null' $W/last.json > /dev/null || fail "a hint from the far future must be ignored: $(state)"
+  touch -d @1701 $W/foreground-hint; tick 1700
+  jq -e '.reasons | index("foreground") != null' $W/last.json > /dev/null || fail "a hint 1 s ahead (clock skew) must still count: $(state)"
+  rm $W/foreground-hint
+
   # host-telemetry: two samples, the second carries deltas and the governor's state.
   export HOST_TELEMETRY_DIR=$W/tel
   printf 'usage_usec 1000000\n' > $EMB/cpu.stat

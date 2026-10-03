@@ -170,6 +170,10 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   EOF
   chmod +x $PWD/bin/powerprofilesctl
   export LOCAL_STT_POWERPROFILESCTL=$PWD/bin/powerprofilesctl
+  # A hold that outlives this whole run, so "one hold at a time" below is a
+  # property of the router, not of how fast the earlier cases happened to go
+  # (the wedged-stub case alone takes 20 s of a 30 s hold).
+  export LOCAL_STT_HOLD_SECONDS=600
   hint=$PWD/throttle/foreground-hint
   export LOCAL_STT_THROTTLE_HINT=$hint
   log=$PWD/asked
@@ -275,11 +279,11 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   # leaves a foreground hint that ai-throttle reads to pause the background
   # units on its next tick. A transcription takes the same hold inline, so
   # the gain exists without any ping.
-  # The transcriptions above already took the hold: one launch, seconds ago,
-  # whose 30 s child is still alive, so every request in this block must
-  # ride it rather than start another.
+  # The transcriptions above already took the hold: one launch whose child
+  # (600 s here) is still alive, so every request in this block must ride it
+  # rather than start another.
   [ -f "$hint" ] || fail "the transcriptions left no foreground hint at $hint"
-  [ "$(sort -u "$PPD_LOG")" = "launch -p performance -- sleep 30" ] || fail "the transcriptions did not hold the performance profile: $(cat "$PPD_LOG")"
+  [ "$(sort -u "$PPD_LOG")" = "launch -p performance -- sleep 600" ] || fail "the transcriptions did not hold the performance profile: $(cat "$PPD_LOG")"
   holds=$(wc -l < "$PPD_LOG")
   rm -f "$hint"
   res=$(ask prepare /v1/prepare)
@@ -288,10 +292,15 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   [ -f "$hint" ] || fail "prepare left no foreground hint at $hint"
   res=$(ask prepare-post /prepare)
   [ "$(jq -r '.[0]' <<< "$res")" = 204 ] || fail "POST /prepare: $res"
-  rm -f "$hint"
+  # An existing, stale hint is re-dated by the next transcription: ai-throttle
+  # reads the mtime, so a hint that is only ever created would go stale after
+  # the first dictation.
+  touch -d @1500 "$hint"
+  before=$(date +%s)
   res=$(ask EN-hello "" "" 3)
   [ "$(jq -r '.[1].text' <<< "$res")" = "short heard it" ] || fail "transcription after prepare: $res"
   [ -f "$hint" ] || fail "a transcription left no foreground hint"
+  [ "$(stat -c %Y "$hint")" -ge "$before" ] || fail "a transcription did not re-date the stale hint (mtime $(stat -c %Y "$hint") < $before)"
   sleep 0.3
   [ "$(wc -l < "$PPD_LOG")" = "$holds" ] || fail "a request while the hold lives started another hold: $(cat "$PPD_LOG")"
   # A router with no hold alive: the first prepare starts one, at once.
@@ -303,7 +312,7 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   [ "$(jq -r '.[0]' <<< "$res")" = 204 ] || fail "prepare on a fresh router: $res"
   # The 204 does not wait for the hold's child to start; give it a moment.
   for _ in $(seq 40); do [ -s $PWD/r3/calls ] && break; sleep 0.05; done
-  [ "$(cat $PWD/r3/calls)" = "launch -p performance -- sleep 30" ] || fail "a prepare with no hold alive did not start one: $(cat $PWD/r3/calls)"
+  [ "$(cat $PWD/r3/calls)" = "launch -p performance -- sleep 600" ] || fail "a prepare with no hold alive did not start one: $(cat $PWD/r3/calls)"
   [ -f $PWD/r3/hint ] || fail "prepare on a fresh router left no hint"
   kill "$router3"
   # No powerprofilesctl (the lane VM, any machine without power-profiles-daemon):

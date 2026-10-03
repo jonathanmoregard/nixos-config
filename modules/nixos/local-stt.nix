@@ -154,6 +154,7 @@ in
       # client (the daemon itself is the desktop's), and the hint file the
       # governor reads, the one path for both so they cannot drift.
       LOCAL_STT_POWERPROFILESCTL = "${pkgs.power-profiles-daemon}/bin/powerprofilesctl";
+      LOCAL_STT_NICE = "${pkgs.coreutils}/bin/nice";
       LOCAL_STT_THROTTLE_HINT = config.services.aiThrottle.foregroundHint;
     };
     serviceConfig = priority // {

@@ -93,8 +93,15 @@ THROTTLE_HINT = os.environ.get("LOCAL_STT_THROTTLE_HINT") or os.path.join(
     os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "ai-throttle", "foreground-hint")
 # How long one performance hold lasts: a dictation's transcription plus the
 # next one, which is likely close behind. Each prepare while a hold lives
-# changes nothing; the first one after it ends starts the next.
-HOLD_SECONDS = 30
+# changes nothing; the first one after it ends starts the next. An input so
+# the lane can pick a hold that outlives its whole run.
+HOLD_SECONDS = max(1, int(os.environ.get("LOCAL_STT_HOLD_SECONDS", "30")))
+# powerprofilesctl is a Python/GLib program whose start-up competes with the
+# transcription it serves (un-niced it cost ~35 ms on AC, 2026-10-03), so the
+# child is started through nice(1). An argv prefix, not preexec_fn: preexec_fn
+# runs Python between fork and exec, which CPython documents as unsafe with
+# threads, and a child stuck there would hold the single-flight slot forever.
+NICE = os.environ.get("LOCAL_STT_NICE") or shutil.which("nice")
 
 
 class BackendError(Exception):
@@ -138,13 +145,11 @@ class Boost:
                     self.say_once(f"powerprofilesctl exited {self.child.returncode}; "
                                   "is power-profiles-daemon running? Trying again on the next request")
             try:
-                # powerprofilesctl is a Python/GLib program: niced, so its
-                # start-up does not compete with the transcription it serves
-                # (inline, un-niced, it cost ~90 ms on AC, 2026-10-03).
+                argv = [POWERPROFILESCTL, "launch", "-p", "performance", "--", "sleep", str(HOLD_SECONDS)]
+                if NICE:
+                    argv = [NICE, "-n", "19"] + argv
                 self.child = subprocess.Popen(
-                    [POWERPROFILESCTL, "launch", "-p", "performance", "--", "sleep", str(HOLD_SECONDS)],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    preexec_fn=lambda: os.nice(19))
+                    argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except OSError as e:
                 self.child = None
                 self.say_once(f"cannot start powerprofilesctl ({e}); transcriptions run without the performance hold")
