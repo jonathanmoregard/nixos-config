@@ -44,7 +44,7 @@ in
     };
     foreground = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "local-stt.service" "local-stt-general.service" "local-stt-swedish.service" ];
+      default = [ "local-stt.service" "local-stt-general.service" "local-stt-general-short.service" "local-stt-swedish.service" ];
       description = "Interactive user units whose recent CPU use pauses the background units outright.";
     };
     quietAtC = lib.mkOption {
