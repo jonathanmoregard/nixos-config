@@ -20,14 +20,19 @@ oneshot service from a daily user timer at 03:33 (±20 min, `Persistent=true`):
 1. **Due?** Reads `$XDG_STATE_HOME/offline-ai/smoke.json`. If the last `ok` is younger
    than 6 days → exits 0 without running ("weekly", with a daily opportunity so a
    missed night is caught the next night, not a week later).
-2. **Right moment?** Skips (status `skipped`, no toast) when on battery. Waits for the
-   user to be idle ≥ 15 min (`xprintidle`; if it cannot be read, proceeds), polling
-   every 5 min for at most 2 h; still active → `skipped`, try next night. Rationale:
-   loading the model evicts voquill/local-stt/aggregator for the duration.
-3. **Memory peace.** Runs the model step under `nix-memory-run -- …` (blocking): waits
-   for a running nix build and keeps auto-deploy from starting one while the model
-   holds 24 GiB.
-4. **Ask.** Records whether the model was already up (`offline-ai status`). Runs
+2. **Right moment?** A skip is recorded as `last_skip` + `skip_reason` beside the last
+   verdict, never over it (a quiet night after a failure must not hide the failure).
+   Skips: outside the night window 01–07 local (a timer that elapsed during suspend
+   fires at resume, which would otherwise run the smoke mid-day); on battery; user not
+   idle ≥ 15 min (`xprintidle`; if it cannot be read, proceeds) after polling every
+   5 min for at most 2 h. Rationale: loading the model evicts voquill/local-stt/
+   aggregator for the duration.
+3. **Memory peace.** Runs the model step under `nix-memory-run --nonblock -- …`; exit
+   75 (a nix build holds the memory lock) is retried every 5 min for up to 1 h, then
+   the night is skipped. While the smoke holds the lock, auto-deploy defers its own
+   build instead of loading one beside the 24 GiB model.
+4. **Ask.** Records whether the model unit was already active
+   (`systemctl --user is-active offline-ai-llm.service`: true / false / unknown). Runs
    `timeout -k 30 600 offline-ai "<prompt>"` with `OFFLINE_AI_READY_TIMEOUT=600`. The
    CLI enters offline mode if the server is down and leaves it in `finally`, however
    it ends; if the user already had the model up, the CLI leaves it alone and so does
@@ -37,17 +42,23 @@ oneshot service from a daily user timer at 03:33 (±20 min, `Persistent=true`):
    `exit 2` → answer cut off, `124/137` → timeout, exit 0 without PONG → unexpected
    answer (first 200 chars kept). Wall time and the CLI's "model ready after N s" are
    recorded.
-6. **Always clean up.** If the model was not up before and `offline-ai status` still
-   shows it active after a failure (e.g. SIGKILL after the grace period), run
-   `offline-ai down`.
-7. **Report.** Writes `smoke.json` (`last_run`, `last_ok`, `status`, `reason`,
-   `elapsed_s`, `model_ready_s`, `answer`, `exit_code`). `fail` → one journal line and
-   `notify-send -u critical` ("offline-ai smoke FAILED: <reason>"). `ok`/`skipped` →
-   journal only. A SessionStart hook in `~/.claude` (separate PR) announces `fail`, or
-   no successful run in 10 days, to the agent and the operator; silent otherwise.
+6. **Always clean up.** After a failed run, when the unit was *not* active before,
+   run `offline-ai down` (bounded by 15 min; a hang is named in the reason, never a
+   traceback). Never when it was the user's model, and never when systemd could not
+   say (`cleanup: not touched`). A SIGTERM from the service's own timeout is caught
+   and recorded as a failed attempt before exiting; the CLI leaves offline mode on
+   its own SIGTERM from the control group.
+7. **Report.** Writes `smoke.json` (`first_run`, `last_check`, `last_run`,
+   `last_attempt`, `last_ok`, `status`, `reason`, `elapsed_s`, `model_ready_s`,
+   `answer`, `exit_code`, `was_up`, `cleanup`, `last_skip`, `skip_reason`). `fail` →
+   one journal line and `notify-send -u critical` ("offline-ai smoke FAILED: <reason>").
+   `ok` and skips → journal only. A SessionStart hook in `~/.claude` (separate PR)
+   announces `fail`, or no pass within 10 days of `first_run`, to the agent and the
+   operator; silent otherwise.
 
 Exit code of the service: 0 for ok/skipped/not-due, 1 for fail (so `systemctl
---user status offline-ai-smoke` shows red and `OnFailure` could be attached later).
+--user status offline-ai-smoke` shows red and `OnFailure` could be attached later),
+128+signal when aborted.
 
 ## Units (modules/nixos/offline-ai.nix)
 
