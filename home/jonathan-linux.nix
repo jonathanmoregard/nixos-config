@@ -636,6 +636,7 @@ in
     ./nixos-config-fetch.nix
     ./sota-watch.nix
     ./ai-router.nix
+    ./session-reflect-backfill.nix
     ./worktree-sweep.nix
     ./router-services.nix
     ./claude-services.nix
