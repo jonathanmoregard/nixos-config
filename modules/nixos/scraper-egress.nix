@@ -22,7 +22,10 @@
 {
   networking.nftables.enable = true;
   networking.nftables.tables.scraper-egress = {
-    family = "ip";
+    # inet, not ip: the guest's SLIRP NIC carries IPv6 (fec0::/64 by RA)
+    # even with networking.enableIPv6 = false, and SLIRP maps fec0::2 to
+    # the HOST's ::1 just as 10.0.2.2 maps to 127.0.0.1.
+    family = "inet";
     content = ''
       chain output {
         type filter hook output priority filter; policy accept;
@@ -30,6 +33,8 @@
         oifname "lo" accept
         ip daddr 10.0.2.3 meta l4proto { tcp, udp } th dport 53 accept
         ip daddr 10.0.2.2 udp dport 67 accept
+        # SLIRP's v6 DNS: resolved lists it beside 10.0.2.3 on the link.
+        ip6 daddr fec0::3 meta l4proto { tcp, udp } th dport 53 accept
         ip daddr {
           0.0.0.0/8,
           10.0.0.0/8,
@@ -38,6 +43,12 @@
           172.16.0.0/12,
           192.168.0.0/16
         } counter reject
+        # IPv6: nothing new leaves the guest. It is meant to be IPv4-only,
+        # and SLIRP's v6 reaches host-local ground (fec0::2 = host ::1,
+        # the host's ULA and tailscale addresses). Public egress is
+        # carried by IPv4; chromium falls back on the immediate reject.
+        # TCP/UDP only, so ICMPv6 neighbour discovery is left alone.
+        meta nfproto ipv6 meta l4proto { tcp, udp } counter reject
       }
     '';
   };

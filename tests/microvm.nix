@@ -596,19 +596,41 @@ pkgs.testers.runNixOSTest {
     scraper.succeed("timeout 6 bash -c 'exec 3<>/dev/tcp/10.0.2.3/53'")
     scraper.fail("timeout 6 bash -c 'exec 3<>/dev/tcp/10.0.2.3/443'")
 
+    # IPv6. The guest sets enableIPv6 = false, yet live its SLIRP NIC still
+    # carries fec0::/64 from SLIRP's RA (networkd re-enables v6 per link),
+    # and SLIRP maps fec0::2 to the HOST's ::1 exactly as 10.0.2.2 maps to
+    # 127.0.0.1 (measured 2026-10-03: a canary on host [::1] was served to
+    # the guest, and a page WebSocket to ws://[fec0::2] reached it past the
+    # Python request guard). Reproduce that link state here: v6 on eth1
+    # only, SLIRP's v6 gateway played by upstream.
+    upstream.succeed(
+        "sysctl -w net.ipv6.conf.eth1.disable_ipv6=0",
+        "ip -6 addr add fec0::2/64 dev eth1 nodad",
+        "systemd-run --unit=v6-gateway ${pkgs.python3}/bin/python3 -m http.server 8443 --bind fec0::2 --directory /srv/cdn",
+    )
+    scraper.succeed(
+        "sysctl -w net.ipv6.conf.eth1.disable_ipv6=0",
+        "ip -6 addr add fec0::15/64 dev eth1 nodad",
+    )
+    upstream.wait_until_succeeds("ss -ltn | grep -q '\\[fec0::2\\]:8443'")
+    rc, code = scraper_get("-g http://[fec0::2]:8443/")
+    assert rc != 0, f"scraper reached the v6 host gateway (code {code!r}) — guest egress must refuse IPv6"
+
     # Inbound still works: the host's hostfwd arrives from 10.0.2.2, and
     # replies on that connection must not be caught by the output drop.
     out = upstream.succeed("curl -sS -m 5 --interface 10.0.2.2 http://10.0.2.15:8000/")
     assert out.strip() == "api-ok", f"inbound API via gateway broken: {out!r}"
 
-    counters = scraper.succeed("nft list table ip scraper-egress")
+    counters = scraper.succeed("nft list table inet scraper-egress")
     print("[diag] scraper-egress:\n" + counters)
     assert "packets 0 " not in counters, "reject rule never matched — test exercised nothing"
 
     # Non-vacuity: with the chain emptied, the very same gateway URL is
     # reachable — so the refusals above were the policy, not the network.
-    scraper.succeed("nft flush chain ip scraper-egress output")
+    scraper.succeed("nft flush chain inet scraper-egress output")
     rc, code = scraper_get("http://10.0.2.2:443/")
     assert rc == 0 and code == "200", f"control: gateway unreachable even without policy: rc={rc} code={code!r}"
+    rc, code = scraper_get("-g http://[fec0::2]:8443/")
+    assert rc == 0 and code == "200", f"control: v6 gateway unreachable even without policy: rc={rc} code={code!r}"
   '';
 }
