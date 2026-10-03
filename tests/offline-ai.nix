@@ -43,10 +43,29 @@
 #     streams and never leaves stdout empty with exit 0 (it exits 2);
 #   - swap is counted as the RAM it frees: a swap file one for one, zram at
 #     its compression ratio, bounded by free swap and anonymous memory, and
-#     the "will move to swap" message reports what really moves.
+#     the "will move to swap" message reports what really moves;
+#   - two models: a run loads the default (small) model's unit unless --model
+#     names the other; selecting the other while one is loaded stops the
+#     loaded one (its marker with it) before the other starts; a conversation
+#     while the mode is on only switches models and leaves the model it
+#     loaded, one from default mode leaves nothing loaded; `down` stops every
+#     model unit and clears every marker; an unknown --model exits 1 naming
+#     the models; a missing model names its own fetch hint; status and
+#     models name the loaded model. And, read from the deployed units: each
+#     model unit names the other in Conflicts=, and the gated units refuse
+#     to start while either model's marker stands;
+#   - the help text is a complete reference: every command the CLI
+#     dispatches on, every option its parser defines, every model (with its
+#     line and fetch hint), the default, and the exit statuses — the
+#     expected list read from the script, so a command or option added
+#     without a line of help fails here.
 #
 # Run: nix build .#checks.x86_64-linux.offline-ai -L
-{ pkgs, offlineAi, libraryServe, libraryFetch }:
+{ pkgs, offlineAi, libraryServe, libraryFetch
+, conflicts ? { }               # model name -> Conflicts= of its deployed unit (string or list)
+, gatedUserDropIn ? ""          # the drop-in text one gated user service carries
+, gatedSystemConditions ? [ ]   # ConditionPathExists= of one gated system unit
+}:
 let
   stub = pkgs.writeText "offline-ai-stub.py" ''
     import json, sys
@@ -168,31 +187,46 @@ let
 
   # Stands in for systemctl in the mode scenarios: units are files in a state
   # folder (present = active), every call is logged, and units listed in
-  # $FAKE_REFUSE refuse to start. Starting the model unit makes the model
-  # stub report healthy; stopping it makes it unhealthy again.
+  # $FAKE_REFUSE refuse to start. Starting a model unit makes the model stub
+  # report healthy; stopping it makes it unhealthy again. Two model units,
+  # each with its own reservation and marker file: the small model's
+  # (mode/marker) and the coder's (mode/marker-coder). No Conflicts= here:
+  # the CLI itself must stop the loaded model before it starts the other,
+  # or the fake keeps the first unit active.
   fakeSystemctl = pkgs.writeShellScript "systemctl" ''
     state="$FAKE_STATE"; scope=system
     [ "$1" = --user ] && { scope=user; shift; }
     verb=$1; shift; [ "$1" = -- ] && shift; unit=$1
     [ "$verb" = show ] && unit=''${*: -1}
     echo "$scope $verb $unit" >> "$state/calls"
+    marker_of() {
+      case "$1" in
+        offline-ai-llm.service|memory-reserve-offline-ai.service) echo "$state/marker" ;;
+        offline-ai-llm-coder.service|memory-reserve-offline-ai-coder.service) echo "$state/marker-coder" ;;
+      esac
+    }
+    is_model() { case "$1" in offline-ai-llm.service|offline-ai-llm-coder.service) return 0 ;; *) return 1 ;; esac; }
+    any_marker() { [ -e "$state/marker" ] || [ -e "$state/marker-coder" ]; }
     case "$verb" in
       is-active) if [ -e "$state/$scope/$unit" ]; then echo active; else echo inactive; exit 3; fi ;;
       show)
         case " $* " in
           *" LoadState "*) [ -e "$state/gone/$unit" ] && echo not-found || echo loaded ;;
-          # A gated unit started while the marker stands was refused by its condition.
-          *" ConditionResult "*) [ -e "$state/marker" ] && [ -e "$state/gated/$unit" ] && echo no || echo yes ;;
+          # A gated unit started while a marker stands was refused by its condition.
+          *" ConditionResult "*) any_marker && [ -e "$state/gated/$unit" ] && echo no || echo yes ;;
           *) [ -e "$state/transient/$unit" ] && echo yes || echo no ;;
         esac
         exit 0 ;;
       stop)
-        rm -f "$state/$scope/$unit"; [ "$unit" = offline-ai-llm.service ] && rm -f "$state/healthy"
-        # The model unit's ExecStopPost stops the reservation, which removes the
-        # marker; FAKE_STICKY_MARKER=1 is that stop failing, =2 the reservation
-        # refusing to stop at all.
-        [ "$unit" = offline-ai-llm.service ] && [ "''${FAKE_STICKY_MARKER:-0}" = 0 ] && rm -f "$state/marker"
-        [ "$unit" = memory-reserve-offline-ai.service ] && [ "''${FAKE_STICKY_MARKER:-0}" != 2 ] && rm -f "$state/marker"
+        # A model unit that was running stops answering.
+        if is_model "$unit" && [ -e "$state/$scope/$unit" ]; then rm -f "$state/healthy"; fi
+        rm -f "$state/$scope/$unit"
+        # The model unit's ExecStopPost stops its reservation, which removes
+        # its marker; FAKE_STICKY_MARKER=1 is that stop failing, =2 the
+        # reservation refusing to stop at all.
+        marker=$(marker_of "$unit")
+        if is_model "$unit" && [ "''${FAKE_STICKY_MARKER:-0}" = 0 ]; then rm -f "$marker"; fi
+        case "$unit" in memory-reserve-*) [ "''${FAKE_STICKY_MARKER:-0}" != 2 ] && rm -f "$marker" ;; esac
         # Stopping a unit that holds GPU memory gives that memory back.
         if [ -e "$state/gpu/$unit" ]; then
           avail=$(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' "$FAKE_MEMINFO")
@@ -201,13 +235,13 @@ let
         exit 0 ;;
       start)
         case " $FAKE_REFUSE " in *" $unit "*) echo "refused $unit" >&2; exit 1 ;; esac
-        # ConditionPathExists=!marker: start returns 0 and does nothing.
-        if [ -e "$state/marker" ] && [ -e "$state/gated/$unit" ]; then exit 0; fi
+        # ConditionPathExists=!marker (one line per model): start returns 0 and does nothing.
+        if any_marker && [ -e "$state/gated/$unit" ]; then exit 0; fi
         touch "$state/$scope/$unit"
-        if [ "$unit" = offline-ai-llm.service ]; then
+        if is_model "$unit"; then
           # ExecStartPre starts the reservation (the marker), unless it fails;
           # the server becomes healthy, unless it never does.
-          [ "''${FAKE_NO_MARKER:-0}" = 1 ] || touch "$state/marker"
+          [ "''${FAKE_NO_MARKER:-0}" = 1 ] || touch "$(marker_of "$unit")"
           [ "''${FAKE_NEVER_HEALTHY:-0}" = 1 ] || touch "$state/healthy"
         fi
         exit 0 ;;
@@ -406,6 +440,39 @@ let
         print("citation rules:\n  " + "\n  ".join(failed), file=sys.stderr)
         sys.exit(1)
     print("citation rules ok")
+  '';
+
+  # The help text as a reference. The expected words come from the script
+  # itself: the commands it dispatches on (COMMANDS), the option strings its
+  # parser defines (build_parser), the model names in its table; plus the
+  # default marked, the two-word library form, the exit statuses, and each
+  # model's line and fetch hint. A word counts only as a whole word.
+  helpUnit = pkgs.writeText "offline-ai-help-unit.py" ''
+    import importlib.util, re, sys
+
+    spec = importlib.util.spec_from_file_location("oai", sys.argv[1])
+    oai = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oai)
+    for name in ("COMMANDS", "build_parser", "usage"):
+        if not hasattr(oai, name):
+            sys.exit(f"the CLI has no {name} to derive the help reference from")
+    text = oai.usage()
+    expected = list(oai.COMMANDS) + list(oai.MODELS)
+    expected += [flag for action in oai.build_parser()._actions for flag in action.option_strings]
+    missing = [word for word in expected
+               if not re.search(r"(?<![\w-])" + re.escape(word) + r"(?![\w-])", text)]
+    for needle, what in ((oai.DEFAULT_MODEL + " (default)", "which model is the default"),
+                         ("library fetch", "the two-word library form"),
+                         ("Exit status", "the exit statuses")):
+        if needle not in text:
+            missing.append(what)
+    for name, entry in oai.MODELS.items():
+        for key in ("about", "fetch"):
+            if entry.get(key) and entry[key] not in text:
+                missing.append(f"the {name} model's {key}")
+    if missing:
+        sys.exit("the help text lacks: " + ", ".join(missing))
+    print("help reference ok")
   '';
 
   swapUnit = pkgs.writeText "offline-ai-swap-unit.py" ''
@@ -675,7 +742,7 @@ pkgs.runCommand "offline-ai-harness"
     trap 'kill $stub_pid $library_pid $mirror_pid $mode_pid 2>/dev/null || true' EXIT
     for _ in $(seq 1 50); do [ -s mode_port ] && break; sleep 0.1; done
     reset_units() {
-      rm -rf mode/system mode/user mode/calls mode/healthy mode/marker mode/gated; mkdir -p mode/system mode/user mode/gated
+      rm -rf mode/system mode/user mode/calls mode/healthy mode/marker mode/marker-coder mode/gated; mkdir -p mode/system mode/user mode/gated
       touch mode/system/a.timer mode/system/b.service mode/user/d.service   # c.service is not running
       touch mode/gated/d.service mode/gated/b.service   # these carry ConditionPathExists=!marker
     }
@@ -883,6 +950,132 @@ pkgs.runCommand "offline-ai-harness"
     MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode up > mixed.out 2>&1 || { cat mixed.out; fail "up refused although zram and the swap file together could take the rest"; }
     grep -q '28 GiB of other programs. idle memory will move to swap' mixed.out || { cat mixed.out; fail "the message does not say how much really moves with zram in the mix"; }
     MODE_MODEL="$PWD/model-00001-of-00001.gguf" mode down > /dev/null 2>&1 || fail "down after a load that relied on zram and the swap file failed"
+
+    # --- two models: the small one by default, the coder on demand. The
+    # table the module exports: the small model keeps today's unit,
+    # reservation and marker; the coder has its own, and a model in parts.
+    # Plenty of memory, so only the switching matters here.
+    echo "MemAvailable:   99999999 kB" > meminfo
+    truncate -s 1M small.gguf coder-00001-of-00002.gguf coder-00002-of-00002.gguf
+    jq -n --arg d "$PWD" '{
+      small: {unit: "offline-ai-llm.service", model: ($d + "/small.gguf"),
+              reservation: "memory-reserve-offline-ai.service", marker: ($d + "/mode/marker"),
+              about: "small fixture, 1 MB, on the iGPU, 64k context: the one to use",
+              fetch: "hf download small-fixture"},
+      coder: {unit: "offline-ai-llm-coder.service", model: ($d + "/coder-00001-of-00002.gguf"),
+              reservation: "memory-reserve-offline-ai-coder.service", marker: ($d + "/mode/marker-coder"),
+              about: "coder fixture, 2 MB, CPU-only, 32k context: the fallback when the small one stumbles",
+              fetch: "hf download coder-fixture"}}' > models.json
+    two() { OFFLINE_AI_MODELS="$(cat models.json)" OFFLINE_AI_DEFAULT_MODEL=small mode "$@"; }
+    active() { [ -e "mode/user/$1" ]; }
+
+    # A conversation loads the default model's unit; --model coder the coder's.
+    # From default mode either leaves nothing loaded and no marker behind.
+    reset_units
+    two "which model" > two-small.out 2>&1 || { cat two-small.out; fail "a default-model conversation failed"; }
+    case "$(calls)" in *"user start offline-ai-llm.service;"*) ;; *) fail "the default conversation did not load the small model: $(calls)" ;; esac
+    case "$(calls)" in *"start offline-ai-llm-coder.service"*) fail "the default conversation loaded the coder: $(calls)" ;; esac
+    reset_units
+    two --model coder "which model" > two-coder.out 2>&1 || { cat two-coder.out; fail "a --model coder conversation failed"; }
+    grep -q 'MODE ANSWER' two-coder.out || fail "no answer from the coder"
+    case "$(calls)" in *"user start offline-ai-llm-coder.service;"*) ;; *) fail "--model coder did not load the coder: $(calls)" ;; esac
+    case "$(calls)" in *"start offline-ai-llm.service"*) fail "--model coder loaded the small model: $(calls)" ;; esac
+    active offline-ai-llm-coder.service && fail "a --model coder conversation from default mode left the coder loaded"
+    [ ! -e mode/marker ] && [ ! -e mode/marker-coder ] || fail "a conversation from default mode left a marker"
+    [ -e mode/system/b.service ] && [ -e mode/user/d.service ] || fail "what gave way to the coder was not restarted"
+    [ ! -e run/offline-ai/evicted.json ] || fail "the record survived a coder conversation from default mode"
+
+    # While the mode is on, a conversation with the other model only switches
+    # models: the model it loaded stays, and so does the mode.
+    reset_units
+    two up > two-up.out 2>&1 || { cat two-up.out; fail "two-model up failed"; }
+    active offline-ai-llm.service && [ -e mode/marker ] || fail "up did not load the small model with its marker"
+    two --model coder "harder question" > two-switch-conv.out 2>&1 || { cat two-switch-conv.out; fail "a --model coder conversation with the small model loaded failed"; }
+    active offline-ai-llm-coder.service || fail "the coder did not stay loaded after a conversation started in the mode"
+    active offline-ai-llm.service && fail "the small model stayed active beside the coder"
+    [ ! -e mode/system/b.service ] || fail "a coder conversation started in the mode ended the mode"
+    two "easy question" > /dev/null 2>&1 || fail "a default-model conversation with the coder loaded failed"
+    active offline-ai-llm.service || fail "the small model did not stay loaded after switching back"
+    active offline-ai-llm-coder.service && fail "the coder stayed active beside the small model"
+
+    # Switching with `up`: the loaded model is stopped, its marker going with
+    # it, before the other starts; the switch is announced.
+    rm -f mode/calls
+    two --model coder up > two-switch.out 2>&1 || { cat two-switch.out; fail "--model coder up failed with the small model loaded"; }
+    grep -q 'switching from small to coder' two-switch.out || { cat two-switch.out; fail "the switch was not announced"; }
+    case "$(calls)" in
+      *"user stop offline-ai-llm.service;"*"user start offline-ai-llm-coder.service;"*) ;;
+      *) fail "the small model was not stopped before the coder started: $(calls)" ;;
+    esac
+    active offline-ai-llm.service && fail "the small model's unit stayed active after the switch"
+    active offline-ai-llm-coder.service || fail "the coder's unit is not active after the switch"
+    [ ! -e mode/marker ] || fail "the small model's marker outlived the switch"
+    [ -e mode/marker-coder ] || fail "the coder's marker is missing after the switch"
+    [ ! -e mode/system/b.service ] || fail "the switch ended offline-AI mode"
+
+    # status and models name the loaded model, and which is the default.
+    two status > two-status.out 2>&1 || { cat two-status.out; fail "status with the coder loaded failed"; }
+    grep -q '^model server: ready (coder)$' two-status.out || { cat two-status.out; fail "status does not name the loaded model"; }
+    grep -q '^models: small (not loaded, on disk, default); coder (loaded, on disk)$' two-status.out \
+      || { cat two-status.out; fail "status does not list the models"; }
+    two models > two-models.out 2>&1 || { cat two-models.out; fail "models failed"; }
+    grep -q '^small: not loaded, on disk, default$' two-models.out || { cat two-models.out; fail "models does not describe the small model"; }
+    grep -q '^coder: loaded, on disk$' two-models.out || { cat two-models.out; fail "models does not describe the coder"; }
+
+    # down with the coder loaded stops it, clears every marker, restores.
+    rm -f mode/calls
+    two down > two-down.out 2>&1 || { cat two-down.out; fail "down with the coder loaded failed"; }
+    case "$(calls)" in *"user stop offline-ai-llm-coder.service;"*) ;; *) fail "down did not stop the coder: $(calls)" ;; esac
+    active offline-ai-llm-coder.service && fail "the coder stayed active after down"
+    [ ! -e mode/marker ] && [ ! -e mode/marker-coder ] || fail "a marker survived down"
+    [ -e mode/system/a.timer ] && [ -e mode/system/b.service ] && [ -e mode/user/d.service ] || fail "down did not restart what gave way to the coder"
+    [ ! -e run/offline-ai/evicted.json ] || fail "the record survived a clean down from the coder"
+    two status > two-status2.out 2>&1 || fail "status after down failed"
+    grep -q '^model server: inactive$' two-status2.out || { cat two-status2.out; fail "status after down does not say inactive"; }
+    grep -q '^models: small (not loaded, on disk, default); coder (not loaded, on disk)$' two-status2.out \
+      || { cat two-status2.out; fail "status after down does not list both models unloaded"; }
+
+    # An unknown model exits 1 naming the models, before anything is touched;
+    # a model not on disk names its own fetch hint, and what gave way comes back.
+    reset_units
+    two --model nope "question" > two-nope.out 2>&1 && fail "an unknown --model did not fail"
+    [ "$(two --model nope "question" > /dev/null 2>&1; echo $?)" = 1 ] || fail "an unknown --model did not exit 1"
+    grep -q 'small' two-nope.out && grep -q 'coder' two-nope.out || { cat two-nope.out; fail "the unknown-model message does not name the models"; }
+    if grep -qs ' start ' mode/calls; then fail "an unknown --model started something: $(calls)"; fi
+    mv coder-00001-of-00002.gguf coder-away.gguf
+    two --model coder up > two-missing.out 2>&1 && fail "a coder that is not on disk did not fail"
+    grep -q 'coder-fixture' two-missing.out || { cat two-missing.out; fail "the missing coder does not name its fetch hint"; }
+    if grep -q 'small-fixture' two-missing.out; then fail "the missing coder named the small model's fetch hint"; fi
+    [ -e mode/system/b.service ] && [ -e mode/user/d.service ] || { cat two-missing.out; fail "units stopped for a coder that is not on disk were not restarted"; }
+    mv coder-away.gguf coder-00001-of-00002.gguf
+    two models > two-models2.out 2>&1 || fail "models after the missing-coder case failed"
+    grep -q '^coder: not loaded, on disk$' two-models2.out || { cat two-models2.out; fail "models does not see the coder back on disk"; }
+
+    # --- the deployed units, read at eval time: each model unit names the
+    # other in Conflicts=, so systemd itself never holds both loaded, and
+    # the gated units (one user drop-in, one system unit) refuse to start
+    # while either model's marker stands.
+    small_conflicts=${pkgs.lib.escapeShellArg (toString (conflicts.small or [ ]))}
+    coder_conflicts=${pkgs.lib.escapeShellArg (toString (conflicts.coder or [ ]))}
+    case " $small_conflicts " in *" offline-ai-llm-coder.service "*) ;; *) fail "the small model's unit does not conflict with the coder's: '$small_conflicts'" ;; esac
+    case " $coder_conflicts " in *" offline-ai-llm.service "*) ;; *) fail "the coder's unit does not conflict with the small model's: '$coder_conflicts'" ;; esac
+    gated_user=${pkgs.lib.escapeShellArg gatedUserDropIn}
+    gated_system=${pkgs.lib.escapeShellArg (toString gatedSystemConditions)}
+    for marker in /run/memory-reserve/offline-ai /run/memory-reserve/offline-ai-coder; do
+      printf '%s\n' "$gated_user" | grep -qx "ConditionPathExists=!$marker" \
+        || fail "the gated user drop-in lacks ConditionPathExists=!$marker: $gated_user"
+      case " $gated_system " in *" !$marker "*) ;; *) fail "the gated system units lack !$marker: '$gated_system'" ;; esac
+    done
+
+    # --- the help text is a complete reference (see helpUnit), reached by
+    # both `help` and --help, and carries the table's lines and fetch hints.
+    OFFLINE_AI_MODELS="$(cat models.json)" OFFLINE_AI_DEFAULT_MODEL=small python3 ${helpUnit} "$script" \
+      || fail "the help text is not a complete reference"
+    two --help > two-help.out 2>&1 || { cat two-help.out; fail "--help failed"; }
+    two help > two-help2.out 2>&1 || fail "help failed"
+    cmp -s two-help.out two-help2.out || fail "help and --help print different texts"
+    grep -q 'coder-fixture' two-help.out && grep -q 'the fallback when the small one stumbles' two-help.out \
+      || { cat two-help.out; fail "--help does not carry the coder's line and fetch hint"; }
 
     python3 ${swapUnit} "$script" || fail "swap accounting is wrong"
 

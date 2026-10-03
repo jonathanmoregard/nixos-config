@@ -414,11 +414,22 @@
         # tuxedo deploys against a stub model server and a fixture archive —
         # tool results reach the model, reads outside the allowed roots are
         # refused, library search works end to end, the answer reaches stdout.
-        offline-ai = import ./tests/offline-ai.nix {
+        offline-ai = let tuxedo = self.nixosConfigurations.tuxedo.config; in import ./tests/offline-ai.nix {
           pkgs = pkgsLinux;
-          offlineAi = self.nixosConfigurations.tuxedo.config.system.build.offline-ai;
-          libraryServe = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-serve;
-          libraryFetch = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-fetch;
+          offlineAi = tuxedo.system.build.offline-ai;
+          libraryServe = tuxedo.system.build.offline-ai-library-serve;
+          libraryFetch = tuxedo.system.build.offline-ai-library-fetch;
+          # The never-two-loaded invariant, read from the deployed units: each
+          # model unit's Conflicts=, and the markers one gated user service and
+          # one gated system unit test for. A missing attribute reads as empty,
+          # so the harness reports it instead of failing to evaluate.
+          conflicts = {
+            small = tuxedo.systemd.user.services.offline-ai-llm.unitConfig.Conflicts or [ ];
+            coder = tuxedo.systemd.user.services.offline-ai-llm-coder.unitConfig.Conflicts or [ ];
+          };
+          gatedUserDropIn = tuxedo.home-manager.users.jonathan.xdg.configFile
+            ."systemd/user/aggregator-embed-server.service.d/offline-ai.conf".text or "";
+          gatedSystemConditions = tuxedo.systemd.services."microvm@research-agent".unitConfig.ConditionPathExists or [ ];
         };
         # Not a VM lane: runs the weekly smoke script against fake offline-ai /
         # xprintidle / notify-send / nix-memory-run binaries — gates, verdicts,

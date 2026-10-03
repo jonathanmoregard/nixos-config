@@ -71,6 +71,51 @@ LIBRARY_UNIT = os.environ.get("OFFLINE_AI_LIBRARY_UNIT", "offline-ai-library.ser
 MARKER = os.environ.get("OFFLINE_AI_MODE_MARKER", "/run/memory-reserve/offline-ai")
 RESERVATION = os.environ.get("OFFLINE_AI_RESERVATION", "memory-reserve-offline-ai.service")
 READY_TIMEOUT = int(os.environ.get("OFFLINE_AI_READY_TIMEOUT", "900"))  # seconds to wait for the model
+DEFAULT_FETCH = ("nix shell nixpkgs#python3Packages.huggingface-hub -c hf download "
+                 "unsloth/Qwen3.6-35B-A3B-GGUF --include 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' "
+                 "--local-dir ~/.local/share/llm-models/qwen3.6-35b-a3b-mtp (23 GB)")
+
+
+def load_models():
+    """The models this machine can serve, name -> {unit, model, reservation,
+    marker, fetch}, from OFFLINE_AI_MODELS (JSON, written by the module).
+    Without it, the one model the single-model settings above describe,
+    named "small", so every setting still means what it did."""
+    spec = os.environ.get("OFFLINE_AI_MODELS", "")
+    if not spec:
+        return {"small": {"unit": UNIT, "model": MODEL, "reservation": RESERVATION, "marker": MARKER,
+                          "fetch": DEFAULT_FETCH}}
+    try:
+        table = json.loads(spec)
+        if not isinstance(table, dict) or not table or not all(
+                isinstance(entry, dict) and all(key in entry for key in ("unit", "reservation", "marker"))
+                for entry in table.values()):
+            raise ValueError("expected an object of name -> {unit, model, reservation, marker, fetch}")
+    except ValueError as exc:
+        sys.exit(f"OFFLINE_AI_MODELS is not a model table: {exc}")
+    return table
+
+
+MODELS = load_models()
+DEFAULT_MODEL = os.environ.get("OFFLINE_AI_DEFAULT_MODEL") or next(iter(MODELS))
+if DEFAULT_MODEL not in MODELS:
+    sys.exit(f"OFFLINE_AI_DEFAULT_MODEL names no model: {DEFAULT_MODEL!r}; the models are: {', '.join(MODELS)}")
+# The default first wherever the models are listed (JSON from Nix comes sorted by name).
+MODELS = {DEFAULT_MODEL: MODELS[DEFAULT_MODEL], **{name: entry for name, entry in MODELS.items() if name != DEFAULT_MODEL}}
+SELECTED = DEFAULT_MODEL
+
+
+def select_model(name):
+    """Make `name` the model this run loads, waits for and reports on. The
+    mode functions read UNIT, MODEL, RESERVATION and MARKER by name when they
+    run, so assigning the globals selects the model for all of them."""
+    global SELECTED, UNIT, MODEL, RESERVATION, MARKER
+    entry = MODELS[name]
+    SELECTED, UNIT, MODEL = name, entry["unit"], entry.get("model") or ""
+    RESERVATION, MARKER = entry["reservation"], entry["marker"]
+
+
+select_model(DEFAULT_MODEL)
 
 
 def parse_collections(spec):
@@ -1329,28 +1374,65 @@ def answer(messages, out=sys.stdout, log=sys.stderr):
 
 # ---------------------------------------------------------------- service
 
-USAGE = """offline-ai — a local assistant for when the internet is down.
+# The words main() dispatches on. The help text must name each of them, each
+# option build_parser() defines and each model in the table (tests/offline-ai.nix
+# reads these from here), so nothing can be added without a line of help.
+COMMANDS = ("up", "down", "status", "models", "library", "index", "help")
 
-Two modes. Default mode is the machine as usual. Offline-AI mode stops the
-services listed as giving way (the microVMs, dictation, ingest jobs), loads the
-big model and the library, and gives the memory back when it ends.
 
-  offline-ai                 enter offline-AI mode, then a conversation; leaving it returns to default mode
-  offline-ai "question"      the same for one question
-  offline-ai up              enter offline-AI mode and stay in it (about half a minute)
-  offline-ai down            leave it: stop the model and the library, restart what was stopped
-  offline-ai status          what is loaded and which references are present
-  offline-ai library         start the browsable reference library and print where to open it
-  offline-ai library fetch   download the archives the corpus lists (--list to preview, --all for optional ones)
-  offline-ai index           re-read the document folders and manual pages
-  offline-ai help            this text
+def build_parser():
+    parser = argparse.ArgumentParser(usage=usage(), add_help=False)
+    parser.add_argument("question", nargs="*")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("-h", "--help", action="store_true")
+    return parser
 
-The assistant only looks things up (options, this machine's flake, units and logs, disk,
-processes, network, manual pages, documents, the library, your notes). It never changes
-anything: it gives commands and Nix code for you to run.
 
-Exit status of `offline-ai "question"`: 0 answered; 1 the model could not be loaded or
-reached; 2 the answer was cut off by the model's context limit (ask something narrower)."""
+def usage():
+    """The reference: every form, every option, one line per model (from the
+    table, so it says what `models` knows), the exit statuses."""
+    forms = [
+        ("[--model NAME] [--force]", "enter offline-AI mode, then a conversation; leaving it returns to default mode"),
+        ('[--model NAME] [--force] "question"', "the same for one question"),
+        ("[--model NAME] [--force] up", "enter offline-AI mode and stay in it (about half a minute)"),
+        ("down", "leave it: stop the model and the library, restart what was stopped"),
+        ("status", "what is loaded, the mode, the models, which references are present"),
+        ("models", "one line per model: loaded or not, on disk or not, which is the default"),
+        ("library", "start the browsable reference library and print where to open it"),
+        ("library fetch [--list] [--all]", "download the archives the corpus lists (--list to preview, --all for optional ones)"),
+        ("index", "re-read the document folders and manual pages"),
+        ("help | -h | --help", "this text"),
+    ]
+    options = [
+        ("--model NAME", f"which model to load: {', '.join(MODELS)} (default: {DEFAULT_MODEL}). One is loaded at a"),
+        ("", "time: selecting the other stops the running one, which stays loaded until `down` or the next --model"),
+        ("--force", "load even when the memory arithmetic says the model will not fit"),
+        ("-h, --help", "this text"),
+    ]
+    width = max(len(form) for form, _ in forms) + len("offline-ai ") + 2
+    lines = ["offline-ai — a local assistant for when the internet is down.", "",
+             "Two modes. Default mode is the machine as usual. Offline-AI mode stops the services listed",
+             "as giving way (the microVMs, dictation, ingest jobs), loads a model and the library, and",
+             "gives the memory back when it ends. A run started while the mode is on only makes sure",
+             "its model is the one loaded.", "", "Usage:"]
+    lines += [f"  {'offline-ai ' + form:<{width}}{text}" for form, text in forms]
+    lines += ["", "Options:"]
+    lines += [f"  {flag:<16}{text}" for flag, text in options]
+    lines += ["", "Models (--model NAME; one loaded at a time):"]
+    label_width = max(len(name) for name in MODELS) + len(" (default)") + 2
+    for name, entry in MODELS.items():
+        label = name + (" (default)" if name == DEFAULT_MODEL else "")
+        lines.append(f"  {label:<{label_width}}{entry.get('about') or entry['unit']}")
+        if entry.get("fetch"):
+            lines.append(f"  {'':<{label_width}}fetch: {entry['fetch']}")
+    lines += ["",
+              "The assistant only looks things up (options, this machine's flake, units and logs, disk,",
+              "processes, network, manual pages, documents, the library, your notes). It never changes",
+              "anything: it gives commands and Nix code for you to run.", "",
+              "Exit status: 0 answered; 1 the model could not be loaded or reached, or the model or an",
+              "option is unknown; 2 the answer was cut off by the model's context limit (ask something narrower)."]
+    return "\n".join(lines)
 
 
 MODEL_ERRORS = (urllib.error.URLError, OSError, ValueError, http.client.HTTPException)
@@ -1733,19 +1815,27 @@ def bring_back(user, unit, how, spec):
     return systemctl(user, "start", unit)
 
 
-def clear_marker():
-    """The mode marker must be gone before anything is started again. Stopping
-    the model unit normally stops the reservation that holds it; when that
-    did not happen (the stop is best-effort inside the unit), stop the
-    reservation here, and say so if the marker still stands."""
-    if not os.path.exists(MARKER):
-        return True
-    systemctl(False, "stop", RESERVATION)
-    if os.path.exists(MARKER):
-        print(f"the mode marker {MARKER} still exists: what gave way to the model cannot start until it is gone "
-              f"(`systemctl stop {RESERVATION}`)", file=sys.stderr)
-        return False
-    return True
+def clear_marker(name=None):
+    """The mode markers must be gone before anything is started again. Stopping
+    a model unit normally stops the reservation that holds its marker; when
+    that did not happen (the stop is best-effort inside the unit), stop the
+    reservation here, and say so if the marker still stands. One model's
+    marker, or every model's."""
+    cleared = True
+    for model in ([name] if name else MODELS):
+        marker, reservation = MODELS[model]["marker"], MODELS[model]["reservation"]
+        if not os.path.exists(marker):
+            continue
+        systemctl(False, "stop", reservation)
+        if os.path.exists(marker):
+            print(f"the mode marker {marker} still exists: what gave way to the model cannot start until it is gone "
+                  f"(`systemctl stop {reservation}`)", file=sys.stderr)
+            cleared = False
+    return cleared
+
+
+def markers_standing():
+    return [entry["marker"] for entry in MODELS.values() if os.path.exists(entry["marker"])]
 
 
 def restore():
@@ -1763,8 +1853,8 @@ def restore():
             # `systemctl start` returns 0 for a unit whose condition refused:
             # it was not started. Nothing in the record may be forgotten that way.
             failed.insert(0, entry)
-            print(f"{unit} did not start: its condition refused (the mode marker {MARKER} still exists)",
-                  file=sys.stderr)
+            print(f"{unit} did not start: its condition refused "
+                  f"(the mode marker {', '.join(markers_standing()) or MARKER} still exists)", file=sys.stderr)
         elif done.returncode == 0:
             print(f"{word.rstrip('e')}ed {unit}", file=sys.stderr)
         else:
@@ -1776,41 +1866,80 @@ def restore():
 
 
 
-def enter_offline_mode(force=False):
-    evict()
+def loaded_model():
+    """The model whose unit is active or activating, if any. The units
+    conflict in systemd, so there is at most one."""
+    for name, entry in MODELS.items():
+        if run(["systemctl", "--user", "is-active", "--", entry["unit"]]) in ("active", "activating"):
+            return name
+    return None
+
+
+def mode_on():
+    """Offline-AI mode is on while a model server answers, a model unit is
+    active or activating, or a reservation's marker still stands."""
+    return healthy() or loaded_model() is not None or bool(markers_standing())
+
+
+def stop_other_model():
+    """A model other than the selected one is loaded: stop it, so the memory
+    it held is free before the selected one's needs are measured. Its
+    ExecStopPost drops its reservation; the marker is cleared here in case
+    that did not happen."""
+    other = loaded_model()
+    if other is None or other == SELECTED:
+        return
+    unit = MODELS[other]["unit"]
+    print(f"switching from {other} to {SELECTED}: stopping {unit}...", file=sys.stderr)
+    done = systemctl_user("stop", unit)
+    if done.returncode != 0:
+        sys.exit(f"could not stop {unit}: {done.stderr.strip()}")
+    clear_marker(other)
+
+
+def load_model(force=False):
+    """Bring up the selected model, whatever is loaded now."""
     try:
+        stop_other_model()
         if MODEL and os.path.exists(MODEL) and not healthy():
             make_room(model_bytes() + HEADROOM)
         up(force=force)
     except SystemExit:
-        # The model did not load: give back what was stopped for it. The unit
-        # may still be running (a load that never became ready) and holding
-        # the reservation whose marker keeps those units from starting, so it
-        # goes first, then the marker, then what gave way.
+        # The model did not load. Its unit may still be running (a load that
+        # never became ready) and holding the reservation whose marker keeps
+        # what gave way from starting, so it goes first, then the marker.
         systemctl_user("stop", UNIT)
-        clear_marker()
+        clear_marker(SELECTED)
+        raise
+
+
+def enter_offline_mode(force=False):
+    evict()
+    try:
+        load_model(force=force)
+    except SystemExit:
+        # The model did not load: give back what was stopped for it (its unit
+        # and marker are already gone, so what gave way can start).
         restore()
         raise
     start_library()
 
 
 def leave_offline_mode():
+    """Stop the library and every model unit, clear every marker, restore."""
     systemctl_user("stop", LIBRARY_UNIT)
-    stopped = systemctl_user("stop", UNIT)
+    stopped = all([systemctl_user("stop", entry["unit"]).returncode == 0 for entry in MODELS.values()])
     cleared = clear_marker()
     restored = restore()
-    return stopped.returncode == 0 and cleared and restored
+    return stopped and cleared and restored
 
 
 def up(force=False):
-    if healthy():
+    if healthy() and loaded_model() in (None, SELECTED):
         return
     if MODEL and not os.path.exists(MODEL):
-        sys.exit(f"the model is not on this machine: {MODEL}\n"
-                 "Fetch it while online (23 GB):\n"
-                 "  nix shell nixpkgs#python3Packages.huggingface-hub -c hf download "
-                 "unsloth/Qwen3.6-35B-A3B-GGUF --include 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' "
-                 "--local-dir ~/.local/share/llm-models/qwen3.6-35b-a3b-mtp")
+        sys.exit(f"the {SELECTED} model is not on this machine: {MODEL}\n"
+                 f"Fetch it while online:\n  {MODELS[SELECTED].get('fetch') or '(no fetch hint configured)'}")
     loading = run(["systemctl", "--user", "is-active", "--", UNIT]) in ("active", "activating")
     if MODEL and not force and not loading:
         need, free = model_bytes(), available_bytes()
@@ -1829,7 +1958,7 @@ def up(force=False):
                   f"loads, to free the {(need - free) / 2**30:.0f} GiB it still needs"
                   + (" (zram keeps a compressed copy of what it takes in RAM)" if moving > need - free else ""),
                   file=sys.stderr)
-    print(f"loading the model ({UNIT})...", file=sys.stderr)
+    print(f"loading the {SELECTED} model ({UNIT})...", file=sys.stderr)
     started = systemctl_user("start", UNIT)
     if started.returncode != 0:
         sys.exit(f"could not start {UNIT}: {started.stderr.strip()}")
@@ -1869,13 +1998,37 @@ def start_library():
     return []
 
 
+def model_words(name, loaded):
+    """What `models` and `status` say about one model."""
+    entry = MODELS[name]
+    words = ["loaded" if name == loaded else "not loaded"]
+    if entry.get("model"):
+        words.append("on disk" if os.path.exists(entry["model"]) else "not on disk")
+    if name == DEFAULT_MODEL:
+        words.append("default")
+    return words
+
+
+def model_lines():
+    loaded = loaded_model()
+    return [f"{name}: {', '.join(model_words(name, loaded))}" for name in MODELS]
+
+
 def status_lines():
     index = load_doc_index()
-    lines = ["model server: " + ("ready" if healthy() else run(["systemctl", "--user", "is-active", "--", UNIT]))]
+    loaded = loaded_model()
+    if healthy():
+        server = "ready" + (f" ({loaded})" if loaded else "")
+    elif loaded:
+        server = run(["systemctl", "--user", "is-active", "--", MODELS[loaded]["unit"]]) + f" ({loaded})"
+    else:
+        server = run(["systemctl", "--user", "is-active", "--", UNIT])
+    lines = ["model server: " + server]
     evicted = read_evicted()
     lines.append("mode: offline-AI, stopped for it: " + ", ".join(
         unit + (" (frozen)" if how == "freeze" else "") for _, unit, how, _spec in evicted) if evicted
                  else "mode: " + ("offline-AI" if healthy() else "default"))
+    lines.append("models: " + "; ".join(f"{name} ({', '.join(model_words(name, loaded))})" for name in MODELS))
     for source, path in OPTION_FILES.items():
         lines.append(f"{source} options: " + ("present" if path and os.path.exists(path) else "MISSING"))
     for label in COLLECTIONS:
@@ -1896,11 +2049,13 @@ def status_lines():
 
 
 def main():
-    parser = argparse.ArgumentParser(usage=USAGE, add_help=False)
-    parser.add_argument("question", nargs="*")
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("-h", "--help", action="store_true")
+    parser = build_parser()
     args, extra = parser.parse_known_args()
+    if args.model not in MODELS:
+        # Checked here, not by argparse's choices: an unknown model is an
+        # ordinary failure (exit 1) that names what there is.
+        sys.exit(f"unknown model {args.model!r}; the models are: {', '.join(MODELS)} (see `offline-ai models`)")
+    select_model(args.model)
     if args.question[:2] == ["library", "fetch"]:
         rest = args.question[2:] + extra + (["--help"] if args.help else [])
         try:
@@ -1912,12 +2067,15 @@ def main():
     command = args.question[0] if len(args.question) == 1 else None
 
     if args.help or command == "help":
-        print(USAGE)
+        print(usage())
         return
     if command == "down":
         sys.exit(0 if leave_offline_mode() else 1)
     if command == "status":
         print("\n".join(status_lines()))
+        return
+    if command == "models":
+        print("\n".join(model_lines()))
         return
     if command == "index":
         index = load_doc_index(rebuild=True)
@@ -1944,13 +2102,22 @@ def main():
         return
 
     # A conversation started from default mode enters offline-AI mode and leaves it
-    # again when it ends, however it ends; one started after `up` leaves the mode alone.
-    owns_mode = not healthy()
+    # again when it ends, however it ends. One started while the mode is on (after
+    # `up`, or with another model loaded) only makes sure the selected model is the
+    # one loaded, and leaves the mode, and that model, as they are.
+    owns_mode = not mode_on()
     for number in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(number, lambda signum, frame: sys.exit(128 + signum))
     try:
         if owns_mode:
             enter_offline_mode(force=args.force)
+        else:
+            try:
+                load_model(force=args.force)
+            except SystemExit:
+                if loaded_model() is None:
+                    print("no model is loaded now; `offline-ai down` returns to default mode", file=sys.stderr)
+                raise
         converse(args.question)
     finally:
         if owns_mode:
