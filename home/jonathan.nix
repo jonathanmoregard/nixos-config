@@ -11,6 +11,9 @@
     nodejs_22
     pnpm
     gitleaks
+    # Credential pass of the permission-ledger aggregator and the proposal
+    # intake gate (~/.claude); both fail open ("unavailable") without it.
+    detect-secrets
     gh
     direnv
     jq
