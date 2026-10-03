@@ -78,28 +78,29 @@ def parse_form(content_type, body):
 
 
 def wav_seconds(audio):
-    """Length of a WAV clip in seconds from its header, or None if it is not one."""
-    try:
-        if audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
-            return None
-        pos, rate, channels, bits = 12, None, None, None
-        while pos + 8 <= len(audio):
-            chunk = audio[pos:pos + 4]
-            size = int.from_bytes(audio[pos + 4:pos + 8], "little")
-            if chunk == b"fmt ":
-                channels = int.from_bytes(audio[pos + 10:pos + 12], "little")
-                rate = int.from_bytes(audio[pos + 12:pos + 16], "little")
-                bits = int.from_bytes(audio[pos + 22:pos + 24], "little")
-            elif chunk == b"data":
-                if not (rate and channels and bits):
-                    return None
-                # A streaming encoder may leave the size 0 or 0xFFFFFFFF: trust the bytes.
-                present = len(audio) - pos - 8
-                length = size if 0 < size <= present else present
-                return length / (rate * channels * bits / 8)
-            pos += 8 + size + (size & 1)
-    except (ValueError, ZeroDivisionError):
-        pass
+    """Length of a WAV clip in seconds from its header, or None if it is not one.
+
+    Slices past the end are empty and read as 0, so a truncated header ends
+    in None, never an exception.
+    """
+    if audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+        return None
+    pos, rate, channels, bits = 12, 0, 0, 0
+    while pos + 8 <= len(audio):
+        chunk = audio[pos:pos + 4]
+        size = int.from_bytes(audio[pos + 4:pos + 8], "little")
+        if chunk == b"fmt ":
+            channels = int.from_bytes(audio[pos + 10:pos + 12], "little")
+            rate = int.from_bytes(audio[pos + 12:pos + 16], "little")
+            bits = int.from_bytes(audio[pos + 22:pos + 24], "little")
+        elif chunk == b"data":
+            if not (rate and channels and bits):
+                return None
+            # A streaming encoder may leave the size 0 or 0xFFFFFFFF: trust the bytes.
+            present = len(audio) - pos - 8
+            length = size if 0 < size <= present else present
+            return length / (rate * channels * bits / 8)
+        pos += 8 + size + (size & 1)
     return None
 
 
