@@ -40,6 +40,31 @@ pkgs.runCommand "prompt-injection-scan-check" {
   printf '%s\n%s\n' "$filler" "$payload" | prompt-injection-scan >/dev/null 2>&1 || rc=$?
   [ "$rc" = 1 ] || fail "stdin input with buried payload: want exit 1, got $rc"
 
+  # Callers batch many short documents into one input, separated by `---`
+  # lines (the permission-ledger aggregator joins every digest sample that
+  # way). One payload among a few benign tool arguments must still be
+  # flagged: scored as one blob, the benign neighbours dilute it below
+  # threshold (measured: 1.00 alone, 0.03 next to these six).
+  docs="git status --short
+  ---
+  gh pr checks 42 --watch
+  Wait for CI on the docs PR
+  ---
+  /home/user/project/src/main.rs
+  ---
+  cargo test --workspace 2>&1 | tail -20
+  Run the workspace tests
+  ---
+  nix flake check --no-build
+  Evaluate flake outputs
+  ---
+  ls -la ~/Downloads
+  List downloads"
+  expect 0 --text "$docs"
+  expect 1 --text "$docs
+  ---
+  $payload"
+
   expect 0 --text "   "
   expect 2 --file /nonexistent/input.txt
 

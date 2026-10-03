@@ -195,7 +195,7 @@
         # and its absence was silent for months because the consumer
         # failed open. See overlays/dcg.nix.
         (import ./overlays/dcg.nix)
-        # `pkgs.prompt-injection-scan` — offline PIGuard classifier for the
+        # `pkgs.prompt-injection-scan` — offline ProtectAI DeBERTa classifier for the
         # ~/.claude injection scans. See overlays/prompt-injection-scan.nix.
         (import ./overlays/prompt-injection-scan.nix)
         # `pkgs.aggregator` — a real store path for the ingest timer, so

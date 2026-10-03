@@ -16,13 +16,20 @@ The model sees at most 512 tokens, so long input is scored in overlapping
 windows and the verdict is the highest window score. Truncating instead
 (what llm-guard's MatchType.FULL does) would let a payload placed after the
 first few hundred tokens pass unseen.
+
+Input may hold several independent documents separated by lines that are
+just `---` (the permission-ledger aggregator joins its samples that way).
+Each document is windowed and scored on its own: in one shared window, a
+few benign neighbours dilute a payload's score far below threshold.
 """
 import argparse
 import os
+import re
 import sys
 
 MAX_TOKENS = 512
 STRIDE = 448
+DOC_SEPARATOR = re.compile(r"^[ \t]*---[ \t]*$", re.MULTILINE)
 BATCH = 1
 
 
@@ -63,15 +70,21 @@ def load(model_dir):
 
 
 def score(text, model_dir):
-    """Highest INJECTION probability over all windows, and its window index."""
+    """Highest INJECTION probability over every document's windows, and its index."""
     np, tok, sess = load(model_dir)
     cls_id = tok.token_to_id("[CLS]")
     sep_id = tok.token_to_id("[SEP]")
     pad_id = tok.token_to_id("[PAD]")
     if cls_id is None or sep_id is None or pad_id is None:
         fail("tokenizer lacks [CLS]/[SEP]/[PAD]")
-    ids = tok.encode(text, add_special_tokens=False).ids
-    chunks = [[cls_id] + w + [sep_id] for w in windows(ids, MAX_TOKENS - 2, STRIDE)]
+    chunks = []
+    for doc in DOC_SEPARATOR.split(text):
+        if not doc.strip():
+            continue
+        ids = tok.encode(doc, add_special_tokens=False).ids
+        chunks += [[cls_id] + w + [sep_id] for w in windows(ids, MAX_TOKENS - 2, STRIDE)]
+    if not chunks:
+        return 0.0, 0, 0
     input_names = {i.name for i in sess.get_inputs()}
 
     best, best_at = 0.0, 0
