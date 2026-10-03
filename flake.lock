@@ -305,11 +305,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1791023278,
-        "narHash": "sha256-nZ0+Sl72rPJbvP1/nM8np2XgHFn/gzA2RP3TVguA4HQ=",
+        "lastModified": 1791039198,
+        "narHash": "sha256-QfPBzgk/QfUHE55CLYS1oZ1bTRR0SiLIsFtvwgQpbUI=",
         "owner": "jonathanmoregard",
         "repo": "pr-swipe",
-        "rev": "644c18a7de2e5a8e1aca4066c061e329a9e81c65",
+        "rev": "1e5960c68f6190d48d099a76dec9cd5a2fdda453",
         "type": "github"
       },
       "original": {
