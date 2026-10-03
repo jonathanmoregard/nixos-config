@@ -13,7 +13,8 @@
 #     the short-window general model (a second turbo server with a 15-second
 #     encoder window: half the latency, same text); longer clips and audio of
 #     unknown length go to the full-window one, Swedish re-transcription always
-#     uses the full window, and with the short-window model down short clips
+#     uses the full window, and with the short-window model down, or accepting
+#     but not answering within LOCAL_STT_SHORT_TIMEOUT seconds, short clips
 #     fall back to the full-window one;
 #   - with the Swedish model down, Swedish audio still gets the general
 #     model's text; with the general model down, the caller gets a 502, not a
@@ -28,10 +29,12 @@
 { pkgs, routerCommand }:
 let
   stub = pkgs.writeText "whisper-stub.py" ''
-    import json, sys
+    import json, sys, time
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     port, name, log = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+    # Optional: seconds to sit on every request before answering (a wedged server).
+    delay = float(sys.argv[4]) if len(sys.argv) > 4 else 0
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -47,6 +50,7 @@ let
                      "language": body.split(b'name="language"\r\n\r\n')[1].split(b"\r\n")[0].decode()}
             with open(log, "a") as f:
                 f.write(json.dumps(asked) + "\n")
+            time.sleep(delay)
             lang = "sv" if audio.startswith("SV") else "en"
             if asked["language"] not in ("auto", ""):
                 lang = asked["language"]
@@ -94,6 +98,9 @@ let
                 return r.status, json.load(r)
         except urllib.error.HTTPError as e:
             return e.code, json.load(e)
+        except (urllib.error.URLError, OSError) as e:
+            # No answer at all (e.g. the router held the request): a status of its own.
+            return 599, {"error": str(e)}
 
     what = sys.argv[1]
     if what == "models":
@@ -129,10 +136,11 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   export LOCAL_STT_GENERAL=http://127.0.0.1:18763
   export LOCAL_STT_SWEDISH=http://127.0.0.1:18764
   export LOCAL_STT_GENERAL_SHORT=http://127.0.0.1:18762
+  export LOCAL_STT_SHORT_TIMEOUT=2
   log=$PWD/asked
   fail() { echo "FAIL: $*" >&2; exit 1; }
 
-  start_stub() { python3 ${stub} "$1" "$2" "$log.$2" > /dev/null 2>&1 & echo $!; }
+  start_stub() { python3 ${stub} "$1" "$2" "$log.$2" "''${3:-0}" > /dev/null 2>&1 & echo $!; }
   wait_port() {
     for _ in $(seq 100); do
       python3 -c "import socket; socket.create_connection(('127.0.0.1', $1), 1)" 2>/dev/null && return 0
@@ -173,7 +181,8 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
 
   # Clip length picks the model: a short clip (most dictation) goes to the
   # short-window turbo server, whose 15-second encoder window halves the
-  # latency without changing the text (2026-10-03: 12 real clips). A long
+  # latency for the same words (2026-10-03: 12 real clips; punctuation varied
+  # on four, a 1-second "test" came back as "testing"). A long
   # clip or audio of unknown length goes to the full-window server, since a
   # smaller window chunks long audio and wrecks the text; the same server
   # cannot serve both, as switching its window costs seconds. Swedish
@@ -223,6 +232,16 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   for h in $(tr ',' ' ' <<< "$sdk"); do
     grep -q "\(^\|,\)$h\(,\|$\)" <<< "$allowed" || fail "preflight does not allow the SDK's $h header (allowed: $allowed)"
   done
+
+  # Short-window model wedged (accepts, never answers): the clip is not held
+  # for the backend's long timeout but handed to the full-window model.
+  kill "$short"; wait "$short" 2>/dev/null || true
+  short=$(start_stub 18762 short 60)
+  wait_port 18762
+  started=$SECONDS
+  res=$(ask EN-hello "" "" 3)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "short clip with the short-window model wedged: $res"
+  [ $((SECONDS - started)) -lt 15 ] || fail "a wedged short-window model held a short clip for $((SECONDS - started)) s"
 
   # Short-window model down: short clips still answered, by the full-window one.
   kill "$short"; wait "$short" 2>/dev/null || true

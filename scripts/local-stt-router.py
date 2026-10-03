@@ -22,12 +22,14 @@ Whisper always encodes a padded 30-second window, so a 3-second dictation
 costs as much as a 30-second one. A second turbo server keeps a 15-second
 window (whisper-server -ac 768) and answers clips of at most
 LOCAL_STT_SHORT_SECONDS: half the encoder work, and on 12 real clips of up
-to 15 s the text was the same (measured 2026-10-03). One server cannot do
+to 15 s the words were the same (punctuation varied on four, a 1-second
+"test" came back as "testing"; measured 2026-10-03). One server cannot do
 both, since changing its window between requests costs seconds. A longer
 clip, or audio whose length the router cannot read, goes to the full-window
 server, which a smaller window would chunk and garble; so does a short clip
-when the short-window server is down. The Swedish re-transcription always
-keeps the full window: Swedish accuracy first.
+when the short-window server is down or has not answered within
+LOCAL_STT_SHORT_TIMEOUT seconds. The Swedish re-transcription always keeps
+the full window: Swedish accuracy first.
 
 Settings come from the environment (the systemd unit sets them):
   LOCAL_STT_PORT           port to listen on (127.0.0.1 only)
@@ -37,6 +39,8 @@ Settings come from the environment (the systemd unit sets them):
   LOCAL_STT_SWEDISH        base URL of the kb-whisper whisper-server
   LOCAL_STT_SHORT_SECONDS  clips up to this length (s) go to the short-window
                            server (14)
+  LOCAL_STT_SHORT_TIMEOUT  seconds to wait for the short-window server before
+                           using the full-window one (20)
 """
 
 import email.parser
@@ -57,6 +61,7 @@ SWEDISH = os.environ.get("LOCAL_STT_SWEDISH", "http://127.0.0.1:8764")
 TIMEOUT = 600
 MODEL_ID = "local-stt"
 SHORT_SECONDS = float(os.environ.get("LOCAL_STT_SHORT_SECONDS", "14"))
+SHORT_TIMEOUT = float(os.environ.get("LOCAL_STT_SHORT_TIMEOUT", "20"))
 
 
 class BackendError(Exception):
@@ -104,7 +109,7 @@ def wav_seconds(audio):
     return None
 
 
-def transcribe(base, audio, language, prompt):
+def transcribe(base, audio, language, prompt, timeout=TIMEOUT):
     """Run one whisper-server; returns (text, detected language code or None)."""
     boundary = uuid.uuid4().hex
     parts = [("response_format", "verbose_json"), ("temperature", "0"), ("language", language)]
@@ -120,7 +125,7 @@ def transcribe(base, audio, language, prompt):
         base + "/inference", data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             result = json.load(response)
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise BackendError(f"{base}: {e}") from e
@@ -151,10 +156,11 @@ def route(audio, language, prompt):
         detected = None
         if short:
             try:
-                text, detected = transcribe(GENERAL_SHORT, audio, language or "auto", prompt)
+                text, detected = transcribe(GENERAL_SHORT, audio, language or "auto", prompt,
+                                            timeout=SHORT_TIMEOUT)
                 note = f"{clip}, 15 s window"
             except BackendError as e:
-                print(f"local-stt: short-window model unavailable, using the full window: {e}",
+                print(f"local-stt: short-window model unavailable or slow, using the full window: {e}",
                       file=sys.stderr, flush=True)
         if text is None:
             text, detected = transcribe(GENERAL, audio, language or "auto", prompt)

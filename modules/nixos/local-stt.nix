@@ -27,7 +27,8 @@
 # Whisper encodes a padded 30-second window whatever the clip length, so a
 # 3-second dictation costs as much as a 30-second one. A second turbo server
 # keeps a 15-second window (-ac 768) and answers clips of up to 14 s: on 12
-# real clips the text was the same and the round trip fell from ~1.6 s to
+# real clips the words were the same (punctuation varied on four, a 1-second
+# "test" came back as "testing") and the round trip fell from ~1.9 s to
 # ~0.9 s (2026-10-03, with the cloud service at ~0.9 s). One server cannot do
 # both, since changing its window between requests costs seconds. Longer
 # clips, and every Swedish re-transcription, keep the full window.
@@ -54,23 +55,34 @@ let
   generalPort = 8763;
   swedishPort = 8764;
   generalShortPort = 8762;
-  shortAudioCtx = 768; # encoder frames: 15 s; 1500 is the full 30 s window
+  # Encoder frames of the short server's window: 768 of the full 1500 = 15.36 s.
+  # The router sends it clips of at most shortSeconds, one second under the
+  # window so nothing is chunked; the two numbers stay tied here.
+  shortAudioCtx = 768;
+  shortSeconds = builtins.floor (shortAudioCtx * 30.0 / 1500) - 1;
+  # A short server that accepts but does not answer within this many seconds
+  # is given up on and the clip goes to the full-window one (a short clip
+  # takes ~1 s; Voquill waits far less than whisper-server's 600 s).
+  shortTimeoutSeconds = 20;
 
-  # The iGPU does the work; the CPU threads only feed it. -nf: no temperature
-  # fallback, so an uncertain decode is not re-run at rising temperatures;
-  # 2026-10-03 that changed no text on 20 real clips and removes the slow
-  # outliers. The encoder window is chosen per request by the router.
-  whisperServer = { model, port, language, audioCtx ? null }:
+  # The iGPU does the work; the CPU threads only feed it. -nf on the turbo
+  # servers: no temperature fallback, so an uncertain decode is not re-run at
+  # rising temperatures; 2026-10-03 that changed no text on 20 real clips and
+  # removes the slow outliers. kb-whisper keeps the fallback: it is whisper's
+  # guard against looping on real Swedish speech, which no bench here could
+  # judge (no real Swedish audio), and it bought Swedish no measured speed.
+  whisperServer = { model, port, language, audioCtx ? null, noFallback ? false }:
     "${pkgs.whisper-cpp-vulkan}/bin/whisper-server -m ${model} --host 127.0.0.1"
-    + " --port ${toString port} -l ${language} -t 4 -nf"
+    + " --port ${toString port} -l ${language} -t 4"
+    + lib.optionalString noFallback " -nf"
     + lib.optionalString (audioCtx != null) " -ac ${toString audioCtx}";
 
-  backend = { description, model, port, language, audioCtx ? null }: {
+  backend = { description, model, port, language, audioCtx ? null, noFallback ? false }: {
     inherit description;
     wantedBy = [ "default.target" ];
     unitConfig.ConditionPathExists = model;
     serviceConfig = {
-      ExecStart = whisperServer { inherit model port language audioCtx; };
+      ExecStart = whisperServer { inherit model port language audioCtx noFallback; };
       Restart = "on-failure";
       RestartSec = 5;
     };
@@ -82,14 +94,16 @@ in
     model = generalModel;
     port = generalPort;
     language = "auto";
+    noFallback = true;
   };
 
   systemd.user.services.local-stt-general-short = backend {
-    description = "local-stt: whisper-large-v3-turbo, 15-second window (clips up to 14 s)";
+    description = "local-stt: whisper-large-v3-turbo, 15-second window (clips up to ${toString shortSeconds} s)";
     model = generalModel;
     port = generalShortPort;
     language = "auto";
     audioCtx = shortAudioCtx;
+    noFallback = true;
   };
 
   systemd.user.services.local-stt-swedish = backend {
@@ -108,6 +122,8 @@ in
       LOCAL_STT_PORT = toString port;
       LOCAL_STT_GENERAL = "http://127.0.0.1:${toString generalPort}";
       LOCAL_STT_GENERAL_SHORT = "http://127.0.0.1:${toString generalShortPort}";
+      LOCAL_STT_SHORT_SECONDS = toString shortSeconds;
+      LOCAL_STT_SHORT_TIMEOUT = toString shortTimeoutSeconds;
       LOCAL_STT_SWEDISH = "http://127.0.0.1:${toString swedishPort}";
     };
     serviceConfig = {
