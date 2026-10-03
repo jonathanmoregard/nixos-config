@@ -85,9 +85,11 @@ let
         # A browser-side caller: status and response headers, keys lowercased.
         origin = sys.argv[2]
         if what == "preflight":
+            # Third argument: the headers the page wants to send (default: a bare key).
+            requested = sys.argv[3] if len(sys.argv) > 3 else "authorization"
             req = urllib.request.Request("http://127.0.0.1:18765/models", method="OPTIONS", headers={
                 "Origin": origin, "Access-Control-Request-Method": "GET",
-                "Access-Control-Request-Headers": "authorization"})
+                "Access-Control-Request-Headers": requested})
         else:
             req = urllib.request.Request("http://127.0.0.1:18765/v1/models", headers={"Origin": origin})
         try:
@@ -166,6 +168,19 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   [ "$(hdr access-control-allow-origin "$res")" = "tauri://localhost" ] || fail "model list carries no CORS grant for the webview: $res"
   res=$(ask preflight https://example.com)
   [ -z "$(hdr access-control-allow-origin "$res")" ] || fail "a foreign web page was granted cross-origin access: $res"
+
+  # The settings page's Test button runs the openai npm SDK in that webview,
+  # and the SDK sends its x-stainless-* telemetry headers next to the key. The
+  # browser drops the request unless the preflight allows every header the
+  # page asked for. 2026-10-03 the router allowed only Authorization and
+  # Content-Type, so the SDK gave up with "Connection error." although the
+  # model list itself was reachable.
+  sdk=authorization,content-type,x-stainless-arch,x-stainless-lang,x-stainless-os,x-stainless-package-version,x-stainless-retry-count,x-stainless-runtime,x-stainless-runtime-version,x-stainless-timeout
+  res=$(ask preflight tauri://localhost "$sdk")
+  allowed=$(hdr access-control-allow-headers "$res" | tr 'A-Z' 'a-z' | tr -d ' ')
+  for h in $(tr ',' ' ' <<< "$sdk"); do
+    grep -q "\(^\|,\)$h\(,\|$\)" <<< "$allowed" || fail "preflight does not allow the SDK's $h header (allowed: $allowed)"
+  done
 
   # Swedish model down: Swedish audio still answered, by the general model.
   kill "$swedish"; wait "$swedish" 2>/dev/null || true

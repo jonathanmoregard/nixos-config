@@ -15,6 +15,9 @@
 #     including a `down` that hangs, and a SIGTERM from the service timeout;
 #   - after a failed run the model is brought down again — unless it was the
 #     user's model to begin with, or systemd could not say whose it was;
+#   - while another model's unit (the coder) is active or activating, the
+#     night is skipped naming it, nothing is run and the status is untouched:
+#     the operator's session is never switched away from or brought down;
 #   - first_run is set once; the state file keeps at most 200 characters of
 #     the answer.
 #
@@ -55,12 +58,14 @@ let
     [ "$1" = "--" ] && shift
     exec "$@"
   '';
-  # `systemctl --user is-active -- <unit>`: active (rc 0), inactive (rc 3), or a
-  # broken systemd that cannot be asked (FAKE_UNIT_STATE=broken).
+  # `systemctl --user is-active -- <unit>`: active (rc 0) for the units named in
+  # FAKE_ACTIVE_UNITS, otherwise inactive (rc 3), or a broken systemd that
+  # cannot be asked (FAKE_UNIT_STATE=broken).
   fakeSystemctl = pkgs.writeShellScript "systemctl" ''
     echo "systemctl $*" >> "$FAKE_LOG"
+    unit=''${*: -1}
+    case " ''${FAKE_ACTIVE_UNITS:-} " in *" $unit "*) echo active; exit 0 ;; esac
     case "''${FAKE_UNIT_STATE:-inactive}" in
-      active) echo active; exit 0 ;;
       inactive) echo inactive; exit 3 ;;
       *) echo "Failed to connect to bus" >&2; exit 1 ;;
     esac
@@ -86,13 +91,15 @@ pkgs.runCommand "offline-ai-smoke-harness"
     reset() { rm -f calls.log calls.log.idle calls.log.lock; : > calls.log; }
     reset_state() { rm -rf state; }
     state() { jq -r "$1" state/offline-ai/smoke.json; }
-    # Poll 0.1 s, wait at most 0.6 s for idle or the lock, any hour, budget 600 s
-    # unless a case overrides (later env assignments win).
+    # Poll 0.1 s, wait at most 0.6 s for idle or the lock, any hour, budget 600 s,
+    # the two model units the module declares, unless a case overrides (later
+    # env assignments win).
     smoke() {
       env PATH="$PWD/fakebin:$PATH" FAKE_LOG="$PWD/calls.log" XDG_STATE_HOME="$PWD/state" \
           OFFLINE_AI_SMOKE_POWER_SUPPLY_DIR="$PWD/ps" OFFLINE_AI_SMOKE_POLL_S=0.1 \
           OFFLINE_AI_SMOKE_WAIT_MAX_MIN=0.01 OFFLINE_AI_SMOKE_LOCK_WAIT_MIN=0.01 \
-          OFFLINE_AI_SMOKE_WINDOW=0-24 "$@" python3 "$script"
+          OFFLINE_AI_SMOKE_WINDOW=0-24 OFFLINE_AI_UNIT=offline-ai-llm.service \
+          OFFLINE_AI_MODEL_UNITS="offline-ai-llm.service offline-ai-llm-coder.service" "$@" python3 "$script"
     }
     stale_ok() {  # a pass 8 days ago, so a run is due
       mkdir -p state/offline-ai
@@ -170,7 +177,7 @@ pkgs.runCommand "offline-ai-smoke-harness"
 
     # 10. The model was the user's (already up) and the run fails: no down.
     reset; stale_ok
-    smoke FAKE_UNIT_STATE=active FAKE_EXIT=1 > out10 2> err10 && fail "exit 1 with the model already up passed"
+    smoke FAKE_ACTIVE_UNITS=offline-ai-llm.service FAKE_EXIT=1 > out10 2> err10 && fail "exit 1 with the model already up passed"
     grep -q '^offline-ai down' calls.log && fail "brought down a model the user had up"
     [ "$(state .was_up)" = true ] || fail "was_up not recorded"
 
@@ -245,6 +252,24 @@ pkgs.runCommand "offline-ai-smoke-harness"
     sleep 1; reset
     smoke > out18b 2> err18b || fail "second run failed"
     [ "$(state .first_run)" = "$first" ] || fail "first_run changed on a later run"
+
+    # 19. Another model's unit (the coder) is active: the operator's session.
+    #     Skipped naming it, the CLI never run (it would switch to the small
+    #     model), the status untouched. The wrapper hands the script every
+    #     model unit the module declares. The default unit being up is still
+    #     case 10's business.
+    reset; stale_ok
+    smoke FAKE_ACTIVE_UNITS=offline-ai-llm-coder.service > out19 2> err19 || fail "model-in-use skip exited non-zero"
+    [ "$(state .skip_reason)" = "model in use: offline-ai-llm-coder.service" ] || fail "model-in-use skip has the wrong reason: $(state .skip_reason)"
+    grep -q '^offline-ai' calls.log && fail "model-in-use skip called offline-ai"
+    [ "$(state .status)" = ok ] || fail "model-in-use skip changed the status"
+    grep -q 'skipped: model in use' err19 || fail "model-in-use skip is not logged"
+    grep -q 'OFFLINE_AI_MODEL_UNITS=.*offline-ai-llm-coder.service' ${smoke}/bin/offline-ai-smoke \
+      || fail "the smoke wrapper does not hand the script every model unit"
+    reset; stale_ok
+    smoke FAKE_ACTIVE_UNITS="offline-ai-llm-coder.service offline-ai-llm.service" > out19b 2> err19b || fail "model-in-use skip with both units active exited non-zero"
+    grep -q 'model in use' <<< "$(state .skip_reason)" || fail "both units active did not skip"
+    grep -q '^offline-ai' calls.log && fail "both units active still ran the CLI"
 
     mkdir -p "$out"
     echo 'offline-ai-smoke harness passed' > "$out/result"
