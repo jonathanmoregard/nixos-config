@@ -420,6 +420,13 @@
           libraryServe = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-serve;
           libraryFetch = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-fetch;
         };
+        # Not a VM lane: runs the weekly smoke script against fake offline-ai /
+        # xprintidle / notify-send / nix-memory-run binaries — gates, verdicts,
+        # toast, cleanup. The real model is never loaded by a check.
+        offline-ai-smoke = import ./tests/offline-ai-smoke.nix {
+          pkgs = pkgsLinux;
+          smoke = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-smoke;
+        };
         # Not a VM lane: runs the local-stt router with the exact command
         # tuxedo's unit starts, against two stub whisper servers — English
         # stays on the general model, detected Swedish is re-transcribed by

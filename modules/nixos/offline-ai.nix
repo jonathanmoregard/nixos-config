@@ -222,10 +222,32 @@ let
       exec python3 ${../../scripts/offline-ai.py} "$@"
     '';
   };
+
+  # Weekly smoke test: loads the model through the CLI above, asks one question,
+  # records the verdict, shouts only on failure. Runs from a user timer; see
+  # docs/superpowers/specs/2026-10-03-offline-ai-smoke-design.md. Everything it
+  # calls is found on PATH so tests/offline-ai-smoke.nix can stand in fakes.
+  smoke = pkgs.writeShellApplication {
+    name = "offline-ai-smoke";
+    runtimeInputs = [
+      pkgs.python3
+      pkgs.coreutils
+      pkgs.systemd
+      pkgs.xprintidle
+      pkgs.libnotify
+      offlineAi
+      config.services.buildCoordination.runnerPackage
+    ];
+    text = ''
+      export OFFLINE_AI_UNIT="''${OFFLINE_AI_UNIT:-${unit}}"
+      exec python3 ${../../scripts/offline-ai-smoke.py} "$@"
+    '';
+  };
 in
 {
   environment.systemPackages = [ offlineAi libraryFetch ];
   system.build.offline-ai = offlineAi;
+  system.build.offline-ai-smoke = smoke;
   system.build.offline-ai-library-serve = libraryServe;
   system.build.offline-ai-library-fetch = libraryFetch;
 
@@ -298,6 +320,39 @@ in
     serviceConfig = {
       ExecStart = "${libraryServe}/bin/offline-ai-library-serve";
       Restart = "no";
+    };
+  };
+
+  # Weekly smoke: a nightly opportunity. The script skips while the last pass is
+  # younger than six days, outside 01-07 local time (a timer that elapsed during
+  # suspend fires at resume, which would otherwise mean mid-day), on battery, while
+  # the user is active, or while a build holds nix-memory-run; Persistent catches
+  # up after a night powered off. DISPLAY/DBUS as autodoro does: xprintidle needs
+  # the X server and notify-send the session bus.
+  systemd.user.services.offline-ai-smoke = {
+    description = "offline-ai weekly smoke test (loads the model, asks one question)";
+    unitConfig.ConditionPathExists = model;
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${smoke}/bin/offline-ai-smoke";
+      # 2 h idle wait + 1 h lock wait + 10 min run + 15 min down, with margin. The
+      # script records an abort if this still runs out.
+      TimeoutStartSec = "4h";
+      # On stop the CLI leaves offline mode (restarting what it evicted); let it.
+      TimeoutStopSec = "15min";
+      Environment = [
+        "DISPLAY=:0"
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus"
+      ];
+    };
+  };
+  systemd.user.timers.offline-ai-smoke = {
+    description = "offline-ai weekly smoke test, nightly opportunity";
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnCalendar = "*-*-* 03:33:00";
+      RandomizedDelaySec = "20min";
+      Persistent = true;
     };
   };
 }
