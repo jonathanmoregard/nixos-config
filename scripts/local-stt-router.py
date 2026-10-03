@@ -137,8 +137,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Vary", "Origin")
+        # The page lists the headers it wants to send: the settings page of
+        # Voquill runs the openai SDK, which adds its x-stainless-* telemetry
+        # next to the key, and the browser drops the request unless every one
+        # is allowed. The origin is local, so allow what it asks for.
+        requested = self.headers.get("Access-Control-Request-Headers")
+        self.send_header("Access-Control-Allow-Headers", requested or "Authorization, Content-Type")
+        self.send_header("Vary", "Origin, Access-Control-Request-Headers")
 
     def reply(self, status, payload):
         data = json.dumps(payload, ensure_ascii=False).encode()
