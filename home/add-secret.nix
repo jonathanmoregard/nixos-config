@@ -37,6 +37,7 @@ pkgs.writeShellApplication {
     git
     gh
     wl-clipboard
+    xclip
     coreutils
     gnugrep
     gnused
@@ -79,7 +80,7 @@ Examples:
   pass show anthropic-api-key | add-secret anthropic-api-key
   wl-paste                    | add-secret openai-api-key
   add-secret gemini-api-key                       # interactive prompt
-  add-secret gemini-api-key --from-clipboard      # explicit wl-paste
+  add-secret gemini-api-key --from-clipboard      # wl-paste, or xclip on X11
 
 Must be run from a nixos-config worktree root (e.g.
 ~/Repos/nixos-config-worktrees/<slug>). Creates the source .age file,
@@ -213,10 +214,25 @@ To edit its value, use the manual edit path:
           printf '%s' "$v1"
           ;;
         clipboard)
-          command -v wl-paste >/dev/null 2>&1 || die "wl-paste not available (not on Wayland?)"
-          if ! wl-paste --no-newline; then
-            die "wl-paste failed — is a Wayland session running?"
+          # Wayland first when a Wayland session is advertised and
+          # wl-paste actually works; otherwise X11 via xclip. Each tool
+          # writes into a temp file so a failed attempt never leaks
+          # partial output into the value.
+          local clip
+          clip=$(mktemp)
+          if [ -n "''${WAYLAND_DISPLAY:-}" ] && wl-paste --no-newline >"$clip" 2>/dev/null; then
+            :
+          elif [ -n "''${DISPLAY:-}" ] && xclip -selection clipboard -o >"$clip" 2>/dev/null; then
+            :
+          else
+            rm -f "$clip"
+            if [ -z "''${WAYLAND_DISPLAY:-}" ] && [ -z "''${DISPLAY:-}" ]; then
+              die "--from-clipboard needs a graphical session (neither WAYLAND_DISPLAY nor DISPLAY is set). Pipe the value in instead."
+            fi
+            die "could not read the clipboard (WAYLAND_DISPLAY=''${WAYLAND_DISPLAY:-unset}, DISPLAY=''${DISPLAY:-unset}; tried wl-paste, then xclip -selection clipboard -o)"
           fi
+          cat "$clip"
+          rm -f "$clip"
           ;;
         stdin)
           cat

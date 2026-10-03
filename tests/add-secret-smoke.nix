@@ -15,6 +15,10 @@
 #       - refuses to overwrite an existing .age file on rerun
 #   - a host file that carries its own marker (example-server) is the
 #     target instead; no marker anywhere refuses without leaving a .age
+#   - --from-clipboard on X11 (real Xvfb + xclip owner), including the
+#     fallback when WAYLAND_DISPLAY is set but unusable; the stored value
+#     is decrypted and compared. No session at all refuses clearly.
+#     The working-Wayland branch needs a compositor and is not covered.
 #
 # What is NOT exercised here (requires real nix eval / real gh / real
 # rekey — must be manually tested on dellan; see the PR body):
@@ -29,7 +33,7 @@ pkgs.runCommand "add-secret-smoke"
   {
     inherit deployedBin;
     tool = "${addSecretPkg}/bin/add-secret";
-    nativeBuildInputs = with pkgs; [ bash coreutils git gnugrep age ];
+    nativeBuildInputs = with pkgs; [ bash coreutils git gnugrep gnused age openssh xorg-server xclip ];
   } ''
     set -euo pipefail
 
@@ -305,6 +309,59 @@ NIXFILE
     [ ! -f "$PWD/f-nomarker/secrets/lost.age" ] \
       || fail "missing-marker refusal left secrets/lost.age behind"
 
-    echo "ok: name-validate, preflight, dup-refuse, happy-path, custom-attrs, exists-refuse, KEY= strip, auto-detect-stdin, auto-detect-empty-refuse, explicit-prompt-override, host-marker, no-marker-refuse"
+    # --- 13. --from-clipboard on X11 (no Wayland) ------------------------
+    # A real Xvfb + real xclip as clipboard owner. The fixture's first
+    # master pubkey is swapped for a key generated here so the .age can
+    # be decrypted and the stored value compared byte-for-byte.
+    mkdir -p "$PWD/xdg"
+    Xvfb :99 -nolisten tcp -nolisten unix >xvfb.log 2>&1 &
+    xvfb_pid=$!
+    # xclip -i forks and stays the selection owner; retry until Xvfb
+    # accepts connections.
+    for _ in $(seq 100); do
+      printf 'clip-x11-value' | DISPLAY=:99 xclip -selection clipboard -i 2>/dev/null && break
+      sleep 0.1
+    done
+    [ "$(DISPLAY=:99 xclip -selection clipboard -o 2>/dev/null)" = clip-x11-value ] \
+      || fail "could not seed the X11 clipboard (see xvfb.log)"
+
+    ssh-keygen -q -t ed25519 -N "" -C harness -f "$PWD/clipkey"
+    mkclipfixture() {
+      mkfixture "$1"
+      sed -i "0,/pubkey = \"[^\"]*\"/s||pubkey = \"$(cat "$PWD/clipkey.pub")\"|" \
+        "$1/modules/nixos/agenix-rekey-common.nix"
+    }
+
+    mkclipfixture "$PWD/f-clip-x11"
+    ( cd "$PWD/f-clip-x11" && env -u WAYLAND_DISPLAY DISPLAY=:99 \
+        ADD_SECRET_TEST_MODE=1 "$tool" clip-x11 --from-clipboard ) \
+      </dev/null >clip-x11.log 2>&1 || fail "X11 clipboard path failed"
+    got=$(age -d -i "$PWD/clipkey" "$PWD/f-clip-x11/secrets/clip-x11.age") \
+      || fail "could not decrypt clip-x11.age"
+    [ "$got" = "clip-x11-value" ] || fail "X11 clipboard stored '$got', expected 'clip-x11-value'"
+
+    # --- 14. WAYLAND_DISPLAY set but unusable → falls back to X11 --------
+    mkclipfixture "$PWD/f-clip-fallback"
+    ( cd "$PWD/f-clip-fallback" && \
+        env WAYLAND_DISPLAY=wayland-absent XDG_RUNTIME_DIR="$PWD/xdg" DISPLAY=:99 \
+        ADD_SECRET_TEST_MODE=1 "$tool" clip-fallback --from-clipboard ) \
+      </dev/null >clip-fallback.log 2>&1 || fail "dead-Wayland fallback to X11 failed"
+    got=$(age -d -i "$PWD/clipkey" "$PWD/f-clip-fallback/secrets/clip-fallback.age") \
+      || fail "could not decrypt clip-fallback.age"
+    [ "$got" = "clip-x11-value" ] || fail "fallback stored '$got', expected 'clip-x11-value'"
+
+    kill "$xvfb_pid" 2>/dev/null || true
+
+    # --- 15. no graphical session → clear refusal, no .age --------------
+    mkfixture "$PWD/f-clip-none"
+    ( cd "$PWD/f-clip-none" && env -u WAYLAND_DISPLAY -u DISPLAY \
+        ADD_SECRET_TEST_MODE=1 "$tool" clip-none --from-clipboard ) \
+      </dev/null >clip-none.log 2>&1 && fail "accepted --from-clipboard without a session" || true
+    grep -q "needs a graphical session" clip-none.log \
+      || fail "no clear error when neither WAYLAND_DISPLAY nor DISPLAY is set"
+    [ ! -f "$PWD/f-clip-none/secrets/clip-none.age" ] \
+      || fail "clipboard refusal left secrets/clip-none.age behind"
+
+    echo "ok: name-validate, preflight, dup-refuse, happy-path, custom-attrs, exists-refuse, KEY= strip, auto-detect-stdin, auto-detect-empty-refuse, explicit-prompt-override, host-marker, no-marker-refuse, clipboard-x11, clipboard-wayland-fallback, clipboard-no-session"
     touch "$out"
   ''
