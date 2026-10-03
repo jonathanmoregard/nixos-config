@@ -59,6 +59,12 @@
 # nothing against a saturating hog (the loss is wake-up latency, not share),
 # the hog's own policy does — SCHED_BATCH or SCHED_IDLE on the hog leaves the
 # dictation at its unloaded latency. Hence nix-daemon's batch policy.
+#
+# RECORD-START BOOST. The router answers GET|POST /v1/prepare with 204 and
+# holds the `performance` power profile for 30 s through powerprofilesctl
+# (one hold at a time) while touching ai-throttle's foreground hint, so the
+# background units pause at once; every transcription takes the same boost
+# inline. Voquill pings /v1/prepare when a recording starts.
 { config, lib, pkgs, ... }:
 let
   models = "${config.users.users.jonathan.home}/.local/share/stt-models";
@@ -144,6 +150,11 @@ in
       LOCAL_STT_SHORT_SECONDS = toString shortSeconds;
       LOCAL_STT_SHORT_TIMEOUT = toString shortTimeoutSeconds;
       LOCAL_STT_SWEDISH = "http://127.0.0.1:${toString swedishPort}";
+      # The record-start boost's two side channels: power-profiles-daemon's
+      # client (the daemon itself is the desktop's), and the hint file the
+      # governor reads, the one path for both so they cannot drift.
+      LOCAL_STT_POWERPROFILESCTL = "${pkgs.power-profiles-daemon}/bin/powerprofilesctl";
+      LOCAL_STT_THROTTLE_HINT = config.services.aiThrottle.foregroundHint;
     };
     serviceConfig = priority // {
       ExecStart = "${pkgs.python3}/bin/python3 ${../../scripts/local-stt-router.py}";

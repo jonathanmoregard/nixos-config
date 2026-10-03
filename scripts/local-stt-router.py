@@ -31,6 +31,25 @@ when the short-window server is down or has not answered within
 LOCAL_STT_SHORT_TIMEOUT seconds. The Swedish re-transcription always keeps
 the full window: Swedish accuracy first.
 
+The record-start boost: on battery this laptop idles at 1.6-2.2 GHz under the
+`balanced` power profile and a dictation is a one-second burst, too short for
+the governor to ramp for. GET or POST /v1/prepare (Voquill pings it when a
+recording starts) answers 204 at once and boost() does two things for the
+seconds the transcription is about to need:
+
+  - holds the `performance` power profile: `powerprofilesctl launch -p
+    performance -- sleep 30` runs as a child and power-profiles-daemon keeps
+    the hold exactly as long as that child lives; one child at a time, so a
+    burst of pings cannot stack holds;
+  - touches ai-throttle's foreground hint file, so the governor pauses the
+    background units (embedding backfill) on its next tick instead of after
+    the dictation's CPU time has shown up in cpu.stat.
+
+Every transcription takes the same boost inline, so the gain exists without
+any client ping. Without powerprofilesctl (a machine without
+power-profiles-daemon) the hint is still left and the request still served;
+the journal says so once.
+
 Settings come from the environment (the systemd unit sets them):
   LOCAL_STT_PORT           port to listen on (127.0.0.1 only)
   LOCAL_STT_GENERAL        base URL of the turbo whisper-server (full window)
@@ -41,6 +60,10 @@ Settings come from the environment (the systemd unit sets them):
                            server (14)
   LOCAL_STT_SHORT_TIMEOUT  seconds to wait for the short-window server before
                            using the full-window one (20)
+  LOCAL_STT_POWERPROFILESCTL  the powerprofilesctl binary (default: the one
+                           on PATH; none found = no performance hold)
+  LOCAL_STT_THROTTLE_HINT  ai-throttle's foreground hint file (default
+                           $XDG_RUNTIME_DIR/ai-throttle/foreground-hint)
 """
 
 import email.parser
@@ -48,7 +71,10 @@ import email.policy
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 import uuid
@@ -62,10 +88,82 @@ TIMEOUT = 600
 MODEL_ID = "local-stt"
 SHORT_SECONDS = float(os.environ.get("LOCAL_STT_SHORT_SECONDS", "14"))
 SHORT_TIMEOUT = float(os.environ.get("LOCAL_STT_SHORT_TIMEOUT", "20"))
+POWERPROFILESCTL = os.environ.get("LOCAL_STT_POWERPROFILESCTL") or shutil.which("powerprofilesctl")
+THROTTLE_HINT = os.environ.get("LOCAL_STT_THROTTLE_HINT") or os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "ai-throttle", "foreground-hint")
+# How long one performance hold lasts: a dictation's transcription plus the
+# next one, which is likely close behind. Each prepare while a hold lives
+# changes nothing; the first one after it ends starts the next.
+HOLD_SECONDS = 30
 
 
 class BackendError(Exception):
     pass
+
+
+def log(message):
+    print("local-stt: " + message, file=sys.stderr, flush=True)
+
+
+class Boost:
+    """The record-start boost: one performance hold at a time, and the hint.
+
+    The hold is a child process, `powerprofilesctl launch -p performance --
+    sleep HOLD_SECONDS`: power-profiles-daemon releases the hold when its
+    D-Bus client exits, so the hold lives exactly as long as the child and
+    nothing here has to remember to release it. Requests arrive on threads;
+    the lock keeps two of them from both seeing "no child" and spawning two.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.child = None
+        self.said = set()
+
+    def say_once(self, message):
+        if message not in self.said:
+            self.said.add(message)
+            log(message)
+
+    def hold(self):
+        if not POWERPROFILESCTL or not os.path.exists(POWERPROFILESCTL):
+            self.say_once(f"no powerprofilesctl at {POWERPROFILESCTL or '(PATH)'}; "
+                          "transcriptions run without the performance hold")
+            return
+        with self.lock:
+            if self.child is not None:
+                if self.child.poll() is None:
+                    return
+                if self.child.returncode != 0:
+                    self.say_once(f"powerprofilesctl exited {self.child.returncode}; "
+                                  "is power-profiles-daemon running? Trying again on the next request")
+            try:
+                # powerprofilesctl is a Python/GLib program: niced, so its
+                # start-up does not compete with the transcription it serves
+                # (inline, un-niced, it cost ~90 ms on AC, 2026-10-03).
+                self.child = subprocess.Popen(
+                    [POWERPROFILESCTL, "launch", "-p", "performance", "--", "sleep", str(HOLD_SECONDS)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    preexec_fn=lambda: os.nice(19))
+            except OSError as e:
+                self.child = None
+                self.say_once(f"cannot start powerprofilesctl ({e}); transcriptions run without the performance hold")
+
+    def hint(self):
+        try:
+            os.makedirs(os.path.dirname(THROTTLE_HINT), exist_ok=True)
+            with open(THROTTLE_HINT, "a"):
+                pass
+            os.utime(THROTTLE_HINT, None)
+        except OSError as e:
+            self.say_once(f"cannot write the ai-throttle hint {THROTTLE_HINT}: {e}")
+
+    def __call__(self):
+        self.hold()
+        self.hint()
+
+
+boost = Boost()
 
 
 def parse_form(content_type, body):
@@ -193,7 +291,7 @@ def local_origin(origin):
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        print("local-stt: " + fmt % args, file=sys.stderr, flush=True)
+        log(fmt % args)
 
     def cors_headers(self):
         origin = self.headers.get("Origin", "")
@@ -218,6 +316,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def no_content(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.cors_headers()
+        self.end_headers()
+
     def do_OPTIONS(self):
         # The browser's preflight: no body, the grant (or none) in the headers.
         self.send_response(204)
@@ -226,18 +330,32 @@ class Handler(BaseHTTPRequestHandler):
         self.cors_headers()
         self.end_headers()
 
+    def prepare(self):
+        """The record-start ping: boost now, answer at once, no body to wait for."""
+        boost()
+        self.no_content()
+
     def do_GET(self):
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             self.reply(200, {"object": "list", "data": [{"id": MODEL_ID, "object": "model", "owned_by": "local"}]})
+        elif self.path.rstrip("/") in ("/v1/prepare", "/prepare"):
+            self.prepare()
         elif self.path.rstrip("/") in ("", "/health"):
             self.reply(200, {"status": "ok"})
         else:
             self.reply(404, {"error": {"message": f"no route {self.path}"}})
 
     def do_POST(self):
+        if self.path.rstrip("/") in ("/v1/prepare", "/prepare"):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.prepare()
+            return
         if self.path.rstrip("/") not in ("/v1/audio/transcriptions", "/audio/transcriptions"):
             self.reply(404, {"error": {"message": f"no route {self.path}"}})
             return
+        # The boost before the body is read: the hold and the hint are worth
+        # the most at the start of the second the transcription takes.
+        boost()
         try:
             length = int(self.headers.get("Content-Length") or 0)
             fields = parse_form(self.headers.get("Content-Type", ""), self.rfile.read(length))
@@ -261,8 +379,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"local-stt: listening on 127.0.0.1:{PORT} (general {GENERAL}, Swedish {SWEDISH})",
-          file=sys.stderr, flush=True)
+    log(f"listening on 127.0.0.1:{PORT} (general {GENERAL}, Swedish {SWEDISH}, "
+        f"performance hold via {POWERPROFILESCTL or 'nothing'}, hint {THROTTLE_HINT})")
     server.serve_forever()
 
 
