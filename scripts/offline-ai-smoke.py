@@ -9,8 +9,9 @@ is otherwise discovered exactly when the network is gone.
 Driven by the offline-ai-smoke user timer: a nightly opportunity, a weekly cadence
 (nothing runs while the last pass is younger than INTERVAL_DAYS). A night is skipped
 outside the night window (a timer that elapsed during suspend fires at resume, which
-would otherwise be mid-day), on battery, while the user is active, or while a nix
-build holds nix-memory-run; a skip never hides the last verdict.
+would otherwise be mid-day), on battery, while another model's unit is up (the
+operator's session: the CLI would switch away from it), while the user is active,
+or while a nix build holds nix-memory-run; a skip never hides the last verdict.
 
 Every program used is found on PATH (offline-ai, systemctl, xprintidle, notify-send,
 nix-memory-run, timeout) so tests/offline-ai-smoke.nix can stand in fakes.
@@ -44,6 +45,9 @@ BUDGET_S = int(env_float("OFFLINE_AI_SMOKE_BUDGET_S", 600))
 DOWN_TIMEOUT_S = int(env_float("OFFLINE_AI_SMOKE_DOWN_TIMEOUT_S", 900))
 POWER_SUPPLY = Path(os.environ.get("OFFLINE_AI_SMOKE_POWER_SUPPLY_DIR", "/sys/class/power_supply"))
 UNIT = os.environ.get("OFFLINE_AI_UNIT", "offline-ai-llm.service")
+# Every model unit the module declares. The CLI loads the default model, which
+# stops any other model that is up: while another is, the night is skipped.
+MODEL_UNITS = os.environ.get("OFFLINE_AI_MODEL_UNITS", UNIT).split()
 # Plain words on purpose: nothing here matches the CLI's SAFETY regex, so the
 # citation gate never adds a turn to the smoke.
 PROMPT = os.environ.get("OFFLINE_AI_SMOKE_PROMPT",
@@ -132,6 +136,23 @@ def unit_active():
     if out.returncode == 3 and state in ("inactive", "failed"):
         return False
     return None  # activating, deactivating, or systemd itself unreachable
+
+
+def other_model_in_use():
+    """A model unit other than ours that is active or activating: the operator's
+    session, which the CLI would switch away from. None when there is none, or
+    when systemd cannot be asked (then unit_active() decides what is touched)."""
+    for unit in MODEL_UNITS:
+        if unit == UNIT:
+            continue
+        try:
+            out = subprocess.run(["systemctl", "--user", "is-active", "--", unit],
+                                 capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if out.stdout.strip() in ("active", "activating"):
+            return unit
+    return None
 
 
 def notify(summary, body):
@@ -247,6 +268,9 @@ def main():
         return skip(state, f"outside the night window {start:02d}-{end:02d} (hour {hour:02d})")
     if on_battery():
         return skip(state, "on battery")
+    busy = other_model_in_use()
+    if busy:
+        return skip(state, f"model in use: {busy}")
 
     deadline = time.monotonic() + WAIT_MAX_MIN * 60
     while True:
