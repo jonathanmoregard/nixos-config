@@ -127,6 +127,17 @@
         assert rec["result"] == "exit-code", rec
         assert rec["failed_at"] and rec["inspect"], rec
 
+        # Root owns record and directory, nobody else can write either
+        # (the hook trusts the record as root-authored), and no in-flight
+        # temp file is left behind.
+        perms = dellan.succeed(
+            f"stat -c '%U:%G %a' /var/lib/unit-failures {record}"
+        ).split("\n")
+        assert perms[:2] == ["root:root 755", "root:root 644"], perms
+        dellan.fail(f"su jonathan -s /bin/sh -c 'echo x >> {record}'")
+        dellan.fail("su jonathan -s /bin/sh -c 'touch /var/lib/unit-failures/x.json'")
+        dellan.succeed("test -z \"$(ls -A /var/lib/unit-failures | grep -v '^nix-gc.json$')\"")
+
         # Fail closed: nothing was collected without its pins.
         dellan.succeed(f"test -e {protected}")
 
