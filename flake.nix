@@ -427,6 +427,12 @@
             small = tuxedo.systemd.user.services.offline-ai-llm.unitConfig.Conflicts or [ ];
             coder = tuxedo.systemd.user.services.offline-ai-llm-coder.unitConfig.Conflicts or [ ];
           };
+          # Conflicts= alone orders nothing; After= is what makes systemd run
+          # the stop job before the start job.
+          after = {
+            small = tuxedo.systemd.user.services.offline-ai-llm.unitConfig.After or [ ];
+            coder = tuxedo.systemd.user.services.offline-ai-llm-coder.unitConfig.After or [ ];
+          };
           gatedUserDropIn = tuxedo.home-manager.users.jonathan.xdg.configFile
             ."systemd/user/aggregator-embed-server.service.d/offline-ai.conf".text or "";
           gatedSystemConditions = tuxedo.systemd.services."microvm@research-agent".unitConfig.ConditionPathExists or [ ];

@@ -51,9 +51,15 @@
 #     loaded, one from default mode leaves nothing loaded; `down` stops every
 #     model unit and clears every marker; an unknown --model exits 1 naming
 #     the models; a missing model names its own fetch hint; status and
-#     models name the loaded model. And, read from the deployed units: each
-#     model unit names the other in Conflicts=, and the gated units refuse
-#     to start while either model's marker stands;
+#     models name the loaded model; without OFFLINE_AI_DEFAULT_MODEL the
+#     default is `small`, not whichever name sorts first; a switch to a
+#     model that is not on disk stops nothing and leaves the loaded model
+#     and the mode as they were. And, read from the deployed units: each
+#     model unit names the other in Conflicts= and in After= (Conflicts=
+#     alone orders nothing: with the ordering, systemd runs the stop job
+#     before the start job, so a by-hand start of the other unit cannot run
+#     both servers at once), and the gated units refuse to start while
+#     either model's marker stands;
 #   - the help text is a complete reference: every command the CLI
 #     dispatches on, every option its parser defines, every model (with its
 #     line and fetch hint), the default, and the exit statuses — the
@@ -63,6 +69,7 @@
 # Run: nix build .#checks.x86_64-linux.offline-ai -L
 { pkgs, offlineAi, libraryServe, libraryFetch
 , conflicts ? { }               # model name -> Conflicts= of its deployed unit (string or list)
+, after ? { }                   # model name -> After= of its deployed unit (string or list)
 , gatedUserDropIn ? ""          # the drop-in text one gated user service carries
 , gatedSystemConditions ? [ ]   # ConditionPathExists= of one gated system unit
 }:
@@ -954,10 +961,11 @@ pkgs.runCommand "offline-ai-harness"
     # --- two models: the small one by default, the coder on demand. The
     # table the module exports: the small model keeps today's unit,
     # reservation and marker; the coder has its own, and a model in parts.
+    # Keys sorted, as builtins.toJSON writes them (so the coder comes first).
     # Plenty of memory, so only the switching matters here.
     echo "MemAvailable:   99999999 kB" > meminfo
     truncate -s 1M small.gguf coder-00001-of-00002.gguf coder-00002-of-00002.gguf
-    jq -n --arg d "$PWD" '{
+    jq -n -S --arg d "$PWD" '{
       small: {unit: "offline-ai-llm.service", model: ($d + "/small.gguf"),
               reservation: "memory-reserve-offline-ai.service", marker: ($d + "/mode/marker"),
               about: "small fixture, 1 MB, on the iGPU, 64k context: the one to use",
@@ -968,6 +976,13 @@ pkgs.runCommand "offline-ai-harness"
               fetch: "hf download coder-fixture"}}' > models.json
     two() { OFFLINE_AI_MODELS="$(cat models.json)" OFFLINE_AI_DEFAULT_MODEL=small mode "$@"; }
     active() { [ -e "mode/user/$1" ]; }
+
+    # Without OFFLINE_AI_DEFAULT_MODEL the default is the small model, not the
+    # name that happens to sort first in the table.
+    reset_units
+    OFFLINE_AI_MODELS="$(cat models.json)" mode models > two-default.out 2>&1 || { cat two-default.out; fail "models without OFFLINE_AI_DEFAULT_MODEL failed"; }
+    grep -q '^small: not loaded, on disk, default$' two-default.out \
+      || { cat two-default.out; fail "without OFFLINE_AI_DEFAULT_MODEL the default is not the small model"; }
 
     # A conversation loads the default model's unit; --model coder the coder's.
     # From default mode either leaves nothing loaded and no marker behind.
@@ -1051,14 +1066,36 @@ pkgs.runCommand "offline-ai-harness"
     two models > two-models2.out 2>&1 || fail "models after the missing-coder case failed"
     grep -q '^coder: not loaded, on disk$' two-models2.out || { cat two-models2.out; fail "models does not see the coder back on disk"; }
 
+    # With the small model loaded, a switch to a coder that is not on disk
+    # fails before anything is stopped: the small model stays loaded with its
+    # marker, the mode stays on, and the message names the coder's fetch hint.
+    reset_units
+    two up > /dev/null 2>&1 || fail "up before the missing-coder switch failed"
+    mv coder-00001-of-00002.gguf coder-away.gguf
+    rm -f mode/calls
+    two --model coder "harder question" > two-missing-switch.out 2>&1 && fail "a switch to a coder that is not on disk did not fail"
+    grep -q 'coder-fixture' two-missing-switch.out || { cat two-missing-switch.out; fail "the missing-coder switch does not name the fetch hint"; }
+    if grep -qs 'stop offline-ai-llm.service' mode/calls; then fail "the small model was stopped for a coder that is not on disk: $(calls)"; fi
+    active offline-ai-llm.service && [ -e mode/marker ] || fail "the small model did not stay loaded when the coder was not on disk"
+    [ ! -e mode/system/b.service ] || fail "a failed switch ended offline-AI mode"
+    mv coder-away.gguf coder-00001-of-00002.gguf
+    two down > /dev/null 2>&1 || fail "down after the failed switch failed"
+
     # --- the deployed units, read at eval time: each model unit names the
-    # other in Conflicts=, so systemd itself never holds both loaded, and
-    # the gated units (one user drop-in, one system unit) refuse to start
-    # while either model's marker stands.
+    # other in Conflicts= and in After= (Conflicts= alone orders nothing, so
+    # a by-hand `systemctl --user start` of the other unit could run both
+    # servers at once; with the ordering, systemd.unit(5): stop jobs are
+    # ordered before start jobs), so systemd itself never holds both loaded;
+    # and the gated units (one user drop-in, one system unit) refuse to
+    # start while either model's marker stands.
     small_conflicts=${pkgs.lib.escapeShellArg (toString (conflicts.small or [ ]))}
     coder_conflicts=${pkgs.lib.escapeShellArg (toString (conflicts.coder or [ ]))}
     case " $small_conflicts " in *" offline-ai-llm-coder.service "*) ;; *) fail "the small model's unit does not conflict with the coder's: '$small_conflicts'" ;; esac
     case " $coder_conflicts " in *" offline-ai-llm.service "*) ;; *) fail "the coder's unit does not conflict with the small model's: '$coder_conflicts'" ;; esac
+    small_after=${pkgs.lib.escapeShellArg (toString (after.small or [ ]))}
+    coder_after=${pkgs.lib.escapeShellArg (toString (after.coder or [ ]))}
+    case " $small_after " in *" offline-ai-llm-coder.service "*) ;; *) fail "the small model's unit is not ordered after the coder's (After=): '$small_after'" ;; esac
+    case " $coder_after " in *" offline-ai-llm.service "*) ;; *) fail "the coder's unit is not ordered after the small model's (After=): '$coder_after'" ;; esac
     gated_user=${pkgs.lib.escapeShellArg gatedUserDropIn}
     gated_system=${pkgs.lib.escapeShellArg (toString gatedSystemConditions)}
     for marker in /run/memory-reserve/offline-ai /run/memory-reserve/offline-ai-coder; do

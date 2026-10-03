@@ -318,6 +318,9 @@ let
     ];
     text = ''
       export OFFLINE_AI_UNIT="''${OFFLINE_AI_UNIT:-${default.unit}}"
+      # Every model unit: the smoke skips the night while any other than its
+      # own is up, instead of switching the operator's session away from it.
+      export OFFLINE_AI_MODEL_UNITS="''${OFFLINE_AI_MODEL_UNITS:-${lib.concatMapStringsSep " " (m: m.unit) (lib.attrValues models)}}"
       exec python3 ${../../scripts/offline-ai-smoke.py} "$@"
     '';
   };
@@ -341,13 +344,20 @@ in
   services.memoryPressure.reservations =
     lib.mapAttrs' (_: m: lib.nameValuePair m.reservation m.bytes) models;
 
-  systemd.user.services = lib.mapAttrs' (name: m: lib.nameValuePair (lib.removeSuffix ".service" m.unit) {
+  systemd.user.services = lib.mapAttrs' (name: m: let
+    others = map (o: o.unit) (lib.attrValues (lib.filterAttrs (other: _: other != name) models));
+  in lib.nameValuePair (lib.removeSuffix ".service" m.unit) {
     description = "offline-ai local model server (llama.cpp, the ${name} model)";
     unitConfig.ConditionPathExists = m.model;
     # Starting this model stops any other: never two loaded, enforced by
     # systemd below the CLI (which stops the other first anyway, so its
-    # memory arithmetic sees that memory free).
-    conflicts = map (o: o.unit) (lib.attrValues (lib.filterAttrs (other: _: other != name) models));
+    # memory arithmetic sees that memory free). Conflicts= alone orders
+    # nothing: a by-hand `systemctl --user start` of the other unit could
+    # run both servers at once (one port, ~70 GB). With After= in both
+    # directions the stop job is ordered before the start job
+    # (systemd.unit(5): "stop jobs are always ordered before start jobs").
+    conflicts = others;
+    after = others;
     serviceConfig = {
       # "-": failing to shrink the build cap should not keep the assistant
       # from answering during an outage. ExecStopPost also runs after a

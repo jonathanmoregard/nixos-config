@@ -97,7 +97,9 @@ def load_models():
 
 
 MODELS = load_models()
-DEFAULT_MODEL = os.environ.get("OFFLINE_AI_DEFAULT_MODEL") or next(iter(MODELS))
+# The default: what the module says, else the small model if there is one, else
+# the first name. Never "whichever sorts first": the table from Nix is sorted.
+DEFAULT_MODEL = os.environ.get("OFFLINE_AI_DEFAULT_MODEL") or ("small" if "small" in MODELS else next(iter(MODELS)))
 if DEFAULT_MODEL not in MODELS:
     sys.exit(f"OFFLINE_AI_DEFAULT_MODEL names no model: {DEFAULT_MODEL!r}; the models are: {', '.join(MODELS)}")
 # The default first wherever the models are listed (JSON from Nix comes sorted by name).
@@ -1897,8 +1899,26 @@ def stop_other_model():
     clear_marker(other)
 
 
+def require_model_on_disk():
+    """The selected model's weights must be here before anything is stopped
+    for it: a switch to a model that is missing would otherwise leave nothing
+    loaded. The message says how to fetch them."""
+    if MODEL and not os.path.exists(MODEL):
+        sys.exit(f"the {SELECTED} model is not on this machine: {MODEL}\n"
+                 f"Fetch it while online:\n  {MODELS[SELECTED].get('fetch') or '(no fetch hint configured)'}")
+
+
+def serving_selected():
+    """The selected model, or a server outside systemd, is already answering:
+    nothing to stop, nothing to load, no weights to ask for."""
+    return healthy() and loaded_model() in (None, SELECTED)
+
+
 def load_model(force=False):
     """Bring up the selected model, whatever is loaded now."""
+    if serving_selected():
+        return
+    require_model_on_disk()
     try:
         stop_other_model()
         if MODEL and os.path.exists(MODEL) and not healthy():
@@ -1935,11 +1955,9 @@ def leave_offline_mode():
 
 
 def up(force=False):
-    if healthy() and loaded_model() in (None, SELECTED):
+    if serving_selected():
         return
-    if MODEL and not os.path.exists(MODEL):
-        sys.exit(f"the {SELECTED} model is not on this machine: {MODEL}\n"
-                 f"Fetch it while online:\n  {MODELS[SELECTED].get('fetch') or '(no fetch hint configured)'}")
+    require_model_on_disk()
     loading = run(["systemctl", "--user", "is-active", "--", UNIT]) in ("active", "activating")
     if MODEL and not force and not loading:
         need, free = model_bytes(), available_bytes()
