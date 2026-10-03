@@ -46,6 +46,19 @@
 #
 # Offline-AI mode (offline-ai.nix) stops these units while the big model is
 # loaded and starts them again afterwards.
+#
+# PRIORITY. A dictation is a one-second burst that competes with whatever
+# else runs in this user's session (nix evaluations, builds, the embedding
+# backfill). The four units carry CPUWeight=1000 against the default 100, so
+# under contention the scheduler gives them ten shares to every other
+# sibling's one; ram-heavy.slice (memory-pressure.nix) sits at 50 and
+# nix-daemon runs batch/idle (build-coordination.nix). IOWeight=1000 states
+# the same intent for IO; the user manager is delegated cpu, memory and pids
+# only, so it takes effect once io is delegated too. Measured 2026-10-03
+# with a 24-process CPU hog in a default-weight scope: the weight alone buys
+# nothing against a saturating hog (the loss is wake-up latency, not share),
+# the hog's own policy does — SCHED_BATCH or SCHED_IDLE on the hog leaves the
+# dictation at its unloaded latency. Hence nix-daemon's batch policy.
 { config, lib, pkgs, ... }:
 let
   models = "${config.users.users.jonathan.home}/.local/share/stt-models";
@@ -65,6 +78,12 @@ let
   # takes ~1 s; Voquill waits far less than whisper-server's 600 s).
   shortTimeoutSeconds = 20;
 
+  # Ten shares to every default sibling's one, for the burst a dictation is.
+  priority = {
+    CPUWeight = 1000;
+    IOWeight = 1000;
+  };
+
   # The iGPU does the work; the CPU threads only feed it. -nf on the turbo
   # servers: no temperature fallback, so an uncertain decode is not re-run at
   # rising temperatures; 2026-10-03 that changed no text on 20 real clips and
@@ -81,7 +100,7 @@ let
     inherit description;
     wantedBy = [ "default.target" ];
     unitConfig.ConditionPathExists = model;
-    serviceConfig = {
+    serviceConfig = priority // {
       ExecStart = whisperServer { inherit model port language audioCtx noFallback; };
       Restart = "on-failure";
       RestartSec = 5;
@@ -126,7 +145,7 @@ in
       LOCAL_STT_SHORT_TIMEOUT = toString shortTimeoutSeconds;
       LOCAL_STT_SWEDISH = "http://127.0.0.1:${toString swedishPort}";
     };
-    serviceConfig = {
+    serviceConfig = priority // {
       ExecStart = "${pkgs.python3}/bin/python3 ${../../scripts/local-stt-router.py}";
       Restart = "on-failure";
       RestartSec = 5;
