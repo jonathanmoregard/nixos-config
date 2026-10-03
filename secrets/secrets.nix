@@ -99,4 +99,10 @@ in
   # placeholder — until the founder edits the real token in, GitHub answers
   # 401 and every wrapper refuses.
   "klaffat-github-token.age".publicKeys = klaffat;
+
+  # pr-swipe merge-gate GitHub App private key: the only credential that can
+  # merge or close PRs on owned repos. Host keys only, for the same reason as
+  # the klaffat secrets: jonathan (the principal agents run as) must not be
+  # able to decrypt it. Read at runtime by pr-swipe-executor via LoadCredential.
+  "pr-swipe-merge-gate.age".publicKeys = klaffat;
 }
