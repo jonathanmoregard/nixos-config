@@ -29,6 +29,24 @@
 # A failure while pinning fails the unit before collection starts, so
 # the cache is never deleted unprotected.
 #
+# ── Failure reporting ──
+#
+# Fail-closed pinning has a cost: if `nix path-info` output ever breaks
+# (a Nix bump changing the JSON), nix-gc fails every night and no
+# scheduled GC runs at all. That must not be silent, and a desktop toast
+# alone is not enough — it reaches Jonathan, never the Claude session
+# that could fix it (2026-08-31 constraint). So:
+#
+#   OnFailure=nix-gc-failure-notify.service (system, root) logs a journal
+#     marker and writes /var/lib/unit-failures/nix-gc.json, the durable
+#     world-readable record that ~/.claude's SessionStart hook
+#     (hooks/unit-failure-health.py) puts into every session's context.
+#   A user path unit watches that record and raises a critical toast —
+#     the nixos-deploy pattern (system writes a file, the user manager
+#     owns the session bus).
+#   postStop deletes the record after a successful run, so it always
+#     means "the last run failed", never "a run once failed".
+#
 # Known limit: age is registration time, not last use. A closure that
 # stays unchanged and unrooted for longer than `days` is still collected
 # once per `days`+1 nights (weekly instead of nightly at the default).
@@ -38,6 +56,50 @@
 let
   cfg = config.services.nixGcKeepRecent;
   rootsDir = "/nix/var/nix/gcroots/keep-recent";
+
+  # One JSON record per failed system unit, <unit>.json. Read by
+  # ~/.claude/hooks/unit-failure-health.py at SessionStart; another
+  # system unit opts in by writing the same shape here.
+  failuresDir = "/var/lib/unit-failures";
+  record = "${failuresDir}/nix-gc.json";
+
+  # Activated only via OnFailure (no wantedBy). Journal first, then the
+  # record, written atomically so the hook never reads half a file.
+  failureNotify = pkgs.writeShellApplication {
+    name = "nix-gc-failure-notify";
+    runtimeInputs = [ pkgs.jq pkgs.coreutils ];
+    text = ''
+      result="''${MONITOR_SERVICE_RESULT:-unknown}"
+      status="''${MONITOR_EXIT_STATUS:-unknown}"
+      echo "nix-gc FAILED (result=$result status=$status): scheduled GC did not run; inspect: journalctl -u nix-gc.service -n 100"
+
+      mkdir -p -- ${failuresDir}
+      chmod 0755 -- ${failuresDir}
+      tmp=$(mktemp ${failuresDir}/.nix-gc.XXXXXX)
+      jq -n \
+        --arg unit nix-gc.service \
+        --arg result "$result" \
+        --arg status "$status" \
+        --arg invocation "''${MONITOR_INVOCATION_ID:-}" \
+        --arg failed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg summary "Scheduled Nix garbage collection failed; no scheduled GC runs until this is fixed (the keep-recent pin step fails closed)." \
+        --arg inspect "journalctl -u nix-gc.service -n 100" \
+        '{unit: $unit, result: $result, exit_status: $status, invocation_id: $invocation, failed_at: $failed_at, summary: $summary, inspect: $inspect}' \
+        > "$tmp"
+      chmod 0644 -- "$tmp"
+      mv -f -- "$tmp" ${record}
+      echo "nix-gc-failure-notify: recorded ${record}"
+    '';
+  };
+
+  # Runs on success and failure alike; only a successful run clears the
+  # failure record.
+  postStop = pkgs.writeShellScript "nix-gc-post-stop" ''
+    ${pkgs.coreutils}/bin/rm -rf -- ${rootsDir}
+    if [ "''${SERVICE_RESULT:-}" = success ]; then
+      ${pkgs.coreutils}/bin/rm -f -- ${record}
+    fi
+  '';
 
   pinRecent = pkgs.writeShellApplication {
     name = "nix-gc-pin-recent";
@@ -87,7 +149,35 @@ in
 
     systemd.services.nix-gc = {
       preStart = "${lib.getExe pinRecent}";
-      postStop = "${pkgs.coreutils}/bin/rm -rf -- ${rootsDir}";
+      postStop = "${postStop}";
+      unitConfig.OnFailure = "nix-gc-failure-notify.service";
+    };
+
+    systemd.services.nix-gc-failure-notify = {
+      description = "Record and announce a failed scheduled Nix GC";
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = lib.getExe failureNotify;
+      };
+    };
+
+    # Toast: PathChanged fires on close-after-write or rename into place,
+    # once per recorded failure.
+    systemd.user.paths.nix-gc-failure-toast = {
+      wantedBy = [ "default.target" ];
+      pathConfig.PathChanged = record;
+    };
+    systemd.user.services.nix-gc-failure-toast = {
+      description = "Desktop notification: scheduled Nix GC failed";
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = pkgs.writeShellScript "nix-gc-failure-toast" ''
+          [ -e ${record} ] || exit 0
+          ${pkgs.libnotify}/bin/notify-send -u critical "nix-gc FAILED" \
+            "Scheduled Nix GC failed; no scheduled GC runs until fixed. Inspect: journalctl -u nix-gc.service -n 100" \
+            || echo "notify-send failed (no session bus?); ${record} still reaches Claude"
+        '';
+      };
     };
   };
 }
