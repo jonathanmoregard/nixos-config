@@ -460,6 +460,10 @@ let
       else
         echo "rsi-daily-review: no user bus; running without MemoryMax scope" >&2
       fi
+      # This run is a machine session. The sentinel tells session-reflect
+      # (~/.claude/skills/session-reflect/reflect.sh) not to mint a
+      # reflection of it — otherwise tomorrow's review reads tonight's.
+      export CLAUDE_PIPELINE_INTERNAL=1
       rc=0
       "''${scope[@]}" timeout "''${RSI_REVIEW_TIMEOUT:-3600}" \
         claude --model opus --print --allowedTools "Read Glob Grep" \
@@ -560,6 +564,10 @@ in
   home.file.".config/crontab".text = ''
     CRON_TZ=Europe/Stockholm
     PATH=${cronPath}
+    # Every job below is unattended: any `claude` it spawns is a machine
+    # session, which session-reflect skips instead of reflecting into the
+    # corpus the RSI review reads. Must stay above every job line.
+    CLAUDE_PIPELINE_INTERNAL=1
     0 9 * * 1 /home/jonathan/.claude/date-check.sh
     0 10 * * 1 /home/jonathan/.claude/scripts/update-submodules.sh >> /home/jonathan/.claude/logs/submodule-update.log 2>&1
     0 11 * * 1 /home/jonathan/Repos/dotfiles/backup-crontab.sh >> /home/jonathan/Repos/dotfiles/backup-crontab.log 2>&1

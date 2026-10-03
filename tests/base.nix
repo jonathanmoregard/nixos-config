@@ -746,6 +746,30 @@ in
     live_active_commands = [
         _cron_command(line) for line in live_crontab.splitlines()
     ]
+    # Every cron job is unattended, so any `claude` it spawns is a machine
+    # session that session-reflect must skip. The sentinel is a crontab
+    # environment line; cron applies one only to entries BELOW it, so it
+    # must precede every job, in the source and in the installed table.
+    import re as _re_cron
+    _re_env = _re_cron.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+    def _sentinel_covers_every_job(table):
+        covered = False
+        for line in table.splitlines():
+            s = line.strip()
+            if s == "CLAUDE_PIPELINE_INTERNAL=1":
+                covered = True
+            elif _cron_command(line) and not _re_env.match(s):
+                if not covered:
+                    return False
+        return covered
+    assert _sentinel_covers_every_job(crontab_src), (
+        "a cron job runs without CLAUDE_PIPELINE_INTERNAL=1:\n"
+        f"{crontab_src}"
+    )
+    assert _sentinel_covers_every_job(live_crontab), (
+        "installed crontab runs a job without CLAUDE_PIPELINE_INTERNAL=1:\n"
+        f"{live_crontab}"
+    )
     assert not any("mint-drift-agent.sh" in c for c in active_commands), (
         "obsolete Mint drift job must not remain scheduled:\n"
         f"{crontab_src}"
