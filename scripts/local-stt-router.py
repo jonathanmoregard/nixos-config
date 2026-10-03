@@ -28,6 +28,7 @@ import email.parser
 import email.policy
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -112,17 +113,49 @@ def route(audio, language, prompt):
     return text, "turbo (Swedish model unavailable)"
 
 
+def local_origin(origin):
+    """A caller that runs inside a browser on this machine.
+
+    Voquill's settings page tests a key from its webview (origin
+    tauri://localhost) with an Authorization header, so the browser asks with
+    OPTIONS first and reads nothing without a CORS grant. The grant covers
+    local origins only: a web page from elsewhere, open in some browser here,
+    gets none, so it cannot use the transcriber or learn it exists.
+    """
+    if origin == "tauri://localhost":
+        return True
+    return re.match(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$", origin) is not None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print("local-stt: " + fmt % args, file=sys.stderr, flush=True)
+
+    def cors_headers(self):
+        origin = self.headers.get("Origin", "")
+        if not local_origin(origin):
+            return
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Vary", "Origin")
 
     def reply(self, status, payload):
         data = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self.cors_headers()
         self.end_headers()
         self.wfile.write(data)
+
+    def do_OPTIONS(self):
+        # The browser's preflight: no body, the grant (or none) in the headers.
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.cors_headers()
+        self.end_headers()
 
     def do_GET(self):
         if self.path.rstrip("/") in ("/v1/models", "/models"):
