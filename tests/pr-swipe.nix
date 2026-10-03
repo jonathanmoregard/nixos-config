@@ -82,5 +82,14 @@ in
         dellan.succeed("test \"$(systemctl show -p User --value pr-swipe-gui.service)\" = prswipe")
         dellan.succeed("systemctl is-active pr-swipe-gui.service")
         dellan.fail("journalctl -u pr-swipe-gui.service | grep -q Traceback")
+
+    with subtest("the running GUI still reaches the executor after the executor restarts"):
+        # auto-deploy restarts the executor while the deck may be open
+        dellan.succeed("systemctl restart pr-swipe-executor.service")
+        dellan.wait_for_file("/run/pr-swipe/executor.sock")
+        out = dellan.succeed(
+            "nsenter -t $(systemctl show -p MainPID --value pr-swipe-gui.service) -m -- "
+            "runuser -u prswipe -- python3 ${send} '{\"action\": \"merge-now\"}'")
+        assert json.loads(out)["ok"] is False, out
   '';
 }
