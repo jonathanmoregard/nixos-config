@@ -55,12 +55,20 @@ in
         r = json.loads(out)
         assert r["ok"] is False and "error" in r, r
         dellan.succeed("test -s /run/credentials/pr-swipe-executor.service/merge-gate.pem")
+        # a well-formed approve for a head the verifier never recorded is answered and refused
+        # (offline VM: the App lookup fails, which must also come back as an answer, not a hang)
+        sha = "a" * 40
+        out = dellan.succeed("runuser -u prswipe -- python3 ${send} "
+                             f"'{{\"action\": \"approve\", \"repo\": \"o/r\", \"number\": 1, "
+                             f"\"head_sha\": \"{sha}\", \"card_sha256\": \"{'f' * 64}\", \"ts\": 1}}'")
+        assert json.loads(out)["ok"] is False, out
 
     with subtest("the user account cannot reach the executor or its key"):
         dellan.fail("runuser -u jonathan -- python3 ${send} '{}'")
         dellan.fail("runuser -u jonathan -- cat /run/credentials/pr-swipe-executor.service/merge-gate.pem")
         dellan.fail("runuser -u jonathan -- cat /etc/pr-swipe-test/key.pem")
         dellan.fail("runuser -u jonathan -- ls /var/lib/pr-swipe/state")
+        dellan.fail("runuser -u jonathan -- ls /var/lib/pr-swipe/git")
         dellan.fail("runuser -u jonathan -- systemctl stop pr-swipe-executor.service")
         dellan.succeed("systemctl is-active pr-swipe-executor.service")
 

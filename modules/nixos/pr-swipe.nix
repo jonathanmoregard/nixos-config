@@ -130,13 +130,16 @@ in
 
     # inbox:   collector (user) writes 0640 cards, gui reads via the group.
     # outbox:  gui writes 0660 requests, collector reads and deletes them.
-    # returns: executor → gui notes. state: executor + gui private state.
+    # returns: executor → gui notes. state: executor + gui private state (incl. the verifier's
+    # GitHub-sourced records). git: verifier mirrors; the deck renders diffs from these only.
     systemd.tmpfiles.rules = [
       "d ${root}         0755 root     root       -"
       "d ${root}/inbox   2750 ${cfg.user} prswipe-io -"
       "d ${root}/outbox  2770 prswipe  prswipe-io -"
       "d ${root}/returns 0750 prswipe  prswipe    -"
       "d ${root}/state   0700 prswipe  prswipe    -"
+      # verifier's bare mirrors: git objects fetched from GitHub by the executor, re-hashed on import
+      "d ${root}/git     0700 prswipe  prswipe    -"
     ];
 
     systemd.services.pr-swipe-executor = {
@@ -155,7 +158,7 @@ in
         LoadCredential = [ "merge-gate.pem:${keyFile}" ];
         RuntimeDirectory = "pr-swipe";
         RuntimeDirectoryMode = "0700";
-        ReadWritePaths = [ "${root}/state" "${root}/returns" ];
+        ReadWritePaths = [ "${root}/state" "${root}/returns" "${root}/git" ];
         RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
         Restart = "on-failure";
         RestartSec = 5;
