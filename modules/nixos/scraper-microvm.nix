@@ -33,6 +33,7 @@
 let
   # Captured here: inside the guest module below, `config` is the guest's.
   hostJonathanUid = config.users.users.jonathan.uid;
+  researchAgentReports = "/home/jonathan/Repos/research-agent/reports";
 in
 {
   # Per-boot bearer token. Random, never persisted across reboots. The
@@ -97,8 +98,13 @@ in
             # default is readOnly=false — the flag MUST be set
             # explicitly. (Verified via:
             # `nix eval .#nixosConfigurations.dellan.config.microvm.vms.scraper.config.config.microvm.shares`.)
-            source = "/home/jonathan/Repos/research-agent";
-            mountPoint = "/workspace";
+            # ONLY the scraper/ subdir: the repo root also holds reports/
+            # (every past report, prompts in the audit/failure logs), .git
+            # and .venv, and this VM runs attacker JS with open egress.
+            # Mounted at the same /workspace/scraper path, so ExecStart is
+            # unchanged. See the share assertion below.
+            source = "/home/jonathan/Repos/research-agent/scraper";
+            mountPoint = "/workspace/scraper";
             tag = "workspace";
             proto = "virtiofs";
             readOnly = true;
@@ -254,6 +260,18 @@ in
       # admitted by the guest firewall, or the forward dies the same
       # silent death. Fails the build, not the runtime.
       assertions = [{
+        # The scraper is the least-trusted VM: chromium runs attacker JS
+        # with open egress. It must not see the research-agent reports
+        # dir (every past report, prompts in the audit/failure logs) —
+        # i.e. no share may be that dir or any parent of it.
+        # Security review 2026-10-03, finding B1.
+        assertion = lib.all (s:
+          let src = lib.removeSuffix "/" s.source;
+          in !(lib.hasPrefix "${src}/" "${researchAgentReports}/")
+        ) config.microvm.shares;
+        message = "scraper microvm: a share exposes ${researchAgentReports} (or a parent) to chromium — share only the scraper/ subdir";
+      }
+      {
         assertion = lib.all (p:
           p.from or "host" != "host"
           || p.proto or "tcp" != "tcp"
