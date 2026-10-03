@@ -81,6 +81,20 @@ let
             print(json.dumps(json.load(r)))
     elif what == "nofile":
         print(json.dumps(call("", with_file=False)))
+    elif what in ("preflight", "models-headers"):
+        # A browser-side caller: status and response headers, keys lowercased.
+        origin = sys.argv[2]
+        if what == "preflight":
+            req = urllib.request.Request("http://127.0.0.1:18765/models", method="OPTIONS", headers={
+                "Origin": origin, "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization"})
+        else:
+            req = urllib.request.Request("http://127.0.0.1:18765/v1/models", headers={"Origin": origin})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                print(json.dumps([r.status, {k.lower(): v for k, v in r.headers.items()}]))
+        except urllib.error.HTTPError as e:
+            print(json.dumps([e.code, {k.lower(): v for k, v in e.headers.items()}]))
     else:
         audio, language, prompt = (sys.argv[1:] + ["", ""])[:3]
         print(json.dumps(call(audio, language or None, prompt or None)))
@@ -135,6 +149,23 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   # API surface.
   [ "$(ask models | jq -r '.data[0].id')" = local-stt ] || fail "model list"
   [ "$(ask nofile | jq -r '.[0]')" = 400 ] || fail "request without audio not refused"
+
+  # A caller inside a browser: Voquill's settings page tests a key from its
+  # webview (origin tauri://localhost) and sends an Authorization header, so
+  # the browser asks first with OPTIONS and reads nothing without a CORS
+  # grant. 2026-10-03 the router answered that OPTIONS with 501 and the
+  # settings page reported a connection error. The grant is for local
+  # origins only: a web page from elsewhere gets none.
+  hdr() { jq -r ".[1].\"$1\" // empty" <<< "$2"; }
+  res=$(ask preflight tauri://localhost)
+  [ "$(jq -r '.[0]' <<< "$res")" = 204 ] || fail "CORS preflight from Voquill's webview: $res"
+  [ "$(hdr access-control-allow-origin "$res")" = "tauri://localhost" ] || fail "preflight does not grant the webview origin: $res"
+  grep -qi 'authorization' <<< "$(hdr access-control-allow-headers "$res")" || fail "preflight does not allow the Authorization header: $res"
+  grep -q 'POST' <<< "$(hdr access-control-allow-methods "$res")" || fail "preflight does not allow POST: $res"
+  res=$(ask models-headers tauri://localhost)
+  [ "$(hdr access-control-allow-origin "$res")" = "tauri://localhost" ] || fail "model list carries no CORS grant for the webview: $res"
+  res=$(ask preflight https://example.com)
+  [ -z "$(hdr access-control-allow-origin "$res")" ] || fail "a foreign web page was granted cross-origin access: $res"
 
   # Swedish model down: Swedish audio still answered, by the general model.
   kill "$swedish"; wait "$swedish" 2>/dev/null || true
