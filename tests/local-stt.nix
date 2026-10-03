@@ -9,6 +9,12 @@
 #     model, with the caller's prompt passed on;
 #   - a caller that says the audio is Swedish goes straight to the Swedish
 #     model, and one that names another language is not re-routed;
+#   - a clip of at most LOCAL_STT_SHORT_SECONDS (14 by default) is answered by
+#     the short-window general model (a second turbo server with a 15-second
+#     encoder window: half the latency, same text); longer clips and audio of
+#     unknown length go to the full-window one, Swedish re-transcription always
+#     uses the full window, and with the short-window model down short clips
+#     fall back to the full-window one;
 #   - with the Swedish model down, Swedish audio still gets the general
 #     model's text; with the general model down, the caller gets a 502, not a
 #     hang or an empty 200;
@@ -33,7 +39,10 @@ let
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
-            audio = body.split(b"\r\n\r\n")[-1].split(b"\r\n--")[0].decode()
+            raw = body.split(b"\r\n\r\n")[-1].split(b"\r\n--")[0]
+            # The client sends a bare token or a WAV whose samples start with
+            # the token; the stub only needs the token.
+            audio = (raw[44:] if raw.startswith(b"RIFF") else raw).split(b"\0")[0].decode()
             asked = {"audio": audio, "prompt": b'name="prompt"' in body,
                      "language": body.split(b'name="language"\r\n\r\n')[1].split(b"\r\n")[0].decode()}
             with open(log, "a") as f:
@@ -56,7 +65,17 @@ let
   client = pkgs.writeText "local-stt-client.py" ''
     import json, sys, urllib.error, urllib.request, uuid
 
-    def call(audio, language=None, prompt=None, with_file=True):
+    def wav(token, seconds):
+        # 16 kHz mono 16-bit silence of the given length, the token in its first bytes.
+        size = int(seconds * 32000)
+        data = token.encode().ljust(size, b"\0")
+        header = (b"RIFF" + (36 + size).to_bytes(4, "little") + b"WAVEfmt " + (16).to_bytes(4, "little")
+                  + (1).to_bytes(2, "little") + (1).to_bytes(2, "little") + (16000).to_bytes(4, "little")
+                  + (32000).to_bytes(4, "little") + (2).to_bytes(2, "little") + (16).to_bytes(2, "little")
+                  + b"data" + size.to_bytes(4, "little"))
+        return header + data
+
+    def call(audio, language=None, prompt=None, with_file=True, seconds=None):
         b = uuid.uuid4().hex
         body = f'--{b}\r\nContent-Disposition: form-data; name="model"\r\n\r\nlocal-stt\r\n'.encode()
         if language:
@@ -65,7 +84,8 @@ let
             body += f'--{b}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n{prompt}\r\n'.encode()
         if with_file:
             body += (f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
-                     f'Content-Type: audio/wav\r\n\r\n{audio}\r\n').encode()
+                     f'Content-Type: audio/wav\r\n\r\n').encode()
+            body += (wav(audio, seconds) if seconds is not None else audio.encode()) + b'\r\n'
         body += f'--{b}--\r\n'.encode()
         req = urllib.request.Request("http://127.0.0.1:18765/v1/audio/transcriptions", data=body,
                                      headers={"Content-Type": f"multipart/form-data; boundary={b}"})
@@ -98,8 +118,9 @@ let
         except urllib.error.HTTPError as e:
             print(json.dumps([e.code, {k.lower(): v for k, v in e.headers.items()}]))
     else:
-        audio, language, prompt = (sys.argv[1:] + ["", ""])[:3]
-        print(json.dumps(call(audio, language or None, prompt or None)))
+        audio, language, prompt, seconds = (sys.argv[1:] + ["", "", ""])[:4]
+        print(json.dumps(call(audio, language or None, prompt or None,
+                              seconds=float(seconds) if seconds else None)))
   '';
 in
 pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]; } ''
@@ -107,6 +128,7 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   export LOCAL_STT_PORT=18765
   export LOCAL_STT_GENERAL=http://127.0.0.1:18763
   export LOCAL_STT_SWEDISH=http://127.0.0.1:18764
+  export LOCAL_STT_GENERAL_SHORT=http://127.0.0.1:18762
   log=$PWD/asked
   fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -123,9 +145,10 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
 
   general=$(start_stub 18763 general)
   swedish=$(start_stub 18764 swedish)
+  short=$(start_stub 18762 short)
   ${routerCommand} &
   router=$!
-  wait_port 18763; wait_port 18764; wait_port 18765
+  wait_port 18762; wait_port 18763; wait_port 18764; wait_port 18765
 
   # English: general model only, and the split word comes back whole.
   res=$(ask EN-hello)
@@ -147,6 +170,25 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   # Caller names another language: no re-routing even if detection would.
   res=$(ask SV-hej en)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "language=en re-routed: $res"
+
+  # Clip length picks the model: a short clip (most dictation) goes to the
+  # short-window turbo server, whose 15-second encoder window halves the
+  # latency without changing the text (2026-10-03: 12 real clips). A long
+  # clip or audio of unknown length goes to the full-window server, since a
+  # smaller window chunks long audio and wrecks the text; the same server
+  # cannot serve both, as switching its window costs seconds. Swedish
+  # re-transcription always uses the full window: Swedish accuracy first.
+  res=$(ask EN-hello "" "" 3)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "short heard it" ] || fail "a 3 s clip was not answered by the short-window model: $res"
+  res=$(ask EN-hello "" "" 20)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "a 20 s clip was not answered by the full-window model: $res"
+  res=$(ask EN-hello)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "audio of unknown length was not answered by the full-window model: $res"
+  before=$(asked_count general)
+  res=$(ask SV-hej "" "" 3)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "swedish heard it" ] || fail "short Swedish: $res"
+  [ "$(tail -1 "$log.short" | jq -r '.audio')" = SV-hej ] || fail "a short Swedish clip was not detected by the short-window model: $(tail -1 "$log.short")"
+  [ "$(asked_count general)" = "$before" ] || fail "a short Swedish clip also went through the full-window general model"
 
   # API surface.
   [ "$(ask models | jq -r '.data[0].id')" = local-stt ] || fail "model list"
@@ -181,6 +223,11 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   for h in $(tr ',' ' ' <<< "$sdk"); do
     grep -q "\(^\|,\)$h\(,\|$\)" <<< "$allowed" || fail "preflight does not allow the SDK's $h header (allowed: $allowed)"
   done
+
+  # Short-window model down: short clips still answered, by the full-window one.
+  kill "$short"; wait "$short" 2>/dev/null || true
+  res=$(ask EN-hello "" "" 3)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "short clip with the short-window model down: $res"
 
   # Swedish model down: Swedish audio still answered, by the general model.
   kill "$swedish"; wait "$swedish" 2>/dev/null || true
