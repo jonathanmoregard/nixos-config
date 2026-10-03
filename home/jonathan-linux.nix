@@ -346,9 +346,82 @@ let
         sys.exit(2)
   '';
 
+  # Deterministic inputs for the nightly review, computed here rather than
+  # asked of the model. The review runs with Read/Glob/Grep only, and
+  # Glob caps at 100 matches returned oldest-first: over a sessions dir of
+  # thousands it never reached the newest twelve, so every night spent
+  # turns improvising a different (and day-boundary-drifting) workaround
+  # for prompt.md Step 2. This prints a markdown block with
+  #   1. the Step 2 window: top-level <sessions>/<id>/final.json, mtime
+  #      within 24h, newest first, at most 12; oversize (>32 KiB) ones
+  #      listed as skipped instead;
+  #   2. the proposal inventory (path + status, every category, archived
+  #      and rejected included) so dedup is a comparison, not a sweep.
+  # Exit 3 = nothing in the window: the wrapper skips the model call.
+  # Manifest eligibility (sessionend complete) stays with the model per
+  # prompt.md Step 2.
+  rsiReviewInputs = pkgs.writeShellApplication {
+    name = "rsi-review-inputs";
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.gawk ];
+    text = ''
+      sessions="''${1:?usage: rsi-review-inputs <sessions-dir> <proposals-root>}"
+      proposals="''${2:?usage: rsi-review-inputs <sessions-dir> <proposals-root>}"
+      max_bytes=32768
+      # awk 'NR<=12' rather than head: head closing the pipe early would
+      # SIGPIPE sort, which pipefail turns into a failed run.
+      mapfile -t newest < <(
+        find -H "$sessions" -mindepth 2 -maxdepth 2 -type f -name final.json \
+          -mmin -1440 -printf '%T@\t%s\t%p\n' 2>/dev/null \
+          | sort -t "$(printf '\t')" -k1,1 -rn | awk 'NR<=12'
+      )
+      window=()
+      skipped=()
+      for row in "''${newest[@]}"; do
+        IFS=$'\t' read -r mtime size path <<<"$row"
+        stamp="$(date -d "@''${mtime%.*}" -Is)"
+        if [ "$size" -gt "$max_bytes" ]; then
+          skipped+=("- \`$path\` (''${size} B, over 32 KiB — do not open)")
+        else
+          window+=("- \`$path\` (modified $stamp)")
+        fi
+      done
+      if [ "''${#window[@]}" -eq 0 ]; then
+        echo "rsi-review-inputs: no readable reflections modified in the last 24h under $sessions" >&2
+        exit 3
+      fi
+      echo "## Precomputed inputs (appended by the rsi-daily-review wrapper)"
+      echo
+      echo "### Step 2 window"
+      echo
+      echo "The wrapper has already selected Step 2's candidates (top-level final.json, modified in the last 24h, newest first, at most 12). Use exactly this list: do not glob, grep or otherwise search for reflections. Apply Step 2's manifest checks to each entry."
+      echo
+      printf '%s\n' "''${window[@]}"
+      if [ "''${#skipped[@]}" -gt 0 ]; then
+        echo
+        echo "Skipped for size — report these in your final summary, never open them:"
+        echo
+        printf '%s\n' "''${skipped[@]}"
+      fi
+      echo
+      echo "### Existing proposal inventory"
+      echo
+      echo "Every proposal file under $proposals, with its status. Compare each candidate finding against these slugs first; read only the bodies that plausibly match, then apply Step 1 item 7's concrete-term search. Rejected entries are decisions and must not be regenerated."
+      echo
+      if [ -d "$proposals" ]; then
+        find -H "$proposals" -type f -name '*.md' -printf '%P\n' | LC_ALL=C sort \
+          | while IFS= read -r rel; do
+              status="$(awk 'NR==1 && $0!="---" {exit} NR>1 && $0=="---" {exit} /^status:/ {sub(/^status:[ \t]*/, ""); print; exit}' "$proposals/$rel")"
+              echo "- $rel — status: ''${status:-unknown}"
+            done
+      else
+        echo "(no proposal sink at $proposals yet)"
+      fi
+    '';
+  };
+
   rsiDailyReview = pkgs.writeShellApplication {
     name = "rsi-daily-review";
-    runtimeInputs = [ rsiProposalSink pkgs.coreutils pkgs.jq ];
+    runtimeInputs = [ rsiProposalSink rsiReviewInputs pkgs.coreutils pkgs.jq pkgs.util-linux ];
     text = ''
       prompt_file="$HOME/.claude/recursive-self-improvement/config/prompt.md"
       # Proposals land in the state-dir sink, NOT in ~/.claude. ~/.claude
@@ -401,11 +474,6 @@ let
         echo "rsi-daily-review: prompt file missing/unreadable: $prompt_file" >&2
         exit 1
       fi
-      psize="$(stat -c%s "$prompt_file")"
-      if [ "$psize" -gt 102400 ]; then
-        echo "rsi-daily-review: $prompt_file is ''${psize}B (>100KiB cap); refusing (ARG_MAX)" >&2
-        exit 1
-      fi
       # Create the sink up front, before the hour-long model call rather
       # than after it: on a fresh machine the state dir does not exist,
       # and discovering that at the sink step would throw away the run.
@@ -429,7 +497,8 @@ let
       tmpdir="/tmp"
       [ -d "$XDG_RUNTIME_DIR" ] && tmpdir="$XDG_RUNTIME_DIR"
       raw="$(mktemp -p "$tmpdir" rsi-daily-review.XXXXXX)"
-      trap 'rm -f "$raw"' EXIT
+      prompt_tmp="$(mktemp -p "$tmpdir" rsi-daily-review-prompt.XXXXXX)"
+      trap 'rm -f "$raw" "$prompt_tmp"' EXIT
       override="
 
       ## Headless run override (appended by the rsi-daily-review wrapper)
@@ -448,6 +517,47 @@ let
       entirely: a trusted wrapper persists these blocks to the
       proposals directory, and pushing happens behind the proposals
       intake gate."
+      # Window + inventory, selected deterministically (see rsiReviewInputs).
+      # An empty window means there is nothing to review: skip the model
+      # call rather than pay for a pass that can only search in vain.
+      inputs_rc=0
+      inputs="$(rsi-review-inputs "$HOME/.claude/reflections/sessions" \
+        "$(dirname "$dest")")" || inputs_rc=$?
+      if [ "$inputs_rc" -eq 3 ]; then
+        echo "rsi-daily-review: no reflections in the 24h window — skipping (no model call)"
+        exit 0
+      elif [ "$inputs_rc" -ne 0 ]; then
+        echo "rsi-daily-review: rsi-review-inputs failed rc=$inputs_rc" >&2
+        exit "$inputs_rc"
+      fi
+      # Logged so each night's window is auditable next to the run.
+      printf '%s\n' "$inputs" | grep '/final.json' || true
+      override="$override
+
+      $inputs"
+      # The prompt goes to claude on STDIN, not as an argv string. The
+      # kernel caps one argv string at 128 KiB (MAX_ARG_STRLEN), and the
+      # inventory above grows ~100 B per proposal: as an argument the run
+      # would die with E2BIG ("Argument list too long") once the sink got
+      # big enough. `claude --print` with no prompt argument reads the
+      # prompt from stdin. printf '%s' keeps the bytes identical to what
+      # the old `-p "$(cat ...)$override"` passed (the command
+      # substitution still strips prompt.md's trailing newlines).
+      printf '%s' "$(cat "$prompt_file")$override" > "$prompt_tmp"
+      # Size guard. Stdin has no 128 KiB cap, but a prompt this large
+      # means something is wrong (a runaway inventory or prompt.md) and
+      # would burn an Opus context on it. Fail loudly instead: stderr
+      # lands in review-agent.log, logger puts it in the journal, and the
+      # non-zero exit is the cron entry's failure signal. Today's prompt
+      # is ~23 KB; 256 KiB leaves room for ~2,000 more proposals.
+      prompt_max=262144
+      prompt_bytes="$(stat -c%s "$prompt_tmp")"
+      if [ "$prompt_bytes" -gt "$prompt_max" ]; then
+        msg="rsi-daily-review: composed prompt is ''${prompt_bytes} B (> ''${prompt_max} B cap); refusing to run the model. Check prompt.md size and the proposal inventory under $(dirname "$dest")"
+        echo "$msg" >&2
+        logger -p user.err -t rsi-daily-review "$msg" || true
+        exit 1
+      fi
       echo "rsi-daily-review: start $(date -Is)"
       # Memory-bound the model call when the user bus is reachable (same
       # per-call cgroup pattern research-agent uses, commit 48447eb
@@ -460,10 +570,14 @@ let
       else
         echo "rsi-daily-review: no user bus; running without MemoryMax scope" >&2
       fi
+      # This run is a machine session. The sentinel tells session-reflect
+      # (~/.claude/skills/session-reflect/reflect.sh) not to mint a
+      # reflection of it — otherwise tomorrow's review reads tonight's.
+      export CLAUDE_PIPELINE_INTERNAL=1
       rc=0
       "''${scope[@]}" timeout "''${RSI_REVIEW_TIMEOUT:-3600}" \
         claude --model opus --print --allowedTools "Read Glob Grep" \
-        -p "$(cat "$prompt_file")$override" > "$raw" || rc=$?
+        -p < "$prompt_tmp" > "$raw" || rc=$?
       if [ "$rc" -eq 124 ]; then
         echo "rsi-daily-review: claude timed out after ''${RSI_REVIEW_TIMEOUT:-3600}s" >&2
         exit "$rc"
@@ -522,6 +636,7 @@ in
     ./nixos-config-fetch.nix
     ./sota-watch.nix
     ./ai-router.nix
+    ./session-reflect-backfill.nix
     ./worktree-sweep.nix
     ./router-services.nix
     ./claude-services.nix
@@ -544,6 +659,12 @@ in
   # reach interactive shells (which is where prose-decorate runs).
   home.sessionVariables.GEMINI_API_KEY_FILE = "/run/agenix/gemini-api-key";
 
+  # Offline prompt-injection classifier behind ~/.claude's scan_content.py
+  # (permission-ledger injection pass, RSI research cron). Without it those
+  # passes report "unavailable" and emit samples unscanned.
+  # See overlays/prompt-injection-scan.nix.
+  home.packages = [ pkgs.prompt-injection-scan ];
+
   # User crontab — declarative source of truth. Re-applied on every rebuild
   # (overwrites any ad-hoc `crontab -e` edits).
   # Several cron entries redirect into ~/.claude/logs/ before their
@@ -560,6 +681,10 @@ in
   home.file.".config/crontab".text = ''
     CRON_TZ=Europe/Stockholm
     PATH=${cronPath}
+    # Every job below is unattended: any `claude` it spawns is a machine
+    # session, which session-reflect skips instead of reflecting into the
+    # corpus the RSI review reads. Must stay above every job line.
+    CLAUDE_PIPELINE_INTERNAL=1
     0 9 * * 1 /home/jonathan/.claude/date-check.sh
     0 10 * * 1 /home/jonathan/.claude/scripts/update-submodules.sh >> /home/jonathan/.claude/logs/submodule-update.log 2>&1
     0 11 * * 1 /home/jonathan/Repos/dotfiles/backup-crontab.sh >> /home/jonathan/Repos/dotfiles/backup-crontab.log 2>&1

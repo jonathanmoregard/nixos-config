@@ -69,15 +69,50 @@ let
           | sort -z > "$scratch/local-bin-entries"
         while IFS= read -r -d $'\0' entry; do
           resolved=$(readlink -f "$entry" 2>/dev/null || printf '%s' "$entry")
+          name=''${entry#"$local_bin"/}
           case "$resolved" in
             /nix/store/*) ;;
-            *) printf '%s\n' "''${entry#"$local_bin"/}" >> "$scratch/local-bin" ;;
+            # Claude Code's self-updating native installer is the binary
+            # in use by design (home/claude-egress-slice.nix). Exempt only
+            # that exact shape, so a hand-copied `claude` still reports.
+            "$HOME"/.local/share/claude/versions/*)
+              [ "$name" = claude ] \
+                || printf '%s\n' "$name" >> "$scratch/local-bin" ;;
+            *) printf '%s\n' "$name" >> "$scratch/local-bin" ;;
           esac
         done < "$scratch/local-bin-entries"
         if [ -s "$scratch/local-bin" ]; then
           add_finding \
             "Entries outside /nix/store in ~/.local/bin" \
             "$(cat "$scratch/local-bin")"
+        fi
+      fi
+
+      # Home-manager writes every user unit, drop-in and *.wants entry as
+      # a symlink pointing straight into /nix/store. Anything else here
+      # was put there imperatively: a hand-authored unit file (lost on a
+      # fresh install, 2026-08-08 claude-idle-handoff), a
+      # `systemctl --user enable` link (targets the ~/.config path, not
+      # the store), or a `systemctl --user edit` override file. The
+      # immediate link target is checked, not the resolved one, because
+      # an imperative enable of a declared unit resolves into the store
+      # through the unit's own HM link.
+      user_units="''${NIXOS_DRIFT_SYSTEMD_USER_DIR:-$HOME/.config/systemd/user}"
+      if [ -d "$user_units" ]; then
+        : > "$scratch/user-units"
+        find "$user_units" -mindepth 1 ! -type d -print0 \
+          | sort -z > "$scratch/user-unit-entries"
+        while IFS= read -r -d $'\0' entry; do
+          target=$(readlink "$entry" 2>/dev/null || true)
+          case "$target" in
+            /nix/store/*) ;;
+            *) printf '%s\n' "''${entry#"$user_units"/}" >> "$scratch/user-units" ;;
+          esac
+        done < "$scratch/user-unit-entries"
+        if [ -s "$scratch/user-units" ]; then
+          add_finding \
+            "Unmanaged entries in ~/.config/systemd/user" \
+            "$(cat "$scratch/user-units")"
         fi
       fi
 
