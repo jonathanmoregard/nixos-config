@@ -1197,6 +1197,83 @@ in
         f"nothing may be written on the duplicate night:\n{night2}"
     )
 
+    # The review's window is selected by the WRAPPER, not the model. The
+    # model runs with Read/Glob/Grep only; Glob caps at 100 matches and
+    # returns them oldest-first, so over a corpus of thousands of
+    # sessions it never saw the newest twelve and each night improvised a
+    # different workaround. The helper below is what the wrapper runs;
+    # exercise the real binary against a fixture corpus.
+    inputs_bin = dellan.succeed(
+        "grep -o '/nix/store/[^:\"]*rsi-review-inputs[^:\"]*/bin' "
+        f"{rsi_bin} | head -1"
+    ).strip() + "/rsi-review-inputs"
+    fx = dellan.succeed("mktemp -d").strip()
+    sess = f"{fx}/sessions"
+    # 14 fresh sessions, s00 newest; one stale; one subagent artifact
+    # (newest of all, must still be excluded); one oversize among the
+    # newest twelve.
+    fixture = [f"mkdir -p {sess}"]
+    for i in range(14):
+        fixture.append(
+            f"mkdir -p {sess}/s{i:02d} && echo '{{}}' > {sess}/s{i:02d}/final.json"
+            f" && touch -d '-{i + 1} minutes' {sess}/s{i:02d}/final.json"
+        )
+    fixture += [
+        f"mkdir -p {sess}/old && echo '{{}}' > {sess}/old/final.json"
+        f" && touch -d '-2 days' {sess}/old/final.json",
+        f"mkdir -p {sess}/s00/subagents/a1"
+        f" && echo '{{}}' > {sess}/s00/subagents/a1/final.json",
+        f"head -c 40000 /dev/zero > {sess}/s03/final.json"
+        f" && touch -d '-4 minutes' {sess}/s03/final.json",
+        f"mkdir -p {fx}/proposals/rsi {fx}/proposals/permissions/archived",
+        f"printf -- '---\\nstatus: rejected\\n---\\nbody\\n'"
+        f" > {fx}/proposals/rsi/2026-09-01-probe-rejected.md",
+        f"printf -- '---\\nstatus: pending\\n---\\nbody\\n'"
+        f" > {fx}/proposals/permissions/archived/2026-09-02-probe-pending.md",
+    ]
+    dellan.succeed(" && ".join(fixture))
+    block = dellan.succeed(f"{inputs_bin} {sess} {fx}/proposals")
+    window = [
+        l.split("`")[1] for l in block.splitlines()
+        if l.startswith("- `") and "/final.json" in l and "B, over" not in l
+    ]
+    expected = [f"{sess}/s{i:02d}/final.json" for i in range(12) if i != 3]
+    assert window == expected, (
+        "the window must be the twelve newest top-level final.json files "
+        "modified in the last 24h, newest first, oversize ones moved to the "
+        f"skipped list:\nexpected {expected}\ngot {window}\n{block}"
+    )
+    assert f"{sess}/s03/final.json" in block and "over 32 KiB" in block, (
+        f"an oversize candidate must be reported as skipped:\n{block}"
+    )
+    for leak in ["subagents", f"{sess}/old/", f"{sess}/s12/"]:
+        assert leak not in block, f"{leak} must not reach the window:\n{block}"
+    for entry in [
+        "rsi/2026-09-01-probe-rejected.md — status: rejected",
+        "permissions/archived/2026-09-02-probe-pending.md — status: pending",
+    ]:
+        assert entry in block, (
+            "the proposal inventory must list every proposal, archived and "
+            f"rejected included, with its status ({entry}):\n{block}"
+        )
+    # A symlinked sessions dir or proposals root (the compat-symlink
+    # pattern this config already uses for proposals) must yield the
+    # same window and inventory, not a silent "nothing to review" skip.
+    dellan.succeed(f"ln -s {sess} {fx}/sess-link && ln -s {fx}/proposals {fx}/prop-link")
+    linked = dellan.succeed(f"{inputs_bin} {fx}/sess-link {fx}/prop-link")
+    linked_window = [
+        l.split("`")[1].replace(f"{fx}/sess-link", sess) for l in linked.splitlines()
+        if l.startswith("- `") and "/final.json" in l and "B, over" not in l
+    ]
+    assert linked_window == expected, (
+        f"a symlinked sessions dir must select the same window:\n{linked}"
+    )
+    assert "rsi/2026-09-01-probe-rejected.md — status: rejected" in linked, (
+        f"a symlinked proposals root must still be inventoried:\n{linked}"
+    )
+    empty_sess = dellan.succeed("mktemp -d").strip()
+    dellan.fail(f"{inputs_bin} {empty_sess} {fx}/proposals")
+
     def run_rsi(expect_ok=True):
         cmd = f"su - jonathan -c {rsi_bin} 2>&1"
         return dellan.succeed(cmd) if expect_ok else dellan.fail(cmd)
@@ -1262,6 +1339,78 @@ in
     )
     assert "rsi-daily-review:" in on, (
         f"daily_review=true must reach the wrapper's own preflight:\n{on}"
+    )
+
+    # The composed prompt (prompt.md + window + proposal inventory) grows
+    # ~100 B per proposal. Passed as one argv string it hits the kernel's
+    # 128 KiB MAX_ARG_STRLEN and the run dies with E2BIG once the sink is
+    # big enough. Drive the real wrapper end to end with `claude` stubbed
+    # on PATH: an inventory pushing the prompt past 128 KiB must still
+    # reach the model intact, and a runaway one must be refused loudly
+    # (journal + non-zero exit) without a model call.
+    stub = dellan.succeed("mktemp -d").strip()
+    dellan.succeed(
+        f"cat > {stub}/claude <<'STUB_EOF'\n"
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$@\" > {stub}/argv\n"
+        f"cat > {stub}/stdin\n"
+        "STUB_EOF\n"
+        f"chmod 755 {stub}/claude && chmod 777 {stub}"
+    )
+    probe_sess = "/home/jonathan/.claude/reflections/sessions/e2big-probe"
+    probe_prop = "/home/jonathan/.local/state/claude-proposals/rsi-e2big-probe"
+    dellan.succeed(
+        f"mkdir -p {probe_sess} {probe_prop}"
+        f" && echo '{{}}' > {probe_sess}/final.json"
+        f" && printf 'PROMPT-MD-MARKER\\n\\n' > {rsi_cfg_dir}/prompt.md"
+        " && chown -R jonathan:users /home/jonathan/.claude"
+        " /home/jonathan/.local/state"
+    )
+
+    def fill_inventory(n):
+        dellan.succeed(
+            f"rm -f {probe_prop}/*.md; for i in $(seq 1 {n}); do"
+            f" printf -- '---\\nstatus: pending\\n---\\n' > "
+            f"{probe_prop}/2026-10-02-synthetic-proposal-with-a-realistic-slug-length-$i.md;"
+            f" done; chown -R jonathan:users {probe_prop}"
+        )
+
+    def run_stubbed():
+        dellan.succeed(f"rm -f {stub}/argv {stub}/stdin")
+        return dellan.execute(
+            f"su - jonathan -c 'PATH={stub}:$PATH {rsi_bin}' 2>&1"
+        )
+
+    fill_inventory(1400)
+    rc_big, out_big = run_stubbed()
+    assert rc_big == 0, f"a >128 KiB prompt must still run (rc={rc_big}):\n{out_big}"
+    fed = dellan.succeed(f"cat {stub}/stdin")
+    assert len(fed.encode()) > 131072, (
+        f"fixture must push the prompt past MAX_ARG_STRLEN, got {len(fed.encode())} B"
+    )
+    assert fed.startswith("PROMPT-MD-MARKER") and f"{probe_sess}/final.json" in fed, (
+        "the model must receive prompt.md plus the precomputed window"
+    )
+    assert "synthetic-proposal-with-a-realistic-slug-length-1400.md" in fed, (
+        "the whole inventory must reach the model, not a truncation"
+    )
+    argv_big = dellan.succeed(f"cat {stub}/argv")
+    assert "PROMPT-MD-MARKER" not in argv_big and len(argv_big) < 4096, (
+        f"the prompt must not travel in argv:\n{argv_big[:2000]}"
+    )
+
+    fill_inventory(3000)
+    rc_huge, out_huge = run_stubbed()
+    assert rc_huge != 0, f"a runaway prompt must fail the run:\n{out_huge}"
+    assert "composed prompt is" in out_huge, (
+        f"the size guard must say why it refused:\n{out_huge}"
+    )
+    dellan.fail(f"test -e {stub}/argv")
+    dellan.succeed(
+        "journalctl -t rsi-daily-review --no-pager | grep -q 'composed prompt is'"
+    )
+    dellan.succeed(
+        f"rm -rf {probe_sess} {probe_prop} {stub} {rsi_cfg_dir}/prompt.md"
     )
     dellan.succeed(f"rm -f {rsi_cfg_dir}/config.json")
     # Guard against reintroducing the dead-grant pattern: path-scoped
