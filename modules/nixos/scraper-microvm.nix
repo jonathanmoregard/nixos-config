@@ -33,7 +33,14 @@
 let
   # Captured here: inside the guest module below, `config` is the guest's.
   hostJonathanUid = config.users.users.jonathan.uid;
-  researchAgentReports = "/home/jonathan/Repos/research-agent/reports";
+  # The ONLY host paths the chromium VM may see. Exact-match allowlist: a
+  # lexical "not a parent of reports/" check was bypassable with
+  # `scraper/..`, symlinks or doubled separators (refuter, 2026-10-03).
+  scraperApprovedShares = [
+    "/home/jonathan/Repos/research-agent/scraper"
+    "/var/lib/scraper-bearer"
+    "/var/lib/scraper/vm-ssh"
+  ];
 in
 {
   # Per-boot bearer token. Random, never persisted across reboots. The
@@ -262,14 +269,11 @@ in
       assertions = [{
         # The scraper is the least-trusted VM: chromium runs attacker JS
         # with open egress. It must not see the research-agent reports
-        # dir (every past report, prompts in the audit/failure logs) —
-        # i.e. no share may be that dir or any parent of it.
+        # dir (every past report, prompts in the audit/failure logs), so
+        # every share must be an exactly-approved path.
         # Security review 2026-10-03, finding B1.
-        assertion = lib.all (s:
-          let src = lib.removeSuffix "/" s.source;
-          in !(lib.hasPrefix "${src}/" "${researchAgentReports}/")
-        ) config.microvm.shares;
-        message = "scraper microvm: a share exposes ${researchAgentReports} (or a parent) to chromium — share only the scraper/ subdir";
+        assertion = lib.all (s: builtins.elem s.source scraperApprovedShares) config.microvm.shares;
+        message = "scraper microvm: share source not in scraperApprovedShares — chromium must not see the research-agent repo root or reports/ (approved: ${lib.concatStringsSep ", " scraperApprovedShares})";
       }
       {
         assertion = lib.all (p:
