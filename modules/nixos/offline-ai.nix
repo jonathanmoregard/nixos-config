@@ -222,10 +222,30 @@ let
       exec python3 ${../../scripts/offline-ai.py} "$@"
     '';
   };
+
+  # Weekly smoke test: loads the model through the CLI above, asks one question,
+  # records the verdict, shouts only on failure. Runs from a user timer; see
+  # docs/superpowers/specs/2026-10-03-offline-ai-smoke-design.md. Everything it
+  # calls is found on PATH so tests/offline-ai-smoke.nix can stand in fakes.
+  smoke = pkgs.writeShellApplication {
+    name = "offline-ai-smoke";
+    runtimeInputs = [
+      pkgs.python3
+      pkgs.coreutils
+      pkgs.xprintidle
+      pkgs.libnotify
+      offlineAi
+      config.services.buildCoordination.runnerPackage
+    ];
+    text = ''
+      exec python3 ${../../scripts/offline-ai-smoke.py} "$@"
+    '';
+  };
 in
 {
   environment.systemPackages = [ offlineAi libraryFetch ];
   system.build.offline-ai = offlineAi;
+  system.build.offline-ai-smoke = smoke;
   system.build.offline-ai-library-serve = libraryServe;
   system.build.offline-ai-library-fetch = libraryFetch;
 
