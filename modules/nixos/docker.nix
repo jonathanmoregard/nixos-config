@@ -8,5 +8,9 @@
 # See: https://github.com/astro/microvm.nix
 {
   virtualisation.docker.enable = true;
-  users.users.jonathan.extraGroups = [ "wheel" "networkmanager" "docker" ];
+  # jonathan is deliberately NOT in the `docker` group: membership is
+  # password-less root (mount / into a container), and jonathan is the uid
+  # agents run as, so it would undo every root-only secret and the pr-swipe
+  # uid split. Use `sudo docker …` for the rare interactive need.
+  # (wheel / networkmanager come from profiles/base.nix.)
 }
