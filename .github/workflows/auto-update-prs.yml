@@ -83,6 +83,10 @@ jobs:
         with:
           app-id: ${{ secrets.AUTO_UPDATE_APP_ID }}
           private-key: ${{ secrets.AUTO_UPDATE_APP_PRIVATE_KEY }}
+          # Ask for exactly what update-branch uses instead of every
+          # permission the App installation holds.
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Update one behind, green auto-merge PR
         env:

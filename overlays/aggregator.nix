@@ -90,7 +90,7 @@
 #
 # Cost: the unpacked model is ~445 MiB, which lands in dellan's system
 # closure and in CI's store snapshot. It also exceeds the cachix
-# post-build-hook's 256 MiB push budget (see tests/cachix-push-filter.nix),
+# deployed-closure push's 256 MiB budget (see tests/cachix-push-filter.nix),
 # so it is fetched from GitHub rather than substituted on a cold builder.
 #
 # ── Bumping the aggregator ──

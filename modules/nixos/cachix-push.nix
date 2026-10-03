@@ -1,30 +1,34 @@
-# Auto-push every successful local build to the jonathanmoregard
-# cachix cache via nix.settings.post-build-hook.
+# Push the DEPLOYED system closure to the public jonathanmoregard cachix
+# cache after nixos-deploy switched to a new main commit.
 #
-# Why: when I `nix build .#nixosConfigurations.dellan...toplevel` or
-# `nix build .#checks.x86_64-linux.vm-base` on dellan, the resulting
-# store paths only live in dellan's local /nix/store. CI on GHA then
-# rebuilds the same closures cold because cachix has never seen them.
-# With this hook, every successful local build pushes to cachix → the
-# next CI run on the same closure substitutes from cache instead.
+# Why only the deployed closure: this used to be a global
+# nix.settings.post-build-hook that pushed EVERY successful local build.
+# The cache is publicly readable, so any local `nix build` of a private
+# flake (Klaffat) published its outputs to the world — 31 Klaffat store
+# paths were found in the public cache (security review 2026-10-03).
+# A deployed system is built only from this public repo and its public
+# flake inputs, so it is the one local build that is safe to publish.
 #
-# Test runs (`vm-test-run-vm-*` derivations) push too — they're
-# content-addressed store paths like any other; cachix dedupes by hash.
+# What it is for: nixos-deploy fires on the merge webhook, minutes before
+# CI's push:main run has built and pushed the same toplevel. Whatever the
+# first host built locally lands in the cache for the second host. CI
+# (push:main only) remains the primary cache writer.
 #
-# Resilience contract (the hook is opportunistic, NOT load-bearing):
-#   - The hook ALWAYS exits 0. A `cachix push` failure must NEVER fail
-#     a build — the build artifact is fine on local /nix/store, the
-#     remote cache miss is a separate problem.
+# Cost, stated: ad-hoc local builds (VM gates, feature-vm, test lanes)
+# no longer warm the cache for CI.
+#
+# Trigger: a path unit on /var/lib/nixos-deploy/notify-success, which
+# nixos-deploy touches only after a successful switch (never on no-op or
+# deferred ticks) — so a push runs once per real deploy, not hourly.
+#
+# Resilience contract (the push is opportunistic, NOT load-bearing):
+#   - The script ALWAYS exits 0; a push failure is logged and dropped.
 #   - Each push is wrapped in `timeout` so a stalled upload (cachix.org
-#     hiccup, slow network, server-side rate limit) can't hang the
-#     whole rebuild. SIGKILL after the timeout; log and move on.
+#     hiccup, slow network, server-side rate limit) can't run unbounded.
 #   - Paths that can't realistically finish inside the timeout are
 #     skipped up front (push-budget filter: *-microvm-store-disk.erofs
-#     by name, plus anything over maxPathBytes) — otherwise EVERY
-#     referencing derivation re-attempts the same doomed upload.
-#   - Failures + timeouts go to the journal (stderr is captured by
-#     systemd-journald via the nix-daemon service), so they're
-#     diagnosable but invisible to interactive build sessions.
+#     by name, plus anything over maxPathBytes).
+#   - Failures + timeouts go to the journal of cachix-push-deployed.service.
 #
 # Contract enforced by checks.cachix-push-filter
 # (tests/cachix-push-filter.nix), a runtime-invocation harness over the
@@ -59,11 +63,11 @@ let
   # opportunistic; CI rebuilds whatever the cache misses.
   maxPathBytes = 256 * 1024 * 1024;
 
-  # Nix daemon invokes this after every successful local build.
-  # OUT_PATHS is space-separated store paths; `cachix push` accepts
-  # multiple paths in one invocation. We DELIBERATELY DO NOT use
-  # `set -e`: any subcommand failure must be swallowed locally so
-  # the script returns 0 to nix-daemon.
+  # OUT_PATHS is space-separated store paths (here: the deployed
+  # toplevel; `cachix push` uploads its closure minus what the caches
+  # already hold). We DELIBERATELY DO NOT use `set -e`: any subcommand
+  # failure must be swallowed so a push problem never reads as a
+  # failed deploy.
   #
   # The script body lives in ./cachix-push-hook.nix, parameterized so
   # the runtime-invocation check (nix build
@@ -77,9 +81,37 @@ let
     duBin = "${pkgs.coreutils}/bin/du";
     cutBin = "${pkgs.coreutils}/bin/cut";
   });
+
+  pushDeployed = pkgs.writeShellScript "cachix-push-deployed" ''
+    OUT_PATHS="$(${pkgs.coreutils}/bin/readlink -f /run/current-system)" || OUT_PATHS=""
+    export OUT_PATHS
+    exec ${pushHook}
+  '';
 in
 {
   age.secrets.cachix-auth-token.rekeyFile = ../../secrets/cachix-auth-token.age;
 
-  nix.settings.post-build-hook = "${pushHook}";
+  # Exact deployed script bytes, smoked by checks.cachix-push-filter.
+  system.build.cachixPushHook = pushHook;
+
+  # Deliberately NO nix.settings.post-build-hook: see the header.
+
+  systemd.services.cachix-push-deployed = {
+    description = "Push the deployed system closure to cachix";
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${pushDeployed}";
+      Nice = 19;
+      IOSchedulingClass = "idle";
+      # The script's own timeout caps the push at pushTimeoutSeconds.
+      TimeoutStartSec = "${toString (pushTimeoutSeconds + 120)}s";
+    };
+  };
+
+  systemd.paths.cachix-push-deployed = {
+    wantedBy = [ "multi-user.target" ];
+    pathConfig.PathChanged = "/var/lib/nixos-deploy/notify-success";
+  };
 }

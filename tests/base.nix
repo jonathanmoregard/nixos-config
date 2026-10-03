@@ -539,6 +539,40 @@ in
     dellan.wait_until_succeeds("test -s /tmp/waiter-crossed")
     dellan.wait_until_succeeds(f"test ! -e /proc/{waiter}")
 
+    # The lock lives in jonathan's directory, which root's deploy opens.
+    # A symlink jonathan plants there must not turn root's open into a
+    # truncation of the link target (root-owned canary stays intact).
+    dellan.succeed("echo root-canary > /root/memory-lock-canary")
+    dellan.succeed(
+        "su - jonathan -c 'mv /home/jonathan/.nix-memory-pressure/lock "
+        "/home/jonathan/.nix-memory-pressure/lock.real && "
+        "ln -s /root/memory-lock-canary /home/jonathan/.nix-memory-pressure/lock'"
+    )
+    dellan.succeed("nix-memory-run --nonblock -- true")
+    canary = dellan.succeed("cat /root/memory-lock-canary").strip()
+    assert canary == "root-canary", (
+        f"root's lock open truncated the symlink target: {canary!r}"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'rm /home/jonathan/.nix-memory-pressure/lock && "
+        "mv /home/jonathan/.nix-memory-pressure/lock.real "
+        "/home/jonathan/.nix-memory-pressure/lock'"
+    )
+
+    # Cache push: no global post-build-hook (local builds of private flakes
+    # must not reach the public cache); a successful deploy's success flag
+    # triggers the deployed-closure push, which is opportunistic: with no
+    # token (the VM has no agenix key) it must finish successfully.
+    hook = dellan.succeed("nix config show post-build-hook").strip()
+    assert hook == "", f"a global post-build-hook is set: {hook!r}"
+    dellan.succeed("mkdir -p /var/lib/nixos-deploy && touch /var/lib/nixos-deploy/notify-success")
+    dellan.wait_until_succeeds(
+        "systemctl show cachix-push-deployed -p ExecMainExitTimestampMonotonic --value | grep -qv '^0$'",
+        timeout=60,
+    )
+    result = dellan.succeed("systemctl show cachix-push-deployed -p Result --value").strip()
+    assert result == "success", f"deployed-closure push unit: {result}"
+
     # Run one real derivation through the production wrapper. The running Nix
     # client must live in ram-heavy.slice, while use-cgroups places the builder
     # in a delegated descendant below nix-daemon.service.
@@ -1427,6 +1461,16 @@ in
     argv_big = dellan.succeed(f"cat {stub}/argv")
     assert "PROMPT-MD-MARKER" not in argv_big and len(argv_big) < 4096, (
         f"the prompt must not travel in argv:\n{argv_big[:2000]}"
+    )
+    # The prompt is untrusted transcript content: the tool SURFACE must be
+    # closed (--tools), not just permissions granted (--allowedTools), and
+    # no MCP server may load.
+    argv_lines = argv_big.splitlines()
+    assert "--tools" in argv_lines and argv_lines[argv_lines.index("--tools") + 1] == "Read,Glob,Grep", (
+        f"the reviewer must run with only Read,Glob,Grep available:\n{argv_big}"
+    )
+    assert "--strict-mcp-config" in argv_lines and "--mcp-config" not in argv_lines, (
+        f"the reviewer must load no MCP servers:\n{argv_big}"
     )
 
     fill_inventory(3000)

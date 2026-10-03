@@ -1,5 +1,5 @@
 # cachix-push-filter: runtime-invocation harness for the cachix
-# post-build-hook (modules/nixos/cachix-push-hook.nix — the exact logic
+# deployed-closure push (modules/nixos/cachix-push-hook.nix — the exact logic
 # template cachix-push.nix instantiates for production, here
 # instantiated with PATH-resolvable binary names and a 2s timeout so
 # stubs and the hang case run in seconds).

@@ -201,6 +201,9 @@
         # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
         # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
         (import ./overlays/claude-code.nix)
+        # `pkgs.codex` >= 0.149.0: security floor for the apply_patch
+        # parent-directory write escape. See overlays/codex.nix.
+        (import ./overlays/codex.nix)
         # `pkgs.aggregator` — a real store path for the ingest timer, so
         # modules/nixos/aggregator-ingest-timer.nix needs no flake-input
         # specialArgs threading (same reason the listen-tools tools are
@@ -350,13 +353,30 @@
             touch $out
           '';
         # Not a VM lane: runtime-invocation harness for the cachix
-        # post-build-hook's push-budget filter (skip microvm erofs +
+        # deployed-closure push's budget filter (skip microvm erofs +
         # >256MiB paths; never fail the build). Cheap runCommand.
         cachix-push-filter = import ./tests/cachix-push-filter.nix {
           pkgs = pkgsLinux;
           prodHook = self.nixosConfigurations.dellan.config
-            .nix.settings.post-build-hook;
+            .system.build.cachixPushHook;
         };
+        # Not a VM lane: privacy invariant. The cache is public, so no host
+        # may push every local build (a private flake's outputs would be
+        # published). Only the deployed closure is pushed — see
+        # modules/nixos/cachix-push.nix. Pure eval; instant.
+        no-global-cache-push =
+          let
+            hooks = nixpkgs.lib.mapAttrs (_: h: h.config.nix.settings.post-build-hook or null)
+              { inherit (self.nixosConfigurations) dellan tuxedo; };
+            offenders = nixpkgs.lib.filterAttrs (_: v: v != null && v != "") hooks;
+          in
+          nixpkgs.lib.throwIf (offenders != { }) ''
+            nix.settings.post-build-hook is set on ${builtins.concatStringsSep ", " (builtins.attrNames offenders)}.
+            A global post-build-hook pushes EVERY local build to the public cachix cache,
+            including private flakes (Klaffat). Push the deployed closure only
+            (modules/nixos/cachix-push.nix).
+          ''
+            (pkgsLinux.runCommand "no-global-cache-push" { } "touch $out");
         # Not a VM lane: ai-throttle / host-telemetry runtime harness
         # (modules/nixos/ai-throttle.nix) — fake sysfs, cgroup and systemctl,
         # driven tick by tick. Seconds.

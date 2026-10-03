@@ -1,4 +1,4 @@
-# Shell text for the cachix post-build-hook, parameterized over binary
+# Shell text for the cachix deployed-closure push, parameterized over binary
 # locations, limits and the token path so the runtime-invocation test
 # (tests/cachix-push-filter.nix) can instantiate the SAME logic with
 # PATH stubs and a short timeout. cachix-push.nix instantiates it with

@@ -197,7 +197,7 @@ jobs:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/check-eval-warnings.sh
       # cachix push-budget contract: runtime-invocation harness for the
-      # post-build-hook filter (tests/cachix-push-filter.nix) — skip
+      # deployed-closure push filter (tests/cachix-push-filter.nix) — skip
       # microvm erofs + >256MiB paths, never fail the build. Tiny
       # runCommand — seconds; boots nothing.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
@@ -492,7 +492,10 @@ jobs:
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
           name: jonathanmoregard
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          # Write token on push:main only. PR jobs run PR-head code, so a
+          # token there could be exfiltrated or used to push NARs main
+          # never built; PRs read the public cache without a token.
+          authToken: ${{ github.event_name == 'push' && secrets.CACHIX_AUTH_TOKEN || '' }}
       # Pin the toplevel as a gcroot so cache-nix-action's post-step
       # `nix store gc --max` can't delete it before tarring. `--no-link`
       # (the previous flag) left it unreachable; gc trimmed it; cache
@@ -568,7 +571,10 @@ jobs:
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
           name: jonathanmoregard
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          # Write token on push:main only. PR jobs run PR-head code, so a
+          # token there could be exfiltrated or used to push NARs main
+          # never built; PRs read the public cache without a token.
+          authToken: ${{ github.event_name == 'push' && secrets.CACHIX_AUTH_TOKEN || '' }}
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         env:
           TMPDIR: /mnt/tmp
@@ -680,12 +686,15 @@ jobs:
           save: false
       # cachix remains the secondary substituter: it covers paths the
       # GHA cache didn't have (e.g. brand-new VM-specific closure) and
-      # paths from other developers' machines pushed via post-build hooks.
+      # paths a host pushed after deploying (modules/nixos/cachix-push.nix).
       - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
           name: jonathanmoregard
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          # Write token on push:main only. PR jobs run PR-head code, so a
+          # token there could be exfiltrated or used to push NARs main
+          # never built; PRs read the public cache without a token.
+          authToken: ${{ github.event_name == 'push' && secrets.CACHIX_AUTH_TOKEN || '' }}
       - name: Verify KVM
         if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         run: |
