@@ -192,7 +192,8 @@ def sample():
            "gpu_top": top(gpu, prev.get("gpu", {}), 1_000_000)}
     try:
         rec["throttle"] = json.loads(THROTTLE_STATE.read_text())
-        rec["throttle"] = {k: rec["throttle"].get(k) for k in ("paused", "reasons")}
+        rec["throttle"] = {k: rec["throttle"].get(k)
+                           for k in ("paused", "reasons", "duty", "setpoint_c", "mean_c", "idle")}
     except (OSError, ValueError):
         rec["throttle"] = None
     OUT_DIR.mkdir(parents=True, exist_ok=True)
