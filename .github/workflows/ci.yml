@@ -604,12 +604,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `klaffat-infra` and `klaffat-dependabot-caretaker` are matrix-only,
+        # `klaffat-infra`, `klaffat-dependabot-caretaker` and `pr-swipe` are matrix-only,
         # like listen-tools / camera-relay / auto-deploy. They are
         # deliberately absent from `discover`'s LANES, so they never report
         # "cached" and always execute. They gate credential handling and
         # caretaker trust boundaries.
-        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker]
+        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker, pr-swipe]
     steps:
       # Read this lane's cache status from the discover job. ALWAYS
       # runs (no `if:`) so subsequent steps can reference

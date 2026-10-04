@@ -35,6 +35,9 @@
     ../../modules/nixos/build-coordination.nix
     ../../modules/nixos/memory-pressure.nix
     ../../modules/nixos/claude-agent-users.nix
+    # pr-swipe: swipe-triage of PRs; the executor (prswipe uid) is the only
+    # holder of the merge-gate App key. See the module header.
+    ../../modules/nixos/pr-swipe.nix
     ../../modules/nixos/codex-security.nix
 
     # research-agent microvm. The MCP server spawned by Claude Code
@@ -143,6 +146,12 @@
   # Per-host rekey settings (hostPubkey, localStorageDir) stay in each
   # host file; `rekey` writes one copy per host that imports this profile.
   # ---------------------------------------------------------------------
+
+  # merge-gate App ID is not secret; the key is (secrets/pr-swipe-merge-gate.age).
+  services.prSwipe = {
+    enable = true;
+    appId = 5173130;
+  };
 
   age.secrets.deploy-ssh-key.rekeyFile        = ../../secrets/deploy-ssh-key.age;
   age.secrets.github-webhook-secret.rekeyFile = ../../secrets/github-webhook-secret.age;

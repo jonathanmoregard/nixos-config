@@ -298,6 +298,27 @@
         "type": "github"
       }
     },
+    "pr-swipe": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791105531,
+        "narHash": "sha256-KDmOQ8LCuzevfy8LR8pLNe0rzGelAIgQm0erydNz8tw=",
+        "owner": "jonathanmoregard",
+        "repo": "pr-swipe",
+        "rev": "b335c024953411651ac47d77a9f89788f51e7318",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jonathanmoregard",
+        "ref": "feat/core",
+        "repo": "pr-swipe",
+        "type": "github"
+      }
+    },
     "pre-commit-hooks": {
       "inputs": {
         "flake-compat": "flake-compat",
@@ -549,6 +570,7 @@
         "home-manager": "home-manager_2",
         "microvm": "microvm",
         "nixpkgs": "nixpkgs",
+        "pr-swipe": "pr-swipe",
         "prose-decorate": "prose-decorate",
         "pyproject-build-systems": "pyproject-build-systems_2",
         "pyproject-nix": "pyproject-nix_2",

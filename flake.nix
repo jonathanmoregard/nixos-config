@@ -28,6 +28,12 @@
     prose-decorate.url = "github:jonathanmoregard/prose-decorate";
     prose-decorate.inputs.nixpkgs.follows = "nixpkgs";
 
+    # pr-swipe — human-gated PR triage (modules/nixos/pr-swipe.nix). Public
+    # repo, so no access token on any surface that evaluates this flake.
+    # Tracks feat/core until jonathanmoregard/pr-swipe#1 lands; then main.
+    pr-swipe.url = "github:jonathanmoregard/pr-swipe/feat/core";
+    pr-swipe.inputs.nixpkgs.follows = "nixpkgs";
+
     # Anthropic ships an official Linux app since 2026-06-30, but not
     # via nixpkgs. `aaddrick/claude-desktop-debian` repackages the
     # upstream Linux app as `.deb`/`.rpm`/AppImage plus a Nix flake
@@ -156,7 +162,7 @@
   };
 
   outputs = flakeInputs@{ self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
-              tts-tool, substack-url-tool, prose-decorate, claude-desktop,
+              tts-tool, substack-url-tool, prose-decorate, claude-desktop, pr-swipe,
               aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
               ... }:
   let
@@ -217,6 +223,7 @@
           tts-tool = tts-tool.packages.${linuxSystem}.default;
           substack-url-tool = substack-url-tool.packages.${linuxSystem}.default;
           prose-decorate = prose-decorate.packages.${linuxSystem}.default;
+          pr-swipe = pr-swipe.packages.${linuxSystem}.default;
         })
       ];
     };
@@ -317,6 +324,7 @@
         # exists to prevent.
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
         vm-klaffat-dependabot-caretaker = mkLane ./tests/klaffat-dependabot-caretaker.nix;
+        vm-pr-swipe = mkLane ./tests/pr-swipe.nix;
 
         # Not a VM lane: an eval-time assertion, because that is when the
         # fault would land. dellan is the machine holding the root-only
