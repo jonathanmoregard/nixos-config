@@ -18,7 +18,8 @@
 #    └─ scraper microvm (this module)
 #         - chromium + playwright via headless HTTP server on guest :8000
 #         - SLIRP forwarded to host 127.0.0.1:8123
-#         - stock NixOS firewall: ssh + scraper port inbound, * outbound
+#         - stock NixOS firewall: ssh + scraper port inbound; outbound
+#           public only (scraper-egress.nix: no host gateway, no RFC1918)
 #         - holds NO secrets; the bearer token gates incoming requests only
 #    └─ research-agent microvm (sibling module)
 #         - reaches scraper via 10.0.2.2:8123 (SLIRP host gateway)
@@ -76,6 +77,7 @@ in
 
   microvm.vms.scraper = {
     config = { config, pkgs, ... }: {
+      imports = [ ./scraper-egress.nix ];
 
       microvm = {
         hypervisor = "qemu";
@@ -144,12 +146,13 @@ in
           # ssh on host 2225 (research-agent uses 2223; pick a stable
           # next-free port). Useful for interactive debug; the agent →
           # scraper transport is HTTP, not ssh.
-          { from = "host"; host.port = 2225; guest.port = 22; proto = "tcp"; }
-          # HTTP scraper API. Bind to host loopback only (forwardPorts
-          # default with no bind addr → 127.0.0.1, which is what we want
-          # — the API must NOT be reachable from off-host or from the
-          # LAN; it speaks bearer-auth but defense-in-depth).
-          { from = "host"; host.port = 8123; guest.port = 8000; proto = "tcp"; }
+          { from = "host"; host.address = "127.0.0.1"; host.port = 2225; guest.port = 22; proto = "tcp"; }
+          # HTTP scraper API, on host loopback only. host.address must be
+          # set: microvm.nix's default is "", which QEMU binds to 0.0.0.0
+          # (every host interface), leaving only the host firewall between
+          # the LAN and the API. The research-agent VM still reaches it at
+          # 10.0.2.2:8123, which its SLIRP maps to the host's 127.0.0.1.
+          { from = "host"; host.address = "127.0.0.1"; host.port = 8123; guest.port = 8000; proto = "tcp"; }
         ];
       };
 
@@ -235,8 +238,9 @@ in
       };
 
       # Inbound: ssh (opened by services.openssh.openFirewall) + the
-      # scraper API. Outbound unrestricted on purpose — the scraper's
-      # job is to fetch arbitrary URLs. That widened egress is contained
+      # scraper API. Outbound open to the PUBLIC internet on purpose — the
+      # scraper's job is to fetch arbitrary URLs — but not to the SLIRP
+      # host gateway or private ranges (scraper-egress.nix). That widened egress is contained
       # by the VM boundary; no API keys or operator data live here, so
       # the exfil ceiling for a chromium compromise is "the HTML the
       # operator asked it to fetch anyway".
