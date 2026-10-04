@@ -81,6 +81,14 @@ in
         dellan.succeed("runuser -u jonathan -- cat /var/lib/pr-swipe/outbox/r.json")
         dellan.succeed("runuser -u jonathan -- rm /var/lib/pr-swipe/outbox/r.json")
         dellan.fail("runuser -u jonathan -- sh -c 'echo x > /var/lib/pr-swipe/returns/forged.json'")
+        # loops: pr-swipe-loops (user) writes the snapshot the GUI reads; the GUI's requests
+        # land in outbox/loops for the user service to apply and delete. The GUI cannot write
+        # the snapshot (it would steer what the deck shows).
+        dellan.succeed("runuser -u jonathan -- sh -c 'echo {} > /var/lib/pr-swipe/inbox/loops/open.json && chmod 0640 /var/lib/pr-swipe/inbox/loops/open.json'")
+        dellan.succeed("runuser -u prswipe -- cat /var/lib/pr-swipe/inbox/loops/open.json")
+        dellan.fail("runuser -u prswipe -- sh -c 'echo x > /var/lib/pr-swipe/inbox/loops/forged.json'")
+        dellan.succeed("runuser -u prswipe -- sh -c 'echo {} > /var/lib/pr-swipe/outbox/loops/q.json && chmod 0660 /var/lib/pr-swipe/outbox/loops/q.json'")
+        dellan.succeed("runuser -u jonathan -- rm /var/lib/pr-swipe/outbox/loops/q.json")
 
     with subtest("the user launches the GUI, which maps a window as prswipe"):
         dellan.wait_for_unit("xvfb.service")

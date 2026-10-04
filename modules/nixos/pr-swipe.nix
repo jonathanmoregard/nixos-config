@@ -104,6 +104,12 @@ in
       default = 600;
       description = "Seconds between collector passes.";
     };
+    loopsRepo = lib.mkOption {
+      type = lib.types.str;
+      default = "${cfg.githubLogin}/.claude";
+      defaultText = lib.literalExpression ''"''${githubLogin}/.claude"'';
+      description = "Private repo whose `loop`-labelled issues hold open loops.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -136,6 +142,9 @@ in
       "d ${root}         0755 root     root       -"
       "d ${root}/inbox   2750 ${cfg.user} prswipe-io -"
       "d ${root}/outbox  2770 prswipe  prswipe-io -"
+      # loops: pr-swipe-loops (user) writes the open-loops snapshot, the gui writes requests
+      "d ${root}/inbox/loops  2750 ${cfg.user} prswipe-io -"
+      "d ${root}/outbox/loops 2770 prswipe  prswipe-io -"
       "d ${root}/returns 0750 prswipe  prswipe    -"
       "d ${root}/state   0700 prswipe  prswipe    -"
       # verifier's bare mirrors: git objects fetched from GitHub by the executor, re-hashed on import
@@ -221,6 +230,27 @@ in
       };
     };
 
-    environment.systemPackages = [ launcher ];
+    # Open loops (follow-ups, blocked-on-human items) live as `loop` issues in
+    # ${cfg.loopsRepo}. Same user token as the collector; pr_swipe.loops pins
+    # the repo and refuses issues without the `loop` label. Files merged PRs'
+    # manual steps, applies the GUI's requests (outbox/loops), and writes the
+    # snapshot the Loops deck reads (inbox/loops/open.json).
+    systemd.user.services.pr-swipe-loops = {
+      description = "pr-swipe loops (open balls as issues; Loops deck snapshot)";
+      wantedBy = [ "default.target" ];
+      unitConfig.ConditionUser = cfg.user;
+      environment = commonEnv // {
+        PR_SWIPE_LOOPS_REPO = cfg.loopsRepo;
+        PATH = lib.mkForce "/etc/profiles/per-user/${cfg.user}/bin:/run/current-system/sw/bin";
+      };
+      serviceConfig = {
+        ExecStart = "${cfg.package}/bin/pr-swipe-loops --interval 300";
+        Restart = "on-failure";
+        RestartSec = 60;
+      };
+    };
+
+    # pr-swipe-loops-mcp: the gated MCP server agents use for loops (registered in ~/.claude).
+    environment.systemPackages = [ launcher cfg.package ];
   };
 }
