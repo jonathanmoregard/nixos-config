@@ -2,28 +2,34 @@
 # scraper microvm — JS-rendering crawler sibling to research-agent.
 #
 # Why separate from research-agent: chromium executes attacker-controlled
-# JS on every render. Hosting it in research-agent would (a) put exa/tavily
-# keys in the same process tree as a chromium sandbox escape, and (b) force
-# the research-agent egress allowlist open to '*' since chromium needs to
-# reach any URL. Splitting keeps the research-agent allowlist narrow
-# (anthropic/exa/tavily only) and confines chromium's wide egress to a VM
+# JS on every render. Hosting it in research-agent would (a) put the
+# agent's LLM credentials in the same process tree as a chromium sandbox
+# escape, and (b) force the research-agent egress allowlist open to '*'
+# since chromium needs to reach any URL. Splitting keeps the research-agent
+# allowlist narrow (LLM providers + the host broker) and confines
+# chromium's wide egress to a VM
 # that holds nothing worth exfiltrating: no API keys, no operator data,
 # nothing persisted across calls.
 #
 # Trust model:
 #   host
 #    └─ scraper-bearer-init.service: generates per-boot random token at
-#       /var/lib/scraper-bearer/token (0444). Virtiofs RO-shared into both
-#       VMs at /etc/scraper/token.
+#       /var/lib/scraper-bearer/token (0444). Read by the host's
+#       research-broker per request, and virtiofs RO-shared into this VM
+#       at /etc/scraper/token. The research-agent VM no longer has it.
 #    └─ scraper microvm (this module)
 #         - chromium + playwright via headless HTTP server on guest :8000
 #         - SLIRP forwarded to host 127.0.0.1:8123
 #         - stock NixOS firewall: ssh + scraper port inbound, * outbound
 #         - holds NO secrets; the bearer token gates incoming requests only
+#    └─ research-broker.service (host, research-broker.nix)
+#         - the only caller of the render/browse API: calls
+#           127.0.0.1:8123 with the bearer after gating each URL against
+#           the run's ledger (the host MCP server still pulls finished
+#           artifacts from /artifacts/<run> itself)
 #    └─ research-agent microvm (sibling module)
-#         - reaches scraper via 10.0.2.2:8123 (SLIRP host gateway)
-#         - single nftables rule added there opens 10.0.2.2:8123 only
-#         - render_shim.py reads /etc/scraper/token, attaches Bearer
+#         - cannot reach the scraper: its nftables opens 10.0.2.2:8124
+#           (the broker), not :8123; render_shim posts to the broker
 #
 # Compromise of chromium yields:
 #   - no API keys (none present)
@@ -44,10 +50,10 @@ let
 in
 {
   # Per-boot bearer token. Random, never persisted across reboots. The
-  # only consumers that need it (scraper-http inside the scraper VM,
-  # render_shim inside the research-agent VM) both read on demand via
-  # virtiofs, so a rotation is just `systemctl restart scraper-bearer-init`
-  # followed by restarts of the two consumers.
+  # only consumers (scraper-http inside the scraper VM via virtiofs, and
+  # research-broker on the host) both read it on demand, so a rotation is
+  # just `systemctl restart scraper-bearer-init` followed by a restart of
+  # scraper-http.
   systemd.tmpfiles.rules = [
     "d /var/lib/scraper-bearer 0755 root root -"
     "d /var/lib/scraper 0700 root root -"

@@ -15,7 +15,8 @@
 # BEFORE it hands the answer back. So an address becomes connectable at
 # the exact moment the agent learns it, whatever the CDN did since boot.
 #
-# Why (2026-10-02): api.ebay.com is a CNAME chain onto Akamai
+# Why (2026-10-02): api.ebay.com (then allowlisted here; since 2026-10
+# reached through the host broker instead) is a CNAME chain onto Akamai
 # (e333426.a.akamaiedge.net) with 8-29 s A-record TTLs; the whole answer
 # set turned over inside 30 s. The previous design resolved the
 # allowlist with getent at boot (egress-init) and every 10 min
@@ -30,7 +31,7 @@
 #     every A record in the answer, including the ones owned by the CNAME
 #     targets (forward.c process_reply → rfc1035.c extract_addresses).
 #     So only the name the agent asks for has to be listed. Matching is
-#     suffix-wise: `api.ebay.com` also covers `*.api.ebay.com` — names
+#     suffix-wise: `api.anthropic.com` also covers `*.api.anthropic.com` — names
 #     under the same owner, and much narrower than what any CDN IP
 #     allowlist already implies (an Akamai edge IP serves every Akamai
 #     customer by SNI).
@@ -67,7 +68,7 @@
 #     tld`) reached whatever nameserver was authoritative for a name the
 #     agent invented. AAAA and PTR follow the same rule: forwarded only
 #     for allowlisted names, NXDOMAIN otherwise. Residual: labels UNDER
-#     an allowlisted domain (`x.api.ebay.com`) are still forwarded,
+#     an allowlisted domain (`x.api.anthropic.com`) are still forwarded,
 #     because matching is suffix-wise (as for nftset) — they reach only
 #     that domain owner's own nameservers, not an attacker's.
 #   - Only dnsmasq may talk to the upstream resolver. The port-53 rule
@@ -91,40 +92,20 @@ let
     "chatgpt.com"
     "auth.openai.com"
     "api.openai.com"
-    "api.exa.ai"
-    "mcp.exa.ai"
-    # api.tavily.com is AWS ELB-backed and its A records rotate on a
-    # scale of hours-to-days (2026-08-24: the incident that first showed
-    # a boot-time snapshot of DNS cannot hold a rotating host).
-    "api.tavily.com"
-    "mcp.tavily.com"
-    # Trademark-clearance shims (agent/shims/{trademark,bolagsverket}
-    # _shim.py in the research-agent repo). Added to the agent in
-    # 2026-06 but never to this allowlist — every call dialled out,
-    # hit dropped packets, and hung to its client timeout (EUIPO
-    # curl-28 after 30s, bolagsverket urllib after 120s), burning
-    # whole research budgets on dead waits.
-    # EUIPO sandbox (in use until the production subscription is
-    # approved):
-    "auth-sandbox.euipo.europa.eu"
-    "api-sandbox.euipo.europa.eu"
-    # EUIPO production (pre-added so the sandbox->prod flip is a
-    # shim-env change, not another firewall PR):
-    "euipo.europa.eu"
-    "api.euipo.europa.eu"
+    # Keyless bulk open-data sources. Neither takes a model-authored URL
+    # or query (the shims fetch fixed bulk files) and neither holds a
+    # key, so they stay direct rather than going through the broker
+    # (research-agent docs/egress-broker.md §0.2).
     # Bolagsverket open-data bulk file (CC-BY, weekly refresh):
     "vardefulla-datamangder.bolagsverket.se"
     # PRV open-data FTP (Swedish national trademark register;
     # sanctioned bulk channel used by prv_shim).
     "opendata.prv.se"
-    # Shopping-search shims (agent/shims/{ebay,tradera}_shim.py in
-    # the research-agent repo): the marketplaces' own read-only
-    # search APIs. eBay's token endpoint and Browse API share
-    # api.ebay.com. eBay 403s scraped search pages, so without
-    # this host the agent has no eBay route at all. api.ebay.com is
-    # the fast-rotating Akamai host described above.
-    "api.ebay.com"
-    "api.tradera.com"
+    # NOT here, on purpose (2026-10, egress broker): the keyed APIs —
+    # api.exa.ai, mcp.exa.ai, api.tavily.com, mcp.tavily.com, the EUIPO
+    # hosts, api.ebay.com, api.tradera.com. The guest holds none of
+    # their keys any more; the host's research-broker calls them and
+    # the guest reaches it at 10.0.2.2:8124 (output chain below).
   ];
 in
 {
@@ -169,13 +150,14 @@ in
             ip daddr ${cfg.upstreamDns} udp dport 53 meta skuid "dnsmasq" accept
             ip daddr ${cfg.upstreamDns} tcp dport 53 meta skuid "dnsmasq" accept
             ip daddr @research_allowed tcp dport 443 accept
-            # Scraper microvm HTTP API. 10.0.2.2 is the SLIRP host
-            # gateway from inside this VM (qemu user-mode default).
-            # The host's forwardPorts rule on the scraper VM exposes
-            # the scraper's guest port 8000 at host loopback :8123,
-            # so this rule lets the agent's render_shim reach the
-            # scraper without widening the broader egress allowlist.
-            ip daddr 10.0.2.2 tcp dport 8123 accept
+            # research-broker (modules/nixos/research-broker.nix).
+            # 10.0.2.2 is the SLIRP host gateway from inside this VM
+            # (qemu user-mode default) and maps to host loopback, where
+            # research-broker.socket listens on 127.0.0.1:8124. This is
+            # the guest's only path to the keyed APIs AND to the scraper:
+            # the scraper's host port (8123) is deliberately not opened,
+            # so every render goes through the broker's URL gate.
+            ip daddr 10.0.2.2 tcp dport 8124 accept
           }
         }
       '';

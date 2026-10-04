@@ -126,20 +126,13 @@ in
             tag = "tool-cache";
             proto = "virtiofs";
           }
-          {
-            # Bearer token for the scraper microvm's HTTP API. The file
-            # lives on the host at /var/lib/scraper-bearer/token
-            # (generated per-boot by scraper-bearer-init.service in
-            # modules/nixos/scraper-microvm.nix). render_shim.py reads
-            # /etc/scraper/token at call time.
-            # readOnly=true: a prompt-injected agent inside the VM
-            # cannot rotate the bearer out from under the scraper.
-            source = "/var/lib/scraper-bearer";
-            mountPoint = "/etc/scraper";
-            tag = "scraper-token";
-            proto = "virtiofs";
-            readOnly = true;
-          }
+          # No scraper-token share (removed 2026-10, egress broker): the
+          # guest no longer talks to the scraper or holds its bearer. The
+          # host's research-broker injects the bearer and is the guest's
+          # only path to the scraper (research-agent-egress.nix opens
+          # 10.0.2.2:8124, not :8123). Changing the share count changes
+          # the DSDT layout (see `mem` above), so a cutover includes a
+          # real boot of microvm@research-agent.
         ];
 
         interfaces = [
