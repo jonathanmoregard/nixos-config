@@ -679,6 +679,16 @@
       update-beeper = pkgsLinux.beeper-update;
       check-signal-expiry = pkgsLinux.signal-expiry-check;
       add-secret = import ./home/add-secret.nix { pkgs = pkgsLinux; };
+      # `nix run .#security-static [-- --self-test]` — fast offline security
+      # scanners, pinned via flake.lock. CI job `security-static`.
+      security-static = pkgsLinux.writeShellApplication {
+        name = "security-static";
+        runtimeInputs = with pkgsLinux; [
+          zizmor actionlint gitleaks shellcheck poutine
+          git gnutar coreutils findutils gnugrep
+        ];
+        text = builtins.readFile ./scripts/security-static.sh;
+      };
     };
 
     # agenix-rekey CLI plumbing. Exposes:
