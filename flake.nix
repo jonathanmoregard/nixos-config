@@ -459,7 +459,9 @@
         # Not a VM lane: runs the local-stt router with the exact command
         # tuxedo's unit starts, against two stub whisper servers — English
         # stays on the general model, detected Swedish is re-transcribed by
-        # the Swedish one, and a model that is down degrades or errors visibly.
+        # the Swedish one, a model that is down degrades or errors visibly,
+        # and the record-start ping holds the performance profile once and
+        # leaves ai-throttle's hint (fake powerprofilesctl).
         local-stt = import ./tests/local-stt.nix {
           pkgs = pkgsLinux;
           routerCommand = self.nixosConfigurations.tuxedo.config

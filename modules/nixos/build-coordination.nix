@@ -180,5 +180,12 @@ in
       cores = cfg.cores;
       use-cgroups = true;
     };
+
+    # Builds yield to interactive work: SCHED_BATCH keeps a build's threads
+    # from preempting a dictation's (local-stt.nix) or the desktop's, and the
+    # idle IO class gives them the disk only when nobody else wants it. A
+    # build with the machine to itself runs as before.
+    nix.daemonCPUSchedPolicy = "batch";
+    nix.daemonIOSchedClass = "idle";
   };
 }
