@@ -310,6 +310,7 @@
         vm-android-dev  = mkLane ./tests/android-dev.nix;
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
         vm-nix-gc       = mkLane ./tests/nix-gc.nix;
+        vm-security-batch = mkLane ./tests/security-batch.nix;
         # In ci.yml's vm-minimal matrix, and deliberately absent from
         # `discover`'s LANES so it never reports "cached" and always
         # executes — it gates credential handling and the sudo password
@@ -503,6 +504,17 @@
         # payloads, incl. one buried past the model's 512-token window.
         prompt-injection-scan = import ./tests/prompt-injection-scan.nix {
           pkgs = pkgsLinux;
+        };
+        # Not a VM lane: the research-agent security sweep's verdict logic
+        # (modules/nixos/security-batch/research-agent.sh) against fake
+        # vulnix / systemd-analyze — seed, new CVE, accepted, score
+        # regression, tool errors. The module itself: vm-security-batch.
+        security-batch-research-agent = import ./tests/security-batch-research-agent.nix {
+          pkgs = pkgsLinux;
+          runnerScript = ./modules/nixos/security-batch/research-agent.sh;
+          # Drift gate: the package dellan deploys.
+          runnerPackage = self.nixosConfigurations.dellan.config
+            .services.securityBatch.research-agent.script;
         };
         signal-expiry = import ./tests/signal-expiry.nix {
           pkgs = pkgsLinux;
