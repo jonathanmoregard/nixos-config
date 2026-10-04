@@ -352,18 +352,10 @@
             fi
             touch $out
           '';
-        # Not a VM lane: runtime-invocation harness for the cachix
-        # deployed-closure push's budget filter (skip microvm erofs +
-        # >256MiB paths; never fail the build). Cheap runCommand.
-        cachix-push-filter = import ./tests/cachix-push-filter.nix {
-          pkgs = pkgsLinux;
-          prodHook = self.nixosConfigurations.dellan.config
-            .system.build.cachixPushHook;
-        };
         # Not a VM lane: privacy invariant. The cache is public, so no host
         # may push every local build (a private flake's outputs would be
-        # published). Only the deployed closure is pushed — see
-        # modules/nixos/cachix-push.nix. Pure eval; instant.
+        # published). CI's push:main run is the only cache writer; it
+        # already holds every deployed closure. Pure eval; instant.
         no-global-cache-push =
           let
             hooks = nixpkgs.lib.mapAttrs (_: h: h.config.nix.settings.post-build-hook or null)
@@ -373,8 +365,8 @@
           nixpkgs.lib.throwIf (offenders != { }) ''
             nix.settings.post-build-hook is set on ${builtins.concatStringsSep ", " (builtins.attrNames offenders)}.
             A global post-build-hook pushes EVERY local build to the public cachix cache,
-            including private flakes (Klaffat). Push the deployed closure only
-            (modules/nixos/cachix-push.nix).
+            including private flakes (Klaffat). CI's push:main run is the
+            only cache writer.
           ''
             (pkgsLinux.runCommand "no-global-cache-push" { } "touch $out");
         # Not a VM lane: ai-throttle / host-telemetry runtime harness

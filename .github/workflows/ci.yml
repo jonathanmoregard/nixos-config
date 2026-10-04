@@ -196,12 +196,6 @@ jobs:
       # bug on every eval, invisibly, while it took the VM down).
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/check-eval-warnings.sh
-      # cachix push-budget contract: runtime-invocation harness for the
-      # deployed-closure push filter (tests/cachix-push-filter.nix) — skip
-      # microvm erofs + >256MiB paths, never fail the build. Tiny
-      # runCommand — seconds; boots nothing.
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        run: nix build .#checks.x86_64-linux.cachix-push-filter -L
       # worktree-sweep fail-closed contract: fixture bare repo +
       # worktrees + stubbed gh, asserting the sweeper deletes only
       # merged+old+clean+no-live-cwd and that a gh outage means zero
@@ -685,8 +679,8 @@ jobs:
             nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
           save: false
       # cachix remains the secondary substituter: it covers paths the
-      # GHA cache didn't have (e.g. brand-new VM-specific closure) and
-      # paths a host pushed after deploying (modules/nixos/cachix-push.nix).
+      # GHA cache didn't have (e.g. brand-new VM-specific closure), pushed
+      # by earlier push:main runs.
       - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:

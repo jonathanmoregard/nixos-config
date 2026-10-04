@@ -559,20 +559,6 @@ in
         "/home/jonathan/.nix-memory-pressure/lock'"
     )
 
-    # Cache push: no global post-build-hook (local builds of private flakes
-    # must not reach the public cache); a successful deploy's success flag
-    # triggers the deployed-closure push, which is opportunistic: with no
-    # token (the VM has no agenix key) it must finish successfully.
-    hook = dellan.succeed("nix config show post-build-hook").strip()
-    assert hook == "", f"a global post-build-hook is set: {hook!r}"
-    dellan.succeed("mkdir -p /var/lib/nixos-deploy && touch /var/lib/nixos-deploy/notify-success")
-    dellan.wait_until_succeeds(
-        "systemctl show cachix-push-deployed -p ExecMainExitTimestampMonotonic --value | grep -qv '^0$'",
-        timeout=60,
-    )
-    result = dellan.succeed("systemctl show cachix-push-deployed -p Result --value").strip()
-    assert result == "success", f"deployed-closure push unit: {result}"
-
     # Run one real derivation through the production wrapper. The running Nix
     # client must live in ram-heavy.slice, while use-cgroups places the builder
     # in a delegated descendant below nix-daemon.service.
