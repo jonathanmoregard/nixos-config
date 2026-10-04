@@ -207,6 +207,9 @@
         # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
         # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
         (import ./overlays/claude-code.nix)
+        # `pkgs.codex` >= 0.149.0: security floor for the apply_patch
+        # parent-directory write escape. See overlays/codex.nix.
+        (import ./overlays/codex.nix)
         # `pkgs.aggregator` — a real store path for the ingest timer, so
         # modules/nixos/aggregator-ingest-timer.nix needs no flake-input
         # specialArgs threading (same reason the listen-tools tools are
@@ -357,14 +360,23 @@
             fi
             touch $out
           '';
-        # Not a VM lane: runtime-invocation harness for the cachix
-        # post-build-hook's push-budget filter (skip microvm erofs +
-        # >256MiB paths; never fail the build). Cheap runCommand.
-        cachix-push-filter = import ./tests/cachix-push-filter.nix {
-          pkgs = pkgsLinux;
-          prodHook = self.nixosConfigurations.dellan.config
-            .nix.settings.post-build-hook;
-        };
+        # Not a VM lane: privacy invariant. The cache is public, so no host
+        # may push every local build (a private flake's outputs would be
+        # published). CI's push:main run is the only cache writer; it
+        # already holds every deployed closure. Pure eval; instant.
+        no-global-cache-push =
+          let
+            hooks = nixpkgs.lib.mapAttrs (_: h: h.config.nix.settings.post-build-hook or null)
+              { inherit (self.nixosConfigurations) dellan tuxedo; };
+            offenders = nixpkgs.lib.filterAttrs (_: v: v != null && v != "") hooks;
+          in
+          nixpkgs.lib.throwIf (offenders != { }) ''
+            nix.settings.post-build-hook is set on ${builtins.concatStringsSep ", " (builtins.attrNames offenders)}.
+            A global post-build-hook pushes EVERY local build to the public cachix cache,
+            including private flakes (Klaffat). CI's push:main run is the
+            only cache writer.
+          ''
+            (pkgsLinux.runCommand "no-global-cache-push" { } "touch $out");
         # Not a VM lane: ai-throttle / host-telemetry runtime harness
         # (modules/nixos/ai-throttle.nix) — fake sysfs, cgroup and systemctl,
         # driven tick by tick. Seconds.
@@ -455,7 +467,9 @@
         # Not a VM lane: runs the local-stt router with the exact command
         # tuxedo's unit starts, against two stub whisper servers — English
         # stays on the general model, detected Swedish is re-transcribed by
-        # the Swedish one, and a model that is down degrades or errors visibly.
+        # the Swedish one, a model that is down degrades or errors visibly,
+        # and the record-start ping holds the performance profile once and
+        # leaves ai-throttle's hint (fake powerprofilesctl).
         local-stt = import ./tests/local-stt.nix {
           pkgs = pkgsLinux;
           routerCommand = self.nixosConfigurations.tuxedo.config

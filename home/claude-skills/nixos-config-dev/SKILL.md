@@ -223,7 +223,7 @@ nix eval .#checks.x86_64-linux --apply builtins.attrNames
 | `vm-keyring` · `vm-kitty` · `vm-claude-pane` · `vm-autodoro` | the named feature |
 | `vm-listen-tools` · `vm-android-dev` · `vm-camera-relay` | the named feature |
 | `vm-claude-egress` · `vm-auto-deploy` | egress policy · deploy pipeline |
-| `cachix-push-filter` · `add-secret-smoke` · `secrets-no-dead-credentials` · `signal-expiry` · `worktree-sweep` | script/data assertions (no VM — fast) |
+| `no-global-cache-push` · `add-secret-smoke` · `secrets-no-dead-credentials` · `signal-expiry` · `worktree-sweep` | script/data assertions (no VM — fast) |
 
 The non-VM lanes run in seconds; the `vm-*` lanes boot a machine. When a
 change spans areas, build each affected lane and record all of them in
