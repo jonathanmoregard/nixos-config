@@ -574,9 +574,18 @@ let
       # (~/.claude/skills/session-reflect/reflect.sh) not to mint a
       # reflection of it — otherwise tomorrow's review reads tonight's.
       export CLAUDE_PIPELINE_INTERNAL=1
+      # --allowedTools only GRANTS permissions; it does not remove tools.
+      # The prompt carries untrusted transcript content, and global
+      # settings allow Bash and MCP servers, so without --tools the
+      # "read-only" run could still shell out or write files (2026-10-03:
+      # it Wrote two proposals straight into the sink, bypassing it).
+      # --tools is the tool surface; --strict-mcp-config with no
+      # --mcp-config loads no MCP servers.
       rc=0
       "''${scope[@]}" timeout "''${RSI_REVIEW_TIMEOUT:-3600}" \
-        claude --model opus --print --allowedTools "Read Glob Grep" \
+        claude --model opus --print \
+        --tools "Read,Glob,Grep" --strict-mcp-config \
+        --allowedTools "Read Glob Grep" \
         -p < "$prompt_tmp" > "$raw" || rc=$?
       if [ "$rc" -eq 124 ]; then
         echo "rsi-daily-review: claude timed out after ''${RSI_REVIEW_TIMEOUT:-3600}s" >&2
@@ -690,7 +699,11 @@ in
     0 11 * * 1 /home/jonathan/Repos/dotfiles/backup-crontab.sh >> /home/jonathan/Repos/dotfiles/backup-crontab.log 2>&1
     23 14 * * * /home/jonathan/Repos/dotfiles/sync-agent.sh >> /home/jonathan/Repos/dotfiles/sync.log 2>&1
     0 10 * * 1 git -C /home/jonathan/Repos/everything-claude-code pull --ff-only >> /home/jonathan/.claude/logs/ecc-pull.log 2>&1
-    0 */6 * * * /home/jonathan/.claude/repo-autosync-data/token-optimizer/wrapper.sh
+    # token-optimizer upstream-merge autosync: REMOVED 2026-10-03. It would
+    # merge third-party upstream (alexgreensh/token-optimizer) hook code
+    # into a live, enabled plugin with no human review. Dormant since
+    # 2026-04-27 (its wrapper.sh carries the pre-NixOS PATH), so repairing
+    # it would have silently re-armed that. Pull upstream by hand instead.
     */30 6-22 * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/habit-tracker.py >> /home/jonathan/.claude/logs/habit-tracker.log 2>&1
     */30 * * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/sunset-walk-tracker.py >> /home/jonathan/.claude/logs/sunset-walk-tracker.log 2>&1
     # superpowers is a PUBLIC fork of obra/superpowers and gitignores
