@@ -226,6 +226,12 @@ jobs:
       # to a failure that actually cost a day's sessions.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.kitty-scripts -L
+      # research-agent security sweep verdict logic
+      # (tests/security-batch-research-agent.nix): seed, new CVE,
+      # accepted, score regression, tool errors, against fake vulnix /
+      # systemd-analyze. Tiny runCommand — seconds.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.security-batch-research-agent -L
 
   docs:
     # Validate that every `nix run .#<attr>` reference in this repo's
@@ -609,7 +615,7 @@ jobs:
         # deliberately absent from `discover`'s LANES, so they never report
         # "cached" and always execute. They gate credential handling and
         # caretaker trust boundaries.
-        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker]
+        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker, security-batch]
     steps:
       # Read this lane's cache status from the discover job. ALWAYS
       # runs (no `if:`) so subsequent steps can reference
