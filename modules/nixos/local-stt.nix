@@ -65,6 +65,29 @@
 # (one hold at a time) while touching ai-throttle's foreground hint, so the
 # background units pause at once; every transcription takes the same boost
 # inline. Voquill pings /v1/prepare when a recording starts.
+#
+# DEPLOYS. A NixOS switch that changes these unit files restarts them, and a
+# dictation may be in flight: 2026-10-04 switch-to-configuration's user-unit
+# pass stopped all four and started them again half a second later, the
+# router died with a request in hand and the dictation was lost. (Voquill
+# itself is a home-manager unit and is kept across switches there, see
+# home/router-services.nix.) Three things make a restart invisible to the
+# caller, each exercised by tests/local-stt-switch.nix under a real switch:
+#   - `local-stt.socket` owns the listening socket and hands it to each
+#     router process, so the port stays open between two processes and a
+#     request that arrives then waits in the socket's queue;
+#   - the router, told to stop, takes nothing new and finishes the requests
+#     it holds before it exits (bounded by TimeoutStopSec = drainSeconds);
+#   - a request that finds a whisper server gone waits for it to come back
+#     (backendWaitSeconds) and sends the audio again.
+# All four units are restarted (stopIfChanged = false), not stopped and
+# started: switch-to-configuration stops stop-and-start units before it
+# restarts the others and starts them only after those restarts have
+# finished, so a router finishing a request would wait on whisper servers
+# that cannot come back until it is done. For the same reason the router is
+# not ordered After= the whisper servers: systemd would hold their start
+# until the router had stopped. The router needs no such order; it waits for
+# a server that is not listening yet.
 { config, lib, pkgs, ... }:
 let
   models = "${config.users.users.jonathan.home}/.local/share/stt-models";
@@ -83,6 +106,21 @@ let
   # is given up on and the clip goes to the full-window one (a short clip
   # takes ~1 s; Voquill waits far less than whisper-server's 600 s).
   shortTimeoutSeconds = 20;
+  # A request waits this long for a whisper server that is not there to come
+  # back before the router falls back or answers 502 (a restart takes the
+  # second or two the model needs to load; a server that stays away for the
+  # whole wait is then asked once per request until it answers again).
+  backendWaitSeconds = 30;
+  # How long a stopping router may take to finish the requests in flight
+  # before systemd kills it. A switch waits for it, so this is also the most
+  # a deploy can be held up. It has to cover a request that waits for two
+  # servers in turn (Swedish audio: detection, then kb-whisper) and is then
+  # transcribed, hence the assertion below.
+  drainSeconds = 90;
+  # A client that connects and then says nothing is dropped after this long,
+  # so it cannot hold a stopping router (and the requests queued behind the
+  # restart) for the whole drain.
+  clientIdleSeconds = 5;
 
   # Ten shares to every default sibling's one, for the burst a dictation is.
   priority = {
@@ -105,6 +143,10 @@ let
   backend = { description, model, port, language, audioCtx ? null, noFallback ? false }: {
     inherit description;
     wantedBy = [ "default.target" ];
+    # Restarted in the same pass as the router, see DEPLOYS above. A request
+    # the server had in hand and did not answer before it stopped is sent
+    # again by the router.
+    stopIfChanged = false;
     unitConfig.ConditionPathExists = model;
     serviceConfig = priority // {
       ExecStart = whisperServer { inherit model port language audioCtx noFallback; };
@@ -138,11 +180,34 @@ in
     language = "sv";
   };
 
+  assertions = [{
+    assertion = drainSeconds > 2 * backendWaitSeconds;
+    message = "local-stt: drainSeconds (${toString drainSeconds}) must exceed twice backendWaitSeconds "
+      + "(${toString backendWaitSeconds}), or a request waiting for a restarting whisper server is "
+      + "killed with the router before it can be answered.";
+  }];
+
+  # The endpoint's listening socket, held by systemd and handed to whichever
+  # router process runs: the port stays open across the router's restarts.
+  # A switch does not touch a changed .socket unit, so a new port takes
+  # effect at the next login.
+  systemd.user.sockets.local-stt = {
+    description = "local-stt: listening socket of the transcription endpoint";
+    wantedBy = [ "sockets.target" ];
+    listenStreams = [ "127.0.0.1:${toString port}" ];
+  };
+
   systemd.user.services.local-stt = {
     description = "local-stt: OpenAI-compatible transcription endpoint";
+    # Started at login rather than on the first connection, so the first
+    # dictation does not pay for the router's start.
     wantedBy = [ "default.target" ];
+    requires = [ "local-stt.socket" ];
+    after = [ "local-stt.socket" ];
     wants = [ "local-stt-general.service" "local-stt-general-short.service" "local-stt-swedish.service" ];
-    after = [ "local-stt-general.service" "local-stt-general-short.service" "local-stt-swedish.service" ];
+    # Restarted, never stopped and started: the socket stays, the old process
+    # finishes what it holds. See DEPLOYS above.
+    stopIfChanged = false;
     environment = {
       LOCAL_STT_PORT = toString port;
       LOCAL_STT_GENERAL = "http://127.0.0.1:${toString generalPort}";
@@ -156,11 +221,14 @@ in
       LOCAL_STT_POWERPROFILESCTL = "${pkgs.power-profiles-daemon}/bin/powerprofilesctl";
       LOCAL_STT_NICE = "${pkgs.coreutils}/bin/nice";
       LOCAL_STT_THROTTLE_HINT = config.services.aiThrottle.foregroundHint;
+      LOCAL_STT_BACKEND_WAIT = toString backendWaitSeconds;
+      LOCAL_STT_CLIENT_IDLE = toString clientIdleSeconds;
     };
     serviceConfig = priority // {
       ExecStart = "${pkgs.python3}/bin/python3 ${../../scripts/local-stt-router.py}";
       Restart = "on-failure";
       RestartSec = 5;
+      TimeoutStopSec = drainSeconds;
     };
   };
 }
