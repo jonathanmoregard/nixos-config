@@ -14,6 +14,8 @@
     ../../modules/nixos/offline-tools.nix
     # Tuxedo only: speech-to-text on the Radeon 890M for Voquill.
     ../../modules/nixos/local-stt.nix
+    # Tuxedo only: keeps Voquill's dictation clips as a local test corpus.
+    ../../modules/nixos/stt-corpus.nix
     # Tuxedo only: quiet background AI (freeze when hot/battery/dictating) + telemetry.
     ../../modules/nixos/ai-throttle.nix
   ];

@@ -471,6 +471,16 @@
           routerCommand = self.nixosConfigurations.tuxedo.config
             .systemd.user.services.local-stt.serviceConfig.ExecStart;
         };
+        # Not a VM lane: runs the dictation corpus keeper with the exact
+        # command tuxedo's unit starts, against a stand-in for Voquill's
+        # database and audio folder (synthetic clips only) — clips arrive
+        # before Voquill prunes them, the cap drops the oldest, a database
+        # that cannot be read changes nothing, Voquill's side is only read.
+        stt-corpus = import ./tests/stt-corpus.nix {
+          pkgs = pkgsLinux;
+          keeperCommand = self.nixosConfigurations.tuxedo.config
+            .systemd.user.services.stt-corpus-keep.serviceConfig.ExecStart;
+        };
         # Not a VM lane: runtime-invocation harness for `add-secret`
         # (home/add-secret.nix). Exercises name validation, worktree
         # preflight, dup-refuse, happy-path insertion, and KEY=VALUE

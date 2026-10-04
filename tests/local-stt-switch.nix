@@ -24,6 +24,13 @@
 #     to the socket-activated one leaves a working endpoint each time (the
 #     first deploy of the socket, and a rollback across it).
 #
+# The same user manager also runs the dictation corpus keeper
+# (modules/nixos/stt-corpus.nix) against a stand-in for Voquill's database
+# and audio folder: a new recording starts it, the timer catches a clip no
+# file event announced, a row that lands after its file still arrives, and
+# the cap drops the oldest. (What one run does to the corpus is covered
+# without a VM in tests/stt-corpus.nix.)
+#
 # The stubs hold a request for as long as <log>.hold exists, so "in flight"
 # and "during the restart" are facts the test arranges, not timing.
 #
@@ -31,6 +38,7 @@
 { pkgs, inputs }:
 let
   inherit (import ./lib/local-stt-fixtures.nix { inherit pkgs; }) stub client;
+  inherit (import ./lib/stt-corpus-fixtures.nix { inherit pkgs; }) voquill;
   dir = "/tmp/stt";
   sttUnits = [ "local-stt" "local-stt-general" "local-stt-general-short" "local-stt-swedish" ];
 in
@@ -38,6 +46,7 @@ in
   name = "vm-local-stt";
   extraModules = [
     ../modules/nixos/local-stt.nix
+    ../modules/nixos/stt-corpus.nix
     ({ lib, pkgs, config, ... }:
       let
         # A whisper server replaced by the stub: the unit keeps everything
@@ -60,8 +69,14 @@ in
         config = {
           system.switch.enable = true;
           users.users.jonathan.linger = true;
-          environment.systemPackages = [ pkgs.python3 ];
+          environment.systemPackages = [ pkgs.python3 pkgs.jq ];
           systemd.tmpfiles.rules = [ "d ${dir} 0777 root root -" ];
+
+          # The corpus keeper with a cap and a sweep small enough to watch.
+          services.sttCorpus = {
+            maxClips = 3;
+            sweepInterval = "5s";
+          };
 
           systemd.user.services = {
             local-stt-general = stubbed 8763 "general";
@@ -257,5 +272,69 @@ in
         assert prop("local-stt.socket", "SubState") == "running", (
             "the router is not running off the socket: " + prop("local-stt.socket", "SubState"))
         assert prop("local-stt.service", "ActiveState") == "active"
+
+    with subtest("the corpus keeper is started by a new recording and by its timer"):
+        home = "/home/jonathan"
+        corpus = f"{home}/.local/share/stt-corpus"
+        database = f"{home}/.config/com.voquill.desktop.local/voquill.db"
+        fixture = (
+            f"FAKE_VOQUILL_DB={database} "
+            f"FAKE_VOQUILL_AUDIO={home}/.local/share/com.voquill.desktop.local/transcription-audio "
+            "python3 ${voquill}")
+
+        def kept():
+            return dellan.succeed(
+                f"if [ -f {corpus}/voquill-manifest.jsonl ]; then jq -r .id {corpus}/voquill-manifest.jsonl | tr '\\n' ' '; fi"
+            ).strip()
+
+        problems = []
+
+        def expect(what, ids, seconds):
+            try:
+                wait_for(what, lambda: kept() == ids, seconds)
+            except Exception:
+                problems.append(f"{what}: the corpus has [{kept()}], expected [{ids}]")
+
+        # The file event alone (timer stopped): the row is there when the
+        # recording lands, so the run it starts finds the clip.
+        user("systemctl --user stop stt-corpus-keep.timer")
+        user(f"{fixture} init")
+        user(f"{fixture} add clip-a 1000 rowfirst")
+        expect("a new recording to start the keeper", "clip-a", 30)
+
+        # The timer alone (path unit stopped): nothing announces this clip.
+        user("systemctl --user stop stt-corpus-keep.path")
+        user(f"{fixture} add clip-b 2000")
+        user("systemctl --user start stt-corpus-keep.timer")
+        expect("the timer to sweep a clip no event announced", "clip-a clip-b", 60)
+
+        # Both, and the order the app writes in: the recording first, its
+        # row a moment later. The event comes too early; the clip arrives.
+        user("systemctl --user start stt-corpus-keep.path")
+        user(f"{fixture} add clip-c 3000 rowlate")
+        expect("a clip whose row came after its file", "clip-a clip-b clip-c", 60)
+
+        # The cap (3 here): the oldest goes, file and line.
+        user(f"{fixture} add clip-d 4000 rowfirst")
+        expect("the cap to drop the oldest clip", "clip-b clip-c clip-d", 60)
+        if exists(f"{corpus}/voquill/clip-a.wav"):
+            problems.append("the dropped clip's file is still in the corpus")
+
+        # No database (Voquill not installed yet, or its folder moved): the
+        # unit still ends well, and the corpus stays as it is.
+        dellan.succeed(f"mv {database} {database}.away")
+        status, _ = dellan.execute(
+            f"su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/{uid} systemctl --user start stt-corpus-keep.service'")
+        result = prop("stt-corpus-keep.service", "Result")
+        if status != 0 or result != "success":
+            problems.append(f"without a database the keeper failed (start exited {status}, Result={result})")
+        if kept() != "clip-b clip-c clip-d":
+            problems.append(f"without a database the corpus changed: [{kept()}]")
+        dellan.succeed(f"mv {database}.away {database}")
+
+        mode = dellan.succeed(f"stat -c %a {corpus}").strip()
+        if mode != "700":
+            problems.append(f"the corpus folder has mode {mode}, not 700")
+        assert not problems, "\n".join(problems)
   '';
 }
