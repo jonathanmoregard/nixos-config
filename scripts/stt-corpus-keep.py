@@ -16,12 +16,20 @@ long as newer clips fill the cap, because it is older than all of them.
 
 What it never does:
   - write to anything Voquill owns: the database is opened read-only and the
-    audio files are only read;
+    audio files are only read. Voquill's database is in WAL mode; while
+    nobody has it open there is no -wal file, and an ordinary read-only open
+    would create one (and a -shm) in Voquill's folder, so a database at rest
+    is read as an immutable file instead;
   - fail because Voquill's database is missing, locked, half-written or not
     a database: the run ends quietly with the corpus untouched, and the next
     run (a new recording, or the timer) picks the clips up;
   - touch the corpus when there is nothing to do: no rewrite, no temp file;
   - open a network connection.
+
+What does fail the run (exit 1, so the unit shows as failed): a database
+that answers but no longer has the table or a column read here, as after an
+app update. Waiting does not cure that, and every quiet run would let
+Voquill prune clips nobody copied.
 
 The corpus holds recordings of a person's voice, so the folder is made
 readable by its owner only, and new files are created that way.
@@ -67,15 +75,38 @@ PLAIN_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
 # How long to wait for a writer to let go of the database before leaving it
 # for the next run.
 DB_BUSY_SECONDS = 1.0
+# sqlite results that mean "not now": a writer holds the database, or the
+# file is absent, being copied, or not (yet) a database. Anything else, such
+# as a missing table or column, will not get better by waiting.
+NOT_NOW = frozenset((
+    sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_NOTADB,
+    sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_IOERR, sqlite3.SQLITE_READONLY, sqlite3.SQLITE_PROTOCOL,
+))
+
+
+def at_rest_in_wal_mode():
+    """True for a WAL-mode database that no connection has open (no -wal file)."""
+    try:
+        with open(DB, "rb") as handle:
+            header = handle.read(20)
+    except OSError:
+        return False
+    # Bytes 18 and 19 of the header are the file format versions; 2 is WAL.
+    return header.startswith(b"SQLite format 3\x00") and header[18:20] == b"\x02\x02" \
+        and not os.path.exists(DB + "-wal")
 
 
 def read_rows():
     """Voquill's rows that still have audio on disk, or None if the database
-    cannot be read right now."""
+    cannot be read right now. Raises sqlite3.Error when it can be read but
+    no longer has what the keeper asks for."""
     if not os.path.isfile(DB):
         return None
+    # immutable=1 reads the file as it is, without the -shm and -wal files a
+    # WAL database otherwise needs; safe only while no writer has it open.
+    uri = f"file:{DB}?mode=ro" + ("&immutable=1" if at_rest_in_wal_mode() else "")
     try:
-        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=DB_BUSY_SECONDS)
+        con = sqlite3.connect(uri, uri=True, timeout=DB_BUSY_SECONDS)
         try:
             con.row_factory = sqlite3.Row
             rows = con.execute(
@@ -84,8 +115,11 @@ def read_rows():
             ).fetchall()
         finally:
             con.close()
-    except sqlite3.Error:
-        return None
+    except sqlite3.Error as error:
+        code = getattr(error, "sqlite_errorcode", None)
+        if code is not None and code & 0xFF in NOT_NOW:
+            return None
+        raise
     usable = []
     for row in rows:
         clip_id = row["id"]
@@ -128,7 +162,12 @@ def close_to_others(path):
 
 def main():
     os.umask(0o077)
-    rows = read_rows()
+    try:
+        rows = read_rows()
+    except sqlite3.Error as error:
+        print(f"stt-corpus-keep: Voquill's database no longer has what the keeper reads ({error}); "
+              "clips are NOT being kept until scripts/stt-corpus-keep.py matches it", file=sys.stderr)
+        return 1
     if rows is None:
         print("stt-corpus-keep: Voquill's database is not readable right now; nothing done")
         return 0

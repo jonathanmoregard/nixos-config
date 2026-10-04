@@ -320,6 +320,24 @@ in
         if exists(f"{corpus}/voquill/clip-a.wav"):
             problems.append("the dropped clip's file is still in the corpus")
 
+        # A burst: several short dictations in a row (or history being
+        # cleared) start the keeper many times within seconds. systemd's
+        # default start limit (5 starts in 10 s) would fail the service and
+        # take the path unit down with it until the next login. The timer is
+        # stopped, so only the file events can bring these clips in.
+        user("systemctl --user stop stt-corpus-keep.timer")
+        for n in range(8):
+            user(f"{fixture} add burst-{n} {5000 + n} rowfirst")
+            dellan.succeed("sleep 0.5")
+        expect("every clip of a burst of recordings", "burst-5 burst-6 burst-7", 30)
+        path_state = prop("stt-corpus-keep.path", "ActiveState")
+        path_result = prop("stt-corpus-keep.path", "Result")
+        if path_state != "active":
+            problems.append(
+                f"after a burst of recordings the path unit is {path_state} (Result={path_result}), not active")
+        dellan.execute(
+            f"su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/{uid} systemctl --user start stt-corpus-keep.timer'")
+
         # No database (Voquill not installed yet, or its folder moved): the
         # unit still ends well, and the corpus stays as it is.
         dellan.succeed(f"mv {database} {database}.away")
@@ -328,7 +346,7 @@ in
         result = prop("stt-corpus-keep.service", "Result")
         if status != 0 or result != "success":
             problems.append(f"without a database the keeper failed (start exited {status}, Result={result})")
-        if kept() != "clip-b clip-c clip-d":
+        if kept() != "burst-5 burst-6 burst-7":
             problems.append(f"without a database the corpus changed: [{kept()}]")
         dellan.succeed(f"mv {database}.away {database}")
 

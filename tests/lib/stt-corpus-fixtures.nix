@@ -69,7 +69,16 @@
         while not os.path.exists(release):
             time.sleep(0.05)
         con.execute("rollback")
+    elif what == "wal":
+        # The journal mode of the real app's database. Once the last
+        # connection closes, sqlite removes the -wal and -shm files again.
+        con.execute("pragma journal_mode=wal").fetchall()
+    elif what == "drift":
+        # An app update that drops a column the keeper reads.
+        con.execute("alter table transcriptions drop column post_process_mode")
+        con.commit()
     else:
         sys.exit("unknown fixture command " + what)
+    con.close()
   '';
 }

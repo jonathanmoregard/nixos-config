@@ -161,6 +161,30 @@ pkgs.runCommand "stt-corpus-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq 
   [ ! -e $STT_CORPUS_DIR/voquill/old-1.wav ] || fail "a dropped clip's file is still there"
   [ "$(head -1 "$manifest"; cd $STT_CORPUS_DIR/voquill && sha256sum old-2.wav)" = "$(sed -n 2p <<< "$earlier"; sed -n 4p <<< "$earlier")" ] || fail "the surviving earlier clip was altered"
 
+  # The real app keeps its database in WAL mode. While nobody has it open
+  # there is no -wal file, and a plain read-only open would create one (and
+  # a -shm) in Voquill's folder. The keeper leaves nothing there, and the
+  # clip still arrives.
+  voquill wal
+  voquill add clip-h 9000
+  theirs=$(state $PWD/voquill)
+  STT_CORPUS_MAX_CLIPS=400 keep
+  [ "$(ids | tr ' ' '\n' | tail -1)" = "clip-h" ] || fail "a clip from a WAL database did not arrive: $(ids)"
+  [ "$(state $PWD/voquill)" = "$theirs" ] || fail "reading a WAL database left something in Voquill's folder: $(diff <(echo "$theirs") <(state $PWD/voquill))"
+
+  # An app update changed the table (a column the keeper reads is gone).
+  # That is not "try again later": every later run would end the same way
+  # while Voquill prunes clips nobody copied. The run fails and says what is
+  # missing, so the unit shows as failed; the corpus stays as it is.
+  cp $FAKE_VOQUILL_DB $PWD/drifted.db
+  FAKE_VOQUILL_DB=$PWD/drifted.db voquill drift
+  ours=$(state $STT_CORPUS_DIR)
+  if STT_CORPUS_VOQUILL_DB=$PWD/drifted.db ${keeperCommand} > $PWD/keep.log 2>&1; then
+    fail "a table the keeper can no longer read ended the run successfully: $(cat $PWD/keep.log)"
+  fi
+  grep -q 'post_process_mode' $PWD/keep.log || fail "the failure does not name what is missing: $(cat $PWD/keep.log)"
+  [ "$(state $STT_CORPUS_DIR)" = "$ours" ] || fail "a failed run changed the corpus"
+
   echo "stt-corpus: all assertions passed"
   touch $out
 ''

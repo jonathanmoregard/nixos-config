@@ -72,6 +72,13 @@ in
   config = {
     systemd.user.services.stt-corpus-keep = {
       description = "Keep Voquill's dictation clips in the local STT test corpus";
+      # Every recording starts a run, and a few short dictations in a row
+      # are more than systemd's default of 5 starts in 10 s. Hitting that
+      # limit fails the service and the path unit with it
+      # (unit-start-limit-hit), and then nothing is kept until the next
+      # login. A run is a moment of idle-priority work; there is nothing to
+      # limit.
+      unitConfig.StartLimitIntervalSec = 0;
       environment = {
         STT_CORPUS_DIR = cfg.dir;
         STT_CORPUS_MAX_CLIPS = toString cfg.maxClips;
