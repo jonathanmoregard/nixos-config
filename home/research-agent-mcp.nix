@@ -8,10 +8,12 @@
 #  1. The injection-scanner L3 honeypot calls Anthropic + OpenAI on every
 #     scan. Without ANTHROPIC_API_KEY / OPENAI_API_KEY in the spawn env,
 #     smoke fails closed and the server exits before binding stdio.
-#  2. The research agent itself (inside the dev container) needs EXA +
-#     TAVILY for search providers and a Claude Code OAuth token to drive
-#     the headless `claude` CLI. Without these, `research()` calls fail
-#     at the first tool invocation with `<provider>-api-key not in keyring`.
+#  2. The research agent itself (inside the microvm) needs a Claude Code
+#     OAuth token to drive the headless `claude` CLI. Its search/shopping/
+#     trademark API keys are NOT exported here any more: research-broker
+#     (modules/nixos/research-broker.nix) holds them host-side and the MCP
+#     server registers each run on the broker's admin socket. Only
+#     EXA_API_KEY stays, for the host-side fast path (_direct_exa).
 #
 # The MCP server's secret loader prefers env vars before falling back to
 # the GNOME keyring (see `_SECRET_ENV` in mcp_server/server.py). On NixOS
@@ -56,29 +58,20 @@ in
         # injection-scanner L2 (Lakera Guard) is fail-closed — without this
         # the scanner rejects every report. Must be a real key.
         LAKERA_API_KEY=$(< /run/agenix/lakera-api-key)
+        # Host-side Exa fast path (_direct_exa) only; the in-VM search
+        # goes through research-broker, which reads its own copy.
         EXA_API_KEY=$(< /run/agenix/exa-api-key)
-        TAVILY_API_KEY=$(< /run/agenix/tavily-api-key)
         CLAUDE_CODE_OAUTH_TOKEN=$(< /run/agenix/claude-token)
-        # EUIPO OAuth2 client_credentials for the trademark_shim. Both
-        # files start empty (placeholder) and decrypt to empty strings
-        # until the EUIPO dev-portal subscription is approved; the shim's
-        # _clean_env() guard treats an empty value as unset and the tool
-        # errors cleanly only when actually called — so existing research
-        # paths keep working with the secrets unset.
-        EUIPO_CLIENT_ID=$(< /run/agenix/euipo-client-id)
-        EUIPO_CLIENT_SECRET=$(< /run/agenix/euipo-client-secret)
-        # eBay + Tradera keys for the shopping shim. Same placeholder
-        # model as EUIPO: empty until the developer keys are filled in,
-        # and an empty value reads as "not configured".
-        EBAY_CLIENT_ID=$(< /run/agenix/ebay-client-id)
-        EBAY_CLIENT_SECRET=$(< /run/agenix/ebay-client-secret)
-        TRADERA_APP_ID=$(< /run/agenix/tradera-app-id)
-        TRADERA_APP_KEY=$(< /run/agenix/tradera-app-key)
+        # Tavily, EUIPO, eBay and Tradera keys are root-only now and read
+        # by research-broker alone (LoadCredential); reading them here
+        # would fail.
         export ANTHROPIC_API_KEY OPENAI_API_KEY LAKERA_API_KEY \
-               EXA_API_KEY TAVILY_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
-               EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET \
-               EBAY_CLIENT_ID EBAY_CLIENT_SECRET \
-               TRADERA_APP_ID TRADERA_APP_KEY
+               EXA_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+
+        # research-broker admin socket (0600 jonathan): the MCP server
+        # registers each agent dial here and gets the per-run token it
+        # ships to the VM. Override-friendly like the others.
+        export RESEARCH_BROKER_ADMIN="''${RESEARCH_BROKER_ADMIN:-/run/research-broker/admin.sock}"
 
         # Lakera Guard tuned-policy project (not a secret — see
         # home/lakera.nix). injection_scanner/lakera.py sends

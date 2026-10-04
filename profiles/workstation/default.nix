@@ -58,6 +58,9 @@
     # scraper microvm — sibling to research-agent for JS-rendering
     # crawls. See module header for the trust-boundary rationale.
     ../../modules/nixos/scraper-microvm.nix
+    # Host-side egress broker: holds the research agent's third-party API
+    # keys and is the research VM's only path to them and to the scraper.
+    ../../modules/nixos/research-broker.nix
     ../../modules/nixos/scraper-microvm-healthcheck.nix
 
     # Host-level Android dev tooling. Provides adb on PATH + JDK17 for
@@ -177,6 +180,13 @@
     group = "users";
     mode = "0400";
   };
+  # Third-party research API keys (exa, tavily, euipo-*, ebay-*,
+  # tradera-*): read by research-broker.service through LoadCredential
+  # (modules/nixos/research-broker.nix), which PID 1 does as root; the
+  # research VM never sees them. Root-owned so a compromised jonathan-uid
+  # process cannot read them either. exa-api-key is the exception: the
+  # research-agent MCP server's host-side fast path (_direct_exa) also
+  # reads it, so it stays jonathan's.
   age.secrets.exa-api-key = {
     rekeyFile = ../../secrets/exa-api-key.age;
     owner = "jonathan";
@@ -185,8 +195,8 @@
   };
   age.secrets.tavily-api-key = {
     rekeyFile = ../../secrets/tavily-api-key.age;
-    owner = "jonathan";
-    group = "users";
+    owner = "root";
+    group = "root";
     mode = "0400";
   };
   age.secrets.gemini-api-key = {
@@ -209,56 +219,55 @@
   # ~/.claude/todo/backends/ticktick.py rewrites whenever it refreshes the
   # OAuth token. An agenix copy would be a snapshot of a moving value.
   # Enforced by checks.x86_64-linux.secrets-no-dead-credentials.
-  # EUIPO OAuth2 credentials for the research-agent's trademark_shim
-  # (queries the EU trademark register over its REST API). Both files
-  # are empty placeholders until the EUIPO developer-portal
-  # subscription is approved — the shim treats empty values as unset
-  # and errors cleanly only when the tool is actually called, so
-  # leaving these unset does not break any existing research path.
+  # EUIPO OAuth2 credentials for the research-agent's trademark search
+  # (EU trademark register REST API, called by research-broker). Both
+  # files are empty placeholders until the EUIPO developer-portal
+  # subscription is approved — the broker answers "not configured" for
+  # an empty value only when the tool is actually called, so leaving
+  # these unset does not break any existing research path.
   # When the keys land, replace the file contents with
   # `agenix -e euipo-client-id.age` / `euipo-client-secret.age`.
   age.secrets.euipo-client-id = {
     rekeyFile = ../../secrets/euipo-client-id.age;
-    owner = "jonathan";
-    group = "users";
+    owner = "root";
+    group = "root";
     mode = "0400";
   };
   age.secrets.euipo-client-secret = {
     rekeyFile = ../../secrets/euipo-client-secret.age;
-    owner = "jonathan";
-    group = "users";
+    owner = "root";
+    group = "root";
     mode = "0400";
   };
 
   # eBay Browse API (client_credentials) and Tradera API keys for the
-  # research-agent's shopping shim (ebay_search / tradera_search). Same
-  # placeholder model as EUIPO above: the files decrypt to empty strings
-  # until the developer keys exist, and the shim answers "not configured"
-  # for an empty value. Fill with
+  # research-agent's shopping search (ebay_search / tradera_search, via
+  # research-broker). Same placeholder model as EUIPO above: an empty
+  # file reads as "not configured". Fill with
   # `nix run .#agenix-rekey.x86_64-linux.edit-view -- edit secrets/<name>.age`
   # then `rekey`.
   age.secrets.ebay-client-id = {
     rekeyFile = ../../secrets/ebay-client-id.age;
-    owner = "jonathan";
-    group = "users";
+    owner = "root";
+    group = "root";
     mode = "0400";
   };
   age.secrets.ebay-client-secret = {
     rekeyFile = ../../secrets/ebay-client-secret.age;
-    owner = "jonathan";
-    group = "users";
+    owner = "root";
+    group = "root";
     mode = "0400";
   };
   age.secrets.tradera-app-id = {
     rekeyFile = ../../secrets/tradera-app-id.age;
-    owner = "jonathan";
-    group = "users";
+    owner = "root";
+    group = "root";
     mode = "0400";
   };
   age.secrets.tradera-app-key = {
     rekeyFile = ../../secrets/tradera-app-key.age;
-    owner = "jonathan";
-    group = "users";
+    owner = "root";
+    group = "root";
     mode = "0400";
   };
 
