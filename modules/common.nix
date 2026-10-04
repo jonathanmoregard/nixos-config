@@ -121,7 +121,7 @@
       "https://jonathanmoregard.cachix.org"
     ];
     trusted-public-keys = [
-      "jonathanmoregard.cachix.org-1:Qzksr/c2ciAaV4j/U2mGFd1HTgOAicks8gJNs1Ztxo8="
+      "jonathanmoregard.cachix.org-1:dx2ddtW26xQClPgpJYu0ba6B3n/2FGGLw96vpREEw7w="
     ];
   };
 }
