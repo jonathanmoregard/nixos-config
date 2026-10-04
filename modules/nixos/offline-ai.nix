@@ -191,8 +191,11 @@ let
     # 15 GB of GTT after a big batch, which is what thrashed the model).
     "aggregator-embed.service"
     "aggregator-embed-server.service"
-    # local-stt.nix: the router first, then the three models behind it (~3 GB).
+    # local-stt.nix: the router first, then its listening socket (left open,
+    # a connection would start the router again, and the router wants the
+    # models), then the three models behind it (~3 GB).
     "local-stt.service"
+    "local-stt.socket"
     "local-stt-general.service"
     "local-stt-general-short.service"
     "local-stt-swedish.service"
@@ -209,6 +212,9 @@ let
     "router-ingestor-scan.service"
     "voquill.service"
     "local-stt.service"
+    # A switch starts sockets.target again, and with it a socket it finds
+    # stopped.
+    "local-stt.socket"
     "local-stt-general.service"
     "local-stt-general-short.service"
     "local-stt-swedish.service"

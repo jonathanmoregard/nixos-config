@@ -116,6 +116,15 @@ let
       ExecStart=${pkgs.coreutils}/bin/sleep 60
     '';
 
+  # voquill.service with a sleeper in place of the app, which is built outside
+  # Nix and absent from the VM. Everything else about the unit is the deployed
+  # file, which is what the switch test below reads.
+  voquillSwitchProbe = pkgs.writeText "vm-base-voquill-switch-probe.conf" ''
+    [Service]
+    ExecStart=
+    ExecStart=${pkgs.coreutils}/bin/sleep 300
+  '';
+
   # Anonymous-memory pressure fixture for the behavioral OOMD assertion. VM
   # lowers only ram-heavy.slice's runtime threshold before launching this;
   # production thresholds remain untouched.
@@ -3060,6 +3069,53 @@ in
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user show -P MainPID embed-restart-canary.service'"
     ).strip()
+
+    # VOQUILL RIDES THE SAME SWITCH. A recording lives inside the app, so a
+    # restart loses the dictation being spoken: 2026-10-04 a deploy changed
+    # voquill.service and sd-switch restarted it mid-sentence. The real unit
+    # file goes through the same sd-switch run as the embed worker, with only
+    # its ExecStart swapped for a sleeper (the app is built outside Nix and is
+    # not in the VM); the canary above is the negative control for both.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user stop voquill.service'"
+    )
+    dellan.succeed(
+        "install -D -o jonathan -g users -m 0644 "
+        "${voquillSwitchProbe} "
+        "/home/jonathan/.config/systemd/user/"
+        "voquill.service.d/switch-probe.conf"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "systemctl --user daemon-reload && "
+        "systemctl --user start voquill.service'"
+    )
+    voquill_pid_before = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -P MainPID voquill.service'"
+    ).strip()
+    assert voquill_pid_before != "0", "the voquill probe did not start"
+    voquill_managed_target = dellan.succeed(
+        "readlink -f /home/jonathan/.config/systemd/user/voquill.service"
+    ).strip()
+    dellan.succeed(
+        "cp /home/jonathan/.config/systemd/user/voquill.service "
+        "/tmp/sd-switch-old/voquill.service && "
+        "cp /tmp/sd-switch-old/voquill.service "
+        "/tmp/sd-switch-new/voquill.service && "
+        "sed -i '/^\\[Service\\]/a Environment=DEPLOY_LIFECYCLE_PROBE=v2' "
+        "/tmp/sd-switch-new/voquill.service && "
+        # The generation being left has no say: the old copy loses its
+        # X-RestartIfChanged, as in the deploy that first brought it in.
+        "sed -i '/^X-RestartIfChanged=/d' /tmp/sd-switch-old/voquill.service && "
+        "chown jonathan:users /tmp/sd-switch-old/voquill.service "
+        "/tmp/sd-switch-new/voquill.service && "
+        "ln -sfn /tmp/sd-switch-new/voquill.service "
+        "/home/jonathan/.config/systemd/user/voquill.service && "
+        "chown -h jonathan:users "
+        "/home/jonathan/.config/systemd/user/voquill.service"
+    )
     dellan.succeed(
         "ln -sfn /tmp/sd-switch-new/aggregator-embed.service "
         "/home/jonathan/.config/systemd/user/aggregator-embed.service && "
@@ -3090,6 +3146,29 @@ in
     assert canary_pid_after != canary_pid_before, (
         "negative control did not restart, so sd-switch did not exercise "
         f"changed active units; output={sd_switch_out!r}"
+    )
+    voquill_pid_after = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -P MainPID voquill.service'"
+    ).strip()
+    assert voquill_pid_after == voquill_pid_before, (
+        "Home Manager's sd-switch restarted voquill.service when its unit "
+        "file changed, which loses the dictation being recorded: "
+        f"{voquill_pid_before} -> {voquill_pid_after}; output={sd_switch_out!r}"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user stop voquill.service'"
+    )
+    dellan.succeed(
+        f"ln -sfn {voquill_managed_target} "
+        "/home/jonathan/.config/systemd/user/voquill.service && "
+        "chown -h jonathan:users "
+        "/home/jonathan/.config/systemd/user/voquill.service && "
+        "rm -f /home/jonathan/.config/systemd/user/"
+        "voquill.service.d/switch-probe.conf && "
+        "rmdir --ignore-fail-on-non-empty "
+        "/home/jonathan/.config/systemd/user/voquill.service.d"
     )
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "

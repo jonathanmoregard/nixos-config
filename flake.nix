@@ -310,6 +310,10 @@
         vm-android-dev  = mkLane ./tests/android-dev.nix;
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
         vm-nix-gc       = mkLane ./tests/nix-gc.nix;
+        # The local-stt units under a real user manager and a real
+        # switch-to-configuration, whisper servers stubbed: a switch that
+        # changes the units does not cut a transcription in flight.
+        vm-local-stt    = mkLane ./tests/local-stt-switch.nix;
         # In ci.yml's vm-minimal matrix, and deliberately absent from
         # `discover`'s LANES so it never reports "cached" and always
         # executes — it gates credential handling and the sudo password
@@ -466,6 +470,16 @@
           pkgs = pkgsLinux;
           routerCommand = self.nixosConfigurations.tuxedo.config
             .systemd.user.services.local-stt.serviceConfig.ExecStart;
+        };
+        # Not a VM lane: runs the dictation corpus keeper with the exact
+        # command tuxedo's unit starts, against a stand-in for Voquill's
+        # database and audio folder (synthetic clips only) — clips arrive
+        # before Voquill prunes them, the cap drops the oldest, a database
+        # that cannot be read changes nothing, Voquill's side is only read.
+        stt-corpus = import ./tests/stt-corpus.nix {
+          pkgs = pkgsLinux;
+          keeperCommand = self.nixosConfigurations.tuxedo.config
+            .systemd.user.services.stt-corpus-keep.serviceConfig.ExecStart;
         };
         # Not a VM lane: runtime-invocation harness for `add-secret`
         # (home/add-secret.nix). Exercises name validation, worktree

@@ -148,6 +148,12 @@ in
       Description = "Voquill voice-typing";
       After = [ "graphical-session.target" ];
       PartOf = [ "graphical-session.target" ];
+      # A recording lives inside the app, so restarting it loses the
+      # dictation being spoken: 2026-10-04 a deploy changed this unit and
+      # Home Manager's sd-switch restarted it mid-sentence. Keep the running
+      # app across switches; a changed unit takes effect at the next login
+      # (the app itself is built outside Nix and never changes with a deploy).
+      X-RestartIfChanged = false;
     };
     Service = {
       Type = "simple";

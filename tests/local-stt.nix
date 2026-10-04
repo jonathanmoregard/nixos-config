@@ -28,126 +28,23 @@
 #     performance power profile once at a time through powerprofilesctl and
 #     leaves ai-throttle's foreground hint; a transcription takes the same
 #     hold; without powerprofilesctl the hint is still left and 204 still
-#     answered.
+#     answered;
+#   - a restart loses no dictation: the router, told to stop, answers the
+#     request it holds before it exits; a request that finds a whisper server
+#     gone (not listening, or dead with the request in hand) waits for it and
+#     is answered by the new process; on a socket handed over the systemd way
+#     a request sent between two router processes waits and is answered. Each
+#     with a negative control that is cut. A model that stays away is waited
+#     for once, not on every request, and the short-window model never is.
+#     (The same under a real user manager and a real switch:
+#     tests/local-stt-switch.nix.)
 #
 # Run: nix build .#checks.x86_64-linux.local-stt -L
 { pkgs, routerCommand }:
 let
-  stub = pkgs.writeText "whisper-stub.py" ''
-    import json, sys, time
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    port, name, log = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-    # Optional: seconds to sit on every request before answering (a wedged server).
-    delay = float(sys.argv[4]) if len(sys.argv) > 4 else 0
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def do_POST(self):
-            body = self.rfile.read(int(self.headers["Content-Length"]))
-            raw = body.split(b"\r\n\r\n")[-1].split(b"\r\n--")[0]
-            # The client sends a bare token or a WAV whose samples start with
-            # the token; the stub only needs the token.
-            audio = (raw[44:] if raw.startswith(b"RIFF") else raw).split(b"\0")[0].decode()
-            asked = {"audio": audio, "prompt": b'name="prompt"' in body,
-                     "language": body.split(b'name="language"\r\n\r\n')[1].split(b"\r\n")[0].decode()}
-            with open(log, "a") as f:
-                f.write(json.dumps(asked) + "\n")
-            time.sleep(delay)
-            lang = "sv" if audio.startswith("SV") else "en"
-            if asked["language"] not in ("auto", ""):
-                lang = asked["language"]
-            # Like whisper-server: several candidates, the detected one not first.
-            reply = {"language_probabilities": {"no": 0.001, "en": 0.004, lang: 0.99},
-                     "segments": [{"text": " " + name + " hear"}, {"text": "d it"}]}
-            data = json.dumps(reply).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
-  '';
-
-  client = pkgs.writeText "local-stt-client.py" ''
-    import json, os, sys, urllib.error, urllib.request, uuid
-
-    # The router under test; a second instance (other settings) listens elsewhere.
-    base = "http://127.0.0.1:" + os.environ.get("LOCAL_STT_TEST_PORT", "18765")
-
-    def wav(token, seconds):
-        # 16 kHz mono 16-bit silence of the given length, the token in its first bytes.
-        size = int(seconds * 32000)
-        data = token.encode().ljust(size, b"\0")
-        header = (b"RIFF" + (36 + size).to_bytes(4, "little") + b"WAVEfmt " + (16).to_bytes(4, "little")
-                  + (1).to_bytes(2, "little") + (1).to_bytes(2, "little") + (16000).to_bytes(4, "little")
-                  + (32000).to_bytes(4, "little") + (2).to_bytes(2, "little") + (16).to_bytes(2, "little")
-                  + b"data" + size.to_bytes(4, "little"))
-        return header + data
-
-    def call(audio, language=None, prompt=None, with_file=True, seconds=None):
-        b = uuid.uuid4().hex
-        body = f'--{b}\r\nContent-Disposition: form-data; name="model"\r\n\r\nlocal-stt\r\n'.encode()
-        if language:
-            body += f'--{b}\r\nContent-Disposition: form-data; name="language"\r\n\r\n{language}\r\n'.encode()
-        if prompt:
-            body += f'--{b}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n{prompt}\r\n'.encode()
-        if with_file:
-            body += (f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
-                     f'Content-Type: audio/wav\r\n\r\n').encode()
-            body += (wav(audio, seconds) if seconds is not None else audio.encode()) + b'\r\n'
-        body += f'--{b}--\r\n'.encode()
-        req = urllib.request.Request(base + "/v1/audio/transcriptions", data=body,
-                                     headers={"Content-Type": f"multipart/form-data; boundary={b}"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return r.status, json.load(r)
-        except urllib.error.HTTPError as e:
-            return e.code, json.load(e)
-        except (urllib.error.URLError, OSError) as e:
-            # No answer at all (e.g. the router held the request): a status of its own.
-            return 599, {"error": str(e)}
-
-    what = sys.argv[1]
-    if what == "models":
-        with urllib.request.urlopen(base + "/v1/models", timeout=10) as r:
-            print(json.dumps(json.load(r)))
-    elif what == "nofile":
-        print(json.dumps(call("", with_file=False)))
-    elif what in ("prepare", "prepare-post"):
-        # The record-start ping, from the webview origin: status and headers.
-        path = sys.argv[2] if len(sys.argv) > 2 else "/v1/prepare"
-        req = urllib.request.Request(base + path, method="POST" if what == "prepare-post" else "GET",
-                                     data=b"" if what == "prepare-post" else None,
-                                     headers={"Origin": "tauri://localhost"})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                print(json.dumps([r.status, {k.lower(): v for k, v in r.headers.items()}]))
-        except urllib.error.HTTPError as e:
-            print(json.dumps([e.code, {k.lower(): v for k, v in e.headers.items()}]))
-    elif what in ("preflight", "models-headers"):
-        # A browser-side caller: status and response headers, keys lowercased.
-        origin = sys.argv[2]
-        if what == "preflight":
-            # Third argument: the headers the page wants to send (default: a bare key).
-            requested = sys.argv[3] if len(sys.argv) > 3 else "authorization"
-            req = urllib.request.Request(base + "/models", method="OPTIONS", headers={
-                "Origin": origin, "Access-Control-Request-Method": "GET",
-                "Access-Control-Request-Headers": requested})
-        else:
-            req = urllib.request.Request(base + "/v1/models", headers={"Origin": origin})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                print(json.dumps([r.status, {k.lower(): v for k, v in r.headers.items()}]))
-        except urllib.error.HTTPError as e:
-            print(json.dumps([e.code, {k.lower(): v for k, v in e.headers.items()}]))
-    else:
-        audio, language, prompt, seconds = (sys.argv[1:] + ["", "", ""])[:4]
-        print(json.dumps(call(audio, language or None, prompt or None,
-                              seconds=float(seconds) if seconds else None)))
-  '';
+  # The stub whisper server, the client and the socket holder: shared with
+  # the VM lane (tests/local-stt-switch.nix).
+  inherit (import ./lib/local-stt-fixtures.nix { inherit pkgs; }) stub client socketHolder;
 in
 pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]; } ''
   set -euo pipefail
@@ -156,6 +53,10 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   export LOCAL_STT_SWEDISH=http://127.0.0.1:18764
   export LOCAL_STT_GENERAL_SHORT=http://127.0.0.1:18762
   export LOCAL_STT_SHORT_TIMEOUT=2
+  # How long a request waits for a model that is not there to come back (a
+  # restart). Short here, so the cases with a model down for good stay quick;
+  # the restart cases below set their own.
+  export LOCAL_STT_BACKEND_WAIT=4
   # The record-start boost's two side channels: a fake powerprofilesctl that
   # records how it was called and then runs the held command like the real
   # one, and a hint file in a directory that does not exist yet.
@@ -328,6 +229,144 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   [ "$(grep -c 'no powerprofilesctl' $PWD/router2.log)" = 1 ] || fail "a missing powerprofilesctl must be logged once: $(cat $PWD/router2.log)"
   kill "$router2"
 
+  # A deploy must not cut a dictation. 2026-10-04 a NixOS switch changed the
+  # unit files of the router and the three whisper servers and restarted all
+  # four while a dictation was in flight; the router died on SIGTERM with the
+  # request in hand and the dictation was lost. What must hold now, whichever
+  # of the four is restarted: a transcription already in flight returns its
+  # text, and one that arrives while a server is away is answered once that
+  # server is back. The stubs hold a request for as long as <log>.hold exists,
+  # so "in flight" below is a fact, not a race.
+  hold() { touch "$log.$1.hold"; }
+  release() { rm -f "$log.$1.hold"; }
+  asked_times() { if [ -f "$log.$1" ]; then grep -c "\"audio\": \"$2\"" "$log.$1" || true; else echo 0; fi; }
+  wait_asked() {
+    for _ in $(seq 200); do
+      [ "$(asked_times "$1" "$2")" -ge "$3" ] && return 0
+      sleep 0.05
+    done
+    fail "the $1 model was not asked for $2 $3 time(s): $(cat "$log.$1" 2>/dev/null)"
+  }
+  wait_gone() {
+    for _ in $(seq "$2"); do
+      kill -0 "$1" 2>/dev/null || return 0
+      sleep 0.1
+    done
+    return 1
+  }
+  status() { jq -r '.[0]' "$1"; }
+  text() { jq -r '.[1].text' "$1"; }
+  start_router() {
+    mkdir -p "$PWD/$1"
+    PPD_LOG=$PWD/$1/calls LOCAL_STT_PORT=18768 LOCAL_STT_THROTTLE_HINT=$PWD/$1/hint \
+      ${routerCommand} > "$PWD/$1/log" 2>&1 &
+  }
+
+  # The router is told to stop (SIGTERM, what systemd sends on a restart)
+  # with a transcription in flight: the caller still gets the text, and only
+  # then does the router exit, cleanly.
+  start_router r4; router4=$!
+  wait_port 18768
+  hold general
+  LOCAL_STT_TEST_PORT=18768 ask EN-inflight > $PWD/r4/inflight & inflight=$!
+  wait_asked general EN-inflight 1
+  kill -TERM "$router4"
+  sleep 1
+  kill -0 "$router4" 2>/dev/null || fail "the router exited on SIGTERM with a transcription in flight: $(cat $PWD/r4/log)"
+  release general
+  wait "$inflight"
+  [ "$(status $PWD/r4/inflight)" = 200 ] && [ "$(text $PWD/r4/inflight)" = "general heard it" ] \
+    || fail "a transcription in flight when the router was told to stop: $(cat $PWD/r4/inflight)"
+  rc=0; wait "$router4" || rc=$?
+  [ "$rc" = 0 ] || fail "the router did not exit cleanly once its request was answered (status $rc): $(cat $PWD/r4/log)"
+  # Negative control: the same request with the router killed outright is
+  # lost, so the case above did have its request in flight across the signal.
+  start_router r4k; router4k=$!
+  wait_port 18768
+  hold general
+  LOCAL_STT_TEST_PORT=18768 ask EN-killed > $PWD/r4k/inflight & inflight=$!
+  wait_asked general EN-killed 1
+  kill -KILL "$router4k"; wait "$router4k" 2>/dev/null || true
+  wait "$inflight"
+  [ "$(status $PWD/r4k/inflight)" = 599 ] || fail "negative control: a killed router still answered: $(cat $PWD/r4k/inflight)"
+  release general
+
+  # A client that connected and never sent a request does not keep a stopping
+  # router alive: it is given LOCAL_STT_CLIENT_IDLE seconds, not for ever. A
+  # router that waited on it would hold every queued dictation behind it.
+  LOCAL_STT_CLIENT_IDLE=2 start_router r4i; router4i=$!
+  wait_port 18768
+  python3 -c "import socket, time; s = socket.create_connection(('127.0.0.1', 18768)); time.sleep(120)" &
+  silent=$!
+  sleep 0.5
+  kill -TERM "$router4i"
+  wait_gone "$router4i" 100 || fail "a silent connection kept the stopping router alive: $(cat $PWD/r4i/log)"
+  kill "$silent" 2>/dev/null || true
+
+  # A whisper server is restarted (a deploy changed its unit, or it crashed):
+  # the request that finds it gone waits for it, bounded by
+  # LOCAL_STT_BACKEND_WAIT, and is answered by the new process.
+  LOCAL_STT_BACKEND_WAIT=60 start_router r5; router5=$!
+  wait_port 18768
+  kill "$general"; wait "$general" 2>/dev/null || true
+  LOCAL_STT_TEST_PORT=18768 ask EN-while-down > $PWD/r5/down & waiting=$!
+  # The request has reached the router and found the server gone...
+  for _ in $(seq 200); do grep -q 'not answering' $PWD/r5/log && break; sleep 0.05; done
+  grep -q 'not answering' $PWD/r5/log \
+    || fail "a request with the general model down was not held for it: $(cat $PWD/r5/log) $(cat $PWD/r5/down 2>/dev/null)"
+  # ...and the server comes back.
+  general=$(start_stub 18763 general)
+  wait "$waiting"
+  [ "$(status $PWD/r5/down)" = 200 ] && [ "$(text $PWD/r5/down)" = "general heard it" ] \
+    || fail "a request that arrived while the general model was restarting: $(cat $PWD/r5/down)"
+
+  # The server dies with the request in hand (no answer, connection gone):
+  # the audio is sent again to the new process, and the caller gets the text.
+  hold general
+  LOCAL_STT_TEST_PORT=18768 ask EN-dropped > $PWD/r5/dropped & waiting=$!
+  wait_asked general EN-dropped 1
+  kill -KILL "$general"; wait "$general" 2>/dev/null || true
+  general=$(start_stub 18763 general)
+  wait_asked general EN-dropped 2
+  release general
+  wait "$waiting"
+  [ "$(status $PWD/r5/dropped)" = 200 ] && [ "$(text $PWD/r5/dropped)" = "general heard it" ] \
+    || fail "a request whose backend died under it: $(cat $PWD/r5/dropped)"
+  kill -TERM "$router5"; wait "$router5" 2>/dev/null || true
+
+  # The router's own restart. Under systemd the listening socket belongs to
+  # local-stt.socket and is handed to each router process, so the port stays
+  # open while one process stops and the next starts: a dictation that ends
+  # in that moment waits in the socket's queue and is answered by the new
+  # process. The holder stands in for systemd (same LISTEN_FDS protocol).
+  mkdir -p $PWD/r6
+  PPD_LOG=$PWD/r6/calls LOCAL_STT_PORT=18769 LOCAL_STT_THROTTLE_HINT=$PWD/r6/hint \
+    python3 ${socketHolder} 18769 $PWD/r6 ${routerCommand} > $PWD/r6/log 2>&1 &
+  holder=$!
+  wait_port 18769
+  touch $PWD/r6/start
+  for _ in $(seq 100); do [ -s $PWD/r6/pid ] && break; sleep 0.05; done
+  first=$(cat $PWD/r6/pid)
+  LOCAL_STT_TEST_PORT=18769 LOCAL_STT_TEST_TIMEOUT=10 ask EN-hello > $PWD/r6/first
+  [ "$(status $PWD/r6/first)" = 200 ] && [ "$(text $PWD/r6/first)" = "general heard it" ] \
+    || fail "the router did not serve on the socket it was handed: $(cat $PWD/r6/first) $(cat $PWD/r6/log)"
+  kill -TERM "$first"
+  for _ in $(seq 100); do [ -s $PWD/r6/exited ] && break; sleep 0.1; done
+  [ "$(cat $PWD/r6/exited)" = 0 ] || fail "the router on a handed socket did not stop cleanly: $(cat $PWD/r6/exited 2>/dev/null) $(cat $PWD/r6/log)"
+  LOCAL_STT_TEST_PORT=18769 ask EN-queued > $PWD/r6/queued & queued=$!
+  sleep 1
+  kill -0 "$queued" 2>/dev/null || fail "a request sent between two router processes did not wait: $(cat $PWD/r6/queued)"
+  touch $PWD/r6/start
+  wait "$queued"
+  [ "$(status $PWD/r6/queued)" = 200 ] && [ "$(text $PWD/r6/queued)" = "general heard it" ] \
+    || fail "a request sent between two router processes: $(cat $PWD/r6/queued) $(cat $PWD/r6/log)"
+  [ "$(cat $PWD/r6/pid)" != "$first" ] || fail "the queued request was not answered by a new router process"
+  kill "$holder" "$(cat $PWD/r6/pid)" 2>/dev/null || true
+  # Negative control: a router that binds its own port (as before) is simply
+  # not there between two processes; the same request is refused.
+  LOCAL_STT_TEST_PORT=18768 ask EN-refused > $PWD/r5/refused
+  [ "$(status $PWD/r5/refused)" = 599 ] || fail "negative control: a stopped router's own port still answered: $(cat $PWD/r5/refused)"
+
   # Short-window model wedged (accepts, never answers): the clip is not held
   # for the backend's long timeout but handed to the full-window model.
   kill "$short"; wait "$short" 2>/dev/null || true
@@ -338,18 +377,32 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "short clip with the short-window model wedged: $res"
   [ $((SECONDS - started)) -lt 15 ] || fail "a wedged short-window model held a short clip for $((SECONDS - started)) s"
 
-  # Short-window model down: short clips still answered, by the full-window one.
+  # Short-window model down: short clips still answered, by the full-window
+  # one, and at once. The short-window model is never waited for: the
+  # full-window one gives the same text a second later.
   kill "$short"; wait "$short" 2>/dev/null || true
+  started=$SECONDS
   res=$(ask EN-hello "" "" 3)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "short clip with the short-window model down: $res"
+  [ $((SECONDS - started)) -lt 3 ] || fail "a short clip waited $((SECONDS - started)) s for the short-window model instead of using the full window"
 
-  # Swedish model down: Swedish audio still answered, by the general model.
+  # Swedish model down: Swedish audio still answered, by the general model,
+  # once the Swedish one has had LOCAL_STT_BACKEND_WAIT seconds to come back.
   kill "$swedish"; wait "$swedish" 2>/dev/null || true
   res=$(ask SV-hej)
   [ "$(jq -r '.[0]' <<< "$res")" = 200 ] || fail "Swedish with its model down: $res"
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "fallback text: $res"
+  # A model that stayed away is not waited for again: the wait is for a
+  # restart, and every later request would otherwise pay it in full.
+  started=$SECONDS
   res=$(ask EN-anything sv)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "language=sv with its model down: $res"
+  [ $((SECONDS - started)) -lt 3 ] || fail "a model known to be down was waited for again ($((SECONDS - started)) s)"
+  # Back again, it is used again; nobody has to tell the router.
+  swedish=$(start_stub 18764 swedish)
+  wait_port 18764
+  res=$(ask EN-anything sv)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "swedish heard it" ] || fail "the Swedish model came back and was not used: $res"
 
   # General model down: an error the caller can see.
   kill "$general"; wait "$general" 2>/dev/null || true

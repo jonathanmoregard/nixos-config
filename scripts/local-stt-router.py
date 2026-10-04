@@ -50,8 +50,26 @@ any client ping. Without powerprofilesctl (a machine without
 power-profiles-daemon) the hint is still left and the request still served;
 the journal says so once.
 
+Restarts. A deploy restarts this router and the whisper servers whenever
+their units change, and a dictation may be in flight (2026-10-04: one was,
+and it was lost). Three things keep the caller from noticing:
+
+  - told to stop (SIGTERM), the router accepts nothing new, finishes the
+    requests it holds and only then exits; systemd's TimeoutStopSec bounds
+    that;
+  - under systemd the listening socket belongs to local-stt.socket and is
+    handed to each router process (LISTEN_FDS), so a request that arrives
+    between two processes waits in the socket's queue instead of being
+    refused;
+  - a whisper server that is not there (connection refused, or gone before
+    it answered) is waited for, up to LOCAL_STT_BACKEND_WAIT seconds, and the
+    audio is sent again; only then do the rules above for a server that is
+    down apply. The short-window server is never waited for: the full-window
+    one gives the same text a second later.
+
 Settings come from the environment (the systemd unit sets them):
-  LOCAL_STT_PORT           port to listen on (127.0.0.1 only)
+  LOCAL_STT_PORT           port to listen on (127.0.0.1 only), unless systemd
+                           hands over a socket
   LOCAL_STT_GENERAL        base URL of the turbo whisper-server (full window)
   LOCAL_STT_GENERAL_SHORT  base URL of the turbo whisper-server with the
                            15-second window (default: LOCAL_STT_GENERAL)
@@ -64,17 +82,25 @@ Settings come from the environment (the systemd unit sets them):
                            on PATH; none found = no performance hold)
   LOCAL_STT_THROTTLE_HINT  ai-throttle's foreground hint file (default
                            $XDG_RUNTIME_DIR/ai-throttle/foreground-hint)
+  LOCAL_STT_BACKEND_WAIT   seconds a request waits for a whisper server that
+                           is not there to come back (30)
+  LOCAL_STT_CLIENT_IDLE    seconds a connected client may stay silent before
+                           it is dropped (5)
 """
 
 import email.parser
 import email.policy
+import http.client
 import json
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -102,10 +128,24 @@ HOLD_SECONDS = max(1, int(os.environ.get("LOCAL_STT_HOLD_SECONDS", "30")))
 # runs Python between fork and exec, which CPython documents as unsafe with
 # threads, and a child stuck there would hold the single-flight slot forever.
 NICE = os.environ.get("LOCAL_STT_NICE") or shutil.which("nice")
+# Seconds a connected client may stay silent, before its request or between
+# two pieces of it. A stopping router waits for every connection it has
+# accepted, so one that never speaks must not be able to hold the stop, and
+# with it every dictation queued behind the restart.
+CLIENT_IDLE = float(os.environ.get("LOCAL_STT_CLIENT_IDLE", "5"))
+# Seconds a request waits for a whisper server that is not there to come
+# back. A server being restarted (a deploy changed its unit, or it crashed)
+# is away for the second or two it takes to load its model; the request
+# holds the audio and sends it again when the server listens.
+BACKEND_WAIT = float(os.environ.get("LOCAL_STT_BACKEND_WAIT", "30"))
 
 
 class BackendError(Exception):
     pass
+
+
+class BackendGone(BackendError):
+    """The backend was not there: a restart in progress, not an answer."""
 
 
 def log(message):
@@ -230,8 +270,15 @@ def transcribe(base, audio, language, prompt, timeout=TIMEOUT):
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             result = json.load(response)
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        raise BackendError(f"{base}: {e}") from e
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+        # URLError wraps the socket error met while connecting or sending.
+        # Refused, reset, or closed before or in the middle of the answer:
+        # the server is not there (any more). A timeout or an HTTP error is
+        # a server that is there and not doing its job, which waiting for a
+        # restart would not help.
+        cause = e.reason if isinstance(e, urllib.error.URLError) else e
+        gone = isinstance(cause, (ConnectionError, http.client.IncompleteRead))
+        raise (BackendGone if gone else BackendError)(f"{base}: {e}") from e
     if "error" in result:
         raise BackendError(f"{base}: {result['error']}")
     # whisper-server joins segments with a newline, and a segment can end in
@@ -246,6 +293,47 @@ def transcribe(base, audio, language, prompt, timeout=TIMEOUT):
     probabilities = result.get("language_probabilities") or {}
     detected = max(probabilities, key=probabilities.get) if probabilities else None
     return text.strip(), detected
+
+
+# Backends that stayed away for a whole BACKEND_WAIT, until they answer again.
+away = set()
+
+
+def reach(base, audio, language, prompt):
+    """transcribe(), waiting out a backend that is being restarted.
+
+    A backend that is not there is asked again, the audio sent anew each
+    time, until it answers or BACKEND_WAIT seconds have passed. One that
+    stayed away for the whole wait is remembered and asked once per request
+    from then on, so a model that is down for good (its file was never
+    fetched) costs the wait once, not on every dictation; its first answer
+    clears the mark.
+    """
+    patience = 0 if base in away else BACKEND_WAIT
+    # Only the time spent waiting counts against the patience: the seconds a
+    # request was in flight in a backend that then died are not the backend
+    # being away.
+    waited, pause = 0.0, 0.05
+    while True:
+        try:
+            result = transcribe(base, audio, language, prompt)
+        except BackendGone as e:
+            if waited + pause > patience:
+                if patience:
+                    log(f"{base} did not come back within {patience:g} s; "
+                        "it is not waited for again until it answers")
+                away.add(base)
+                raise
+            if not waited:
+                log(f"{e}: not answering; waiting up to {patience:g} s for it to come back")
+            time.sleep(pause)
+            waited += pause
+            pause = min(pause * 2, 1.0)
+        else:
+            if waited:
+                log(f"{base} is back")
+            away.discard(base)
+            return result
 
 
 def route(audio, language, prompt):
@@ -266,17 +354,17 @@ def route(audio, language, prompt):
                 print(f"local-stt: short-window model unavailable or slow, using the full window: {e}",
                       file=sys.stderr, flush=True)
         if text is None:
-            text, detected = transcribe(GENERAL, audio, language or "auto", prompt)
+            text, detected = reach(GENERAL, audio, language or "auto", prompt)
         if language or detected != "sv":
             return text, "turbo", note
     # Swedish accuracy first: kb-whisper always gets the full window.
     try:
-        return transcribe(SWEDISH, audio, "sv", prompt)[0], "kb-whisper", f"{clip}, 30 s window"
+        return reach(SWEDISH, audio, "sv", prompt)[0], "kb-whisper", f"{clip}, 30 s window"
     except BackendError as e:
         print(f"local-stt: Swedish model unavailable, answering with turbo's text: {e}",
               file=sys.stderr, flush=True)
     if text is None:
-        text = transcribe(GENERAL, audio, "sv", prompt)[0]
+        text = reach(GENERAL, audio, "sv", prompt)[0]
     return text, "turbo (Swedish model unavailable)", note
 
 
@@ -295,6 +383,10 @@ def local_origin(origin):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Applies to reads from and writes to the client only; the time a
+    # transcription takes is spent waiting on a backend, not on this socket.
+    timeout = CLIENT_IDLE
+
     def log_message(self, fmt, *args):
         log(fmt % args)
 
@@ -382,11 +474,51 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200, {"text": text})
 
 
+def handed_socket():
+    """The listening socket systemd holds for this unit (local-stt.socket), or None.
+
+    sd_listen_fds(3): LISTEN_PID names this process and LISTEN_FDS counts the
+    sockets passed, the first of them as fd 3. systemd keeps that socket open
+    while one router process stops and the next starts, so a connection made
+    in between waits in the socket's queue instead of being refused.
+    """
+    if os.environ.get("LISTEN_PID") != str(os.getpid()) or int(os.environ.get("LISTEN_FDS") or 0) < 1:
+        return None
+    return socket.socket(fileno=3)
+
+
+class Server(ThreadingHTTPServer):
+    # Not daemon threads: server_close() then waits for every request in
+    # flight, which is what lets a restart finish a dictation instead of
+    # dropping it (ThreadingHTTPServer's default kills them with the process).
+    daemon_threads = False
+
+    def __init__(self, handed):
+        # A handed socket is bound and listening already; without one (run by
+        # hand, or a unit without its .socket) the router binds PORT itself.
+        super().__init__(("127.0.0.1", PORT), Handler, bind_and_activate=handed is None)
+        if handed is not None:
+            self.socket.close()
+            self.socket = handed
+            self.server_address = handed.getsockname()
+
+
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    log(f"listening on 127.0.0.1:{PORT} (general {GENERAL}, Swedish {SWEDISH}, "
+    handed = handed_socket()
+    server = Server(handed)
+    # systemd stops a unit with SIGTERM, on a restart too. shutdown() blocks
+    # until serve_forever() has returned, and the handler runs in the thread
+    # serve_forever() is in, so it is called from another one.
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+    host, port = server.server_address[:2]
+    log(f"listening on {host}:{port}{' (socket handed over by systemd)' if handed else ''} "
+        f"(general {GENERAL}, Swedish {SWEDISH}, "
         f"performance hold via {POWERPROFILESCTL or 'nothing'}, hint {THROTTLE_HINT})")
     server.serve_forever()
+    log("told to stop: accepting nothing new, finishing the requests in flight")
+    server.server_close()
+    log("stopped")
 
 
 if __name__ == "__main__":
