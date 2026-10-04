@@ -134,7 +134,8 @@ let
       echo "$unit FAILED (result=$result status=$status)"
 
       if [ "$result" = exit-code ]; then
-        found=$(runuser -u "secbatch-$name" -- head -c 2000 "${stateRoot}/$name/latest/summary.txt" 2>/dev/null \
+        # timeout: a FIFO planted as summary.txt must not wedge the notifier.
+        found=$(timeout -k 5 10 runuser -u "secbatch-$name" -- head -c 2000 "${stateRoot}/$name/latest/summary.txt" 2>/dev/null \
           | tr '\n' ' ' | tr -cd 'A-Za-z0-9 =:;,.@_>-' | head -c 200 || true)
         what="exit $status: ''${found:-no summary.txt}"
       else
@@ -218,6 +219,7 @@ in
         serviceConfig = {
           Type = "oneshot";
           ExecStart = "${lib.getExe notify} %i";
+          TimeoutStartSec = "2min";
         };
       };
     } // lib.mapAttrs' (name: r: lib.nameValuePair "security-batch-${name}" {

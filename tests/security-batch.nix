@@ -38,6 +38,7 @@ let
           printf 'new=1 CVE-2099-0001 $(touch /tmp/pwned) \033[31m<b>`id`\n' > summary.txt
           exit 1 ;;
         symlink) ln -s /etc/sb-secret summary.txt; exit 1 ;;
+        fifo) mkfifo summary.txt; exit 1 ;;
         sleep) sleep 600 ;;
         short) sleep 5; echo "new=0" > summary.txt; exit 0 ;;
         rc75) exit 75 ;;
@@ -142,6 +143,13 @@ in
     m.fail(f"systemctl start {unit}")
     rec = failed_run(before)
     assert "TOPSECRET" not in json.dumps(rec), rec
+    assert "no summary.txt" in rec["summary"], rec
+
+    # A FIFO as summary.txt cannot wedge the notifier.
+    mode("fifo")
+    before = notified()
+    m.fail(f"systemctl start {unit}")
+    rec = failed_run(before)
     assert "no summary.txt" in rec["summary"], rec
 
     # ── 4. offline: skip, nothing changes ──

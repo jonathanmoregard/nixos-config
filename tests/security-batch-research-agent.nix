@@ -9,8 +9,8 @@
 #   - a new CVE below 7, or not yet scored: exit 0 (counted, not alerted);
 #   - a new CVE listed in accepted.txt: exit 0;
 #   - a unit's exposure score rising: exit 1, unless accepted.txt allows it;
-#   - vulnix crashing or printing non-JSON, or systemd-analyze giving no
-#     score: exit 3 — and the other step still ran;
+#   - vulnix crashing, printing non-JSON, or skipping over half the
+#     closure, or systemd-analyze giving no score: exit 3 — and the other step still ran;
 #   - summary.txt never carries vulnix's free-text descriptions.
 #
 # Run: nix build .#checks.x86_64-linux.security-batch-research-agent -L
@@ -20,8 +20,15 @@ let
     echo "vulnix $*" >> "$FAKE_LOG"
     vm=$(basename "$(dirname "''${*: -1}")")
     f="$FAKE_DIR/vulnix-$vm.json"
+    for _ in $(seq "$(cat "$FAKE_DIR/skipped" 2>/dev/null || echo 0)"); do
+      echo "DEBUG:vulnix.nix:Skipping closure path without deriver: x" >&2
+    done
     [ -f "$f" ] && cat "$f" || cat "$FAKE_DIR/vulnix.json"
     exit "$(cat "$FAKE_DIR/vulnix.rc" 2>/dev/null || echo 2)"
+  '';
+  # Closure size; vulnix's skip lines come from FAKE_DIR/skipped (default 0).
+  fakeNixStore = pkgs.writeShellScript "nix-store" ''
+    seq "$(cat "$FAKE_DIR/closure" 2>/dev/null || echo 500)"
   '';
   fakeAnalyze = pkgs.writeShellScript "systemd-analyze" ''
     unit=''${*: -1}
@@ -44,6 +51,7 @@ pkgs.runCommand "security-batch-research-agent-harness"
     mkdir -p fakebin fake
     ln -s ${fakeVulnix} fakebin/vulnix
     ln -s ${fakeAnalyze} fakebin/systemd-analyze
+    ln -s ${fakeNixStore} fakebin/nix-store
     export FAKE_DIR=$PWD/fake FAKE_LOG=$PWD/calls.log
 
     vuln() {  # vuln '<CVE>:<score|null> ...' → fake vulnix output
@@ -76,7 +84,7 @@ pkgs.runCommand "security-batch-research-agent-harness"
     [ "$rc" = 0 ] || fail "seeding run exited $rc"
     grep -q 'seeded=yes' <<< "$(summary)" || fail "seed not marked"
     [ "$(cat "$run/cves.txt")" = CVE-2025-0001 ] || fail "high CVE set wrong: $(cat "$run/cves.txt")"
-    [ "$(grep -c '^vulnix --closure --json' calls.log)" = 2 ] || fail "vulnix not run on both microVMs"
+    [ "$(grep -c '^vulnix -vv --closure --json' calls.log)" = 2 ] || fail "vulnix not run on both microVMs"
 
     # 2. Same findings as the baseline: clean.
     sweep "$seed"; [ "$rc" = 0 ] || fail "unchanged findings exited $rc"
@@ -128,6 +136,18 @@ pkgs.runCommand "security-batch-research-agent-harness"
     sweep "$seed"; [ "$rc" = 3 ] || fail "missing systemd-analyze score exited $rc"
     grep -q 'failed: systemd-analyze:microvm@scraper.service' <<< "$(summary)" || fail "analyze failure not named"
     grep -q 'tool_errors=5' <<< "$(summary)" || fail "every missing score is an error"
+    # Coverage floor: most of the closure skipped (no .drv) is a tool error,
+    # not a clean scan that would become the baseline; a few skips are fine.
+    base_scores; vuln "CVE-2025-0001:9.8"
+    echo 10 > fake/skipped
+    sweep "$seed"; [ "$rc" = 0 ] || fail "10 of 500 skipped exited $rc"
+    echo 300 > fake/skipped
+    sweep "$seed"; [ "$rc" = 3 ] || fail "300 of 500 skipped exited $rc"
+    grep -q 'failed: vulnix-research-agent-coverage,vulnix-scraper-coverage' <<< "$(summary)" || fail "coverage failure not named"
+    rm fake/skipped; echo 0 > fake/closure
+    sweep "$seed"; [ "$rc" = 3 ] || fail "empty closure exited $rc"
+    rm fake/closure
+
     # A new CVE AND a tool error: still 3, and the CVE is still reported.
     vuln "CVE-2025-0001:9.8 CVE-2025-0009:8.0"; scores "microvm@research-agent.service 9.4"
     sweep "$seed"; [ "$rc" = 3 ] || fail "new CVE + tool error exited $rc"

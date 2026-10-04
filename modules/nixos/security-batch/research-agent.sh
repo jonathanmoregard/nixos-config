@@ -41,11 +41,22 @@ accepted_cves=$(grep -oE '^[[:space:]]*CVE-[0-9]{4}-[0-9]+' "$accepted" | tr -d 
 for vm in "${vms[@]}"; do
   out="$run/vulnix-$vm.json"
   rc=0
-  vulnix --closure --json --cache-dir "${CACHE_DIRECTORY:-$run}/vulnix" \
+  vulnix -vv --closure --json --cache-dir "${CACHE_DIRECTORY:-$run}/vulnix" \
     "$microvms_dir/$vm/current" > "$out" 2> "$run/vulnix-$vm.err" || rc=$?
   # vulnix: 0 = nothing found, 2 = vulnerable; anything else is a failure.
   if { [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; } || ! jq -e 'type == "array"' "$out" > /dev/null 2>&1; then
     errors+=("vulnix-$vm")
+    continue
+  fi
+  # Coverage floor: vulnix silently skips closure paths whose .drv is gone,
+  # and an empty scan would pass and become the baseline. Over half the
+  # closure skipped is a tool error. (Relies on vulnix's -vv debug line; if
+  # that wording changes the floor stops tripping, it never false-fails.)
+  total=$(nix-store --query --requisites "$microvms_dir/$vm/current" 2> /dev/null | wc -l)
+  skipped=$(grep -c 'Skipping closure path' "$run/vulnix-$vm.err" || true)
+  echo "$vm closure=$total skipped=$skipped" >> "$run/coverage.txt"
+  if [ "$total" -eq 0 ] || [ $((skipped * 2)) -gt "$total" ]; then
+    errors+=("vulnix-$vm-coverage")
     continue
   fi
   jq -r '.[] | .cvssv3_basescore as $s | .affected_by[] | "\(.)\t\($s[.] // "none")"' "$out" >> "$run/cves.all"
