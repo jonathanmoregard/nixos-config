@@ -57,5 +57,16 @@ in
       hash = "sha256-K58PL588Hhk75FyXgU6b8IEAco8FIz8oGd1S0WgOjyQ="; # pragma: allowlist secret
     };
     env = old.env // { RUSTY_V8_SRC_BINDING_PATH = v8Binding; };
+    # Disk: cargoInstallPostBuildHook copies the WHOLE release dir to
+    # release-tmp, then installs only its top-level binaries. codex's
+    # release dir is tens of GB (deps, build scripts, thin-LTO + line
+    # tables), so the copy doubles it and ran the CI runner's 60G /nix
+    # loop out of space (run 37184584292). The implicit postBuild runs
+    # before postBuildHooks, so prune everything below the top level
+    # first; the top-level binaries are hardlinks and survive.
+    postBuild = (old.postBuild or "") + ''
+      releaseDir=target/${prev.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType
+      rm -rf "$releaseDir"/{deps,build,incremental,.fingerprint,examples}
+    '';
   });
 }
