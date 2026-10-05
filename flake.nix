@@ -374,6 +374,16 @@
         # (modules/nixos/ai-throttle.nix) — fake sysfs, cgroup and systemctl,
         # driven tick by tick. Seconds.
         ai-throttle = import ./tests/ai-throttle.nix { pkgs = pkgsLinux; };
+        # Not a VM lane: the cache-publisher gates (scripts/cache-publisher.py)
+        # against a stubbed GitHub/nix/cachix world. Every gate fails closed.
+        cache-publisher-unit = pkgsLinux.runCommand "cache-publisher-unit" {
+          nativeBuildInputs = [ pkgsLinux.python3 pkgsLinux.nix ];
+        } ''
+          CACHE_PUBLISHER_SRC=${./scripts/cache-publisher.py} \
+            python3 -W error::ResourceWarning ${./tests/cache-publisher/test_publisher.py} -v
+          touch $out
+        '';
+        vm-cache-publisher = mkLane ./tests/cache-publisher.nix;
         # Not a VM lane: fail-closed contract harness for the merged-or-
         # inactive worktree sweeper (home/worktree-sweep-script.nix). Builds
         # a fixture bare repo + worktrees with real git, stubs gh, and
