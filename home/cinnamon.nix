@@ -239,6 +239,9 @@ in
       tap-to-click = true;
       tap-and-drag = true;
       disable-while-typing = true;
+      # The Fn touchpad-toggle hotkey flips this key in the user dconf db, where
+      # it survives reboots (cursor stuck mid-screen). Pin it so a rebuild re-enables.
+      send-events = "enabled";
     };
 
     # --- Touchpad gestures ---
