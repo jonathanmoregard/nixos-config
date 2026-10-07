@@ -18,7 +18,7 @@
 # of the new tag. Drop this overlay once nixpkgs ships >= 0.149.0.
 final: prev:
 let
-  version = "0.149.0";
+  version = "0.160.1";
   # rusty_v8 prebuilt artifacts. Since 0.147 codex builds v8 with
   # `v8_enable_sandbox` (code-mode-runtime), which selects the
   # pointer-compression + sandbox variant of BOTH the static library and
@@ -49,12 +49,12 @@ in
       owner = "openai";
       repo = "codex";
       tag = "rust-v${version}";
-      hash = "sha256-SMVTW/CcGz4xxyeFe3KUf3Ns6jp+2SRMTvtA2o2+y7Q="; # pragma: allowlist secret
+      hash = "sha256-9oXMysQ+v4txGIhPsgh45xAAqWYglZjhdS50uxMPHz4="; # pragma: allowlist secret
     };
     cargoDeps = final.rustPlatform.fetchCargoVendor {
       inherit (finalAttrs) src sourceRoot;
       name = "codex-${version}";
-      hash = "sha256-K58PL588Hhk75FyXgU6b8IEAco8FIz8oGd1S0WgOjyQ="; # pragma: allowlist secret
+      hash = "sha256-DMRbIOynO0wGXjBxaXZJNKorD9YQv3fAoRTZ4iZEIE4="; # pragma: allowlist secret
     };
     env = old.env // { RUSTY_V8_SRC_BINDING_PATH = v8Binding; };
     # Disk: cargoInstallPostBuildHook copies the WHOLE release dir to
