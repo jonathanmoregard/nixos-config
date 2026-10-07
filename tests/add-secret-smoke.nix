@@ -6,6 +6,7 @@
 #   - name validation rejects invalid shapes (uppercase, leading digit)
 #   - preflight refuses when not in a nixos-config worktree root
 #   - refuses when the secret is already declared in the target file
+#   - interactive prompt mode displays both prompts and completes under a PTY
 #   - happy path (TEST_MODE=1):
 #       - writes secrets/<name>.age (valid age file — starts with the
 #         `age-encryption.org/v1` header)
