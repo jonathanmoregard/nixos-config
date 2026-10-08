@@ -36,6 +36,7 @@
     claude-desktop.url = "github:aaddrick/claude-desktop-debian";
     claude-desktop.inputs.nixpkgs.follows = "nixpkgs";
 
+    # The lockfile pins 0.161.0, above the 0.149.0 apply_patch security floor.
     codex-cli-nix.url = "github:sadjow/codex-cli-nix";
 
     # aggregator — the personal search index behind
