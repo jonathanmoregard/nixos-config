@@ -27,6 +27,8 @@
     cargo
     python3
     uv
+    # Editor
+    vscodium
     # Intentionally NOT included (drift-scan 2026-04-19):
     # - terraform: not used for now
     # - yt-dlp: not wanted
