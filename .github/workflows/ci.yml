@@ -20,7 +20,7 @@
 #
 # Fast-path: a `preflight` job runs the same denylist regex as gate.yml
 # and emits `risk=TRIVIAL` for docs-only PRs. Heavy STEPS inside the
-# downstream jobs (flake-check, build-dellan, vm-minimal, vm-graphical)
+# downstream jobs (flake-check, build-tuxedo, vm-minimal, vm-graphical)
 # are gated `if: needs.preflight.outputs.risk != 'TRIVIAL'`, so the
 # job COMPLETES SUCCESS with no work — that keeps branch-protection
 # required checks satisfied. Skipping the job itself would mark the
@@ -168,7 +168,7 @@ jobs:
             narinfo-cache-positive-ttl = 600
       # No cache-nix-action here on purpose. flake-check is eval-only
       # (`--no-build`); its added /nix/store would be small relative to
-      # build-dellan's snapshot (≤8 GB uncompressed per gc-max), and
+      # build-tuxedo's snapshot (≤8 GB uncompressed per gc-max), and
       # this job has no /mnt loopback so restoring the shared snapshot
       # to the runner's root disk would likely ENOSPC.
       # agenix-rekey's NixOS module references the per-host rekeyed dir
@@ -300,7 +300,7 @@ jobs:
     # needs nixpkgs eval data, not the full closure. First eval cold-
     # fetches nixpkgs source (~30s); subsequent six lanes reuse it
     # from this runner's /nix/store. Total discover runtime ~45-90s,
-    # parallel with build-dellan so it doesn't lengthen the critical path.
+    # parallel with build-tuxedo so it doesn't lengthen the critical path.
     name: discover
     runs-on: ubuntu-latest
     needs: [verify-fork-guards, preflight]
@@ -380,8 +380,8 @@ jobs:
           echo "statuses=$json" >> "$GITHUB_OUTPUT"
           echo "Discover summary: $json"
 
-  build-dellan:
-    name: build dellan toplevel
+  build-tuxedo:
+    name: build tuxedo toplevel
     runs-on: ubuntu-latest
     needs: [verify-fork-guards, preflight]
     permissions:
@@ -426,7 +426,7 @@ jobs:
             max-substitution-jobs = 64
             http-connections = 64
             narinfo-cache-positive-ttl = 600
-      # build-dellan owns the shared cache. Restore on entry; the action
+      # build-tuxedo owns the shared cache. Restore on entry; the action
       # auto-saves /nix/store at job end under `primary-key` (post step is
       # gated `post-if: success()`, so cancelled/failed runs skip save and
       # don't poison the snapshot). Subsequent PR jobs (vm-minimal lanes)
@@ -450,7 +450,7 @@ jobs:
       # is mostly pre-compressed (elf, gz, xz), so tar+zstd only hits
       # ~1.2-1.3×. gc-max-store-size-linux: 8G (binary, 8.59 GB decimal)
       # → ~6.5 GB compressed, comfortable under the 10 GB cap. The cap
-      # is sized to hold the dellan toplevel + recent intermediates;
+      # is sized to hold the tuxedo toplevel + recent intermediates;
       # actual closure size is whatever the build produces (re-tune by
       # reading `nix path-info -sSh /run/current-system` after a fresh
       # build if the cache starts thrashing).
@@ -502,7 +502,7 @@ jobs:
       # snapshots held only intermediates; every PR re-fetched the
       # toplevel from cachix.
       #
-      # `--out-link "$GITHUB_WORKSPACE/result-dellan"` registers an
+      # `--out-link "$GITHUB_WORKSPACE/result-tuxedo"` registers an
       # indirect gcroot under /nix/var/nix/gcroots/auto/ — the
       # workspace dir is owned by the runner user, which is what nix's
       # addPermRoot requires for the auto-gcroot registration to fire.
@@ -513,75 +513,11 @@ jobs:
           TMPDIR: /mnt/tmp
         run: |
           set -euo pipefail
-          nix build .#nixosConfigurations.dellan.config.system.build.toplevel \
-            --out-link "$GITHUB_WORKSPACE/result-dellan" \
-            --print-build-logs --keep-going
-          nix-store --add-root "$GITHUB_WORKSPACE/result-dellan" -r \
-            "$(readlink -f "$GITHUB_WORKSPACE/result-dellan")" >/dev/null
-      - name: Disk after (post-build)
-        if: always() && needs.preflight.outputs.risk != 'TRIVIAL'
-        run: df -h / /mnt /tmp 2>/dev/null || df -h /
-
-  # Second workstation host. Shares profiles/workstation with dellan, so
-  # it runs after build-dellan and restores that job's /nix/store snapshot
-  # (save: false — build-dellan owns it); only the host-specific delta
-  # (kernel modules, tuxedo-drivers, initrd) builds here. cachix-action
-  # pushes the result, which is what tuxedo's nixos-auto-deploy
-  # substitutes from after merge instead of compiling locally.
-  build-tuxedo:
-    name: build tuxedo toplevel
-    runs-on: ubuntu-latest
-    needs: [verify-fork-guards, preflight, build-dellan]
-    permissions:
-      contents: read
-    steps:
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          # Head SHA + explicit token: see build-dellan.
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Free root disk (dotnet/ghc/android/docker/codeql)
-        if: needs.preflight.outputs.risk != 'TRIVIAL'
-        run: ./scripts/free-root-disk.sh
-      - name: Mount /tmp on /mnt bind
-        if: needs.preflight.outputs.risk != 'TRIVIAL'
-        run: ./scripts/mount-tmp-loop.sh
-      - name: Mount /nix on /mnt loopback (replaces free-disk-space)
-        if: needs.preflight.outputs.risk != 'TRIVIAL'
-        run: ./scripts/mount-nix-loop.sh
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          extra-conf: |
-            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
-            max-substitution-jobs = 64
-            http-connections = 64
-            narinfo-cache-positive-ttl = 600
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
-        with:
-          primary-key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/*.nix') }}
-          # Lock-scoped only — see the build-dellan block.
-          restore-prefixes-first-match: |
-            nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
-          save: false
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
-        with:
-          name: jonathanmoregard
-          # Write token on push:main only. PR jobs run PR-head code, so a
-          # token there could be exfiltrated or used to push NARs main
-          # never built; PRs read the public cache without a token.
-          authToken: ${{ github.event_name == 'push' && secrets.CACHIX_AUTH_TOKEN || '' }}
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        env:
-          TMPDIR: /mnt/tmp
-        run: |
-          set -euo pipefail
           nix build .#nixosConfigurations.tuxedo.config.system.build.toplevel \
-            --no-link --print-build-logs --keep-going
+            --out-link "$GITHUB_WORKSPACE/result-tuxedo" \
+            --print-build-logs --keep-going
+          nix-store --add-root "$GITHUB_WORKSPACE/result-tuxedo" -r \
+            "$(readlink -f "$GITHUB_WORKSPACE/result-tuxedo")" >/dev/null
       - name: Disk after (post-build)
         if: always() && needs.preflight.outputs.risk != 'TRIVIAL'
         run: df -h / /mnt /tmp 2>/dev/null || df -h /
@@ -592,10 +528,10 @@ jobs:
     # block `keyring` reporting status. `fail-fast: false` keeps every
     # lane reporting even after one breaks.
     #
-    # `needs: [..., build-dellan]` serializes the toplevel-closure
+    # `needs: [..., build-tuxedo]` serializes the toplevel-closure
     # build before any lane starts. Without this, all lanes race
-    # build-dellan to rebuild the same closure cold. With the dep,
-    # build-dellan saves the shared /nix/store snapshot to GHA cache
+    # build-tuxedo to rebuild the same closure cold. With the dep,
+    # build-tuxedo saves the shared /nix/store snapshot to GHA cache
     # (and pushes deltas to cachix); lanes restore from that snapshot
     # so most paths land locally on disk before nix even runs.
     #
@@ -604,7 +540,7 @@ jobs:
     # when adding/removing a lane.
     name: vm-minimal (${{ matrix.lane }})
     runs-on: ubuntu-latest
-    needs: [verify-fork-guards, preflight, discover, build-dellan]
+    needs: [verify-fork-guards, preflight, discover, build-tuxedo]
     permissions:
       contents: read
     strategy:
@@ -664,14 +600,14 @@ jobs:
             max-substitution-jobs = 64
             http-connections = 64
             narinfo-cache-positive-ttl = 600
-      # Restore the shared /nix/store snapshot that build-dellan saved.
-      # save: false — only build-dellan owns the snapshot. 7 lanes saving
+      # Restore the shared /nix/store snapshot that build-tuxedo saved.
+      # save: false — only build-tuxedo owns the snapshot. 7 lanes saving
       # in parallel would race for the same cache key, and 7 × ~8 GB
-      # blows the GHA 10 GB cap. Worst case (build-dellan's save hasn't
+      # blows the GHA 10 GB cap. Worst case (build-tuxedo's save hasn't
       # propagated) the restore-prefixes fall back to the previous run's
       # snapshot — still faster than cold.
       #
-      # Order matches build-dellan: cache restore AFTER the installer
+      # Order matches build-tuxedo: cache restore AFTER the installer
       # because the action's restore phase needs /nix/var/nix/db to
       # exist (it chowns + sqlite-checkpoints the daemon DB so it can
       # merge cached store-paths into the freshly-installed DB).
@@ -679,7 +615,7 @@ jobs:
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
           primary-key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/*.nix') }}
-          # Lock-scoped only — see the build-dellan block for why a bare
+          # Lock-scoped only — see the build-tuxedo block for why a bare
           # runner.os fallback overflows the /nix loop.
           restore-prefixes-first-match: |
             nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
