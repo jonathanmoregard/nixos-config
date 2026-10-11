@@ -49,7 +49,6 @@
 #    Required GitHub App permissions:
 #      Contents: Read & write
 #      Pull requests: Read & write
-#      Checks: Read, Commit statuses: Read (red-CI filter)
 #    The App must be installed on this repo.
 #
 # `gh pr update-branch` returns non-zero on merge conflict; logged as
@@ -88,9 +87,10 @@ jobs:
           # permission the App installation holds.
           permission-contents: write
           permission-pull-requests: write
-          # Read-only: the red-CI filter reads statusCheckRollup.
-          permission-checks: read
-          permission-statuses: read
+          # No checks/statuses request: the red-CI filter reads
+          # statusCheckRollup, which any token can read on this public
+          # repo. Requesting them failed every run since #311, because
+          # the App installation does not hold those permissions.
 
       - name: Update one behind, green auto-merge PR
         env:
