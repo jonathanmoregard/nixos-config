@@ -496,12 +496,10 @@ jobs:
           # token there could be exfiltrated or used to push NARs main
           # never built; PRs read the public cache without a token.
           authToken: ${{ github.event_name == 'push' && secrets.CACHIX_AUTH_TOKEN || '' }}
-          # No daemon push: it uploads every built output plus its closure
-          # in the background and the post step only waits 60 s for the
-          # queue to drain. A 3 GB path (zoom) missed that window and
-          # failed a green build (run 37907225414). The explicit
-          # "Push ... to cachix" step below blocks until done instead.
-          skipPush: true
+          # Push in the post step with a plain blocking `cachix push` of new
+          # store paths. The default daemon gives its queue only ~60 s to
+          # drain at job end, and a 3 GB zoom upload failed a green build.
+          useDaemon: false
       # Pin the toplevel as a gcroot so cache-nix-action's post-step
       # `nix store gc --max` can't delete it before tarring. `--no-link`
       # (the previous flag) left it unreachable; gc trimmed it; cache
@@ -524,16 +522,6 @@ jobs:
             --print-build-logs --keep-going
           nix-store --add-root "$GITHUB_WORKSPACE/result-dellan" -r \
             "$(readlink -f "$GITHUB_WORKSPACE/result-dellan")" >/dev/null
-      # Runtime closure only: that is what dellan's auto-deploy
-      # substitutes. Paths already in the cache or upstream are skipped.
-      # continue-on-error: a cachix outage must not red a green build or
-      # skip cache-nix-action's success()-gated snapshot save. The step
-      # still shows red in the run, so a bad token (403) stays visible.
-      - name: Push dellan closure to cachix
-        continue-on-error: true
-        if: github.event_name == 'push' && needs.preflight.outputs.risk != 'TRIVIAL'
-        timeout-minutes: 30
-        run: cachix push jonathanmoregard "$(readlink -f "$GITHUB_WORKSPACE/result-dellan")"
       - name: Disk after (post-build)
         if: always() && needs.preflight.outputs.risk != 'TRIVIAL'
         run: df -h / /mnt /tmp 2>/dev/null || df -h /
@@ -541,8 +529,8 @@ jobs:
   # Second workstation host. Shares profiles/workstation with dellan, so
   # it runs after build-dellan and restores that job's /nix/store snapshot
   # (save: false — build-dellan owns it); only the host-specific delta
-  # (kernel modules, tuxedo-drivers, initrd) builds here. the push:main
-  # run pushes the result to cachix, which is what tuxedo's nixos-auto-deploy
+  # (kernel modules, tuxedo-drivers, initrd) builds here. cachix-action
+  # pushes the result, which is what tuxedo's nixos-auto-deploy
   # substitutes from after merge instead of compiling locally.
   build-tuxedo:
     name: build tuxedo toplevel
@@ -591,25 +579,17 @@ jobs:
           # token there could be exfiltrated or used to push NARs main
           # never built; PRs read the public cache without a token.
           authToken: ${{ github.event_name == 'push' && secrets.CACHIX_AUTH_TOKEN || '' }}
-          # No daemon push: it uploads every built output plus its closure
-          # in the background and the post step only waits 60 s for the
-          # queue to drain. A 3 GB path (zoom) missed that window and
-          # failed a green build (run 37907225414). The explicit
-          # "Push ... to cachix" step below blocks until done instead.
-          skipPush: true
+          # Push in the post step with a plain blocking `cachix push` of new
+          # store paths. The default daemon gives its queue only ~60 s to
+          # drain at job end, and a 3 GB zoom upload failed a green build.
+          useDaemon: false
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         env:
           TMPDIR: /mnt/tmp
         run: |
           set -euo pipefail
           nix build .#nixosConfigurations.tuxedo.config.system.build.toplevel \
-            --out-link "$GITHUB_WORKSPACE/result-tuxedo" \
-            --print-build-logs --keep-going
-      - name: Push tuxedo closure to cachix
-        continue-on-error: true
-        if: github.event_name == 'push' && needs.preflight.outputs.risk != 'TRIVIAL'
-        timeout-minutes: 30
-        run: cachix push jonathanmoregard "$(readlink -f "$GITHUB_WORKSPACE/result-tuxedo")"
+            --no-link --print-build-logs --keep-going
       - name: Disk after (post-build)
         if: always() && needs.preflight.outputs.risk != 'TRIVIAL'
         run: df -h / /mnt /tmp 2>/dev/null || df -h /
@@ -624,7 +604,7 @@ jobs:
     # build before any lane starts. Without this, all lanes race
     # build-dellan to rebuild the same closure cold. With the dep,
     # build-dellan saves the shared /nix/store snapshot to GHA cache
-    # (push:main also pushes its closure to cachix); lanes restore from that snapshot
+    # (and pushes deltas to cachix); lanes restore from that snapshot
     # so most paths land locally on disk before nix even runs.
     #
     # Branch-protection required-check names are
@@ -714,7 +694,7 @@ jobs:
           save: false
       # cachix remains the secondary substituter: it covers paths the
       # GHA cache didn't have (e.g. brand-new VM-specific closure), pushed
-      # by earlier push:main runs' "Push vm-<lane> result" step.
+      # by earlier push:main runs.
       - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
@@ -723,12 +703,10 @@ jobs:
           # token there could be exfiltrated or used to push NARs main
           # never built; PRs read the public cache without a token.
           authToken: ${{ github.event_name == 'push' && secrets.CACHIX_AUTH_TOKEN || '' }}
-          # No daemon push: it uploads every built output plus its closure
-          # in the background and the post step only waits 60 s for the
-          # queue to drain. A 3 GB path (zoom) missed that window and
-          # failed a green build (run 37907225414). The explicit
-          # "Push ... to cachix" step below blocks until done instead.
-          skipPush: true
+          # Push in the post step with a plain blocking `cachix push` of new
+          # store paths. The default daemon gives its queue only ~60 s to
+          # drain at job end, and a 3 GB zoom upload failed a green build.
+          useDaemon: false
       - name: Verify KVM
         if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         run: |
@@ -765,23 +743,6 @@ jobs:
           done
           echo "::error::vm-${{ matrix.lane }} failed after $attempts attempts"
           exit 1
-      # discover marks a lane "cached" when this output is in cachix.
-      # Lanes run cache-nix-action with save: false, so cachix is the only
-      # cross-run cache for VM-only paths: push the test driver closure
-      # (node toplevels, initrd) too, where the lane has one.
-      - name: Push vm-${{ matrix.lane }} result to cachix
-        continue-on-error: true
-        if: github.event_name == 'push' && needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          check=.#checks.x86_64-linux.vm-${{ matrix.lane }}
-          out=$(nix build "$check" --no-link --print-out-paths)
-          if nix eval "$check.driver.outPath" >/dev/null 2>&1; then
-            out="$out $(nix build "$check.driver" --no-link --print-out-paths)"
-          fi
-          # shellcheck disable=SC2086 # word-split the path list on purpose
-          cachix push jonathanmoregard $out
       - name: Disk after (post-build)
         if: always() && needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         run: df -h / /mnt /tmp 2>/dev/null || df -h /
