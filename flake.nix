@@ -36,6 +36,9 @@
     claude-desktop.url = "github:aaddrick/claude-desktop-debian";
     claude-desktop.inputs.nixpkgs.follows = "nixpkgs";
 
+    # The lockfile pins 0.161.0, above the 0.149.0 apply_patch security floor.
+    codex-cli-nix.url = "github:sadjow/codex-cli-nix";
+
     # aggregator — the personal search index behind
     # `aggregator_search_memory`. Consumed as SOURCE ONLY (`flake = false`)
     # and built here by overlays/aggregator.nix, because the aggregator's
@@ -157,6 +160,7 @@
 
   outputs = flakeInputs@{ self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
               tts-tool, substack-url-tool, prose-decorate, claude-desktop,
+              codex-cli-nix,
               aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
               ... }:
   let
@@ -201,9 +205,9 @@
         # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
         # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
         (import ./overlays/claude-code.nix)
-        # `pkgs.codex` >= 0.149.0: security floor for the apply_patch
-        # parent-directory write escape. See overlays/codex.nix.
-        (import ./overlays/codex.nix)
+        # Native Codex CLI package with prebuilt store paths from the
+        # codex-cli Cachix cache.
+        codex-cli-nix.overlays.default
         # `pkgs.aggregator` — a real store path for the ingest timer, so
         # modules/nixos/aggregator-ingest-timer.nix needs no flake-input
         # specialArgs threading (same reason the listen-tools tools are
@@ -310,6 +314,7 @@
         vm-android-dev  = mkLane ./tests/android-dev.nix;
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
         vm-nix-gc       = mkLane ./tests/nix-gc.nix;
+        vm-security-batch = mkLane ./tests/security-batch.nix;
         # In ci.yml's vm-minimal matrix, and deliberately absent from
         # `discover`'s LANES so it never reports "cached" and always
         # executes — it gates credential handling and the sudo password
@@ -503,6 +508,17 @@
         # payloads, incl. one buried past the model's 512-token window.
         prompt-injection-scan = import ./tests/prompt-injection-scan.nix {
           pkgs = pkgsLinux;
+        };
+        # Not a VM lane: the research-agent security sweep's verdict logic
+        # (modules/nixos/security-batch/research-agent.sh) against fake
+        # vulnix / systemd-analyze — seed, new CVE, accepted, score
+        # regression, tool errors. The module itself: vm-security-batch.
+        security-batch-research-agent = import ./tests/security-batch-research-agent.nix {
+          pkgs = pkgsLinux;
+          runnerScript = ./modules/nixos/security-batch/research-agent.sh;
+          # Drift gate: the package dellan deploys.
+          runnerPackage = self.nixosConfigurations.dellan.config
+            .services.securityBatch.research-agent.script;
         };
         signal-expiry = import ./tests/signal-expiry.nix {
           pkgs = pkgsLinux;
