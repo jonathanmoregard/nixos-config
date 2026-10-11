@@ -3831,6 +3831,27 @@ in
         user_systemctl + " unset-environment AI_CLIENT_CONFIG_REMOTE'"
     )
 
+    # gh-token.service executes a script that lives in ~/.claude under a
+    # pinned PATH (home/claude-services.nix). The first deployed run died with
+    # `env: 'bash': No such file or directory` (2026-10-11): the PATH carried
+    # the tools but not the interpreter. Stand in a stub with the real shebang
+    # and tool list; the unit must run it to completion. The VM has no App
+    # key, so the unit's ReadOnlyPaths pem is stubbed too.
+    mint_stub = "/home/jonathan/.claude/dev-container/bin/mint-gh-token"
+    mint_marker = "/home/jonathan/.cache/gh-tokens/vm-mint-ran"
+    tuxedo.succeed(
+        "install -d -o jonathan -g users -m 700 /home/jonathan/.config/github-app && "
+        "install -o jonathan -g users -m 600 /dev/null /home/jonathan/.config/github-app/app.pem && "
+        "install -d -o jonathan -g users /home/jonathan/.claude/dev-container/bin && "
+        "printf '%s\\n' '#!/usr/bin/env bash' 'set -euo pipefail' "
+        "'command -v curl jq openssl sed mktemp base64 date tr >/dev/null' "
+        f"'touch {mint_marker}' > {mint_stub} && "
+        f"chmod 755 {mint_stub} && chown jonathan:users {mint_stub}"
+    )
+    tuxedo.succeed(user_systemctl + " start gh-token.service'")
+    tuxedo.succeed(f"test -f {mint_marker}")
+    tuxedo.succeed(f"rm -f {mint_stub} {mint_marker}")
+
     # GitHub App host token (home/gh-host-token.nix): the `gh` on jonathan's
     # PATH and git's github.com credential helper must FAIL CLOSED without a
     # fresh token, and never fall back to gh's keyring. The VM has no App
@@ -3849,12 +3870,18 @@ in
     def as_jonathan(cmd):
         return "su - jonathan -c 'env -u GH_TOKEN -u GITHUB_TOKEN " + cmd + "' 2>&1"
 
-    for state, expect in [("missing", "missing or empty"), ("stale", "stale")]:
+    for state, expect in [
+        ("missing", "missing or empty"),
+        ("stale", "stale"),
+        ("future", "in the future"),
+    ]:
         if state == "stale":
             tuxedo.succeed(
                 f"su - jonathan -c 'umask 077; printf vm-dummy-token > {host_token}'"
                 f" && touch -d '2 hours ago' {host_token}"
             )
+        elif state == "future":
+            tuxedo.succeed(f"touch -d '2 hours' {host_token}")
         gh_out = tuxedo.fail(as_jonathan("gh repo view octo/example"))
         assert expect in gh_out and "gh-token.service" in gh_out, (
             f"gh wrapper did not fail closed on a {state} token:\n{gh_out}"
@@ -3875,7 +3902,46 @@ in
     assert tuxedo.succeed(
         "su - jonathan -c 'GH_TOKEN=explicit-dummy gh auth token'"
     ).strip() == "explicit-dummy"
+
+    # A helper configured before ours must never get a turn. git reads the
+    # system config ahead of the user's, so a decoy there stands in for any
+    # founder credential stored elsewhere; the user config resets the helper
+    # list before naming gh-app-credential, so the decoy is dropped whether
+    # the App token is present (ours answers) or absent (ours refuses).
+    decoy = "/tmp/decoy-credential-helper"
+    decoy_cfg = "/tmp/decoy-gitconfig"
+
+    def cred_fill_with(env):
+        # The env assignment must sit on `git`, the consumer of the config,
+        # not on the printf that feeds it.
+        return (
+            "printf \"protocol=https\\nhost=github.com\\n\\n\""
+            f" | {env} git credential fill"
+        )
+
+    decoy_probe = cred_fill_with(f"GIT_CONFIG_SYSTEM={decoy_cfg}")
+    tuxedo.succeed(
+        "printf '%s\\n' '#!/bin/sh' \"printf 'username=founder\\npassword=LEAK\\n'\""
+        f" > {decoy} && chmod 755 {decoy} && "
+        f"printf '[credential \"https://github.com\"]\\n\\thelper = {decoy}\\n' > {decoy_cfg}"
+    )
+    # Fixture self-check: with the user config out of the way the decoy must
+    # answer, otherwise the two assertions below would pass vacuously.
+    assert "password=LEAK" in tuxedo.succeed(
+        "su - jonathan -c '"
+        + cred_fill_with(f"GIT_CONFIG_SYSTEM={decoy_cfg} GIT_CONFIG_GLOBAL=/dev/null")
+        + "'"
+    ), "decoy helper fixture is inert; the test would prove nothing"
+    git_out = tuxedo.succeed(as_jonathan(decoy_probe))
+    assert "password=vm-dummy-token" in git_out and "LEAK" not in git_out, (
+        f"an earlier credential helper answered ahead of the App token:\n{git_out}"
+    )
     tuxedo.succeed(f"rm {host_token}")
+    git_out = tuxedo.fail(as_jonathan(decoy_probe))
+    assert "LEAK" not in git_out and "told us to quit" in git_out, (
+        f"an earlier credential helper answered while the App token was absent:\n{git_out}"
+    )
+    tuxedo.succeed(f"rm -f {decoy} {decoy_cfg}")
 
     # claude-pull — the pull half of ~/.claude's continuous delivery. The
     # timer must be linked and armed in the live user session.

@@ -1,4 +1,7 @@
-# GitHub access as the GitHub App, never as the founder.
+# GitHub access as the GitHub App. The "never as the founder" guarantee is
+# complete only once the founder's PAT is revoked and gh is logged out of the
+# keyring: until then the unwrapped /run/current-system/sw/bin/gh and an
+# explicit GH_TOKEN can still reach GitHub as the founder.
 #
 # gh-token.service (home/claude-services.nix) runs ~/.claude's mint-gh-token,
 # which mints a whole-installation GitHub App token into
@@ -39,8 +42,19 @@ let
         host_token_error="GitHub App host token $file is missing or empty; no fallback to a personal token. Fix: systemctl --user start gh-token.service"
         return 1
       fi
-      mtime=$(stat -c %Y -- "$file")
-      now=$(date +%s)
+      # Callers run this under `if !`, which switches errexit off inside the
+      # function, so every step checks its own result: a failed stat or date
+      # must refuse, never slip through as an empty number.
+      mtime=$(stat -c %Y -- "$file" 2>/dev/null) || mtime=""
+      now=$(date +%s 2>/dev/null) || now=""
+      if ! [[ "$mtime" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]]; then
+        host_token_error="cannot determine the age of GitHub App host token $file (stat or date failed); no fallback to a personal token. Fix: systemctl --user start gh-token.service"
+        return 1
+      fi
+      if [ $(( now - mtime )) -lt -60 ]; then
+        host_token_error="GitHub App host token $file is dated in the future ($(( (mtime - now) / 60 )) min ahead of the clock); no fallback to a personal token. Fix: systemctl --user start gh-token.service"
+        return 1
+      fi
       age=$(( (now - mtime) / 60 ))
       if [ "$age" -ge ${toString maxAgeMinutes} ]; then
         host_token_error="GitHub App host token $file is stale (''${age} min old, limit ${toString maxAgeMinutes}); no fallback to a personal token. Fix: systemctl --user start gh-token.service"
