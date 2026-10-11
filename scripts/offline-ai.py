@@ -47,7 +47,77 @@ EVICT = {
     True: os.environ.get("OFFLINE_AI_EVICT_USER", "").split(),
 }
 EVICTED = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/offline-ai-{os.getuid()}") / "offline-ai" / "evicted.json"
+# When the listed units are not enough, other large units of this user give
+# way too, largest first, until the model fits: frozen with their memory
+# pushed to swap, or, when they hold GPU memory (pinned RAM on this APU, which
+# only goes with the process), stopped and started again afterwards. Desktop
+# applications, terminals, the session bus and whatever this CLI itself runs
+# inside are never touched.
+MEMINFO = Path(os.environ.get("OFFLINE_AI_MEMINFO", "/proc/meminfo"))
+SWAPS = Path(os.environ.get("OFFLINE_AI_SWAPS", "/proc/swaps"))
+SYS_BLOCK = Path(os.environ.get("OFFLINE_AI_SYS_BLOCK", "/sys/block"))  # zramN/mm_stat lives here
+CGROUP_ROOT = Path(os.environ.get("OFFLINE_AI_CGROUP_ROOT", "/sys/fs/cgroup"))
+PROC = Path(os.environ.get("OFFLINE_AI_PROC", "/proc"))  # where GPU use is read from
+USER_CGROUP = os.environ.get("OFFLINE_AI_USER_CGROUP", "")  # the user manager's cgroup; found from /proc by default
+FREEZE_MIN = 512 * 2**20  # units holding less than this are not worth freezing
+HEADROOM = 2**30  # free memory left over once the model is in
+NEVER_FREEZE = re.compile(r"^(app-|kitty-|tmux-|dbus|offline-ai|init\.scope|session-)")
 LIBRARY_UNIT = os.environ.get("OFFLINE_AI_LIBRARY_UNIT", "offline-ai-library.service")
+# While the model's memory reservation (a system unit the model unit starts
+# and stops around itself) is active, this path exists, and the units that
+# gave way refuse to start (ConditionPathExists=!MARKER): a deploy or a timer
+# cannot bring them back into the model's memory. restore() must therefore
+# only run once the marker is gone, and must notice when it is not.
+MARKER = os.environ.get("OFFLINE_AI_MODE_MARKER", "/run/memory-reserve/offline-ai")
+RESERVATION = os.environ.get("OFFLINE_AI_RESERVATION", "memory-reserve-offline-ai.service")
+READY_TIMEOUT = int(os.environ.get("OFFLINE_AI_READY_TIMEOUT", "900"))  # seconds to wait for the model
+DEFAULT_FETCH = ("nix shell nixpkgs#python3Packages.huggingface-hub -c hf download "
+                 "unsloth/Qwen3.6-35B-A3B-GGUF --include 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' "
+                 "--local-dir ~/.local/share/llm-models/qwen3.6-35b-a3b-mtp (23 GB)")
+
+
+def load_models():
+    """The models this machine can serve, name -> {unit, model, reservation,
+    marker, fetch}, from OFFLINE_AI_MODELS (JSON, written by the module).
+    Without it, the one model the single-model settings above describe,
+    named "small", so every setting still means what it did."""
+    spec = os.environ.get("OFFLINE_AI_MODELS", "")
+    if not spec:
+        return {"small": {"unit": UNIT, "model": MODEL, "reservation": RESERVATION, "marker": MARKER,
+                          "fetch": DEFAULT_FETCH}}
+    try:
+        table = json.loads(spec)
+        if not isinstance(table, dict) or not table or not all(
+                isinstance(entry, dict) and all(key in entry for key in ("unit", "reservation", "marker"))
+                for entry in table.values()):
+            raise ValueError("expected an object of name -> {unit, model, reservation, marker, fetch}")
+    except ValueError as exc:
+        sys.exit(f"OFFLINE_AI_MODELS is not a model table: {exc}")
+    return table
+
+
+MODELS = load_models()
+# The default: what the module says, else the small model if there is one, else
+# the first name. Never "whichever sorts first": the table from Nix is sorted.
+DEFAULT_MODEL = os.environ.get("OFFLINE_AI_DEFAULT_MODEL") or ("small" if "small" in MODELS else next(iter(MODELS)))
+if DEFAULT_MODEL not in MODELS:
+    sys.exit(f"OFFLINE_AI_DEFAULT_MODEL names no model: {DEFAULT_MODEL!r}; the models are: {', '.join(MODELS)}")
+# The default first wherever the models are listed (JSON from Nix comes sorted by name).
+MODELS = {DEFAULT_MODEL: MODELS[DEFAULT_MODEL], **{name: entry for name, entry in MODELS.items() if name != DEFAULT_MODEL}}
+SELECTED = DEFAULT_MODEL
+
+
+def select_model(name):
+    """Make `name` the model this run loads, waits for and reports on. The
+    mode functions read UNIT, MODEL, RESERVATION and MARKER by name when they
+    run, so assigning the globals selects the model for all of them."""
+    global SELECTED, UNIT, MODEL, RESERVATION, MARKER
+    entry = MODELS[name]
+    SELECTED, UNIT, MODEL = name, entry["unit"], entry.get("model") or ""
+    RESERVATION, MARKER = entry["reservation"], entry["marker"]
+
+
+select_model(DEFAULT_MODEL)
 
 
 def parse_collections(spec):
@@ -67,7 +137,16 @@ DOC_DIRS = list(COLLECTIONS.values())
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "offline-ai"
 
 MAX_STEPS = 8
-MAX_TOOL_CHARS = 6000
+# Tool output is budgeted so a conversation stays inside the model's context
+# (32k tokens on this host): one result is cut at MAX_TOOL_CHARS, and once the
+# results kept in the conversation add up to more than TOOL_BUDGET_CHARS the
+# oldest are replaced by a stub naming the call (trim_tool_results). Measured
+# 2026-10-02: 61k chars of tool results (layout-extracted PDF pages, about 5
+# chars per token) made a 16k-token prompt; the model spent the other 16k
+# tokens thinking and was cut off with nothing said. 40k chars keeps the
+# prompt near 12k tokens and leaves the rest for the answer.
+MAX_TOOL_CHARS = int(os.environ.get("OFFLINE_AI_TOOL_CHARS", 6000))
+TOOL_BUDGET_CHARS = int(os.environ.get("OFFLINE_AI_TOOL_BUDGET_CHARS", 40000))
 UNIT_NAME = re.compile(r"^[A-Za-z0-9@:._\\-]+$")
 WORD = re.compile(r"[a-z0-9]+")
 
@@ -75,7 +154,8 @@ WORD = re.compile(r"[a-z0-9]+")
 def clip(text, limit=MAX_TOOL_CHARS):
     if len(text) <= limit:
         return text
-    return text[:limit] + f"\n[... truncated, {len(text) - limit} more characters]"
+    return text[:limit] + (f"\n[... {len(text) - limit} more characters not shown; ask for a narrower range "
+                           "or a later start, or search for the part you need]")
 
 
 # ---------------------------------------------------------------- options
@@ -934,6 +1014,65 @@ def call_tool(name, raw_arguments):
         return f"tool error: {type(exc).__name__}: {exc}"
 
 
+DROPPED = "dropped to save context; call it again if needed]"
+
+
+def describe_call(call):
+    """`name key=value ...`: what was asked, for a stub standing in for the result."""
+    function = call.get("function") or {}
+    try:
+        arguments = json.loads(function.get("arguments") or "{}")
+    except ValueError:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {"arguments": arguments}
+    pairs = " ".join(f"{key}={value}" for key, value in arguments.items())
+    return f"{function.get('name') or '?'} {pairs}".strip()[:160]
+
+
+def dropped_stub(call, content):
+    """What stands in for a dropped result: the call it answered, plus the
+    document and article names it listed, so an answer can still cite them."""
+    names = [line for line in content.splitlines() if line.startswith(("### ", "article: "))]
+    return "\n".join([f"[{describe_call(call)} — result {DROPPED}", *names[:16]])
+
+
+def is_dropped(message):
+    return message.get("role") == "tool" and (message.get("content") or "").split("\n", 1)[0].endswith(DROPPED)
+
+
+def result_of(messages, call_id):
+    """The tool message answering a call, or None."""
+    return next((m for m in messages if m.get("role") == "tool" and m.get("tool_call_id") == call_id), None)
+
+
+def trim_tool_results(messages, budget=TOOL_BUDGET_CHARS):
+    """Keep the tool results held in the conversation within the budget: the
+    oldest are replaced by stubs until the rest fit. The model's own turns
+    stay as they are. llama-server reuses its prompt cache up to the first
+    changed token, so a result rewritten this far back costs one re-prompt of
+    everything after it; that is the price of staying inside the context at
+    all. Returns how many were dropped."""
+    calls, results = {}, []
+    for message in messages:
+        if message.get("role") == "assistant":  # ids may repeat across turns: the latest assistant turn owns them
+            calls.update({call.get("id"): call for call in message.get("tool_calls") or []})
+        elif message.get("role") == "tool":
+            results.append((message, calls.get(message.get("tool_call_id"), {})))
+    total = sum(len(message.get("content") or "") for message, _ in results)
+    dropped = 0
+    for message, call in results:
+        if total <= budget:
+            break
+        if is_dropped(message):
+            continue
+        stub = dropped_stub(call, message.get("content") or "")
+        total -= len(message.get("content") or "") - len(stub)
+        message["content"] = stub
+        dropped += 1
+    return dropped
+
+
 # ------------------------------------------------------------------- chat
 
 
@@ -968,7 +1107,7 @@ Rules:
 - For disk space, memory, slowness or connectivity, measure first (disk_usage, big_files, processes, network_status) and base the advice on what they show.
 - Before giving a command with flags you are not sure of, check its manual page (search_man, read_man).
 - For how-to knowledge beyond this machine, use search_docs (handbooks and manuals stored here) and search_library (offline wikis), and name the document or article you relied on.
-- The stored documents include first-aid, medical, water, food and shelter handbooks (collections survival and survival-more) and an emergency medicine wiki in the library. For injuries, illness or survival questions, search them before answering, give the steps they give, and say to get professional help when it can be reached.
+- The stored documents include first-aid, medical, water, food and shelter handbooks (collections survival and survival-more) and an emergency medicine wiki in the library. For injuries, illness, medicine or electricity, search them before answering, give only the steps they give, say to get professional help when it can be reached, and end with a line `Sources:` naming each document with its page, or each library article. Nothing from memory: if the references do not cover it, say so.
 - If the tools do not show it, say you could not verify it.
 - Be brief: the answer, the commands, one line of why."""
 
@@ -1003,11 +1142,13 @@ def post(payload):
 
 
 def complete(messages, use_tools, out):
-    """One streamed model turn. Returns the assistant message."""
+    """One streamed model turn. Returns the assistant message and the server's
+    finish_reason: "stop" or "tool_calls" when the model ended its turn,
+    "length" when the server cut it off (the context filled up)."""
     payload = {"messages": messages, "stream": True, "temperature": 0.2}
     if use_tools:
         payload["tools"] = TOOLS
-    content, calls = [], {}
+    content, calls, finish = [], {}, None
     with post(payload) as response:
         for raw in response:
             line = raw.decode("utf-8", errors="replace").strip()
@@ -1019,6 +1160,7 @@ def complete(messages, use_tools, out):
             choices = json.loads(data).get("choices") or []
             if not choices:
                 continue
+            finish = choices[0].get("finish_reason") or finish
             delta = choices[0].get("delta") or {}
             if delta.get("content"):
                 content.append(delta["content"])
@@ -1037,7 +1179,7 @@ def complete(messages, use_tools, out):
              "function": {"name": c["name"], "arguments": c["arguments"]}}
             for i, c in sorted(calls.items())
         ]
-    return message
+    return message, finish
 
 
 CODE = re.compile(r"```[^\n]*\n(.*?)```|`([^`\n]+)`", re.DOTALL)
@@ -1061,15 +1203,134 @@ def tools_given_as_commands(text):
     return found
 
 
+# Questions where a wrong answer can hurt someone: injuries, illness, medicine,
+# electricity. English and Swedish word starts. Answers to them must cite the
+# stored references they came from; a false alarm only costs a citation.
+SAFETY = re.compile(r"\b(" + "|".join([
+    # "brän" covers bränna, bränt, brände; "brut" covers bruten, brutit.
+    "bleed", "blöd", "blod", "wound", "sår", "burn", "brän", "fractur", "fraktur", "broken bone", "brut",
+    "sprain", "stuk", "cpr", "hlr", "resuscitat", "unconscious", "medvetslös", "chok", "kvävn", "satt i halsen",
+    "poison", "förgift", "fever", "feber", "diarrh", "diarré", "vomit", "kräk", "dehydrat", "uttork", "ors\\b",
+    "vätskeersätt", "infect", "infektion", "sepsis", "hypotherm", "nedkyl", "frostbite", "köldskad", "heat stroke",
+    "värmeslag", "allerg", "anaphyla", "anafyla", "asthma", "astma", "stroke", "heart attack", "hjärtinfarkt",
+    "hjärtstopp", "seizure", "epilep", "kramp", "pregnan", "gravid", "childbirth", "förlossning", "medicin",
+    "medication", "läkemedel", "dose\\b", "dosage", "dosering", "antibiot", "painkill", "värktablett", "pain\\b",
+    "smärta", "injur", "skadad", "sick", "sjuk", "symptom", "cholera", "kolera", "first aid", "första hjälpen",
+    "carbon monoxide", "kolmonoxid", "electric", "elektri", "elsäker", "elstöt", "stöt", "shock", "chock",
+    "fuse box", "fusebox", "blown fuse", "power line", "live wire", "kraftledning", "elledning",
+    "elinstallation", "wiring", "säkring", "circuit breaker", "breaker box", "jordfels", "voltage", "spänning",
+    # Not a bare "generator" or "breaker": systemd has generators and a sysadmin
+    # question about them is not an electrical one.
+    "petrol generator", "diesel generator", "gasoline generator", "bensindriv", "dieseldriv", "elverk",
+    "outlet", "eluttag",
+]) + ")", re.IGNORECASE)
+# A citation line, not prose that happens to open with the word: the colon is
+# what "Sources of infection are ..." lacks. Markdown bold around it is fine.
+SOURCE_LINE = re.compile(r"^\W*(sources?|references?|källa|källor)\s*\**\s*:", re.IGNORECASE | re.MULTILINE)
+
+
+def plain(text):
+    return " ".join(re.sub(r"[\W_]+", " ", str(text).lower()).split())
+
+
+def retrieved_sources(messages):
+    """Documents and articles the tools returned in this conversation, as names to cite."""
+    names = set()
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content") or ""
+        names.update(Path(doc).stem for doc in re.findall(r"^### (.+?), page \d+$", content, re.MULTILINE))
+        for title, article in re.findall(r"^### (.+)\narticle: (\S+)", content, re.MULTILINE):
+            names.update((title, Path(article).stem))
+    return {name for name in names if plain(name)}
+
+
+def cited(answer, sources):
+    """True when the answer has a Sources line naming at least one retrieved document or article.
+    Names match as whole words or phrases, so "burn" does not vouch for "burns";
+    a one-word article title that is also the topic word can still be echoed by
+    a made-up citation, which only a structured citation format would catch."""
+    found = SOURCE_LINE.search(answer or "")
+    if not found:
+        return False
+    tail = plain(answer[found.start():])
+    return any(re.search(r"\b" + re.escape(plain(name)) + r"\b", tail) for name in sources)
+
+
+def safety_gate(question, content, messages, out, log, may_nudge):
+    """For a medical or electrical question, the answer must cite a retrieved
+    reference. Returns True when the model should be asked once more (the
+    nudge is appended to messages); otherwise the warning, if any, is written."""
+    if not SAFETY.search(question):
+        return False
+    sources = retrieved_sources(messages)
+    if cited(content, sources):
+        return False
+    if may_nudge:
+        print("[check] safety answer without a cited stored source; asking again", file=log)
+        out.write("\n[revising: a medical or electrical answer must name the stored reference it "
+                  "comes from]\n\n")
+        listed = "; ".join(sorted(sources)[:8])
+        messages.append({"role": "user", "content": (
+            "This is a medical or electrical question: give only what the stored references say, "
+            "and end with a line 'Sources:' naming each document with its page, or each library "
+            "article. " + (f"References you have retrieved: {listed}." if sources else
+                           "You have not retrieved any yet: search_docs and search_library first."))})
+        return True
+    out.write("\n\n!! NOT VERIFIED: this answer names no stored reference it was checked "
+              "against. Do not rely on it for injuries, illness or electricity; "
+              + (f"look it up yourself in: {'; '.join(sorted(sources)[:8])}." if sources else
+                 "look it up yourself with `offline-ai library` or the survival documents.") + "\n")
+    return False
+
+
+CUT_OFF = ("[cut off] The answer was cut short by the model's context limit. Ask a narrower question, "
+           "or for fewer pages or documents at a time.")
+
+
+def cut_off(message, finish, out, log):
+    """True when the reply ended at the context limit or said nothing at all.
+    Said on both streams: the operator must never get silence and exit 0 after
+    the model has run (a thinking model can spend the whole context thinking,
+    and that part is never printed)."""
+    text = message.get("content") or ""
+    if finish != "length" and text.strip():
+        return False
+    why = "the model hit its context limit" if finish == "length" else "the model answered with nothing"
+    print(f"[context] {why} (finish_reason={finish}); the answer is incomplete", file=log)
+    out.write(CUT_OFF + "\n")
+    out.flush()
+    if not text.strip():
+        # An assistant turn with neither text nor tool calls is refused by the
+        # server's chat template; keep the conversation valid for the next question.
+        message["content"] = "(no answer: the reply was cut off by the context limit)"
+    return True
+
+
+def within_budget(messages, log):
+    dropped = trim_tool_results(messages)
+    if dropped:
+        print(f"[context] dropped the text of {dropped} older tool result(s) to stay within the model's context; "
+              "they are named in place and can be fetched again", file=log)
+
+
 def answer(messages, out=sys.stdout, log=sys.stderr):
-    """Run the tool loop for the question already appended to messages."""
-    asked, nudged = set(), False
+    """Run the tool loop for the question already appended to messages.
+    Returns False when the final reply was cut off by the context limit."""
+    asked, nudged, cite_nudged = {}, False, False
+    # The operator's own words, without the reminder and option-name leads with_leads() appends.
+    question = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    question = question.split("\n\n" + REMINDER)[0]
     for _ in range(MAX_STEPS):
-        message = complete(messages, True, out)
+        within_budget(messages, log)
+        message, finish = complete(messages, True, out)
         messages.append(message)
         calls = message.get("tool_calls")
         if not calls:
             out.write("\n")
+            if cut_off(message, finish, out, log):
+                return False
             misused = tools_given_as_commands(message["content"])
             if misused and not nudged:
                 # Told in prose, a small model still hands its own tools to the operator as
@@ -1082,47 +1343,98 @@ def answer(messages, out=sys.stdout, log=sys.stderr):
                                  f"You gave {names} as commands for me to run. Those are your tools; I cannot run "
                                  "them. Call them yourself now, then answer with real shell commands only."})
                 continue
-            return message["content"]
+            if safety_gate(question, message["content"], messages, out, log, may_nudge=not cite_nudged):
+                cite_nudged = True
+                continue
+            return True
         for call in calls:
             name, arguments = call["function"]["name"], call["function"]["arguments"]
             print(f"[tool] {name} {arguments}", file=log)
-            if (name, arguments) in asked:
+            earlier = result_of(messages, asked.get((name, arguments)))
+            if earlier is not None and not is_dropped(earlier):
                 # A small model can loop on one lookup; the answer would be the same.
                 result = ("You already made this exact call and its result is above; it has not changed. "
                           "Answer from what you have, or look somewhere else.")
-            else:
-                asked.add((name, arguments))
+            else:  # new, or its earlier result was dropped to save context
+                asked[(name, arguments)] = call["id"]
                 result = call_tool(name, arguments)
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
     messages.append({"role": "user", "content": "Stop looking things up and give your best answer now, "
                      "saying plainly what you could not verify."})
-    message = complete(messages, False, out)
+    within_budget(messages, log)
+    message, finish = complete(messages, False, out)
     messages.append(message)
     out.write("\n")
-    return message["content"]
+    if cut_off(message, finish, out, log):
+        return False
+    # The same gate as above: an answer forced out of the model after it ran
+    # out of steps is the one most likely to be uncited, and it must not pass
+    # as checked. No second round: there are no steps left.
+    safety_gate(question, message["content"], messages, out, log, may_nudge=False)
+    return True
 
 
 # ---------------------------------------------------------------- service
 
-USAGE = """offline-ai — a local assistant for when the internet is down.
+# The words main() dispatches on. The help text must name each of them, each
+# option build_parser() defines and each model in the table (tests/offline-ai.nix
+# reads these from here), so nothing can be added without a line of help.
+COMMANDS = ("up", "down", "status", "models", "library", "index", "help")
 
-Two modes. Default mode is the machine as usual. Offline-AI mode stops the
-services listed as giving way (the microVMs, dictation, ingest jobs), loads the
-big model and the library, and gives the memory back when it ends.
 
-  offline-ai                 enter offline-AI mode, then a conversation; leaving it returns to default mode
-  offline-ai "question"      the same for one question
-  offline-ai up              enter offline-AI mode and stay in it (about half a minute)
-  offline-ai down            leave it: stop the model and the library, restart what was stopped
-  offline-ai status          what is loaded and which references are present
-  offline-ai library         start the browsable reference library and print where to open it
-  offline-ai library fetch   download the archives the corpus lists (--list to preview, --all for optional ones)
-  offline-ai index           re-read the document folders and manual pages
-  offline-ai help            this text
+def build_parser():
+    parser = argparse.ArgumentParser(usage=usage(), add_help=False)
+    parser.add_argument("question", nargs="*")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("-h", "--help", action="store_true")
+    return parser
 
-The assistant only looks things up (options, this machine's flake, units and logs, disk,
-processes, network, manual pages, documents, the library, your notes). It never changes
-anything: it gives commands and Nix code for you to run."""
+
+def usage():
+    """The reference: every form, every option, one line per model (from the
+    table, so it says what `models` knows), the exit statuses."""
+    forms = [
+        ("[--model NAME] [--force]", "enter offline-AI mode, then a conversation; leaving it returns to default mode"),
+        ('[--model NAME] [--force] "question"', "the same for one question"),
+        ("[--model NAME] [--force] up", "enter offline-AI mode and stay in it (about half a minute)"),
+        ("down", "leave it: stop the model and the library, restart what was stopped"),
+        ("status", "what is loaded, the mode, the models, which references are present"),
+        ("models", "one line per model: loaded or not, on disk or not, which is the default"),
+        ("library", "start the browsable reference library and print where to open it"),
+        ("library fetch [--list] [--all]", "download the archives the corpus lists (--list to preview, --all for optional ones)"),
+        ("index", "re-read the document folders and manual pages"),
+        ("help | -h | --help", "this text"),
+    ]
+    options = [
+        ("--model NAME", f"which model to load: {', '.join(MODELS)} (default: {DEFAULT_MODEL}). One is loaded at a"),
+        ("", "time: selecting the other stops the running one, which stays loaded until `down` or the next --model"),
+        ("--force", "load even when the memory arithmetic says the model will not fit"),
+        ("-h, --help", "this text"),
+    ]
+    width = max(len(form) for form, _ in forms) + len("offline-ai ") + 2
+    lines = ["offline-ai — a local assistant for when the internet is down.", "",
+             "Two modes. Default mode is the machine as usual. Offline-AI mode stops the services listed",
+             "as giving way (the microVMs, dictation, ingest jobs), loads a model and the library, and",
+             "gives the memory back when it ends. A run started while the mode is on only makes sure",
+             "its model is the one loaded.", "", "Usage:"]
+    lines += [f"  {'offline-ai ' + form:<{width}}{text}" for form, text in forms]
+    lines += ["", "Options:"]
+    lines += [f"  {flag:<16}{text}" for flag, text in options]
+    lines += ["", "Models (--model NAME; one loaded at a time):"]
+    label_width = max(len(name) for name in MODELS) + len(" (default)") + 2
+    for name, entry in MODELS.items():
+        label = name + (" (default)" if name == DEFAULT_MODEL else "")
+        lines.append(f"  {label:<{label_width}}{entry.get('about') or entry['unit']}")
+        if entry.get("fetch"):
+            lines.append(f"  {'':<{label_width}}fetch: {entry['fetch']}")
+    lines += ["",
+              "The assistant only looks things up (options, this machine's flake, units and logs, disk,",
+              "processes, network, manual pages, documents, the library, your notes). It never changes",
+              "anything: it gives commands and Nix code for you to run.", "",
+              "Exit status: 0 answered; 1 the model could not be loaded or reached, or the model or an",
+              "option is unknown; 2 the answer was cut off by the model's context limit (ask something narrower)."]
+    return "\n".join(lines)
 
 
 MODEL_ERRORS = (urllib.error.URLError, OSError, ValueError, http.client.HTTPException)
@@ -1151,17 +1463,95 @@ def model_bytes():
     return sum(f.stat().st_size for f in files if f.is_file())
 
 
-def available_bytes():
-    """MemAvailable in bytes, or None where /proc/meminfo does not report it."""
+def meminfo(key):
+    """A /proc/meminfo field in bytes, or None where it is not reported."""
     try:
-        lines = Path("/proc/meminfo").read_text().splitlines()
+        lines = MEMINFO.read_text().splitlines()
     except OSError:
         return None
     for line in lines:
         fields = line.split()
-        if fields[:1] == ["MemAvailable:"] and len(fields) > 1 and fields[1].isdigit():
+        if fields[:1] == [key + ":"] and len(fields) > 1 and fields[1].isdigit():
             return int(fields[1]) * 1024
     return None
+
+
+def available_bytes():
+    return meminfo("MemAvailable")
+
+
+ZRAM = re.compile(r"^/dev/(zram\d+)$")
+
+
+def text_of(path):
+    try:
+        return Path(path).read_text()
+    except OSError:
+        return None
+
+
+def zram_mm_stat(name):
+    return text_of(SYS_BLOCK / name / "mm_stat")
+
+
+def swap_areas(swaps, mm_stat):
+    """The active swap areas of /proc/swaps as (free bytes, RAM freed per byte
+    swapped into it), highest priority first: the order the kernel fills them.
+
+    A swap file or partition frees a page of RAM for every page it takes. A
+    zram device is RAM: a page swapped into it stays resident, compressed, so
+    only what compression saves is freed, 1 - 1/ratio. The ratio is read from
+    the device's mm_stat (bytes stored / bytes they compress to, fields 1 and
+    2) and taken as 2 while nothing is in it yet."""
+    areas = []
+    for line in (swaps or "").splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 5 or not (fields[2].isdigit() and fields[3].isdigit()):
+            continue
+        free = max(0, int(fields[2]) - int(fields[3])) * 1024
+        share = 1.0
+        zram = ZRAM.match(fields[0])
+        if zram:
+            stat = (mm_stat(zram[1]) or "").split()
+            stored, compressed = (int(stat[0]), int(stat[1])) if stat[:2] and all(f.isdigit() for f in stat[:2]) else (0, 0)
+            ratio = stored / compressed if stored and compressed else 2.0
+            share = max(0.0, 1 - 1 / ratio)
+        priority = int(fields[4]) if fields[4].lstrip("-").isdigit() else 0
+        areas.append((priority, free, share))
+    return [(free, share) for _, free, share in sorted(areas, key=lambda area: -area[0])]
+
+
+def host_swap():
+    return meminfo("AnonPages") or 0, swap_areas(text_of(SWAPS), zram_mm_stat)
+
+
+def swappable_bytes(anon=None, areas=None):
+    """RAM that moving idle anonymous memory to swap would free: each area,
+    in the order the kernel fills them, takes what is left of the anonymous
+    memory up to its free space and frees its share of that. Pinned GPU
+    memory is not anonymous memory and never counts."""
+    if anon is None or areas is None:
+        anon, areas = host_swap()
+    freed = 0
+    for free, share in areas:
+        moved = min(anon, free)
+        anon -= moved
+        freed += moved * share
+    return int(freed)
+
+
+def swap_needed(shortfall, anon=None, areas=None):
+    """How much anonymous memory must move to swap to free `shortfall` bytes
+    of RAM: more than that where zram keeps a compressed copy in RAM."""
+    if anon is None or areas is None:
+        anon, areas = host_swap()
+    moved = 0
+    for free, share in areas:
+        if shortfall <= 0 or anon <= 0 or share <= 0:
+            continue
+        take = min(anon, free, shortfall / share)
+        anon, shortfall, moved = anon - take, shortfall - take * share, moved + take
+    return int(moved)
 
 
 def systemctl_user(verb, unit):
@@ -1173,9 +1563,16 @@ def systemctl(user, verb, unit):
 
 
 def read_evicted():
+    """What gave way to the model, oldest first, as (user, unit, how, spec) entries.
+
+    how is "stop" (start it again), "freeze" (thaw it) or "relaunch" (a
+    transient unit, recreated from spec: argv, working directory, environment,
+    slice). Records from older versions have only (user, unit) and were stops."""
     try:
-        return [(bool(user), unit) for user, unit in json.loads(EVICTED.read_text())]
-    except (OSError, ValueError, TypeError):
+        return [(bool(entry[0]), entry[1], entry[2] if len(entry) > 2 else "stop",
+                 entry[3] if len(entry) > 3 else None)
+                for entry in json.loads(EVICTED.read_text())]
+    except (OSError, ValueError, TypeError, IndexError):
         return []
 
 
@@ -1185,88 +1582,421 @@ def write_evicted(entries):
         return
     EVICTED.parent.mkdir(parents=True, exist_ok=True)
     tmp = EVICTED.with_suffix(".tmp")
-    tmp.write_text(json.dumps([[user, unit] for user, unit in entries]))
+    tmp.write_text(json.dumps([list(entry) for entry in entries]))
     tmp.replace(EVICTED)
+
+
+def record(entry):
+    """Append one entry at once, so an interrupted run can still restore it."""
+    write_evicted(read_evicted() + [entry])
+
+
+def unrecord(entry):
+    entries = read_evicted()
+    if entry in entries:
+        entries.remove(entry)
+    write_evicted(entries)
 
 
 def evict():
     """Stop the running units that give way to the model; remember which, for restore()."""
-    stopped = read_evicted()
     for user in (False, True):
         for unit in EVICT[user]:
-            if (user, unit) in stopped or run(["systemctl", *scope(user), "is-active", "--", unit]) not in (
-                    "active", "activating", "reloading"):
+            if any(entry[:2] == (user, unit) for entry in read_evicted()) or run(
+                    ["systemctl", *scope(user), "is-active", "--", unit]) not in ("active", "activating", "reloading"):
                 continue
             done = systemctl(user, "stop", unit)
             if done.returncode == 0:
-                stopped.append((user, unit))
-                write_evicted(stopped)  # recorded at once, so an interrupted run can still restore it
+                record((user, unit, "stop", None))
                 print(f"stopped {unit} to make room", file=sys.stderr)
             else:
                 print(f"could not stop {unit}: {done.stderr.strip()}", file=sys.stderr)
 
 
+def own_cgroups():
+    """The cgroups of this process and every process above it (terminal, shell, session)."""
+    groups, pid = set(), os.getpid()
+    while pid > 1:
+        try:
+            for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines():
+                if line.startswith("0::"):
+                    groups.add(line[3:])
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return groups
+
+
+def cgroup_bytes(group):
+    """Memory the cgroup holds in RAM (anonymous and page cache)."""
+    try:
+        return int((group / "memory.current").read_text())
+    except (OSError, ValueError):
+        return 0
+
+
+def gpu_bytes():
+    """GPU memory per cgroup, from the DRM fdinfo of this user's processes.
+
+    On an APU the GPU's buffers are ordinary RAM, pinned: not charged to any
+    cgroup, not swappable, not released by freezing. A model server with its
+    layers on the iGPU can hold tens of GiB this way. Each client is counted
+    once however many descriptors share it."""
+    seen, held = set(), {}
+    for proc in PROC.iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            group = next((line[3:] for line in (proc / "cgroup").read_text().splitlines()
+                          if line.startswith("0::")), None)
+            fdinfos = list((proc / "fdinfo").iterdir())
+        except OSError:
+            continue
+        for fdinfo in fdinfos:
+            try:
+                text = fdinfo.read_text()
+            except OSError:
+                continue
+            if "drm-client-id" not in text:
+                continue
+            fields = dict(line.split(":", 1) for line in text.splitlines() if ":" in line)
+            client = (fields.get("drm-pdev", "").strip(), fields.get("drm-client-id", "").strip())
+            if client in seen or group is None:
+                continue
+            seen.add(client)
+            # What is resident, wherever it sits: on an APU a buffer allotted as
+            # VRAM can live in GTT, so drm-total-gtt alone undercounts. Older
+            # amdgpu kernels report only drm-memory-<region>.
+            kind = "drm-resident-" if any(key.startswith("drm-resident-") for key in fields) else "drm-memory-"
+            for key, value in fields.items():
+                parts = value.split()
+                if key.startswith(kind) and parts and parts[0].isdigit():
+                    scale = {"KiB": 2**10, "MiB": 2**20, "GiB": 2**30}.get(parts[1] if len(parts) > 1 else "", 1)
+                    held[group] = held.get(group, 0) + int(parts[0]) * scale
+    return held
+
+
+def user_manager():
+    """The cgroup directory of this user's systemd manager, or None outside one."""
+    manager = Path(USER_CGROUP) if USER_CGROUP else None
+    marker = f"user@{os.getuid()}.service"
+    for group in own_cgroups() if manager is None else ():
+        if marker in group:
+            manager = CGROUP_ROOT / (group.lstrip("/").split(marker)[0] + marker)
+            break
+    if manager is None:  # run from an SSH login or cron: not below the manager, which is still there
+        manager = CGROUP_ROOT / "user.slice" / f"user-{os.getuid()}.slice" / marker
+    return manager if manager is not None and manager.is_dir() else None
+
+
+def user_units():
+    """This user's units that may give way, as (unit, cgroup dir). Desktop
+    applications, terminals, the session bus, offline-ai's own units and
+    whatever this CLI runs inside are left alone."""
+    manager = user_manager()
+    if manager is None:
+        return []
+    protected = [CGROUP_ROOT / group.lstrip("/") for group in own_cgroups()]
+    found = []
+    for group in manager.rglob("*"):
+        name = group.name
+        if not group.is_dir() or not name.endswith((".service", ".scope")) or NEVER_FREEZE.match(name):
+            continue
+        if group.parent.name.endswith((".service", ".scope")):
+            continue  # a unit's own sub-cgroup, not a unit
+        if "session.slice" in group.relative_to(manager).parts:
+            continue  # what the desktop session itself runs on (compositor, shell)
+        if any(p == group or group in p.parents for p in protected):
+            continue
+        found.append((name, group))
+    return found
+
+
+def bus_path(unit):
+    """The D-Bus object path of a unit: every byte outside [A-Za-z0-9] as _xx."""
+    return "/org/freedesktop/systemd1/unit/" + "".join(
+        c if c.isascii() and c.isalnum() else "".join(f"_{b:02x}" for b in c.encode()) for c in unit)
+
+
+def relaunch_spec(unit):
+    """How to start a transient unit again once it is gone: its exact argv,
+    working directory, environment and slice, read from the manager."""
+    done = subprocess.run(["busctl", "--user", "--json=short", "get-property", "org.freedesktop.systemd1",
+                           bus_path(unit), "org.freedesktop.systemd1.Service",
+                           "ExecStart", "Environment", "WorkingDirectory", "Slice"],
+                          capture_output=True, text=True)
+    if done.returncode != 0:
+        return None
+    try:
+        execs, env, workdir, slice_ = (json.loads(line)["data"] for line in done.stdout.splitlines() if line.strip())
+        # WorkingDirectory reads "!/path" when a missing directory is allowed.
+        return {"argv": execs[0][1], "env": env, "workdir": workdir.lstrip("!"), "slice": slice_}
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
+def give_way(unit, group, gpu):
+    """Free what one unit holds. GPU memory goes only when the process does, so
+    a unit holding it is stopped, to be started again later (recreated from
+    its recorded command line if it was transient). Anything else is frozen
+    and its memory pushed to swap; thawing it later brings it back as it was."""
+    if gpu:
+        if unit.endswith(".scope"):
+            # A scope's processes were started outside systemd: nothing could start them again.
+            print(f"left {unit} running ({gpu / 2**30:.1f} GiB of GPU memory): it could not be started again",
+                  file=sys.stderr)
+            return False
+        transient = run(["systemctl", "--user", "show", "-p", "Transient", "--value", "--", unit]) == "yes"
+        spec = relaunch_spec(unit) if transient else None
+        if transient and spec is None:
+            print(f"left {unit} running: could not record how to start it again", file=sys.stderr)
+            return False
+        # Recorded before acting, so a run killed in between still knows how to bring it back.
+        entry = (True, unit, "relaunch" if transient else "stop", spec)
+        record(entry)
+        done = systemctl(True, "stop", unit)
+        if done.returncode != 0:
+            unrecord(entry)
+            print(f"could not stop {unit}: {done.stderr.strip()}", file=sys.stderr)
+            return False
+        print(f"stopped {unit} ({gpu / 2**30:.1f} GiB of GPU memory) to make room", file=sys.stderr)
+        return True
+    size = cgroup_bytes(group)
+    entry = (True, unit, "freeze", None)
+    record(entry)
+    done = systemctl(True, "freeze", unit)
+    if done.returncode != 0:
+        unrecord(entry)
+        print(f"could not freeze {unit}: {done.stderr.strip()}", file=sys.stderr)
+        return False
+    try:
+        (group / "memory.reclaim").write_text(str(size))
+    except OSError:
+        pass  # EAGAIN: less than asked could be reclaimed; what was is still freed
+    print(f"froze {unit} ({size / 2**30:.1f} GiB moved to swap) to make room", file=sys.stderr)
+    return True
+
+
+def make_room(need):
+    """Free memory until `need` bytes are available: this user's large units
+    give way, largest first, and stop as soon as there is enough."""
+    held = gpu_bytes()
+    candidates = []
+    for unit, group in user_units():
+        try:
+            if (group / "cgroup.freeze").read_text().strip() == "1":
+                continue  # already frozen, by us or anyone
+        except OSError:
+            continue
+        gpu = sum(size for path, size in held.items()
+                  if CGROUP_ROOT / path.lstrip("/") == group or group in (CGROUP_ROOT / path.lstrip("/")).parents)
+        size = gpu + cgroup_bytes(group)
+        if size >= FREEZE_MIN:
+            candidates.append((size, unit, group, gpu if gpu >= FREEZE_MIN else 0))
+    for size, unit, group, gpu in sorted(candidates, key=lambda item: item[0], reverse=True):
+        free = available_bytes()
+        if free is None or free >= need:
+            return
+        give_way(unit, group, gpu)
+    # What is still short is left to the kernel: as the model loads it moves
+    # the coldest pages of everything else to swap, which up() allows for.
+
+
+def bring_back(user, unit, how, spec):
+    if how == "freeze":
+        return systemctl(user, "thaw", unit)
+    if how == "relaunch":
+        argv = ["systemd-run", "--user", f"--unit={unit}", "--collect"]
+        if spec.get("slice"):
+            argv.append(f"--slice={spec['slice']}")
+        if spec.get("workdir"):
+            argv.append(f"--working-directory={spec['workdir']}")
+        argv += [f"--setenv={pair}" for pair in spec.get("env") or []]
+        return subprocess.run([*argv, "--", *spec["argv"]], capture_output=True, text=True)
+    return systemctl(user, "start", unit)
+
+
+def clear_marker(name=None):
+    """The mode markers must be gone before anything is started again. Stopping
+    a model unit normally stops the reservation that holds its marker; when
+    that did not happen (the stop is best-effort inside the unit), stop the
+    reservation here, and say so if the marker still stands. One model's
+    marker, or every model's."""
+    cleared = True
+    for model in ([name] if name else MODELS):
+        marker, reservation = MODELS[model]["marker"], MODELS[model]["reservation"]
+        if not os.path.exists(marker):
+            continue
+        systemctl(False, "stop", reservation)
+        if os.path.exists(marker):
+            print(f"the mode marker {marker} still exists: what gave way to the model cannot start until it is gone "
+                  f"(`systemctl stop {reservation}`)", file=sys.stderr)
+            cleared = False
+    return cleared
+
+
+def markers_standing():
+    return [entry["marker"] for entry in MODELS.values() if os.path.exists(entry["marker"])]
+
+
 def restore():
-    """Start again what evict() stopped, latest first; keep anything that would not start for next time."""
+    """Bring back what gave way, latest first; keep anything that failed for next time."""
     failed = []
-    for user, unit in reversed(read_evicted()):
-        done = systemctl(user, "start", unit)
-        if done.returncode == 0:
-            print(f"restarted {unit}", file=sys.stderr)
+    for entry in reversed(read_evicted()):
+        user, unit, how, spec = entry
+        if how == "freeze" and run(["systemctl", *scope(user), "show", "-p", "LoadState", "--value", "--", unit]) != "loaded":
+            print(f"{unit} is gone; nothing to thaw", file=sys.stderr)  # its processes ended while frozen
+            continue
+        done = bring_back(*entry)
+        word = {"freeze": "thaw", "relaunch": "relaunch"}.get(how, "restart")
+        if done.returncode == 0 and how == "stop" and run(
+                ["systemctl", *scope(user), "show", "-p", "ConditionResult", "--value", "--", unit]) == "no":
+            # `systemctl start` returns 0 for a unit whose condition refused:
+            # it was not started. Nothing in the record may be forgotten that way.
+            failed.insert(0, entry)
+            print(f"{unit} did not start: its condition refused "
+                  f"(the mode marker {', '.join(markers_standing()) or MARKER} still exists)", file=sys.stderr)
+        elif done.returncode == 0:
+            print(f"{word.rstrip('e')}ed {unit}", file=sys.stderr)
         else:
-            failed.insert(0, (user, unit))
-            print(f"could not restart {unit}: {done.stderr.strip()}", file=sys.stderr)
+            failed.insert(0, entry)
+            print(f"could not {word} {unit}: {done.stderr.strip()}", file=sys.stderr)
     write_evicted(failed)
     return not failed
+
+
+
+
+def loaded_model():
+    """The model whose unit is active or activating, if any. The units
+    conflict in systemd, so there is at most one."""
+    for name, entry in MODELS.items():
+        if run(["systemctl", "--user", "is-active", "--", entry["unit"]]) in ("active", "activating"):
+            return name
+    return None
+
+
+def mode_on():
+    """Offline-AI mode is on while a model server answers, a model unit is
+    active or activating, or a reservation's marker still stands."""
+    return healthy() or loaded_model() is not None or bool(markers_standing())
+
+
+def stop_other_model():
+    """A model other than the selected one is loaded: stop it, so the memory
+    it held is free before the selected one's needs are measured. Its
+    ExecStopPost drops its reservation; the marker is cleared here in case
+    that did not happen."""
+    other = loaded_model()
+    if other is None or other == SELECTED:
+        return
+    unit = MODELS[other]["unit"]
+    print(f"switching from {other} to {SELECTED}: stopping {unit}...", file=sys.stderr)
+    done = systemctl_user("stop", unit)
+    if done.returncode != 0:
+        sys.exit(f"could not stop {unit}: {done.stderr.strip()}")
+    clear_marker(other)
+
+
+def require_model_on_disk():
+    """The selected model's weights must be here before anything is stopped
+    for it: a switch to a model that is missing would otherwise leave nothing
+    loaded. The message says how to fetch them."""
+    if MODEL and not os.path.exists(MODEL):
+        sys.exit(f"the {SELECTED} model is not on this machine: {MODEL}\n"
+                 f"Fetch it while online:\n  {MODELS[SELECTED].get('fetch') or '(no fetch hint configured)'}")
+
+
+def serving_selected():
+    """The selected model, or a server outside systemd, is already answering:
+    nothing to stop, nothing to load, no weights to ask for."""
+    return healthy() and loaded_model() in (None, SELECTED)
+
+
+def load_model(force=False):
+    """Bring up the selected model, whatever is loaded now."""
+    if serving_selected():
+        return
+    require_model_on_disk()
+    try:
+        stop_other_model()
+        if MODEL and os.path.exists(MODEL) and not healthy():
+            make_room(model_bytes() + HEADROOM)
+        up(force=force)
+    except SystemExit:
+        # The model did not load. Its unit may still be running (a load that
+        # never became ready) and holding the reservation whose marker keeps
+        # what gave way from starting, so it goes first, then the marker.
+        systemctl_user("stop", UNIT)
+        clear_marker(SELECTED)
+        raise
 
 
 def enter_offline_mode(force=False):
     evict()
     try:
-        up(force=force)
+        load_model(force=force)
     except SystemExit:
-        restore()  # the model did not load: give back what was stopped for it
+        # The model did not load: give back what was stopped for it (its unit
+        # and marker are already gone, so what gave way can start).
+        restore()
         raise
     start_library()
 
 
 def leave_offline_mode():
+    """Stop the library and every model unit, clear every marker, restore."""
     systemctl_user("stop", LIBRARY_UNIT)
-    stopped = systemctl_user("stop", UNIT)
+    stopped = all([systemctl_user("stop", entry["unit"]).returncode == 0 for entry in MODELS.values()])
+    cleared = clear_marker()
     restored = restore()
-    return stopped.returncode == 0 and restored
+    return stopped and cleared and restored
 
 
 def up(force=False):
-    if healthy():
+    if serving_selected():
         return
-    if MODEL and not os.path.exists(MODEL):
-        sys.exit(f"the model is not on this machine: {MODEL}\n"
-                 "Fetch it while online (46 GB):\n"
-                 "  nix shell nixpkgs#python3Packages.huggingface-hub -c hf download "
-                 "Qwen/Qwen3-Coder-Next-GGUF --include 'Qwen3-Coder-Next-Q4_K_M/*' "
-                 "--local-dir ~/.local/share/llm-models/qwen3-coder-next")
+    require_model_on_disk()
     loading = run(["systemctl", "--user", "is-active", "--", UNIT]) in ("active", "activating")
     if MODEL and not force and not loading:
         need, free = model_bytes(), available_bytes()
+        anon, areas = host_swap()
+        swappable = swappable_bytes(anon, areas)
+        if free is not None and need > free + swappable:
+            sys.exit(f"not enough memory: the model needs about {need / 2**30:.0f} GiB; "
+                     f"{free / 2**30:.0f} GiB is available and {swappable / 2**30:.0f} GiB more could go to swap"
+                     + (" (zram keeps swapped pages in RAM, compressed, so it frees less than it takes)"
+                        if any(share < 1 for _, share in areas) else "") + ".\n"
+                     "Close something large first (`ps -eo rss,comm --sort=-rss | head`), "
+                     "or run `offline-ai up --force` to load anyway.")
         if free is not None and need > free:
-            sys.exit(f"not enough free memory: the model needs about {need / 2**30:.0f} GiB and "
-                     f"{free / 2**30:.0f} GiB is available.\nClose something large first "
-                     "(`ps -eo rss,comm --sort=-rss | head`), or run `offline-ai up --force` to load anyway.")
-    print(f"loading the model ({UNIT})...", file=sys.stderr)
+            moving = swap_needed(need - free, anon, areas)
+            print(f"{moving / 2**30:.0f} GiB of other programs' idle memory will move to swap while the model "
+                  f"loads, to free the {(need - free) / 2**30:.0f} GiB it still needs"
+                  + (" (zram keeps a compressed copy of what it takes in RAM)" if moving > need - free else ""),
+                  file=sys.stderr)
+    print(f"loading the {SELECTED} model ({UNIT})...", file=sys.stderr)
     started = systemctl_user("start", UNIT)
     if started.returncode != 0:
         sys.exit(f"could not start {UNIT}: {started.stderr.strip()}")
     began = time.time()
-    while time.time() - began < 900:
+    while time.time() - began < READY_TIMEOUT:
         if healthy():
             print(f"model ready after {time.time() - began:.0f} s", file=sys.stderr)
+            if not os.path.exists(MARKER):
+                # The unit starts its reservation best-effort, so the model
+                # answers either way; but without the marker a deploy or a
+                # timer can start what gave way, and builds are not capped.
+                print(f"warning: no mode marker at {MARKER}: the memory reservation ({RESERVATION}) did not "
+                      "start, so what gave way to the model may be started again by a deploy or a timer, "
+                      f"and builds are not capped; see: journalctl -u {RESERVATION} -b -n 20", file=sys.stderr)
             return
         state = run(["systemctl", "--user", "is-active", "--", UNIT])
         if state in ("failed", "inactive"):
             sys.exit(f"{UNIT} is {state}; see: journalctl --user -u {UNIT} -b -n 40")
-        time.sleep(3)
-    sys.exit(f"{UNIT} did not become ready within 15 minutes")
+        time.sleep(min(3, READY_TIMEOUT))
+    sys.exit(f"{UNIT} did not become ready within {READY_TIMEOUT // 60 or 1} minutes")
 
 
 def start_library():
@@ -1286,12 +2016,37 @@ def start_library():
     return []
 
 
+def model_words(name, loaded):
+    """What `models` and `status` say about one model."""
+    entry = MODELS[name]
+    words = ["loaded" if name == loaded else "not loaded"]
+    if entry.get("model"):
+        words.append("on disk" if os.path.exists(entry["model"]) else "not on disk")
+    if name == DEFAULT_MODEL:
+        words.append("default")
+    return words
+
+
+def model_lines():
+    loaded = loaded_model()
+    return [f"{name}: {', '.join(model_words(name, loaded))}" for name in MODELS]
+
+
 def status_lines():
     index = load_doc_index()
-    lines = ["model server: " + ("ready" if healthy() else run(["systemctl", "--user", "is-active", "--", UNIT]))]
+    loaded = loaded_model()
+    if healthy():
+        server = "ready" + (f" ({loaded})" if loaded else "")
+    elif loaded:
+        server = run(["systemctl", "--user", "is-active", "--", MODELS[loaded]["unit"]]) + f" ({loaded})"
+    else:
+        server = run(["systemctl", "--user", "is-active", "--", UNIT])
+    lines = ["model server: " + server]
     evicted = read_evicted()
-    lines.append("mode: offline-AI, stopped for it: " + ", ".join(unit for _, unit in evicted) if evicted
+    lines.append("mode: offline-AI, stopped for it: " + ", ".join(
+        unit + (" (frozen)" if how == "freeze" else "") for _, unit, how, _spec in evicted) if evicted
                  else "mode: " + ("offline-AI" if healthy() else "default"))
+    lines.append("models: " + "; ".join(f"{name} ({', '.join(model_words(name, loaded))})" for name in MODELS))
     for source, path in OPTION_FILES.items():
         lines.append(f"{source} options: " + ("present" if path and os.path.exists(path) else "MISSING"))
     for label in COLLECTIONS:
@@ -1312,11 +2067,13 @@ def status_lines():
 
 
 def main():
-    parser = argparse.ArgumentParser(usage=USAGE, add_help=False)
-    parser.add_argument("question", nargs="*")
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("-h", "--help", action="store_true")
+    parser = build_parser()
     args, extra = parser.parse_known_args()
+    if args.model not in MODELS:
+        # Checked here, not by argparse's choices: an unknown model is an
+        # ordinary failure (exit 1) that names what there is.
+        sys.exit(f"unknown model {args.model!r}; the models are: {', '.join(MODELS)} (see `offline-ai models`)")
+    select_model(args.model)
     if args.question[:2] == ["library", "fetch"]:
         rest = args.question[2:] + extra + (["--help"] if args.help else [])
         try:
@@ -1328,12 +2085,15 @@ def main():
     command = args.question[0] if len(args.question) == 1 else None
 
     if args.help or command == "help":
-        print(USAGE)
+        print(usage())
         return
     if command == "down":
         sys.exit(0 if leave_offline_mode() else 1)
     if command == "status":
         print("\n".join(status_lines()))
+        return
+    if command == "models":
+        print("\n".join(model_lines()))
         return
     if command == "index":
         index = load_doc_index(rebuild=True)
@@ -1360,13 +2120,22 @@ def main():
         return
 
     # A conversation started from default mode enters offline-AI mode and leaves it
-    # again when it ends, however it ends; one started after `up` leaves the mode alone.
-    owns_mode = not healthy()
+    # again when it ends, however it ends. One started while the mode is on (after
+    # `up`, or with another model loaded) only makes sure the selected model is the
+    # one loaded, and leaves the mode, and that model, as they are.
+    owns_mode = not mode_on()
     for number in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(number, lambda signum, frame: sys.exit(128 + signum))
     try:
         if owns_mode:
             enter_offline_mode(force=args.force)
+        else:
+            try:
+                load_model(force=args.force)
+            except SystemExit:
+                if loaded_model() is None:
+                    print("no model is loaded now; `offline-ai down` returns to default mode", file=sys.stderr)
+                raise
         converse(args.question)
     finally:
         if owns_mode:
@@ -1379,9 +2148,11 @@ def converse(question):
     if question:
         messages.append({"role": "user", "content": with_leads(" ".join(question))})
         try:
-            answer(messages)
+            finished = answer(messages)
         except MODEL_ERRORS as exc:
             sys.exit(model_error(exc))
+        if not finished:
+            sys.exit(2)  # said on stdout already; a distinct status so a script can tell it from an error
         return
     print("\n".join(status_lines()), file=sys.stderr)
     print("\noffline-ai. Ask a question; empty line or Ctrl-D to quit.", file=sys.stderr)

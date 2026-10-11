@@ -74,6 +74,14 @@ in
       ExecStart = "${pkgs.uv}/bin/uv run router-ingestor --paths %h/.config/router/paths.yaml watch";
       Restart = "on-failure";
       RestartSec = 5;
+      # The watcher answers SIGTERM in under a second when idle (6 of 7 stops
+      # on 2026-10-02), but once, stopped minutes after a restart with a
+      # backlog, it sat in stop-sigterm for the full default 90 s and was
+      # SIGKILLed. offline-ai stops this unit synchronously when it loads
+      # the model, so that wait is the operator's. Its graceful teardown
+      # joins its threads for at most 5 s each; 20 s is generous for that
+      # and short for a wedge. The wedge itself belongs to router-agent.
+      TimeoutStopSec = 20;
     };
     Install.WantedBy = [ "default.target" ];
   };
@@ -146,6 +154,10 @@ in
       ExecStart = "${voquillWrapper}/bin/voquill-launch --voquill-autostart-hidden";
       Restart = "on-failure";
       RestartSec = 5;
+      # Dictation is interactive: five shares to a default sibling's one
+      # under CPU contention (the STT units themselves carry ten, see
+      # modules/nixos/local-stt.nix).
+      CPUWeight = 500;
     };
     Install.WantedBy = [ "graphical-session.target" ];
   };

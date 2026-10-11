@@ -31,8 +31,9 @@
 # WHAT IT DOES NOT DO. Installing the timer does not download any weights.
 # The worker runs with `HF_HUB_OFFLINE=1` and fails loudly if the models are
 # absent; `aggregator-embed-seed.service` is the only path that fetches them
-# (~2.4 GB, `HF_HUB_OFFLINE=0`), it is human-triggered, and it has no
-# `Install.WantedBy` on purpose. Start it by hand once:
+# (the pinned Qwen3-Embedding Q8_0 GGUF plus the reranker, `HF_HUB_OFFLINE=0`),
+# it is human-triggered, and it has no `Install.WantedBy` on purpose. Start it
+# by hand once:
 #
 #   systemctl --user start aggregator-embed-seed
 #
@@ -41,10 +42,12 @@
 # claude-web, chatgpt, sessions, subagents, then everything unranked — and
 # finishes each before starting the next, so `aggregator status` answers
 # "which sources are searchable today" rather than one percentage for the
-# whole corpus. Measured on the real cache at 40 tok/s: dropbox ~1.1 days,
-# dropbox + substack + claude-web ~4 days, the whole corpus ~54.8 days, of
-# which 91% is sessions + subagents. A tick that reports progress and does
-# not finish is the normal case for weeks.
+# whole corpus. Since the 9e99864 bump the vectors come from
+# `aggregator-embed-server.service` (llama-server on the iGPU over a unix
+# socket) instead of torch on the CPU: measured on a copy of the real cache at
+# 2-4 chunks/s, against ~40 tok/s before, so the backfill is days rather than
+# the ~55 days it was. Offline-AI mode (modules/nixos/offline-ai.nix) stops the
+# timer, the worker and the server while its model is loaded.
 #
 # `aggregator-src` IS REQUIRED, AND A NIX DEFAULT CANNOT SOFTEN THAT. This
 # module uses the argument inside `imports`, and the module system resolves an
@@ -73,7 +76,7 @@
 # home-manager block that built the failing configuration. Every site that
 # constructs one must pass it — both host blocks in flake.nix, both builders in
 # tests/lib/common.nix, and tests/microvm.nix, which rolls its own.
-{ lib, pkgs, aggregator-src, ... }:
+{ pkgs, aggregator-src, ... }:
 
 {
   imports = [ "${aggregator-src}/nix/aggregator.nix" ];
@@ -108,15 +111,6 @@
     tag.enable = false;
   };
 
-  # TEMPORARILY PAUSED. Keep the worker and seed units installed so resuming
-  # needs no model or package rebuild, but remove the timer's target link so
-  # login, reboot, and Home Manager activation cannot start background
-  # embedding. The existing vector backlog and weights remain untouched;
-  # lexical FTS5 search, ingest, and the shared MCP backend keep running.
-  # Resume by deleting this override and updating tests/base.nix in the same
-  # PR.
-  systemd.user.timers.aggregator-embed.Install.WantedBy = lib.mkForce [ ];
-
   # A MEMORY CEILING THAT THROTTLES, AND DELIBERATELY DOES NOT KILL.
   #
   # Upstream bounds this worker's CPU and IO (Nice=19, IOSchedulingClass=idle)
@@ -124,8 +118,8 @@
   # interchangeable. dellan took 16 OOM-kills in the fortnight to 2026-08-25,
   # and the process the kernel picked was rerank-paired.service's python3 at
   # 10.4 GB anon-rss — the same torch / sentence-transformers workload class
-  # this unit loads. Unbounded, a ~55-day backfill is 55 days of exposure to
-  # that.
+  # this unit loaded until the 9e99864 bump moved the model into
+  # aggregator-embed-server; the worker now chunks text and writes vectors.
   #
   # MemoryHigh, NOT MemoryMax, and the difference is the entire point.
   # MemoryMax kills. A SIGKILLed worker leaves its per-row claim on disk, and

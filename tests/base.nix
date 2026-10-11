@@ -288,6 +288,13 @@ let
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
   name = "vm-base";
+  # A reservation only this lane declares; dellan and tuxedo have their own.
+  extraModules = [{
+    services.memoryPressure = {
+      reservations.vmtest = 2 * 1024 * 1024 * 1024;
+      desktopReserve = 2 * 1024 * 1024 * 1024;
+    };
+  }];
   testScript = ''
     dellan.wait_for_unit("multi-user.target")
     # Keep the dormant TUXEDO profile's eval and package-build contract in
@@ -532,6 +539,26 @@ in
     dellan.wait_until_succeeds("test -s /tmp/waiter-crossed")
     dellan.wait_until_succeeds(f"test ! -e /proc/{waiter}")
 
+    # The lock lives in jonathan's directory, which root's deploy opens.
+    # A symlink jonathan plants there must not turn root's open into a
+    # truncation of the link target (root-owned canary stays intact).
+    dellan.succeed("echo root-canary > /root/memory-lock-canary")
+    dellan.succeed(
+        "su - jonathan -c 'mv /home/jonathan/.nix-memory-pressure/lock "
+        "/home/jonathan/.nix-memory-pressure/lock.real && "
+        "ln -s /root/memory-lock-canary /home/jonathan/.nix-memory-pressure/lock'"
+    )
+    dellan.succeed("nix-memory-run --nonblock -- true")
+    canary = dellan.succeed("cat /root/memory-lock-canary").strip()
+    assert canary == "root-canary", (
+        f"root's lock open truncated the symlink target: {canary!r}"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'rm /home/jonathan/.nix-memory-pressure/lock && "
+        "mv /home/jonathan/.nix-memory-pressure/lock.real "
+        "/home/jonathan/.nix-memory-pressure/lock'"
+    )
+
     # Run one real derivation through the production wrapper. The running Nix
     # client must live in ram-heavy.slice, while use-cgroups places the builder
     # in a delegated descendant below nix-daemon.service.
@@ -675,6 +702,49 @@ in
         "| grep -F 'oomd-hog.service'"
     )
 
+    # Memory reservation (memory-pressure.nix). jonathan starts it the way
+    # offline-ai-llm does (polkit, no password); while active both build
+    # cgroups are capped at half of MemTotal - reservation - desktopReserve,
+    # and the cap survives daemon-reload (every switch) and a daemon restart.
+    # Stopping it restores each unit's configured MemoryHigh exactly.
+    def _memory_high(unit, user=False):
+        scope = "--user --machine=jonathan@ " if user else ""
+        group = dellan.succeed(f"systemctl {scope}show -P ControlGroup {unit}").strip()
+        return int(dellan.succeed(f"cat /sys/fs/cgroup{group}/memory.high").strip())
+
+    def _configured_high(unit, user=False):
+        scope = "--user --machine=jonathan@ " if user else ""
+        return int(dellan.succeed(f"systemctl {scope}show -P MemoryHigh {unit}").strip())
+
+    mem_total = int(dellan.succeed("awk '/^MemTotal:/ {print $2}' /proc/meminfo")) * 1024
+    share = max((mem_total - 2 * 2**30 - 2 * 2**30) // 2, 2**30)
+    reserved_cap = min(share, mem_total * 50 // 100) // 4096 * 4096
+    capped = [("nix-daemon.service", False), ("ram-heavy.slice", True)]
+    dellan.succeed("systemctl start nix-daemon.service")
+    dellan.succeed("su - jonathan -c 'systemctl start memory-reserve-vmtest.service'")
+    for unit, user in capped:
+        assert _memory_high(unit, user) == reserved_cap, (unit, _memory_high(unit, user), reserved_cap)
+    # An active reservation is visible as a path, so units that must not
+    # start into the reserved memory can carry ConditionPathExists=!<path>
+    # (offline-ai hangs its evicted services on /run/memory-reserve/offline-ai).
+    # Any user can see it; it is gone the moment the reservation ends.
+    dellan.succeed("su - jonathan -c 'test -d /run/memory-reserve/vmtest'")
+    dellan.succeed("systemctl daemon-reload")
+    dellan.succeed("systemctl --user --machine=jonathan@ daemon-reload")
+    dellan.succeed("systemctl restart nix-daemon.service")
+    for unit, user in capped:
+        assert _memory_high(unit, user) == reserved_cap, (unit, _memory_high(unit, user), "after reload/restart")
+    dellan.succeed("su - jonathan -c 'systemctl stop memory-reserve-vmtest.service'")
+    dellan.succeed("test ! -e /run/memory-reserve/vmtest")
+    # nix-daemon returns to its 50%; the slice to the OOMD check's own runtime
+    # override above, which the reservation must neither beat afterwards nor
+    # delete.
+    unreserved = (mem_total * 50 // 100) // 4096 * 4096
+    assert _configured_high("nix-daemon.service") // 4096 * 4096 == unreserved
+    assert _configured_high("ram-heavy.slice", True) == 128 * 2**20
+    for unit, user in capped:
+        assert _memory_high(unit, user) == _configured_high(unit, user) // 4096 * 4096, unit
+
     # Assert on the home.file source rather than `crontab -l`: the live
     # crontab is installed by an activation hook whose timing relative to
     # /run/wrappers/bin/crontab in this VM image isn't load-bearing for
@@ -696,6 +766,30 @@ in
     live_active_commands = [
         _cron_command(line) for line in live_crontab.splitlines()
     ]
+    # Every cron job is unattended, so any `claude` it spawns is a machine
+    # session that session-reflect must skip. The sentinel is a crontab
+    # environment line; cron applies one only to entries BELOW it, so it
+    # must precede every job, in the source and in the installed table.
+    import re as _re_cron
+    _re_env = _re_cron.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+    def _sentinel_covers_every_job(table):
+        covered = False
+        for line in table.splitlines():
+            s = line.strip()
+            if s == "CLAUDE_PIPELINE_INTERNAL=1":
+                covered = True
+            elif _cron_command(line) and not _re_env.match(s):
+                if not covered:
+                    return False
+        return covered
+    assert _sentinel_covers_every_job(crontab_src), (
+        "a cron job runs without CLAUDE_PIPELINE_INTERNAL=1:\n"
+        f"{crontab_src}"
+    )
+    assert _sentinel_covers_every_job(live_crontab), (
+        "installed crontab runs a job without CLAUDE_PIPELINE_INTERNAL=1:\n"
+        f"{live_crontab}"
+    )
     assert not any("mint-drift-agent.sh" in c for c in active_commands), (
         "obsolete Mint drift job must not remain scheduled:\n"
         f"{crontab_src}"
@@ -878,7 +972,20 @@ in
         "git -C $root/seed commit -q --allow-empty -m seed; "
         "git -C $root/seed push -q origin HEAD:refs/heads/main; "
         "GIT_DIR=$root/repo.git git worktree add -q $root/anchor main; "
-        "git -C $root/anchor worktree add -q --force $root/duplicate main'"
+        "git -C $root/anchor worktree add -q --force $root/duplicate main; "
+        # User-unit surface: a hand-authored unit, an imperative
+        # `systemctl --user enable` link (points at the unit path under
+        # ~/.config, not into the store), and a store-owned link of the
+        # shape home-manager writes, which must stay silent.
+        "u=$root/home/.config/systemd/user; mkdir -p $u/timers.target.wants; "
+        "printf \"[Timer]\\nOnCalendar=hourly\\n\" > $u/hand-made.timer; "
+        "ln -s $u/hand-made.timer $u/timers.target.wants/hand-made.timer; "
+        "ln -s /nix/store/00000000000000000000000000000000-hm/x.service $u/hm-owned.service; "
+        # Claude Code native installer: a deliberate, documented exception
+        # (home/claude-egress-slice.nix), not drift.
+        "mkdir -p $root/home/.local/share/claude/versions; "
+        "printf \"#!/bin/sh\\n\" > $root/home/.local/share/claude/versions/9.9.9; "
+        "ln -s $root/home/.local/share/claude/versions/9.9.9 $root/home/.local/bin/claude'"
     )
     drift_env = (
         f"HOME={drift_fixture}/home "
@@ -909,6 +1016,23 @@ in
         assert marker in drift_report, (
             f"drift fixture finding {marker!r} missing:\n{drift_report}"
         )
+    def drift_section(heading):
+        parts = drift_report.split(f"## {heading}\n", 1)
+        assert len(parts) == 2, f"section {heading!r} missing:\n{drift_report}"
+        return parts[1].split("~~~", 2)[1].split()
+
+    user_units = drift_section("Unmanaged entries in ~/.config/systemd/user")
+    for entry in ["hand-made.timer", "timers.target.wants/hand-made.timer"]:
+        assert entry in user_units, (
+            f"user unit drift {entry!r} missing:\n{drift_report}"
+        )
+    assert "hm-owned.service" not in user_units, (
+        f"store-owned user unit reported as drift:\n{drift_report}"
+    )
+    local_bin = drift_section("Entries outside /nix/store in ~/.local/bin")
+    assert "claude" not in local_bin, (
+        f"Claude Code native installer reported as drift:\n{drift_report}"
+    )
     drift_success = f"{drift_fixture}/state/nixos-drift-analyzer/last-success"
     dellan.succeed(f"test -s {drift_success}")
 
@@ -1123,6 +1247,83 @@ in
         f"nothing may be written on the duplicate night:\n{night2}"
     )
 
+    # The review's window is selected by the WRAPPER, not the model. The
+    # model runs with Read/Glob/Grep only; Glob caps at 100 matches and
+    # returns them oldest-first, so over a corpus of thousands of
+    # sessions it never saw the newest twelve and each night improvised a
+    # different workaround. The helper below is what the wrapper runs;
+    # exercise the real binary against a fixture corpus.
+    inputs_bin = dellan.succeed(
+        "grep -o '/nix/store/[^:\"]*rsi-review-inputs[^:\"]*/bin' "
+        f"{rsi_bin} | head -1"
+    ).strip() + "/rsi-review-inputs"
+    fx = dellan.succeed("mktemp -d").strip()
+    sess = f"{fx}/sessions"
+    # 14 fresh sessions, s00 newest; one stale; one subagent artifact
+    # (newest of all, must still be excluded); one oversize among the
+    # newest twelve.
+    fixture = [f"mkdir -p {sess}"]
+    for i in range(14):
+        fixture.append(
+            f"mkdir -p {sess}/s{i:02d} && echo '{{}}' > {sess}/s{i:02d}/final.json"
+            f" && touch -d '-{i + 1} minutes' {sess}/s{i:02d}/final.json"
+        )
+    fixture += [
+        f"mkdir -p {sess}/old && echo '{{}}' > {sess}/old/final.json"
+        f" && touch -d '-2 days' {sess}/old/final.json",
+        f"mkdir -p {sess}/s00/subagents/a1"
+        f" && echo '{{}}' > {sess}/s00/subagents/a1/final.json",
+        f"head -c 40000 /dev/zero > {sess}/s03/final.json"
+        f" && touch -d '-4 minutes' {sess}/s03/final.json",
+        f"mkdir -p {fx}/proposals/rsi {fx}/proposals/permissions/archived",
+        f"printf -- '---\\nstatus: rejected\\n---\\nbody\\n'"
+        f" > {fx}/proposals/rsi/2026-09-01-probe-rejected.md",
+        f"printf -- '---\\nstatus: pending\\n---\\nbody\\n'"
+        f" > {fx}/proposals/permissions/archived/2026-09-02-probe-pending.md",
+    ]
+    dellan.succeed(" && ".join(fixture))
+    block = dellan.succeed(f"{inputs_bin} {sess} {fx}/proposals")
+    window = [
+        l.split("`")[1] for l in block.splitlines()
+        if l.startswith("- `") and "/final.json" in l and "B, over" not in l
+    ]
+    expected = [f"{sess}/s{i:02d}/final.json" for i in range(12) if i != 3]
+    assert window == expected, (
+        "the window must be the twelve newest top-level final.json files "
+        "modified in the last 24h, newest first, oversize ones moved to the "
+        f"skipped list:\nexpected {expected}\ngot {window}\n{block}"
+    )
+    assert f"{sess}/s03/final.json" in block and "over 32 KiB" in block, (
+        f"an oversize candidate must be reported as skipped:\n{block}"
+    )
+    for leak in ["subagents", f"{sess}/old/", f"{sess}/s12/"]:
+        assert leak not in block, f"{leak} must not reach the window:\n{block}"
+    for entry in [
+        "rsi/2026-09-01-probe-rejected.md — status: rejected",
+        "permissions/archived/2026-09-02-probe-pending.md — status: pending",
+    ]:
+        assert entry in block, (
+            "the proposal inventory must list every proposal, archived and "
+            f"rejected included, with its status ({entry}):\n{block}"
+        )
+    # A symlinked sessions dir or proposals root (the compat-symlink
+    # pattern this config already uses for proposals) must yield the
+    # same window and inventory, not a silent "nothing to review" skip.
+    dellan.succeed(f"ln -s {sess} {fx}/sess-link && ln -s {fx}/proposals {fx}/prop-link")
+    linked = dellan.succeed(f"{inputs_bin} {fx}/sess-link {fx}/prop-link")
+    linked_window = [
+        l.split("`")[1].replace(f"{fx}/sess-link", sess) for l in linked.splitlines()
+        if l.startswith("- `") and "/final.json" in l and "B, over" not in l
+    ]
+    assert linked_window == expected, (
+        f"a symlinked sessions dir must select the same window:\n{linked}"
+    )
+    assert "rsi/2026-09-01-probe-rejected.md — status: rejected" in linked, (
+        f"a symlinked proposals root must still be inventoried:\n{linked}"
+    )
+    empty_sess = dellan.succeed("mktemp -d").strip()
+    dellan.fail(f"{inputs_bin} {empty_sess} {fx}/proposals")
+
     def run_rsi(expect_ok=True):
         cmd = f"su - jonathan -c {rsi_bin} 2>&1"
         return dellan.succeed(cmd) if expect_ok else dellan.fail(cmd)
@@ -1188,6 +1389,88 @@ in
     )
     assert "rsi-daily-review:" in on, (
         f"daily_review=true must reach the wrapper's own preflight:\n{on}"
+    )
+
+    # The composed prompt (prompt.md + window + proposal inventory) grows
+    # ~100 B per proposal. Passed as one argv string it hits the kernel's
+    # 128 KiB MAX_ARG_STRLEN and the run dies with E2BIG once the sink is
+    # big enough. Drive the real wrapper end to end with `claude` stubbed
+    # on PATH: an inventory pushing the prompt past 128 KiB must still
+    # reach the model intact, and a runaway one must be refused loudly
+    # (journal + non-zero exit) without a model call.
+    stub = dellan.succeed("mktemp -d").strip()
+    dellan.succeed(
+        f"cat > {stub}/claude <<'STUB_EOF'\n"
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$@\" > {stub}/argv\n"
+        f"cat > {stub}/stdin\n"
+        "STUB_EOF\n"
+        f"chmod 755 {stub}/claude && chmod 777 {stub}"
+    )
+    probe_sess = "/home/jonathan/.claude/reflections/sessions/e2big-probe"
+    probe_prop = "/home/jonathan/.local/state/claude-proposals/rsi-e2big-probe"
+    dellan.succeed(
+        f"mkdir -p {probe_sess} {probe_prop}"
+        f" && echo '{{}}' > {probe_sess}/final.json"
+        f" && printf 'PROMPT-MD-MARKER\\n\\n' > {rsi_cfg_dir}/prompt.md"
+        " && chown -R jonathan:users /home/jonathan/.claude"
+        " /home/jonathan/.local/state"
+    )
+
+    def fill_inventory(n):
+        dellan.succeed(
+            f"rm -f {probe_prop}/*.md; for i in $(seq 1 {n}); do"
+            f" printf -- '---\\nstatus: pending\\n---\\n' > "
+            f"{probe_prop}/2026-10-02-synthetic-proposal-with-a-realistic-slug-length-$i.md;"
+            f" done; chown -R jonathan:users {probe_prop}"
+        )
+
+    def run_stubbed():
+        dellan.succeed(f"rm -f {stub}/argv {stub}/stdin")
+        return dellan.execute(
+            f"su - jonathan -c 'PATH={stub}:$PATH {rsi_bin}' 2>&1"
+        )
+
+    fill_inventory(1400)
+    rc_big, out_big = run_stubbed()
+    assert rc_big == 0, f"a >128 KiB prompt must still run (rc={rc_big}):\n{out_big}"
+    fed = dellan.succeed(f"cat {stub}/stdin")
+    assert len(fed.encode()) > 131072, (
+        f"fixture must push the prompt past MAX_ARG_STRLEN, got {len(fed.encode())} B"
+    )
+    assert fed.startswith("PROMPT-MD-MARKER") and f"{probe_sess}/final.json" in fed, (
+        "the model must receive prompt.md plus the precomputed window"
+    )
+    assert "synthetic-proposal-with-a-realistic-slug-length-1400.md" in fed, (
+        "the whole inventory must reach the model, not a truncation"
+    )
+    argv_big = dellan.succeed(f"cat {stub}/argv")
+    assert "PROMPT-MD-MARKER" not in argv_big and len(argv_big) < 4096, (
+        f"the prompt must not travel in argv:\n{argv_big[:2000]}"
+    )
+    # The prompt is untrusted transcript content: the tool SURFACE must be
+    # closed (--tools), not just permissions granted (--allowedTools), and
+    # no MCP server may load.
+    argv_lines = argv_big.splitlines()
+    assert "--tools" in argv_lines and argv_lines[argv_lines.index("--tools") + 1] == "Read,Glob,Grep", (
+        f"the reviewer must run with only Read,Glob,Grep available:\n{argv_big}"
+    )
+    assert "--strict-mcp-config" in argv_lines and "--mcp-config" not in argv_lines, (
+        f"the reviewer must load no MCP servers:\n{argv_big}"
+    )
+
+    fill_inventory(3000)
+    rc_huge, out_huge = run_stubbed()
+    assert rc_huge != 0, f"a runaway prompt must fail the run:\n{out_huge}"
+    assert "composed prompt is" in out_huge, (
+        f"the size guard must say why it refused:\n{out_huge}"
+    )
+    dellan.fail(f"test -e {stub}/argv")
+    dellan.succeed(
+        "journalctl -t rsi-daily-review --no-pager | grep -q 'composed prompt is'"
+    )
+    dellan.succeed(
+        f"rm -rf {probe_sess} {probe_prop} {stub} {rsi_cfg_dir}/prompt.md"
     )
     dellan.succeed(f"rm -f {rsi_cfg_dir}/config.json")
     # Guard against reintroducing the dead-grant pattern: path-scoped
@@ -1710,6 +1993,71 @@ in
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user reset-failed ai-router-ranking.service'"
+    )
+
+    # ── session-reflect backfill drain (home/session-reflect-backfill.nix) ──
+    # Friday timer running ~/.claude/skills/session-reflect/backfill.sh. The
+    # ~/.claude repo is not cloned here, so the clean run is the guard path
+    # (missing script -> "skipping", unit NOT failed, notifier silent); a
+    # planted failing script must turn the unit red and fire the notifier.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start session-reflect-backfill.service'"
+    )
+    state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed session-reflect-backfill.service || true'"
+    ).strip()
+    assert state != "failed", \
+        f"session-reflect-backfill.service failed on the guard path: {state!r}"
+    backfill_log = dellan.succeed(
+        "cat /home/jonathan/.local/share/session-reflect/backfill.log"
+    )
+    assert "skipping" in backfill_log, \
+        f"guard-path 'skipping' marker missing from backfill.log:\n{backfill_log}"
+    notify_log = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u session-reflect-backfill-failure-notify.service "
+        "--no-pager' || true"
+    )
+    assert "session-reflect backfill drain failed" not in notify_log, (
+        "notify marker present after a SUCCESSFUL guard-path run — "
+        f"OnFailure is mis-wired:\n{notify_log}"
+    )
+    # The drain must see the user's own launchers (claude, ai-router); the
+    # planted script records its PATH, then fails.
+    dellan.succeed(
+        "install -d -o jonathan -g users /home/jonathan/.claude/skills/session-reflect && "
+        "printf 'echo \"PATH=$PATH\"\\nexit 1\\n' "
+        "> /home/jonathan/.claude/skills/session-reflect/backfill.sh && "
+        "chmod 644 /home/jonathan/.claude/skills/session-reflect/backfill.sh"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user start session-reflect-backfill.service; true'"
+    )
+    state = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-failed session-reflect-backfill.service || true'"
+    ).strip()
+    assert state == "failed", \
+        f"failing drain should leave the unit failed; got {state!r}"
+    backfill_log = dellan.succeed(
+        "cat /home/jonathan/.local/share/session-reflect/backfill.log"
+    )
+    assert "/home/jonathan/.local/bin" in backfill_log and \
+        "/home/jonathan/.claude/bin" in backfill_log, \
+        f"drain PATH lacks the user's launcher dirs:\n{backfill_log}"
+    dellan.wait_until_succeeds(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u session-reflect-backfill-failure-notify.service "
+        "--no-pager' | grep -q 'session-reflect backfill drain failed'",
+        timeout=60,
+    )
+    dellan.succeed("rm -rf /home/jonathan/.claude/skills/session-reflect")
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user reset-failed session-reflect-backfill.service'"
     )
 
     # ── aggregator all-sources ingest (modules/nixos/aggregator-ingest-timer.nix) ──
@@ -2382,23 +2730,19 @@ in
     # declared in this repo, so upstream's `aggregator-embed-unit-hygiene`
     # check keeps guarding the unit that actually runs. What THIS repo
     # decides, and therefore what is asserted here, is the wiring: that the
-    # worker is installed but deliberately unarmed, that it can never download
+    # worker is installed and armed, that it can never download
     # on a manual run, that the seed
     # unit is human-triggered only, and that importing the upstream module
     # did not also resurrect its per-source ingest timers.
-    assert "aggregator-embed.timer" not in agg_timers, (
-        "aggregator-embed.timer is armed despite the temporary embedding "
-        f"pause:\n{agg_timers}"
+    assert "aggregator-embed.timer" in agg_timers, (
+        "aggregator-embed.timer is not armed; the embed worker would never "
+        f"run:\n{agg_timers}"
     )
-    for prop, forbidden in [("is-enabled", "enabled"), ("is-active", "active")]:
-        got = dellan.succeed(
-            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-            f"systemctl --user {prop} aggregator-embed.timer || true'"
-        ).strip()
-        assert got != forbidden, (
-            f"aggregator-embed.timer {prop}={got!r}; temporary pause requires "
-            f"anything except {forbidden!r}"
-        )
+    got = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-enabled aggregator-embed.timer || true'"
+    ).strip()
+    assert got == "enabled", f"aggregator-embed.timer is-enabled={got!r}"
 
     # THE IMPORT MUST NOT BRING THE PER-SOURCE INGEST TIMERS BACK.
     # `services.aggregator.enable = true` switches on the whole upstream
@@ -2482,7 +2826,7 @@ in
             f"systemctl --user cat {unit}'"
         ):
             agg_armed.append(unit)
-    # Three armed units now. The shared MCP backend is armed on purpose so every
+    # Five armed units now. The shared MCP backend is armed on purpose so every
     # stdio client can remain a tiny proxy, and its process/model behavior is
     # exercised above. The health timer is also armed on purpose — a detector
     # that only runs when someone remembers to run it is not a detector — and
@@ -2490,13 +2834,20 @@ in
     # by its timer and the failure-notify service is OnFailure-only, both
     # asserted `static` above. That asymmetry is the property worth defending,
     # and it is why this list is about WantedBy rather than about unit count.
+    # The embed timer and embed server joined with the 9e99864 bump (embedding
+    # on the iGPU): the timer is the deliberate second writer to cache.db
+    # (vectors only; the ingest timer writes rows), and the server is
+    # llama-server behind a unix socket, which never opens cache.db.
     assert agg_armed == [
+        "aggregator-embed-server.service",
+        "aggregator-embed.timer",
         "aggregator-ingest.timer",
         "aggregator-mcp-backend.service",
         "aggregator-schema-health.timer",
     ], (
-        "the set of ARMED aggregator units changed. Only the ingest and "
-        "schema-health timers plus the shared MCP backend may "
+        "the set of ARMED aggregator units changed. Only the ingest, embed "
+        "and schema-health timers, the embed server and the shared MCP "
+        "backend may "
         f"carry an [Install] WantedBy; got {agg_armed} out of "
         f"{agg_all_units}.\n"
         "A newly armed unit is something an aggregator-src bump added that "
@@ -2524,9 +2875,12 @@ in
     # THE ENV VAR IS THE WEAKEST HALF OF "OFFLINE", and asserting only it is
     # how this check quietly stops covering anything. HF_HUB_OFFLINE is a
     # REQUEST: a library that does not read it, or any subprocess spawned
-    # along the way, still has the network. The load-bearing lines are the
-    # seccomp address-family restriction — which makes an AF_INET socket()
-    # fail outright — and the IP filter behind it.
+    # along the way, still has the network. The load-bearing line is the
+    # seccomp address-family restriction, which makes an AF_INET socket()
+    # fail outright. (The IPAddressDeny=any filter that used to sit behind it
+    # was dropped in the 9e99864 bump: in this host's user manager it did not
+    # stop a connect to the machine's own LAN address, so it guaranteed
+    # nothing. The worker reaches the embed server over a unix socket.)
     #
     # AND THIS REPO'S CI IS THE ONLY PLACE THAT CAN CATCH THEIR LOSS.
     # `aggregator-src` is a `flake = false` input, so upstream's own
@@ -2536,12 +2890,24 @@ in
     for directive in [
         "TRANSFORMERS_OFFLINE=1",
         "RestrictAddressFamilies=AF_UNIX AF_NETLINK",
-        "IPAddressDeny=any",
     ]:
         assert directive in agg_embed_unit, (
             f"aggregator-embed.service no longer carries {directive!r}, so the "
             "worker's offline guarantee rests on every library agreeing to "
             f"read an environment variable:\n{agg_embed_unit}"
+        )
+    # The embed server reads what the worker sends it (untrusted corpus text)
+    # and has no reason to reach any network either.
+    agg_embed_server_unit = dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user cat aggregator-embed-server.service'"
+    )
+    for unit_text, name in [(agg_embed_unit, "aggregator-embed.service"),
+                            (agg_embed_server_unit, "aggregator-embed-server.service")]:
+        families = [l for l in unit_text.splitlines() if l.startswith("RestrictAddressFamilies=")]
+        assert families and all("AF_INET" not in l for l in families), (
+            f"{name} may open IP sockets (RestrictAddressFamilies: {families}); "
+            "the embed worker and server talk over a unix socket only"
         )
 
     # The one opt-in that lets a run fetch weights. It belongs to the seed
@@ -2797,6 +3163,14 @@ in
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user reset-failed aggregator-ingest.service; true'"
+    )
+    # The VM has no internet, so every unit start below would sit out the
+    # wrapper's full 120 s network wait. The unit does not set this
+    # variable, so the user manager's environment reaches it. Unset again
+    # where the timer is re-armed.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user set-environment AGGREGATOR_NETWORK_WAIT_SEC=4'"
     )
 
     AGG_MARKER = "aggregator ingest run FAILED"
@@ -3078,6 +3452,10 @@ in
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user reset-failed aggregator-ingest.service; true'"
     )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user unset-environment AGGREGATOR_NETWORK_WAIT_SEC'"
+    )
     # Re-arm the timer stopped above. Separate call on purpose: a
     # `VAR=x cmd1; cmd2` prefix scopes VAR to cmd1 only, so a second
     # systemctl in the same `su -c` runs without XDG_RUNTIME_DIR and cannot
@@ -3274,7 +3652,7 @@ in
     )
     for marker in [
         "ProtectHome=tmpfs",
-        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json -%h/.config/gh -%h/Repos -%t/bus",
+        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json -%h/.cache/gh-tokens/host -%h/Repos",
         "InaccessiblePaths=-%h/.codex/auth.json -%h/.codex/sessions",
     ]:
         assert marker in sync_service, (
@@ -3288,10 +3666,10 @@ in
     sync_script_text = dellan.succeed(f"cat {sync_script}")
     for marker in [
         "credential.https://github.com.helper=",
-        "gh auth git-credential",
+        "/bin/gh-app-credential",
     ]:
         assert marker in sync_script_text, (
-            f"ai-client-config sync lost host-scoped gh helper '{marker}':\\n"
+            f"ai-client-config sync lost host-scoped App-token helper '{marker}':\\n"
             f"{sync_script_text}"
         )
     assert "ai-client-config-claude.json" not in sync_script_text, (
@@ -3340,9 +3718,9 @@ in
         + "AI_CLIENT_CONFIG_CLAUDE_STATE_OUTPUT'"
     )
 
-    # The feature VM has no desktop keyring. Production's default HTTPS
-    # remote must therefore fail before network access, name authentication
-    # as the stage, and give an actionable desktop-session repair command.
+    # The feature VM has no GitHub App host token. Production's default HTTPS
+    # remote must therefore fail closed before network access, name
+    # authentication as the stage, and give an actionable repair command.
     dellan.succeed(
         user_systemctl + " reset-failed ai-client-config-codex-sync.service'"
     )
@@ -3355,7 +3733,7 @@ in
         "journalctl --user -u ai-client-config-codex-sync.service "
         "-n 50 --no-pager'"
     )
-    assert "gh auth login --hostname github.com --git-protocol https" in sync_journal, (
+    assert "systemctl --user start gh-token.service" in sync_journal, (
         "missing GitHub auth must name exact recovery command:\\n"
         f"{sync_journal}"
     )
@@ -3383,6 +3761,52 @@ in
     dellan.succeed(
         user_systemctl + " unset-environment AI_CLIENT_CONFIG_REMOTE'"
     )
+
+    # GitHub App host token (home/gh-host-token.nix): the `gh` on jonathan's
+    # PATH and git's github.com credential helper must FAIL CLOSED without a
+    # fresh token, and never fall back to gh's keyring. The VM has no App
+    # key, so gh-token.service mints nothing and the token starts absent.
+    host_dir = "/home/jonathan/.cache/gh-tokens/host"
+    host_token = host_dir + "/token"
+    assert dellan.succeed(f"stat -c %a {host_dir}").strip() == "700", (
+        "host token dir must be private to jonathan"
+    )
+    assert dellan.succeed(f"cat {host_dir}/scope").strip() == "installation"
+    dellan.fail(f"test -e {host_token}")
+    cred_probe = (
+        "printf \"protocol=https\\nhost=github.com\\n\\n\" | git credential fill"
+    )
+
+    def as_jonathan(cmd):
+        return "su - jonathan -c 'env -u GH_TOKEN -u GITHUB_TOKEN " + cmd + "' 2>&1"
+
+    for state, expect in [("missing", "missing or empty"), ("stale", "stale")]:
+        if state == "stale":
+            dellan.succeed(
+                f"su - jonathan -c 'umask 077; printf vm-dummy-token > {host_token}'"
+                f" && touch -d '2 hours ago' {host_token}"
+            )
+        gh_out = dellan.fail(as_jonathan("gh repo view octo/example"))
+        assert expect in gh_out and "gh-token.service" in gh_out, (
+            f"gh wrapper did not fail closed on a {state} token:\n{gh_out}"
+        )
+        git_out = dellan.fail(as_jonathan(cred_probe))
+        assert "told us to quit" in git_out and "password=" not in git_out, (
+            f"git credential helper did not fail closed on a {state} token:\n{git_out}"
+        )
+
+    # Fresh token: it reaches the real gh as GH_TOKEN and git as the
+    # x-access-token password, with no network involved.
+    dellan.succeed(f"touch {host_token}")
+    assert dellan.succeed(as_jonathan("gh auth token")).strip() == "vm-dummy-token"
+    git_out = dellan.succeed(as_jonathan(cred_probe))
+    assert "username=x-access-token" in git_out, git_out
+    assert "password=vm-dummy-token" in git_out, git_out
+    # An explicit GH_TOKEN is the caller's choice and passes through untouched.
+    assert dellan.succeed(
+        "su - jonathan -c 'GH_TOKEN=explicit-dummy gh auth token'"
+    ).strip() == "explicit-dummy"
+    dellan.succeed(f"rm {host_token}")
 
     # claude-pull — the pull half of ~/.claude's continuous delivery. The
     # timer must be linked and armed in the live user session.

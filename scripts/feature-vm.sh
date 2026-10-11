@@ -25,7 +25,7 @@ With no COMMAND: boot in the foreground (Ctrl-C / poweroff to stop).
 
 Options (only read by up / foreground boot; later commands reuse them):
   --host NAME   nixosConfigurations.NAME to boot (default: this machine)
-  --trusted     mount the shared folders read-write, allow guest internet
+  --trusted     mount the worktrees share read-write, allow guest internet
   --flake DIR   nixos-config checkout (default: the worktree you are in,
                 else ~/Repos/nixos-config-worktrees/main)
 
@@ -208,7 +208,9 @@ serve() {
   opts="$opts -qmp unix:$run_dir/qmp.sock,server=on,wait=off"
   opts="$opts -serial unix:$run_dir/serial.sock,server=on,wait=off"
   opts="$opts -virtfs local,path=$HOME/Repos/nixos-config-worktrees,security_model=none,mount_tag=worktrees$ro"
-  opts="$opts -virtfs local,path=$research,security_model=mapped-xattr,mount_tag=research-agent$ro"
+  # research-agent is read-only in every mode: the guest copies it to local
+  # disk (feature-vm-research-agent-copy) and works on the copy.
+  opts="$opts -virtfs local,path=$research,security_model=mapped-xattr,mount_tag=research-agent,readonly=on"
   export QEMU_OPTS="${FEATURE_VM_DISPLAY--display none} $opts"
   export QEMU_NET_OPTS="$net"
 

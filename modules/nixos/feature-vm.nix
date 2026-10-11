@@ -13,7 +13,11 @@
 #                     QEMU on the host, so root in the guest cannot write
 #                     through them); guest network `restrict=on` (the ssh
 #                     port forward still works).
-#   --trusted         shares read-write, guest internet on.
+#   --trusted         worktrees share read-write, guest internet on.
+#
+# The research-agent checkout is always read-only: the guest copies it to
+# local disk (feature-vm-research-agent-copy) and the inner microvms work
+# on that copy.
 #
 # Secrets, in both modes: the VM never receives a host or user key. Every
 # agenix secret is replaced by a throwaway fixture (see below). The real
@@ -102,6 +106,9 @@ in
       forwardPorts = [
         {
           from = "host";
+          # Loopback only. Unset, QEMU's hostfwd listens on every
+          # interface; the guest holds a copy of the host user's ssh key.
+          host.address = "127.0.0.1";
           host.port = 2222;
           guest.port = 22;
         }
@@ -123,19 +130,66 @@ in
         ];
       };
 
-      # research-agent worktree mount. RW under --trusted so the inner
-      # microvm's virtiofs RW share for /out can write reports into
-      # reports/; read-only in locked mode.
-      fileSystems."/home/jonathan/Repos/research-agent" = {
+      # research-agent worktree, 9p-exported by the launcher. Mounted
+      # read-only at a staging path and copied to local disk by
+      # feature-vm-research-agent-copy below: the inner microvms share
+      # /home/jonathan/Repos/research-agent over virtiofs, and virtiofs
+      # stacked on a 9p mount fails every open() with EOPNOTSUPP, so the
+      # scraper could not read scraper/server.py and crash-looped.
+      fileSystems."/mnt/research-agent-src" = {
         device = "research-agent";
         fsType = "9p";
         options = [
           "trans=virtio"
           "version=9p2000.L"
           "msize=131072"
+          "ro"
           "x-systemd.requires=modprobe@9pnet_virtio.service"
         ];
       };
+    };
+
+    # Local copy of the research-agent checkout for the inner microvms.
+    # Reports they write land in this copy, not on the host. To pick up
+    # host-side edits without a reboot, `sudo systemctl restart` this unit.
+    systemd.services.feature-vm-research-agent-copy = {
+      description = "Copy the 9p research-agent checkout to local disk for the microvms";
+      wantedBy = [ "multi-user.target" ];
+      requiredBy = [
+        "microvm-virtiofsd@research-agent.service"
+        "microvm-virtiofsd@scraper.service"
+      ];
+      before = [
+        "microvm-virtiofsd@research-agent.service"
+        "microvm-virtiofsd@scraper.service"
+      ];
+      unitConfig.RequiresMountsFor = [ "/mnt/research-agent-src" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        # Root, not jonathan: the 9p export is mapped-xattr, so the VM
+        # sees host ownership. Host jonathan is uid 1003 on tuxedo while
+        # the VM's jonathan is uid 1000, and most reports are mode 0600 —
+        # as jonathan the copy failed with exit 23 on every one of them.
+        # Root bypasses the VM-side check; the host side still reads as
+        # the qemu process's own user. --chown hands the copy to jonathan.
+        User = "root";
+      };
+      path = [ pkgs.rsync ];
+      # reports/_quarantine/ is kept as an EMPTY directory (its contents
+      # are never copied into the VM). The anchored exclude matches the
+      # directory itself, so rsync never opendir()s it — an include-dir +
+      # exclude-contents pair still lists it. The mkdir recreates it.
+      script = ''
+        dest=/home/jonathan/Repos/research-agent
+        mkdir -p "$dest"
+        rsync -a --delete --chown=jonathan:users \
+          --exclude=.venv --exclude=__pycache__ \
+          --exclude=/reports/_quarantine/ \
+          /mnt/research-agent-src/ "$dest/"
+        mkdir -p "$dest/reports/_quarantine"
+        chown jonathan:users "$dest" "$dest/reports" "$dest/reports/_quarantine"
+      '';
     };
 
     # agenix opens only fixtures here: the klaffat ones (a real-shaped

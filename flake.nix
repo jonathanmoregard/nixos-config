@@ -36,6 +36,9 @@
     claude-desktop.url = "github:aaddrick/claude-desktop-debian";
     claude-desktop.inputs.nixpkgs.follows = "nixpkgs";
 
+    # The lockfile pins 0.161.0, above the 0.149.0 apply_patch security floor.
+    codex-cli-nix.url = "github:sadjow/codex-cli-nix";
+
     # aggregator — the personal search index behind
     # `aggregator_search_memory`. Consumed as SOURCE ONLY (`flake = false`)
     # and built here by overlays/aggregator.nix, because the aggregator's
@@ -126,8 +129,12 @@
     # GET-only and reuse gh's keyring credential instead of an expiring PAT.
     # Bump 472fb55 -> 08106b1 (2026-09-11): add an authenticated FastMCP
     # proxy path so deployed MCP children share one model backend.
+    # Bump 08106b1 -> 9e99864 (2026-10-01): embeddings move from torch on the
+    # CPU to llama-server (Qwen3-Embedding-0.6B Q8_0) on the iGPU, reached over
+    # a unix socket. New embedding stamp: a new index is built beside the old
+    # fp32 vectors, which stay on disk unused.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/08106b171681a194691faed6c478df5eca912c6d";
+      url = "github:jonathanmoregard/aggregator/0c580d8afe4a8f87b84e6576e72cfbb9c87a6c11";
       flake = false;
     };
 
@@ -153,6 +160,7 @@
 
   outputs = flakeInputs@{ self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
               tts-tool, substack-url-tool, prose-decorate, claude-desktop,
+              codex-cli-nix,
               aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
               ... }:
   let
@@ -191,6 +199,15 @@
         # and its absence was silent for months because the consumer
         # failed open. See overlays/dcg.nix.
         (import ./overlays/dcg.nix)
+        # `pkgs.prompt-injection-scan` — offline ProtectAI DeBERTa classifier for the
+        # ~/.claude injection scans. See overlays/prompt-injection-scan.nix.
+        (import ./overlays/prompt-injection-scan.nix)
+        # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
+        # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
+        (import ./overlays/claude-code.nix)
+        # Native Codex CLI package with prebuilt store paths from the
+        # codex-cli Cachix cache.
+        codex-cli-nix.overlays.default
         # `pkgs.aggregator` — a real store path for the ingest timer, so
         # modules/nixos/aggregator-ingest-timer.nix needs no flake-input
         # specialArgs threading (same reason the listen-tools tools are
@@ -296,11 +313,10 @@
         vm-listen-tools = mkLane ./tests/listen-tools.nix;
         vm-android-dev  = mkLane ./tests/android-dev.nix;
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
-        # In ci.yml's vm-minimal matrix, and deliberately absent from
-        # `discover`'s LANES so it never reports "cached" and always
-        # executes — it gates credential handling and the sudo password
-        # rule, and a cache hit skipping it is exactly the silence it
-        # exists to prevent.
+        vm-nix-gc       = mkLane ./tests/nix-gc.nix;
+        vm-security-batch = mkLane ./tests/security-batch.nix;
+        # In ci.yml's vm-minimal matrix. Gates credential handling and the
+        # sudo password rule.
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
         vm-klaffat-dependabot-caretaker = mkLane ./tests/klaffat-dependabot-caretaker.nix;
 
@@ -327,15 +343,6 @@
             `hashedPasswordFile` — do not put a plaintext default back in profiles/base.nix.
           ''
             (pkgsLinux.runCommand "dellan-initial-password-null" { } "touch $out");
-        # Not a VM lane: runtime-invocation harness for the research-agent
-        # guest's egress-init script (offline-resilience contract). Cheap
-        # runCommand; seconds, not minutes.
-        egress-init-retry = import ./tests/egress-init-retry.nix {
-          pkgs = pkgsLinux;
-          script = self.nixosConfigurations.dellan.config
-            .microvm.vms.research-agent.config.config
-            .systemd.services.research-agent-egress-init.script;
-        };
         # Not a VM lane: runtime-invocation harness for the feature-vm
         # launcher (locked-by-default sandbox invariants). Seconds.
         feature-vm-ctl = import ./tests/feature-vm-ctl.nix { pkgs = pkgsLinux; };
@@ -350,23 +357,27 @@
             fi
             touch $out
           '';
-        # Not a VM lane: runtime-invocation harness for the research-agent
-        # guest's egress-refresh script (atomic-replace + never-shrink
-        # contract). Cheap runCommand; seconds, not minutes.
-        egress-refresh = import ./tests/egress-refresh.nix {
-          pkgs = pkgsLinux;
-          script = self.nixosConfigurations.dellan.config
-            .microvm.vms.research-agent.config.config
-            .systemd.services.research-agent-egress-refresh.script;
-        };
-        # Not a VM lane: runtime-invocation harness for the cachix
-        # post-build-hook's push-budget filter (skip microvm erofs +
-        # >256MiB paths; never fail the build). Cheap runCommand.
-        cachix-push-filter = import ./tests/cachix-push-filter.nix {
-          pkgs = pkgsLinux;
-          prodHook = self.nixosConfigurations.dellan.config
-            .nix.settings.post-build-hook;
-        };
+        # Not a VM lane: privacy invariant. The cache is public, so no host
+        # may push every local build (a private flake's outputs would be
+        # published). CI's push:main run is the only cache writer; it
+        # already holds every deployed closure. Pure eval; instant.
+        no-global-cache-push =
+          let
+            hooks = nixpkgs.lib.mapAttrs (_: h: h.config.nix.settings.post-build-hook or null)
+              { inherit (self.nixosConfigurations) dellan tuxedo; };
+            offenders = nixpkgs.lib.filterAttrs (_: v: v != null && v != "") hooks;
+          in
+          nixpkgs.lib.throwIf (offenders != { }) ''
+            nix.settings.post-build-hook is set on ${builtins.concatStringsSep ", " (builtins.attrNames offenders)}.
+            A global post-build-hook pushes EVERY local build to the public cachix cache,
+            including private flakes (Klaffat). CI's push:main run is the
+            only cache writer.
+          ''
+            (pkgsLinux.runCommand "no-global-cache-push" { } "touch $out");
+        # Not a VM lane: ai-throttle / host-telemetry runtime harness
+        # (modules/nixos/ai-throttle.nix) — fake sysfs, cgroup and systemctl,
+        # driven tick by tick. Seconds.
+        ai-throttle = import ./tests/ai-throttle.nix { pkgs = pkgsLinux; };
         # Not a VM lane: fail-closed contract harness for the merged-or-
         # inactive worktree sweeper (home/worktree-sweep-script.nix). Builds
         # a fixture bare repo + worktrees with real git, stubs gh, and
@@ -420,11 +431,46 @@
         # tuxedo deploys against a stub model server and a fixture archive —
         # tool results reach the model, reads outside the allowed roots are
         # refused, library search works end to end, the answer reaches stdout.
-        offline-ai = import ./tests/offline-ai.nix {
+        offline-ai = let tuxedo = self.nixosConfigurations.tuxedo.config; in import ./tests/offline-ai.nix {
           pkgs = pkgsLinux;
-          offlineAi = self.nixosConfigurations.tuxedo.config.system.build.offline-ai;
-          libraryServe = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-serve;
-          libraryFetch = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-library-fetch;
+          offlineAi = tuxedo.system.build.offline-ai;
+          libraryServe = tuxedo.system.build.offline-ai-library-serve;
+          libraryFetch = tuxedo.system.build.offline-ai-library-fetch;
+          # The never-two-loaded invariant, read from the deployed units: each
+          # model unit's Conflicts=, and the markers one gated user service and
+          # one gated system unit test for. A missing attribute reads as empty,
+          # so the harness reports it instead of failing to evaluate.
+          conflicts = {
+            small = tuxedo.systemd.user.services.offline-ai-llm.unitConfig.Conflicts or [ ];
+            coder = tuxedo.systemd.user.services.offline-ai-llm-coder.unitConfig.Conflicts or [ ];
+          };
+          # Conflicts= alone orders nothing; After= is what makes systemd run
+          # the stop job before the start job.
+          after = {
+            small = tuxedo.systemd.user.services.offline-ai-llm.unitConfig.After or [ ];
+            coder = tuxedo.systemd.user.services.offline-ai-llm-coder.unitConfig.After or [ ];
+          };
+          gatedUserDropIn = tuxedo.home-manager.users.jonathan.xdg.configFile
+            ."systemd/user/aggregator-embed-server.service.d/offline-ai.conf".text or "";
+          gatedSystemConditions = tuxedo.systemd.services."microvm@research-agent".unitConfig.ConditionPathExists or [ ];
+        };
+        # Not a VM lane: runs the weekly smoke script against fake offline-ai /
+        # xprintidle / notify-send / nix-memory-run binaries — gates, verdicts,
+        # toast, cleanup. The real model is never loaded by a check.
+        offline-ai-smoke = import ./tests/offline-ai-smoke.nix {
+          pkgs = pkgsLinux;
+          smoke = self.nixosConfigurations.tuxedo.config.system.build.offline-ai-smoke;
+        };
+        # Not a VM lane: runs the local-stt router with the exact command
+        # tuxedo's unit starts, against two stub whisper servers — English
+        # stays on the general model, detected Swedish is re-transcribed by
+        # the Swedish one, a model that is down degrades or errors visibly,
+        # and the record-start ping holds the performance profile once and
+        # leaves ai-throttle's hint (fake powerprofilesctl).
+        local-stt = import ./tests/local-stt.nix {
+          pkgs = pkgsLinux;
+          routerCommand = self.nixosConfigurations.tuxedo.config
+            .systemd.user.services.local-stt.serviceConfig.ExecStart;
         };
         # Not a VM lane: runtime-invocation harness for `add-secret`
         # (home/add-secret.nix). Exercises name validation, worktree
@@ -457,6 +503,23 @@
         # app.asar fixtures — pins max-selection over the zero decoys,
         # "expired still measures", and "unreadable fails loud". Cheap
         # runCommand; seconds.
+        # Not a VM lane: drives the built `prompt-injection-scan` (real
+        # model, offline) over benign tool-argument text and injection
+        # payloads, incl. one buried past the model's 512-token window.
+        prompt-injection-scan = import ./tests/prompt-injection-scan.nix {
+          pkgs = pkgsLinux;
+        };
+        # Not a VM lane: the research-agent security sweep's verdict logic
+        # (modules/nixos/security-batch/research-agent.sh) against fake
+        # vulnix / systemd-analyze — seed, new CVE, accepted, score
+        # regression, tool errors. The module itself: vm-security-batch.
+        security-batch-research-agent = import ./tests/security-batch-research-agent.nix {
+          pkgs = pkgsLinux;
+          runnerScript = ./modules/nixos/security-batch/research-agent.sh;
+          # Drift gate: the package dellan deploys.
+          runnerPackage = self.nixosConfigurations.dellan.config
+            .services.securityBatch.research-agent.script;
+        };
         signal-expiry = import ./tests/signal-expiry.nix {
           pkgs = pkgsLinux;
           checkScript = pkgsLinux.signal-expiry-check;
@@ -520,6 +583,16 @@
       update-beeper = pkgsLinux.beeper-update;
       check-signal-expiry = pkgsLinux.signal-expiry-check;
       add-secret = import ./home/add-secret.nix { pkgs = pkgsLinux; };
+      # `nix run .#security-static [-- --self-test]` — fast offline security
+      # scanners, pinned via flake.lock. CI job `security-static`.
+      security-static = pkgsLinux.writeShellApplication {
+        name = "security-static";
+        runtimeInputs = with pkgsLinux; [
+          zizmor actionlint gitleaks shellcheck poutine
+          git gnutar coreutils findutils gnugrep
+        ];
+        text = builtins.readFile ./scripts/security-static.sh;
+      };
     };
 
     # agenix-rekey CLI plumbing. Exposes:

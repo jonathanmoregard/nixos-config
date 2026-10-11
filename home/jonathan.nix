@@ -1,4 +1,8 @@
 { pkgs, ... }:
+let
+  # gh + git-over-HTTPS authenticate as the GitHub App, never as the founder.
+  ghHost = import ./gh-host-token.nix { inherit pkgs; };
+in
 {
   home.username = "jonathan";
   home.homeDirectory = "/home/jonathan";
@@ -11,7 +15,14 @@
     nodejs_22
     pnpm
     gitleaks
-    gh
+    # Credential pass of the permission-ledger aggregator and the proposal
+    # intake gate (~/.claude); both fail open ("unavailable") without it.
+    detect-secrets
+    # `gh` here is the App-token wrapper (home/gh-host-token.nix), not pkgs.gh:
+    # it shadows /run/current-system/sw/bin/gh and fails closed without a
+    # fresh host token.
+    ghHost.gh
+    ghHost.credentialHelper
     direnv
     jq
     # The git-broker MCP (~/.claude/mcps/git-broker) runs every Git op
@@ -24,6 +35,14 @@
     cargo
     python3
     uv
+    # Editor: VSCodium with Rust and TOML support baked in (declarative extensions)
+    (vscode-with-extensions.override {
+      vscode = vscodium;
+      vscodeExtensions = with vscode-extensions; [
+        rust-lang.rust-analyzer
+        tamasfe.even-better-toml
+      ];
+    })
     # Intentionally NOT included (drift-scan 2026-04-19):
     # - terraform: not used for now
     # - yt-dlp: not wanted
@@ -37,7 +56,9 @@
       user.email = "jonathan.more@hotmail.com";
       init.defaultBranch = "main";
       pull.rebase = true;
-      credential."https://github.com".helper = "!/run/current-system/sw/bin/gh auth git-credential";
+      # GitHub App host token, fail closed (home/gh-host-token.nix). Absolute
+      # store path: git runs it as-is, no PATH lookup.
+      credential."https://github.com".helper = "${ghHost.credentialHelper}/bin/gh-app-credential";
       core.hooksPath = "~/.config/git/hooks";
       core.excludesfile = "~/.config/git/ignore";
 
@@ -259,14 +280,6 @@
       # Powerlevel10k
       source ${pkgs.zsh-powerlevel10k}/share/zsh-powerlevel10k/powerlevel10k.zsh-theme
       [[ -f ~/.p10k.zsh ]] && source ~/.p10k.zsh
-
-      # gh wrapper: ensure auth before gh commands
-      gh() {
-        if ! command gh auth status &>/dev/null 2>&1; then
-          command gh auth login
-        fi
-        command gh "$@"
-      }
 
       # claude wrapper: clear + resume most recent session by default.
       # Use `claudee` to start a fresh session.

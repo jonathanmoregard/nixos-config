@@ -34,7 +34,6 @@
     ../../modules/nixos/nixos-auto-deploy.nix
     ../../modules/nixos/build-coordination.nix
     ../../modules/nixos/memory-pressure.nix
-    ../../modules/nixos/cachix-push.nix
     ../../modules/nixos/claude-agent-users.nix
     ../../modules/nixos/codex-security.nix
 
@@ -60,6 +59,9 @@
     # crawls. See module header for the trust-boundary rationale.
     ../../modules/nixos/scraper-microvm.nix
     ../../modules/nixos/scraper-microvm-healthcheck.nix
+    # Weekly CVE + sandbox-score sweep of both microVMs; results reach
+    # Claude via /var/lib/unit-failures (modules/nixos/security-batch.nix).
+    ../../modules/nixos/security-batch/research-agent.nix
 
     # Host-level Android dev tooling. Provides adb on PATH + JDK17 for
     # the AGP 8.x gradle builds in ~/Repos/intender-app and pairs with
@@ -231,6 +233,38 @@
     mode = "0400";
   };
 
+  # eBay Browse API (client_credentials) and Tradera API keys for the
+  # research-agent's shopping shim (ebay_search / tradera_search). Same
+  # placeholder model as EUIPO above: the files decrypt to empty strings
+  # until the developer keys exist, and the shim answers "not configured"
+  # for an empty value. Fill with
+  # `nix run .#agenix-rekey.x86_64-linux.edit-view -- edit secrets/<name>.age`
+  # then `rekey`.
+  age.secrets.ebay-client-id = {
+    rekeyFile = ../../secrets/ebay-client-id.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.ebay-client-secret = {
+    rekeyFile = ../../secrets/ebay-client-secret.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.tradera-app-id = {
+    rekeyFile = ../../secrets/tradera-app-id.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+  age.secrets.tradera-app-key = {
+    rekeyFile = ../../secrets/tradera-app-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   # Private half of the SSH keypair the MCP server uses to ssh into the
   # research-agent microvm. Matching public key is plaintext inside
   # modules/nixos/research-agent-microvm.nix as authorized_keys.
@@ -262,6 +296,20 @@
   # ABOVE this marker. Do not remove — the tool refuses to insert
   # without it. See home/add-secret.nix + skill doc
   # home/claude-skills/nixos-agenix-secret/SKILL.md.
+  age.secrets.gcal-ical-url = {
+    rekeyFile = ../../secrets/gcal-ical-url.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
+  age.secrets.openrouter-jev-key = {
+    rekeyFile = ../../secrets/openrouter-jev-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   # add-secret:insert-here
 
   # ---------------------------------------------------------------------

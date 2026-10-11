@@ -51,7 +51,12 @@ let
         : > "$lock_path"
       fi
 
-      exec {memory_lock_fd}>"$lock_path"
+      # Read-only open: flock(2) needs no write access, and `>` would
+      # O_TRUNC whatever the path resolves to. The directory is
+      # jonathan's (not sticky, so protected_symlinks does not apply),
+      # so a symlink planted at `lock` would make root's deploy truncate
+      # the link target. `<` neither truncates nor writes.
+      exec {memory_lock_fd}<"$lock_path"
       if [ "$nonblock" -eq 1 ]; then
         if ! flock -n "$memory_lock_fd"; then
           echo "nix-memory-run: memory-heavy job active; deferred" >&2
@@ -120,6 +125,20 @@ in
   options.services.buildCoordination = {
     enable = lib.mkEnableOption "memory coordination for Nix and feature-VM jobs";
 
+    maxJobs = lib.mkOption {
+      type = lib.types.ints.positive;
+      # 24-thread / 64 GiB host. Parallel builders share nix-daemon's
+      # MemoryHigh (memory-pressure.nix), which throttles before OOMD kills.
+      default = 4;
+      description = "nix.settings.max-jobs: derivations built in parallel.";
+    };
+
+    cores = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 6;
+      description = "nix.settings.cores: build threads per derivation.";
+    };
+
     runnerPackage = lib.mkOption {
       type = lib.types.package;
       readOnly = true;
@@ -157,9 +176,16 @@ in
 
     nix.settings = {
       experimental-features = [ "cgroups" ];
-      max-jobs = 1;
-      cores = 4;
+      max-jobs = cfg.maxJobs;
+      cores = cfg.cores;
       use-cgroups = true;
     };
+
+    # Builds yield to interactive work: SCHED_BATCH keeps a build's threads
+    # from preempting a dictation's (local-stt.nix) or the desktop's, and the
+    # idle IO class gives them the disk only when nobody else wants it. A
+    # build with the machine to itself runs as before.
+    nix.daemonCPUSchedPolicy = "batch";
+    nix.daemonIOSchedClass = "idle";
   };
 }
