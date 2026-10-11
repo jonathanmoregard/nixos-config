@@ -4025,6 +4025,44 @@ in
         ("no repo context is personal", gh_probe(""), "vm-personal-token"),
     ]:
         assert got == want, f"gh wrapper owner selection, {label}: got {got!r}"
+
+    # `gh api ...` and `gh repo list ...` are real gh commands (no extension
+    # can be named `api`) that need the network to show their token. So these
+    # run the deployed wrapper's own text with the real gh store path swapped
+    # for the probe: same selection code, offline.
+    wrapper = workstation.succeed("su - jonathan -c 'readlink -f $(command -v gh)'").strip()
+    gh_stub = "/home/jonathan/gh-owner-stub"
+    workstation.succeed(
+        f"real=$(grep -o '/nix/store/[^ ]*-gh-[0-9][^ /]*/bin/gh' {wrapper} | head -1)"
+        f" && test -n \"$real\""
+        f" && sed \"s#$real#${ghTokenProbe}#g\" {wrapper} > {gh_stub}"
+        f" && chown jonathan {gh_stub} && chmod 0755 {gh_stub}"
+    )
+
+    def gh_cmd(args, cwd="/home/jonathan", env="", ok=True):
+        cmd = as_jonathan(f"{env} sh -c \"cd {cwd} && {gh_stub} {args}\"")
+        return (workstation.succeed(cmd) if ok else workstation.fail(cmd)).strip()
+
+    for label, got, want in [
+        ("api repos/OWNER picks the org token",
+         gh_cmd("api repos/klaffat/klaffat/rulesets"), "vm-org-token"),
+        ("api /repos/OWNER with flags picks the org token",
+         gh_cmd("api -X GET /repos/Klaffat/klaffat/pulls"), "vm-org-token"),
+        ("api orgs/OWNER picks the org token", gh_cmd("api orgs/klaffat"), "vm-org-token"),
+        ("api on a personal repo is personal, even from an org cwd",
+         gh_cmd("api repos/jonathanmoregard/x", cwd=org_repo), "vm-personal-token"),
+        ("api user is personal", gh_cmd("api user"), "vm-personal-token"),
+        ("api path beats GH_REPO",
+         gh_cmd("api repos/klaffat/klaffat", env="GH_REPO=jonathanmoregard/x"),
+         "vm-org-token"),
+        ("-R beats the api path",
+         gh_cmd("-R jonathanmoregard/x api repos/klaffat/klaffat"), "vm-personal-token"),
+        ("repo list OWNER picks the org token",
+         gh_cmd("repo list --limit 5 klaffat"), "vm-org-token"),
+        ("repo list of a personal owner is personal, even from an org cwd",
+         gh_cmd("repo list jonathanmoregard", cwd=org_repo), "vm-personal-token"),
+    ]:
+        assert got == want, f"gh wrapper owner selection, {label}: got {got!r}"
     # git sends path= because jonathan.nix sets useHttpPath for github.com.
     assert "password=vm-org-token" in cred_for("klaffat/klaffat.git"), (
         "credential helper did not pick the org token by path"
@@ -4050,13 +4088,18 @@ in
     )
     gh_out = gh_probe("", cwd=org_repo, ok=False)
     assert "stale" in gh_out and org_token in gh_out, gh_out
+    gh_out = gh_cmd("api repos/klaffat/klaffat/rulesets", ok=False)
+    assert "stale" in gh_out and org_token in gh_out and "vm-" not in gh_out, gh_out
+    assert gh_cmd("api user") == "vm-personal-token"
     git_out = cred_for("klaffat/klaffat.git", ok=False)
     assert "told us to quit" in git_out and "password=" not in git_out, (
         f"credential helper did not fail closed on a stale org token:\n{git_out}"
     )
     assert gh_probe("-R jonathanmoregard/agent-test") == "vm-personal-token"
 
-    workstation.succeed(f"rm -r {probe_dir} {org_repo} && rm {host_token} {org_token}")
+    workstation.succeed(
+        f"rm -r {probe_dir} {org_repo} && rm {gh_stub} {host_token} {org_token}"
+    )
 
     # claude-pull — the pull half of ~/.claude's continuous delivery. The
     # timer must be linked and armed in the live user session.

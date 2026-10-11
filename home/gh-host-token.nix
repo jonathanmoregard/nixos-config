@@ -18,9 +18,11 @@
 #                       GH_TOKEN/GITHUB_TOKEN passes through untouched.
 #                       Otherwise the owner comes from, first match wins:
 #                       -R/--repo [HOST/]OWNER/NAME (or `gh repo <sub>
-#                       OWNER/NAME`), else GH_REPO, else the cwd repo's
-#                       remote.origin.url. That owner's token becomes GH_TOKEN
-#                       if host/<owner>/token exists, else the personal one.
+#                       OWNER/NAME`), else the endpoint of `gh api
+#                       [/]repos|orgs/OWNER/...` or `gh repo list OWNER`,
+#                       else GH_REPO, else the cwd repo's remote.origin.url.
+#                       That owner's token becomes GH_TOKEN if
+#                       host/<owner>/token exists, else the personal one.
 #   gh-app-credential   git credential helper for https://github.com. With
 #                       credential.useHttpPath git sends path=OWNER/NAME.git;
 #                       the first segment picks the owner the same way.
@@ -185,14 +187,61 @@ let
           fi
         done
       fi
-      if [ -z "$have_spec" ] && [ -n "''${GH_REPO:-}" ]; then
+      # Owner-only sources, after -R and before GH_REPO.
+      owner=""
+      have_owner=""
+      # `gh api [/]repos/OWNER/...` or `[/]orgs/OWNER...`: the first argument
+      # of that shape (flag values such as `-X GET` or `-f k=v` never match).
+      # A placeholder like repos/{owner}/{repo} is no owner: gh fills it from
+      # GH_REPO or the cwd repo, so the selection falls through to those too.
+      if [ -z "$have_spec" ] && [ "''${1:-}" = api ]; then
+        for arg in "''${@:2}"; do
+          [ "$arg" = -- ] && break
+          arg="''${arg#/}"
+          arg="''${arg%%\?*}"
+          case "$arg" in
+            repos/?* | orgs/?*)
+              rest="''${arg#*/}"
+              if owner=$(normalize_owner "''${rest%%/*}"); then
+                have_owner=1
+                break
+              fi
+              owner=""
+              ;;
+          esac
+        done
+      fi
+      # `gh repo list OWNER`: the first positional, skipping flag values.
+      if [ -z "$have_spec" ] && [ "''${1:-}" = repo ] && [ "''${2:-}" = list ]; then
+        skip=""
+        for arg in "''${@:3}"; do
+          if [ -n "$skip" ]; then
+            skip=""
+            continue
+          fi
+          case "$arg" in
+            --) break ;;
+            -L | --limit | -l | --language | --topic | --visibility | --json | -q | --jq | -t | --template)
+              skip=1
+              continue
+              ;;
+            -*) continue ;;
+          esac
+          have_owner=1
+          owner=$(normalize_owner "$arg") || owner=""
+          break
+        done
+      fi
+      if [ -z "$have_spec" ] && [ -z "$have_owner" ] && [ -n "''${GH_REPO:-}" ]; then
         spec="$GH_REPO"
         have_spec=1
       fi
-      if [ -z "$have_spec" ]; then
+      if [ -z "$have_spec" ] && [ -z "$have_owner" ]; then
         spec=$(${pkgs.git}/bin/git config --get remote.origin.url 2>/dev/null) || spec=""
       fi
-      owner=$(owner_from_repo_spec "$spec") || owner=""
+      if [ -z "$have_owner" ]; then
+        owner=$(owner_from_repo_spec "$spec") || owner=""
+      fi
 
       token_file=$(token_file_for_owner "$owner")
       if ! load_token "$token_file"; then
