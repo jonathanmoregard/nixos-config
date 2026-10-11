@@ -57,8 +57,11 @@ in
       init.defaultBranch = "main";
       pull.rebase = true;
       # GitHub App host token, fail closed (home/gh-host-token.nix). Absolute
-      # store path: git runs it as-is, no PATH lookup.
-      credential."https://github.com".helper = "${ghHost.credentialHelper}/bin/gh-app-credential";
+      # store path: git runs it as-is, no PATH lookup. The empty entry first
+      # resets any helper configured earlier (system config, a later
+      # `gh auth setup-git`), so nothing can answer for github.com ahead of
+      # the App token. tests/base.nix proves it with a decoy system helper.
+      credential."https://github.com".helper = [ "" "${ghHost.credentialHelper}/bin/gh-app-credential" ];
       core.hooksPath = "~/.config/git/hooks";
       core.excludesfile = "~/.config/git/ignore";
 
