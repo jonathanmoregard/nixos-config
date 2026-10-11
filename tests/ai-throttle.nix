@@ -4,8 +4,8 @@
 # fake `xprintidle`, then drives the scripts' `--once` mode tick by tick: the
 # duty-cycle governor (duty follows the temperature error, clamps, and runs
 # each period as pause-then-run), the idle setpoint, the hard-stop band with
-# hysteresis, battery, a recent dictation, an inactive unit, and the telemetry
-# record shape. Seconds.
+# hysteresis, battery, a recent dictation (by CPU use and by the router's
+# record-start hint), an inactive unit, and the telemetry record shape. Seconds.
 { pkgs }:
 pkgs.runCommand "ai-throttle-check" {
   nativeBuildInputs = [ pkgs.python3 pkgs.jq pkgs.coreutils pkgs.bash ];
@@ -70,6 +70,7 @@ pkgs.runCommand "ai-throttle-check" {
   chmod +x $W/bin/xprintidle
   export FAKE=$W PATH=$W/bin:$PATH SYSFS_ROOT=$W/sys CGROUP_ROOT=$W/cg PROC_ROOT=$W/proc
   export AI_THROTTLE_STATE=$W/state.json
+  export AI_THROTTLE_FOREGROUND_HINT=$W/foreground-hint
   export AI_THROTTLE_UNITS="aggregator-embed.service aggregator-embed-server.service"
   export AI_THROTTLE_FOREGROUND="local-stt.service local-stt-general.service"
   export AI_THROTTLE_QUIET_AT_C=65 AI_THROTTLE_IDLE_QUIET_AT_C=75 AI_THROTTLE_IDLE_AFTER_S=900
@@ -168,6 +169,22 @@ pkgs.runCommand "ai-throttle-check" {
   stt_usage 219000; tick 1593
   paused && fail "0.4 ms/s of foreground CPU is below the 5 ms/s threshold"
 
+  # A record-start hint: the local-stt router touches this file when Voquill
+  # pings /v1/prepare and at the start of every transcription, before any
+  # STT CPU time shows in cpu.stat. A hint older than the hold is history; a
+  # fresh one pauses the units on this very tick, as foreground.
+  touch -d @1500 $W/foreground-hint; tick 1594
+  paused && fail "a hint older than the 60 s hold must not pause: $(state)"
+  touch -d @1595 $W/foreground-hint; tick 1596
+  paused || fail "a fresh foreground hint must pause within one tick: $(state)"
+  jq -e '.reasons == ["foreground"]' $W/last.json > /dev/null || fail "a hint must pause as foreground: $(state)"
+  [ "$(freezer aggregator-embed.service)" = T ] || fail "worker not stopped on a fresh hint"
+  rm $W/foreground-hint
+  # The hold from that hint outlives the next cases; hand them running
+  # processes again so they can see their own stop signals.
+  unit aggregator-embed.service active S 101
+  unit aggregator-embed-server.service active S 102
+
   # An inactive worker (between timer runs) is never signalled; the server is.
   unit aggregator-embed.service inactive S 101
   : > $W/calls
@@ -180,6 +197,16 @@ pkgs.runCommand "ai-throttle-check" {
   # A unit restarted while paused (new process, running) is stopped again.
   unit aggregator-embed.service active S 103; tick 1620
   [ "$(freezer aggregator-embed.service)" = T ] || fail "a new worker run started while paused was not stopped"
+
+  # A hint dated well into the future is a clock step, not a dictation: it
+  # must not count (clamped to now it would re-arm every tick until the clock
+  # caught up, and the pause would outlast the hold). Inside the tolerance it
+  # is just an ordinary fresh hint. The heat pause stays; only the reason moves.
+  touch -d @1800 $W/foreground-hint; tick 1700
+  jq -e '.reasons | index("foreground") == null' $W/last.json > /dev/null || fail "a hint from the far future must be ignored: $(state)"
+  touch -d @1701 $W/foreground-hint; tick 1700
+  jq -e '.reasons | index("foreground") != null' $W/last.json > /dev/null || fail "a hint 1 s ahead (clock skew) must still count: $(state)"
+  rm $W/foreground-hint
 
   # host-telemetry: two samples, the second carries deltas and the governor's state.
   export HOST_TELEMETRY_DIR=$W/tel

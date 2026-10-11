@@ -169,7 +169,10 @@ in
     systemd.user.slices.ram-heavy = {
       description = "Memory-heavy disposable workloads";
       documentation = [ "man:systemd-oomd.service(8)" ];
-      sliceConfig = disposablePolicy;
+      # Half a default sibling's CPU share: an interactive eval or build
+      # client here yields to the rest of the session under contention
+      # (dictation carries CPUWeight=1000, modules/nixos/local-stt.nix).
+      sliceConfig = disposablePolicy // { CPUWeight = 50; };
       wantedBy = [ "default.target" ];
     };
 

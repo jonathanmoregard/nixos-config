@@ -23,7 +23,12 @@
 #     sits in whisper-server's list;
 #   - text whisper-server split mid-word across segments comes back whole;
 #   - the model list and a request without audio are answered like the
-#     OpenAI API would.
+#     OpenAI API would;
+#   - GET or POST /v1/prepare (the record-start ping) answers 204, holds the
+#     performance power profile once at a time through powerprofilesctl and
+#     leaves ai-throttle's foreground hint; a transcription takes the same
+#     hold; without powerprofilesctl the hint is still left and 204 still
+#     answered.
 #
 # Run: nix build .#checks.x86_64-linux.local-stt -L
 { pkgs, routerCommand }:
@@ -67,7 +72,10 @@ let
   '';
 
   client = pkgs.writeText "local-stt-client.py" ''
-    import json, sys, urllib.error, urllib.request, uuid
+    import json, os, sys, urllib.error, urllib.request, uuid
+
+    # The router under test; a second instance (other settings) listens elsewhere.
+    base = "http://127.0.0.1:" + os.environ.get("LOCAL_STT_TEST_PORT", "18765")
 
     def wav(token, seconds):
         # 16 kHz mono 16-bit silence of the given length, the token in its first bytes.
@@ -91,7 +99,7 @@ let
                      f'Content-Type: audio/wav\r\n\r\n').encode()
             body += (wav(audio, seconds) if seconds is not None else audio.encode()) + b'\r\n'
         body += f'--{b}--\r\n'.encode()
-        req = urllib.request.Request("http://127.0.0.1:18765/v1/audio/transcriptions", data=body,
+        req = urllib.request.Request(base + "/v1/audio/transcriptions", data=body,
                                      headers={"Content-Type": f"multipart/form-data; boundary={b}"})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -104,21 +112,32 @@ let
 
     what = sys.argv[1]
     if what == "models":
-        with urllib.request.urlopen("http://127.0.0.1:18765/v1/models", timeout=10) as r:
+        with urllib.request.urlopen(base + "/v1/models", timeout=10) as r:
             print(json.dumps(json.load(r)))
     elif what == "nofile":
         print(json.dumps(call("", with_file=False)))
+    elif what in ("prepare", "prepare-post"):
+        # The record-start ping, from the webview origin: status and headers.
+        path = sys.argv[2] if len(sys.argv) > 2 else "/v1/prepare"
+        req = urllib.request.Request(base + path, method="POST" if what == "prepare-post" else "GET",
+                                     data=b"" if what == "prepare-post" else None,
+                                     headers={"Origin": "tauri://localhost"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                print(json.dumps([r.status, {k.lower(): v for k, v in r.headers.items()}]))
+        except urllib.error.HTTPError as e:
+            print(json.dumps([e.code, {k.lower(): v for k, v in e.headers.items()}]))
     elif what in ("preflight", "models-headers"):
         # A browser-side caller: status and response headers, keys lowercased.
         origin = sys.argv[2]
         if what == "preflight":
             # Third argument: the headers the page wants to send (default: a bare key).
             requested = sys.argv[3] if len(sys.argv) > 3 else "authorization"
-            req = urllib.request.Request("http://127.0.0.1:18765/models", method="OPTIONS", headers={
+            req = urllib.request.Request(base + "/models", method="OPTIONS", headers={
                 "Origin": origin, "Access-Control-Request-Method": "GET",
                 "Access-Control-Request-Headers": requested})
         else:
-            req = urllib.request.Request("http://127.0.0.1:18765/v1/models", headers={"Origin": origin})
+            req = urllib.request.Request(base + "/v1/models", headers={"Origin": origin})
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 print(json.dumps([r.status, {k.lower(): v for k, v in r.headers.items()}]))
@@ -137,6 +156,26 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   export LOCAL_STT_SWEDISH=http://127.0.0.1:18764
   export LOCAL_STT_GENERAL_SHORT=http://127.0.0.1:18762
   export LOCAL_STT_SHORT_TIMEOUT=2
+  # The record-start boost's two side channels: a fake powerprofilesctl that
+  # records how it was called and then runs the held command like the real
+  # one, and a hint file in a directory that does not exist yet.
+  mkdir -p $PWD/bin
+  export PPD_LOG=$PWD/powerprofilesctl.calls
+  cat > $PWD/bin/powerprofilesctl <<'EOF'
+  #!${pkgs.bash}/bin/bash
+  echo "$*" >> "$PPD_LOG"
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
+  shift
+  exec "$@"
+  EOF
+  chmod +x $PWD/bin/powerprofilesctl
+  export LOCAL_STT_POWERPROFILESCTL=$PWD/bin/powerprofilesctl
+  # A hold that outlives this whole run, so "one hold at a time" below is a
+  # property of the router, not of how fast the earlier cases happened to go
+  # (the wedged-stub case alone takes 20 s of a 30 s hold).
+  export LOCAL_STT_HOLD_SECONDS=600
+  hint=$PWD/throttle/foreground-hint
+  export LOCAL_STT_THROTTLE_HINT=$hint
   log=$PWD/asked
   fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -232,6 +271,62 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   for h in $(tr ',' ' ' <<< "$sdk"); do
     grep -q "\(^\|,\)$h\(,\|$\)" <<< "$allowed" || fail "preflight does not allow the SDK's $h header (allowed: $allowed)"
   done
+
+  # Record-start boost. Voquill pings GET /v1/prepare when a recording starts;
+  # the router answers 204 at once and, for the seconds the transcription is
+  # about to need, holds the performance power profile (powerprofilesctl
+  # launch keeps the hold while its child lives; one child at a time) and
+  # leaves a foreground hint that ai-throttle reads to pause the background
+  # units on its next tick. A transcription takes the same hold inline, so
+  # the gain exists without any ping.
+  # The transcriptions above already took the hold: one launch whose child
+  # (600 s here) is still alive, so every request in this block must ride it
+  # rather than start another.
+  [ -f "$hint" ] || fail "the transcriptions left no foreground hint at $hint"
+  [ "$(sort -u "$PPD_LOG")" = "launch -p performance -- sleep 600" ] || fail "the transcriptions did not hold the performance profile: $(cat "$PPD_LOG")"
+  holds=$(wc -l < "$PPD_LOG")
+  rm -f "$hint"
+  res=$(ask prepare /v1/prepare)
+  [ "$(jq -r '.[0]' <<< "$res")" = 204 ] || fail "GET /v1/prepare: $res"
+  [ "$(hdr access-control-allow-origin "$res")" = "tauri://localhost" ] || fail "prepare carries no CORS grant for the webview: $res"
+  [ -f "$hint" ] || fail "prepare left no foreground hint at $hint"
+  res=$(ask prepare-post /prepare)
+  [ "$(jq -r '.[0]' <<< "$res")" = 204 ] || fail "POST /prepare: $res"
+  # An existing, stale hint is re-dated by the next transcription: ai-throttle
+  # reads the mtime, so a hint that is only ever created would go stale after
+  # the first dictation.
+  touch -d @1500 "$hint"
+  before=$(date +%s)
+  res=$(ask EN-hello "" "" 3)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "short heard it" ] || fail "transcription after prepare: $res"
+  [ -f "$hint" ] || fail "a transcription left no foreground hint"
+  [ "$(stat -c %Y "$hint")" -ge "$before" ] || fail "a transcription did not re-date the stale hint (mtime $(stat -c %Y "$hint") < $before)"
+  sleep 0.3
+  [ "$(wc -l < "$PPD_LOG")" = "$holds" ] || fail "a request while the hold lives started another hold: $(cat "$PPD_LOG")"
+  # A router with no hold alive: the first prepare starts one, at once.
+  mkdir -p $PWD/r3
+  PPD_LOG=$PWD/r3/calls LOCAL_STT_PORT=18767 LOCAL_STT_THROTTLE_HINT=$PWD/r3/hint ${routerCommand} > $PWD/r3/log 2>&1 &
+  router3=$!
+  wait_port 18767
+  res=$(LOCAL_STT_TEST_PORT=18767 ask prepare /v1/prepare)
+  [ "$(jq -r '.[0]' <<< "$res")" = 204 ] || fail "prepare on a fresh router: $res"
+  # The 204 does not wait for the hold's child to start; give it a moment.
+  for _ in $(seq 40); do [ -s $PWD/r3/calls ] && break; sleep 0.05; done
+  [ "$(cat $PWD/r3/calls)" = "launch -p performance -- sleep 600" ] || fail "a prepare with no hold alive did not start one: $(cat $PWD/r3/calls)"
+  [ -f $PWD/r3/hint ] || fail "prepare on a fresh router left no hint"
+  kill "$router3"
+  # No powerprofilesctl (the lane VM, any machine without power-profiles-daemon):
+  # prepare still answers 204 and leaves the hint; the journal says so once.
+  LOCAL_STT_PORT=18766 LOCAL_STT_POWERPROFILESCTL=$PWD/no-such-powerprofilesctl \
+    LOCAL_STT_THROTTLE_HINT=$PWD/hint2 ${routerCommand} > $PWD/router2.log 2>&1 &
+  router2=$!
+  wait_port 18766
+  res=$(LOCAL_STT_TEST_PORT=18766 ask prepare /v1/prepare)
+  [ "$(jq -r '.[0]' <<< "$res")" = 204 ] || fail "prepare without powerprofilesctl: $res"
+  [ -f $PWD/hint2 ] || fail "prepare without powerprofilesctl left no hint"
+  LOCAL_STT_TEST_PORT=18766 ask prepare /v1/prepare > /dev/null
+  [ "$(grep -c 'no powerprofilesctl' $PWD/router2.log)" = 1 ] || fail "a missing powerprofilesctl must be logged once: $(cat $PWD/router2.log)"
+  kill "$router2"
 
   # Short-window model wedged (accepts, never answers): the clip is not held
   # for the backend's long timeout but handed to the full-window model.

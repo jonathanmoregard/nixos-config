@@ -30,6 +30,9 @@
     enable = true;
     settings = {
       PasswordAuthentication = false;
+      # Keyboard-interactive is the other password path (PAM prompts);
+      # keys only.
+      KbdInteractiveAuthentication = false;
       PermitRootLogin = "no";
     };
   };

@@ -154,6 +154,10 @@ in
       ExecStart = "${voquillWrapper}/bin/voquill-launch --voquill-autostart-hidden";
       Restart = "on-failure";
       RestartSec = 5;
+      # Dictation is interactive: five shares to a default sibling's one
+      # under CPU contention (the STT units themselves carry ten, see
+      # modules/nixos/local-stt.nix).
+      CPUWeight = 500;
     };
     Install.WantedBy = [ "graphical-session.target" ];
   };

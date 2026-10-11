@@ -1,0 +1,4 @@
+# Findings accepted for the research-agent security sweep (research-agent.sh).
+# One per line, with the reason; a PR adding a line is the review of it.
+#   CVE-2025-12345                 build-only dependency, not in the guest
+#   microvm@scraper.service 9.6    upstream microvm.nix default, see #NNN

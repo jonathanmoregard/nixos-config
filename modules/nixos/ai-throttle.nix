@@ -14,7 +14,9 @@
 #     been idle. The setpoints are the inputs; the duty is the outcome, logged
 #     and carried into the telemetry. It pauses the units outright while the
 #     package is very hot (the band above the governor), on battery, or while
-#     speech-to-text was used in the last minute. Pausing never kills, so the
+#     speech-to-text was used in the last minute — seen as CPU time in the
+#     STT units' cgroups, or earlier as the hint file the local-stt router
+#     touches when a recording starts. Pausing never kills, so the
 #     embed worker resumes mid-row and no row is condemned as poison the way a
 #     kill would condemn it. Not the cgroup freezer: systemd refuses to stop a
 #     frozen unit, which would break offline-ai's eviction and Home Manager
@@ -97,6 +99,15 @@ in
       default = 60;
       description = "Stay paused this long after the last foreground activity.";
     };
+    foregroundHint = lib.mkOption {
+      type = lib.types.str;
+      default = "%t/ai-throttle/foreground-hint";
+      description = ''
+        File the local-stt router touches when a recording starts and when a
+        transcription begins; a mtime younger than foregroundHoldSec counts as
+        foreground activity. systemd specifiers apply (%t is the runtime dir).
+      '';
+    };
     requireAC = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -122,6 +133,7 @@ in
         AI_THROTTLE_PAUSE_AT_C = toString cfg.pauseAtC;
         AI_THROTTLE_RESUME_BELOW_C = toString cfg.resumeBelowC;
         AI_THROTTLE_FOREGROUND_HOLD_S = toString cfg.foregroundHoldSec;
+        AI_THROTTLE_FOREGROUND_HINT = cfg.foregroundHint;
         AI_THROTTLE_REQUIRE_AC = if cfg.requireAC then "1" else "0";
         # xprintidle asks the X server; without a display it fails and the
         # script treats the desk as occupied (the quiet setpoint).

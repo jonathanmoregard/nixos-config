@@ -26,6 +26,10 @@ Three conditions pause the units outright, whatever the duty:
     (someone is dictating; the next dictation is likely close behind). Use
     is a rate, FOREGROUND_CPU_MS_PER_S of CPU per second of wall time since
     the previous sample, so the period length does not change what counts.
+    The local-stt router also touches a hint file when a recording starts
+    (Voquill's /v1/prepare ping) and at the start of every transcription; a
+    hint younger than FOREGROUND_HOLD_S counts as foreground use at its
+    mtime, so the pause lands on this tick, before any CPU time shows.
 
 While paused outright the governor is frozen. Pausing never kills: a paused
 embed worker resumes mid-row, so no row is set aside as poison the way a kill
@@ -43,6 +47,8 @@ Configuration is environment (see modules/nixos/ai-throttle.nix):
   AI_THROTTLE_PAUSE_AT_C, AI_THROTTLE_RESUME_BELOW_C, AI_THROTTLE_FOREGROUND_HOLD_S,
   AI_THROTTLE_FOREGROUND_CPU_MS_PER_S, AI_THROTTLE_REQUIRE_AC
   AI_THROTTLE_STATE        state file (default $XDG_RUNTIME_DIR/ai-throttle/state.json)
+  AI_THROTTLE_FOREGROUND_HINT  the router's record-start hint file (default
+                           $XDG_RUNTIME_DIR/ai-throttle/foreground-hint)
   SYSFS_ROOT, CGROUP_ROOT, PROC_ROOT  for tests (default /sys, /sys/fs/cgroup, /proc)
 
 `ai-throttle --once [--now EPOCH]` runs one control step and one period
@@ -85,6 +91,10 @@ REQUIRE_AC = os.environ.get("AI_THROTTLE_REQUIRE_AC", "1") == "1"
 STATE = Path(os.environ.get(
     "AI_THROTTLE_STATE",
     os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "ai-throttle", "state.json"),
+))
+HINT = Path(os.environ.get(
+    "AI_THROTTLE_FOREGROUND_HINT",
+    os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "ai-throttle", "foreground-hint"),
 ))
 
 
@@ -214,6 +224,19 @@ def hard_reasons(st, now, temp, ac):
             st["fg_last_active"] = now
     st["fg_usage"] = usage
     st["fg_ts"] = now
+    # The router's record-start hint: foreground use at the file's mtime,
+    # which lands this tick instead of the one after the CPU time shows.
+    # A hint dated more than a couple of seconds into the future is a clock
+    # step, not a dictation: ignored, so the pause can never outlast HOLD_S
+    # (clamping it to now would re-arm it every tick until the clock caught up).
+    try:
+        hinted = HINT.stat().st_mtime
+    except OSError:
+        hinted = None
+    if hinted is not None and hinted > now + 2:
+        hinted = None
+    if hinted is not None and now - hinted < HOLD_S:
+        st["fg_last_active"] = max(st.get("fg_last_active") or 0, hinted)
     last = st.get("fg_last_active")
     if last is not None and now - last < HOLD_S:
         reasons.append("foreground")

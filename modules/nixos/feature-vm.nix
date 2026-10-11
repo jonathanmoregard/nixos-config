@@ -85,6 +85,9 @@ in
       forwardPorts = [
         {
           from = "host";
+          # Loopback only. Unset, QEMU's hostfwd listens on every
+          # interface; the guest holds a copy of the host user's ssh key.
+          host.address = "127.0.0.1";
           host.port = 2222;
           guest.port = 22;
         }

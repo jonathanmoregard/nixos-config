@@ -194,9 +194,10 @@ To edit its value, use the manual edit path:
           # Actually TRY to open /dev/tty — `[ -r /dev/tty ]` returns
           # true in sandboxes where the device node exists but isn't
           # connected to anything (open() then fails with ENXIO).
-          # `exec 3</dev/tty` returns non-zero on that ENXIO, which is
-          # what we key off.
-          if exec 3</dev/tty 2>/dev/null; then
+          # Scope stderr suppression to this group. A bare
+          # `exec 3</dev/tty 2>/dev/null` keeps stderr redirected for the
+          # rest of this subshell and silently swallows both prompts.
+          if { exec 3</dev/tty; } 2>/dev/null; then
             printf 'value for %s: ' "$NAME" >&2
             IFS= read -rs v1 <&3
             printf '\n' >&2

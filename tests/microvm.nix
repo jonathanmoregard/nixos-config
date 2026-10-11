@@ -111,6 +111,27 @@ pkgs.testers.runNixOSTest {
     environment.systemPackages = [ pkgs.curl pkgs.dig ];
   };
 
+  # The scraper guest's egress policy, run for real: same module the
+  # scraper guest imports, on SLIRP's guest address. The API port is open
+  # inbound as in the guest, with a stub listener.
+  nodes.scraper = { pkgs, ... }: {
+    imports = [ ../modules/nixos/scraper-egress.nix ];
+    networking.enableIPv6 = false;
+    networking.interfaces.eth1.ipv4.addresses = lib.mkAfter [
+      { address = "10.0.2.15"; prefixLength = 24; }
+      { address = "203.0.113.20"; prefixLength = 24; }
+    ];
+    networking.firewall.allowedTCPPorts = [ 8000 ];
+    environment.systemPackages = [ pkgs.curl pkgs.dig ];
+    systemd.services.fake-scraper-api = {
+      wantedBy = [ "multi-user.target" ];
+      script = ''
+        mkdir -p /srv/api && echo api-ok > /srv/api/index.html
+        exec ${pkgs.python3}/bin/python3 -m http.server 8000 --bind 0.0.0.0 --directory /srv/api
+      '';
+    };
+  };
+
   # Stands in for "the internet": an authoritative-enough resolver plus a
   # TCP :443 listener on several addresses. api.ebay.com is served with
   # its real shape — a CNAME chain whose final A record (the Akamai edge)
@@ -121,9 +142,17 @@ pkgs.testers.runNixOSTest {
   nodes.upstream = { pkgs, ... }: {
     networking.firewall.enable = false;
     environment.systemPackages = [ pkgs.dig ];
-    networking.interfaces.eth1.ipv4.addresses = lib.mkAfter (map
+    networking.interfaces.eth1.ipv4.addresses = lib.mkAfter ((map
       (n: { address = "192.168.1.${toString n}"; prefixLength = 24; })
-      [ 10 11 12 13 ]);
+      [ 10 11 12 13 ])
+      # For node `scraper`: SLIRP's host gateway (= host loopback in prod)
+      # and DNS, plus an address outside every private range standing in
+      # for "a public web server".
+      ++ [
+        { address = "10.0.2.2"; prefixLength = 24; }
+        { address = "10.0.2.3"; prefixLength = 24; }
+        { address = "203.0.113.10"; prefixLength = 24; }
+      ]);
     services.dnsmasq = {
       enable = true;
       resolveLocalQueries = false;
@@ -322,6 +351,20 @@ pkgs.testers.runNixOSTest {
     # ---------------------------------------------------------------
     dellan.succeed("systemctl start install-microvm-scraper.service")
     dellan.succeed("test -d /var/lib/microvms/scraper")
+
+    # Every host forward of both VMs binds host loopback, never 0.0.0.0.
+    # QEMU reads `hostfwd=tcp::P-:G` (empty address, microvm.nix's
+    # default) as "all interfaces", which left the scraper API, both
+    # sshds and through them the guests reachable from the LAN with only
+    # the host firewall in the way. Asserted on the runner qemu execs.
+    for vm, fwds in (("research-agent", ["2223-:22"]),
+                     ("scraper", ["2225-:22", "8123-:8000"])):
+        runner = f"/var/lib/microvms/{vm}/current/bin/microvm-run"
+        found = dellan.succeed(f"grep -oE 'hostfwd=tcp:[^,]*' {runner} | sort -u").split()
+        print(f"[diag] {vm} hostfwds: {found}")
+        assert sorted(found) == sorted(f"hostfwd=tcp:127.0.0.1:{f}" for f in fwds), (
+            f"{vm}: expected loopback-only hostfwds for {fwds}, got {found}"
+        )
     dellan.succeed(
         "systemctl cat microvm@scraper.service | grep -q 'Description='"
     )
@@ -513,5 +556,81 @@ pkgs.testers.runNixOSTest {
     final = egress_set()
     print("[diag] set after test:\n" + final)
     assert "192.168.1.12" not in final, "unlisted name's address leaked into the egress set"
+
+    # ---------------------------------------------------------------
+    # scraper guest egress, at runtime (nodes scraper + upstream).
+    # In prod 10.0.2.2 is SLIRP's gateway = the HOST's loopback; any new
+    # connection there let rendered pages reach host-local services.
+    # ---------------------------------------------------------------
+    scraper.start()
+    scraper.wait_for_unit("multi-user.target")
+    scraper.wait_for_unit("fake-scraper-api.service")
+    scraper.wait_for_open_port(8000)
+
+    # Test VMs carry their OWN QEMU SLIRP NIC on eth0, in the same
+    # 10.0.2.0/24 the scraper guest's rules name. Take it down on both
+    # nodes so 10.0.2.x is reached over the test vlan (eth1), where
+    # upstream plays SLIRP's gateway/DNS. Without this the 10.0.2.x checks
+    # below would fail for routing reasons and prove nothing.
+    for m in (scraper, upstream):
+        m.succeed("ip link set eth0 down")
+    scraper.succeed("ip route get 10.0.2.2 | grep -q 'dev eth1'")
+
+    def scraper_get(url):
+        return scraper.execute(f"curl -sS -m 5 -o /dev/null -w '%{{http_code}}' {url}")
+
+    # Positive control first: the same listener on a non-private address
+    # is reachable, so the failures below are the policy, not the network.
+    rc, code = scraper_get("http://203.0.113.10:443/")
+    assert rc == 0 and code == "200", f"public egress broken: rc={rc} code={code!r}"
+
+    # Host gateway and private ranges: refused, whatever the port.
+    for url in ["http://10.0.2.2:443/", "http://10.0.2.2:8123/",
+                "http://192.168.1.10:443/"]:
+        rc, code = scraper_get(url)
+        assert rc != 0, f"scraper reached {url} (code {code!r}) — guest egress must refuse it"
+
+    # SLIRP's DNS port stays reachable (the scraper resolves every URL it
+    # renders) — and only that port: upstream also listens on :443 at
+    # the same address, which must stay refused.
+    scraper.succeed("timeout 6 bash -c 'exec 3<>/dev/tcp/10.0.2.3/53'")
+    scraper.fail("timeout 6 bash -c 'exec 3<>/dev/tcp/10.0.2.3/443'")
+
+    # IPv6. The guest sets enableIPv6 = false, yet live its SLIRP NIC still
+    # carries fec0::/64 from SLIRP's RA (networkd re-enables v6 per link),
+    # and SLIRP maps fec0::2 to the HOST's ::1 exactly as 10.0.2.2 maps to
+    # 127.0.0.1 (measured 2026-10-03: a canary on host [::1] was served to
+    # the guest, and a page WebSocket to ws://[fec0::2] reached it past the
+    # Python request guard). Reproduce that link state here: v6 on eth1
+    # only, SLIRP's v6 gateway played by upstream.
+    upstream.succeed(
+        "sysctl -w net.ipv6.conf.eth1.disable_ipv6=0",
+        "ip -6 addr add fec0::2/64 dev eth1 nodad",
+        "systemd-run --unit=v6-gateway ${pkgs.python3}/bin/python3 -m http.server 8443 --bind fec0::2 --directory /srv/cdn",
+    )
+    scraper.succeed(
+        "sysctl -w net.ipv6.conf.eth1.disable_ipv6=0",
+        "ip -6 addr add fec0::15/64 dev eth1 nodad",
+    )
+    upstream.wait_until_succeeds("ss -ltn | grep -q '\\[fec0::2\\]:8443'")
+    rc, code = scraper_get("-g http://[fec0::2]:8443/")
+    assert rc != 0, f"scraper reached the v6 host gateway (code {code!r}) — guest egress must refuse IPv6"
+
+    # Inbound still works: the host's hostfwd arrives from 10.0.2.2, and
+    # replies on that connection must not be caught by the output drop.
+    out = upstream.succeed("curl -sS -m 5 --interface 10.0.2.2 http://10.0.2.15:8000/")
+    assert out.strip() == "api-ok", f"inbound API via gateway broken: {out!r}"
+
+    counters = scraper.succeed("nft list table inet scraper-egress")
+    print("[diag] scraper-egress:\n" + counters)
+    assert "packets 0 " not in counters, "reject rule never matched — test exercised nothing"
+
+    # Non-vacuity: with the chain emptied, the very same gateway URL is
+    # reachable — so the refusals above were the policy, not the network.
+    scraper.succeed("nft flush chain inet scraper-egress output")
+    rc, code = scraper_get("http://10.0.2.2:443/")
+    assert rc == 0 and code == "200", f"control: gateway unreachable even without policy: rc={rc} code={code!r}"
+    rc, code = scraper_get("-g http://[fec0::2]:8443/")
+    assert rc == 0 and code == "200", f"control: v6 gateway unreachable even without policy: rc={rc} code={code!r}"
   '';
 }
