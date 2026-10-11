@@ -27,6 +27,14 @@
     cargo
     python3
     uv
+    # Editor: VSCodium with Rust and TOML support baked in (declarative extensions)
+    (vscode-with-extensions.override {
+      vscode = vscodium;
+      vscodeExtensions = with vscode-extensions; [
+        rust-lang.rust-analyzer
+        tamasfe.even-better-toml
+      ];
+    })
     # Intentionally NOT included (drift-scan 2026-04-19):
     # - terraform: not used for now
     # - yt-dlp: not wanted
