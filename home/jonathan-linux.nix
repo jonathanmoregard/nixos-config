@@ -357,9 +357,10 @@ let
   #      listed as skipped instead;
   #   2. the proposal inventory (path + status, every category, archived
   #      and rejected included) so dedup is a comparison, not a sweep.
-  # Exit 3 = nothing in the window: the wrapper skips the model call.
-  # Manifest eligibility (sessionend complete) stays with the model per
-  # prompt.md Step 2.
+  # Exit 3 = nothing in the window. The block is still printed, with the
+  # window marked empty, so a run fed only by PR review feedback keeps its
+  # inventory. Manifest eligibility (sessionend complete) stays with the
+  # model per prompt.md Step 2.
   rsiReviewInputs = pkgs.writeShellApplication {
     name = "rsi-review-inputs";
     runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.gawk ];
@@ -385,17 +386,18 @@ let
           window+=("- \`$path\` (modified $stamp)")
         fi
       done
-      if [ "''${#window[@]}" -eq 0 ]; then
-        echo "rsi-review-inputs: no readable reflections modified in the last 24h under $sessions" >&2
-        exit 3
-      fi
       echo "## Precomputed inputs (appended by the rsi-daily-review wrapper)"
       echo
       echo "### Step 2 window"
       echo
-      echo "The wrapper has already selected Step 2's candidates (top-level final.json, modified in the last 24h, newest first, at most 12). Use exactly this list: do not glob, grep or otherwise search for reflections. Apply Step 2's manifest checks to each entry."
-      echo
-      printf '%s\n' "''${window[@]}"
+      if [ "''${#window[@]}" -eq 0 ]; then
+        echo "rsi-review-inputs: no readable reflections modified in the last 24h under $sessions" >&2
+        echo "No reflections were modified in the last 24h: skip Step 2 and do not search for reflections."
+      else
+        echo "The wrapper has already selected Step 2's candidates (top-level final.json, modified in the last 24h, newest first, at most 12). Use exactly this list: do not glob, grep or otherwise search for reflections. Apply Step 2's manifest checks to each entry."
+        echo
+        printf '%s\n' "''${window[@]}"
+      fi
       if [ "''${#skipped[@]}" -gt 0 ]; then
         echo
         echo "Skipped for size — report these in your final summary, never open them:"
@@ -416,12 +418,19 @@ let
       else
         echo "(no proposal sink at $proposals yet)"
       fi
+      [ "''${#window[@]}" -gt 0 ] || exit 3
     '';
   };
 
+  # The user's own PR review comments, a second review input. The
+  # script's docstring states what it collects and why PR conversation
+  # comments are left out. gh resolves from PATH, like claude below.
+  rsiPrFeedback = pkgs.writers.writePython3Bin "rsi-pr-feedback" { }
+    (builtins.readFile ./rsi-pr-feedback.py);
+
   rsiDailyReview = pkgs.writeShellApplication {
     name = "rsi-daily-review";
-    runtimeInputs = [ rsiProposalSink rsiReviewInputs pkgs.coreutils pkgs.jq pkgs.util-linux ];
+    runtimeInputs = [ rsiProposalSink rsiReviewInputs rsiPrFeedback pkgs.coreutils pkgs.jq pkgs.util-linux ];
     text = ''
       prompt_file="$HOME/.claude/recursive-self-improvement/config/prompt.md"
       # Proposals land in the state-dir sink, NOT in ~/.claude. ~/.claude
@@ -518,23 +527,41 @@ let
       proposals directory, and pushing happens behind the proposals
       intake gate."
       # Window + inventory, selected deterministically (see rsiReviewInputs).
-      # An empty window means there is nothing to review: skip the model
-      # call rather than pay for a pass that can only search in vain.
       inputs_rc=0
       inputs="$(rsi-review-inputs "$HOME/.claude/reflections/sessions" \
         "$(dirname "$dest")")" || inputs_rc=$?
-      if [ "$inputs_rc" -eq 3 ]; then
-        echo "rsi-daily-review: no reflections in the 24h window — skipping (no model call)"
-        exit 0
-      elif [ "$inputs_rc" -ne 0 ]; then
+      if [ "$inputs_rc" -ne 0 ] && [ "$inputs_rc" -ne 3 ]; then
         echo "rsi-daily-review: rsi-review-inputs failed rc=$inputs_rc" >&2
         exit "$inputs_rc"
+      fi
+      # PR review feedback (see rsiPrFeedback) is an optional input: a gh
+      # outage, missing auth or a timeout costs this input, never the
+      # review.
+      pr_rc=0
+      pr_feedback="$(timeout 600 rsi-pr-feedback --login jonathanmoregard \
+        --owner jonathanmoregard --owner klaffat \
+        --since "$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)")" || pr_rc=$?
+      if [ "$pr_rc" -ne 0 ]; then
+        [ "$pr_rc" -eq 3 ] \
+          || echo "rsi-daily-review: rsi-pr-feedback failed rc=$pr_rc — continuing without PR feedback" >&2
+        pr_feedback=""
+      fi
+      # Nothing to review: skip the model call rather than pay for a pass
+      # that can only search in vain.
+      if [ "$inputs_rc" -eq 3 ] && [ -z "$pr_feedback" ]; then
+        echo "rsi-daily-review: no reflections and no PR feedback in the 24h window — skipping (no model call)"
+        exit 0
       fi
       # Logged so each night's window is auditable next to the run.
       printf '%s\n' "$inputs" | grep '/final.json' || true
       override="$override
 
       $inputs"
+      if [ -n "$pr_feedback" ]; then
+        override="$override
+
+      $pr_feedback"
+      fi
       # The prompt goes to claude on STDIN, not as an argv string. The
       # kernel caps one argv string at 128 KiB (MAX_ARG_STRLEN), and the
       # inventory above grows ~100 B per proposal: as an argument the run
