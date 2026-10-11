@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # security-batch runner: research-agent weekly sweep (runs under
 # modules/nixos/security-batch.nix; contract in that file's header).
 #

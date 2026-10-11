@@ -315,11 +315,8 @@
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
         vm-nix-gc       = mkLane ./tests/nix-gc.nix;
         vm-security-batch = mkLane ./tests/security-batch.nix;
-        # In ci.yml's vm-minimal matrix, and deliberately absent from
-        # `discover`'s LANES so it never reports "cached" and always
-        # executes — it gates credential handling and the sudo password
-        # rule, and a cache hit skipping it is exactly the silence it
-        # exists to prevent.
+        # In ci.yml's vm-minimal matrix. Gates credential handling and the
+        # sudo password rule.
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
         vm-klaffat-dependabot-caretaker = mkLane ./tests/klaffat-dependabot-caretaker.nix;
 
@@ -695,6 +692,16 @@
       update-beeper = pkgsLinux.beeper-update;
       check-signal-expiry = pkgsLinux.signal-expiry-check;
       add-secret = import ./home/add-secret.nix { pkgs = pkgsLinux; };
+      # `nix run .#security-static [-- --self-test]` — fast offline security
+      # scanners, pinned via flake.lock. CI job `security-static`.
+      security-static = pkgsLinux.writeShellApplication {
+        name = "security-static";
+        runtimeInputs = with pkgsLinux; [
+          zizmor actionlint gitleaks shellcheck poutine
+          git gnutar coreutils findutils gnugrep
+        ];
+        text = builtins.readFile ./scripts/security-static.sh;
+      };
     };
 
     # agenix-rekey CLI plumbing. Exposes:
