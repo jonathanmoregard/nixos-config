@@ -3762,6 +3762,27 @@ in
         user_systemctl + " unset-environment AI_CLIENT_CONFIG_REMOTE'"
     )
 
+    # gh-token.service executes a script that lives in ~/.claude under a
+    # pinned PATH (home/claude-services.nix). The first deployed run died with
+    # `env: 'bash': No such file or directory` (2026-10-11): the PATH carried
+    # the tools but not the interpreter. Stand in a stub with the real shebang
+    # and tool list; the unit must run it to completion. The VM has no App
+    # key, so the unit's ReadOnlyPaths pem is stubbed too.
+    mint_stub = "/home/jonathan/.claude/dev-container/bin/mint-gh-token"
+    mint_marker = "/home/jonathan/.cache/gh-tokens/vm-mint-ran"
+    dellan.succeed(
+        "install -d -o jonathan -g users -m 700 /home/jonathan/.config/github-app && "
+        "install -o jonathan -g users -m 600 /dev/null /home/jonathan/.config/github-app/app.pem && "
+        "install -d -o jonathan -g users /home/jonathan/.claude/dev-container/bin && "
+        "printf '%s\\n' '#!/usr/bin/env bash' 'set -euo pipefail' "
+        "'command -v curl jq openssl sed mktemp base64 date tr >/dev/null' "
+        f"'touch {mint_marker}' > {mint_stub} && "
+        f"chmod 755 {mint_stub} && chown jonathan:users {mint_stub}"
+    )
+    dellan.succeed(user_systemctl + " start gh-token.service'")
+    dellan.succeed(f"test -f {mint_marker}")
+    dellan.succeed(f"rm -f {mint_stub} {mint_marker}")
+
     # GitHub App host token (home/gh-host-token.nix): the `gh` on jonathan's
     # PATH and git's github.com credential helper must FAIL CLOSED without a
     # fresh token, and never fall back to gh's keyring. The VM has no App

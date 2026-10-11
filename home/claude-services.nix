@@ -31,9 +31,11 @@
       Type = "oneshot";
       ExecStart = "%h/.claude/dev-container/bin/mint-gh-token";
       # The script lives in ~/.claude, not the store, so it resolves its
-      # tools from PATH. The user manager's PATH has no openssl (JWT
-      # signing), so pin every tool it calls.
-      Environment = "PATH=${pkgs.lib.makeBinPath (with pkgs; [ coreutils curl gnused jq openssl ])}";
+      # interpreter (`#!/usr/bin/env bash`) and tools from PATH. The user
+      # manager's PATH has no openssl (JWT signing) and no bash, so pin
+      # every tool it calls. tests/base.nix runs the unit against a stub
+      # script with the same shebang and tool list.
+      Environment = "PATH=${pkgs.lib.makeBinPath (with pkgs; [ bash coreutils curl gnused jq openssl ])}";
       Nice = 5;
 
       NoNewPrivileges = "yes";
