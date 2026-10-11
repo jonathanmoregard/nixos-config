@@ -578,6 +578,9 @@ in
         "https://github.com/jonathanmoregard/klaffat.git"
         "git@github.com:jonathanmoregard/klaffat.git"
         "ssh://git@github.com/jonathanmoregard/klaffat.git"
+        "https://github.com/klaffat/klaffat.git"
+        "git@github.com:klaffat/klaffat.git"
+        "ssh://git@github.com/klaffat/klaffat.git"
       ];
       description = "Repository origins accepted by the unprivileged build helper.";
     };

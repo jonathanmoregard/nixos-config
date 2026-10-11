@@ -422,24 +422,36 @@ let
   #
   # git only runs this when the server answers 401, and only for the URL
   # it was asked about — which is the pinned one.
-  remoteCredentialHelper =
-    if cfg.remoteTokenFile == null then null
-    else pkgs.writeShellScript "klaffat-git-credential" ''
-      if [ ! -r "${cfg.remoteTokenFile}" ]; then
-        echo "klaffat-git-credential: cannot read ${cfg.remoteTokenFile} (services.klaffatInfra.remoteTokenFile)" >&2
+  # Several token files may be configured (`remoteTokenFiles`): a
+  # fine-grained PAT is bound to ONE resource owner, so while the repo moves
+  # between owners the host holds one token per owner. Each file gets its
+  # own helper and `mirror_sync` tries them in order, so a token the server
+  # rejects (401/404) falls through to the next one; only when every
+  # candidate failed does the gate refuse.
+  tokenFiles =
+    if cfg.remoteTokenFiles != [ ] then cfg.remoteTokenFiles
+    else lib.optional (cfg.remoteTokenFile != null) cfg.remoteTokenFile;
+
+  credentialHelperFor = file:
+    pkgs.writeShellScript "klaffat-git-credential" ''
+      if [ ! -r "${file}" ]; then
+        echo "klaffat-git-credential: cannot read ${file} (services.klaffatInfra.remoteTokenFiles)" >&2
         exit 1
       fi
-      printf 'username=x-access-token\npassword=%s\n' "$(${pkgs.coreutils}/bin/cat ${cfg.remoteTokenFile})"
+      token="$(${pkgs.coreutils}/bin/cat ${lib.escapeShellArg file})"
+      if [ -z "$token" ]; then
+        echo "klaffat-git-credential: ${file} is empty" >&2
+        exit 1
+      fi
+      printf 'username=x-access-token\npassword=%s\n' "$token"
     '';
 
-  credentialArg =
-    lib.optionalString (remoteCredentialHelper != null)
-      "-c credential.helper=${remoteCredentialHelper} ";
+  remoteCredentialHelpers = map credentialHelperFor tokenFiles;
 
   fetchHint =
-    if cfg.remoteTokenFile == null
+    if tokenFiles == [ ]
     then "that repository is private and services.klaffatInfra.remoteTokenFile is null"
-    else "the fetch needs the network and a valid read-only token in ${cfg.remoteTokenFile}";
+    else "the fetch needs the network and a valid read-only token in one of: ${lib.concatStringsSep ", " tokenFiles}";
 
   # The provenance gate, as shell functions shared by all four wrappers.
   # See "What provenance means here" in the header. Every refusal exits 2.
@@ -467,13 +479,25 @@ let
         git --git-dir="${mirrorDir}" symbolic-ref HEAD refs/heads/main
       fi
       # `-c credential.helper=` first EMPTIES the helper list, so the one
-      # appended after it is the only helper that runs.
-      if ! (
-        cd "${stateDir}"
-        export GIT_TERMINAL_PROMPT=0
-        git --git-dir="${mirrorDir}" -c credential.helper= ${credentialArg}fetch --quiet --prune \
-          "${cfg.repoRemoteUrl}" '+refs/heads/*:refs/heads/*'
-      ); then
+      # appended after it is the only helper that runs. One attempt per
+      # configured token file, in order; with none configured, one
+      # anonymous attempt.
+      local helpers=( ${lib.escapeShellArgs remoteCredentialHelpers} ) helper fetched=0
+      if [ "''${#helpers[@]}" -eq 0 ]; then helpers=( "" ); fi
+      for helper in "''${helpers[@]}"; do
+        local helper_args=( -c credential.helper= )
+        if [ -n "$helper" ]; then helper_args+=( -c "credential.helper=$helper" ); fi
+        if (
+          cd "${stateDir}"
+          export GIT_TERMINAL_PROMPT=0
+          git --git-dir="${mirrorDir}" "''${helper_args[@]}" fetch --quiet --prune \
+            "${cfg.repoRemoteUrl}" '+refs/heads/*:refs/heads/*'
+        ); then
+          fetched=1
+          break
+        fi
+      done
+      if [ "$fetched" -ne 1 ]; then
         echo "${name}: (${fetchHint})" >&2
         gate_refuse "could not fetch ${cfg.repoRemoteUrl} into the root-only mirror — refusing."
       fi
@@ -1648,6 +1672,20 @@ in
         2026-09-05 and this default changed in the same commit. Should it
         ever move again, change the two together — the wrappers refuse,
         loudly, when the fetch fails.
+      '';
+    };
+
+    remoteTokenFiles = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "/run/agenix/klaffat-github-token-org" "/run/agenix/klaffat-github-token" ];
+      description = ''
+        Root-only token files tried IN ORDER by the mirror fetch; the first
+        one the server accepts wins, and the gate refuses only when every
+        file failed. A fine-grained token is bound to one resource owner,
+        so list one token per owner while the repository moves between
+        owners. When empty (the default), `remoteTokenFile` is used as a
+        one-element list.
       '';
     };
 

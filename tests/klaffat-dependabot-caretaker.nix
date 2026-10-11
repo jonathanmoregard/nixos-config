@@ -127,6 +127,10 @@ common.mkMinimalTest {
         enable = true;
         schedule = "2099-01-01 00:00:00";
         repoRemoteUrl = "file:///var/lib/klaffat-caretaker/remote.git";
+        # The lane runs as the org slug: every filter keys on cfg.repo, so the
+        # whole flow doubles as proof that the org slug passes the assertion
+        # and the jq/URL checks, and the old owner no longer does (below).
+        repo = "klaffat/klaffat";
         metadataCommand = metadata;
         repairCommand = repair;
         dependencyPreparationCommand = dependencyPreparation;
@@ -178,7 +182,7 @@ common.mkMinimalTest {
     dellan.fail("grep -F do-not-leak /tmp/mcp-results")
     base_sha = dellan.succeed("git -C /var/lib/klaffat-caretaker/source rev-parse main").strip()
     head_sha = dellan.succeed("git -C /var/lib/klaffat-caretaker/source rev-parse HEAD").strip()
-    valid = {"state":"open", "author":"dependabot[bot]", "base":"main", "head_repo":"jonathanmoregard/klaffat", "pr":42, "head_ref":"dependabot/npm_and_yarn/lodash-4.17.22", "head_sha":head_sha, "base_sha":base_sha}
+    valid = {"state":"open", "author":"dependabot[bot]", "base":"main", "head_repo":"klaffat/klaffat", "pr":42, "head_ref":"dependabot/npm_and_yarn/lodash-4.17.22", "head_sha":head_sha, "base_sha":base_sha}
     def write_metadata(value):
       values = value if isinstance(value, list) else [value]
       dellan.succeed("printf %s > /var/lib/klaffat-caretaker/metadata.json" % shlex.quote(json.dumps(values)))
@@ -199,7 +203,7 @@ common.mkMinimalTest {
     next_caretaker_day()
     dellan.succeed("systemctl start klaffat-dependabot-caretaker.service")
     dellan.succeed("test -f /var/lib/klaffat-dependabot-caretaker/state/ready.json")
-    dellan.succeed("jq -e '.state == \"ready\" and .pr == 42 and .url == \"https://github.com/jonathanmoregard/klaffat/pull/42\"' /var/lib/klaffat-dependabot-caretaker/state/ready.json")
+    dellan.succeed("jq -e '.state == \"ready\" and .pr == 42 and .url == \"https://github.com/klaffat/klaffat/pull/42\"' /var/lib/klaffat-dependabot-caretaker/state/ready.json")
     dellan.succeed("test \"$(stat -c '%U:%G:%a' /var/lib/klaffat-dependabot-caretaker/notification/ready.json)\" = root:root:644")
     dellan.succeed("cmp /var/lib/klaffat-dependabot-caretaker/state/ready.json /var/lib/klaffat-dependabot-caretaker/notification/ready.json")
     dellan.succeed("test -f /var/lib/klaffat-dependabot-caretaker/notification/ready")
@@ -224,7 +228,7 @@ common.mkMinimalTest {
     dellan.succeed("jq -e '.pr == 42' /var/lib/klaffat-dependabot-caretaker/state/ready.json")
     dellan.succeed("jq -s -e 'any(.[]; .stage == \"awaiting-human\")' /var/lib/klaffat-dependabot-caretaker/state/audit/events.jsonl")
 
-    for patch in [{"head_repo":"mallory/klaffat"}, {"head_ref":"main"}, {"head_sha":"A" * 40}]:
+    for patch in [{"head_repo":"mallory/klaffat"}, {"head_repo":"jonathanmoregard/klaffat"}, {"head_ref":"main"}, {"head_sha":"A" * 40}]:
       write_metadata(valid | patch)
       dellan.fail("systemctl start klaffat-dependabot-caretaker.service")
     dellan.succeed('test "$(jq -s \'[.[] | select(.stage == "ready")] | length\' /var/lib/klaffat-dependabot-caretaker/state/audit/events.jsonl)" = 1')
