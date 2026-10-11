@@ -49,6 +49,7 @@
 #    Required GitHub App permissions:
 #      Contents: Read & write
 #      Pull requests: Read & write
+#      Checks: Read, Commit statuses: Read (red-CI filter)
 #    The App must be installed on this repo.
 #
 # `gh pr update-branch` returns non-zero on merge conflict; logged as
@@ -83,6 +84,13 @@ jobs:
         with:
           app-id: ${{ secrets.AUTO_UPDATE_APP_ID }}
           private-key: ${{ secrets.AUTO_UPDATE_APP_PRIVATE_KEY }}
+          # Ask for exactly what update-branch uses instead of every
+          # permission the App installation holds.
+          permission-contents: write
+          permission-pull-requests: write
+          # Read-only: the red-CI filter reads statusCheckRollup.
+          permission-checks: read
+          permission-statuses: read
 
       - name: Update one behind, green auto-merge PR
         env:
@@ -141,10 +149,10 @@ jobs:
               # cancel-in-progress duplicates don't leak through
               # (older=CANCELLED, newer=SUCCESS). Empty rollup → include.
               # See cli/cli#12895 for the dedupe rationale.
-              # `|| echo "false"` defaults to "not red" on gh failure
-              # (bias toward attempting update vs. incorrectly skipping).
-              # stderr left visible so permission / API issues surface.
-              is_red=$(gh pr view "$num" --json statusCheckRollup --jq '
+              # Fail closed: if gh cannot read the rollup (API error, token
+              # lacking checks/statuses read), skip the PR — an unknown
+              # CI state must not read as green. stderr stays visible.
+              if ! is_red=$(gh pr view "$num" --json statusCheckRollup --jq '
                 [ .statusCheckRollup
                   | group_by(.name // .context)
                   | map(sort_by(.startedAt // .completedAt) | last)
@@ -156,7 +164,10 @@ jobs:
                           or . == "STARTUP_FAILURE" or . == "ACTION_REQUIRED"
                           or . == "STALE" or . == "ERROR"))
                 | length > 0
-              ' || echo "false")
+              '); then
+                echo "  PR #$num ($head): could not read check status, skipped" >&2
+                continue
+              fi
               if [ "$is_red" = "true" ]; then
                 echo "  PR #$num ($head): has failing check, skipped" >&2
                 continue

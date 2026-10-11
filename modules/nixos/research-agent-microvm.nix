@@ -144,7 +144,9 @@ in
         ];
 
         forwardPorts = [
-          { from = "host"; host.port = 2223; guest.port = 22; proto = "tcp"; }
+          # Host loopback only: microvm.nix's default host.address ("")
+          # makes QEMU bind 0.0.0.0. The host MCP server dials 127.0.0.1.
+          { from = "host"; host.address = "127.0.0.1"; host.port = 2223; guest.port = 22; proto = "tcp"; }
         ];
       };
 

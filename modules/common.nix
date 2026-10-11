@@ -119,9 +119,11 @@
     # it). Trusted-public-keys is additive.
     substituters = [
       "https://jonathanmoregard.cachix.org"
+      "https://codex-cli.cachix.org"
     ];
     trusted-public-keys = [
       "jonathanmoregard.cachix.org-1:dx2ddtW26xQClPgpJYu0ba6B3n/2FGGLw96vpREEw7w="
+      "codex-cli.cachix.org-1:1Br3H1hHoRYG22n//cGKJOk3cQXgYobUel6O8DgSing="
     ];
   };
 }
