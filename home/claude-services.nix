@@ -11,16 +11,29 @@
   # ReadWritePaths below must exist or the unit dies at NAMESPACE (226).
   # ~/.cache is not carried over to a fresh host, so create it here.
   # 0755 matches dellan's long-lived dir.
+  #
+  # host/ + scope=installation switch on mint-gh-token's host mode: a
+  # whole-installation App token in host/token, read by the gh wrapper and
+  # git credential helper (home/gh-host-token.nix). 0700: the token is the
+  # laptop's only GitHub credential once the founder PAT is gone. `f+`
+  # rewrites the marker each boot so a hand edit cannot narrow or widen it.
   systemd.user.tmpfiles.rules = [
     "d %h/.cache/gh-tokens 0755 - - -"
+    "d %h/.cache/gh-tokens/host 0700 - - -"
+    "f+ %h/.cache/gh-tokens/host/scope 0644 - - - installation"
   ];
 
-  # gh-token — rotate GitHub App installation tokens for active sandboxes.
+  # gh-token — rotate GitHub App installation tokens: one per active sandbox,
+  # plus the host token every agent on this machine uses.
   systemd.user.services.gh-token = {
-    Unit.Description = "Rotate GitHub App installation tokens for active Claude sandboxes";
+    Unit.Description = "Rotate GitHub App installation tokens (host + active Claude sandboxes)";
     Service = {
       Type = "oneshot";
       ExecStart = "%h/.claude/dev-container/bin/mint-gh-token";
+      # The script lives in ~/.claude, not the store, so it resolves its
+      # tools from PATH. The user manager's PATH has no openssl (JWT
+      # signing), so pin every tool it calls.
+      Environment = "PATH=${pkgs.lib.makeBinPath (with pkgs; [ coreutils curl gnused jq openssl ])}";
       Nice = 5;
 
       NoNewPrivileges = "yes";
@@ -40,15 +53,19 @@
   };
 
   systemd.user.timers.gh-token = {
-    Unit.Description = "Rotate GitHub App tokens every 50 minutes";
+    Unit.Description = "Rotate GitHub App tokens every 20 minutes";
     Timer = {
       OnBootSec = "1min";
-      OnUnitActiveSec = "50min";
-      # No Persistent: it only belongs on OnCalendar timers. On a monotonic
-      # timer it restores last-trigger from the previous boot's stamp, and if
-      # the user manager starts after OnBootSec has elapsed (login >1min after
-      # boot) systemd treats the boot tick as already fired and the timer
-      # never elapses — observed 2026-09-30, tokens went stale for 3h.
+      # Realtime, not OnUnitActiveSec: the monotonic clock stops during
+      # suspend, so after a night asleep a monotonic timer would leave the
+      # (60-minute) host token expired for up to its whole interval, and the
+      # fail-closed gh wrapper would refuse every call meanwhile. A calendar
+      # elapse that passed during suspend fires on resume.
+      OnCalendar = "*:0/20";
+      # No Persistent: OnBootSec already covers boot. Persistent on the old
+      # monotonic timer restored last-trigger from the previous boot's stamp
+      # and, if the user manager started after OnBootSec had elapsed, the
+      # timer never elapsed: observed 2026-09-30, tokens went stale for 3h.
     };
     Install.WantedBy = [ "timers.target" ];
   };
