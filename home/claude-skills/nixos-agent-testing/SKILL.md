@@ -69,20 +69,35 @@ checkout). `nix run .#feature-vm -- --help` lists every command.
 No command (`nix run .#feature-vm`) boots in the foreground as before;
 Ctrl+C stops it.
 
-## Locked (default) vs trusted
+## Locked (default) vs agent vs trusted
 
-| | Locked (default) | `--trusted` |
-|---|---|---|
-| Guest internet | none (`restrict=on`; the ssh forward still works) | on |
-| `/mnt/worktrees`, research-agent share | read-only (enforced by QEMU on the host) | read-write |
-| Your keys / agenix secrets | none; every secret is a throwaway fixture | same |
+| | Locked (default) | `--agent` | `--trusted` |
+|---|---|---|---|
+| Guest network | none (`restrict=on`; the ssh forward still works) | only `api.anthropic.com:443`, relayed by QEMU on the host | full internet |
+| `/mnt/worktrees` | read-only (enforced by QEMU on the host) | read-only | read-write |
+| research-agent share | read-only; the guest works on a local copy | same | same |
+| Claude token | none | copied into guest tmpfs after boot and every `reset` | none |
+| Your keys / agenix secrets | none; every secret is a throwaway fixture | same | same |
 
 Use locked for everything that does not need the internet or to write
 host files — including running commands you would not run on the host.
-Pass `--trusted` only when the change under test must reach the network
-or write through a share (e.g. the research-agent microvm writing
-reports), and say so in the PR evidence. The mode is chosen at `up`;
-`reset` keeps it.
+
+Use `--agent` to run Claude Code inside the VM, e.g. to test a skill or
+agent config against the VM's own `~/.claude`. It needs a token from
+`claude setup-token` saved in `~/.config/feature-vm/claude-oauth-token`
+(or the file named by `$FEATURE_VM_AGENT_TOKEN_FILE`); `up` refuses
+without one. In the VM, `claude` picks the token up from the
+environment, with non-essential traffic off:
+
+```bash
+nix run .#feature-vm -- --agent up
+nix run .#feature-vm -- run 'claude -p "list your skills"'
+```
+
+Pass `--trusted` only when the change under test must reach the wider
+network or write through the worktrees share, and say so in the PR
+evidence. The mode is chosen at `up`; `reset` keeps it. `--agent` works
+with `up` only, not a foreground boot.
 
 ## Headless vs headful
 
@@ -100,6 +115,9 @@ headful when the user has explicitly asked for a window.
   `/run/agenix/` is a fixture (see below).
 - `/mnt/worktrees` — host's `~/Repos/nixos-config-worktrees`
   (read-only unless `--trusted`).
+- `~/Repos/research-agent` — a local copy of the host checkout, made at
+  boot from the read-only share. Reports written there stay in the VM;
+  fetch them with `get`.
 - The host `/nix/store`, read-only — anything built on the host is
   instantly visible in the guest. That is what makes `apply` fast.
 - `jonathan` user, in `wheel` + `keys`, sudo without password.
@@ -232,7 +250,8 @@ read. Verify the real-credential path on the host after deploy.
   service).
 - Public-network reachability (other LAN hosts can't see the VM;
   only `host:2222` is exposed via QEMU usermode `hostfwd`). In locked
-  mode the guest has no outbound network at all.
+  mode the guest has no outbound network at all; in `--agent` mode only
+  api.anthropic.com.
 - One VM at a time (fixed ssh port 2222). `up` refuses while one runs.
 - While a VM runs it holds the memory-coordination lock, so other
   memory-heavy Nix jobs (including auto-deploy) wait until `down`.
