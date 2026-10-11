@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # feature-vm — boot and drive a disposable copy of a workstation host.
 #
 # Sourced into a writeShellApplication by scripts/feature-vm.nix, which
@@ -60,8 +61,10 @@ known_hosts="$state_dir/known_hosts"
 # The VM's sshd key is fixed at build time (feature-vm.nix) and pinned
 # here, so a command meant for the VM never runs on whatever else might
 # be listening on localhost:2222.
+# No agent or port forwarding into the VM, whatever ~/.ssh/config says.
 interactive_ssh_opts=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts"
-  -o GlobalKnownHostsFile=/dev/null -o LogLevel=ERROR -i "$HOME/.ssh/id_ed25519")
+  -o GlobalKnownHostsFile=/dev/null -o LogLevel=ERROR -i "$HOME/.ssh/id_ed25519"
+  -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes)
 ssh_opts=("${interactive_ssh_opts[@]}" -o BatchMode=yes -o ConnectTimeout=5)
 
 opt_host=""

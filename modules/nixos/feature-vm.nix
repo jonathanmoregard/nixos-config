@@ -117,6 +117,14 @@ in
         }
       ];
 
+      # qemu-vm.nix always exports two more 9p shares, xchg and shared,
+      # backed by a writable directory under the launcher's run dir and
+      # with no read-only option. Point both at an empty store path: the
+      # host user cannot write there, so the guest cannot either, in any
+      # mode.
+      sharedDirectories.xchg.source = lib.mkForce "${pkgs.emptyDirectory}";
+      sharedDirectories.shared.source = lib.mkForce "${pkgs.emptyDirectory}";
+
       # Host shares, exported by the launcher's QEMU_OPTS (mount tags
       # worktrees, research-agent) so it can make them read-only.
       # The mounts live in `virtualisation.fileSystems` because qemu-vm.nix

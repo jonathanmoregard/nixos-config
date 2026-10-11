@@ -80,7 +80,10 @@ pkgs.runCommand "feature-vm-ctl-harness"
     printf '%s\n' "ssh \''${@: -1}" >> $log
     printf '%s\n' "\$*" >> $log.ssh-args
     case "\''${@: -1}" in
-      *feature-vm-agent/token*) cat >> "\$HOME/staged-token" ;;
+      *feature-vm-agent/token*)
+        cat >> "\$HOME/staged-token"
+        exit \''${FAKE_STAGE_RC:-0}
+        ;;
     esac
     exit \''${FAKE_SSH_RC:-0}
     EOF
@@ -145,6 +148,10 @@ pkgs.runCommand "feature-vm-ctl-harness"
     if grep -qi 'StrictHostKeyChecking=\(n\)o' $log.ssh-args; then fail "an ssh call skips host key checking"; fi
     grep -q "StrictHostKeyChecking=yes -o UserKnownHostsFile=$XDG_CACHE_HOME/feature-vm/known_hosts" $log.ssh-args ||
       fail "ssh does not use the pinned known_hosts"
+    # ...and never forwards the host agent or ports into the VM.
+    if grep -v -- '-o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes' $log.ssh-args | grep -q .; then
+      fail "an ssh call may forward the agent or ports"
+    fi
 
     # 5. refusals.
     rm $HOME/vm-active
@@ -208,8 +215,9 @@ pkgs.runCommand "feature-vm-ctl-harness"
     #     without its token.
     rm -f $HOME/vm-active
     rc=0
-    FAKE_BOOT=1 FAKE_SSH_RC=1 FEATURE_VM_BOOT_TIMEOUT=2 fv --agent up 2> agent.err || rc=$?
+    FAKE_BOOT=1 FAKE_STAGE_RC=1 fv --agent up 2> agent.err || rc=$?
     [ $rc -ne 0 ] || fail "--agent up succeeded although the token copy failed"
+    grep -q 'could not copy the Claude token' agent.err || fail "wrong token-copy failure: $(cat agent.err)"
     [ ! -e $HOME/vm-active ] || fail "VM left running after a failed token copy"
 
     # 13. Mode refusals.
