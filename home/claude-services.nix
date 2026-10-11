@@ -17,10 +17,17 @@
   # git credential helper (home/gh-host-token.nix). 0700: the token is the
   # laptop's only GitHub credential once the founder PAT is gone. `f+`
   # rewrites the marker each boot so a hand edit cannot narrow or widen it.
+  #
+  # host/<owner>/ holds the org installation token for each ORG_INSTALLATIONS
+  # entry in ~/.config/github-app/config (multi-owner: the wrapper and helper
+  # pick it for that owner's repos, home/gh-host-token.nix). Declared 0700
+  # here for the klaffat org; mint-gh-token creates any other owner's dir
+  # 0700 itself.
   systemd.user.tmpfiles.rules = [
     "d %h/.cache/gh-tokens 0755 - - -"
     "d %h/.cache/gh-tokens/host 0700 - - -"
     "f+ %h/.cache/gh-tokens/host/scope 0644 - - - installation"
+    "d %h/.cache/gh-tokens/host/klaffat 0700 - - -"
   ];
 
   # gh-token — rotate GitHub App installation tokens: one per active sandbox,

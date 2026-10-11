@@ -174,8 +174,13 @@ let
           # explicitly (home/gh-host-token.nix; only that token's directory
           # is bound in), scoped to github.com so no other remote can receive
           # it. It fails closed: no token, no clone, and no keyring fallback.
+          # useHttpPath hands the helper path=OWNER/NAME.git so it picks that
+          # owner's installation token (personal or org); the probe asks for
+          # exactly the path the clone will.
           stage="authenticate"
-          if ! printf 'protocol=https\nhost=github.com\n\n' \
+          probe_path="''${remote#*://}"
+          probe_path="''${probe_path#*/}"
+          if ! printf 'protocol=https\nhost=github.com\npath=%s\n\n' "$probe_path" \
             | ${credentialHelper} get >/dev/null; then
             echo "ai-client-config sync: GitHub App host token unavailable; run 'systemctl --user start gh-token.service' and check 'journalctl --user -u gh-token.service'" >&2
             exit 69
@@ -183,6 +188,7 @@ let
           clone_args=(
             -c credential.helper=
             -c "credential.https://github.com.helper=${credentialHelper}"
+            -c credential.https://github.com.useHttpPath=true
             clone
             "''${clone_args[@]}"
           )

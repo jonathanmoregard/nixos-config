@@ -62,6 +62,9 @@ in
       # `gh auth setup-git`), so nothing can answer for github.com ahead of
       # the App token. tests/base.nix proves it with a decoy system helper.
       credential."https://github.com".helper = [ "" "${ghHost.credentialHelper}/bin/gh-app-credential" ];
+      # Send path=OWNER/NAME.git to the helper: one App installation covers
+      # one owner, so the token is picked per owner (personal or org).
+      credential."https://github.com".useHttpPath = true;
       core.hooksPath = "~/.config/git/hooks";
       core.excludesfile = "~/.config/git/ignore";
 
