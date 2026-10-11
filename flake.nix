@@ -315,6 +315,10 @@
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
         vm-nix-gc       = mkLane ./tests/nix-gc.nix;
         vm-security-batch = mkLane ./tests/security-batch.nix;
+        # Known-value masking producer (modules/nixos/secret-fingerprints.nix)
+        # on lane-minted agenix fixtures: fingerprint cases, root-only
+        # entropy rule, switch trigger, degraded record, salt persistence.
+        vm-secret-fingerprints = mkLane ./tests/secret-fingerprints.nix;
         # In ci.yml's vm-minimal matrix, and deliberately absent from
         # `discover`'s LANES so it never reports "cached" and always
         # executes — it gates credential handling and the sudo password

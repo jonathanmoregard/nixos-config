@@ -135,9 +135,15 @@
     ../../modules/nixos/klaffat-infra.nix
     ../../modules/nixos/klaffat-dependabot-caretaker.nix
     ../../modules/nixos/klaffat-local-google.nix
+
+    # Salted fingerprints of every agenix secret value, for the
+    # known-value masking in ~/.claude's output-redaction hook and the
+    # aggregator ingest scrubber (format-less keys regexes cannot catch).
+    ../../modules/nixos/secret-fingerprints.nix
   ];
 
   services.claudeEgressObserve.enable = true;
+  services.secretFingerprints.enable = true;
   services.klaffatInfra.enable = true;
   services.klaffatLocalGoogle.enable = true;
 
