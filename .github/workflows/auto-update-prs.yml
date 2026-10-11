@@ -87,10 +87,6 @@ jobs:
           # permission the App installation holds.
           permission-contents: write
           permission-pull-requests: write
-          # No checks/statuses request: the red-CI filter reads
-          # statusCheckRollup, which any token can read on this public
-          # repo. Requesting them failed every run since #311, because
-          # the App installation does not hold those permissions.
 
       - name: Update one behind, green auto-merge PR
         env:
