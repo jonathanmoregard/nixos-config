@@ -80,8 +80,9 @@ def candidates(text):
 
     Private-key blocks are removed first; the regex detectors catch their
     armour. Taken as given: the content of a single-line file, and every
-    KEY=value value — the file or the key says it is a secret. Taken only
-    when they hold a digit and a letter: other lines, JSON string values,
+    KEY=value value that is not a path — the file or the key says it is a
+    secret. Taken only when they hold a digit and a letter: other lines,
+    JSON string values,
     and every maximal [A-Za-z0-9_-] run of any candidate; this keeps
     ordinary words ("service_account", a path, a secret's own name) out.
     """
@@ -93,7 +94,8 @@ def candidates(text):
     given, derived = set(), set()
     for line in lines:
         value = env_value(line)
-        if value is not None:
+        # A path value is a reference to a secret, not the secret.
+        if value is not None and not value.startswith(("/", "~/")):
             given.add(value)
         if len(lines) == 1:
             given.add(strip_quotes(line))

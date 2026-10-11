@@ -39,6 +39,7 @@ let
         export OTHER='single-Quoted-Value-5678'
         SHORT=abc123
         PASSWORD=correcthorsebatterystaple
+        CREDS_FILE=/run/secrets/svc-account-key-2024.json
         URL=https://example.invalid/path?token=Ab12Cd34Ef56Gh78Ij90 # note gitleaks:allow (throwaway fixture)
       '';
     };
@@ -145,6 +146,8 @@ in
         FIX["fp-root-camel"],
         FIX["fp-root-built"],
         FIX["fp-root-env"].strip(),
+        "/run/secrets/svc-account-key-2024.json",         # env value that is a path
+        "svc-account-key-2024",                           # ...and its runs
     ]
 
     def load():
