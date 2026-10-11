@@ -266,10 +266,8 @@ interactive VM. When in doubt, run it; the cost is cheap.
 | `verify fork-guards` | Fork-safety guards intact |
 | `flake check (eval)` | Flake evaluates |
 | `docs (eval)` | Doc assertions |
-| `discover` | Computes which `vm-minimal` lanes the diff needs |
-| `build dellan toplevel` | System derivation builds (the slow one, ~15min) |
-| `build tuxedo toplevel` | Tuxedo's system derivation, after dellan's (mostly cache hits) |
-| `vm-minimal (<lane>)` | One job per lane `discover` selected — matrix, not a fixed count |
+| `build tuxedo toplevel` | Tuxedo's system derivation builds |
+| `vm-minimal (<lane>)` | One job per lane in the matrix; an unchanged lane substitutes its cached result |
 | `vm-graphical` | Runs only when desktop files change |
 | `close-fork` | Skipped on non-fork PRs |
 
