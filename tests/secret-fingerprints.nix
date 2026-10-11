@@ -52,6 +52,12 @@ let
         nested.list = [ "Nested-JSON-Value-42abc" ];
       };
     };
+    # Nested past Python's recursion limit: must not crash the run (every other
+    # fixture's assertion fails if it does).
+    fp-deep-json = {
+      access = "user";
+      value = lib.strings.replicate 5000 "[" + ''"Deep-JSON-Survivor-7x9q"'' + lib.strings.replicate 5000 "]";
+    };
     fp-short = { access = "user"; value = "short123"; };
     fp-passphrase = { access = "user"; value = "correct horse battery staple"; };
     fp-group = { access = "group"; value = "weak group pass 1234"; };

@@ -65,14 +65,16 @@ def env_value(line):
 
 
 def json_strings(node):
-    if isinstance(node, str):
-        yield node
-    elif isinstance(node, dict):
-        for v in node.values():
-            yield from json_strings(v)
-    elif isinstance(node, list):
-        for v in node:
-            yield from json_strings(v)
+    # Iterative: nesting depth must not be able to crash the whole run.
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            yield node
+        elif isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
 
 
 def candidates(text):
@@ -103,7 +105,7 @@ def candidates(text):
             derived.add(strip_quotes(line))
     try:
         derived.update(json_strings(json.loads(body)))
-    except ValueError:
+    except (ValueError, RecursionError):  # not JSON, or nested past the parser
         pass
     for v in given | derived:
         derived.update(RUN_RE.findall(v))
