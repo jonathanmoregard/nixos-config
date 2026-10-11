@@ -3733,7 +3733,7 @@ in
     )
     for marker in [
         "ProtectHome=tmpfs",
-        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json -%h/.config/gh -%h/Repos -%t/bus",
+        "BindReadOnlyPaths=-%h/.claude -%h/.claude.json -%h/.cache/gh-tokens/host -%h/Repos",
         "InaccessiblePaths=-%h/.codex/auth.json -%h/.codex/sessions",
     ]:
         assert marker in sync_service, (
@@ -3747,10 +3747,10 @@ in
     sync_script_text = dellan.succeed(f"cat {sync_script}")
     for marker in [
         "credential.https://github.com.helper=",
-        "gh auth git-credential",
+        "/bin/gh-app-credential",
     ]:
         assert marker in sync_script_text, (
-            f"ai-client-config sync lost host-scoped gh helper '{marker}':\\n"
+            f"ai-client-config sync lost host-scoped App-token helper '{marker}':\\n"
             f"{sync_script_text}"
         )
     assert "ai-client-config-claude.json" not in sync_script_text, (
@@ -3799,9 +3799,9 @@ in
         + "AI_CLIENT_CONFIG_CLAUDE_STATE_OUTPUT'"
     )
 
-    # The feature VM has no desktop keyring. Production's default HTTPS
-    # remote must therefore fail before network access, name authentication
-    # as the stage, and give an actionable desktop-session repair command.
+    # The feature VM has no GitHub App host token. Production's default HTTPS
+    # remote must therefore fail closed before network access, name
+    # authentication as the stage, and give an actionable repair command.
     dellan.succeed(
         user_systemctl + " reset-failed ai-client-config-codex-sync.service'"
     )
@@ -3814,7 +3814,7 @@ in
         "journalctl --user -u ai-client-config-codex-sync.service "
         "-n 50 --no-pager'"
     )
-    assert "gh auth login --hostname github.com --git-protocol https" in sync_journal, (
+    assert "systemctl --user start gh-token.service" in sync_journal, (
         "missing GitHub auth must name exact recovery command:\\n"
         f"{sync_journal}"
     )
@@ -3842,6 +3842,52 @@ in
     dellan.succeed(
         user_systemctl + " unset-environment AI_CLIENT_CONFIG_REMOTE'"
     )
+
+    # GitHub App host token (home/gh-host-token.nix): the `gh` on jonathan's
+    # PATH and git's github.com credential helper must FAIL CLOSED without a
+    # fresh token, and never fall back to gh's keyring. The VM has no App
+    # key, so gh-token.service mints nothing and the token starts absent.
+    host_dir = "/home/jonathan/.cache/gh-tokens/host"
+    host_token = host_dir + "/token"
+    assert dellan.succeed(f"stat -c %a {host_dir}").strip() == "700", (
+        "host token dir must be private to jonathan"
+    )
+    assert dellan.succeed(f"cat {host_dir}/scope").strip() == "installation"
+    dellan.fail(f"test -e {host_token}")
+    cred_probe = (
+        "printf \"protocol=https\\nhost=github.com\\n\\n\" | git credential fill"
+    )
+
+    def as_jonathan(cmd):
+        return "su - jonathan -c 'env -u GH_TOKEN -u GITHUB_TOKEN " + cmd + "' 2>&1"
+
+    for state, expect in [("missing", "missing or empty"), ("stale", "stale")]:
+        if state == "stale":
+            dellan.succeed(
+                f"su - jonathan -c 'umask 077; printf vm-dummy-token > {host_token}'"
+                f" && touch -d '2 hours ago' {host_token}"
+            )
+        gh_out = dellan.fail(as_jonathan("gh repo view octo/example"))
+        assert expect in gh_out and "gh-token.service" in gh_out, (
+            f"gh wrapper did not fail closed on a {state} token:\n{gh_out}"
+        )
+        git_out = dellan.fail(as_jonathan(cred_probe))
+        assert "told us to quit" in git_out and "password=" not in git_out, (
+            f"git credential helper did not fail closed on a {state} token:\n{git_out}"
+        )
+
+    # Fresh token: it reaches the real gh as GH_TOKEN and git as the
+    # x-access-token password, with no network involved.
+    dellan.succeed(f"touch {host_token}")
+    assert dellan.succeed(as_jonathan("gh auth token")).strip() == "vm-dummy-token"
+    git_out = dellan.succeed(as_jonathan(cred_probe))
+    assert "username=x-access-token" in git_out, git_out
+    assert "password=vm-dummy-token" in git_out, git_out
+    # An explicit GH_TOKEN is the caller's choice and passes through untouched.
+    assert dellan.succeed(
+        "su - jonathan -c 'GH_TOKEN=explicit-dummy gh auth token'"
+    ).strip() == "explicit-dummy"
+    dellan.succeed(f"rm {host_token}")
 
     # claude-pull — the pull half of ~/.claude's continuous delivery. The
     # timer must be linked and armed in the live user session.

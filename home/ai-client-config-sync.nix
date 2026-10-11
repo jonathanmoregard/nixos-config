@@ -1,6 +1,8 @@
 { lib, pkgs, ... }:
 let
   networkOnline = import ./network-online-script.nix { inherit pkgs; };
+  ghHost = import ./gh-host-token.nix { inherit pkgs; };
+  credentialHelper = "${ghHost.credentialHelper}/bin/gh-app-credential";
 
   renderInNamespace = pkgs.writeShellScript "ai-client-config-render-isolated" ''
     set -euo pipefail
@@ -168,20 +170,19 @@ let
           clone_args=(-c protocol.file.allow=always clone "''${clone_args[@]}")
       elif [[ "$remote_normalized" =~ ^https://([^/@]+@)?github[.]com(:443)?(/|$) ]]; then
           # This service deliberately cannot see the user's Git config under
-          # ProtectHome=tmpfs. Use gh's existing desktop-keyring credential
-          # explicitly, and scope the helper to github.com so no other remote
-          # can receive it. Environment tokens would shadow that keyring.
-          unset GH_TOKEN GITHUB_TOKEN
-          export GH_CONFIG_DIR="$HOME/.config/gh"
+          # ProtectHome=tmpfs. Name the GitHub App host-token helper
+          # explicitly (home/gh-host-token.nix; only that token's directory
+          # is bound in), scoped to github.com so no other remote can receive
+          # it. It fails closed: no token, no clone, and no keyring fallback.
           stage="authenticate"
-          if ! ${lib.getExe pkgs.gh} auth token --hostname github.com \
-            >/dev/null 2>&1; then
-            echo "ai-client-config sync: GitHub authentication unavailable; run 'gh auth login --hostname github.com --git-protocol https' in your desktop session" >&2
+          if ! printf 'protocol=https\nhost=github.com\n\n' \
+            | ${credentialHelper} get >/dev/null; then
+            echo "ai-client-config sync: GitHub App host token unavailable; run 'systemctl --user start gh-token.service' and check 'journalctl --user -u gh-token.service'" >&2
             exit 69
           fi
           clone_args=(
             -c credential.helper=
-            -c "credential.https://github.com.helper=!${lib.getExe pkgs.gh} auth git-credential"
+            -c "credential.https://github.com.helper=${credentialHelper}"
             clone
             "''${clone_args[@]}"
           )
@@ -461,17 +462,17 @@ in
       PrivateTmp = "yes";
       ProtectSystem = "strict";
       ProtectHome = "tmpfs";
-      # gh keeps the token in Secret Service. Expose only its config metadata
-      # and the user-bus socket needed for the pre-render credential lookup.
+      # GitHub credentials: only the App host-token directory (a directory,
+      # not the file, so the timer's atomic rename stays visible). No gh
+      # config and no user bus: the founder's keyring is out of reach.
       # Trusted wrapper snapshots explicit Claude config entry points and
       # enabled plugin roots. renderInNamespace masks the live home and runtime
       # directory, then exposes only the sparse source snapshot read-only.
       BindReadOnlyPaths = lib.concatStringsSep " " [
         "-%h/.claude"
         "-%h/.claude.json"
-        "-%h/.config/gh"
+        "-%h/.cache/gh-tokens/host"
         "-%h/Repos"
-        "-%t/bus"
       ];
       BindPaths = lib.concatStringsSep " " [
         "%h/.codex"
