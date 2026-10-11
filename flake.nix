@@ -315,11 +315,8 @@
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
         vm-nix-gc       = mkLane ./tests/nix-gc.nix;
         vm-security-batch = mkLane ./tests/security-batch.nix;
-        # In ci.yml's vm-minimal matrix, and deliberately absent from
-        # `discover`'s LANES so it never reports "cached" and always
-        # executes — it gates credential handling and the sudo password
-        # rule, and a cache hit skipping it is exactly the silence it
-        # exists to prevent.
+        # In ci.yml's vm-minimal matrix. Gates credential handling and the
+        # sudo password rule.
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
         vm-klaffat-dependabot-caretaker = mkLane ./tests/klaffat-dependabot-caretaker.nix;
 
