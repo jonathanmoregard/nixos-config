@@ -14,6 +14,9 @@
 #                     through them); guest network `restrict=on` (the ssh
 #                     port forward still works).
 #   --trusted         worktrees share read-write, guest internet on.
+#   --agent           locked, except api.anthropic.com:443 (forwarded by
+#                     QEMU on the host) and a Claude token in guest tmpfs,
+#                     so Claude Code can run inside the VM.
 #
 # The research-agent checkout is always read-only: the guest copies it to
 # local disk (feature-vm-research-agent-copy) and the inner microvms work
@@ -222,6 +225,23 @@ in
       # *directory listing*, not file reads.
       extraGroups = [ "keys" ];
     };
+
+    # The launcher's guestfwd (--agent, --trusted) answers on 10.0.2.100:443
+    # and connects to the real api.anthropic.com, so pin the name there.
+    # In locked mode nothing listens and the connection is refused.
+    networking.hosts."10.0.2.100" = [ "api.anthropic.com" ];
+
+    # `feature-vm --agent up` copies a Claude token here (tmpfs) after
+    # boot. /etc/zshenv runs for every zsh, including `feature-vm run`'s
+    # non-interactive ssh commands. Non-essential traffic (telemetry, error
+    # reports, auto-update) is off: api.anthropic.com is the only route out.
+    environment.shellInit = ''
+      if [ -r /run/feature-vm-agent/token ]; then
+        CLAUDE_CODE_OAUTH_TOKEN="$(cat /run/feature-vm-agent/token)"
+        export CLAUDE_CODE_OAUTH_TOKEN
+        export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+      fi
+    '';
 
     # Console login fallback — same password regardless of the prod
     # `initialPassword` so the QEMU graphics window is usable on first

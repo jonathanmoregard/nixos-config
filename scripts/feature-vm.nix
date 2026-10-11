@@ -39,6 +39,16 @@ let
     '';
   };
 
+  # QEMU runs this on the host for each guest connection to
+  # 10.0.2.100:443 (the guestfwd in feature-vm.sh), with the connection on
+  # stdin/stdout. The destination is fixed here, so the guest cannot pick
+  # another one.
+  anthropicFwd = pkgs.writeShellApplication {
+    name = "feature-vm-anthropic-fwd";
+    runtimeInputs = [ pkgs.socat ];
+    text = "exec socat STDIO TCP:api.anthropic.com:443";
+  };
+
   tool = pkgs.writeShellApplication {
     inherit name;
     # `nix`, `ssh`/`scp` and `systemd-run`/`systemctl` deliberately come from the host
@@ -48,6 +58,7 @@ let
     text = ''
       MEMORY_RUNNER=${memoryRunner}/bin/nix-memory-run
       SCREENCAP=${screencap}/bin/feature-vm-screencap
+      ANTHROPIC_FWD=${anthropicFwd}/bin/feature-vm-anthropic-fwd
       TARGET=${./feature-vm-target.nix}
       SELF="$(readlink -f "$0")"
       ${pkgs.lib.optionalString (display != null) ''

@@ -8,6 +8,10 @@
 #     (and a key copy an older launcher staged is removed);
 #   - a locked boot cuts guest networking (restrict=on) and exports every
 #     share read-only; --trusted is the only way to writable shares + net;
+#   - --agent keeps the locked boot's shares and restrict=on, adds exactly
+#     one forward (guest 10.0.2.100:443 -> the host's fixed
+#     api.anthropic.com relay), and copies the Claude token into the VM
+#     after every boot; without a token it refuses to start;
 #   - `run` passes the guest command's exit code through and quotes
 #     multi-argument commands;
 #   - `apply` builds as a child of the VM's memory lock, not a competitor
@@ -75,6 +79,9 @@ pkgs.runCommand "feature-vm-ctl-harness"
     #!/usr/bin/env bash
     printf '%s\n' "ssh \''${@: -1}" >> $log
     printf '%s\n' "\$*" >> $log.ssh-args
+    case "\''${@: -1}" in
+      *feature-vm-agent/token*) cat >> "\$HOME/staged-token" ;;
+    esac
     exit \''${FAKE_SSH_RC:-0}
     EOF
     mkdir -p fakekey
@@ -94,10 +101,13 @@ pkgs.runCommand "feature-vm-ctl-harness"
     mkdir -p $XDG_CACHE_HOME/feature-vm/host-ssh
     cp $HOME/.ssh/id_ed25519 $XDG_CACHE_HOME/feature-vm/host-ssh/
 
-    # 1. trusted boot: shares writable, network open, still no key.
+    fwd_re='guestfwd=tcp:10\.0\.2\.100:443-cmd:/nix/store/[a-z0-9]*-feature-vm-anthropic-fwd/bin/feature-vm-anthropic-fwd'
+
+    # 1. trusted boot: worktrees writable, network open, still no key.
     fv --trusted
-    grep -q '^QEMU_NET_OPTS=$' $HOME/qemu-env || fail "trusted boot restricted the network"
+    grep -qx "QEMU_NET_OPTS=$fwd_re" $HOME/qemu-env || fail "trusted boot network is not open (+ anthropic forward)"
     grep -q 'mount_tag=worktrees ' $HOME/qemu-env || fail "trusted worktrees share not writable"
+    grep -q 'mount_tag=research-agent,readonly=on' $HOME/qemu-env || fail "trusted research share writable"
     [ ! -e $key ] || fail "the key copy an older launcher staged is still there"
 
     # 2. locked boot: net restricted, shares read-only.
@@ -169,6 +179,43 @@ pkgs.runCommand "feature-vm-ctl-harness"
     [ $rc -ne 0 ] || fail "up succeeded without ssh"
     grep -q 'systemctl --user stop feature-vm-bg.service' $log || fail "failed boot left the VM running"
     [ ! -e $HOME/vm-active ] || fail "VM still active after failed boot"
+
+    # 9. --agent without a token: refused before anything boots.
+    rm -f $HOME/qemu-env
+    export FEATURE_VM_AGENT_TOKEN_FILE=$TMPDIR/claude-token
+    if FAKE_BOOT=1 fv --agent up 2> agent.err; then fail "--agent booted without a token"; fi
+    grep -q 'claude setup-token' agent.err || fail "wrong no-token message: $(cat agent.err)"
+    [ ! -e $HOME/qemu-env ] || fail "--agent without a token started QEMU"
+
+    # 10. --agent up: locked shares and network, plus only the anthropic
+    #     forward; token copied into guest tmpfs; status says agent.
+    printf 'sk-ant-oat01-fake' > $FEATURE_VM_AGENT_TOKEN_FILE
+    rm -f $HOME/staged-token
+    FAKE_BOOT=1 fv --agent up 2> agent.err || fail "--agent up failed: $(cat agent.err)"
+    grep -qx "QEMU_NET_OPTS=restrict=on,$fwd_re" $HOME/qemu-env || fail "--agent network is not restrict=on + anthropic forward only"
+    grep -q 'mount_tag=worktrees,readonly=on' $HOME/qemu-env || fail "--agent worktrees share writable"
+    grep -q 'mount_tag=research-agent,readonly=on' $HOME/qemu-env || fail "--agent research share writable"
+    [ "$(cat $HOME/staged-token 2>/dev/null)" = sk-ant-oat01-fake ] || fail "token not copied into the VM"
+    if grep -q -e sk-ant -e claude-token $HOME/qemu-env; then fail "token handed to QEMU"; fi
+    fv status | grep -q 'mode=agent' || fail "status does not say agent: $(fv status)"
+
+    # 11. reset reboots, so it must copy the token in again.
+    rm -f $HOME/staged-token
+    FAKE_BOOT=1 fv reset 2> agent.err || fail "reset failed: $(cat agent.err)"
+    [ "$(cat $HOME/staged-token 2>/dev/null)" = sk-ant-oat01-fake ] || fail "reset did not copy the token in again"
+
+    # 12. A failed token copy stops the VM instead of leaving an agent VM
+    #     without its token.
+    rm -f $HOME/vm-active
+    rc=0
+    FAKE_BOOT=1 FAKE_SSH_RC=1 FEATURE_VM_BOOT_TIMEOUT=2 fv --agent up 2> agent.err || rc=$?
+    [ $rc -ne 0 ] || fail "--agent up succeeded although the token copy failed"
+    [ ! -e $HOME/vm-active ] || fail "VM left running after a failed token copy"
+
+    # 13. Mode refusals.
+    if fv --agent --trusted up 2>/dev/null; then fail "--agent --trusted accepted"; fi
+    if fv --agent 2> agent.err; then fail "--agent foreground boot accepted"; fi
+    grep -q 'not a foreground boot' agent.err || fail "wrong foreground message: $(cat agent.err)"
 
     touch $out
   ''

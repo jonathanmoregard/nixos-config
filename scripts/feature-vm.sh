@@ -6,7 +6,7 @@
 
 usage() {
   cat >&2 <<'EOF'
-usage: feature-vm [--host NAME] [--trusted] [--flake DIR] [COMMAND ...]
+usage: feature-vm [--host NAME] [--trusted | --agent] [--flake DIR] [COMMAND ...]
 
 With no COMMAND: boot in the foreground (Ctrl-C / poweroff to stop).
 
@@ -26,11 +26,21 @@ With no COMMAND: boot in the foreground (Ctrl-C / poweroff to stop).
 Options (only read by up / foreground boot; later commands reuse them):
   --host NAME   nixosConfigurations.NAME to boot (default: this machine)
   --trusted     mount the worktrees share read-write, allow guest internet
+  --agent       locked down, except the guest can reach api.anthropic.com
+                and gets a Claude token (up only; see below)
   --flake DIR   nixos-config checkout (default: the worktree you are in,
                 else ~/Repos/nixos-config-worktrees/main)
 
-Default mode is locked down: read-only shares, no internet. In both modes
-the VM gets no key of yours; every secret in it is a throwaway fixture.
+Default mode is locked down: read-only shares, no internet. In every mode
+the VM gets no key of yours; every agenix secret in it is a throwaway
+fixture.
+
+--agent is for running Claude Code inside the VM (e.g. testing a skill).
+Shares stay read-only and the only route out is api.anthropic.com:443,
+forwarded by QEMU on the host. The token in
+$FEATURE_VM_AGENT_TOKEN_FILE (default ~/.config/feature-vm/claude-oauth-token,
+made with `claude setup-token`) is copied into guest tmpfs after boot and
+after every reset; `claude` in the VM picks it up. It is gone at down.
 EOF
 }
 
@@ -55,7 +65,7 @@ interactive_ssh_opts=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known
 ssh_opts=("${interactive_ssh_opts[@]}" -o BatchMode=yes -o ConnectTimeout=5)
 
 opt_host=""
-opt_trusted=0
+opt_mode=locked
 opt_flake=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -64,8 +74,9 @@ while [ $# -gt 0 ]; do
       opt_host="$2"
       shift 2
       ;;
-    --trusted)
-      opt_trusted=1
+    --trusted | --agent)
+      [ "$opt_mode" = locked ] || die "pick one of --trusted / --agent"
+      opt_mode="${1#--}"
       shift
       ;;
     --flake)
@@ -92,14 +103,17 @@ cmd="${1:-boot}"
 # than silently booting the default host in the default mode.
 case "$cmd" in
   up | down | reset | status | ssh)
-    [ $# -eq 0 ] || die "$cmd takes no arguments; options go first: feature-vm [--host H] [--trusted] $cmd"
+    [ $# -eq 0 ] || die "$cmd takes no arguments; options go first: feature-vm [--host H] [--trusted | --agent] $cmd"
     ;;
   boot)
     for a in "$@"; do
       case "$a" in
-        --host | --trusted | --flake) die "options go first: feature-vm [--host H] [--trusted]" ;;
+        --host | --trusted | --agent | --flake) die "options go first: feature-vm [--host H] [--trusted | --agent]" ;;
       esac
     done
+    # The token is copied in over ssh once the VM is up, which a
+    # foreground boot never waits for.
+    [ "$opt_mode" != agent ] || die "--agent works with up, not a foreground boot"
     ;;
 esac
 
@@ -119,16 +133,17 @@ resolve_flake() {
 write_config() {
   {
     printf 'host=%q\n' "$1"
-    printf 'trusted=%q\n' "$2"
+    printf 'mode=%q\n' "$2"
     printf 'flake=%q\n' "$3"
     printf 'vm=%q\n' "$4"
     printf 'research=%q\n' "$5"
+    printf 'token_file=%q\n' "$6"
   } > "$config_file"
 }
 
 load_config() {
   [ -f "$config_file" ] || die "no VM configured — run: feature-vm up"
-  host="" trusted="" flake="" vm="" research=""
+  host="" mode="" flake="" vm="" research="" token_file=""
   # shellcheck disable=SC1090
   . "$config_file"
 }
@@ -163,6 +178,13 @@ prepare() {
     die "no research-agent checkout at $research"
   fi
 
+  local token_file=""
+  if [ "$opt_mode" = agent ]; then
+    token_file="${FEATURE_VM_AGENT_TOKEN_FILE:-$HOME/.config/feature-vm/claude-oauth-token}"
+    [ -s "$token_file" ] ||
+      die "--agent needs a Claude token in $token_file — run \`claude setup-token\` and save the token there (mode 0600)"
+  fi
+
   mkdir -p "$state_dir"
   chmod 0700 "$state_dir"
   # Earlier launcher versions staged a copy of ~/.ssh/id_ed25519 here for
@@ -176,7 +198,7 @@ prepare() {
   local hostkey
   hostkey="$(build_target hostkey "$host" "$flake" "")" || die "VM host key build failed"
   printf '[localhost]:%s %s\n' "$ssh_port" "$(cut -d' ' -f1,2 "$hostkey/ssh_host_ed25519_key.pub")" > "$known_hosts"
-  write_config "$host" "$opt_trusted" "$flake" "$vm" "$research"
+  write_config "$host" "$opt_mode" "$flake" "$vm" "$research" "$token_file"
 }
 
 # build_target ATTR HOST FLAKE MODULE — see scripts/feature-vm-target.nix.
@@ -197,13 +219,19 @@ serve() {
   export TMPDIR="$run_dir"
   cd "$run_dir"
 
+  # restrict=on cuts the guest off from the host and the internet; explicit
+  # forwards still work (the ssh hostfwd, and the guestfwd below). The guest
+  # resolves api.anthropic.com to 10.0.2.100 (feature-vm.nix), and QEMU runs
+  # $ANTHROPIC_FWD on the host for each connection there, which pipes it to
+  # the real api.anthropic.com:443. TLS stays end to end.
+  local fwd="guestfwd=tcp:10.0.2.100:443-cmd:$ANTHROPIC_FWD"
   local ro="" net=""
-  if [ "$trusted" != 1 ]; then
-    ro=",readonly=on"
-    # restrict=on cuts the guest off from the host and the internet;
-    # the ssh port forward still works.
-    net="restrict=on"
-  fi
+  case "$mode" in
+    locked) ro=",readonly=on" net="restrict=on" ;;
+    agent) ro=",readonly=on" net="restrict=on,$fwd" ;;
+    trusted) net="$fwd" ;;
+    *) die "bad mode in $config_file: $mode" ;;
+  esac
   local opts="-snapshot"
   opts="$opts -qmp unix:$run_dir/qmp.sock,server=on,wait=off"
   opts="$opts -serial unix:$run_dir/serial.sock,server=on,wait=off"
@@ -214,8 +242,6 @@ serve() {
   export QEMU_OPTS="${FEATURE_VM_DISPLAY--display none} $opts"
   export QEMU_NET_OPTS="$net"
 
-  local mode=locked
-  [ "$trusted" = 1 ] && mode=trusted
   log "host=$host mode=$mode run=$run_dir"
   log "ssh:    feature-vm ssh   (or ssh -p $ssh_port jonathan@localhost)"
   log "serial: socat - UNIX-CONNECT:$run_dir/serial.sock"
@@ -260,7 +286,16 @@ wait_ssh() {
   return 1
 }
 
+# Copy the Claude token into guest tmpfs, readable by jonathan only. A
+# reboot (reset) loses it, so start_bg calls this after every boot.
+stage_token() {
+  ssh -p "$ssh_port" "${ssh_opts[@]}" jonathan@localhost \
+    'sudo install -d -o jonathan -g users -m 0700 /run/feature-vm-agent && umask 077 && cat > /run/feature-vm-agent/token' \
+    < "$token_file"
+}
+
 start_bg() {
+  load_config
   # A socket left from an earlier boot would start the clock early.
   rm -f "$run_dir/qmp.sock"
   systemd-run --user --unit="$unit" --collect --quiet \
@@ -271,6 +306,10 @@ start_bg() {
     # A VM that never came up must not keep holding the memory lock.
     stop_bg
     die "boot failed; VM stopped"
+  fi
+  if [ "$mode" = agent ] && ! stage_token; then
+    stop_bg
+    die "could not copy the Claude token into the VM; VM stopped"
   fi
 }
 
@@ -366,8 +405,6 @@ case "$cmd" in
       exit 3
     fi
     load_config
-    mode=locked
-    [ "$trusted" = 1 ] && mode=trusted
     if ssh_ready; then ready=ssh-ready; else ready=booting; fi
     echo "up host=$host mode=$mode $ready flake=$flake"
     ;;
