@@ -153,7 +153,7 @@
     # `pkgs.writeReferencesToFile` which has been removed in current
     # nixpkgs. flake.lock pins the exact SHA so the build remains
     # reproducible; bumping via `nix flake update microvm` is a
-    # deliberate PR with a re-run dellan-vm test.
+    # deliberate PR with a re-run vm-microvm lane.
     microvm.url = "github:astro/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -385,7 +385,7 @@
           sweepScript = import ./home/worktree-sweep-script.nix { pkgs = pkgsLinux; };
           # Drift gate: the harness asserts the deployed user unit execs
           # exactly the derivation under test.
-          deployedExecStart = self.nixosConfigurations.dellan.config
+          deployedExecStart = self.nixosConfigurations.tuxedo.config
             .home-manager.users.jonathan
             .systemd.user.services.worktree-sweep.Service.ExecStart;
         };
@@ -397,23 +397,23 @@
         # still owns the real-X topology proof.
         kitty-scripts = import ./tests/kitty-scripts.nix {
           pkgs = pkgsLinux;
-          # Drift gate: exercises the packages dellan installs.
-          hmPackages = self.nixosConfigurations.dellan.config
+          # Drift gate: exercises the packages tuxedo installs.
+          hmPackages = self.nixosConfigurations.tuxedo.config
             .home-manager.users.jonathan.home.packages;
-          # The rc pair dellan really deploys — omz, p10k, autosuggest,
+          # The rc pair tuxedo really deploys — omz, p10k, autosuggest,
           # syntax-highlighting and `_claude_slice`, in that order.
           # The restored-claude launcher sources this file from a
           # NON-interactive zsh, so phase L drives it rather than a
           # synthetic stand-in; a rc change that stops defining
           # `_claude_slice` in that shell fails the lane instead of
           # silently un-confining every restored Claude Code pane.
-          deployedZshrc = self.nixosConfigurations.dellan.config
+          deployedZshrc = self.nixosConfigurations.tuxedo.config
             .home-manager.users.jonathan.home.file."./.zshrc".source;
           # Read by EVERY zsh, interactive or not, and where ZSH /
           # ZSH_CACHE_DIR / the PATH the launcher resolves `claude` on
           # come from — so the rc above only behaves like the deployed
           # one with it in place.
-          deployedZshenv = self.nixosConfigurations.dellan.config
+          deployedZshenv = self.nixosConfigurations.tuxedo.config
             .home-manager.users.jonathan.home.file."./.zshenv".source;
         };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
@@ -422,7 +422,7 @@
         secrets-no-dead-credentials = import ./tests/secrets-no-dead-credentials.nix {
           pkgs = pkgsLinux;
           declaredSecrets = builtins.attrNames
-            self.nixosConfigurations.dellan.config.age.secrets;
+            self.nixosConfigurations.tuxedo.config.age.secrets;
         };
         # Not a VM lane: runs the `offline-ai` wrapper and library server
         # tuxedo deploys against a stub model server and a fixture archive —
@@ -474,7 +474,7 @@
         # preflight, dup-refuse, happy-path insertion, and KEY=VALUE
         # stripping under TEST_MODE=1 (which skips the network / eval /
         # gh steps that a nix sandbox can't run). Drift-gated: pulls
-        # the add-secret derivation out of dellan's
+        # the add-secret derivation out of tuxedo's
         # environment.systemPackages and asserts its store path equals
         # the one we smoke. If profiles/workstation swaps it for anything else,
         # the check fails.
@@ -482,13 +482,13 @@
         add-secret-smoke =
           let
             addSecretPkg = import ./home/add-secret.nix { pkgs = pkgsLinux; };
-            dellanPkgs = self.nixosConfigurations.dellan.config
+            tuxedoPkgs = self.nixosConfigurations.tuxedo.config
               .environment.systemPackages;
             matches = builtins.filter
-              (p: (p.name or "") == "add-secret") dellanPkgs;
+              (p: (p.name or "") == "add-secret") tuxedoPkgs;
           in
             if matches == []
-            then throw "add-secret not on dellan's PATH — did environment.systemPackages get pruned?"
+            then throw "add-secret not on tuxedo's PATH — did environment.systemPackages get pruned?"
             else import ./tests/add-secret-smoke.nix {
               pkgs = pkgsLinux;
               inherit addSecretPkg;
@@ -513,8 +513,8 @@
         security-batch-research-agent = import ./tests/security-batch-research-agent.nix {
           pkgs = pkgsLinux;
           runnerScript = ./modules/nixos/security-batch/research-agent.sh;
-          # Drift gate: the package dellan deploys.
-          runnerPackage = self.nixosConfigurations.dellan.config
+          # Drift gate: the package tuxedo deploys.
+          runnerPackage = self.nixosConfigurations.tuxedo.config
             .services.securityBatch.research-agent.script;
         };
         signal-expiry = import ./tests/signal-expiry.nix {

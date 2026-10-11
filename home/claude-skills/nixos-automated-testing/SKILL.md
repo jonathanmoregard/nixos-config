@@ -37,7 +37,7 @@ mixing-pot lane defeats the failure-isolation goal.
 | `vm-claude-pane` | `tests/claude-pane.nix` | Claude SessionStart hook + enricher → unique `claude_session_id` per pane |
 
 Shared node config lives in `tests/lib/common.nix` — imports
-`hosts/dellan/default.nix`, sets autoLogin/linger/virtualisation,
+`hosts/tuxedo/default.nix` (node name `tuxedo`), sets autoLogin/linger/virtualisation,
 and exports `mkTest { name, testScript }`. Each lane is ~20 lines of
 boilerplate + its own testScript.
 
@@ -106,7 +106,7 @@ cheaper layers first:
 | Cost | Command | Catches |
 |------|---------|---------|
 | ~1s | `nix eval --no-warn-dirty .#checks.x86_64-linux.vm-base.drvPath` | Nix syntax + module type errors (any lane works; pick one that builds fast) |
-| ~5-30s | `nix build --no-link --print-out-paths .#nixosConfigurations.dellan.config.home-manager.users.jonathan.home.path` | Generated scripts compile (writeShellApplication shellcheck, writePython3Bin lint) |
+| ~5-30s | `nix build --no-link --print-out-paths .#nixosConfigurations.tuxedo.config.home-manager.users.jonathan.home.path` | Generated scripts compile (writeShellApplication shellcheck, writePython3Bin lint) |
 | ~5s | Read `<home-path-out>/bin/<wrapper>` | Heredoc escaping, shebang at byte 0, paths interpolated correctly |
 | ~90-180s | `nix build --no-link .#checks.x86_64-linux.vm-<feature> -L` | Real boot, real X session, real systemd-user, real assertions for that lane |
 
@@ -120,9 +120,9 @@ stdout, which is captured in the build log. Use this to inspect VM state
 when an assertion fails:
 
 ```python
-dellan.succeed(f"su jonathan -c '... ls > /tmp/state.json'")
-print("[diag] state:\n" + dellan.succeed("cat /tmp/state.json"))
-dellan.succeed("jq -e '...' /tmp/state.json")  # the actual assertion
+tuxedo.succeed(f"su jonathan -c '... ls > /tmp/state.json'")
+print("[diag] state:\n" + tuxedo.succeed("cat /tmp/state.json"))
+tuxedo.succeed("jq -e '...' /tmp/state.json")  # the actual assertion
 ```
 
 Always dump first, assert second — once the assertion fails the cleanup
@@ -173,7 +173,7 @@ phase tears down the VM and you've lost the chance to introspect.
 - VM boot timeout on `multi-user.target` → likely activation script
   failure. Check the test driver log for the failed unit.
 - `Name "machine" already defined` (mypy error) → don't name a node
-  `machine`; framework reserves it. Use `dellan` or any other name.
+  `machine`; framework reserves it. Use `tuxedo` or any other name.
 
 ## What the gate cannot catch
 

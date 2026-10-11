@@ -3,7 +3,7 @@
 # tests/claude-pane.nix).
 #
 # Three builders:
-#   mkTest         — full dellan host import (HM + autoLogin + everything).
+#   mkTest         — full tuxedo host import (HM + autoLogin + everything).
 #                    Lanes that exercise the integrated graphical stack
 #                    use this; closure tracks the prod system.
 #   mkMinimalTest  — base profile + caller-supplied extraModules. No HM,
@@ -20,7 +20,7 @@
 let
   lib = pkgs.lib;
 
-  # Full-host node — mirrors hosts/dellan/default.nix under the test
+  # Full-host node — mirrors hosts/tuxedo/default.nix under the test
   # framework's read-only nixpkgs injection.
   node = { config, ... }: {
     imports = [
@@ -28,14 +28,10 @@ let
       inputs.agenix-rekey.nixosModules.default
       inputs.home-manager.nixosModules.home-manager
       inputs.microvm.nixosModules.host
-      ../../hosts/dellan/default.nix
+      # hosts/tuxedo minus the hardware a QEMU guest cannot model.
+      ./tuxedo-vm.nix
       ../../modules/common.nix
     ];
-
-    # Strip the laptop's real hardware/disk config — virtualisation module
-    # provides a virtio rootfs and the test framework boots without a
-    # bootloader.
-    disabledModules = [ ../../hosts/dellan/hardware-configuration.nix ];
 
     boot.loader.systemd-boot.enable = lib.mkForce false;
     boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
@@ -87,7 +83,7 @@ let
     };
 
     # Do not boot the production microvms inside a test VM, and stub the
-    # host paths they share. This node imports hosts/dellan, so without
+    # host paths they share. This node imports hosts/tuxedo, so without
     # both halves every full-host lane inherits research-agent and
     # scraper and tries to run them nested.
     #
@@ -212,20 +208,20 @@ in
   mkTest = { name, testScript, extraModules ? [] }: pkgs.testers.runNixOSTest {
     inherit name testScript;
     skipTypeCheck = true;
-    nodes.dellan = { imports = [ node ] ++ extraModules; };
+    nodes.tuxedo = { imports = [ node ] ++ extraModules; };
   };
 
   mkMinimalTest = { name, testScript, extraModules ? [] }:
     pkgs.testers.runNixOSTest {
       inherit name testScript;
       skipTypeCheck = true;
-      nodes.dellan = mkMinimalNode extraModules;
+      nodes.tuxedo = mkMinimalNode extraModules;
     };
 
   mkFeatureTest = { name, testScript, hm, extraModules ? [] }:
     pkgs.testers.runNixOSTest {
       inherit name testScript;
       skipTypeCheck = true;
-      nodes.dellan = mkFeatureNode { inherit extraModules hm; };
+      nodes.tuxedo = mkFeatureNode { inherit extraModules hm; };
     };
 }

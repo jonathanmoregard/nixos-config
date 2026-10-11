@@ -29,7 +29,7 @@
 let
   lib = pkgs.lib;
 
-  # Drift gate: the scripts under test are the ones dellan actually
+  # Drift gate: the scripts under test are the ones tuxedo actually
   # installs, pulled out of home-manager's package set by name. A
   # rename in home/kitty.nix fails this lookup at eval time rather
   # than silently testing nothing.
@@ -2140,7 +2140,7 @@ pkgs.runCommand "kitty-scripts-harness"
     # kitty-session-save is a writeShellApplication, so its PATH is
     # pinned to its runtimeInputs and no directory can shadow them.
     # Exported bash FUNCTIONS can — bash resolves a function ahead of
-    # PATH — so the script under test is the one dellan installs, byte
+    # PATH — so the script under test is the one tuxedo installs, byte
     # for byte, with only the exit codes of the three programs it calls
     # chosen by the test.
     save_bin=$(command -v kitty-session-save)
@@ -2619,7 +2619,7 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "  fails to start."
       exit 1; }
 
-    # --- Phase K3: the launcher against the rc dellan really ships ---
+    # --- Phase K3: the launcher against the rc tuxedo really ships ---
     #
     # K1/K2 drive two-line synthetic rcs, which prove the launcher's
     # own branches and nothing about the file it actually sources. The
@@ -2632,7 +2632,7 @@ pkgs.runCommand "kitty-scripts-harness"
     # UNOBSERVED, and no lane would notice.
     #
     # `deployedZshrc`/`deployedZshenv` are the store paths
-    # home-manager writes for dellan, so this cannot pass against a
+    # home-manager writes for tuxedo, so this cannot pass against a
     # stand-in. `.zshenv` has to come too: it is read by every zsh,
     # interactive or not, and is where ZSH, ZSH_CACHE_DIR and the
     # `$HOME/.local/bin`-first PATH that resolves `claude` come from.

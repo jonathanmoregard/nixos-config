@@ -47,21 +47,21 @@ in
     })
   ];
   testScript = ''
-    dellan.wait_for_unit("multi-user.target")
-    dellan.wait_for_unit("home-manager-jonathan.service")
-    dellan.wait_for_unit("default.target", "jonathan")
+    tuxedo.wait_for_unit("multi-user.target")
+    tuxedo.wait_for_unit("home-manager-jonathan.service")
+    tuxedo.wait_for_unit("default.target", "jonathan")
 
     # Voquill must NOT have a cinnamon autostart entry — it is launched by
     # systemd.user.services.voquill (home/router-services.nix); a duplicate
     # autostart entry raced with the systemd unit on every login
     # (proposals/2026-05-05-voquill-autostart-race.md).
-    dellan.succeed(
+    tuxedo.succeed(
         "test ! -e /home/jonathan/.config/autostart/voquill.desktop"
     )
 
     # Default media-keys screenshot bindings cleared, so PrtSc does not
     # double-fire into both "save to ~/Pictures" and the clipboard binding.
-    media_keys = dellan.succeed(
+    media_keys = tuxedo.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "dconf read /org/cinnamon/desktop/keybindings/media-keys/screenshot' || echo EMPTY"
     ).strip()
@@ -73,19 +73,19 @@ in
     # XDG MIME defaults — magnet links and .torrent files route to qBittorrent.
     # User-realistic check: `xdg-open magnet:?xt=...` resolves via xdg-mime,
     # which must find both mimeapps.list and the handler's .desktop file.
-    magnet_default = dellan.succeed(
+    magnet_default = tuxedo.succeed(
         "su - jonathan -c 'xdg-mime query default x-scheme-handler/magnet'"
     ).strip()
     assert magnet_default == "org.qbittorrent.qBittorrent.desktop", \
         f"xdg-mime resolves magnet to {magnet_default!r}, expected qbittorrent"
-    torrent_default = dellan.succeed(
+    torrent_default = tuxedo.succeed(
         "su - jonathan -c 'xdg-mime query default application/x-bittorrent'"
     ).strip()
     assert torrent_default == "org.qbittorrent.qBittorrent.desktop", \
         f"xdg-mime resolves .torrent to {torrent_default!r}, expected qbittorrent"
 
     for mime in ("video/mp4", "video/x-matroska", "video/webm"):
-        video_default = dellan.succeed(
+        video_default = tuxedo.succeed(
             f"su - jonathan -c 'xdg-mime query default {mime}'"
         ).strip()
         assert video_default == "vlc.desktop", \
@@ -107,9 +107,9 @@ in
     # does not wait for display-setup-script to finish. The script
     # touches /run/x11-bell-silenced after xset, so this gives a
     # deterministic post-condition to wait on (no retry loop, no race).
-    dellan.wait_for_x()
-    dellan.wait_for_file("/run/x11-bell-silenced")
-    bell_q = dellan.succeed(
+    tuxedo.wait_for_x()
+    tuxedo.wait_for_file("/run/x11-bell-silenced")
+    bell_q = tuxedo.succeed(
         "env DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 "
         "xset q | grep -i 'bell percent'"
     )
@@ -121,7 +121,7 @@ in
     # through Xcursor.theme; without it they draw X's tiny core glyphs.
     # home.pointerCursor writes ~/.Xresources and the session start must
     # merge it into the server's RESOURCE_MANAGER.
-    dellan.wait_until_succeeds(
+    tuxedo.wait_until_succeeds(
         "env DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 "
         "xrdb -query | grep -qx 'Xcursor.theme:\tBibata-Modern-Classic'",
         timeout=120,
@@ -136,7 +136,7 @@ in
     # `agent-activity mark` the way the settings.json hook does, then stays
     # alive for $2 seconds. Asserted on the dconf keys csd-power reads.
     def as_j(cmd):
-        return dellan.succeed(
+        return tuxedo.succeed(
             "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u) "
             "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus; "
             + cmd + "'"
@@ -154,7 +154,7 @@ in
             got = lid_actions()
             if got == want:
                 return
-            dellan.sleep(0.5)
+            tuxedo.sleep(0.5)
         assert got == want, f"{why}: lid actions {got}, want {want}\n" + as_j("agent-activity status || true")
 
     hook_n = [0]
@@ -162,7 +162,7 @@ in
     def payload_file(event, session, extra=""):
         hook_n[0] += 1
         path = f"/tmp/hook-{hook_n[0]}.json"
-        dellan.succeed(
+        tuxedo.succeed(
             f"echo '{{\"hook_event_name\": \"{event}\", \"session_id\": \"{session}\"{extra}}}' > {path}; chmod 644 {path}"
         )
         return path
@@ -190,7 +190,7 @@ in
 
     # Idle TTL: a turn with no hook activity (an ESC skips Stop) lapses;
     # PostToolUse refreshes it.
-    dellan.sleep(6)
+    tuxedo.sleep(6)
     stale = as_j("AGENT_ACTIVITY_IDLE_TTL_SECS=5 agent-activity status").strip()
     assert stale == "idle", f"marker with no hook activity past the TTL still counts:\n{stale}"
     hook("PostToolUse", "s1")
@@ -216,7 +216,7 @@ in
     # Crashed pane: the marker's agent pid dies → reaped on reconcile.
     hook("UserPromptSubmit", "s2", alive=5)
     expect_lid("nothing", "short-lived agent's turn")
-    dellan.sleep(6)
+    tuxedo.sleep(6)
     as_j("agent-activity reconcile")
     expect_lid("suspend", "dead agent pid must not pin the lid")
 
@@ -232,7 +232,7 @@ in
          "(sleep 600 > /tmp/claude-$(id -u)/proj/s4/tasks/b1.output 2>&1 &); sleep 1; "
          "agent-activity reconcile")
     expect_lid("nothing", "young background bash")
-    dellan.sleep(2)
+    tuxedo.sleep(2)
     aged = as_j("AGENT_ACTIVITY_BASH_CAP_SECS=1 agent-activity status").strip()
     assert aged == "idle", f"background bash past the cap still counts:\n{aged}"
     as_j("pkill -f \"^sleep 600\"; agent-activity reconcile")

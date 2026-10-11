@@ -92,16 +92,16 @@
     { environment.systemPackages = [ pkgs.git ]; }
   ];
   testScript = ''
-    dellan.wait_for_unit("multi-user.target")
+    tuxedo.wait_for_unit("multi-user.target")
 
     # 1. Unit backstop: the whole run is time-bounded.
-    dellan.succeed(
+    tuxedo.succeed(
         "systemctl cat nixos-deploy.service | grep -q 'TimeoutStartSec=60min'"
     )
 
     # Resolve the original deploy script before switching to the deliberately
     # broken candidate, whose ExecStart is /bin/false by construction.
-    script = dellan.succeed(
+    script = tuxedo.succeed(
         "systemctl cat nixos-deploy.service "
         "| awk -F= '/^ExecStart=/{print $2}'"
     ).strip()
@@ -110,27 +110,27 @@
     # running oneshot must survive its own switch; otherwise its parent dies,
     # bookkeeping never reaches last-good, and a timer retry collides with the
     # still-running switch-to-configuration transient unit.
-    dellan.succeed("systemctl start --no-block nixos-deploy.service")
-    dellan.wait_until_succeeds(
+    tuxedo.succeed("systemctl start --no-block nixos-deploy.service")
+    tuxedo.wait_until_succeeds(
         "test \"$(systemctl show -P ActiveState nixos-deploy.service)\" = activating"
     )
-    dellan.succeed("systemctl start deploy-restart-canary.service")
-    deploy_invocation_before = dellan.succeed(
+    tuxedo.succeed("systemctl start deploy-restart-canary.service")
+    deploy_invocation_before = tuxedo.succeed(
         "systemctl show -P InvocationID nixos-deploy.service"
     ).strip()
-    canary_invocation_before = dellan.succeed(
+    canary_invocation_before = tuxedo.succeed(
         "systemctl show -P InvocationID deploy-restart-canary.service"
     ).strip()
-    rc, switch_out = dellan.execute(
+    rc, switch_out = tuxedo.execute(
         "timeout 30 /run/current-system/specialisation/deploy-self-update/"
         "bin/switch-to-configuration test 2>&1"
     )
     print(f"[diag] deploy self-update switch rc={rc} out={switch_out!r}")
     assert rc == 0, switch_out
-    deploy_invocation_after = dellan.succeed(
+    deploy_invocation_after = tuxedo.succeed(
         "systemctl show -P InvocationID nixos-deploy.service"
     ).strip()
-    canary_invocation_after = dellan.succeed(
+    canary_invocation_after = tuxedo.succeed(
         "systemctl show -P InvocationID deploy-restart-canary.service"
     ).strip()
     assert deploy_invocation_after == deploy_invocation_before, (
@@ -141,25 +141,25 @@
         "negative control did not restart, so candidate switch did not "
         "exercise changed-unit handling"
     )
-    dellan.succeed("systemctl stop nixos-deploy.service deploy-restart-canary.service")
+    tuxedo.succeed("systemctl stop nixos-deploy.service deploy-restart-canary.service")
 
     # 2. Script-level network bounds: a stalled connection must abort.
-    dellan.succeed(f"grep -q 'ConnectTimeout=15' {script}")
-    dellan.succeed(f"grep -q 'ServerAliveInterval=15' {script}")
-    dellan.succeed(f"grep -q 'ServerAliveCountMax=4' {script}")
+    tuxedo.succeed(f"grep -q 'ConnectTimeout=15' {script}")
+    tuxedo.succeed(f"grep -q 'ServerAliveInterval=15' {script}")
+    tuxedo.succeed(f"grep -q 'ServerAliveCountMax=4' {script}")
     # The fetch is wrapped in `timeout` with a POSITIVE bound — the
     # regex rejects `timeout 0 git fetch`, which would disable it.
-    dellan.succeed(f"grep -qE 'timeout [1-9][0-9]* git fetch' {script}")
+    tuxedo.succeed(f"grep -qE 'timeout [1-9][0-9]* git fetch' {script}")
 
     # 3. Behavioural: run the REAL script against a bogus origin. The
     #    fetch fails fast; the script must exit non-zero, return
     #    promptly, and NOT latch the commit as poisoned (a transient
     #    network failure is not a bad commit).
-    dellan.succeed(
+    tuxedo.succeed(
         "git init -q /tmp/deploy-repo "
         "&& git -C /tmp/deploy-repo remote add origin /tmp/nonexistent-origin"
     )
-    rc, out = dellan.execute(f"{script} 2>&1")
+    rc, out = tuxedo.execute(f"{script} 2>&1")
     print(f"[diag] deploy script rc={rc} out={out!r}")
     assert rc != 0, f"script should exit non-zero on fetch failure, got rc={rc}"
     # Prove it exited AT THE FETCH, not via some other nonzero branch
@@ -169,15 +169,15 @@
     )
     # poison-latch must exist (touched at start) but be EMPTY — nothing
     # latched, because target_sha is never reached on a fetch failure.
-    dellan.succeed("test -e /var/lib/nixos-deploy/poison-latch")
-    latch = dellan.succeed("cat /var/lib/nixos-deploy/poison-latch")
+    tuxedo.succeed("test -e /var/lib/nixos-deploy/poison-latch")
+    latch = tuxedo.succeed("cat /var/lib/nixos-deploy/poison-latch")
     assert latch.strip() == "", (
         f"fetch failure must NOT latch a poisoned SHA; poison-latch={latch!r}"
     )
     # And the next run can still acquire the lock (it was released on
     # exit) — re-running reaches the same fetch-failure path, not a
     # "another run in progress" no-op.
-    rc2, out2 = dellan.execute(f"{script} 2>&1")
+    rc2, out2 = tuxedo.execute(f"{script} 2>&1")
     assert rc2 != 0 and "another run in progress" not in out2 and "git fetch failed" in out2, (
         f"lock not released / didn't re-reach fetch branch (rc2={rc2}): {out2!r}"
     )
@@ -187,14 +187,14 @@
     #    rendered script with ONLY the `nixos-rebuild switch` invocation
     #    stubbed to `true` (the VM cannot run a real switch); fetch,
     #    poison-latch handling and the bookkeeping tail are untouched.
-    dellan.succeed(
+    tuxedo.succeed(
         "git init -q -b main /tmp/origin-repo "
         "&& git -C /tmp/origin-repo -c user.email=t@test -c user.name=t "
         "commit -q --allow-empty -m seed"
     )
-    target = dellan.succeed("git -C /tmp/origin-repo rev-parse main").strip()
-    dellan.succeed("git -C /tmp/deploy-repo remote set-url origin /tmp/origin-repo")
-    dellan.succeed(
+    target = tuxedo.succeed("git -C /tmp/origin-repo rev-parse main").strip()
+    tuxedo.succeed("git -C /tmp/deploy-repo remote set-url origin /tmp/origin-repo")
+    tuxedo.succeed(
         f"sed 's|nixos-rebuild switch --flake|true --flake|' {script} "
         "> /tmp/deploy-stub-ok "
         "&& grep -q 'true --flake' /tmp/deploy-stub-ok "
@@ -203,86 +203,86 @@
     # Memory admission is a clean deferral, not a failed target. Hold the
     # production lock, run the real script with only rebuild stubbed, and
     # require no success record and no poison latch entry.
-    holder = dellan.succeed(
+    holder = tuxedo.succeed(
         "sh -c 'exec 9>/home/jonathan/.nix-memory-pressure/lock; "
         "flock 9; "
         "echo locked >/tmp/deploy-memory-lock-held; sleep 60' "
         ">/tmp/deploy-memory-lock-holder.log 2>&1 & echo $!"
     ).strip()
-    dellan.wait_until_succeeds("test -f /tmp/deploy-memory-lock-held")
-    rc, out = dellan.execute("/tmp/deploy-stub-ok 2>&1")
+    tuxedo.wait_until_succeeds("test -f /tmp/deploy-memory-lock-held")
+    rc, out = tuxedo.execute("/tmp/deploy-stub-ok 2>&1")
     assert rc == 0 and "deploy deferred" in out, (rc, out)
-    dellan.fail("test -e /var/lib/nixos-deploy/last-good")
-    latch = dellan.succeed("cat /var/lib/nixos-deploy/poison-latch")
+    tuxedo.fail("test -e /var/lib/nixos-deploy/last-good")
+    latch = tuxedo.succeed("cat /var/lib/nixos-deploy/poison-latch")
     assert latch.strip() == "", latch
-    dellan.succeed(f"kill {holder}")
-    dellan.wait_until_succeeds(f"test ! -e /proc/{holder}")
+    tuxedo.succeed(f"kill {holder}")
+    tuxedo.wait_until_succeeds(f"test ! -e /proc/{holder}")
 
     # Seed the pre-rename state file: the script must migrate it to
     # last-good (mv), not leave a second, permanently-stale record —
     # an orphaned state file is exactly the bug class under test.
-    dellan.succeed("printf 'deadbeef\\n' > /var/lib/nixos-deploy/last-deployed-sha")
-    rc, out = dellan.execute("/tmp/deploy-stub-ok 2>&1")
+    tuxedo.succeed("printf 'deadbeef\\n' > /var/lib/nixos-deploy/last-deployed-sha")
+    rc, out = tuxedo.execute("/tmp/deploy-stub-ok 2>&1")
     print(f"[diag] success-path rc={rc} out={out!r}")
     assert rc == 0 and f"deploy success: {target}" in out, (
         f"stubbed success run did not reach the success tail (rc={rc}): {out!r}"
     )
-    last_good = dellan.succeed(
+    last_good = tuxedo.succeed(
         "cat /var/lib/nixos-deploy/last-good 2>/dev/null || echo MISSING"
     ).strip()
     assert last_good == target, (
         f"last-good must equal the deployed SHA; got {last_good!r}, want {target!r}"
     )
-    dellan.succeed("test ! -e /var/lib/nixos-deploy/last-deployed-sha")
+    tuxedo.succeed("test ! -e /var/lib/nixos-deploy/last-deployed-sha")
 
     # 5. Exit 75 from a rebuild is a real build failure, not lock contention.
     #    The runner marks whether it started the child, so this reserved status
     #    cannot silently turn a bad target into a clean deferral.
-    dellan.succeed(
+    tuxedo.succeed(
         "git -C /tmp/origin-repo -c user.email=t@test -c user.name=t "
         "commit -q --allow-empty -m exit-75"
     )
-    target2 = dellan.succeed("git -C /tmp/origin-repo rev-parse main").strip()
-    dellan.succeed(
+    target2 = tuxedo.succeed("git -C /tmp/origin-repo rev-parse main").strip()
+    tuxedo.succeed(
         f"sed \"s|nixos-rebuild switch --flake|sh -c 'exit 75' --|\" {script} "
         "> /tmp/deploy-stub-75 "
         "&& grep -q \"sh -c 'exit 75'\" /tmp/deploy-stub-75 "
         "&& chmod +x /tmp/deploy-stub-75"
     )
-    rc, out = dellan.execute("/tmp/deploy-stub-75 2>&1")
+    rc, out = tuxedo.execute("/tmp/deploy-stub-75 2>&1")
     print(f"[diag] exit-75-path rc={rc} out={out!r}")
     assert rc != 0 and "latched as poisoned" in out and "deferred" not in out, (
         f"a started rebuild exiting 75 was mistaken for contention (rc={rc}): {out!r}"
     )
-    last_good = dellan.succeed("cat /var/lib/nixos-deploy/last-good").strip()
+    last_good = tuxedo.succeed("cat /var/lib/nixos-deploy/last-good").strip()
     assert last_good == target, (last_good, target)
-    latch = dellan.succeed("cat /var/lib/nixos-deploy/poison-latch").strip()
+    latch = tuxedo.succeed("cat /var/lib/nixos-deploy/poison-latch").strip()
     assert latch == target2, (latch, target2)
 
     # 6. Failure path must NOT advance last-good (it is last-GOOD, not
     #    last-attempted): a new commit whose rebuild fails is latched
     #    as poisoned while last-good keeps the previously-deployed SHA.
-    dellan.succeed(
+    tuxedo.succeed(
         "git -C /tmp/origin-repo -c user.email=t@test -c user.name=t "
         "commit -q --allow-empty -m next"
     )
-    target3 = dellan.succeed("git -C /tmp/origin-repo rev-parse main").strip()
-    dellan.succeed(
+    target3 = tuxedo.succeed("git -C /tmp/origin-repo rev-parse main").strip()
+    tuxedo.succeed(
         f"sed 's|nixos-rebuild switch --flake|false --flake|' {script} "
         "> /tmp/deploy-stub-fail "
         "&& grep -q 'false --flake' /tmp/deploy-stub-fail "
         "&& chmod +x /tmp/deploy-stub-fail"
     )
-    rc, out = dellan.execute("/tmp/deploy-stub-fail 2>&1")
+    rc, out = tuxedo.execute("/tmp/deploy-stub-fail 2>&1")
     print(f"[diag] failure-path rc={rc} out={out!r}")
     assert rc != 0 and "latched as poisoned" in out, (
         f"stubbed failure run should latch + exit non-zero (rc={rc}): {out!r}"
     )
-    last_good = dellan.succeed("cat /var/lib/nixos-deploy/last-good").strip()
+    last_good = tuxedo.succeed("cat /var/lib/nixos-deploy/last-good").strip()
     assert last_good == target, (
         f"failed deploy must not advance last-good; got {last_good!r}, want {target!r}"
     )
-    latch = dellan.succeed("cat /var/lib/nixos-deploy/poison-latch").strip()
+    latch = tuxedo.succeed("cat /var/lib/nixos-deploy/poison-latch").strip()
     assert latch == target3, f"poison-latch should hold {target3!r}; got {latch!r}"
   '';
 }

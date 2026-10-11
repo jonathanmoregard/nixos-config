@@ -24,15 +24,15 @@
   testScript = ''
     import shlex
 
-    dellan.wait_for_unit("multi-user.target")
+    tuxedo.wait_for_unit("multi-user.target")
 
     def add_unrooted(name):
-        dellan.succeed(f"echo {name}-$RANDOM-$(date +%s%N) > /tmp/{name}")
-        return dellan.succeed(f"nix-store --add /tmp/{name}").strip()
+        tuxedo.succeed(f"echo {name}-$RANDOM-$(date +%s%N) > /tmp/{name}")
+        return tuxedo.succeed(f"nix-store --add /tmp/{name}").strip()
 
     fresh = add_unrooted("fresh-devshell-output")
     old = add_unrooted("month-old-build-output")
-    dellan.succeed(
+    tuxedo.succeed(
         "${pkgs.sqlite}/bin/sqlite3 /nix/var/nix/db/db.sqlite "
         + shlex.quote(
             "update ValidPaths set registrationTime = strftime('%s','now') - 30*86400 "
@@ -41,30 +41,30 @@
     )
 
     # Neither path is reachable from any root before the run.
-    roots = dellan.succeed("nix-store --gc --print-roots")
+    roots = tuxedo.succeed("nix-store --gc --print-roots")
     assert fresh not in roots and old not in roots, roots
 
-    dellan.succeed("systemctl start nix-gc.service")
-    log = dellan.succeed("journalctl -u nix-gc.service --no-pager")
+    tuxedo.succeed("systemctl start nix-gc.service")
+    log = tuxedo.succeed("journalctl -u nix-gc.service --no-pager")
     assert "nix-gc-pin-recent: rooted" in log, log
 
-    dellan.succeed(f"test -e {fresh}")
-    dellan.fail(f"test -e {old}")
-    dellan.fail("test -e /nix/var/nix/gcroots/keep-recent")
+    tuxedo.succeed(f"test -e {fresh}")
+    tuxedo.fail(f"test -e {old}")
+    tuxedo.fail("test -e /nix/var/nix/gcroots/keep-recent")
 
     # The retention is scoped to the scheduled run: an emergency or manual
     # collection still reclaims the recent path.
-    dellan.succeed("nix-store --gc")
-    dellan.fail(f"test -e {fresh}")
+    tuxedo.succeed("nix-store --gc")
+    tuxedo.fail(f"test -e {fresh}")
 
     # Roots left behind by a run that never reached postStop (power loss)
     # are dropped by the boot-time tmpfiles pass.
     stale = add_unrooted("stale-root-target")
-    dellan.succeed(
+    tuxedo.succeed(
         f"mkdir -p /nix/var/nix/gcroots/keep-recent && ln -s {stale} /nix/var/nix/gcroots/keep-recent/"
     )
-    dellan.succeed("systemd-tmpfiles --remove")
-    dellan.fail("test -e /nix/var/nix/gcroots/keep-recent")
+    tuxedo.succeed("systemd-tmpfiles --remove")
+    tuxedo.fail("test -e /nix/var/nix/gcroots/keep-recent")
 
     # ── A failing scheduled GC must reach Claude, not stay in the journal ──
     #
@@ -78,29 +78,29 @@
     marker = "nix-gc-failure-notify: recorded"
 
     def notifier_runs():
-        out = dellan.succeed(
+        out = tuxedo.succeed(
             "journalctl -u nix-gc-failure-notify.service --no-pager || true"
         )
         return out.count(marker)
 
     # The healthy runs above notified nobody and left no record.
     assert notifier_runs() == 0, "notifier fired on a healthy run"
-    dellan.fail(f"test -e {record}")
+    tuxedo.fail(f"test -e {record}")
 
     # Stub the exact nix binary the pin step runs (bind-mounted over the
     # store path inside nix-gc.service only), once failing outright and
     # once emitting garbage instead of JSON.
-    nix_bin = dellan.succeed("readlink -f /run/current-system/sw/bin/nix").strip()
+    nix_bin = tuxedo.succeed("readlink -f /run/current-system/sw/bin/nix").strip()
     stubs = {
         "exit1": "#!/bin/sh\necho 'stub nix: simulated failure' >&2\nexit 1\n",
         "garbage": "#!/bin/sh\necho 'this is not path-info json'\n",
     }
     for kind, body in stubs.items():
         protected = add_unrooted(f"protected-{kind}")
-        dellan.succeed(
+        tuxedo.succeed(
             f"printf %s {shlex.quote(body)} > /etc/nix-stub-{kind} && chmod 0755 /etc/nix-stub-{kind}"
         )
-        dellan.succeed(
+        tuxedo.succeed(
             "mkdir -p /run/systemd/system/nix-gc.service.d && "
             "printf '[Service]\\nBindReadOnlyPaths=/etc/nix-stub-"
             + kind + ":" + nix_bin
@@ -108,19 +108,19 @@
             "systemctl daemon-reload"
         )
         before = notifier_runs()
-        dellan.fail("systemctl start nix-gc.service")
-        dellan.succeed("systemctl is-failed nix-gc.service")
-        dellan.wait_until_succeeds(
+        tuxedo.fail("systemctl start nix-gc.service")
+        tuxedo.succeed("systemctl is-failed nix-gc.service")
+        tuxedo.wait_until_succeeds(
             f"journalctl -u nix-gc-failure-notify.service --no-pager | grep -c '{marker}' "
             f"| grep -qx {before + 1}",
             timeout=60,
         )
-        log = dellan.succeed("journalctl -u nix-gc-failure-notify.service --no-pager")
+        log = tuxedo.succeed("journalctl -u nix-gc-failure-notify.service --no-pager")
         assert "nix-gc FAILED (result=exit-code" in log, log
 
         # The record is valid JSON, names the unit, and an unprivileged
         # user (the Claude session) can read it.
-        raw = dellan.succeed(f"su jonathan -s /bin/sh -c 'cat {record}'")
+        raw = tuxedo.succeed(f"su jonathan -s /bin/sh -c 'cat {record}'")
         print("[diag] nix-gc failure record: " + raw)
         rec = json.loads(raw)
         assert rec["unit"] == "nix-gc.service", rec
@@ -130,26 +130,26 @@
         # Root owns record and directory, nobody else can write either
         # (the hook trusts the record as root-authored), and no in-flight
         # temp file is left behind.
-        perms = dellan.succeed(
+        perms = tuxedo.succeed(
             f"stat -c '%U:%G %a' /var/lib/unit-failures {record}"
         ).split("\n")
         assert perms[:2] == ["root:root 755", "root:root 644"], perms
-        dellan.fail(f"su jonathan -s /bin/sh -c 'echo x >> {record}'")
-        dellan.fail("su jonathan -s /bin/sh -c 'touch /var/lib/unit-failures/x.json'")
-        dellan.succeed("test -z \"$(ls -A /var/lib/unit-failures | grep -v '^nix-gc.json$')\"")
+        tuxedo.fail(f"su jonathan -s /bin/sh -c 'echo x >> {record}'")
+        tuxedo.fail("su jonathan -s /bin/sh -c 'touch /var/lib/unit-failures/x.json'")
+        tuxedo.succeed("test -z \"$(ls -A /var/lib/unit-failures | grep -v '^nix-gc.json$')\"")
 
         # Fail closed: nothing was collected without its pins.
-        dellan.succeed(f"test -e {protected}")
+        tuxedo.succeed(f"test -e {protected}")
 
-        dellan.succeed(
+        tuxedo.succeed(
             "rm /run/systemd/system/nix-gc.service.d/stub-nix.conf && "
             "systemctl daemon-reload && systemctl reset-failed nix-gc.service"
         )
 
     # Recovery: the next healthy run clears the record and notifies nobody.
     before = notifier_runs()
-    dellan.succeed("systemctl start nix-gc.service")
-    dellan.fail(f"test -e {record}")
+    tuxedo.succeed("systemctl start nix-gc.service")
+    tuxedo.fail(f"test -e {record}")
     assert notifier_runs() == before, "notifier fired on the healthy recovery run"
   '';
 }

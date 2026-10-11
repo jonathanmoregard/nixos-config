@@ -320,7 +320,7 @@ common.mkMinimalTest {
       # archive — is exercised end to end with no internet.
       services.klaffatInfra.repoRemoteUrl = originUrl;
 
-      # Swap dellan's host-key-encrypted ciphertexts for fixtures this VM
+      # Swap the host-key-encrypted ciphertexts for fixtures this VM
       # can actually open. `file` (not `rekeyFile`) on both sides, so the
       # only thing that changes is the recipient. The token fixture
       # decrypts to the password the origin below expects.
@@ -967,7 +967,7 @@ common.mkMinimalTest {
     # That is a claim about the WHOLE sudoers file, not about the line this
     # module emits, and greping for the module's own line could never have
     # falsified it: nixpkgs emits a GLOBAL `env_keep+=SSH_AUTH_SOCK` under
-    # `security.pam.sshAgentAuth`, which dellan does not enable today.
+    # `security.pam.sshAgentAuth`, which tuxedo does not enable today.
     # Enabling it anywhere would keep the variable for every sudo command on
     # the laptop while the command-scoped line below still read correctly.
     # So collect every line that keeps it, and assert the list is exactly

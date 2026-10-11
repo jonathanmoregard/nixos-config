@@ -1,5 +1,5 @@
 # add-secret-smoke — runtime-invocation harness for the add-secret
-# wrapper (home/add-secret.nix; the exact derivation dellan puts on
+# wrapper (home/add-secret.nix; the exact derivation tuxedo puts on
 # PATH is asserted below via deployedBin, not a rebuilt copy).
 #
 # What this exercises (fast — cheap runCommand, seconds):
@@ -22,7 +22,7 @@
 #     The working-Wayland branch needs a compositor and is not covered.
 #
 # What is NOT exercised here (requires real nix eval / real gh / real
-# rekey — must be manually tested on dellan; see the PR body):
+# rekey — must be manually tested on the workstation; see the PR body):
 #   - `nix eval` sanity check
 #   - `agenix-rekey rekey`
 #   - git commit / push / gh pr create
@@ -47,10 +47,10 @@ pkgs.runCommand "add-secret-smoke"
     }
 
     # --- drift gate ----------------------------------------------------
-    # Whatever ends up on dellan's PATH must be the same store path we
+    # Whatever ends up on tuxedo's PATH must be the same store path we
     # just smoked.
     [ "$deployedBin" = "$tool" ] || \
-      fail "dellan add-secret ($deployedBin) != tested tool ($tool)"
+      fail "tuxedo add-secret ($deployedBin) != tested tool ($tool)"
 
     # --- fixture: minimal worktree layout that satisfies preflight ------
     export HOME="$PWD/home"
@@ -291,11 +291,14 @@ NIXFILE
     # both prompts and making the command look hung. `script` supplies a
     # real PTY and the two confirmation lines complete the prompt flow.
     mkfixture "$PWD/f-prompt-tty"
-    printf 'prompt-value\nprompt-value\n' >prompt-input
+    # Absolute path taken before the subshell's `cd`: the redirect below is
+    # expanded after it, when $PWD is already the fixture.
+    prompt_input="$PWD/prompt-input"
+    printf 'prompt-value\nprompt-value\n' >"$prompt_input"
     ( cd "$PWD/f-prompt-tty" && \
         timeout 5 script -qec \
           "ADD_SECRET_TEST_MODE=1 '$tool' prompt-tty --prompt" \
-          /dev/null <"$PWD/prompt-input" ) \
+          /dev/null <"$prompt_input" ) \
       >prompt-tty.log 2>&1 || fail "prompt mode hung or failed under a controlling tty"
     grep -q "value for prompt-tty:" prompt-tty.log \
       || fail "prompt mode did not display its first prompt"
