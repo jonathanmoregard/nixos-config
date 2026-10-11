@@ -3164,6 +3164,14 @@ in
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user reset-failed aggregator-ingest.service; true'"
     )
+    # The VM has no internet, so every unit start below would sit out the
+    # wrapper's full 120 s network wait. The unit does not set this
+    # variable, so the user manager's environment reaches it. Unset again
+    # where the timer is re-armed.
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user set-environment AGGREGATOR_NETWORK_WAIT_SEC=4'"
+    )
 
     AGG_MARKER = "aggregator ingest run FAILED"
 
@@ -3443,6 +3451,10 @@ in
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user reset-failed aggregator-ingest.service; true'"
+    )
+    dellan.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user unset-environment AGGREGATOR_NETWORK_WAIT_SEC'"
     )
     # Re-arm the timer stopped above. Separate call on purpose: a
     # `VAR=x cmd1; cmd2` prefix scopes VAR to cmd1 only, so a second
