@@ -20,7 +20,7 @@
 #
 # Fast-path: a `preflight` job runs the same denylist regex as gate.yml
 # and emits `risk=TRIVIAL` for docs-only PRs. Heavy STEPS inside the
-# downstream jobs (flake-check, build-dellan, vm-minimal, vm-graphical)
+# downstream jobs (flake-check, build-tuxedo, vm-minimal, vm-graphical)
 # are gated `if: needs.preflight.outputs.risk != 'TRIVIAL'`, so the
 # job COMPLETES SUCCESS with no work — that keeps branch-protection
 # required checks satisfied. Skipping the job itself would mark the
@@ -61,8 +61,8 @@ permissions:
 # covers steps after. Both layers point at the same workflow token.
 #
 # Substituter parallelism tuning: defaults (max-substitution-jobs=16,
-# http-connections=25) cap CloudFront throughput when restored
-# /nix/store snapshot misses hundreds of small paths the new closure
+# http-connections=25) cap CloudFront throughput when the
+# runner's /nix/store misses hundreds of small paths the new closure
 # needs. Bumping to 64/64 saturates the connection on high-latency
 # CI links without hitting cachix throttling. narinfo-cache-positive-
 # ttl=600 keeps cachix narinfo hot across the job but invalidates
@@ -166,11 +166,6 @@ jobs:
             max-substitution-jobs = 64
             http-connections = 64
             narinfo-cache-positive-ttl = 600
-      # No cache-nix-action here on purpose. flake-check is eval-only
-      # (`--no-build`); its added /nix/store would be small relative to
-      # build-dellan's snapshot (≤8 GB uncompressed per gc-max), and
-      # this job has no /mnt loopback so restoring the shared snapshot
-      # to the runner's root disk would likely ENOSPC.
       # agenix-rekey's NixOS module references the per-host rekeyed dir
       # via `builtins.path { path = ../../secrets/rekeyed/<host>; }`,
       # producing a deterministic store path. Under `--no-build`,
@@ -196,12 +191,6 @@ jobs:
       # bug on every eval, invisibly, while it took the VM down).
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/check-eval-warnings.sh
-      # cachix push-budget contract: runtime-invocation harness for the
-      # post-build-hook filter (tests/cachix-push-filter.nix) — skip
-      # microvm erofs + >256MiB paths, never fail the build. Tiny
-      # runCommand — seconds; boots nothing.
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        run: nix build .#checks.x86_64-linux.cachix-push-filter -L
       # worktree-sweep fail-closed contract: fixture bare repo +
       # worktrees + stubbed gh, asserting the sweeper deletes only
       # merged+old+clean+no-live-cwd and that a gh outage means zero
@@ -232,6 +221,12 @@ jobs:
       # to a failure that actually cost a day's sessions.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.kitty-scripts -L
+      # research-agent security sweep verdict logic
+      # (tests/security-batch-research-agent.nix): seed, new CVE,
+      # accepted, score regression, tool errors, against fake vulnix /
+      # systemd-analyze. Tiny runCommand — seconds.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.security-batch-research-agent -L
 
   docs:
     # Validate that every `nix run .#<attr>` reference in this repo's
@@ -286,21 +281,18 @@ jobs:
     # the output path and probe cachix's narinfo. Emit a JSON object
     # mapping lane → "cached"|"miss" as the job output. Downstream
     # vm-minimal lanes read this and skip EVERY setup step (checkout,
-    # free-disk, /nix loop mount, nix install, cache-nix-action restore,
-    # cachix-action, KVM verify, build) when the status is "cached".
-    #
-    # This eliminates the per-lane ~3.2GB cache-nix-action snapshot
-    # restore on cache-hit PRs — which is the bulk of lane runtime
-    # post-#90. Cached lanes drop from ~1m30s → ~5-10s.
+    # free-disk, /nix loop mount, nix install, cachix-action, KVM
+    # verify, build) when the status is "cached". Cached lanes take
+    # ~5-10s.
     #
     # The job never fails: TRIVIAL preflight → emit all-cached;
     # eval failure → emit all-miss (fail-safe, vm-minimal runs everything).
     #
-    # No cache-nix-action restore here: `nix eval --raw …outPath` only
+    # `nix eval --raw …outPath` only
     # needs nixpkgs eval data, not the full closure. First eval cold-
     # fetches nixpkgs source (~30s); subsequent six lanes reuse it
     # from this runner's /nix/store. Total discover runtime ~45-90s,
-    # parallel with build-dellan so it doesn't lengthen the critical path.
+    # parallel with build-tuxedo so it doesn't lengthen the critical path.
     name: discover
     runs-on: ubuntu-latest
     needs: [verify-fork-guards, preflight]
@@ -380,8 +372,8 @@ jobs:
           echo "statuses=$json" >> "$GITHUB_OUTPUT"
           echo "Discover summary: $json"
 
-  build-dellan:
-    name: build dellan toplevel
+  build-tuxedo:
+    name: build tuxedo toplevel
     runs-on: ubuntu-latest
     needs: [verify-fork-guards, preflight]
     permissions:
@@ -426,149 +418,18 @@ jobs:
             max-substitution-jobs = 64
             http-connections = 64
             narinfo-cache-positive-ttl = 600
-      # build-dellan owns the shared cache. Restore on entry; the action
-      # auto-saves /nix/store at job end under `primary-key` (post step is
-      # gated `post-if: success()`, so cancelled/failed runs skip save and
-      # don't poison the snapshot). Subsequent PR jobs (vm-minimal lanes)
-      # restore from this snapshot.
-      #
-      # Order: this step runs AFTER determinate-nix-action. cache-nix-
-      # action's restore phase shells out to `sudo chown -R runner:runner
-      # /nix/var/nix/db && sqlite3 ... 'PRAGMA wal_checkpoint(TRUNCATE)'`
-      # (see src/utils/database.ts in the action source) — that dir only
-      # exists once nix is installed. The action then runs its own
-      # `mergeStoreDatabases` to fold the cached store-paths into the
-      # installer's fresh sqlite, so there's no on-disk vs db desync to
-      # worry about (handled in src/utils/restore.ts).
-      #
-      # Key strategy: hash flake.lock + every .nix file. Identical config
-      # → exact hit. flake.lock-only changes (input bump) → restore the
-      # closest lock-prefix and only fetch the delta. Total miss → fall
-      # back to the runner-os prefix.
-      #
-      # Cache budget: GHA caps repos at 10 GB compressed. NixOS store
-      # is mostly pre-compressed (elf, gz, xz), so tar+zstd only hits
-      # ~1.2-1.3×. gc-max-store-size-linux: 8G (binary, 8.59 GB decimal)
-      # → ~6.5 GB compressed, comfortable under the 10 GB cap. The cap
-      # is sized to hold the dellan toplevel + recent intermediates;
-      # actual closure size is whatever the build produces (re-tune by
-      # reading `nix path-info -sSh /run/current-system` after a fresh
-      # build if the cache starts thrashing).
-      #
-      # The cap matters because the action's post step unconditionally
-      # calls `nix store gc --max` on cold save (saveImpl.ts:102), and
-      # without a gcroot the just-built --no-link toplevel is
-      # unreachable and would be deleted before the tarball is written.
-      # The `nix build --out-link` below registers an indirect gcroot
-      # under /nix/var/nix/gcroots/auto/ so the toplevel survives gc.
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
-        with:
-          primary-key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/*.nix') }}
-          # Lock-scoped prefixes only. A bare `nix-store-${{ runner.os }}-`
-          # fallback matches a store built from a *different* flake.lock,
-          # whose paths the new closure cannot reuse — both generations
-          # then have to fit in the 59G /nix loop from mount-nix-loop.sh,
-          # and they don't. Restoring nothing on a lock bump costs one
-          # cold build (~35G, fits); restoring the wrong store is fatal.
-          restore-prefixes-first-match: |
-            nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
-          # `8G` is parsed as binary (8 * 2^30 bytes ≈ 8.59 GB decimal)
-          # by the action's parseNixGcMax — see src/utils/inputs.ts.
-          gc-max-store-size-linux: 8G
-          purge: true
-          # Purge other prefix-matched caches in the same ref (action
-          # scopes purge to the current branch / PR merge ref by
-          # default — see src/utils/purge.ts:84-87, anyRef=false). Keeps
-          # the per-ref cache count bounded; primary-key:never preserves
-          # the snapshot we just restored from.
-          purge-prefixes: nix-store-${{ runner.os }}-
-          # Purge prefix-matched caches not accessed in 7 days (P7D in
-          # ISO 8601 duration — the action also accepts a bare integer
-          # but that's parsed as SECONDS, not hours/days).
-          purge-last-accessed: P7D
-          purge-primary-key: never
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
           name: jonathanmoregard
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      # Pin the toplevel as a gcroot so cache-nix-action's post-step
-      # `nix store gc --max` can't delete it before tarring. `--no-link`
-      # (the previous flag) left it unreachable; gc trimmed it; cache
-      # snapshots held only intermediates; every PR re-fetched the
-      # toplevel from cachix.
-      #
-      # `--out-link "$GITHUB_WORKSPACE/result-dellan"` registers an
-      # indirect gcroot under /nix/var/nix/gcroots/auto/ — the
-      # workspace dir is owned by the runner user, which is what nix's
-      # addPermRoot requires for the auto-gcroot registration to fire.
-      # Explicit `nix-store --add-root` is belt-and-braces in case the
-      # auto-registration path ever changes.
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        env:
-          TMPDIR: /mnt/tmp
-        run: |
-          set -euo pipefail
-          nix build .#nixosConfigurations.dellan.config.system.build.toplevel \
-            --out-link "$GITHUB_WORKSPACE/result-dellan" \
-            --print-build-logs --keep-going
-          nix-store --add-root "$GITHUB_WORKSPACE/result-dellan" -r \
-            "$(readlink -f "$GITHUB_WORKSPACE/result-dellan")" >/dev/null
-      - name: Disk after (post-build)
-        if: always() && needs.preflight.outputs.risk != 'TRIVIAL'
-        run: df -h / /mnt /tmp 2>/dev/null || df -h /
-
-  # Second workstation host. Shares profiles/workstation with dellan, so
-  # it runs after build-dellan and restores that job's /nix/store snapshot
-  # (save: false — build-dellan owns it); only the host-specific delta
-  # (kernel modules, tuxedo-drivers, initrd) builds here. cachix-action
-  # pushes the result, which is what tuxedo's nixos-auto-deploy
-  # substitutes from after merge instead of compiling locally.
-  build-tuxedo:
-    name: build tuxedo toplevel
-    runs-on: ubuntu-latest
-    needs: [verify-fork-guards, preflight, build-dellan]
-    permissions:
-      contents: read
-    steps:
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          # Head SHA + explicit token: see build-dellan.
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Free root disk (dotnet/ghc/android/docker/codeql)
-        if: needs.preflight.outputs.risk != 'TRIVIAL'
-        run: ./scripts/free-root-disk.sh
-      - name: Mount /tmp on /mnt bind
-        if: needs.preflight.outputs.risk != 'TRIVIAL'
-        run: ./scripts/mount-tmp-loop.sh
-      - name: Mount /nix on /mnt loopback (replaces free-disk-space)
-        if: needs.preflight.outputs.risk != 'TRIVIAL'
-        run: ./scripts/mount-nix-loop.sh
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          extra-conf: |
-            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
-            max-substitution-jobs = 64
-            http-connections = 64
-            narinfo-cache-positive-ttl = 600
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
-        with:
-          primary-key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/*.nix') }}
-          # Lock-scoped only — see the build-dellan block.
-          restore-prefixes-first-match: |
-            nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
-          save: false
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
-        with:
-          name: jonathanmoregard
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          # Write token on push:main only. PR jobs run PR-head code, so a
+          # token there could be exfiltrated or used to push NARs main
+          # never built; PRs read the public cache without a token.
+          authToken: ${{ github.event_name == 'push' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          # Push in the post step with a plain blocking `cachix push` of new
+          # store paths. The default daemon gives its queue only ~60 s to
+          # drain at job end, and a 3 GB zoom upload failed a green build.
+          useDaemon: false
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         env:
           TMPDIR: /mnt/tmp
@@ -586,19 +447,18 @@ jobs:
     # block `keyring` reporting status. `fail-fast: false` keeps every
     # lane reporting even after one breaks.
     #
-    # `needs: [..., build-dellan]` serializes the toplevel-closure
-    # build before any lane starts. Without this, all lanes race
-    # build-dellan to rebuild the same closure cold. With the dep,
-    # build-dellan saves the shared /nix/store snapshot to GHA cache
-    # (and pushes deltas to cachix); lanes restore from that snapshot
-    # so most paths land locally on disk before nix even runs.
+    # Lanes run in parallel with build-tuxedo, not after it, and
+    # substitute from cachix (push:main uploads every new path). They used
+    # to wait for a shared GHA /nix/store snapshot, but that snapshot was
+    # ~16 GB against GHA's 10 GB repo cap: lanes never found it, and its
+    # save step added minutes to (or hung) the critical path.
     #
     # Branch-protection required-check names are
     # `vm-minimal (<lane>)` — update protection rules in the GH UI
     # when adding/removing a lane.
     name: vm-minimal (${{ matrix.lane }})
     runs-on: ubuntu-latest
-    needs: [verify-fork-guards, preflight, discover, build-dellan]
+    needs: [verify-fork-guards, preflight, discover]
     permissions:
       contents: read
     strategy:
@@ -609,7 +469,7 @@ jobs:
         # deliberately absent from `discover`'s LANES, so they never report
         # "cached" and always execute. They gate credential handling and
         # caretaker trust boundaries.
-        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker]
+        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker, security-batch]
     steps:
       # Read this lane's cache status from the discover job. ALWAYS
       # runs (no `if:`) so subsequent steps can reference
@@ -658,34 +518,20 @@ jobs:
             max-substitution-jobs = 64
             http-connections = 64
             narinfo-cache-positive-ttl = 600
-      # Restore the shared /nix/store snapshot that build-dellan saved.
-      # save: false — only build-dellan owns the snapshot. 7 lanes saving
-      # in parallel would race for the same cache key, and 7 × ~8 GB
-      # blows the GHA 10 GB cap. Worst case (build-dellan's save hasn't
-      # propagated) the restore-prefixes fall back to the previous run's
-      # snapshot — still faster than cold.
-      #
-      # Order matches build-dellan: cache restore AFTER the installer
-      # because the action's restore phase needs /nix/var/nix/db to
-      # exist (it chowns + sqlite-checkpoints the daemon DB so it can
-      # merge cached store-paths into the freshly-installed DB).
-      - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
-        with:
-          primary-key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/*.nix') }}
-          # Lock-scoped only — see the build-dellan block for why a bare
-          # runner.os fallback overflows the /nix loop.
-          restore-prefixes-first-match: |
-            nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
-          save: false
-      # cachix remains the secondary substituter: it covers paths the
-      # GHA cache didn't have (e.g. brand-new VM-specific closure) and
-      # paths from other developers' machines pushed via post-build hooks.
+      # cachix is the cross-run cache: push:main runs upload every new
+      # path, including VM-specific closures.
       - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
           name: jonathanmoregard
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          # Write token on push:main only. PR jobs run PR-head code, so a
+          # token there could be exfiltrated or used to push NARs main
+          # never built; PRs read the public cache without a token.
+          authToken: ${{ github.event_name == 'push' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          # Push in the post step with a plain blocking `cachix push` of new
+          # store paths. The default daemon gives its queue only ~60 s to
+          # drain at job end, and a 3 GB zoom upload failed a green build.
+          useDaemon: false
       - name: Verify KVM
         if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
         run: |

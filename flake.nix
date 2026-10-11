@@ -36,6 +36,9 @@
     claude-desktop.url = "github:aaddrick/claude-desktop-debian";
     claude-desktop.inputs.nixpkgs.follows = "nixpkgs";
 
+    # The lockfile pins 0.161.0, above the 0.149.0 apply_patch security floor.
+    codex-cli-nix.url = "github:sadjow/codex-cli-nix";
+
     # aggregator — the personal search index behind
     # `aggregator_search_memory`. Consumed as SOURCE ONLY (`flake = false`)
     # and built here by overlays/aggregator.nix, because the aggregator's
@@ -157,6 +160,7 @@
 
   outputs = flakeInputs@{ self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
               tts-tool, substack-url-tool, prose-decorate, claude-desktop,
+              codex-cli-nix,
               aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
               ... }:
   let
@@ -201,6 +205,9 @@
         # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
         # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
         (import ./overlays/claude-code.nix)
+        # Native Codex CLI package with prebuilt store paths from the
+        # codex-cli Cachix cache.
+        codex-cli-nix.overlays.default
         # `pkgs.aggregator` — a real store path for the ingest timer, so
         # modules/nixos/aggregator-ingest-timer.nix needs no flake-input
         # specialArgs threading (same reason the listen-tools tools are
@@ -307,6 +314,7 @@
         vm-android-dev  = mkLane ./tests/android-dev.nix;
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
         vm-nix-gc       = mkLane ./tests/nix-gc.nix;
+        vm-security-batch = mkLane ./tests/security-batch.nix;
         # In ci.yml's vm-minimal matrix, and deliberately absent from
         # `discover`'s LANES so it never reports "cached" and always
         # executes — it gates credential handling and the sudo password
@@ -349,14 +357,23 @@
             fi
             touch $out
           '';
-        # Not a VM lane: runtime-invocation harness for the cachix
-        # post-build-hook's push-budget filter (skip microvm erofs +
-        # >256MiB paths; never fail the build). Cheap runCommand.
-        cachix-push-filter = import ./tests/cachix-push-filter.nix {
-          pkgs = pkgsLinux;
-          prodHook = self.nixosConfigurations.dellan.config
-            .nix.settings.post-build-hook;
-        };
+        # Not a VM lane: privacy invariant. The cache is public, so no host
+        # may push every local build (a private flake's outputs would be
+        # published). CI's push:main run is the only cache writer; it
+        # already holds every deployed closure. Pure eval; instant.
+        no-global-cache-push =
+          let
+            hooks = nixpkgs.lib.mapAttrs (_: h: h.config.nix.settings.post-build-hook or null)
+              { inherit (self.nixosConfigurations) dellan tuxedo; };
+            offenders = nixpkgs.lib.filterAttrs (_: v: v != null && v != "") hooks;
+          in
+          nixpkgs.lib.throwIf (offenders != { }) ''
+            nix.settings.post-build-hook is set on ${builtins.concatStringsSep ", " (builtins.attrNames offenders)}.
+            A global post-build-hook pushes EVERY local build to the public cachix cache,
+            including private flakes (Klaffat). CI's push:main run is the
+            only cache writer.
+          ''
+            (pkgsLinux.runCommand "no-global-cache-push" { } "touch $out");
         # Not a VM lane: ai-throttle / host-telemetry runtime harness
         # (modules/nixos/ai-throttle.nix) — fake sysfs, cgroup and systemctl,
         # driven tick by tick. Seconds.
@@ -491,6 +508,17 @@
         # payloads, incl. one buried past the model's 512-token window.
         prompt-injection-scan = import ./tests/prompt-injection-scan.nix {
           pkgs = pkgsLinux;
+        };
+        # Not a VM lane: the research-agent security sweep's verdict logic
+        # (modules/nixos/security-batch/research-agent.sh) against fake
+        # vulnix / systemd-analyze — seed, new CVE, accepted, score
+        # regression, tool errors. The module itself: vm-security-batch.
+        security-batch-research-agent = import ./tests/security-batch-research-agent.nix {
+          pkgs = pkgsLinux;
+          runnerScript = ./modules/nixos/security-batch/research-agent.sh;
+          # Drift gate: the package dellan deploys.
+          runnerPackage = self.nixosConfigurations.dellan.config
+            .services.securityBatch.research-agent.script;
         };
         signal-expiry = import ./tests/signal-expiry.nix {
           pkgs = pkgsLinux;
