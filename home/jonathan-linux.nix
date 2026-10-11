@@ -424,9 +424,11 @@ let
 
   # The user's own PR review comments, a second review input. The
   # script's docstring states what it collects and why PR conversation
-  # comments are left out. gh resolves from PATH, like claude below.
+  # comments are left out. Its GitHub identity is the App installation
+  # token, through the gh wrapper passed below as --gh.
   rsiPrFeedback = pkgs.writers.writePython3Bin "rsi-pr-feedback" { }
     (builtins.readFile ./rsi-pr-feedback.py);
+  ghApp = (import ./gh-host-token.nix { inherit pkgs; }).gh;
 
   rsiDailyReview = pkgs.writeShellApplication {
     name = "rsi-daily-review";
@@ -536,14 +538,20 @@ let
       fi
       # PR review feedback (see rsiPrFeedback) is an optional input: a gh
       # outage, missing auth or a timeout costs this input, never the
-      # review.
+      # review. Auth: the GitHub App installation token minted by
+      # gh-token.service into ~/.cache/gh-tokens/host/token, read by the
+      # gh-host-token wrapper; missing or stale fails closed, never the PAT.
       pr_rc=0
-      pr_feedback="$(timeout 600 rsi-pr-feedback --login jonathanmoregard \
+      pr_feedback="$(timeout 600 rsi-pr-feedback --gh ${ghApp}/bin/gh \
+        --login jonathanmoregard \
         --owner jonathanmoregard --owner klaffat \
         --since "$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)")" || pr_rc=$?
       if [ "$pr_rc" -ne 0 ]; then
-        [ "$pr_rc" -eq 3 ] \
-          || echo "rsi-daily-review: rsi-pr-feedback failed rc=$pr_rc — continuing without PR feedback" >&2
+        if [ "$pr_rc" -ne 3 ]; then
+          msg="rsi-daily-review: rsi-pr-feedback failed rc=$pr_rc — continuing without PR feedback"
+          echo "$msg" >&2
+          logger -p user.warning -t rsi-daily-review "$msg" || true
+        fi
         pr_feedback=""
       fi
       # Nothing to review: skip the model call rather than pay for a pass
