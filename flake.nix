@@ -202,6 +202,10 @@
         # `pkgs.prompt-injection-scan` — offline ProtectAI DeBERTa classifier for the
         # ~/.claude injection scans. See overlays/prompt-injection-scan.nix.
         (import ./overlays/prompt-injection-scan.nix)
+        # `pkgs.secret-redact` — gitleaks-backed secret redaction for the
+        # ~/.claude output hooks and aggregator ingest. See
+        # overlays/secret-redact.nix.
+        (import ./overlays/secret-redact.nix)
         # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
         # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
         (import ./overlays/claude-code.nix)
@@ -504,6 +508,12 @@
         # model, offline) over benign tool-argument text and injection
         # payloads, incl. one buried past the model's 512-token window.
         prompt-injection-scan = import ./tests/prompt-injection-scan.nix {
+          pkgs = pkgsLinux;
+        };
+        # Not a VM lane: drives the built `secret-redact` (its pinned gitleaks
+        # and rules) through every gitleaks quirk it handles, the fail-closed
+        # exits, and the redaction contract. Seconds.
+        secret-redact = import ./tests/secret-redact.nix {
           pkgs = pkgsLinux;
         };
         # Not a VM lane: the research-agent security sweep's verdict logic
