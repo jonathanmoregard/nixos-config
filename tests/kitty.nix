@@ -185,9 +185,9 @@ in
     import json
     import shlex
 
-    tuxedo.wait_for_unit("multi-user.target")
-    tuxedo.wait_for_unit("home-manager-jonathan.service")
-    tuxedo.wait_for_unit("default.target", "jonathan")
+    workstation.wait_for_unit("multi-user.target")
+    workstation.wait_for_unit("home-manager-jonathan.service")
+    workstation.wait_for_unit("default.target", "jonathan")
 
     # Copy + paste config: BOTH must preserve embedded newlines so a
     # multi-line shell command or code block copied out of kitty
@@ -202,16 +202,16 @@ in
     # comment explicitly mentions `tr -d` to explain why it was
     # removed, so a bare `grep tr -d` would false-positive on the
     # comment line).
-    tuxedo.fail(
+    workstation.fail(
         f"grep -qE '^map ctrl\\+shift\\+c.*tr -d' {kitty_conf}"
     )
     # Regression guard: paste_actions no longer contains replace-newline.
-    tuxedo.fail(
+    workstation.fail(
         f"grep -qE '^paste_actions .*replace-newline' {kitty_conf}"
     )
     # Safety invariant: paste_actions keeps the confirm prompt for
     # control-code-containing payloads.
-    tuxedo.succeed(
+    workstation.succeed(
         f"grep -qE '^paste_actions .*confirm' {kitty_conf}"
     )
 
@@ -224,7 +224,7 @@ in
     # auto_reload_config retyping presented: 4 real panes + 3 error
     # windows = 7.) Ask kitty's own config loader instead, and name the
     # offending line.
-    tuxedo.succeed(
+    workstation.succeed(
         f"su jonathan -c 'KITTY_CONF={kitty_conf} ${configParseProbe}'"
     )
 
@@ -235,27 +235,27 @@ in
     # against an established user manager. Converge those two test fixtures
     # explicitly, after asserting the generated enablement link exists.
     user_systemctl = "systemctl --machine=jonathan@.host --user"
-    tuxedo.succeed(
+    workstation.succeed(
         f"{user_systemctl} is-enabled --quiet kitty-session-save.timer"
     )
-    tuxedo.succeed(f"{user_systemctl} daemon-reload")
-    tuxedo.succeed(f"{user_systemctl} start kitty-session-save.timer")
-    tuxedo.succeed(
+    workstation.succeed(f"{user_systemctl} daemon-reload")
+    workstation.succeed(f"{user_systemctl} start kitty-session-save.timer")
+    workstation.succeed(
         f"{user_systemctl} is-active --quiet kitty-session-save.timer"
     )
 
     # Save script no-ops cleanly when no kitty is running
-    tuxedo.succeed("su - jonathan -c kitty-session-save")
-    tuxedo.succeed("test -d /home/jonathan/.cache/kitty-session")
-    tuxedo.fail("test -f /home/jonathan/.cache/kitty-session/snapshot.json")
+    workstation.succeed("su - jonathan -c kitty-session-save")
+    workstation.succeed("test -d /home/jonathan/.cache/kitty-session")
+    workstation.fail("test -f /home/jonathan/.cache/kitty-session/snapshot.json")
 
     # Convert script processes empty JSON array → empty session file
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'printf %s \"[]\" | kitty-session-convert > /tmp/empty.session'"
     )
 
     # === Positive-path e2e: full save → kill → restore cycle ===
-    tuxedo.wait_for_x()
+    workstation.wait_for_x()
 
     # === Multi-line copy round-trip (Phase A — shell pipeline) ===
     # Drives the EXACT shell command that ctrl+shift+c invokes,
@@ -271,7 +271,7 @@ in
     # The script body lives in `testCopyPipeline` (writeShellScript)
     # outside this testScript string so its multi-line payload doesn't
     # fight Nix's indent-strip on the surrounding raw-string block.
-    tuxedo.succeed(
+    workstation.succeed(
         "su jonathan -c 'DISPLAY=:0 ${testCopyPipeline}'"
     )
 
@@ -285,13 +285,13 @@ in
     # --- Phase 1: bring up kitty + 3 extra windows, each with a distinct
     # cwd and a distinct long-running command. The default first window
     # holds the user's shell. We end with 4 windows total. ---
-    tuxedo.succeed(
+    workstation.succeed(
         "su jonathan -c 'DISPLAY=:0 nohup kitty -1 --detach "
         ">/tmp/kitty-launch.log 2>&1' &"
     )
     # 30s was tight under host load (parallel VM builds, cold caches);
     # 60s gives kitty time to spawn and start its remote-control socket.
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls >/dev/null'", timeout=60
     )
 
@@ -313,24 +313,24 @@ in
     #
     # Failure of this assertion = the fix is dead in production.
     kitty_conf = "/home/jonathan/.config/kitty/kitty.conf"
-    orig_target = tuxedo.succeed(f"readlink {kitty_conf}").strip()
+    orig_target = workstation.succeed(f"readlink {kitty_conf}").strip()
     # Build a mutated config that mirrors the original plus one
     # observable change. Sentinel color #ff00ff (magenta) is unique
     # vs the deployed palette so stale colors can't masquerade.
-    tuxedo.succeed(
+    workstation.succeed(
         f"cp -L {kitty_conf} /tmp/kitty-mutated.conf && "
         "chmod u+w /tmp/kitty-mutated.conf && "
         "sed -i 's/^foreground.*$/foreground #ff00ff/' /tmp/kitty-mutated.conf"
     )
     # Atomic symlink swap — same operation home-manager activation performs.
-    tuxedo.succeed(
+    workstation.succeed(
         f"su jonathan -c 'ln -sfT /tmp/kitty-mutated.conf {kitty_conf}'"
     )
     # Sanity: kitty has not picked up the new color on its own
     # (auto_reload_config does NOT fire on symlink-target swaps).
     # Wait 3s to give any rogue watcher time to misbehave.
-    tuxedo.sleep(3)
-    tuxedo.fail(
+    workstation.sleep(3)
+    workstation.fail(
         f"su jonathan -c '{sock_cmd} get-colors' | "
         "grep -qE '^foreground[[:space:]]+#?ff00ff'"
     )
@@ -338,7 +338,7 @@ in
     # body (see home/kitty.nix `home.activation.kittyReloadConfig`)
     # iterates kitty sockets and runs `kitty @ load-config`. The
     # reload must produce the magenta foreground.
-    tuxedo.succeed(
+    workstation.succeed(
         "su jonathan -c '"
         "for sock in /tmp/kitty.sock-*; do "
         "  [ -S \"$sock\" ] || continue; "
@@ -347,7 +347,7 @@ in
     )
     # Reload is synchronous to the @ call; a short wait is just paranoia
     # for the test runner's scheduling jitter.
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} get-colors' | "
         "grep -qE '^foreground[[:space:]]+#?ff00ff'",
         timeout=5,
@@ -355,17 +355,17 @@ in
     # Restore original symlink + reload back to canonical colors so
     # subsequent test phases (session save/restore) see the deployed
     # palette. Bidirectional reload proof comes free.
-    tuxedo.succeed(
+    workstation.succeed(
         f"su jonathan -c 'ln -sfT {orig_target} {kitty_conf}'"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "su jonathan -c '"
         "for sock in /tmp/kitty.sock-*; do "
         "  [ -S \"$sock\" ] || continue; "
         "  kitty @ --to \"unix:$sock\" load-config 2>/dev/null || true; "
         "done'"
     )
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} get-colors' | "
         "grep -qE '^foreground[[:space:]]+#?ebebeb'",
         timeout=5,
@@ -407,21 +407,21 @@ in
     # Default first window acts as pane 1; 3 additional pane-adds give us
     # 4 total in 2x2.
     for cwd, magic in panes:
-        tuxedo.succeed(
+        workstation.succeed(
             "su jonathan -c "
             f"'kitty-pane-add --cwd {cwd} -- {sleep_bin} {magic}'"
         )
-    tuxedo.succeed(
+    workstation.succeed(
         "su jonathan -c "
         f"'kitty-pane-add --cwd /etc -- {mixed_agent_bin} {codex_sid}'"
     )
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls' | "
         "jq -e '[.[].tabs[].windows[]] | length == 4'",
         timeout=15,
     )
     # Wait for all 4 windows to register.
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls' | "
         "jq -e '[.[].tabs[].windows[]] | length == 4'",
         timeout=15,
@@ -436,7 +436,7 @@ in
     # `exec` replaces the shell in place, so the window keeps its pid
     # and phase 6's respawn comparison is unaffected.
     pane0_magic = "44444"
-    tuxedo.succeed(
+    workstation.succeed(
         "su jonathan -c '" + sock_cmd
         + ' send-text --match id:1 "exec ' + sleep_bin + " "
         + pane0_magic + '\\n"' + "'"
@@ -448,24 +448,24 @@ in
     # on a green run in tests/claude-egress.nix, which warms it for the
     # same reason. A 15s cap timed out here at 16.5s with the text still
     # queued.
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         "su jonathan -c '" + sock_cmd + " ls' | "
         "jq -e '[.[].tabs[].windows[].cmdline | join(\" \")] | "
         'any(. == "' + sleep_bin + " " + pane0_magic + "\")'",
         timeout=300,
     )
-    print("[diag] pane 0 after exec:\n" + tuxedo.succeed(
+    print("[diag] pane 0 after exec:\n" + workstation.succeed(
         "su jonathan -c '" + sock_cmd + " ls' | "
         "jq -c '[.[].tabs[].windows[] | {id, cmdline}]'"
     ))
-    tuxedo.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/ls-before.json'")
-    print("[diag] before save:\n" + tuxedo.succeed("cat /tmp/ls-before.json"))
+    workstation.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/ls-before.json'")
+    print("[diag] before save:\n" + workstation.succeed("cat /tmp/ls-before.json"))
 
     # Empirical precondition: real Kitty discovery, not fixture JSON, must
     # show both agents attached to one PTY and the headless Haiku first.
     # Without this assertion the restore test could pass because the setup
     # failed to reproduce the process order that caused the incident.
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e --arg claude '" + claude_bin
         + "' --arg codex '" + codex_bin
         + "' --arg sid '" + codex_sid + "' '"
@@ -481,7 +481,7 @@ in
     # must recreate. The live foreground argv selects exactly one window;
     # writing a guessed or cwd-matched ID would let this test pass while the
     # next save silently attached the thread to the wrong pane.
-    tuxedo.succeed(
+    workstation.succeed(
         "su jonathan -c '"
         + sock_cmd
         + " ls' | jq -r --arg codex '"
@@ -493,21 +493,21 @@ in
         + " | .id] | unique | if length == 1 then .[0] else error("
         + "\"expected one live Codex pane\") end' > /tmp/codex-window-id"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "su jonathan -c 'wid=$(cat /tmp/codex-window-id); "
         "printf \"%s\\tcodex\\t%s\\t/etc\\t%s\\n\" \"$wid\" "
         f"\"{codex_sid}\" \"$(date +%s)\" > "
         "/home/jonathan/.cache/kitty-session/pane-sessions.tsv'"
     )
-    codex_window_id = int(tuxedo.succeed(
+    codex_window_id = int(workstation.succeed(
         "cat /tmp/codex-window-id"
     ).strip())
 
     # --- Phase 2: save. Files must materialize and parse cleanly. ---
-    tuxedo.succeed("su jonathan -c kitty-session-save")
-    tuxedo.succeed("test -s /home/jonathan/.cache/kitty-session/snapshot.json")
-    tuxedo.succeed("test -s /home/jonathan/.cache/kitty-session/last.session")
-    tuxedo.succeed(
+    workstation.succeed("su jonathan -c kitty-session-save")
+    workstation.succeed("test -s /home/jonathan/.cache/kitty-session/snapshot.json")
+    workstation.succeed("test -s /home/jonathan/.cache/kitty-session/last.session")
+    workstation.succeed(
         "jq -e --arg sid '" + codex_sid + "' '"
         ".[0].tabs[].windows[] "
         f"| select(.id == {codex_window_id}) "
@@ -517,27 +517,27 @@ in
     )
     print(
         "[diag] saved session:\n"
-        + tuxedo.succeed("cat /home/jonathan/.cache/kitty-session/last.session")
+        + workstation.succeed("cat /home/jonathan/.cache/kitty-session/last.session")
     )
     # Session file must contain valid kitty directives only — every line
     # has to start with one of the known keywords. Catches future bugs
     # like emitting `new_window` (which kitty rejects with "unknown
     # command new_window" and aborts session loading).
-    tuxedo.succeed(
+    workstation.succeed(
         "awk 'NF && !/^(new_os_window|new_tab|launch|cd|layout|focus|"
         "enabled_layouts|tab_title|os_window_class|os_window_name|"
         "os_window_state|os_window_size)( |$)/ {print; bad=1} "
         "END {exit bad}' /home/jonathan/.cache/kitty-session/last.session"
     )
     # 4 launch directives — one per pane.
-    tuxedo.succeed(
+    workstation.succeed(
         "test $(grep -c '^launch' "
         "/home/jonathan/.cache/kitty-session/last.session) -eq 4"
     )
     # Each magic sleep arg must appear in the session file (proves the
     # convert script preserves the foreground command, not just titles).
     for _, magic in panes:
-        tuxedo.succeed(
+        workstation.succeed(
             f"grep -q 'sleep {magic}' "
             "/home/jonathan/.cache/kitty-session/last.session"
         )
@@ -545,16 +545,16 @@ in
     # --- Phase 3: kill kitty. Try graceful close first; many kitty
     # processes ignore SIGKILL when started via --detach, but respond
     # to its own remote-control close-os-window protocol. ---
-    print("[diag] ps before kill:\n" + tuxedo.succeed(
+    print("[diag] ps before kill:\n" + workstation.succeed(
         "ps -u jonathan -o pid,comm,args --no-headers || true"
     ))
-    tuxedo.succeed(
+    workstation.succeed(
         f"su jonathan -c '{sock_cmd} close-os-window --match=all || true'"
     )
-    tuxedo.sleep(2)
+    workstation.sleep(2)
     # Then SIGKILL any stragglers. Comm pattern matches `.kitty-wrapped`
     # (nixpkgs wrap-program prefixes the binary with `.`) and `kitten`.
-    tuxedo.succeed(
+    workstation.succeed(
         "for _ in 1 2 3 4 5; do "
         "  pids=$(ps -u jonathan -o pid,comm --no-headers | "
         "    awk '$2 ~ /kit/ {print $1}'); "
@@ -563,53 +563,53 @@ in
         "  sleep 1; "
         "done; true"
     )
-    print("[diag] ps after kill:\n" + tuxedo.succeed(
+    print("[diag] ps after kill:\n" + workstation.succeed(
         "ps -u jonathan -o pid,comm,args --no-headers || true"
     ))
-    tuxedo.succeed("rm -f /tmp/kitty.sock-*")
+    workstation.succeed("rm -f /tmp/kitty.sock-*")
 
     # --- Phase 4: relaunch via wrapper — must auto-inject --session.
     # Use shell backgrounding (& + setsid) instead of kitty's --detach,
     # which can spawn an extra default OS window alongside the session. ---
-    tuxedo.succeed(
+    workstation.succeed(
         "su jonathan -c 'DISPLAY=:0 setsid kitty </dev/null "
         ">/tmp/kitty-relaunch.log 2>&1 &'"
     )
     # Diagnostic dump before the wait — failures at the wait give us
     # nothing to inspect otherwise.
-    tuxedo.sleep(3)
-    print("[diag pre-wait] restore.log:\n" + tuxedo.succeed(
+    workstation.sleep(3)
+    print("[diag pre-wait] restore.log:\n" + workstation.succeed(
         "cat /tmp/kitty-restore.log 2>&1 || true"
     ))
-    print("[diag pre-wait] sockets:\n" + tuxedo.succeed(
+    print("[diag pre-wait] sockets:\n" + workstation.succeed(
         "find /tmp -maxdepth 1 -name 'kitty.sock-*' 2>&1 || true"
     ))
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls >/dev/null'", timeout=30
     )
 
     # --- Phase 5: capture restored state and assert the full topology
     # (4 windows, expected cwds, expected sleep cmdlines). ---
     # First make sure the socket answers; then capture state; then assert.
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls > /tmp/ls-after.json'", timeout=20
     )
     # Give kitty a moment to finish spawning all session-restored windows.
-    tuxedo.sleep(3)
-    tuxedo.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/ls-after.json'")
-    print("[diag] kitty-wrapper.log:\n" + tuxedo.succeed(
+    workstation.sleep(3)
+    workstation.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/ls-after.json'")
+    print("[diag] kitty-wrapper.log:\n" + workstation.succeed(
         "cat /tmp/kitty-wrapper.log 2>&1 || true"
     ))
-    print("[diag] kitty-restore.log:\n" + tuxedo.succeed(
+    print("[diag] kitty-restore.log:\n" + workstation.succeed(
         "cat /tmp/kitty-restore.log 2>&1 || true"
     ))
-    print("[diag] kitty-relaunch.log:\n" + tuxedo.succeed(
+    print("[diag] kitty-relaunch.log:\n" + workstation.succeed(
         "cat /tmp/kitty-relaunch.log 2>&1 || true"
     ))
-    print("[diag] ls-after.json:\n" + tuxedo.succeed("cat /tmp/ls-after.json"))
+    print("[diag] ls-after.json:\n" + workstation.succeed("cat /tmp/ls-after.json"))
 
     # Wait for restore-session to finish injecting all panes (async).
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls > /tmp/ls-after.json' && "
         "jq -e '[.[].tabs[].windows[]] | length == 4' /tmp/ls-after.json",
         timeout=30,
@@ -619,7 +619,7 @@ in
     restore_guard = (
         "/home/jonathan/.local/state/claude/kitty-restore/restore-incomplete"
     )
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         f"su jonathan -c '{sock_cmd} ls > /tmp/ls-after.json' && "
         "jq -e --arg codex '"
         + codex_bin
@@ -629,28 +629,28 @@ in
         "| any(. == [$codex, \"resume\", $sid])' /tmp/ls-after.json",
         timeout=30,
     )
-    tuxedo.wait_until_succeeds(f"test ! -e {restore_guard}", timeout=30)
+    workstation.wait_until_succeeds(f"test ! -e {restore_guard}", timeout=30)
 
     # A subsequent real save must keep the exact restored thread identity.
     # This is the no-hook regression: process argv alone cannot safely invent
     # which same-cwd Codex thread the pane owns.
-    tuxedo.succeed("su jonathan -c kitty-session-save")
-    tuxedo.succeed(
+    workstation.succeed("su jonathan -c kitty-session-save")
+    workstation.succeed(
         "jq -e --arg sid '"
         + codex_sid
         + "' '[.[].tabs[].windows[].codex_session_id?] | any(. == $sid)' "
         "/home/jonathan/.cache/kitty-session/snapshot.json"
     )
-    print("[diag] ls-after final:\n" + tuxedo.succeed("cat /tmp/ls-after.json"))
+    print("[diag] ls-after final:\n" + workstation.succeed("cat /tmp/ls-after.json"))
 
     # Both ordinary commands must be back, with their cwds. The Codex pane's
     # exact foreground command was asserted above before guard removal.
     for cwd, magic in panes:
-        tuxedo.succeed(
+        workstation.succeed(
             f"jq -e '[.[].tabs[].windows[].cwd] | any(. == \"{cwd}\")' "
             "/tmp/ls-after.json"
         )
-        tuxedo.succeed(
+        workstation.succeed(
             "jq -e '[.[].tabs[].windows[].foreground_processes[]?.cmdline | "
             f"join(\" \")] | any(. | endswith(\"sleep {magic}\"))' "
             "/tmp/ls-after.json"
@@ -677,13 +677,13 @@ in
     grid_2x2 = '[true,[false,"pane","pane"],[false,"pane","pane"]]'
     # Two panes side by side — the canonical form for a remainder of 2.
     grid_1x2 = '[true,"pane","pane"]'
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e '.[0].tabs[0].layout == \"splits\"' /tmp/ls-after.json"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e '.[0].tabs[0].groups | length == 4' /tmp/ls-after.json"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         f"jq -e '{shp}.[0].tabs[0].layout_state.pairs | shp == {grid_2x2}' "
         "/tmp/ls-after.json"
     )
@@ -709,7 +709,7 @@ in
     # dead-process half against the scripts; this is the real-kitty
     # half.
     stub = "/home/jonathan/.cache/kitty-session/stub-session"
-    stub_line = tuxedo.succeed(f"cat {stub}").strip()
+    stub_line = workstation.succeed(f"cat {stub}").strip()
     print("[diag] stub:\n" + stub_line)
     # kitty session-parses the line with shlex (kitty/session.py), so
     # shlex is also how the argv it hands pane 0 is read back out.
@@ -723,7 +723,7 @@ in
         "whose recorded cmdline pointed back at the launcher, and pane 0 "
         "opens a bare shell instead of its own command:\n" + stub_line
     )
-    cmdlines = json.loads(tuxedo.succeed(
+    cmdlines = json.loads(workstation.succeed(
         "jq -c '[.[].tabs[].windows[].cmdline]' /tmp/ls-after.json"
     ))
     print("[diag] pane-0 argv: " + json.dumps(pane0_argv))
@@ -776,15 +776,15 @@ in
         tree that had passed the phase a run earlier. Comparing that
         field failed the lane for a race rather than for a regression.
         """
-        tuxedo.succeed(f"su jonathan -c '{sock_cmd} ls > {path}'")
-        groups = tuxedo.succeed(
+        workstation.succeed(f"su jonathan -c '{sock_cmd} ls > {path}'")
+        groups = workstation.succeed(
             f"jq -cS '[.[].tabs[] | {{tab: .id, g: [.groups[].id]}}]' {path}"
         ).strip()
-        focus = tuxedo.succeed(
+        focus = workstation.succeed(
             "jq -cS '[.[].tabs[] | select(.is_focused) | .windows[] | "
             f"select(.is_focused) | .id]' {path}"
         ).strip()
-        pids = tuxedo.succeed(
+        pids = workstation.succeed(
             "jq -cS '[.[].tabs[].windows[] | {id: .id, pid: .pid}] "
             f"| sort_by(.id)' {path}"
         ).strip()
@@ -796,8 +796,8 @@ in
     # proves no detach happened, not merely that the end state matched.
     before = reflow_state("/tmp/reflow-noop-before.json")
     print("[diag] reflow no-op before: " + repr(before))
-    tuxedo.succeed("su jonathan -c kitty-panes-reflow")
-    tuxedo.sleep(1)
+    workstation.succeed("su jonathan -c kitty-panes-reflow")
+    workstation.sleep(1)
     after = reflow_state("/tmp/reflow-noop-after.json")
     print("[diag] reflow no-op after:  " + repr(after))
     assert before == after, (
@@ -812,32 +812,32 @@ in
     # --- 6b: a tab in `stack` layout. It serializes no `pairs` at all,
     # so it can never be canonical; reflow has to switch it to splits
     # and rebuild — without restarting any of the four processes.
-    tuxedo.succeed(f"su jonathan -c '{sock_cmd} goto-layout stack'")
-    tuxedo.sleep(1)
-    tuxedo.succeed(
+    workstation.succeed(f"su jonathan -c '{sock_cmd} goto-layout stack'")
+    workstation.sleep(1)
+    workstation.succeed(
         f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-stack-before.json'"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e '.[0].tabs[0].layout == \"stack\"' "
         "/tmp/reflow-stack-before.json"
     )
     _, _, pids_before = reflow_state("/tmp/reflow-stack-before.json")
-    tuxedo.succeed("su jonathan -c kitty-panes-reflow")
-    tuxedo.sleep(2)
-    tuxedo.succeed(
+    workstation.succeed("su jonathan -c kitty-panes-reflow")
+    workstation.sleep(2)
+    workstation.succeed(
         f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-stack-after.json'"
     )
-    print("[diag] after stack reflow:\n" + tuxedo.succeed(
+    print("[diag] after stack reflow:\n" + workstation.succeed(
         "cat /tmp/reflow-stack-after.json"
     ))
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e '.[0].tabs | length == 1' /tmp/reflow-stack-after.json"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e '.[0].tabs[0].layout == \"splits\"' "
         "/tmp/reflow-stack-after.json"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         f"jq -e '{shp}.[0].tabs[0].layout_state.pairs | shp == {grid_2x2}' "
         "/tmp/reflow-stack-after.json"
     )
@@ -854,40 +854,40 @@ in
     # a second tab holding the canonical form for the remainder (2),
     # again with every process intact.
     for magic in ("44444", "55555"):
-        tuxedo.succeed(
+        workstation.succeed(
             f"su jonathan -c '{sock_cmd} launch --location=hsplit "
             f"--keep-focus {sleep_bin} {magic}'"
         )
-    tuxedo.sleep(2)
-    tuxedo.succeed(
+    workstation.sleep(2)
+    workstation.succeed(
         f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-six-before.json'"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e '[.[].tabs[].windows[]] | length == 6' "
         "/tmp/reflow-six-before.json"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e '.[0].tabs | length == 1' /tmp/reflow-six-before.json"
     )
     _, focus_before, six_pids_before = reflow_state(
         "/tmp/reflow-six-before.json"
     )
-    tuxedo.succeed("su jonathan -c kitty-panes-reflow")
-    tuxedo.sleep(2)
-    tuxedo.succeed(
+    workstation.succeed("su jonathan -c kitty-panes-reflow")
+    workstation.sleep(2)
+    workstation.succeed(
         f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-six-after.json'"
     )
-    print("[diag] after six-pane reflow:\n" + tuxedo.succeed(
+    print("[diag] after six-pane reflow:\n" + workstation.succeed(
         "cat /tmp/reflow-six-after.json"
     ))
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e '.[0].tabs | length == 2' /tmp/reflow-six-after.json"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         f"jq -e '{shp}.[0].tabs[0].layout_state.pairs | shp == {grid_2x2}' "
         "/tmp/reflow-six-after.json"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         f"jq -e '{shp}.[0].tabs[1].layout_state.pairs | shp == {grid_1x2}' "
         "/tmp/reflow-six-after.json"
     )
@@ -910,8 +910,8 @@ in
     # on a shape it does not itself recognise would churn on every
     # invocation forever.
     settled_before = reflow_state("/tmp/reflow-settle-before.json")
-    tuxedo.succeed("su jonathan -c kitty-panes-reflow")
-    tuxedo.sleep(1)
+    workstation.succeed("su jonathan -c kitty-panes-reflow")
+    workstation.sleep(1)
     settled_after = reflow_state("/tmp/reflow-settle-after.json")
     assert settled_before == settled_after, (
         "reflow does not recognise its own output as canonical.\n"
@@ -924,35 +924,35 @@ in
     # stdout and stderr, so everything it prints goes to kitty's log and
     # into no window at all. Driven here exactly the way the binding
     # does it, with the reflow lock held so the refusal is a certainty.
-    tuxedo.succeed(
+    workstation.succeed(
         "su jonathan -c 'flock -x /home/jonathan/.cache/kitty-session/"
         "reflow.lock sleep 30 >/dev/null 2>&1 &'"
     )
-    tuxedo.sleep(2)
-    tuxedo.succeed(
+    workstation.sleep(2)
+    workstation.succeed(
         f"su jonathan -c '{sock_cmd} launch --type=background -- "
         "/etc/profiles/per-user/jonathan/bin/kitty-panes-reflow'"
     )
-    tuxedo.sleep(3)
-    tuxedo.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-notice.json'")
-    print("[diag] with the notice up:\n" + tuxedo.succeed(
+    workstation.sleep(3)
+    workstation.succeed(f"su jonathan -c '{sock_cmd} ls > /tmp/reflow-notice.json'")
+    print("[diag] with the notice up:\n" + workstation.succeed(
         "jq -c '[.[].tabs[] | {g: [.groups[] | {id, windows}], "
         "w: [.windows[] | {id, title, ui: .env.KITTY_SESSION_UI}]}]' "
         "/tmp/reflow-notice.json"
     ))
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e '[.[].tabs[].windows[] | "
         'select(.title == "kitty-panes-reflow")] | length == 1\' '
         "/tmp/reflow-notice.json"
     )
     # Marked as this module's own chrome, so a snapshot taken while it
     # is up does not restore it as a pane.
-    tuxedo.succeed(
+    workstation.succeed(
         "jq -e '[.[].tabs[].windows[] | "
         'select(.title == "kitty-panes-reflow") | '
         ".env.KITTY_SESSION_UI] == [\"1\"]' /tmp/reflow-notice.json"
     )
-    notice_text = tuxedo.succeed(
+    notice_text = workstation.succeed(
         f"su jonathan -c '{sock_cmd} get-text "
         "--match title:kitty-panes-reflow'"
     )
@@ -974,15 +974,15 @@ in
     # driver's own shell running the pattern and kills that instead
     # (measured: exit 143). Probing the lock itself needs no pid and no
     # guess at how long anything takes.
-    tuxedo.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         "flock -n -x /home/jonathan/.cache/kitty-session/reflow.lock "
         "true",
         timeout=60,
     )
-    tuxedo.sleep(1)
+    workstation.sleep(1)
     notice_before = reflow_state("/tmp/reflow-notice-before.json")
-    tuxedo.succeed("su jonathan -c kitty-panes-reflow")
-    tuxedo.sleep(1)
+    workstation.succeed("su jonathan -c kitty-panes-reflow")
+    workstation.sleep(1)
     notice_after = reflow_state("/tmp/reflow-notice-after.json")
     assert notice_before == notice_after, (
         "a reflow notice window was counted as a pane, so reflow tore "

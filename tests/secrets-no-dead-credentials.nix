@@ -51,7 +51,7 @@ if offenders == [ ] then
   ''
 else
   throw ''
-    nixosConfigurations.tuxedo declares age.secrets that duplicate a credential owned
+    the primary host declares age.secrets that duplicate a credential owned
     elsewhere:
 
     ${report}

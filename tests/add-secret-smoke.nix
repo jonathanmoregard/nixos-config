@@ -1,5 +1,5 @@
 # add-secret-smoke — runtime-invocation harness for the add-secret
-# wrapper (home/add-secret.nix; the exact derivation tuxedo puts on
+# wrapper (home/add-secret.nix; the exact derivation the primary host puts on
 # PATH is asserted below via deployedBin, not a rebuilt copy).
 #
 # What this exercises (fast — cheap runCommand, seconds):
@@ -47,10 +47,10 @@ pkgs.runCommand "add-secret-smoke"
     }
 
     # --- drift gate ----------------------------------------------------
-    # Whatever ends up on tuxedo's PATH must be the same store path we
+    # Whatever ends up on the primary host's PATH must be the same store path we
     # just smoked.
     [ "$deployedBin" = "$tool" ] || \
-      fail "tuxedo add-secret ($deployedBin) != tested tool ($tool)"
+      fail "deployed add-secret ($deployedBin) != tested tool ($tool)"
 
     # --- fixture: minimal worktree layout that satisfies preflight ------
     export HOME="$PWD/home"

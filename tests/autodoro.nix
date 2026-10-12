@@ -22,20 +22,20 @@
 (import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
   name = "vm-autodoro";
   testScript = ''
-    tuxedo.wait_for_unit("multi-user.target")
-    tuxedo.wait_for_unit("home-manager-jonathan.service")
+    workstation.wait_for_unit("multi-user.target")
+    workstation.wait_for_unit("home-manager-jonathan.service")
 
     hook = "/home/jonathan/.config/git/hooks/pre-push"
-    tuxedo.succeed(f"test -x {hook}")
+    workstation.succeed(f"test -x {hook}")
 
     # Both registered dispatches must appear by name in a comment.
-    tuxedo.succeed(f"grep -q '^# autodoro-reload$' {hook}")
-    tuxedo.succeed(f"grep -q '^# claude-mcp-sync$' {hook}")
+    workstation.succeed(f"grep -q '^# autodoro-reload$' {hook}")
+    workstation.succeed(f"grep -q '^# claude-mcp-sync$' {hook}")
 
     # Unconditional exit 0 so any dispatch failure never blocks the push.
-    tuxedo.succeed(f"grep -q '^exit 0$' {hook}")
+    workstation.succeed(f"grep -q '^exit 0$' {hook}")
 
     # Syntax gate: bash must parse the composed hook.
-    tuxedo.succeed(f"${pkgs.bash}/bin/bash -n {hook}")
+    workstation.succeed(f"${pkgs.bash}/bin/bash -n {hook}")
   '';
 }

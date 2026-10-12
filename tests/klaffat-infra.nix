@@ -967,7 +967,7 @@ common.mkMinimalTest {
     # That is a claim about the WHOLE sudoers file, not about the line this
     # module emits, and greping for the module's own line could never have
     # falsified it: nixpkgs emits a GLOBAL `env_keep+=SSH_AUTH_SOCK` under
-    # `security.pam.sshAgentAuth`, which tuxedo does not enable today.
+    # `security.pam.sshAgentAuth`, which the workstation does not enable today.
     # Enabling it anywhere would keep the variable for every sudo command on
     # the laptop while the command-scoped line below still read correctly.
     # So collect every line that keeps it, and assert the list is exactly

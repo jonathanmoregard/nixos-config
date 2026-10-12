@@ -70,7 +70,7 @@ in
   testScript = ''
     import json
 
-    m = tuxedo
+    m = workstation
     unit = "security-batch-fixture.service"
     state = "/var/lib/security-batch/fixture"
     record = "/var/lib/unit-failures/security-batch-fixture.json"

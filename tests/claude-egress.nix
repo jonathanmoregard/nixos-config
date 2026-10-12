@@ -53,28 +53,28 @@ in
   testScript = ''
     import re
 
-    tuxedo.wait_for_unit("multi-user.target")
-    tuxedo.wait_for_unit("home-manager-jonathan.service")
-    tuxedo.wait_for_unit("default.target", "jonathan")
-    tuxedo.wait_for_unit("claude-egress-table.service")
+    workstation.wait_for_unit("multi-user.target")
+    workstation.wait_for_unit("home-manager-jonathan.service")
+    workstation.wait_for_unit("default.target", "jonathan")
+    workstation.wait_for_unit("claude-egress-table.service")
     # home-manager-jonathan.service going active does NOT mean the user
     # units it just linked have finished starting — it queues them and
     # returns. Observed flaking here on a slow run: the slice cgroup was
     # still absent one line later. Prod tolerates the same race via the
     # bind timer's OnBootSec=1min; the test has to wait explicitly.
-    tuxedo.wait_for_unit("claude-egress.slice", "jonathan")
+    workstation.wait_for_unit("claude-egress.slice", "jonathan")
 
-    uid = tuxedo.succeed("id -u jonathan").strip()
+    uid = workstation.succeed("id -u jonathan").strip()
     RUNTIME = f"XDG_RUNTIME_DIR=/run/user/{uid}"
 
     # The bind timer fires on its own schedule (OnBootSec=1min /
     # OnUnitActiveSec=5min). Stop it so a tick cannot land in the middle
     # of the stale-binding window assertion 4 constructs; every rebind
     # below is then an explicit, synchronous `systemctl start`.
-    tuxedo.succeed("systemctl stop claude-egress-bind.timer")
+    workstation.succeed("systemctl stop claude-egress-bind.timer")
 
     def nft_chain():
-        return tuxedo.succeed(
+        return workstation.succeed(
             "${nft} list chain inet claude_egress output"
         )
 
@@ -83,19 +83,19 @@ in
         return int(m.group(1)) if m else None
 
     def log_count():
-        return int(tuxedo.succeed(
+        return int(workstation.succeed(
             "journalctl -k --no-pager | grep -c 'claude-egress: ' || true"
         ).strip())
 
     def slice_cgroup():
-        return tuxedo.succeed(
+        return workstation.succeed(
             f"find /sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service "
             "-maxdepth 4 -type d -name claude-egress.slice -print -quit "
             "2>/dev/null || true"
         ).strip()
 
     def state_file():
-        raw = tuxedo.succeed("cat /run/claude-egress/state 2>/dev/null || true")
+        raw = workstation.succeed("cat /run/claude-egress/state 2>/dev/null || true")
         out = {}
         for line in raw.splitlines():
             if "=" in line:
@@ -104,14 +104,14 @@ in
         return out
 
     def user_systemctl(args):
-        return tuxedo.succeed(
+        return workstation.succeed(
             f"su - jonathan -c '{RUNTIME} systemctl --user {args}'"
         )
 
     # Dial targets: unoccupied addresses on this node's own eth1 subnet.
     # On-link, so the SYN really is emitted through the output hook;
     # nothing answers, so nothing depends on a listener existing.
-    node_ip = tuxedo.succeed(
+    node_ip = workstation.succeed(
         "ip -4 -o addr show dev eth1 | grep -o 'inet [0-9.]*' | cut -d' ' -f2"
     ).strip()
     assert node_ip.startswith("192.168.1."), (
@@ -122,7 +122,7 @@ in
     known_ip = "192.168.1.98"       # networking.hosts -> api.anthropic.com
     print(f"[setup] node eth1={node_ip} dial targets={dial_ip},{known_ip}")
 
-    tuxedo.succeed(
+    workstation.succeed(
         "printf '%s\\n' '#!/bin/sh' "
         "'timeout 3 ${bash} -c \"exec 3<>/dev/tcp/$1/443\"' "
         "'exit 0' > /run/egress-dial && chmod 755 /run/egress-dial"
@@ -130,16 +130,16 @@ in
 
     def dial_in_slice(target=None):
         target = target or dial_ip
-        tuxedo.succeed(
+        workstation.succeed(
             f"su - jonathan -c '{RUNTIME} systemd-run --user --scope --quiet "
             f"--slice=claude-egress.slice -- /run/egress-dial {target}' || true"
         )
-        tuxedo.sleep(2)
+        workstation.sleep(2)
 
     def dial_outside(target=None):
         target = target or dial_ip
-        tuxedo.succeed(f"su - jonathan -c \"/run/egress-dial {target}\" || true")
-        tuxedo.sleep(2)
+        workstation.succeed(f"su - jonathan -c \"/run/egress-dial {target}\" || true")
+        workstation.sleep(2)
 
     def dial_sibling_slice(target=None):
         # Same uid, same user manager, DIFFERENT slice — jonathan's browser
@@ -149,14 +149,14 @@ in
         # the driver's root session and would still pass against a rule
         # bound one level too high.
         target = target or dial_ip
-        tuxedo.succeed(
+        workstation.succeed(
             f"su - jonathan -c '{RUNTIME} systemd-run --user --scope --quiet "
             f"--slice=app.slice -- /run/egress-dial {target}' || true"
         )
-        tuxedo.sleep(2)
+        workstation.sleep(2)
 
     def run_bind():
-        tuxedo.succeed("systemctl start claude-egress-bind.service")
+        workstation.succeed("systemctl start claude-egress-bind.service")
 
     # ── The level index is DISCOVERED, never computed ─────────────────
     #
@@ -203,7 +203,7 @@ in
     # nft is what proves the level index is load-bearing rather than
     # decorative: the SAME cgroup at the WRONG ancestor level must match
     # nothing. This is the negative control for the discovery above.
-    tuxedo.succeed(
+    workstation.succeed(
         f'${nft} add rule inet claude_egress output socket cgroupv2 level 4 \\"{rel}\\" '
         'counter comment \\"wrong-level control\\"'
     )
@@ -218,7 +218,7 @@ in
     dial_in_slice()
     got_c, got_l, got_w = counter(), log_count(), wrong_level_counter()
     print(f"[1] after in-slice dial counter={got_c} log={got_l} wrong-level={got_w}")
-    lines = tuxedo.succeed(
+    lines = workstation.succeed(
         "journalctl -k --no-pager | grep 'claude-egress: ' | tail -3 || true"
     )
     print("[1] log lines:\n" + lines)
@@ -263,13 +263,13 @@ in
     # F1's second half: the rule carries the cgroup INODE as a constant,
     # so a slice that is destroyed and recreated leaves a rule that looks
     # armed and matches nothing.
-    ino1 = tuxedo.succeed(f"stat -c %i {cg}").strip()
+    ino1 = workstation.succeed(f"stat -c %i {cg}").strip()
     user_systemctl("stop claude-egress.slice")
     user_systemctl("start claude-egress.slice")
-    tuxedo.wait_for_unit("claude-egress.slice", "jonathan")
+    workstation.wait_for_unit("claude-egress.slice", "jonathan")
     cg2 = slice_cgroup()
     assert cg2, "slice cgroup did not come back after stop/start"
-    ino2 = tuxedo.succeed(f"stat -c %i {cg2}").strip()
+    ino2 = workstation.succeed(f"stat -c %i {cg2}").strip()
     print(f"[4] inode {ino1} -> {ino2}")
     assert ino1 != ino2, (
         "the recreated slice reused its inode, so this run cannot exercise the "
@@ -313,7 +313,7 @@ in
 
     # The wrong-level control rule was flushed away with the rebind;
     # re-add it so nothing below silently depends on chain shape.
-    tuxedo.succeed(
+    workstation.succeed(
         f'${nft} add rule inet claude_egress output socket cgroupv2 level 4 \\"{rel}\\" '
         'counter comment \\"wrong-level control\\"'
     )
@@ -324,7 +324,7 @@ in
     # wrapper shipped in the home-manager profile sits behind it and is
     # never reached — and a VM test of such a wrapper passes green,
     # because no native installer exists in a VM. So the VM plants one.
-    tuxedo.succeed(
+    workstation.succeed(
         "mkdir -p /home/jonathan/.local/bin && "
         "printf '%s\\n' "
         "'#!/bin/sh' "
@@ -346,21 +346,21 @@ in
     # assertion — after this the dump is cached and the calls below take
     # ~10s — and keep the cap far enough above the cold cost that a slow
     # runner cannot turn a passing gate red.
-    tuxedo.succeed(
+    workstation.succeed(
         f"timeout 600 su - jonathan -c '{RUNTIME} TERM=xterm zsh -ic true' || true"
     )
 
     def zsh(cmd, runtime=True):
         env = f"{RUNTIME} " if runtime else ""
-        return tuxedo.succeed(
+        return workstation.succeed(
             f"timeout 300 su - jonathan -c \"{env}TERM=xterm zsh -ic '{cmd}'\" 2>&1"
         )
 
     def fake_log():
-        return tuxedo.succeed("cat /home/jonathan/fake-claude.log")
+        return workstation.succeed("cat /home/jonathan/fake-claude.log")
 
     def clear_fake_log():
-        tuxedo.succeed("truncate -s 0 /home/jonathan/fake-claude.log")
+        workstation.succeed("truncate -s 0 /home/jonathan/fake-claude.log")
 
     # The function must shadow every PATH entry, and `whence -p` must
     # resolve the planted installer rather than the profile copy.
@@ -524,7 +524,7 @@ in
     # and STILL start the tool. Observation degrades; the tool never
     # fails to start.
     clear_fake_log()
-    out = tuxedo.succeed(
+    out = workstation.succeed(
         "timeout 300 su - jonathan -c \"XDG_RUNTIME_DIR=/run/nonexistent "
         "TERM=xterm zsh -ic 'claude --version'\" 2>&1"
     )
@@ -550,7 +550,7 @@ in
     # The brackets are the delimiters that make an empty value visible, and
     # they MUST be quoted: zsh globs an unquoted `[...]` and dies with
     # "no matches found" before printing anything.
-    tuxedo.succeed(
+    workstation.succeed(
         "cat > /run/leak-probe.zsh <<'PROBE'\n"
         "print -r -- \"BEFORE=[$XDG_RUNTIME_DIR]\"\n"
         "claude --version >/dev/null 2>&1\n"
@@ -558,7 +558,7 @@ in
         "PROBE"
     )
     clear_fake_log()
-    leak = tuxedo.succeed(
+    leak = workstation.succeed(
         "timeout 300 su - jonathan -c \"env -u XDG_RUNTIME_DIR TERM=xterm "
         "zsh -ic 'source /run/leak-probe.zsh'\" 2>&1"
     )
@@ -590,8 +590,8 @@ in
     # CDN-fronted candidates rotate addresses, so a destination observed on
     # Tuesday can resolve from nothing by Friday and get filed as unknown —
     # indistinguishable from the signal the report exists to surface.
-    tuxedo.succeed("systemctl start claude-egress-resolve.service")
-    snapshot = tuxedo.succeed("cat /var/lib/claude-egress/resolutions.tsv")
+    workstation.succeed("systemctl start claude-egress-resolve.service")
+    snapshot = workstation.succeed("cat /var/lib/claude-egress/resolutions.tsv")
     print("[report] resolution snapshot:\n" + snapshot)
     assert f"{known_ip}\tapi.anthropic.com" in snapshot, (
         f"the resolve unit did not snapshot the candidate host:\n{snapshot}"
@@ -601,11 +601,11 @@ in
     # its own live resolution: plant a pair no live lookup can produce, and
     # dial that address. If the snapshot is ignored, it lands in section 2.
     snap_only_ip = "192.168.1.97"
-    tuxedo.succeed(
+    workstation.succeed(
         f"printf '%s\\t%s\\t%s\\n' {snap_only_ip} snapshot-only.invalid \"$(date +%s)\" "
         ">> /var/lib/claude-egress/resolutions.tsv"
     )
-    tuxedo.fail("getent ahosts snapshot-only.invalid")
+    workstation.fail("getent ahosts snapshot-only.invalid")
     dial_in_slice(snap_only_ip)
 
     # ── Aged-out pairs must stop matching ────────────────────────────
@@ -615,7 +615,7 @@ in
     # suppressing section 2, which exists to surface exactly that. Planted
     # with a 1970 timestamp so no plausible TTL can keep it alive.
     expired_ip = "192.168.1.96"
-    tuxedo.succeed(
+    workstation.succeed(
         f"printf '%s\\t%s\\t%s\\n' {expired_ip} expired.invalid 1 "
         ">> /var/lib/claude-egress/resolutions.tsv"
     )
@@ -623,8 +623,8 @@ in
 
     # The roll has to drop it too, or the file grows a permanent tail of
     # rows the reporter then has to keep re-ignoring.
-    tuxedo.succeed("systemctl start claude-egress-resolve.service")
-    rolled = tuxedo.succeed("cat /var/lib/claude-egress/resolutions.tsv")
+    workstation.succeed("systemctl start claude-egress-resolve.service")
+    rolled = workstation.succeed("cat /var/lib/claude-egress/resolutions.tsv")
     print("[report] snapshot after the roll:\n" + rolled)
     assert "expired.invalid" not in rolled, (
         "claude-egress-resolve kept an aged-out pair, so the snapshot never "
@@ -638,7 +638,7 @@ in
         f"the roll lost the freshly resolved candidate host:\n{rolled}"
     )
 
-    report = tuxedo.succeed(
+    report = workstation.succeed(
         "timeout 120 su - jonathan -c 'claude-egress-report \"-1 hour\"' 2>&1"
     )
     print("[report]\n" + report)
@@ -702,7 +702,7 @@ in
     )
     # Run as root the same report must additionally show the live rule —
     # the branch the unprivileged run cannot reach.
-    root_report = tuxedo.succeed("claude-egress-report '-1 hour' 2>&1")
+    root_report = workstation.succeed("claude-egress-report '-1 hour' 2>&1")
     assert "socket cgroupv2" in root_report, (
         f"the privileged report does not show the live rule:\n{root_report}"
     )
@@ -712,9 +712,9 @@ in
     # backend on a machine running docker, libvirt and tailscale is not
     # risk this change takes; the module carries an eval-time assertion
     # against networking.nftables.enable, and this is its runtime half.
-    fw = tuxedo.succeed("systemctl is-active firewall.service").strip()
+    fw = workstation.succeed("systemctl is-active firewall.service").strip()
     assert fw == "active", f"firewall.service is not active: {fw!r}"
-    nftsvc = tuxedo.succeed(
+    nftsvc = workstation.succeed(
         "systemctl is-active nftables.service || true"
     ).strip()
     assert nftsvc != "active", (
@@ -728,7 +728,7 @@ in
             f"phase 1 must log and never block, but the chain contains {banned!r}:\n{chain}"
         )
     # And outbound connectivity genuinely works through the hook.
-    tuxedo.succeed(
+    workstation.succeed(
         f"timeout 5 ${bash} -c 'exec 3<>/dev/tcp/{node_ip}/22'"
     )
 
@@ -739,7 +739,7 @@ in
     # meaningful: a ruleset that DOES name a cgroup fails to load
     # outright when that cgroup is absent. Had the table shipped with the
     # cgroup rule baked in, this is what boot would have done.
-    tuxedo.succeed(
+    workstation.succeed(
         "printf '%s\\n' "
         "'table inet probe_absent {' "
         "'  chain output {' "
@@ -748,15 +748,15 @@ in
         "'  }' "
         "'}' > /run/absent.nft"
     )
-    absent_err = tuxedo.fail("${nft} -f /run/absent.nft 2>&1")
+    absent_err = workstation.fail("${nft} -f /run/absent.nft 2>&1")
     assert "cgroupv2 path fails" in absent_err, (
         "a ruleset naming an absent cgroup was expected to fail to load; got:\n"
         f"{absent_err}"
     )
     # The shipped ruleset must therefore contain no cgroup match at all.
-    table_unit = tuxedo.succeed("systemctl cat claude-egress-table.service")
+    table_unit = workstation.succeed("systemctl cat claude-egress-table.service")
     ruleset_path = re.search(r"ExecStart=\S*/nft -f (\S+)", table_unit).group(1)
-    shipped = tuxedo.succeed(f"cat {ruleset_path}")
+    shipped = workstation.succeed(f"cat {ruleset_path}")
     print("[3] shipped ruleset:\n" + shipped)
     assert "cgroupv2" not in shipped, (
         "the boot-time ruleset names a cgroup, so boot fails whenever the slice "
@@ -773,20 +773,20 @@ in
     # manager's load path (systemd.unit(5), "Load path when running in user
     # mode") and home-manager does not manage it, so a /dev/null symlink
     # there is a mask that both wins and survives the reboot.
-    tuxedo.succeed(
+    workstation.succeed(
         "mkdir -p /home/jonathan/.config/systemd/user.control && "
         "ln -sf /dev/null "
         "/home/jonathan/.config/systemd/user.control/claude-egress.slice && "
         "chown -R jonathan:users /home/jonathan/.config/systemd/user.control"
     )
-    tuxedo.shutdown()
-    tuxedo.start()
-    tuxedo.wait_for_unit("multi-user.target")
-    tuxedo.wait_for_unit("claude-egress-table.service")
-    tuxedo.wait_for_unit("default.target", "jonathan")
-    tuxedo.succeed("systemctl stop claude-egress-bind.timer")
+    workstation.shutdown()
+    workstation.start()
+    workstation.wait_for_unit("multi-user.target")
+    workstation.wait_for_unit("claude-egress-table.service")
+    workstation.wait_for_unit("default.target", "jonathan")
+    workstation.succeed("systemctl stop claude-egress-bind.timer")
 
-    masked = tuxedo.succeed(
+    masked = workstation.succeed(
         f"su - jonathan -c '{RUNTIME} systemctl --user is-enabled "
         "claude-egress.slice' || true"
     ).strip()
@@ -798,13 +798,13 @@ in
         "the slice started despite being masked — this reboot is not testing "
         "the absent case"
     )
-    tbl = tuxedo.succeed("systemctl is-active claude-egress-table.service").strip()
+    tbl = workstation.succeed("systemctl is-active claude-egress-table.service").strip()
     assert tbl == "active", (
         f"claude-egress-table.service failed to load with the slice absent: {tbl!r}"
     )
     # The bind unit must treat an unlaunched slice as a no-op, not a fault.
     run_bind()
-    bind_state = tuxedo.succeed(
+    bind_state = workstation.succeed(
         "systemctl is-failed claude-egress-bind.service || true"
     ).strip()
     assert bind_state != "failed", (
@@ -820,7 +820,7 @@ in
     # The report has to survive — and be honest about — exactly this state.
     # "Nothing is being observed" is the single most important thing it can
     # say, and it is the state its health section is least exercised in.
-    absent_report = tuxedo.succeed(
+    absent_report = workstation.succeed(
         "timeout 120 su - jonathan -c 'claude-egress-report \"-1 hour\"' 2>&1"
     )
     print("[3] report with the slice absent:\n" + absent_report)
@@ -860,11 +860,11 @@ in
         f"observations come back nameless:\n{absent_report}"
     )
     # Networking must be unaffected.
-    node_ip = tuxedo.succeed(
+    node_ip = workstation.succeed(
         "ip -4 -o addr show dev eth1 | grep -o 'inet [0-9.]*' | cut -d' ' -f2"
     ).strip()
-    tuxedo.succeed(f"timeout 5 ${bash} -c 'exec 3<>/dev/tcp/{node_ip}/22'")
-    fw = tuxedo.succeed("systemctl is-active firewall.service").strip()
+    workstation.succeed(f"timeout 5 ${bash} -c 'exec 3<>/dev/tcp/{node_ip}/22'")
+    fw = workstation.succeed("systemctl is-active firewall.service").strip()
     assert fw == "active", f"firewall.service not active after reboot: {fw!r}"
 
     # home-manager-jonathan.service fails on this boot, and that is the
@@ -873,21 +873,21 @@ in
     # rather than left as an unexplained red unit for the next reader —
     # and proven to be the cause by unmasking and re-running activation
     # clean below.
-    hm_after_mask = tuxedo.succeed(
+    hm_after_mask = workstation.succeed(
         "systemctl is-failed home-manager-jonathan.service || true"
     ).strip()
     print(f"[3] home-manager while the slice is masked: {hm_after_mask}")
 
     # Leave the machine in the shipped state.
-    tuxedo.succeed(
+    workstation.succeed(
         "rm -f /home/jonathan/.config/systemd/user.control/claude-egress.slice"
     )
     user_systemctl("daemon-reload")
     user_systemctl("start claude-egress.slice")
-    tuxedo.wait_for_unit("claude-egress.slice", "jonathan")
-    tuxedo.succeed("systemctl reset-failed home-manager-jonathan.service || true")
-    tuxedo.succeed("systemctl start home-manager-jonathan.service")
-    hm_clean = tuxedo.succeed(
+    workstation.wait_for_unit("claude-egress.slice", "jonathan")
+    workstation.succeed("systemctl reset-failed home-manager-jonathan.service || true")
+    workstation.succeed("systemctl start home-manager-jonathan.service")
+    hm_clean = workstation.succeed(
         "systemctl is-failed home-manager-jonathan.service || true"
     ).strip()
     assert hm_clean != "failed", (

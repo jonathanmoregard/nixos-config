@@ -61,9 +61,9 @@ pkgs.runCommand "worktree-sweep-harness"
     }
 
     # --- drift gate ----------------------------------------------------
-    # The tuxedo unit must exec exactly the derivation under test.
+    # The deployed unit must exec exactly the derivation under test.
     [ "$deployedExecStart" = "$sweep" ] || \
-      fail "tuxedo ExecStart ($deployedExecStart) != tested script ($sweep)"
+      fail "deployed ExecStart ($deployedExecStart) != tested script ($sweep)"
 
     export HOME="$PWD/home"
     mkdir -p "$HOME"

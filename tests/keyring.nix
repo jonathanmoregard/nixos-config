@@ -16,12 +16,12 @@
   name = "vm-keyring";
   extraModules = [ ../profiles/keyring.nix ];
   testScript = ''
-    tuxedo.wait_for_unit("multi-user.target")
+    workstation.wait_for_unit("multi-user.target")
 
-    tuxedo.succeed(
+    workstation.succeed(
         "grep -q 'password.*pam_gnome_keyring.*use_authtok' /etc/pam.d/login"
     )
-    tuxedo.succeed("grep -q 'auth.*pam_gnome_keyring' /etc/pam.d/login")
-    tuxedo.succeed("grep -q 'session.*pam_gnome_keyring' /etc/pam.d/login")
+    workstation.succeed("grep -q 'auth.*pam_gnome_keyring' /etc/pam.d/login")
+    workstation.succeed("grep -q 'session.*pam_gnome_keyring' /etc/pam.d/login")
   '';
 }

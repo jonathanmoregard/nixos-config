@@ -71,9 +71,9 @@ in
     import json
     import shlex
 
-    tuxedo.wait_for_unit("multi-user.target")
-    tuxedo.wait_for_unit("home-manager-jonathan.service")
-    tuxedo.wait_for_unit("default.target", "jonathan")
+    workstation.wait_for_unit("multi-user.target")
+    workstation.wait_for_unit("home-manager-jonathan.service")
+    workstation.wait_for_unit("default.target", "jonathan")
 
     # Stop the periodic snapshotter — its enricher would race the
     # synthetic phases below by pruning our planted window ids (101,
@@ -84,7 +84,7 @@ in
     # inside this test's ~100s wall time. `--machine=jonathan@.host`
     # is what `wait_for_unit("...", "jonathan")` uses under the hood;
     # `su -` alone doesn't set XDG_RUNTIME_DIR in this test VM.
-    tuxedo.succeed(
+    workstation.succeed(
         "systemctl --machine=jonathan@.host --user "
         "stop kitty-session-save.timer"
     )
@@ -98,13 +98,13 @@ in
     wid_codex, wid_codex_2 = 103, 104
 
     def stage_input(path, payload):
-        tuxedo.succeed(
+        workstation.succeed(
             f"cat > {path} <<'EOF'\n" + payload + "\nEOF"
         )
-        tuxedo.succeed(f"chown jonathan {path}")
+        workstation.succeed(f"chown jonathan {path}")
 
     # --- 6a: hook writes TSV rows from JSON-on-stdin + KITTY_WINDOW_ID env.
-    tuxedo.succeed(f"su - jonathan -c 'mkdir -p $(dirname {tsv}) && rm -f {tsv}'")
+    workstation.succeed(f"su - jonathan -c 'mkdir -p $(dirname {tsv}) && rm -f {tsv}'")
     stage_input(
         "/tmp/hook-a.json",
         f'{{"session_id":"{sid_a}","cwd":"/tmp/fake"}}',
@@ -135,12 +135,12 @@ in
         )
         if args:
             cmd += " " + " ".join(shlex.quote(a) for a in args)
-        tuxedo.succeed("su - jonathan -c " + shlex.quote(cmd))
-    tuxedo.succeed(
+        workstation.succeed("su - jonathan -c " + shlex.quote(cmd))
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
         "claude-kitty-pane-record < /tmp/hook-b.json'"
     )
@@ -148,13 +148,13 @@ in
     run_codex_hook(
         wid_codex_2, "/tmp/hook-codex-2.json", ("resume", sid_codex_2)
     )
-    print("[diag phase6] TSV after hooks:\n" + tuxedo.succeed(f"cat {tsv}"))
-    tuxedo.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a}\\t' {tsv}")
-    tuxedo.succeed(f"grep -qP '^{wid_b}\\tclaude\\t{sid_b}\\t' {tsv}")
-    tuxedo.succeed(
+    print("[diag phase6] TSV after hooks:\n" + workstation.succeed(f"cat {tsv}"))
+    workstation.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a}\\t' {tsv}")
+    workstation.succeed(f"grep -qP '^{wid_b}\\tclaude\\t{sid_b}\\t' {tsv}")
+    workstation.succeed(
         f"grep -qP '^{wid_codex}\\tcodex\\t{sid_codex}\\t' {tsv}"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         f"grep -qP '^{wid_codex_2}\\tcodex\\t{sid_codex_2}\\t' {tsv}"
     )
 
@@ -184,10 +184,10 @@ in
         run_codex_hook(
             wid_codex, "/tmp/hook-codex-nested.json", nested_args
         )
-        tuxedo.succeed(
+        workstation.succeed(
             f"grep -qP '^{wid_codex}\\tcodex\\t{sid_codex}\\t' {tsv}"
         )
-        nested_rows = int(tuxedo.succeed(
+        nested_rows = int(workstation.succeed(
             f"grep -cP '\\t{sid_codex_nested}\\t' {tsv} || true"
         ).strip())
         assert nested_rows == 0, (
@@ -219,7 +219,7 @@ in
             ),
         }))
         run_codex_hook(grammar_wid, grammar_input, grammar_args)
-        tuxedo.succeed(
+        workstation.succeed(
             f"grep -qP '^{grammar_wid}\\tcodex\\t{grammar_sid}\\t' {tsv}"
         )
 
@@ -231,27 +231,27 @@ in
         "/tmp/hook-a2.json",
         f'{{"session_id":"{sid_a2}","cwd":"/tmp/fake"}}',
     )
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
         "claude-kitty-pane-record < /tmp/hook-a2.json'"
     )
-    row_count_a = int(tuxedo.succeed(
+    row_count_a = int(workstation.succeed(
         f"grep -cP '^{wid_a}\\t' {tsv} || true"
     ).strip())
     assert row_count_a == 1, (
         f"expected exactly 1 row for window {wid_a} after re-invocation, "
         f"got {row_count_a}"
     )
-    tuxedo.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a2}\\t' {tsv}")
+    workstation.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a2}\\t' {tsv}")
     # Reset to original sid for downstream assertions.
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
 
     # No KITTY_WINDOW_ID env → silent no-op. Hook must be safe to wire
     # globally even for claude invocations outside kitty.
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'env -u KITTY_WINDOW_ID "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
@@ -261,11 +261,11 @@ in
         "/tmp/hook-bad.json",
         '{"session_id":"not-a-uuid","cwd":"/tmp/fake"}',
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_WINDOW_ID=998 "
         "claude-kitty-pane-record < /tmp/hook-bad.json'"
     )
-    row_count_bad = int(tuxedo.succeed(
+    row_count_bad = int(workstation.succeed(
         f"grep -cP '^998\\t' {tsv} || true"
     ).strip())
     assert row_count_bad == 0, (
@@ -284,11 +284,11 @@ in
             "session_id": bad_sid, "cwd": bad_cwd,
         }))
         bad_wid = 980 + bad_i
-        tuxedo.succeed(
+        workstation.succeed(
             f"su - jonathan -c 'KITTY_WINDOW_ID={bad_wid} "
             f"claude-kitty-pane-record < {bad_path}'"
         )
-        unsafe_rows = int(tuxedo.succeed(
+        unsafe_rows = int(workstation.succeed(
             f"grep -cP '^{bad_wid}\\t' {tsv} || true"
         ).strip())
         assert unsafe_rows == 0, (
@@ -307,12 +307,12 @@ in
         f'{{"session_id":"{sid_evil}","cwd":"/tmp/fake"}}',
     )
     for evil_entrypoint in ["sdk-cli", "claude_code_action", "unknown"]:
-        tuxedo.succeed(
+        workstation.succeed(
             f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
             f"CLAUDE_CODE_ENTRYPOINT={evil_entrypoint} "
             "claude-kitty-pane-record < /tmp/hook-evil.json'"
         )
-        row_count_evil = int(tuxedo.succeed(
+        row_count_evil = int(workstation.succeed(
             f"grep -cP '\\t{sid_evil}\\t' {tsv} || true"
         ).strip())
         assert row_count_evil == 0, (
@@ -320,15 +320,15 @@ in
             f"non-cli gate; got {row_count_evil} matching rows"
         )
         # Existing main row for wid_a must remain untouched.
-        tuxedo.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a}\\t' {tsv}")
+        workstation.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a}\\t' {tsv}")
 
     # Non-numeric KITTY_WINDOW_ID rejected — defends against TSV
     # corruption if some upstream sets the env var to a non-integer.
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_WINDOW_ID=abc "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
-    row_count_abc = int(tuxedo.succeed(
+    row_count_abc = int(workstation.succeed(
         f"grep -cP '^abc\\t' {tsv} || true"
     ).strip())
     assert row_count_abc == 0, (
@@ -354,11 +354,11 @@ in
         }],
     }])
     stage_input("/tmp/fake-ls-codex.json", fake_ls_codex)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'kitty-session-enrich "
         "< /tmp/fake-ls-codex.json > /tmp/enriched-codex.json'"
     )
-    enriched_codex = json.loads(tuxedo.succeed("cat /tmp/enriched-codex.json"))
+    enriched_codex = json.loads(workstation.succeed("cat /tmp/enriched-codex.json"))
     codex_windows = enriched_codex[0]["tabs"][0]["windows"]
     assert codex_windows[0].get("codex_session_id") == sid_codex
     assert codex_windows[1].get("codex_session_id") == sid_codex_2
@@ -393,12 +393,12 @@ in
         ],
     }]}]}])
     stage_input("/tmp/mixed-agent.json", mixed_ls)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/mixed-agent.tsv kitty-session-enrich "
         "< /tmp/mixed-agent.json > /tmp/mixed-agent-enriched.json'"
     )
-    mixed_window = json.loads(tuxedo.succeed(
+    mixed_window = json.loads(workstation.succeed(
         "cat /tmp/mixed-agent-enriched.json"
     ))[0]["tabs"][0]["windows"][0]
     assert mixed_window.get("codex_session_id") == sid_mixed, (
@@ -426,12 +426,12 @@ in
         ]}],
     }]}]}])
     stage_input("/tmp/headless-agent.json", headless_ls)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/headless-agent.tsv kitty-session-enrich "
         "< /tmp/headless-agent.json > /tmp/headless-agent-enriched.json'"
     )
-    headless_window = json.loads(tuxedo.succeed(
+    headless_window = json.loads(workstation.succeed(
         "cat /tmp/headless-agent-enriched.json"
     ))[0]["tabs"][0]["windows"][0]
     assert "claude_session_id" not in headless_window
@@ -443,7 +443,7 @@ in
         "/tmp/codex-partial.tsv",
         f"{wid_codex}\tcodex\t{sid_codex}\t/tmp/codex\t0",
     )
-    rc_codex_partial = int(tuxedo.succeed(
+    rc_codex_partial = int(workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/codex-partial.tsv kitty-session-enrich "
         "< /tmp/fake-ls-codex.json > /tmp/enriched-codex-partial.json; "
@@ -465,7 +465,7 @@ in
     duplicate_ls[0]["tabs"][0]["windows"][0]["cwd"] = "/tmp/codex-a"
     duplicate_ls[0]["tabs"][0]["windows"][1]["cwd"] = "/tmp/codex-b"
     stage_input("/tmp/fake-ls-codex-duplicate.json", json.dumps(duplicate_ls))
-    rc_codex_duplicate = int(tuxedo.succeed(
+    rc_codex_duplicate = int(workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/codex-duplicate.tsv kitty-session-enrich "
         "< /tmp/fake-ls-codex-duplicate.json > /dev/null; echo $?'"
@@ -513,14 +513,14 @@ in
             in codex_grammar_cases
         ),
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/codex-grammar.tsv kitty-session-enrich "
         "< /tmp/fake-ls-codex-grammar.json "
         "> /tmp/enriched-codex-grammar.json'"
     )
     grammar_enriched = json.loads(
-        tuxedo.succeed("cat /tmp/enriched-codex-grammar.json")
+        workstation.succeed("cat /tmp/enriched-codex-grammar.json")
     )[0]["tabs"][0]["windows"]
     for grammar_window, grammar_case in zip(
         grammar_enriched, codex_grammar_cases
@@ -536,12 +536,12 @@ in
             )
 
     grammar_cache = "/home/jonathan/.cache/kitty-session"
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'mkdir -p " + grammar_cache
         + " && cp /tmp/enriched-codex-grammar.json "
         + grammar_cache + "/snapshot.json'"
     )
-    grammar_resolved = json.loads(tuxedo.succeed(
+    grammar_resolved = json.loads(workstation.succeed(
         "su - jonathan -c 'kitty-restore-session --dump-panes'"
     ))
     for grammar_pane, grammar_case in zip(
@@ -613,14 +613,14 @@ in
         "118\tcodex\t66666666-ffff-4666-8666-666666666666\t/tmp/image-exec\t0\n"
         "119\tcodex\t77777777-abab-4777-8777-777777777777\t/tmp/image-review\t0",
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/codex-noninteractive.tsv "
         "kitty-session-enrich < /tmp/fake-ls-codex-noninteractive.json "
         "> /tmp/enriched-codex-noninteractive.json'"
     )
     noninteractive = json.loads(
-        tuxedo.succeed("cat /tmp/enriched-codex-noninteractive.json")
+        workstation.succeed("cat /tmp/enriched-codex-noninteractive.json")
     )[0]["tabs"][0]["windows"]
     assert all("codex_session_id" not in w for w in noninteractive), (
         "codex exec/service subprocess was enriched as an interactive pane"
@@ -638,13 +638,13 @@ in
         ))]}],
     }])
     stage_input("/tmp/fake-ls-codex-legacy.json", legacy_codex_one)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/codex-legacy.tsv kitty-session-enrich "
         "< /tmp/fake-ls-codex-legacy.json "
         "> /tmp/enriched-codex-legacy.json'"
     )
-    legacy_sid = tuxedo.succeed(
+    legacy_sid = workstation.succeed(
         "jq -r '.[0].tabs[0].windows[0].codex_session_id // empty' "
         "/tmp/enriched-codex-legacy.json"
     ).strip()
@@ -668,13 +668,13 @@ in
         f"111\tunknown\t{sid_codex}\t/tmp/u\t0\n"
         f"112\tcodex\t{sid_codex_2}\t/tmp/e\t0\textra",
     )
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/bad-schema.tsv kitty-session-enrich "
         "< /tmp/fake-ls-bad-schema.json > /tmp/enriched-bad-schema.json'"
     )
     bad_schema_windows = json.loads(
-        tuxedo.succeed("cat /tmp/enriched-bad-schema.json")
+        workstation.succeed("cat /tmp/enriched-bad-schema.json")
     )[0]["tabs"][0]["windows"]
     assert all("codex_session_id" not in w for w in bad_schema_windows), (
         "unknown-kind or extra-field TSV row was accepted"
@@ -692,14 +692,14 @@ in
         }]}],
     }])
     stage_input("/tmp/fake-ls-codex-shell.json", fake_ls_codex_shell)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/codex-legacy.tsv kitty-session-enrich "
         "< /tmp/fake-ls-codex-shell.json "
         "> /tmp/enriched-codex-shell.json'"
     )
     shell_fields = json.loads(
-        tuxedo.succeed("cat /tmp/enriched-codex-shell.json")
+        workstation.succeed("cat /tmp/enriched-codex-shell.json")
     )[0]["tabs"][0]["windows"][0]
     assert "codex_session_id" not in shell_fields
     assert "claude_session_id" not in shell_fields
@@ -707,7 +707,7 @@ in
     # Restore emits canonical non-picker Codex commands, strips old launch
     # flags, and never guesses a thread when the exact attachment is absent.
     cache_dir = "/home/jonathan/.cache/kitty-session"
-    tuxedo.succeed(f"su - jonathan -c 'mkdir -p {cache_dir}'")
+    workstation.succeed(f"su - jonathan -c 'mkdir -p {cache_dir}'")
     codex_restore_snap = json.dumps([{
         "tabs": [{"windows": [
             {**json.loads(fake_ls_codex)[0]["tabs"][0]["windows"][0],
@@ -727,11 +727,11 @@ in
         ]}],
     }])
     stage_input("/tmp/codex-restore-snap.json", codex_restore_snap)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'cp /tmp/codex-restore-snap.json "
         f"{cache_dir}/snapshot.json'"
     )
-    codex_resolved = json.loads(tuxedo.succeed(
+    codex_resolved = json.loads(workstation.succeed(
         "su - jonathan -c 'kitty-restore-session --dump-panes'"
     ))
     assert codex_resolved[0]["cmd"] == [
@@ -820,11 +820,11 @@ in
         ]}],
     }])
     stage_input("/tmp/unsafe-codex-snap.json", unsafe_codex_snap)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'cp /tmp/unsafe-codex-snap.json "
         f"{cache_dir}/snapshot.json'"
     )
-    unsafe_resolved = json.loads(tuxedo.succeed(
+    unsafe_resolved = json.loads(workstation.succeed(
         "su - jonathan -c 'kitty-restore-session --dump-panes'"
     ))
     assert unsafe_resolved[0]["cmd"] == ["/bin/zsh"]
@@ -843,14 +843,14 @@ in
     # Re-seed the Claude rows used by all existing phases below.
     for _wid, _input in ((wid_a, "/tmp/hook-a.json"),
                          (wid_b, "/tmp/hook-b.json")):
-        tuxedo.succeed(
+        workstation.succeed(
             f"su - jonathan -c 'KITTY_WINDOW_ID={_wid} "
             f"claude-kitty-pane-record < {_input}'"
         )
 
     # --- 6b: enricher reads TSV and attaches id keyed by kitty window id.
     print("[diag phase6b] TSV right before enricher call:\n"
-          + tuxedo.succeed(f"cat {tsv}"))
+          + workstation.succeed(f"cat {tsv}"))
     fake_ls = json.dumps([{
         "tabs": [{
             "windows": [
@@ -866,17 +866,17 @@ in
         }],
     }])
     stage_input("/tmp/fake-ls.json", fake_ls)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'kitty-session-enrich "
         "< /tmp/fake-ls.json > /tmp/enriched.json'"
     )
-    print("[diag phase6] enriched.json:\n" + tuxedo.succeed("cat /tmp/enriched.json"))
+    print("[diag phase6] enriched.json:\n" + workstation.succeed("cat /tmp/enriched.json"))
 
-    id_a = tuxedo.succeed(
+    id_a = workstation.succeed(
         "jq -r '.[0].tabs[0].windows[0].claude_session_id // empty' "
         "/tmp/enriched.json"
     ).strip()
-    id_b = tuxedo.succeed(
+    id_b = workstation.succeed(
         "jq -r '.[0].tabs[0].windows[1].claude_session_id // empty' "
         "/tmp/enriched.json"
     ).strip()
@@ -903,11 +903,11 @@ in
         }],
     }])
     stage_input("/tmp/fake-ls-noclaude.json", fake_ls_noclaude)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'kitty-session-enrich "
         "< /tmp/fake-ls-noclaude.json > /tmp/enriched-noclaude.json'"
     )
-    has_field = tuxedo.succeed(
+    has_field = workstation.succeed(
         "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
         "/tmp/enriched-noclaude.json"
     ).strip()
@@ -918,7 +918,7 @@ in
     # The fake_ls_noclaude run above had `live_window_ids = {wid_a}`,
     # so the enricher's prune-pass DROPPED wid_b's row as a side effect.
     # Re-add it before downstream phases that rely on both wids present.
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
         "claude-kitty-pane-record < /tmp/hook-b.json'"
     )
@@ -955,11 +955,11 @@ in
         }],
     }])
     stage_input("/tmp/fake-ls-zombie.json", fake_ls_zombie)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'kitty-session-enrich "
         "< /tmp/fake-ls-zombie.json > /tmp/enriched-zombie.json'"
     )
-    id_zombie = tuxedo.succeed(
+    id_zombie = workstation.succeed(
         "jq -r '.[0].tabs[0].windows[0].claude_session_id // empty' "
         "/tmp/enriched-zombie.json"
     ).strip()
@@ -986,11 +986,11 @@ in
         }],
     }])
     stage_input("/tmp/fake-ls-shell.json", fake_ls_shell)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'kitty-session-enrich "
         "< /tmp/fake-ls-shell.json > /tmp/enriched-shell.json'"
     )
-    has_shell_sid = tuxedo.succeed(
+    has_shell_sid = workstation.succeed(
         "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
         "/tmp/enriched-shell.json"
     ).strip()
@@ -1001,7 +1001,7 @@ in
 
     # Both runs above pruned the TSV to live_window_ids={wid_a}.
     # Re-seed wid_b for the phases that follow.
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
         "claude-kitty-pane-record < /tmp/hook-b.json'"
     )
@@ -1009,21 +1009,21 @@ in
     # --- 6c: pruning — stale TSV entries for windows not in `ls` are
     # removed on each enrich pass, keeping the TSV bounded.
     sid_stale = "dddd4444-dddd-dddd-dddd-dddddddddddd"
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c \"printf '999\\t{sid_stale}\\t/tmp/dead\\t0\\n' "
         f">> {tsv}\""
     )
-    tuxedo.succeed(f"grep -qP '^999\\t' {tsv}")
-    tuxedo.succeed(
+    workstation.succeed(f"grep -qP '^999\\t' {tsv}")
+    workstation.succeed(
         "su - jonathan -c 'kitty-session-enrich "
         "< /tmp/fake-ls.json > /dev/null'"
     )
-    tuxedo.fail(f"grep -qP '^999\\t' {tsv}")
+    workstation.fail(f"grep -qP '^999\\t' {tsv}")
 
     # --- 6d: production safety — KITTY_ENRICH_TSV must be ignored
     # without KITTY_ENRICH_TEST=1, or a stray export in a user's shell
     # rc could silently re-route lookups to an attacker-controllable TSV.
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c \"printf '1234\\t{sid_a}\\t/tmp/fake\\t0\\n' "
         f"> /tmp/evil-tsv\""
     )
@@ -1038,12 +1038,12 @@ in
         }],
     }])
     stage_input("/tmp/fake-ls-evil.json", fake_ls_evil)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TSV=/tmp/evil-tsv "
         "kitty-session-enrich < /tmp/fake-ls-evil.json "
         "> /tmp/enriched-evil.json'"
     )
-    has_field_evil = tuxedo.succeed(
+    has_field_evil = workstation.succeed(
         "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
         "/tmp/enriched-evil.json"
     ).strip()
@@ -1052,12 +1052,12 @@ in
         f"production env-var leak risk (has_field={has_field_evil!r})"
     )
     # With the test flag set, the redirect IS honored.
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/evil-tsv kitty-session-enrich "
         "< /tmp/fake-ls-evil.json > /tmp/enriched-evil-on.json'"
     )
-    has_field_evil_on = tuxedo.succeed(
+    has_field_evil_on = workstation.succeed(
         "jq -r '.[0].tabs[0].windows[0] | has(\"claude_session_id\")' "
         "/tmp/enriched-evil-on.json"
     ).strip()
@@ -1071,7 +1071,7 @@ in
     # valid one wins. Uses a single-window fake_ls so the assertion is
     # purely about row parsing (the multi-window race-window guard in
     # 6f-1 is exercised separately and would mask this signal).
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c \"printf '"
         f"not-a-number\\tnot-a-uuid\\n"
         f"\\n"
@@ -1090,12 +1090,12 @@ in
         }],
     }])
     stage_input("/tmp/fake-ls-one.json", fake_ls_one)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'KITTY_ENRICH_TEST=1 "
         "KITTY_ENRICH_TSV=/tmp/junk-tsv kitty-session-enrich "
         "< /tmp/fake-ls-one.json > /tmp/enriched-junk.json'"
     )
-    id_a_junk = tuxedo.succeed(
+    id_a_junk = workstation.succeed(
         "jq -r '.[0].tabs[0].windows[0].claude_session_id // empty' "
         "/tmp/enriched-junk.json"
     ).strip()
@@ -1115,8 +1115,8 @@ in
     # claude panes with at least one un-enriched). The save wrapper
     # treats exit 2 as "preserve prior good snapshot, don't commit
     # this partial".
-    tuxedo.succeed(f"rm -f {tsv}")
-    tuxedo.succeed(
+    workstation.succeed(f"rm -f {tsv}")
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
@@ -1136,7 +1136,7 @@ in
         }],
     }])
     stage_input("/tmp/fake-ls-partial.json", fake_ls_partial)
-    rc_partial = int(tuxedo.succeed(
+    rc_partial = int(workstation.succeed(
         "su - jonathan -c 'kitty-session-enrich "
         "< /tmp/fake-ls-partial.json > /tmp/enriched-partial.json; "
         "echo $?'"
@@ -1158,7 +1158,7 @@ in
         }],
     }])
     stage_input("/tmp/fake-ls-solo.json", fake_ls_solo_unenriched)
-    rc_solo = int(tuxedo.succeed(
+    rc_solo = int(workstation.succeed(
         "su - jonathan -c 'kitty-session-enrich "
         "< /tmp/fake-ls-solo.json > /dev/null; echo $?'"
     ).strip().splitlines()[-1])
@@ -1169,16 +1169,16 @@ in
     # 6f-3: two same-cwd panes BOTH enriched — exit 0 (normal commit).
     # 6f-2's enrich pruned the TSV to live_set={555}, so wipe and
     # re-seed both rows for a clean precondition here.
-    tuxedo.succeed(f"rm -f {tsv}")
-    tuxedo.succeed(
+    workstation.succeed(f"rm -f {tsv}")
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
         "claude-kitty-pane-record < /tmp/hook-b.json'"
     )
-    rc_full = int(tuxedo.succeed(
+    rc_full = int(workstation.succeed(
         "su - jonathan -c 'kitty-session-enrich "
         "< /tmp/fake-ls-partial.json > /dev/null; echo $?'"
     ).strip().splitlines()[-1])
@@ -1191,13 +1191,13 @@ in
     # as unset, so a misconfigured shell launcher injecting an empty
     # env var would silently write to TSV as if it were the main
     # interactive session. The bare ''${VAR-cli} default flips that.
-    tuxedo.succeed(f"rm -f {tsv}")
-    tuxedo.succeed(
+    workstation.succeed(f"rm -f {tsv}")
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
         "CLAUDE_CODE_ENTRYPOINT= "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
-    empty_entrypoint_wrote = tuxedo.succeed(
+    empty_entrypoint_wrote = workstation.succeed(
         f"test -f {tsv} && wc -l < {tsv} || echo 0"
     ).strip()
     assert empty_entrypoint_wrote == "0", (
@@ -1205,12 +1205,12 @@ in
         f"({empty_entrypoint_wrote} lines); gate must reject"
     )
     # Sanity: explicit `cli` still writes.
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
         "CLAUDE_CODE_ENTRYPOINT=cli "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
-    tuxedo.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a}\\t' {tsv}")
+    workstation.succeed(f"grep -qP '^{wid_a}\\tclaude\\t{sid_a}\\t' {tsv}")
 
     # 6f-5: restore-side load_panes refuses to collide. Stage a
     # snapshot.json where two same-cwd claude panes share a cwd but
@@ -1223,18 +1223,18 @@ in
     restore_cwd = "/tmp/restore-test"
     encoded = restore_cwd.replace("/", "-")
     proj = f"/home/jonathan/.claude/projects/{encoded}"
-    tuxedo.succeed(f"su - jonathan -c 'mkdir -p {proj}'")
+    workstation.succeed(f"su - jonathan -c 'mkdir -p {proj}'")
     sid_p1 = "11111111-1111-1111-1111-111111111111"
     sid_p2 = "22222222-2222-2222-2222-222222222222"
     # p1 is the enriched one (also the freshest jsonl on disk).
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'touch -d \"2020-01-01\" {proj}/{sid_p2}.jsonl'"
     )
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'touch -d \"2030-01-01\" {proj}/{sid_p1}.jsonl'"
     )
     cache_dir = "/home/jonathan/.cache/kitty-session"
-    tuxedo.succeed(f"su - jonathan -c 'mkdir -p {cache_dir}'")
+    workstation.succeed(f"su - jonathan -c 'mkdir -p {cache_dir}'")
     snap = json.dumps([{
         "tabs": [{
             "windows": [
@@ -1251,10 +1251,10 @@ in
         }],
     }])
     stage_input("/tmp/race-snap.json", snap)
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'cp /tmp/race-snap.json {cache_dir}/snapshot.json'"
     )
-    dump = tuxedo.succeed(
+    dump = workstation.succeed(
         "su - jonathan -c 'kitty-restore-session --dump-panes'"
     )
     print("[diag phase6f-5] resolved panes:\n" + dump)
@@ -1289,8 +1289,8 @@ in
     # siblings, un-enriched fallback must drop --resume rather than
     # wrong-collide. Remove the spare sid_p2 jsonl so the only option
     # collides; load_panes must return cmd unchanged for pane 2.
-    tuxedo.succeed(f"su - jonathan -c 'rm -f {proj}/{sid_p2}.jsonl'")
-    dump_no_spare = tuxedo.succeed(
+    workstation.succeed(f"su - jonathan -c 'rm -f {proj}/{sid_p2}.jsonl'")
+    dump_no_spare = workstation.succeed(
         "su - jonathan -c 'kitty-restore-session --dump-panes'"
     )
     resolved_no_spare = json.loads(dump_no_spare)
@@ -1306,7 +1306,7 @@ in
     # the orphan — relaunching it is exactly what dropped two of the
     # user's four sessions on 2026-08-25.
     zsid = "33333333-3333-3333-3333-333333333333"
-    tuxedo.succeed(f"su - jonathan -c 'touch {proj}/{zsid}.jsonl'")
+    workstation.succeed(f"su - jonathan -c 'touch {proj}/{zsid}.jsonl'")
     snap_zombie = json.dumps([{
         "tabs": [{
             "windows": [
@@ -1320,11 +1320,11 @@ in
         }],
     }])
     stage_input("/tmp/zombie-snap.json", snap_zombie)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'cp /tmp/zombie-snap.json "
         f"{cache_dir}/snapshot.json'"
     )
-    resolved_zombie = json.loads(tuxedo.succeed(
+    resolved_zombie = json.loads(workstation.succeed(
         "su - jonathan -c 'kitty-restore-session --dump-panes'"
     ))
     cmd_z = resolved_zombie[0]["cmd"]
@@ -1345,7 +1345,7 @@ in
     # ANYWHERE in the list must win, over both index 0 and the window
     # cmdline.
     osid = "44444444-4444-4444-4444-444444444444"
-    tuxedo.succeed(f"su - jonathan -c 'touch {proj}/{osid}.jsonl'")
+    workstation.succeed(f"su - jonathan -c 'touch {proj}/{osid}.jsonl'")
     snap_order = json.dumps([{
         "tabs": [{
             "windows": [
@@ -1361,11 +1361,11 @@ in
         }],
     }])
     stage_input("/tmp/order-snap.json", snap_order)
-    tuxedo.succeed(
+    workstation.succeed(
         "su - jonathan -c 'cp /tmp/order-snap.json "
         f"{cache_dir}/snapshot.json'"
     )
-    resolved_order = json.loads(tuxedo.succeed(
+    resolved_order = json.loads(workstation.succeed(
         "su - jonathan -c 'kitty-restore-session --dump-panes'"
     ))
     cmd_o = resolved_order[0]["cmd"]
@@ -1384,12 +1384,12 @@ in
     # wrapper diverges from this shape, this test will pass while the
     # real wrapper breaks; keep them in sync (see kittyWithSession
     # postBuild in home/kitty.nix).
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c \""
         f"printf '7\\t{sid_a}\\t/some/old/cwd\\t0\\n8\\t{sid_b}\\t/other\\t0\\n'"
         f" > {tsv}\""
     )
-    tuxedo.succeed(f"test -s {tsv}")
+    workstation.succeed(f"test -s {tsv}")
     # Write the wrapper's wipe snippet to a script so the test invokes
     # the same shell logic without nested-quote escaping hell.
     wipe_script = (
@@ -1405,31 +1405,31 @@ in
         "fi\n"
     )
     stage_input("/tmp/wipe.sh", wipe_script)
-    tuxedo.succeed("chmod +x /tmp/wipe.sh")
-    tuxedo.succeed("su - jonathan -c '/tmp/wipe.sh'")
-    tuxedo.fail(f"test -f {tsv}")
+    workstation.succeed("chmod +x /tmp/wipe.sh")
+    workstation.succeed("su - jonathan -c '/tmp/wipe.sh'")
+    workstation.fail(f"test -f {tsv}")
 
     # 6g-2: a unix socket file present → wipe MUST NOT fire (defends
     # against blast-radius: a live kitty whose @ ls transiently
     # failed would otherwise get its TSV nuked underfoot).
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
-    tuxedo.succeed(f"test -s {tsv}")
+    workstation.succeed(f"test -s {tsv}")
     # Synchronously create a unix-socket file at /tmp/kitty.sock-fake.
     # bind() creates the inode; the file persists after python exits.
-    tuxedo.succeed(
+    workstation.succeed(
         "rm -f /tmp/kitty.sock-fake && "
         "python3 -c 'import socket; "
         "s=socket.socket(socket.AF_UNIX); "
         "s.bind(\"/tmp/kitty.sock-fake\")'"
     )
-    tuxedo.succeed("test -S /tmp/kitty.sock-fake")
-    tuxedo.succeed("su - jonathan -c '/tmp/wipe.sh'")
-    tuxedo.succeed(f"test -s {tsv}")
+    workstation.succeed("test -S /tmp/kitty.sock-fake")
+    workstation.succeed("su - jonathan -c '/tmp/wipe.sh'")
+    workstation.succeed(f"test -s {tsv}")
     # Cleanup the fixture socket.
-    tuxedo.succeed("rm -f /tmp/kitty.sock-fake")
+    workstation.succeed("rm -f /tmp/kitty.sock-fake")
 
     # --- 6h: Layer B — kitty-session-save preserves prior good
     # snapshot.json when kitty-session-enrich exits 2. Inline-replicate
@@ -1437,20 +1437,20 @@ in
     # diverges from this shape, this test will silently pass while
     # the real wrapper breaks. Keep in sync with kittySessionSave in
     # home/kitty.nix.
-    tuxedo.succeed(f"rm -f {tsv}")
-    tuxedo.succeed(
+    workstation.succeed(f"rm -f {tsv}")
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_a} "
         "claude-kitty-pane-record < /tmp/hook-a.json'"
     )
     # Pre-write a known-good snapshot with a bytes-equality fingerprint.
     good_snapshot = '{"_FIXTURE": "GOOD-1", "panes": []}'
     cache = "/home/jonathan/.cache/kitty-session"
-    tuxedo.succeed(f"su - jonathan -c 'mkdir -p {cache}'")
-    tuxedo.succeed(
+    workstation.succeed(f"su - jonathan -c 'mkdir -p {cache}'")
+    workstation.succeed(
         f"su - jonathan -c 'printf %s {shlex.quote(good_snapshot)} "
         f"> {cache}/snapshot.json'"
     )
-    sha_before = tuxedo.succeed(
+    sha_before = workstation.succeed(
         f"sha256sum {cache}/snapshot.json | cut -d\" \" -f1"
     ).strip()
     # Stage an input that triggers collision-risk (two same-cwd claude
@@ -1485,13 +1485,13 @@ in
         f"fi; "
         f"echo rc=$enrich_rc"
     )
-    out = tuxedo.succeed(f"su - jonathan -c '{save_snippet}'").strip()
+    out = workstation.succeed(f"su - jonathan -c '{save_snippet}'").strip()
     assert "rc=2" in out, (
         f"enricher should have exited 2 for the staged collision-risk "
         f"input; got: {out!r}"
     )
     # snapshot.json bytes must be unchanged.
-    sha_after = tuxedo.succeed(
+    sha_after = workstation.succeed(
         f"sha256sum {cache}/snapshot.json | cut -d\" \" -f1"
     ).strip()
     assert sha_before == sha_after, (
@@ -1499,16 +1499,16 @@ in
         f"sha_before={sha_before!r} sha_after={sha_after!r}"
     )
     # Tmp must have been removed.
-    tuxedo.fail(f"test -f {cache}/snapshot.json.tmp")
+    workstation.fail(f"test -f {cache}/snapshot.json.tmp")
 
     # 6h-2: when collision-risk clears (TSV gains the missing row),
     # the next save MUST overwrite the snapshot.
-    tuxedo.succeed(
+    workstation.succeed(
         f"su - jonathan -c 'KITTY_WINDOW_ID={wid_b} "
         "claude-kitty-pane-record < /tmp/hook-b.json'"
     )
-    tuxedo.succeed(f"su - jonathan -c '{save_snippet}'")
-    sha_after_full = tuxedo.succeed(
+    workstation.succeed(f"su - jonathan -c '{save_snippet}'")
+    sha_after_full = workstation.succeed(
         f"sha256sum {cache}/snapshot.json | cut -d\" \" -f1"
     ).strip()
     assert sha_after_full != sha_before, (
@@ -1520,7 +1520,7 @@ in
     # succession). flock + atomic mv must yield exactly N rows, no
     # corruption, no duplicates. Stress: 20 parallel writes, distinct
     # window ids + sids.
-    tuxedo.succeed(f"rm -f {tsv}")
+    workstation.succeed(f"rm -f {tsv}")
     parallel_n = 20
     for i in range(parallel_n):
         sid = f"{i:08x}-feed-feed-feed-{i:012x}"
@@ -1534,9 +1534,9 @@ in
         f"claude-kitty-pane-record < /tmp/hook-par-{i}.json &"
         for i in range(parallel_n)
     ) + " wait'"
-    tuxedo.succeed(par_cmd)
+    workstation.succeed(par_cmd)
     actual_rows = int(
-        tuxedo.succeed(f"wc -l < {tsv}").strip()
+        workstation.succeed(f"wc -l < {tsv}").strip()
     )
     assert actual_rows == parallel_n, (
         f"concurrent hooks: expected {parallel_n} rows, got {actual_rows}; "
@@ -1544,7 +1544,7 @@ in
     )
     # Every new row must be well-formed: 5 tab-separated fields, sid is UUID,
     # wid is numeric. Any malformed row indicates a partial-write race.
-    bad = tuxedo.succeed(
+    bad = workstation.succeed(
         "awk -F'\\t' '"
         "NF!=5 || $1 !~ /^[0-9]+$/ || $2 != \"claude\" || "
         "$3 !~ /^[0-9a-f-]+$/ "
@@ -1556,7 +1556,7 @@ in
         f"see TSV at {tsv}"
     )
     # Every wid must appear exactly once (no duplicates).
-    dup_wids = tuxedo.succeed(
+    dup_wids = workstation.succeed(
         f"awk -F'\\t' '{{print $1}}' {tsv} | sort | uniq -d | wc -l"
     ).strip()
     assert dup_wids == "0", (
@@ -1592,7 +1592,7 @@ in
     # The deployed script carries an `if __name__ == "__main__"` guard,
     # so the lane imports the REAL installed binary and calls the real
     # function rather than reimplementing the rule and testing a copy.
-    krs = tuxedo.succeed(
+    krs = workstation.succeed(
         "su - jonathan -c 'command -v kitty-restore-session'"
     ).strip()
     assert krs.startswith("/"), f"kitty-restore-session not on PATH: {krs!r}"
@@ -1601,7 +1601,7 @@ in
     orphan_sid = "sid-with-orphan"
     clean_sid = "sid-all-clean"
     for _sid in (orphan_sid, clean_sid):
-        tuxedo.succeed(
+        workstation.succeed(
             f"su - jonathan -c 'mkdir -p {orphan_proj}/{_sid}/subagents'"
         )
 
@@ -1640,7 +1640,7 @@ in
         stage_input(path, rec)
         # The planted bytes must be valid JSON, or the arms below are
         # measuring the fixture rather than the probe.
-        tuxedo.succeed(
+        workstation.succeed(
             f"python3 -c \"import json,sys; json.load(open(sys.argv[1]))\" "
             f"{path}"
         )
@@ -1677,7 +1677,7 @@ in
             f"n=m.restore_notice({orphan_proj!r}, {sid!r});"
             "print('NONE' if n is None else n.replace(chr(10), ' | '))"
         )
-        return tuxedo.succeed(
+        return workstation.succeed(
             "su - jonathan -c " + shlex.quote(f"python3 -c {shlex.quote(prog)}")
         ).strip()
 
