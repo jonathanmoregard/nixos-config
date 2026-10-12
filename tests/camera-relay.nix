@@ -46,10 +46,10 @@
     })
   ];
   testScript = ''
-    dellan.wait_for_unit("multi-user.target")
-    dellan.wait_for_unit("v4l2-relayd-test.service")
+    workstation.wait_for_unit("multi-user.target")
+    workstation.wait_for_unit("v4l2-relayd-test.service")
 
-    dev = dellan.succeed("cat /run/v4l2-relayd-test/device").strip()
+    dev = workstation.succeed("cat /run/v4l2-relayd-test/device").strip()
     print(f"[diag] loopback device: {dev}")
 
     # The loopback is created with exclusive caps (-x 1): the capture
@@ -57,17 +57,17 @@
     # completed STREAMON (splash preroll). Without this gate v4l2-ctl
     # exits 0 with "unsupported stream type" WITHOUT streaming and the
     # frame assertions below would be hollow.
-    dellan.wait_until_succeeds(
+    workstation.wait_until_succeeds(
         f"v4l2-ctl -d {dev} --list-formats 2>&1 | grep -q YUYV", timeout=60
     )
 
-    pid_before = dellan.succeed(
+    pid_before = workstation.succeed(
         "systemctl show -p MainPID --value v4l2-relayd-test.service"
     ).strip()
     # Baseline, not assumed 0: a benign restart during early startup
     # (before the format gate passed) must not false-red the lane. The
     # assertions below check the DELTA across the consumer sessions.
-    restarts_before = dellan.succeed(
+    restarts_before = workstation.succeed(
         "systemctl show -p NRestarts --value v4l2-relayd-test.service"
     ).strip()
 
@@ -78,20 +78,20 @@
     # 3s of sustained streaming, well past the failure point.
     # timeout(1) bounds the hang when the producer dies mid-stream and
     # the consumer's DQBUF blocks forever.
-    consumer = dellan.execute(
+    consumer = workstation.execute(
         f"timeout 30 v4l2-ctl -d {dev} --stream-mmap --stream-count=90 "
         "--stream-to=/dev/null 2>&1"
     )
     print(f"[diag] consumer rc={consumer[0]} out={consumer[1]!r}")
 
     # Diagnostics BEFORE assertions — once one fails the VM is gone.
-    print("[diag] relay journal:\n" + dellan.succeed(
+    print("[diag] relay journal:\n" + workstation.succeed(
         "journalctl -u v4l2-relayd-test.service --no-pager | tail -40"
     ))
-    restarts = dellan.succeed(
+    restarts = workstation.succeed(
         "systemctl show -p NRestarts --value v4l2-relayd-test.service"
     ).strip()
-    pid_after = dellan.succeed(
+    pid_after = workstation.succeed(
         "systemctl show -p MainPID --value v4l2-relayd-test.service"
     ).strip()
     print(f"[diag] NRestarts={restarts} pid_before={pid_before} pid_after={pid_after}")
@@ -123,7 +123,7 @@
     # 3. Detach/re-attach: a second consumer session must work too
     #    (Meet rejoin path). Guards against wedges that only appear on
     #    the second open — prod also died 0.3s after consumer DETACH.
-    consumer2 = dellan.execute(
+    consumer2 = workstation.execute(
         f"timeout 30 v4l2-ctl -d {dev} --stream-mmap --stream-count=30 "
         "--stream-to=/dev/null 2>&1"
     )
@@ -132,7 +132,7 @@
         f"second consumer session broken (rc={consumer2[0]}, "
         f"frames={frames2}/30): {consumer2[1]!r}"
     )
-    restarts2 = dellan.succeed(
+    restarts2 = workstation.succeed(
         "systemctl show -p NRestarts --value v4l2-relayd-test.service"
     ).strip()
     assert restarts2 == restarts_before, (
