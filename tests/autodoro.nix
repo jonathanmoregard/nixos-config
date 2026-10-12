@@ -22,20 +22,20 @@
 (import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
   name = "vm-autodoro";
   testScript = ''
-    dellan.wait_for_unit("multi-user.target")
-    dellan.wait_for_unit("home-manager-jonathan.service")
+    workstation.wait_for_unit("multi-user.target")
+    workstation.wait_for_unit("home-manager-jonathan.service")
 
     hook = "/home/jonathan/.config/git/hooks/pre-push"
-    dellan.succeed(f"test -x {hook}")
+    workstation.succeed(f"test -x {hook}")
 
     # Both registered dispatches must appear by name in a comment.
-    dellan.succeed(f"grep -q '^# autodoro-reload$' {hook}")
-    dellan.succeed(f"grep -q '^# claude-mcp-sync$' {hook}")
+    workstation.succeed(f"grep -q '^# autodoro-reload$' {hook}")
+    workstation.succeed(f"grep -q '^# claude-mcp-sync$' {hook}")
 
     # Unconditional exit 0 so any dispatch failure never blocks the push.
-    dellan.succeed(f"grep -q '^exit 0$' {hook}")
+    workstation.succeed(f"grep -q '^exit 0$' {hook}")
 
     # Syntax gate: bash must parse the composed hook.
-    dellan.succeed(f"${pkgs.bash}/bin/bash -n {hook}")
+    workstation.succeed(f"${pkgs.bash}/bin/bash -n {hook}")
   '';
 }

@@ -1,7 +1,7 @@
 # Throwaway agenix material for the klaffat-infra test lane and for the
 # feature VM's klaffat overrides.
 #
-# The real `secrets/klaffat-*.age` files are encrypted to dellan's HOST
+# The real `secrets/klaffat-*.age` files are encrypted to the workstation's HOST
 # key, which no test VM has and no test may ever hold. So a lane that
 # wants to assert "the secret decrypted, is 0400 root, and the wrapper
 # read it" has to bring its own recipient. This derivation mints one at
