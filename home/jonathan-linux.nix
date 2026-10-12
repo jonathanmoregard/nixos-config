@@ -688,7 +688,6 @@ in
     ./claude-skills.nix
     ./research-agent-mcp.nix
     ./futuresearch-gate-mcp.nix
-    ./aggregator-embed.nix
     ./aggregator-mcp-backend.nix
     # Must stay AFTER ./jonathan.nix: it redefines claude()/claudee()
     # through `programs.zsh.initContent = lib.mkAfter`, and the later

@@ -52,12 +52,11 @@
     # nothing. A bump that looks like it ran and did not is worse than one
     # that errors.
     #
-    # A bumped rev is NOT gated by the aggregator's own flake checks here.
-    # `flake = false` means this repo never evaluates that flake's outputs, so
-    # `checks.<system>.aggregator-embed-unit-hygiene` — which asserts the embed
-    # units' offline sandbox and seed entry point — runs in the aggregator's CI
-    # and not in this one. tests/base.nix therefore asserts the directives it
-    # depends on directly; keep it that way.
+    # A bumped rev is NOT gated by the aggregator's own flake checks here:
+    # `flake = false` means this repo never evaluates that flake's outputs.
+    # Nor does it import the aggregator's home-manager module — every
+    # aggregator unit on this host is declared in this repo, and
+    # tests/base.nix pins the whole set, so a bump cannot add a unit.
     #
     # The repo is PUBLIC as of 2026-08, so no access token is needed on any
     # of the three surfaces that evaluate this flake (the Actions runner,
@@ -133,8 +132,11 @@
     # CPU to llama-server (Qwen3-Embedding-0.6B Q8_0) on the iGPU, reached over
     # a unix socket. New embedding stamp: a new index is built beside the old
     # fp32 vectors, which stay on disk unused.
+    # 2026-10-12: the embedding pipeline is no longer deployed (its backfill
+    # pinned ~12 cores for weeks); search answers from FTS5 alone, and the
+    # vector tables already in cache.db stay on disk unused.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/72740b3533f611fe43cf6fd287c18e835528ed49";
+      url = "github:jonathanmoregard/aggregator/707855d43dccc18da1c4aa7c5976997d2351c6db";
       flake = false;
     };
 
@@ -248,11 +250,6 @@
       {
         home-manager.useGlobalPkgs = true;
         home-manager.useUserPackages = true;
-        # `aggregator-src` reaches the home config because
-        # home/aggregator-embed.nix imports the embed timer straight from
-        # the pinned source tree rather than re-declaring it here. See that
-        # file for why the units are not vendored.
-        home-manager.extraSpecialArgs = { inherit aggregator-src; };
         home-manager.users.jonathan = import ./home/jonathan-linux.nix;
       }
     ];
@@ -281,11 +278,6 @@
         {
           home-manager.useGlobalPkgs = true;
           home-manager.useUserPackages = true;
-          # `aggregator-src` reaches the home config because
-          # home/aggregator-embed.nix imports the embed timer straight from
-          # the pinned source tree rather than re-declaring it here. See that
-          # file for why the units are not vendored.
-          home-manager.extraSpecialArgs = { inherit aggregator-src; };
           home-manager.users.jonathan = import ./home/jonathan-linux.nix;
         }
       ];
@@ -309,7 +301,7 @@
         mkLane = path: import path {
           pkgs = pkgsLinux;
           inputs = {
-            inherit nixpkgs home-manager agenix agenix-rekey microvm aggregator-src;
+            inherit nixpkgs home-manager agenix agenix-rekey microvm;
             # What the full-host lanes boot: tests/lib/workstation-vm.nix.
             workstation = {
               host = primaryHost;
@@ -468,7 +460,7 @@
             coder = tuxedo.systemd.user.services.offline-ai-llm-coder.unitConfig.After or [ ];
           };
           gatedUserDropIn = tuxedo.home-manager.users.jonathan.xdg.configFile
-            ."systemd/user/aggregator-embed-server.service.d/offline-ai.conf".text or "";
+            ."systemd/user/local-stt.service.d/offline-ai.conf".text or "";
           gatedSystemConditions = tuxedo.systemd.services."microvm@research-agent".unitConfig.ConditionPathExists or [ ];
         };
         # Not a VM lane: runs the weekly smoke script against fake offline-ai /

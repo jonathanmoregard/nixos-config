@@ -113,16 +113,6 @@ let
     print("[ca-probe] OK")
   '';
 
-  # Replace the real multi-week embed command during the background-start
-  # probe. The production unit's Type and systemd lifecycle stay intact; only
-  # ExecStart becomes a bounded sleeping process that the VM can observe.
-  aggregatorEmbedBackgroundProbe = pkgs.writeText
-    "vm-base-aggregator-embed-background.conf" ''
-      [Service]
-      ExecStart=
-      ExecStart=${pkgs.coreutils}/bin/sleep 60
-    '';
-
   # Anonymous-memory pressure fixture for the behavioral OOMD assertion. VM
   # lowers only ram-heavy.slice's runtime threshold before launching this;
   # production thresholds remain untouched.
@@ -2826,96 +2816,61 @@ in
     workstation.fail(f"test -f {down_stamp}")
     workstation.fail(f"test -f {marker}")
 
-    # ── aggregator embed worker (home/aggregator-embed.nix) ────────────────
+    # ── which aggregator units this host installs and arms ────────────────
     #
-    # The embed half is imported from the aggregator's own tree rather than
-    # declared in this repo, so upstream's `aggregator-embed-unit-hygiene`
-    # check keeps guarding the unit that actually runs. What THIS repo
-    # decides, and therefore what is asserted here, is the wiring: that the
-    # worker is installed and armed, that it can never download
-    # on a manual run, that the seed
-    # unit is human-triggered only, and that importing the upstream module
-    # did not also resurrect its per-source ingest timers.
-    assert "aggregator-embed.timer" in agg_timers, (
-        "aggregator-embed.timer is not armed; the embed worker would never "
-        f"run:\n{agg_timers}"
-    )
-    got = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user is-enabled aggregator-embed.timer || true'"
-    ).strip()
-    assert got == "enabled", f"aggregator-embed.timer is-enabled={got!r}"
-
-    # THE IMPORT MUST NOT BRING THE PER-SOURCE INGEST TIMERS BACK.
-    # `services.aggregator.enable = true` switches on the whole upstream
-    # module; home/aggregator-embed.nix turns `sources.*.enable` off because
-    # aggregator-ingest.timer already walks every source through one runner.
-    # If a future edit drops those two lines, this host gets a second and
-    # third writer against the same cache.db doing a subset of the same
-    # work — which is exactly the arrangement the unified runner replaced,
-    # and it would look like nothing more than two extra timers in a list.
+    # ENUMERATED, NOT SPOT-CHECKED. Every aggregator unit on this host is
+    # declared in this repo (the ingest and schema-health timers in
+    # modules/nixos, the MCP backend in home/aggregator-mcp-backend.nix); the
+    # aggregator's own home-manager module is deliberately not imported, so
+    # nothing upstream can add a unit here on a pin bump. These two sets pin
+    # that: a new name fails the lane until someone dispositions it, and the
+    # question to ask of it is "does it write to cache.db".
     #
-    # ENUMERATED, NOT SPOT-CHECKED, and the difference is the whole point.
-    # `sources.sessions.enable` and `sources.github.enable` BOTH DEFAULT TO
-    # TRUE upstream, so the module arms every source it knows about unless
-    # this repo names it and switches it off. A name-by-name check only ever
-    # covers the sources that existed when it was written: an aggregator-src
-    # bump that adds a third default-on source would sail straight past it
-    # and land a second writer on cache.db, silently, on auto-deploy. So
-    # assert the WHOLE SET and make a new name fail the lane until someone
-    # dispositions it deliberately.
+    # The embedding pipeline (embed worker + timer, llama-server embed server,
+    # seed unit) was removed on 2026-10-12: its backfill pinned ~12 cores for
+    # weeks. Search answers from FTS5 alone without it — the query path
+    # degrades when the embed socket is absent. Its absence is asserted here so
+    # a later edit cannot bring the backfill back as a side effect.
     #
-    # `list-unit-files` rather than `list-timers`, because the upstream units
-    # are `lib.mkIf`-gated: a disabled source has no unit FILE at all, and a
-    # file that exists but was never started would not appear in list-timers.
-    # It also spans both search paths — /etc/systemd/user for the NixOS-level
-    # ingest timer, ~/.config/systemd/user for the home-manager embed timer.
+    # `list-unit-files` rather than `list-timers`: a unit file that exists but
+    # was never started would not appear in list-timers. It spans both search
+    # paths — /etc/systemd/user for the NixOS-level timers and
+    # ~/.config/systemd/user for home-manager units.
     agg_timer_files = sorted(set(workstation.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user list-unit-files --no-legend \"aggregator-*.timer\"' "
         "| awk '{print $1}'"
     ).split()))
-    # `aggregator-schema-health.timer` is the third name, dispositioned
-    # deliberately and on the opposite side of the test that this set exists to
-    # apply. Everything above is about keeping a SECOND WRITER off cache.db.
-    # The health timer never writes: it opens the cache `mode=ro` and reads two
-    # source files as text, and it never invokes the aggregator CLI at all —
-    # which matters because every subcommand but `embed` calls migrate(), and
-    # migrate() stamps PRAGMA user_version. modules/nixos/aggregator-schema-health.nix
-    # carries the reasoning; the assertions further up in this file exercise
-    # the script and pin that it names no `aggregator status`.
-    #
-    # A FOURTH name still fails the lane, and should: the question to ask of it
-    # is the same one, "does it write to cache.db", not "is it plausible".
+    # `aggregator-schema-health.timer` never writes: it opens the cache
+    # `mode=ro` and reads two source files as text, and it never invokes the
+    # aggregator CLI at all — which matters because every CLI subcommand but
+    # `embed` calls migrate(), and migrate() stamps PRAGMA user_version.
+    # modules/nixos/aggregator-schema-health.nix carries the reasoning; the
+    # assertions further up in this file exercise the script and pin that it
+    # names no `aggregator status`.
     assert agg_timer_files == [
-        "aggregator-embed.timer",
         "aggregator-ingest.timer",
         "aggregator-schema-health.timer",
     ], (
         "the set of aggregator timers on this host changed. Expected exactly "
-        "the unified ingest runner, the embed worker, and the read-only "
-        "schema-skew detector; got:\n"
-        f"{agg_timer_files}\n"
+        "the unified ingest runner and the read-only schema-skew detector; "
+        f"got:\n{agg_timer_files}\n"
         "A name MISSING here means a timer this host depends on stopped being "
-        "installed. A NEW name is almost certainly an upstream per-source "
-        "ingest timer whose `enable` defaults to true and which "
-        "home/aggregator-embed.nix does not switch off — i.e. a second writer "
-        "against the same cache.db, doing a subset of the work "
-        "aggregator-ingest.timer already does. Disable it there, then add it "
-        "to this list."
+        "installed. A NEW name is a second scheduled job against cache.db (or, "
+        "for aggregator-embed.timer, the multi-week embedding backfill coming "
+        "back). Decide that deliberately, then add it to this list."
     )
 
-    # AND ASK THE SAME QUESTION WITHOUT ASSUMING THE UNIT TYPE. A timer is not
-    # the only thing an aggregator-src bump can add under
-    # `services.aggregator.enable`: a service, path or socket unit carrying its
-    # own [Install] WantedBy is pulled in by a target directly and would never
-    # show up in a timer list at all. flake.nix records that this repo's CI is
-    # the ONLY gate on such a bump — `flake = false` means upstream's own
-    # checks never run here — so pin the general property instead of a
-    # spelling: WHICH aggregator units are ARMED, i.e. carry a WantedBy some
-    # target can follow. Everything else upstream ships (the two -seed and
-    # -failure-notify services) is reachable only by hand or via OnFailure, and
-    # that is the distinction worth defending.
+    # AND ASK THE SAME QUESTION WITHOUT ASSUMING THE UNIT TYPE: a service,
+    # path or socket unit carrying its own [Install] WantedBy is pulled in by
+    # a target directly and would never show up in a timer list. Pin WHICH
+    # aggregator units are ARMED, i.e. carry a WantedBy some target can
+    # follow. The shared MCP backend is armed on purpose so every stdio client
+    # can remain a tiny proxy. The health timer is armed on purpose — a
+    # detector that only runs when someone remembers to run it is not a
+    # detector — and its two services are deliberately NOT here: the check
+    # service is started by its timer and the failure-notify service is
+    # OnFailure-only, both asserted `static` above.
     agg_all_units = sorted(set(workstation.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user list-unit-files --no-legend \"aggregator-*\"' "
@@ -2928,328 +2883,21 @@ in
             f"systemctl --user cat {unit}'"
         ):
             agg_armed.append(unit)
-    # Five armed units now. The shared MCP backend is armed on purpose so every
-    # stdio client can remain a tiny proxy, and its process/model behavior is
-    # exercised above. The health timer is also armed on purpose — a detector
-    # that only runs when someone remembers to run it is not a detector — and
-    # its two services are deliberately NOT here: the check service is started
-    # by its timer and the failure-notify service is OnFailure-only, both
-    # asserted `static` above. That asymmetry is the property worth defending,
-    # and it is why this list is about WantedBy rather than about unit count.
-    # The embed timer and embed server joined with the 9e99864 bump (embedding
-    # on the iGPU): the timer is the deliberate second writer to cache.db
-    # (vectors only; the ingest timer writes rows), and the server is
-    # llama-server behind a unix socket, which never opens cache.db.
     assert agg_armed == [
-        "aggregator-embed-server.service",
-        "aggregator-embed.timer",
         "aggregator-ingest.timer",
         "aggregator-mcp-backend.service",
         "aggregator-schema-health.timer",
     ], (
-        "the set of ARMED aggregator units changed. Only the ingest, embed "
-        "and schema-health timers, the embed server and the shared MCP "
-        "backend may "
-        f"carry an [Install] WantedBy; got {agg_armed} out of "
-        f"{agg_all_units}.\n"
-        "A newly armed unit is something an aggregator-src bump added that "
-        "starts ITSELF. Check whether it writes to cache.db before doing "
-        "anything else — if it does, switch it off in "
-        "home/aggregator-embed.nix rather than widening this list."
+        "the set of ARMED aggregator units changed. Only the ingest and "
+        "schema-health timers and the shared MCP backend may carry an "
+        f"[Install] WantedBy; got {agg_armed} out of {agg_all_units}.\n"
+        "A newly armed unit starts ITSELF. Check whether it writes to "
+        "cache.db, or loads a model, before widening this list."
     )
-
-    agg_embed_unit = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat aggregator-embed.service'"
-    )
-    # OFFLINE ON EVERY TICK. The worker must fail loudly on absent weights
-    # rather than reach the network: a timer that can download turns a
-    # missing-model misconfiguration into a silent multi-GB fetch on a
-    # laptop that may be tethered. `--seed-models` is the only online path.
-    assert "HF_HUB_OFFLINE=1" in agg_embed_unit, (
-        "aggregator-embed.service does not pin HF_HUB_OFFLINE=1, so a "
-        f"scheduled tick could fetch model weights:\n{agg_embed_unit}"
-    )
-    assert "Repos/aggregator" not in agg_embed_unit, (
-        f"aggregator-embed.service names the dev checkout:\n{agg_embed_unit}"
-    )
-
-    # THE ENV VAR IS THE WEAKEST HALF OF "OFFLINE", and asserting only it is
-    # how this check quietly stops covering anything. HF_HUB_OFFLINE is a
-    # REQUEST: a library that does not read it, or any subprocess spawned
-    # along the way, still has the network. The load-bearing line is the
-    # seccomp address-family restriction, which makes an AF_INET socket()
-    # fail outright. (The IPAddressDeny=any filter that used to sit behind it
-    # was dropped in the 9e99864 bump: in this host's user manager it did not
-    # stop a connect to the machine's own LAN address, so it guaranteed
-    # nothing. The worker reaches the embed server over a unix socket.)
-    #
-    # AND THIS REPO'S CI IS THE ONLY PLACE THAT CAN CATCH THEIR LOSS.
-    # `aggregator-src` is a `flake = false` input, so upstream's own
-    # `checks.<system>.aggregator-embed-unit-hygiene` never runs here. A rev
-    # bump that dropped these directives would evaluate clean, build clean,
-    # and auto-deploy to the laptop with the guarantee gone.
-    for directive in [
-        "TRANSFORMERS_OFFLINE=1",
-        "RestrictAddressFamilies=AF_UNIX AF_NETLINK",
-    ]:
-        assert directive in agg_embed_unit, (
-            f"aggregator-embed.service no longer carries {directive!r}, so the "
-            "worker's offline guarantee rests on every library agreeing to "
-            f"read an environment variable:\n{agg_embed_unit}"
-        )
-    # The embed server reads what the worker sends it (untrusted corpus text)
-    # and has no reason to reach any network either.
-    agg_embed_server_unit = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat aggregator-embed-server.service'"
-    )
-    for unit_text, name in [(agg_embed_unit, "aggregator-embed.service"),
-                            (agg_embed_server_unit, "aggregator-embed-server.service")]:
-        families = [l for l in unit_text.splitlines() if l.startswith("RestrictAddressFamilies=")]
-        assert families and all("AF_INET" not in l for l in families), (
-            f"{name} may open IP sockets (RestrictAddressFamilies: {families}); "
-            "the embed worker and server talk over a unix socket only"
-        )
-
-    # The one opt-in that lets a run fetch weights. It belongs to the seed
-    # path and nowhere else; on the worker it would turn a 30-minute timer
-    # into a downloader, which is the exact failure HF_HUB_OFFLINE=1 above is
-    # there to prevent — so assert its ABSENCE rather than inferring it from
-    # the presence of the others.
-    assert "AGGREGATOR_ALLOW_MODEL_DOWNLOAD" not in agg_embed_unit, (
-        "aggregator-embed.service carries AGGREGATOR_ALLOW_MODEL_DOWNLOAD — "
-        "the scheduled worker is permitted to download model weights:\n"
-        f"{agg_embed_unit}"
-    )
-
-    # THE POLITENESS DIRECTIVES ARE LOAD-BEARING, NOT COSMETIC. This worker is
-    # a CPU-bound torch process with TimeoutStartSec=infinity, measured at
-    # ~55 days of continuous work on the real corpus, running on an
-    # interactive laptop. Nice=19 and IOSchedulingClass=idle are the whole
-    # reason that is tolerable: they confine it to otherwise-idle capacity.
-    # Drop them and the same unit becomes a month-long foreground CPU burn,
-    # with no test going red and nothing else in this repo to notice — the
-    # bump that removed them would evaluate clean and auto-deploy. Same
-    # reasoning as the resource-flag assertions on claude-idle-handoff.
-    for directive in ["Nice=19", "IOSchedulingClass=idle"]:
-        assert directive in agg_embed_unit, (
-            f"aggregator-embed.service no longer carries {directive!r}, so a "
-            "backfill measured in weeks would compete with interactive work "
-            f"instead of yielding to it:\n{agg_embed_unit}"
-        )
-
-    # THE MEMORY CEILING MUST STAY A THROTTLE. MemoryMax kills, a SIGKILLed worker leaves
-    # its per-row claim on disk, and upstream condemns a claim found at
-    # startup as a poison row — so swapping this for a hard cap would drop a
-    # good row from the index on every kill, silently, and leave an index that
-    # looks complete and is short. If this assertion is ever in the way, that
-    # is the argument it exists to force.
-    assert "MemoryMax=" not in agg_embed_unit, (
-        "aggregator-embed.service gained a MemoryMax. That cap KILLS, and a "
-        "killed worker's row claim is treated as poison by the embedder, so "
-        "each kill silently removes a good row from the vector index. Use "
-        f"MemoryHigh, which throttles instead:\n{agg_embed_unit}"
-    )
-
-    # Long transformer batches can take more than Home Manager's service
-    # switch timeout to finish after SIGTERM. Exercise the same sd-switch
-    # engine Home Manager uses: a changed active embed unit must keep its PID,
-    # while an unprotected changed canary must restart (driven below).
-
-    # PARSE THE VALUE, NOT THE SECOND `=`-DELIMITED FIELD. `awk -F=` here used
-    # to take $2, which silently truncates the moment ExecStart carries an
-    # argument containing `=`, and emits one line per ExecStart — so a drop-in
-    # adding a second one made this variable multiline, and the `cat {var}`
-    # below then ran everything after the first newline as a shell command in
-    # the VM. Strip the key instead, stop at the first match, and refuse
-    # anything that is not a single bare store path, so a future ExecStart
-    # that grows arguments fails this lane loudly rather than reading whatever
-    # a truncated path happens to point at.
-    agg_embed_exec = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat aggregator-embed.service' "
-        "| awk '/^ExecStart=/{sub(/^ExecStart=/, \"\"); print; exit}' "
-        "| tr -d '\"'"
-    ).strip()
-    assert (
-        agg_embed_exec.startswith("/nix/store/")
-        and len(agg_embed_exec.split()) == 1
-    ), (
-        "could not read a single bare store path out of "
-        f"aggregator-embed.service's ExecStart; got {agg_embed_exec!r}. "
-        "If ExecStart legitimately gained arguments, split the binary off "
-        "here — do not pass this string to a shell."
-    )
-    agg_embed_script = workstation.succeed(f"cat {agg_embed_exec}")
-    # Same store-path ban as the ingest wrapper, same reason (2026-08-16).
-    assert "/home/" not in agg_embed_script, (
-        "the embed wrapper references a home-directory path, so the worker "
-        f"runs a working tree rather than a pinned store path:\n{agg_embed_script}"
-    )
-    # `--catchup`, not `--once`. One batch per 30-minute tick is ~three weeks
-    # before the last row is even attempted, and the symptom is a progress
-    # counter that advances just enough to look healthy.
-    assert "embed --catchup" in agg_embed_script, (
-        f"the embed worker no longer drains the backlog:\n{agg_embed_script}"
-    )
-
-    # START MUST RETURN WHILE THE WORKER KEEPS RUNNING. The real catch-up
-    # takes weeks. A foreground start blocks Home Manager activation, so probe
-    # the same systemctl lifecycle with a bounded sleeper.
-    workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user stop aggregator-embed.service'"
-    )
-    workstation.succeed(
-        "install -D -o jonathan -g users -m 0644 "
-        "${aggregatorEmbedBackgroundProbe} "
-        "/home/jonathan/.config/systemd/user/"
-        "aggregator-embed.service.d/background-probe.conf"
-    )
-    workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user daemon-reload'"
-    )
-    workstation.succeed(
-        "timeout 5 su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user start aggregator-embed.service'"
-    )
-    agg_embed_state = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user show aggregator-embed.service "
-        "-p ActiveState -p SubState -p MainPID'"
-    )
-    assert "ActiveState=active" in agg_embed_state, agg_embed_state
-    assert "SubState=running" in agg_embed_state, agg_embed_state
-    assert "MainPID=0" not in agg_embed_state, agg_embed_state
-    agg_embed_pid_before = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user show -P MainPID aggregator-embed.service'"
-    ).strip()
-    agg_embed_managed_target = workstation.succeed(
-        "readlink -f /home/jonathan/.config/systemd/user/aggregator-embed.service"
-    ).strip()
-    workstation.succeed(
-        "install -d -o jonathan -g users /tmp/sd-switch-old /tmp/sd-switch-new"
-    )
-    workstation.succeed(
-        "cp /home/jonathan/.config/systemd/user/aggregator-embed.service "
-        "/tmp/sd-switch-old/aggregator-embed.service && "
-        "cp /tmp/sd-switch-old/aggregator-embed.service "
-        "/tmp/sd-switch-new/aggregator-embed.service && "
-        "sed -i '/^\\[Service\\]/a Environment=DEPLOY_LIFECYCLE_PROBE=v2' "
-        "/tmp/sd-switch-new/aggregator-embed.service"
-    )
-    workstation.succeed(
-        "printf '%s\\n' '[Unit]' 'Description=Restart canary v1' '[Service]' "
-        "'Type=simple' 'Environment=CANARY_VERSION=v1' "
-        "'ExecStart=${pkgs.coreutils}/bin/sleep 300' "
-        ">/tmp/sd-switch-old/embed-restart-canary.service && "
-        "sed 's/v1/v2/g' /tmp/sd-switch-old/embed-restart-canary.service "
-        ">/tmp/sd-switch-new/embed-restart-canary.service && "
-        "chown jonathan:users /tmp/sd-switch-old/*.service "
-        "/tmp/sd-switch-new/*.service"
-    )
-    workstation.succeed(
-        "ln -sfn /tmp/sd-switch-old/embed-restart-canary.service "
-        "/home/jonathan/.config/systemd/user/embed-restart-canary.service && "
-        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
-        "systemctl --user daemon-reload && "
-        "systemctl --user start embed-restart-canary.service'"
-    )
-    canary_pid_before = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user show -P MainPID embed-restart-canary.service'"
-    ).strip()
-    workstation.succeed(
-        "ln -sfn /tmp/sd-switch-new/aggregator-embed.service "
-        "/home/jonathan/.config/systemd/user/aggregator-embed.service && "
-        "ln -sfn /tmp/sd-switch-new/embed-restart-canary.service "
-        "/home/jonathan/.config/systemd/user/embed-restart-canary.service && "
-        "chown -h jonathan:users "
-        "/home/jonathan/.config/systemd/user/aggregator-embed.service "
-        "/home/jonathan/.config/systemd/user/embed-restart-canary.service"
-    )
-    sd_switch_out = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "${pkgs.sd-switch}/bin/sd-switch --timeout 30000 "
-        "--old-units /tmp/sd-switch-old --new-units /tmp/sd-switch-new'"
-    )
-    print(f"[diag] embed sd-switch out={sd_switch_out!r}")
-    agg_embed_pid_after = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user show -P MainPID aggregator-embed.service'"
-    ).strip()
-    canary_pid_after = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user show -P MainPID embed-restart-canary.service'"
-    ).strip()
-    assert agg_embed_pid_after == agg_embed_pid_before, (
-        "Home Manager's sd-switch restarted active embed worker: "
-        f"{agg_embed_pid_before} -> {agg_embed_pid_after}; output={sd_switch_out!r}"
-    )
-    assert canary_pid_after != canary_pid_before, (
-        "negative control did not restart, so sd-switch did not exercise "
-        f"changed active units; output={sd_switch_out!r}"
-    )
-    workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user stop embed-restart-canary.service'"
-    )
-    workstation.succeed(
-        "timeout 10 su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user stop aggregator-embed.service'"
-    )
-    workstation.succeed(
-        f"ln -sfn {agg_embed_managed_target} "
-        "/home/jonathan/.config/systemd/user/aggregator-embed.service && "
-        "rm -f /home/jonathan/.config/systemd/user/embed-restart-canary.service && "
-        "chown -h jonathan:users "
-        "/home/jonathan/.config/systemd/user/aggregator-embed.service"
-    )
-    workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user daemon-reload'"
-    )
-
-    # THE SEED UNIT IS HUMAN-TRIGGERED, and must stay that way. It is the one
-    # path with network access and it pulls ~2.4 GB, so nothing may arm it.
-    #
-    # ASSERTED ON THE UNIT TEXT, not on `is-enabled`, and the difference bit
-    # once already. The ingest notifier above checks `is-enabled == "static"`,
-    # but that unit is a NixOS-level user unit living in /etc/systemd/user.
-    # These come from home-manager, which symlinks into
-    # ~/.config/systemd/user, and systemd reports an un-armed symlinked unit
-    # as "linked" — with EXIT CODE 1, which `succeed` treats as a failure
-    # before any comparison happens. Both spellings mean the same thing here
-    # ("no [Install] section, nothing pulls it in"), so the durable assertion
-    # is the absence of WantedBy itself.
-    agg_seed_unit = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user cat aggregator-embed-seed.service'"
-    )
-    assert "WantedBy=" not in agg_seed_unit, (
-        "aggregator-embed-seed.service carries an [Install] WantedBy, so some "
-        "target pulls it in — a ~2.4 GB download is not something to schedule "
-        f"implicitly:\n{agg_seed_unit}"
-    )
-    # Corroboration from systemd's own view. `|| true` because the un-armed
-    # answers ("linked", "static") exit non-zero; the assertion is that it is
-    # not the ARMED answer.
-    agg_seed_enabled = workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user is-enabled aggregator-embed-seed.service' || true"
-    ).strip()
-    assert agg_seed_enabled != "enabled", (
-        f"aggregator-embed-seed.service is armed (is-enabled={agg_seed_enabled!r}); "
-        f"it must be startable only by hand"
-    )
-    # The inverse of the worker's assertion: this unit is allowed online, and
-    # if it were not, the models could never arrive at all.
-    assert "HF_HUB_OFFLINE=0" in agg_seed_unit, (
-        "aggregator-embed-seed.service is not marked as the online unit, so "
-        f"nothing in this deployment can fetch the weights:\n{agg_seed_unit}"
+    agg_embed_left = [u for u in agg_all_units if u.startswith("aggregator-embed")]
+    assert not agg_embed_left, (
+        "embedding units are installed again; the backfill was removed on "
+        f"purpose (2026-10-12): {agg_embed_left}"
     )
 
     # Stop the timer before driving the unit by hand. The timer carries
