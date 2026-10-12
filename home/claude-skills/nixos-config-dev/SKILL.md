@@ -268,7 +268,6 @@ interactive VM. When in doubt, run it; the cost is cheap.
 | `docs (eval)` | Doc assertions |
 | `build tuxedo toplevel` | Tuxedo's system derivation builds |
 | `vm-minimal (<lane>)` | One job per lane in the matrix; an unchanged lane substitutes its cached result |
-| `vm-graphical` | Runs only when desktop files change |
 | `close-fork` | Skipped on non-fork PRs |
 
 Job names come from `.github/workflows/ci.yml`; `close-fork` from
