@@ -380,8 +380,17 @@ case "$cmd" in
     # child, not a competing job, so it must not queue behind it.
     top="$(NIX_MEMORY_COORDINATION_HELD=1 build_target toplevel "$host" "$flake" "$module")" ||
       die "build failed"
+    # The guest sees the host /nix/store, so the new system's files are
+    # already there, but its Nix database holds only the boot closure.
+    # Register the new closure first: activation (e.g. Home Manager's
+    # nix-store --realise of its generation) fails on unregistered paths,
+    # and a locked guest has no substituter to fetch them from.
+    log "registering $top in the guest store"
+    mapfile -t closure < <(nix-store -qR "$top")
+    nix-store --dump-db "${closure[@]}" |
+      ssh -p "$ssh_port" "${ssh_opts[@]}" jonathan@localhost "sudo nix-store --load-db" ||
+      die "could not register the new closure in the guest"
     log "activating $top"
-    # The guest sees the host /nix/store, so the new system is already there.
     exec ssh -p "$ssh_port" "${ssh_opts[@]}" jonathan@localhost \
       "sudo $top/bin/switch-to-configuration test"
     ;;

@@ -16,6 +16,8 @@
 #     multi-argument commands;
 #   - `apply` builds as a child of the VM's memory lock, not a competitor
 #     (otherwise it waits forever behind the VM it is meant to update);
+#   - `apply` registers the new closure in the guest's Nix database before
+#     activating it (the guest store is the host's, its database is not);
 #   - ssh to the VM checks its build-time host key (pinned known_hosts),
 #     so commands never run on some other listener on localhost:2222;
 #   - hostile host names are refused before they reach a nix attr path.
@@ -61,6 +63,14 @@ pkgs.runCommand "feature-vm-ctl-harness"
       *) echo $PWD/fakevm ;;
     esac
     EOF
+    cat > fakebin/nix-store <<EOF
+    #!/usr/bin/env bash
+    echo "nix-store \$*" >> $log
+    case "\$1" in
+      -qR) printf '%s\n' "\$2" /nix/store/fake-dep ;;
+      --dump-db) shift; echo "dump-db \$*" ;;
+    esac
+    EOF
     cat > fakebin/systemd-run <<'EOF'
     #!/usr/bin/env bash
     while [ "$1" != -- ]; do shift; done
@@ -83,6 +93,10 @@ pkgs.runCommand "feature-vm-ctl-harness"
       *feature-vm-agent/token*)
         cat >> "\$HOME/staged-token"
         exit \''${FAKE_STAGE_RC:-0}
+        ;;
+      *--load-db)
+        cat > "\$HOME/loaded-db"
+        exit \''${FAKE_LOAD_RC:-0}
         ;;
     esac
     exit \''${FAKE_SSH_RC:-0}
@@ -138,11 +152,23 @@ pkgs.runCommand "feature-vm-ctl-harness"
     fv run echo 'a b'
     grep -qx 'ssh echo a\\ b ' $log || fail "multi-arg run not quoted: $(tail -1 $log)"
 
-    # 4. apply builds under the VM's lock and activates the built system.
+    # 4. apply builds under the VM's lock, registers the new closure in the
+    #    guest's Nix database, then activates the built system.
     fv apply
     grep -q '^nix held=1 .*--argstr attr toplevel' $log ||
       fail "apply did not build the toplevel as a lock child"
-    grep -qx 'ssh sudo /nix/store/fake-toplevel/bin/switch-to-configuration test' $log || fail "apply did not activate"
+    grep -qx 'nix-store -qR /nix/store/fake-toplevel' $log || fail "apply did not query the new closure"
+    [ "$(cat $HOME/loaded-db)" = "dump-db /nix/store/fake-toplevel /nix/store/fake-dep" ] ||
+      fail "guest did not load the closure's registration: $(cat $HOME/loaded-db 2>&1)"
+    grep -A1 -x 'ssh sudo nix-store --load-db' $log |
+      grep -qx 'ssh sudo /nix/store/fake-toplevel/bin/switch-to-configuration test' ||
+      fail "apply did not activate right after registering the closure"
+
+    # A failed registration stops apply before activation.
+    : > $log
+    rc=0; FAKE_LOAD_RC=1 fv apply || rc=$?
+    [ $rc -ne 0 ] || fail "apply succeeded although the registration failed"
+    if grep -q switch-to-configuration $log; then fail "apply activated an unregistered closure"; fi
 
     # Every ssh to the VM checks the pinned key.
     if grep -qi 'StrictHostKeyChecking=\(n\)o' $log.ssh-args; then fail "an ssh call skips host key checking"; fi
