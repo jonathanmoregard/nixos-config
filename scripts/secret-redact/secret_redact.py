@@ -13,8 +13,8 @@ Invariants:
   given or writing an unreadable report, more than MAX_TARGETS distinct secrets, the
   timeout passing while findings are applied) exits 1 with one line on stderr that
   never quotes the input. Callers fail closed on any non-zero exit.
-- Each text is scanned alone, so a rule's keywords never cross texts; a secret found in
-  any text is redacted in every text of the call.
+- Each text is scanned and redacted alone: a rule's keywords never cross texts, and
+  batching never changes a text's result.
 - gitleaks reads everything: a header defeats its binary-type sniffing, every piece fits
   one gitleaks read, and its own read count is checked. Nothing in or around the input
   can silence a finding (no ignore files; gitleaks:allow is ignored).
@@ -76,10 +76,11 @@ def main(argv: list[str]) -> int:
         texts, timeout = _read_request(sys.stdin.buffer.read())
         deadline = time.monotonic() + timeout
         targets = find_secrets(texts, gitleaks=opts["--gitleaks"], rules=opts["--rules"], deadline=deadline)
-        if len(targets) > MAX_TARGETS:
-            raise Failure(f"{len(targets)} distinct secrets, more than the {MAX_TARGETS} redacted in time")
+        distinct = len(set().union(*targets))
+        if distinct > MAX_TARGETS:
+            raise Failure(f"{distinct} distinct secrets, more than the {MAX_TARGETS} redacted in time")
         counts: list[dict[str, int]] = [{} for _ in texts]
-        out = [redact(t, targets, c, deadline) for t, c in zip(texts, counts)]
+        out = [redact(t, found, c, deadline) for t, found, c in zip(texts, targets, counts)]
     except (Failure, getopt.GetoptError) as e:
         sys.stderr.write(f"secret-redact: {e}\n")
         return 1
@@ -104,28 +105,29 @@ def pieces(data: bytes) -> list[bytes]:
     return [data[i : i + PIECE_BYTES] for i in range(0, max(len(data) - OVERLAP_BYTES, 1), step)]
 
 
-def find_secrets(texts: list[str], *, gitleaks: str, rules: str, deadline: float) -> dict[str, str]:
-    """``{target string: rule id}`` over all texts. A target several rules hit gets the
+def find_secrets(texts: list[str], *, gitleaks: str, rules: str, deadline: float) -> list[dict[str, str]]:
+    """Per text, ``{target string: rule id}``. A target several rules hit gets the
     alphabetically first id, so the same input always gives the same markers."""
-    files = [HEADER + p for t in texts if t for p in pieces(t.encode("utf-8", "replace"))]
-    targets: dict[str, str] = {}
+    files = [(i, HEADER + p) for i, t in enumerate(texts) if t for p in pieces(t.encode("utf-8", "replace"))]
+    targets: list[dict[str, str]] = [{} for _ in texts]
 
-    def add(target: str, rule: str) -> None:
-        targets[target] = min(rule, targets.get(target, rule))
+    def add(i: int, target: str, rule: str) -> None:
+        targets[i][target] = min(rule, targets[i].get(target, rule))
 
     if files:
-        for finding, data in _run(gitleaks, rules, files, deadline - time.monotonic()):
+        for finding, n in _run(gitleaks, rules, [data for _, data in files], deadline - time.monotonic()):
+            owner, data = files[n]
             for target in _targets(finding, data):
                 if MARKER not in target:
-                    add(target, finding["RuleID"])
-    for text in texts:
+                    add(owner, target, finding["RuleID"])
+    for i, text in enumerate(texts):
         for block in _armored_blocks(text):
-            add(block, "private-key")
+            add(i, block, "private-key")
     return targets
 
 
-def _run(gitleaks: str, rules: str, files: list[bytes], timeout: float) -> list[tuple[dict, bytes]]:
-    """Each gitleaks finding over ``files`` with the file it is in, checked to be complete."""
+def _run(gitleaks: str, rules: str, files: list[bytes], timeout: float) -> list[tuple[dict, int]]:
+    """Each gitleaks finding over ``files`` with the index of its file, checked to be complete."""
     cmd = [gitleaks, "dir", "in", "--config", os.path.abspath(rules),
            "--report-format", "json", "--report-path", "-", "--exit-code", "0",
            "--no-banner", "--no-color", "--log-level", "info",
@@ -152,8 +154,10 @@ def _run(gitleaks: str, rules: str, files: list[bytes], timeout: float) -> list[
     if scanned is None or int(scanned[1]) < written:
         raise Failure(f"gitleaks read {scanned[1] if scanned else '?'} of {written} bytes")
     try:
-        return [(f, files[int(os.path.basename(f["File"]).removesuffix(".txt"))])
-                for f in json.loads(proc.stdout)]
+        report = [(f, int(os.path.basename(f["File"]).removesuffix(".txt"))) for f in json.loads(proc.stdout)]
+        if any(not 0 <= n < len(files) for _, n in report):
+            raise IndexError
+        return report
     except (ValueError, KeyError, TypeError, IndexError):
         raise Failure("gitleaks report was unreadable") from None
 

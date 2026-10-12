@@ -84,7 +84,9 @@ def redacted(texts, **kw) -> list[str]:
 
 
 def find(texts) -> dict[str, str]:
-    return sr.find_secrets(texts, gitleaks=sr.GITLEAKS, rules=sr.RULES, deadline=time.monotonic() + 120)
+    """All targets found in ``texts``, whichever text they were in."""
+    return {t: r for per_text in sr.find_secrets(texts, gitleaks=sr.GITLEAKS, rules=sr.RULES,
+                                                  deadline=time.monotonic() + 120) for t, r in per_text.items()}
 
 
 def fake_gitleaks(name: str, body: str) -> str:
@@ -110,9 +112,9 @@ check("a token becomes [REDACTED:<rule>:<n>chars], counted per text under its ru
       and out["counts"] == [{"gitlab-pat": 1}, {}], out)
 key = rand(31) + "k"
 TOKENS.append(key)
-a, b = redacted([f'api_key = "{key}"', f"later, bare: {key} ."])
-check("a secret found in one text is redacted in every text of the call",
-      key not in a and key not in b and "[REDACTED:" in b, [a, b])
+texts = [f'api_key = "{key}"', f"later, bare: {key} ."]
+check("each text is redacted alone: batching never changes a text's result",
+      redacted(texts) == [redacted([t])[0] for t in texts] and key not in redacted(texts)[0])
 
 # ----------------------------------------------------------------------
 section("fail closed: any fault exits 1, never echoing the input")
