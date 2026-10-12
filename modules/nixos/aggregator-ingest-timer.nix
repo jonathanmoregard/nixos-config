@@ -314,6 +314,13 @@ in
   systemd.user.services.aggregator-ingest = {
     description = "Aggregator: all-sources ingest";
     unitConfig.OnFailure = "aggregator-ingest-failure-notify.service";
+    # A switch must not restart this unit. Restarting a running oneshot means
+    # stop (SIGTERM, then SIGKILL after the stop timeout, which also fires
+    # OnFailure) plus a start job that completes only when the whole ingest
+    # does, and switch-to-configuration waits for it: on 2026-10-12 a deploy
+    # sat ~20 min behind one. Skipped instead, an in-flight run finishes on
+    # the old closure and the next timer tick runs the new one.
+    restartIfChanged = false;
     environment = {
       # Presence installs the aggregator's in-process notifier; the value
       # names the program. See the two-channel note in the header.
