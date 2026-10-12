@@ -100,14 +100,14 @@ section("the contract callers rely on")
 check("gitleaks and the rules are pinned store paths",
       sr.GITLEAKS.startswith("/nix/store/") and sr.RULES.startswith("/nix/store/") and os.path.isfile(sr.RULES))
 rc, out, err, _ = cli([])
-check("no texts: exit 0, nothing back", rc == 0 and out == {"texts": [], "counts": {}}, err)
+check("no texts: exit 0, nothing back", rc == 0 and out == {"texts": [], "counts": []}, err)
 benign = ["plain prose about keys and tokens", "", "commit 3f2a9c1 fixed the key rotation script"]
 check("benign texts come back unchanged", redacted(benign) == benign)
 t = tok()
-rc, out, err, _ = cli([f"A={t}\nnext line"])
-check("a token becomes [REDACTED:<rule>:<n>chars], counted under its rule",
-      rc == 0 and out["texts"] == [f"A=[REDACTED:gitlab-pat:{len(t)}chars]\nnext line"]
-      and out["counts"] == {"gitlab-pat": 1}, out)
+rc, out, err, _ = cli([f"A={t}\nnext line", "nothing here"])
+check("a token becomes [REDACTED:<rule>:<n>chars], counted per text under its rule",
+      rc == 0 and out["texts"] == [f"A=[REDACTED:gitlab-pat:{len(t)}chars]\nnext line", "nothing here"]
+      and out["counts"] == [{"gitlab-pat": 1}, {}], out)
 key = rand(31) + "k"
 TOKENS.append(key)
 a, b = redacted([f'api_key = "{key}"', f"later, bare: {key} ."])

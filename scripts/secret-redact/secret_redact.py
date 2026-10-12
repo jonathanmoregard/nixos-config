@@ -2,7 +2,7 @@
 """secret-redact: replace every secret in a list of texts, using a pinned gitleaks 8.30.
 
     stdin   {"texts": ["...", ...], "timeout": <seconds>}
-    stdout  {"texts": ["...", ...], "counts": {"<rule id>": <markers>, ...}}
+    stdout  {"texts": ["...", ...], "counts": [{"<rule id>": <markers>, ...}, ...]}  (one per text)
 
 A secret becomes ``[REDACTED:<rule id>:<n>chars]``. ``--gitleaks`` and ``--rules``
 exist for tests; callers never pass them.
@@ -78,8 +78,8 @@ def main(argv: list[str]) -> int:
         targets = find_secrets(texts, gitleaks=opts["--gitleaks"], rules=opts["--rules"], deadline=deadline)
         if len(targets) > MAX_TARGETS:
             raise Failure(f"{len(targets)} distinct secrets, more than the {MAX_TARGETS} redacted in time")
-        counts: dict[str, int] = {}
-        out = [redact(t, targets, counts, deadline) for t in texts]
+        counts: list[dict[str, int]] = [{} for _ in texts]
+        out = [redact(t, targets, c, deadline) for t, c in zip(texts, counts)]
     except (Failure, getopt.GetoptError) as e:
         sys.stderr.write(f"secret-redact: {e}\n")
         return 1

@@ -2,7 +2,7 @@
 # Claude Code output hooks (~/.claude) and the aggregator's ingest. Both call
 # this CLI instead of carrying their own copy of the gitleaks handling.
 #
-# stdin {"texts": [...], "timeout": s} -> stdout {"texts": [...], "counts": {...}};
+# stdin {"texts": [...], "timeout": s} -> stdout {"texts": [...], "counts": [{...}, ...]};
 # any failure exits non-zero and the caller fails closed. The contract and its
 # invariants are in scripts/secret-redact/secret_redact.py.
 #
