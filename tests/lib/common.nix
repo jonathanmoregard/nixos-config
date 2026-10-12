@@ -165,11 +165,6 @@ let
     home-manager = {
       useGlobalPkgs = true;
       useUserPackages = true;
-      # Passed even though no per-lane HM entrypoint imports the aggregator
-      # module today: an unused specialArg costs nothing, and a lane that
-      # starts importing it should not fail with an unrelated "called
-      # without required argument" error.
-      extraSpecialArgs = { inherit (inputs) aggregator-src; };
       users.jonathan = import hm;
     };
 
