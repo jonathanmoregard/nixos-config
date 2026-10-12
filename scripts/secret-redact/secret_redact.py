@@ -48,12 +48,8 @@ OVERLAP_BYTES = 16_000
 MIN_SECRET_CHARS = 8
 # Each distinct secret costs one pass over the texts; 1,000 passes over 8 MB take ~1 s.
 MAX_TARGETS = 1000
-# Decoded findings report the DECODED secret; the encoded runs on that line are what to redact.
-ENCODED_RUN = re.compile(r"[A-Za-z0-9+/=_%\-]{16,}")
 # A target containing a marker is a match on an earlier redaction: dropping it keeps reruns stable.
 MARKER = "[REDACTED:"
-# An existing marker on a decoded line is not an encoded run (its rule id could look like one).
-MARKER_SPAN = re.compile(r"\[REDACTED:[^\]\n]*\]")
 # Armor lines of a private key (PEM, OpenSSH, PGP); bounded, so finding them is linear.
 ARMOR = re.compile(r"-----(BEGIN|END)[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----")
 # gitleaks' log line with its own read count.
@@ -166,16 +162,35 @@ def _targets(finding: dict, data: bytes) -> list[str]:
     """The strings in the scanned file ``data`` that redact this finding."""
     try:
         if any(str(tag).startswith("decoded:") for tag in finding.get("Tags") or ()):
-            lines = data.decode("utf-8", "replace").split("\n")
-            n = finding["StartLine"] - 1
-            if not 0 <= n < len(lines):
-                raise Failure("gitleaks placed a decoded finding outside its file")
-            return ENCODED_RUN.findall(MARKER_SPAN.sub(" ", lines[n]))
+            return [_encoded_span(finding, data)]
         secret = finding.get("Secret") or ""
         target = secret if len(secret) >= MIN_SECRET_CHARS else finding.get("Match") or secret
     except (KeyError, TypeError, AttributeError):
         raise Failure("gitleaks report was unreadable") from None
     return [target] if isinstance(target, str) and target else []
+
+
+def _encoded_span(finding: dict, data: bytes) -> str:
+    """The encoded text a decoded finding (base64, hex, percent, unicode escapes) came
+    from, cut from ``data`` at gitleaks' own coordinates. Those are 1-based byte columns,
+    shifted one further right on every line after the first; HEADER keeps every finding
+    off line 1. Any finding that cannot be placed exactly is a Failure."""
+    line, start, end = finding["StartLine"], finding["StartColumn"] - 2, finding["EndColumn"] - 1
+    lines = data.split(b"\n")
+    if line < 3 or finding.get("EndLine") != line or line > len(lines):
+        raise Failure("gitleaks placed a decoded finding outside its line")
+    text = lines[line - 1]
+    # A rule's boundary character can be the newline just before or after the line.
+    if start == -1:
+        start = 0
+    if end == len(text) + 1:
+        end = len(text)
+    if not 0 <= start < end <= len(text):
+        raise Failure("gitleaks placed a decoded finding outside its line")
+    try:
+        return text[start:end].decode("utf-8")
+    except UnicodeDecodeError:
+        raise Failure("gitleaks placed a decoded finding inside a character") from None
 
 
 def _armored_blocks(text: str) -> list[str]:

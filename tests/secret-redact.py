@@ -19,8 +19,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 
 CLI, SH = sys.argv[1], sys.argv[2]
+RULES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(CLI))), "share", "secret-redact",
+                          "secret-rules.toml")
 _loader = importlib.machinery.SourceFileLoader(
     "secret_redact", os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(CLI))), "lib", "secret_redact.py"))
 sr = importlib.util.module_from_spec(importlib.util.spec_from_loader("secret_redact", _loader))
@@ -62,6 +65,10 @@ def tok(kind: str = "gitlab") -> str:
         "fireworks": lambda: "fw_" + rand(24),
         "tavily": lambda: "tv" + "ly-dev-" + rand(32),
         "oauth": lambda: "sk-" + "ant-oat01-" + rand(95) + "AA",
+        "cloudflare": lambda: "cf" + "ut_" + rand(40) + rand(8, "0123456789abcdef"),
+        "cloudflare-global": lambda: "cf" + "k_" + rand(40) + rand(8, "0123456789abcdef"),
+        "gocspx": lambda: "GOC" + "SPX-" + rand(28),
+        "short-classic": lambda: "gh" + "p_" + rand(20),
     }[kind]()
     TOKENS.append(value)
     return value
@@ -249,6 +256,41 @@ for label, text in (("inside a word", "task-" + rand(30)), ("mid-base64", b64(30
                     ("a short identifier", "test_github" + "_pat_redacted")):
     check(f"known-prefix-token: does NOT fire {label}", "known-prefix-token" not in hits(text))
 
+# Distinct tokens next to each other: a rule must not consume the character the
+# next match needs as its own boundary. Every custom rule in secret-rules.toml.
+for rule_kind in ("fireworks", "tavily", "oauth", "cloudflare", "cloudflare-global", "gocspx", "short-classic"):
+    for sep_label, sep in (("space", " "), ("comma", ","), ("newline", "\n")):
+        three = [tok(rule_kind) for _ in range(3)]
+        out = redacted([sep.join(three)])[0]
+        check(f"{rule_kind}: three distinct tokens separated by {sep_label}: none survives",
+              not any(t in out for t in three), out[:200])
+# The same, rule by rule: each custom rule alone (so no other rule can mask it).
+RULE_TOKENS = {"fireworks-api-key": "fireworks", "tavily-api-key": "tavily", "anthropic-oauth-token": "oauth",
+               "cloudflare-api-token-v2": "cloudflare", "cloudflare-global-api-key-v2": "cloudflare-global",
+               "google-oauth-client-secret": "gocspx", "known-prefix-token": "short-classic"}
+with open(RULES_FILE, "rb") as fh:
+    custom = {r["id"]: r for r in tomllib.load(fh)["rules"]}
+check("every custom rule has an adjacency case", set(custom) == set(RULE_TOKENS) | {"private-key-tail"},
+      sorted(set(custom) ^ (set(RULE_TOKENS) | {"private-key-tail"})))
+for rule_id, kind in RULE_TOKENS.items():
+    only = os.path.join(SCRATCH, f"only-{rule_id}.toml")
+    rule = custom[rule_id]
+    with open(only, "w", encoding="utf-8") as fh:
+        fh.write(f'title = "{rule_id} only"\n[[rules]]\nid = "{rule_id}"\n'
+                 f"regex = '''{rule['regex']}'''\nkeywords = {json.dumps(rule['keywords'])}\n")
+    for sep_label, sep in (("space", " "), ("comma", ","), ("newline", "\n")):
+        three = [tok(kind) for _ in range(3)]
+        rc, out, err, _ = cli([sep.join(three)], args=("--rules", only))
+        got = out["texts"][0] if out else err
+        check(f"{rule_id} alone: three distinct tokens separated by {sep_label}: none survives",
+              rc == 0 and not any(t in got for t in three), got[:200])
+check("fireworks-api-key: an over-long fw_ run (a blob, not a key) does not fire",
+      "fireworks-api-key" not in hits(f"x fw_{rand(80)} y"))
+tails = ["\n".join(key_lines[i * 10:(i + 1) * 10]) + "\nAb3+/x==\n-----END RSA " + "PRIVATE KEY-----" for i in range(3)]
+out = redacted(["\n".join(tails)])[0]
+check("private-key-tail: three END-only tails in a row: no body line survives",
+      not any(line in out for line in key_lines[:30]), out[:200])
+
 # ----------------------------------------------------------------------
 section("findings: decoded runs, idempotency")
 gh = tok("github")
@@ -259,8 +301,30 @@ check("a decoded finding redacts the encoded run on its line, nothing else",
 gx = "GOC" + "SPX-" + rand(28)
 TOKENS.append(gx)
 out = redacted([f"Authorization: Basic {encoded} {gx}"])[0]
-check("a marker next to a decoded run is not taken for an encoded run",
-      "[REDACTED:[REDACTED:" not in out and out.count("[REDACTED:") == 2, out)
+check("a decoded run next to a plain token: both redacted, never a marker inside a marker",
+      "[REDACTED:[REDACTED:" not in out and encoded not in out and gx not in out, out)
+# Every encoding gitleaks decodes: the encoded span it reports is what goes,
+# placed by gitleaks' own coordinates (byte columns, so non-ASCII before it too).
+for label, encode in (
+        ("base64", lambda v: base64.b64encode(f"x={v}".encode()).decode()),
+        ("hex", lambda v: f"x={v}".encode().hex()),
+        ("percent", lambda v: "".join(f"%{b:02x}" for b in f"x={v}".encode())),
+        ("unicode escapes", lambda v: "".join(f"\\u{ord(c):04x}" for c in v))):
+    secret = tok("github")
+    enc = encode(secret)
+    for where, text in (("alone", f"value: {enc} tail"),
+                        ("after non-ASCII text", f"ééé日本 {enc} tail"),
+                        ("next to a plain token", f"{enc} and {tok('github')} end")):
+        rc, out, err, _ = cli([text])
+        got = out["texts"][0] if out else ""
+        check(f"{label}-encoded token {where}: the encoded span is redacted and counted",
+              rc == 0 and enc not in got and secret not in got and out["counts"][0]
+              and got.endswith((" tail", " end")), err or got)
+rc, _, err, _ = cli(["value " + rand(30)], args=("--gitleaks", fake_gitleaks(
+    "badcols", "echo '[{\"File\": \"in/0.txt\", \"RuleID\": \"x\", \"Tags\": [\"decoded:base64\"],"
+    " \"StartLine\": 3, \"EndLine\": 3, \"StartColumn\": 500, \"EndColumn\": 900}]';"
+    " echo 'INF scanned ~999999999 bytes' >&2")))
+check("a decoded finding gitleaks places outside its line: exit 1", rc == 1 and "decoded" in err, err)
 mixed = [f"key {tok()} and {gh}\n{encoded}", f"Authorization: Basic {encoded} {gx}", big[:5000]]
 once = redacted(mixed)
 check("redacting the output again changes nothing (idempotent)", redacted(once) == once)
