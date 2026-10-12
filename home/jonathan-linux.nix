@@ -707,7 +707,9 @@ in
   # (permission-ledger injection pass, RSI research cron). Without it those
   # passes report "unavailable" and emit samples unscanned.
   # See overlays/prompt-injection-scan.nix.
-  home.packages = [ pkgs.prompt-injection-scan ];
+  # secret-redact: the ~/.claude output hooks call it on every tool result and
+  # withhold the result when it is missing. See overlays/secret-redact.nix.
+  home.packages = [ pkgs.prompt-injection-scan pkgs.secret-redact ];
 
   # User crontab — declarative source of truth. Re-applied on every rebuild
   # (overwrites any ad-hoc `crontab -e` edits).
