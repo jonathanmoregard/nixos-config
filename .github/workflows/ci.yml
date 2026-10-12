@@ -209,6 +209,12 @@ jobs:
       # expiry. Tiny runCommand — seconds.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.signal-expiry -L
+      # secret-redact contract (tests/secret-redact.nix): the built CLI
+      # with its pinned gitleaks — every gitleaks quirk it handles, every
+      # fail-closed exit, and the redaction the ~/.claude output hooks and
+      # aggregator ingest rely on. runCommand — under a minute.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.secret-redact -L
       # kitty session save/restore script contracts
       # (tests/kitty-scripts.nix): the single-line session-stub
       # invariant, pane 0's notice surviving as an argv element, grid
