@@ -2226,7 +2226,9 @@ in
     # becomes an unbounded "activating"). The OnFailure edge is exercised
     # behaviourally further down.
     assert "GH_TOKEN=" not in agg_unit, (
-        f"aggregator unit must not inject a token ahead of gh's keyring:\n{agg_unit}"
+        "aggregator unit must not inject a token: the App wrapper on its PATH "
+        "loads the rotating host token at exec time, and an explicit GH_TOKEN "
+        f"passes through it untouched, shadowing that and expiring on its own:\n{agg_unit}"
     )
     assert "github-readonly-pat" not in agg_unit, (
         f"aggregator unit still references the retired agenix copy:\n{agg_unit}"
@@ -2287,8 +2289,9 @@ in
     assert "uv run" not in agg_script, (
         f"aggregator wrapper must not shell out to `uv run`:\n{agg_script}"
     )
-    # GitHub authentication belongs to gh's keyring. A copied token in the
-    # wrapper would expire independently and shadow that live credential.
+    # GitHub authentication belongs to the App-token gh wrapper on PATH
+    # (home/gh-host-token.nix), which loads the rotating host token at exec.
+    # A copied token in this wrapper would expire independently and shadow it.
     assert "GH_TOKEN" not in agg_script, (
         f"aggregator wrapper must not export a copied GitHub token:\n{agg_script}"
     )
@@ -2308,6 +2311,29 @@ in
     agg_cli = agg_exec_lines[0].split()[1].strip("'\"")
     assert agg_cli.startswith("/nix/store/"), (
         f"aggregator wrapper execs {agg_cli!r}, which is not a store path:\n{agg_script}"
+    )
+
+    # The `gh` this unit resolves is the GitHub App wrapper
+    # (home/gh-host-token.nix), proven by behaviour rather than by naming a
+    # store path: run it from the unit's own PATH, as jonathan, in a HOME
+    # that holds no host token, and it must refuse with the wrapper's
+    # message — not fall through to pkgs.gh and whatever credential the
+    # keyring holds (the founder's PAT until it is revoked). Together with
+    # the GH_TOKEN bans above this is the "ingest can never reach GitHub as
+    # the founder" guarantee; a `runtimeInputs = [ pkgs.gh ... ]` regression
+    # passes every assertion before this one.
+    m = _re.search(r'^export PATH="([^"]*?)(?::\$PATH)?"', agg_script, _re.M)
+    assert m, f"aggregator wrapper has no runtimeInputs PATH line:\n{agg_script}"
+    agg_path = m.group(1)
+    dellan.succeed("install -d -m 0700 -o jonathan /run/aggregator-empty-home")
+    gh_no_token = dellan.fail(
+        "su - jonathan -c 'env -u GH_TOKEN -u GITHUB_TOKEN "
+        f"HOME=/run/aggregator-empty-home PATH={agg_path} gh auth status' 2>&1"
+    )
+    assert "GitHub App host token" in gh_no_token, (
+        "the gh on aggregator-ingest's PATH did not fail closed without a host "
+        "token, so it is not the App wrapper and the keyring PAT is reachable "
+        f"from the ingest unit:\n{gh_no_token}"
     )
 
     # Same ban on the unit body — narrower wording because a future
@@ -3319,12 +3345,13 @@ in
 
     agg_baseline = agg_notify_count()
 
-    # (1) The real generated wrapper, invoked directly without any gh
-    # keyring. Supply the same CA environment as the production unit so this
-    # probe reaches authentication instead of stopping at the wrapper's TLS
-    # preflight. It must run the source-isolated all-sources pipeline, report
-    # GitHub's authentication failure, and exit non-zero rather than treating
-    # an empty API result as success.
+    # (1) The real generated wrapper, invoked directly with no GitHub App
+    # host token (the VM mints none) and no gh keyring either. Supply the
+    # same CA environment as the production unit so this probe reaches the
+    # GitHub source instead of stopping at the wrapper's TLS preflight. It
+    # must run the source-isolated all-sources pipeline, report GitHub as
+    # failed (the App wrapper refuses before gh runs), and exit non-zero
+    # rather than treating an empty API result as success.
     dellan.succeed("install -d -m 0755 /run/aggregator-empty-gh-config")
     agg_auth_failure = dellan.fail(
         "su - jonathan -c 'env -u GH_TOKEN -u GITHUB_TOKEN "
@@ -3344,11 +3371,11 @@ in
         "github: added=0 updated=0 unchanged=0 skipped=0 errors=4"
         in agg_auth_failure
     ), (
-        "wrapper must report GitHub as failed when gh has no credential, "
+        "wrapper must report GitHub as failed when there is no App host token, "
         f"while still completing the isolated run:\n{agg_auth_failure}"
     )
 
-    # (2) The real unit, unmodified, taking that same no-keyring path: a
+    # (2) The real unit, unmodified, taking that same no-token path: a
     # non-zero ExecStart must fail the unit and fire the notifier.
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -3362,7 +3389,7 @@ in
         f"aggregator-ingest.service should be failed without gh auth; "
         f"got is-failed={agg_state!r}"
     )
-    wait_agg_notify(agg_baseline, "the real wrapper's no-keyring failure")
+    wait_agg_notify(agg_baseline, "the real wrapper's no-token failure")
     agg_baseline = agg_notify_count()
     dellan.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
