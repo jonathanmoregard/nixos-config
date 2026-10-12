@@ -36,12 +36,13 @@
 #
 # GitHub auth is the GitHub App host token (home/gh-host-token.nix): the `gh`
 # on this unit's PATH is that fail-closed wrapper, not pkgs.gh. It reads
-# ~/.cache/gh-tokens/host/token (minted every 20 min by gh-token.service) at
-# exec time and refuses when the file is missing or stale — there is NO
-# fallback to gh's keyring, which holds the founder's PAT until that is
-# revoked. The unit itself must not export a copied token: an explicit
-# GH_TOKEN passes through the wrapper untouched, so a copy here would shadow
-# the rotating token and expire independently. The packaged aggregator
+# ~/.cache/gh-tokens/host[/<owner>]/token (minted every 20 min by
+# gh-token.service) at exec time and refuses when the file is missing or
+# stale — there is NO fallback to gh's keyring, which holds the founder's PAT
+# until that is revoked. The unit itself must not export a copied token: an
+# explicit GH_TOKEN passes through the wrapper untouched, so a copy here would
+# shadow the rotating token, skip the per-owner choice, and expire
+# independently. The packaged aggregator
 # constrains every GitHub subprocess to `gh api --method GET` and validates
 # each path against its fixed search-endpoint capability before spawning gh,
 # so the App's write permissions cannot turn this reader into a write path.
