@@ -153,7 +153,7 @@
     # `pkgs.writeReferencesToFile` which has been removed in current
     # nixpkgs. flake.lock pins the exact SHA so the build remains
     # reproducible; bumping via `nix flake update microvm` is a
-    # deliberate PR with a re-run dellan-vm test.
+    # deliberate PR with a re-run vm-microvm lane.
     microvm.url = "github:astro/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -225,34 +225,42 @@
       ];
     };
 
-    # Daily-driver workstation: a hosts/<name>/default.nix (hardware +
-    # identity, importing profiles/workstation) plus the flake-level
-    # modules every workstation shares. A replacement laptop is one more
-    # `mkWorkstation ./hosts/<name>/default.nix`.
+    # The daily driver. The VM test harness boots this host's configuration
+    # (tests/lib/workstation-vm.nix) and the drift-gate checks below read
+    # what it deploys. Moving to a new laptop: add its hosts/<name>, give it
+    # a nixosConfigurations entry, and change this one line.
+    primaryHost = "tuxedo";
+
+    # The flake-level modules every workstation shares, around its
+    # hosts/<name>/default.nix (hardware + identity, importing
+    # profiles/workstation). The VM harness imports the same list.
+    workstationModules = [
+      ./modules/common.nix
+      agenix.nixosModules.default
+      agenix-rekey.nixosModules.default
+      { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
+      microvm.nixosModules.host
+      home-manager.nixosModules.home-manager
+      {
+        home-manager.useGlobalPkgs = true;
+        home-manager.useUserPackages = true;
+        # `aggregator-src` reaches the home config because
+        # home/aggregator-embed.nix imports the embed timer straight from
+        # the pinned source tree rather than re-declaring it here. See that
+        # file for why the units are not vendored.
+        home-manager.extraSpecialArgs = { inherit aggregator-src; };
+        home-manager.users.jonathan = import ./home/jonathan-linux.nix;
+      }
+    ];
+
+    # A replacement laptop is one more `mkWorkstation ./hosts/<name>/default.nix`.
     mkWorkstation = hostModule: nixpkgs.lib.nixosSystem {
       system = linuxSystem;
       pkgs = pkgsLinux;
       specialArgs = { inherit microvm; };
-      modules = [
-        hostModule
-        ./modules/common.nix
-        agenix.nixosModules.default
-        agenix-rekey.nixosModules.default
-        { environment.systemPackages = [ agenix.packages.${linuxSystem}.default ]; }
-        microvm.nixosModules.host
-        home-manager.nixosModules.home-manager
-        {
-          home-manager.useGlobalPkgs = true;
-          home-manager.useUserPackages = true;
-          # `aggregator-src` reaches the home config because
-          # home/aggregator-embed.nix imports the embed timer straight from
-          # the pinned source tree rather than re-declaring it here. See that
-          # file for why the units are not vendored.
-          home-manager.extraSpecialArgs = { inherit aggregator-src; };
-          home-manager.users.jonathan = import ./home/jonathan-linux.nix;
-        }
-      ];
+      modules = [ hostModule ] ++ workstationModules;
     };
+    primaryConfig = self.nixosConfigurations.${primaryHost}.config;
   in {
     # NixOS VM (headless, QEMU/KVM)
     nixosConfigurations.vm = nixpkgs.lib.nixosSystem {
@@ -298,6 +306,11 @@
           pkgs = pkgsLinux;
           inputs = {
             inherit nixpkgs home-manager agenix agenix-rekey microvm aggregator-src;
+            # What the full-host lanes boot: tests/lib/workstation-vm.nix.
+            workstation = {
+              host = primaryHost;
+              modules = workstationModules;
+            };
           };
         };
       in {
@@ -388,7 +401,7 @@
           sweepScript = import ./home/worktree-sweep-script.nix { pkgs = pkgsLinux; };
           # Drift gate: the harness asserts the deployed user unit execs
           # exactly the derivation under test.
-          deployedExecStart = self.nixosConfigurations.dellan.config
+          deployedExecStart = primaryConfig
             .home-manager.users.jonathan
             .systemd.user.services.worktree-sweep.Service.ExecStart;
         };
@@ -400,23 +413,23 @@
         # still owns the real-X topology proof.
         kitty-scripts = import ./tests/kitty-scripts.nix {
           pkgs = pkgsLinux;
-          # Drift gate: exercises the packages dellan installs.
-          hmPackages = self.nixosConfigurations.dellan.config
+          # Drift gate: exercises the packages the primary host installs.
+          hmPackages = primaryConfig
             .home-manager.users.jonathan.home.packages;
-          # The rc pair dellan really deploys — omz, p10k, autosuggest,
+          # The rc pair the primary host really deploys — omz, p10k, autosuggest,
           # syntax-highlighting and `_claude_slice`, in that order.
           # The restored-claude launcher sources this file from a
           # NON-interactive zsh, so phase L drives it rather than a
           # synthetic stand-in; a rc change that stops defining
           # `_claude_slice` in that shell fails the lane instead of
           # silently un-confining every restored Claude Code pane.
-          deployedZshrc = self.nixosConfigurations.dellan.config
+          deployedZshrc = primaryConfig
             .home-manager.users.jonathan.home.file."./.zshrc".source;
           # Read by EVERY zsh, interactive or not, and where ZSH /
           # ZSH_CACHE_DIR / the PATH the launcher resolves `claude` on
           # come from — so the rc above only behaves like the deployed
           # one with it in place.
-          deployedZshenv = self.nixosConfigurations.dellan.config
+          deployedZshenv = primaryConfig
             .home-manager.users.jonathan.home.file."./.zshenv".source;
         };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
@@ -425,7 +438,7 @@
         secrets-no-dead-credentials = import ./tests/secrets-no-dead-credentials.nix {
           pkgs = pkgsLinux;
           declaredSecrets = builtins.attrNames
-            self.nixosConfigurations.dellan.config.age.secrets;
+            primaryConfig.age.secrets;
         };
         # Not a VM lane: runs the `offline-ai` wrapper and library server
         # tuxedo deploys against a stub model server and a fixture archive —
@@ -477,7 +490,7 @@
         # preflight, dup-refuse, happy-path insertion, and KEY=VALUE
         # stripping under TEST_MODE=1 (which skips the network / eval /
         # gh steps that a nix sandbox can't run). Drift-gated: pulls
-        # the add-secret derivation out of dellan's
+        # the add-secret derivation out of the primary host's
         # environment.systemPackages and asserts its store path equals
         # the one we smoke. If profiles/workstation swaps it for anything else,
         # the check fails.
@@ -485,13 +498,13 @@
         add-secret-smoke =
           let
             addSecretPkg = import ./home/add-secret.nix { pkgs = pkgsLinux; };
-            dellanPkgs = self.nixosConfigurations.dellan.config
+            hostPkgs = primaryConfig
               .environment.systemPackages;
             matches = builtins.filter
-              (p: (p.name or "") == "add-secret") dellanPkgs;
+              (p: (p.name or "") == "add-secret") hostPkgs;
           in
             if matches == []
-            then throw "add-secret not on dellan's PATH — did environment.systemPackages get pruned?"
+            then throw "add-secret not on ${primaryHost}'s PATH — did environment.systemPackages get pruned?"
             else import ./tests/add-secret-smoke.nix {
               pkgs = pkgsLinux;
               inherit addSecretPkg;
@@ -516,8 +529,8 @@
         security-batch-research-agent = import ./tests/security-batch-research-agent.nix {
           pkgs = pkgsLinux;
           runnerScript = ./modules/nixos/security-batch/research-agent.sh;
-          # Drift gate: the package dellan deploys.
-          runnerPackage = self.nixosConfigurations.dellan.config
+          # Drift gate: the package the primary host deploys.
+          runnerPackage = primaryConfig
             .services.securityBatch.research-agent.script;
         };
         signal-expiry = import ./tests/signal-expiry.nix {
