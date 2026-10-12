@@ -210,7 +210,6 @@ in
     # process owns the real tool server and model state exactly once.
     makeWrapper "${venv}/bin/aggregator-mcp" "$out/bin/aggregator-mcp-backend" \
       --prefix PYTHONPATH : "${spacyModel}/${python.sitePackages}" \
-      --prefix PATH : "${final.secret-redact}/bin" \
       --unset AGGREGATOR_MCP_BACKEND_URL \
       --set FASTMCP_TRANSPORT "http" \
       --set FASTMCP_HOST "127.0.0.1" \
