@@ -133,7 +133,6 @@ Adding a new test: drop `tests/<feature>.nix` (use existing files as templates),
 | `build dellan toplevel` | Builds `nixosConfigurations.dellan.config.system.build.toplevel` |
 | `build tuxedo toplevel` | Builds `nixosConfigurations.tuxedo.config.system.build.toplevel` after dellan, reusing its store snapshot; pushes to cachix for tuxedo's auto-deploy |
 | `vm-minimal (<lane>)` | Ephemeral VM e2e test; one matrix lane per `tests/<feature>.nix` (base / desktop / keyring / kitty / claude-pane) |
-| `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |
 
 Branch protection: required status checks (above) are the gate. No required review on this solo-author repo. All `gh pr merge` invocations (including no flags) are denied at the safe-bash MCP layer — merges happen via the GitHub UI's merge button so the click is a deliberate gesture, not a CLI autopilot path past the checks.
 
