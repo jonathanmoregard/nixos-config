@@ -189,8 +189,11 @@ in
     # has to land in this same bin/ or the packaged tier never exists and the
     # hook falls back to guessing at a checkout. The spaCy PYTHONPATH is
     # irrelevant to it (stdlib-only by contract) and harmless.
+    # secret-redact on PATH: ingest (and `aggregator rescrub`) scrub through it
+    # and fail closed without it; a systemd unit's PATH is too minimal to rely on.
     makeWrapper "${venv}/bin/aggregator" "$out/bin/aggregator" \
-      --prefix PYTHONPATH : "${spacyModel}/${python.sitePackages}"
+      --prefix PYTHONPATH : "${spacyModel}/${python.sitePackages}" \
+      --prefix PATH : "${final.secret-redact}/bin"
 
     # Keep the command path every Claude/Codex manifest and schema-health
     # probe already resolves, but make each pane a small stdio transport
