@@ -3317,12 +3317,19 @@ in
         "wrapper's network wait did not report the offline path:\n"
         f"{agg_auth_failure}"
     )
-    assert (
-        "github: added=0 updated=0 unchanged=0 skipped=0 errors=4"
-        in agg_auth_failure
-    ), (
+    # Every GitHub call fails and nothing is written. The error count is the
+    # aggregator's own query list, so it is matched, not hard-coded: a pin
+    # bump that adds or drops a query must not fail this lane.
+    m_gh = _re.search(
+        r"github: added=0 updated=0 unchanged=0 skipped=0 errors=(\d+)",
+        agg_auth_failure,
+    )
+    assert m_gh and int(m_gh.group(1)) >= 1, (
         "wrapper must report GitHub as failed when there is no App host token, "
         f"while still completing the isolated run:\n{agg_auth_failure}"
+    )
+    assert "source=github phase=end status=failed" in agg_auth_failure, (
+        f"the aggregator must mark the GitHub source failed, not finished:\n{agg_auth_failure}"
     )
 
     # (2) The real unit, unmodified, taking that same no-token path: a
