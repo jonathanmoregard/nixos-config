@@ -23,6 +23,11 @@ let
   };
 in
 {
+  # The `aggregator` CLI and the stdio `aggregator-mcp` proxy every pane
+  # launches (~/.claude.json names /etc/profiles/per-user/jonathan/bin/aggregator-mcp).
+  # The same `pkgs.aggregator` the ingest timer and this backend exec.
+  home.packages = [ pkgs.aggregator ];
+
   systemd.user.tmpfiles.rules = [
     "d %h/.local/share/aggregator 0700 - - -"
   ];
@@ -44,8 +49,9 @@ in
       Restart = "on-failure";
       RestartSec = "5s";
 
-      # Query backend is restartable and owns no ingest/embed claim. Bound its
-      # model state; unlike the embed worker, a hard kill cannot poison a row.
+      # Query backend is restartable and owns no ingest claim, so a hard kill
+      # cannot poison a row. Bound its model state (an opt-in rerank=True
+      # query loads the cross-encoder in-process).
       MemoryAccounting = true;
       MemoryHigh = "6G";
       MemoryMax = "8G";

@@ -171,8 +171,8 @@ let
   # carry ConditionPathExists=!<marker>, one line per model (below), because a
   # `nixos-rebuild switch` restarts every enabled unit it finds stopped and
   # a timer tick starts its service: measured 2026-10-02, a deploy brought
-  # the embed server back into the model's memory three minutes after it
-  # had given way.
+  # a stopped background server back into the model's memory three minutes
+  # after it had given way.
   evictSystem = [
     "research-agent-healthcheck.timer"
     "scraper-healthcheck.timer"
@@ -181,16 +181,9 @@ let
   ];
   evictUser = [
     "aggregator-ingest.timer"
-    # The embed timer first: its worker Wants= the embed server and would
-    # start it again on the next tick.
-    "aggregator-embed.timer"
     "router-ingestor-scan.timer"
     "router-ingestor.service"
     "voquill.service"
-    # The embed worker, then the llama-server it talks to (iGPU; it has held
-    # 15 GB of GTT after a big batch, which is what thrashed the model).
-    "aggregator-embed.service"
-    "aggregator-embed-server.service"
     # local-stt.nix: the router first, then the three models behind it (~3 GB).
     "local-stt.service"
     "local-stt-general.service"
@@ -203,8 +196,6 @@ let
   # to any ConditionPathExists= the unit already has.
   gatedUserServices = [
     "aggregator-ingest.service"
-    "aggregator-embed.service"
-    "aggregator-embed-server.service"
     "router-ingestor.service"
     "router-ingestor-scan.service"
     "voquill.service"
