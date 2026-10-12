@@ -194,7 +194,7 @@ Pre-push checklist:
 
 **The `Behavioural evidence` field is what historically went hollow.** Quote the actual command + observed output that proves the runtime path works. **User-realistic = what the user does** (run, press, hit), not what activates around it. `systemctl is-active` proves the unit is loaded; it does not prove the feature works. Valid examples:
 
-- `nix run .#feature-vm; ssh -p 2222 jonathan@localhost 'systemctl is-active research-agent'; curl localhost:8080/health → 200`
+- `nix run .#feature-vm -- --trusted up; nix run .#feature-vm -- run 'systemctl is-active research-agent; curl -s localhost:8080/health' → 200`
 - `xvfb-run kitty; xdotool key ctrl+shift+c; xclip -o -selection clipboard → "foo" (no trailing \n)`
 - "hardware-only change (touchpad palm rejection); cannot model in VM; will verify on real host after auto-deploy with `nixos-rebuild switch --rollback` ready"
 
