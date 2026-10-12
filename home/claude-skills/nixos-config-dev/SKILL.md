@@ -229,6 +229,11 @@ The non-VM lanes run in seconds; the `vm-*` lanes boot a machine. When a
 change spans areas, build each affected lane and record all of them in
 the `Local gate` field.
 
+The full-host lanes boot the daily driver named by `primaryHost` in
+`flake.nix` (as the test node `workstation`), and the drift-gate checks
+read that host's config. Moving to a new machine means changing
+`primaryHost`; no lane names a physical host.
+
 ## Testing skills
 
 Two complementary VM testing layers, both important. Pick by what

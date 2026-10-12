@@ -36,35 +36,9 @@ pkgs.testers.runNixOSTest {
   name = "vm-microvm";
   skipTypeCheck = true;
 
-  nodes.dellan = { config, ... }: {
-    imports = [
-      inputs.agenix.nixosModules.default
-      inputs.agenix-rekey.nixosModules.default
-      inputs.home-manager.nixosModules.home-manager
-      inputs.microvm.nixosModules.host
-      ../hosts/dellan/default.nix
-      ../modules/common.nix
-    ];
-
-    # Strip the laptop's real hardware/disk config — virtualisation module
-    # provides a virtio rootfs and the test framework boots without a
-    # bootloader.
-    disabledModules = [ ../hosts/dellan/hardware-configuration.nix ];
-
-    boot.loader.systemd-boot.enable = lib.mkForce false;
-    boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
-
-    home-manager = {
-      useGlobalPkgs = true;
-      useUserPackages = true;
-      # This lane builds its own home-manager block rather than going
-      # through tests/lib/common.nix, so it needs the same specialArg the
-      # two builders there pass. home/aggregator-embed.nix uses it in
-      # `imports`, and a module argument resolved from `_module.args`
-      # during import evaluation is an infinite recursion.
-      extraSpecialArgs = { inherit (inputs) aggregator-src; };
-      users.jonathan = import ../home/jonathan-linux.nix;
-    };
+  nodes.workstation = { config, ... }: {
+    # The primary workstation, as in tests/lib/common.nix (HM included).
+    imports = [ (import ./lib/workstation-vm.nix { inherit (inputs) workstation; }) ];
 
     users.users.jonathan = {
       linger = true;
@@ -77,7 +51,7 @@ pkgs.testers.runNixOSTest {
       diskSize = 8192;
     };
 
-    # microvm.nix test-mode overrides. The production dellan config tells
+    # microvm.nix test-mode overrides. The production host config tells
     # microvm.vms.research-agent to virtiofs-share three host dirs that
     # don't exist inside this nested test VM. Without stubs, virtiofsd
     # blocks ~5min waiting for sources and pushes multi-user.target
@@ -183,15 +157,15 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = { nodes, ... }: ''
-    dellan.wait_for_unit("multi-user.target")
+    workstation.wait_for_unit("multi-user.target")
 
     # microvm.nix install-microvm-<name> oneshot exists and runs cleanly.
     # We disabled `wantedBy = [ multi-user.target ]` in the test
     # overrides, so trigger it explicitly to materialize the per-VM
     # files under /var/lib/microvms/<name>.
-    dellan.succeed("systemctl start install-microvm-research-agent.service")
-    dellan.succeed("test -d /var/lib/microvms/research-agent")
-    dellan.succeed(
+    workstation.succeed("systemctl start install-microvm-research-agent.service")
+    workstation.succeed("test -d /var/lib/microvms/research-agent")
+    workstation.succeed(
         "systemctl cat microvm@research-agent.service "
         "| grep -q 'Description='"
     )
@@ -201,15 +175,15 @@ pkgs.testers.runNixOSTest {
     # at the 2 GiB boundary (microvm-nix/microvm.nix#171) and the guest
     # wedges pre-init, pinning a host core. Assert on the materialized
     # runner — the artifact qemu actually execs — not on the .nix source.
-    dellan.fail(
+    workstation.fail(
         "grep -qE -- '-m 2048( |$)' "
         "/var/lib/microvms/research-agent/current/bin/microvm-run"
     )
 
     # Persisted vm-ssh state dir must be in place before the VM boots.
     # The host module's systemd.tmpfiles.rules are the load-bearing piece.
-    dellan.succeed("test -d /var/lib/research-agent/vm-ssh")
-    perms = dellan.succeed(
+    workstation.succeed("test -d /var/lib/research-agent/vm-ssh")
+    perms = workstation.succeed(
         "stat -c '%a %U' /var/lib/research-agent/vm-ssh"
     ).strip()
     assert perms == "700 root", (
@@ -222,7 +196,7 @@ pkgs.testers.runNixOSTest {
     # uid, so anything tighter breaks index builds (same empirical
     # reason run-agent.sh chmods its report file 666).
     for sub in ["prv", "bolagsverket"]:
-        perms = dellan.succeed(
+        perms = workstation.succeed(
             f"stat -c '%a %U' /var/lib/research-agent/tool-cache/{sub}"
         ).strip()
         assert perms == "777 jonathan", (
@@ -232,7 +206,7 @@ pkgs.testers.runNixOSTest {
     # Health-check watchdog: the script must defer to operator-stopped
     # state cleanly, and the systemctl-restart command name must appear in the script body (a
     # rename of the microvm unit would silently break the watchdog).
-    script_path = dellan.succeed(
+    script_path = workstation.succeed(
         "systemctl cat research-agent-healthcheck.service "
         "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
     ).strip()
@@ -240,7 +214,7 @@ pkgs.testers.runNixOSTest {
     # oneshot bounded (the unit's TimeoutStartSec is 30s); a regression
     # back to synchronous restart would let stuck activations stack
     # behind the 1-min timer.
-    dellan.succeed(
+    workstation.succeed(
         f"grep -q 'systemctl restart --no-block microvm@research-agent.service' {script_path}"
     )
     # Give-up latch: the watchdog must cap fruitless restarts (burst
@@ -262,7 +236,7 @@ pkgs.testers.runNixOSTest {
     # "Unknown key type '-p'" and every probe fails unconditionally.
     for unit, port in (("research-agent-healthcheck", "2223"),
                        ("scraper-healthcheck", "2225")):
-        probe = dellan.succeed(
+        probe = workstation.succeed(
             f"grep -ho 'ssh-keyscan[^|]*' "
             f"$(systemctl cat {unit}.service | sed -n 's/^ExecStart=//p')"
         )
@@ -273,27 +247,27 @@ pkgs.testers.runNixOSTest {
             f"{unit} probe has empty -t argument (would fail every probe): {probe}"
         )
 
-    dellan.succeed(f"grep -q 'restart-burst-count' {script_path}")
-    dellan.succeed(f"grep -q 'GIVING UP' {script_path}")
-    dellan.succeed(
+    workstation.succeed(f"grep -q 'restart-burst-count' {script_path}")
+    workstation.succeed(f"grep -q 'GIVING UP' {script_path}")
+    workstation.succeed(
         f"grep -q '/run/microvm-healthcheck-notify/research-agent' {script_path}"
     )
     # Offline gate: probe failures while the HOST is offline must not
     # count toward restarts/give-up (2026-07-07 false "VM DOWN"
     # incident). Precautionary since the guest stopped holding sshd
     # back on DNS; see research-agent-microvm-healthcheck.nix.
-    dellan.succeed(f"grep -q 'host is offline' {script_path}")
-    dellan.succeed(f"grep -q 'getent ahostsv4' {script_path}")
+    workstation.succeed(f"grep -q 'host is offline' {script_path}")
+    workstation.succeed(f"grep -q 'getent ahostsv4' {script_path}")
     # Busy gate: while a research call is dialing the VM the MCP keeps a
     # heartbeat fresh; the watchdog must NOT count a failed probe (and so
     # must not restart) while it's fresh — otherwise it kills the in-flight
     # research call (the 2026-07-30 mid-run-restart failure). Assert the
     # gate is wired and the shared /run dir is jonathan-writable so the
     # MCP can actually touch the heartbeat.
-    dellan.succeed(f"grep -q '/run/research-agent/active' {script_path}")
-    dellan.succeed(f"grep -q 'a research call is active' {script_path}")
-    dellan.succeed("test -d /run/research-agent")
-    aperms = dellan.succeed("stat -c '%a %U' /run/research-agent").strip()
+    workstation.succeed(f"grep -q '/run/research-agent/active' {script_path}")
+    workstation.succeed(f"grep -q 'a research call is active' {script_path}")
+    workstation.succeed("test -d /run/research-agent")
+    aperms = workstation.succeed("stat -c '%a %U' /run/research-agent").strip()
     assert aperms == "755 jonathan", (
         f"/run/research-agent perms expected '755 jonathan', got {aperms!r}"
     )
@@ -302,13 +276,13 @@ pkgs.testers.runNixOSTest {
     # to the journal via the qemu stdio chardev) to a persistent, pruned
     # file — the only window the warm-reboot second-boot failure is still on
     # record. Assert the logic is wired and the persistent dir is root-only.
-    dellan.succeed(f"grep -q 'snapshot_console' {script_path}")
-    dellan.succeed(f"grep -q 'wedge-logs' {script_path}")
-    dellan.succeed(
+    workstation.succeed(f"grep -q 'snapshot_console' {script_path}")
+    workstation.succeed(f"grep -q 'wedge-logs' {script_path}")
+    workstation.succeed(
         f"grep -q 'journalctl -u microvm@research-agent.service' {script_path}"
     )
-    dellan.succeed("test -d /var/lib/research-agent/wedge-logs")
-    wperms = dellan.succeed(
+    workstation.succeed("test -d /var/lib/research-agent/wedge-logs")
+    wperms = workstation.succeed(
         "stat -c '%a %U' /var/lib/research-agent/wedge-logs"
     ).strip()
     assert wperms == "700 root", (
@@ -316,7 +290,7 @@ pkgs.testers.runNixOSTest {
     )
     # Notification chain: flag dir exists and is world-readable so the
     # user session can inotify it.
-    notify_perms = dellan.succeed(
+    notify_perms = workstation.succeed(
         "stat -c '%a %U' /run/microvm-healthcheck-notify"
     ).strip()
     assert notify_perms == "755 root", (
@@ -326,19 +300,19 @@ pkgs.testers.runNixOSTest {
     # silently) — otherwise an admin `systemctl stop microvm@...` would
     # be fought by the watchdog. The microvm unit is stopped in this
     # test (wantedBy mkForce []), so a fresh run must exit 0.
-    dellan.succeed("systemctl start research-agent-healthcheck.service")
+    workstation.succeed("systemctl start research-agent-healthcheck.service")
 
     # Count-file corruption MUST NOT brick the watchdog. Under `set -u`
     # without sanitization, non-numeric input would crash the
     # arithmetic and leave the script aborting forever each tick.
     # read_int must clamp garbage back to 0.
-    dellan.succeed(
+    workstation.succeed(
         "mkdir -p /run/research-agent-healthcheck "
         "&& printf 'abc\\n0\\n5garbage' > /run/research-agent-healthcheck/fail-count"
     )
-    dellan.succeed("systemctl start research-agent-healthcheck.service")
+    workstation.succeed("systemctl start research-agent-healthcheck.service")
     # Service must reach 'inactive' (oneshot exited 0), not 'failed'.
-    rc = dellan.succeed(
+    rc = workstation.succeed(
         "systemctl is-failed research-agent-healthcheck.service || true"
     ).strip()
     assert rc != "failed", (
@@ -349,8 +323,8 @@ pkgs.testers.runNixOSTest {
     # scraper microvm — same shape of assertions as research-agent,
     # plus the bearer-token init service that gates both VMs.
     # ---------------------------------------------------------------
-    dellan.succeed("systemctl start install-microvm-scraper.service")
-    dellan.succeed("test -d /var/lib/microvms/scraper")
+    workstation.succeed("systemctl start install-microvm-scraper.service")
+    workstation.succeed("test -d /var/lib/microvms/scraper")
 
     # Every host forward of both VMs binds host loopback, never 0.0.0.0.
     # QEMU reads `hostfwd=tcp::P-:G` (empty address, microvm.nix's
@@ -360,18 +334,18 @@ pkgs.testers.runNixOSTest {
     for vm, fwds in (("research-agent", ["2223-:22"]),
                      ("scraper", ["2225-:22", "8123-:8000"])):
         runner = f"/var/lib/microvms/{vm}/current/bin/microvm-run"
-        found = dellan.succeed(f"grep -oE 'hostfwd=tcp:[^,]*' {runner} | sort -u").split()
+        found = workstation.succeed(f"grep -oE 'hostfwd=tcp:[^,]*' {runner} | sort -u").split()
         print(f"[diag] {vm} hostfwds: {found}")
         assert sorted(found) == sorted(f"hostfwd=tcp:127.0.0.1:{f}" for f in fwds), (
             f"{vm}: expected loopback-only hostfwds for {fwds}, got {found}"
         )
-    dellan.succeed(
+    workstation.succeed(
         "systemctl cat microvm@scraper.service | grep -q 'Description='"
     )
 
     # Persisted scraper state dirs must be in place before the VM boots.
-    dellan.succeed("test -d /var/lib/scraper/vm-ssh")
-    perms = dellan.succeed(
+    workstation.succeed("test -d /var/lib/scraper/vm-ssh")
+    perms = workstation.succeed(
         "stat -c '%a %U' /var/lib/scraper/vm-ssh"
     ).strip()
     assert perms == "700 root", (
@@ -381,23 +355,23 @@ pkgs.testers.runNixOSTest {
     # Bearer-token init service must exist and produce a token file when
     # invoked. The token is regenerated on every boot; consumers read it
     # via virtiofs on demand, so rotation = a single `systemctl restart`.
-    dellan.succeed("test -d /var/lib/scraper-bearer")
-    perms = dellan.succeed(
+    workstation.succeed("test -d /var/lib/scraper-bearer")
+    perms = workstation.succeed(
         "stat -c '%a %U' /var/lib/scraper-bearer"
     ).strip()
     assert perms == "755 root", (
         f"scraper-bearer dir perms expected '755 root', got {perms!r}"
     )
-    dellan.succeed("systemctl start scraper-bearer-init.service")
-    dellan.succeed("test -s /var/lib/scraper-bearer/token")
-    token_perms = dellan.succeed(
+    workstation.succeed("systemctl start scraper-bearer-init.service")
+    workstation.succeed("test -s /var/lib/scraper-bearer/token")
+    token_perms = workstation.succeed(
         "stat -c '%a %U' /var/lib/scraper-bearer/token"
     ).strip()
     assert token_perms == "444 root", (
         f"scraper token file perms expected '444 root', got {token_perms!r}"
     )
     # Token shape: base64url, ~43 ASCII chars, no '=' / '+' / '/'.
-    token_body = dellan.succeed(
+    token_body = workstation.succeed(
         "cat /var/lib/scraper-bearer/token"
     ).strip()
     assert len(token_body) >= 32, (
@@ -416,38 +390,38 @@ pkgs.testers.runNixOSTest {
     # ---------------------------------------------------------------
     # scraper healthcheck — mirror of research-agent watchdog.
     # ---------------------------------------------------------------
-    scraper_script = dellan.succeed(
+    scraper_script = workstation.succeed(
         "systemctl cat scraper-healthcheck.service "
         "| awk -F= '/^ExecStart=/{print $2}' | tr -d '\"'"
     ).strip()
     # Must restart the scraper unit (not research-agent's) on persistent
     # failure. A rename of the microvm unit would silently break this.
-    dellan.succeed(
+    workstation.succeed(
         f"grep -q 'systemctl restart --no-block microvm@scraper.service' {scraper_script}"
     )
     # Give-up latch + notify chain — mirror of the research-agent
     # assertions above.
-    dellan.succeed(f"grep -q 'restart-burst-count' {scraper_script}")
-    dellan.succeed(f"grep -q 'GIVING UP' {scraper_script}")
-    dellan.succeed(
+    workstation.succeed(f"grep -q 'restart-burst-count' {scraper_script}")
+    workstation.succeed(f"grep -q 'GIVING UP' {scraper_script}")
+    workstation.succeed(
         f"grep -q '/run/microvm-healthcheck-notify/scraper' {scraper_script}"
     )
     # Probe operator-stopped microvm as a no-op (the scraper unit is
     # stopped in this test via wantedBy mkForce []), exit 0 silently.
-    dellan.succeed("systemctl start scraper-healthcheck.service")
-    rc = dellan.succeed(
+    workstation.succeed("systemctl start scraper-healthcheck.service")
+    rc = workstation.succeed(
         "systemctl is-failed scraper-healthcheck.service || true"
     ).strip()
     assert rc != "failed", (
         f"scraper watchdog must survive operator-stopped VM; got is-failed={rc!r}"
     )
     # Corrupted state file must NOT brick the watchdog (read_int clamp).
-    dellan.succeed(
+    workstation.succeed(
         "mkdir -p /run/scraper-healthcheck "
         "&& printf 'abc\\n0\\n5garbage' > /run/scraper-healthcheck/fail-count"
     )
-    dellan.succeed("systemctl start scraper-healthcheck.service")
-    rc = dellan.succeed(
+    workstation.succeed("systemctl start scraper-healthcheck.service")
+    rc = workstation.succeed(
         "systemctl is-failed scraper-healthcheck.service || true"
     ).strip()
     assert rc != "failed", (
@@ -544,11 +518,11 @@ pkgs.testers.runNixOSTest {
 
     # 5. Port 53 is open only towards the configured upstream resolver,
     #    and only for dnsmasq. upstream's dnsmasq listens on every
-    #    address, so .12:53 accepts TCP from an unfiltered node (dellan,
+    #    address, so .12:53 accepts TCP from an unfiltered node (workstation,
     #    same vlan) — not from the agent. A root process on the agent
     #    asking the upstream directly (skipping dnsmasq's name filter)
     #    gets no answer, even for an allowlisted name.
-    dellan.succeed("timeout 6 bash -c 'exec 3<>/dev/tcp/192.168.1.12/53'")
+    workstation.succeed("timeout 6 bash -c 'exec 3<>/dev/tcp/192.168.1.12/53'")
     agent.fail("timeout 6 bash -c 'exec 3<>/dev/tcp/192.168.1.12/53'")
     agent.fail("dig +time=2 +tries=1 @${nodes.upstream.networking.primaryIPAddress} api.ebay.com")
     agent.fail("dig +tcp +time=2 +tries=1 @${nodes.upstream.networking.primaryIPAddress} api.ebay.com")
