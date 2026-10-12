@@ -75,6 +75,6 @@ git push origin main
 - comin alternative to webhook→deploy (research recommendation; not adopted)
 - microvm.nix runner isolation (research recommendation; not implemented)
 - Two-App split (label-bot vs merge-bot) — single App used currently
-- Janitor cron for stale GHA jobs — `gh-janitor-token.age` declared but no cron yet
+- Janitor cron for stale GHA jobs — not built; would read GitHub through the App token, not a stored PAT
 
 None block the core "PR → classifier → label → merge → auto-deploy" flow.

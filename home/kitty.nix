@@ -5056,6 +5056,7 @@ in
     cursor_text_color     #363a43
 
     # Window split dividers (kitty default = neon green, replaced)
+    window_border_width   1.0
     active_border_color   #5c6370
     inactive_border_color #3a3d44
 

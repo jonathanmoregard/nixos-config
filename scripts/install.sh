@@ -2,12 +2,12 @@
 # scripts/install.sh — guided, single-command installer for the CI/CD
 # workflow on dellan. Walks through:
 #   1. Generate deploy SSH key → pause for user to add to GH Deploy Keys
-#   2. Generate webhook secret + prompt for Rulesets PAT
+#   2. Generate webhook secret
 #   3. Commit + push encrypted secrets
 #   4. VM gate + nixos-rebuild switch
 #   5. Bare-repo + deploy-target bootstraps
 #   6. Tailscale Funnel + GitHub Webhook UI
-#   7. Branch protection bootstrap (evaluate then active)
+#   7. Branch protection bootstrap (one-shot PAT, never stored; evaluate then active)
 #   8. Smoke test (no-op PR)
 #
 # CI itself runs on GitHub-hosted runners (ubuntu-latest); see
@@ -20,7 +20,7 @@
 #   CONFIG_PATH=/path        Override /etc/nixos target (default: /etc/nixos)
 #   DRY_RUN=1                Skip sudo, push, rebuild, bootstraps, funnel, rulesets
 #   SKIP_VM_GATE=1           Skip the VM gate before nixos-rebuild switch
-#   TEST_PAT=...             Skip Rulesets PAT prompt; use this value
+#   TEST_PAT=...             Skip the Phase 7 bootstrap PAT prompt; use this value
 #   INSTALL_SH_BOOTSTRAPPED  Internal: prevents nix-shell re-exec loop
 
 set -euo pipefail
@@ -198,10 +198,10 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Phase 2: Webhook secret + Rulesets PAT
+# Phase 2: Webhook secret
 # -------------------------------------------------------------------------
 
-heading "Phase 2: Webhook secret + Rulesets PAT"
+heading "Phase 2: Webhook secret"
 
 WEBHOOK_AGE="$CONFIG_PATH/secrets/github-webhook-secret.age"
 if age_file_valid "$WEBHOOK_AGE"; then
@@ -212,28 +212,6 @@ else
   printf 'WEBHOOK_SECRET=%s\n' "$WEBHOOK_SECRET" | agenix_encrypt github-webhook-secret
   ok "Generated + encrypted webhook secret"
   WEBHOOK_SECRET_DISPLAY="$WEBHOOK_SECRET"
-fi
-
-PAT_AGE="$CONFIG_PATH/secrets/gh-janitor-token.age"
-if age_file_valid "$PAT_AGE"; then
-  ok "$PAT_AGE already exists; skipping"
-else
-  if [ -n "${TEST_PAT:-}" ]; then
-    PAT="$TEST_PAT"
-    note "Using TEST_PAT from env (no prompt)"
-  else
-    prompt "Open https://github.com/settings/tokens/new"
-    prompt "  Note: nixos-config-rulesets-bootstrap"
-    prompt "  Expiration: 7 days OR 1 year"
-    prompt "  Scope: 'repo' (full)"
-    PAT=$(read_secret "Paste PAT (input hidden):")
-  fi
-  [ -n "$PAT" ] || fail "empty PAT"
-
-  printf 'GH_TOKEN=%s\n' "$PAT" | agenix_encrypt gh-janitor-token
-  RULESETS_PAT="$PAT"   # keep for Phase 7
-  unset PAT
-  ok "Encrypted as secrets/gh-janitor-token.age"
 fi
 
 # -------------------------------------------------------------------------
@@ -356,14 +334,18 @@ heading "Phase 7: Branch protection bootstrap"
 if [ "$DRY_RUN" = "1" ]; then
   note "DRY_RUN: skipping Branch protection bootstrap"
 else
-  if [ -z "${RULESETS_PAT:-}" ]; then
-    if [ -n "${TEST_PAT:-}" ]; then
-      RULESETS_PAT="$TEST_PAT"
-    else
-      prompt "Re-paste the Rulesets PAT for this run (input hidden):"
-      RULESETS_PAT=$(read_secret "")
-    fi
+  # One-shot credential: used for the two calls below, then unset. Never
+  # stored — not on disk, not in agenix. Revoke it on GitHub afterwards.
+  if [ -n "${TEST_PAT:-}" ]; then
+    RULESETS_PAT="$TEST_PAT"
+  else
+    prompt "Open https://github.com/settings/tokens/new"
+    prompt "  Note: nixos-config-rulesets-bootstrap"
+    prompt "  Expiration: 7 days"
+    prompt "  Scope: 'repo' (full)"
+    RULESETS_PAT=$(read_secret "Paste PAT (input hidden):")
   fi
+  [ -n "$RULESETS_PAT" ] || fail "empty PAT"
 
   note "Running bootstrap-branch-protection.sh in evaluate (dry-run) mode..."
   GH_TOKEN="$RULESETS_PAT" "$REPO_ROOT/scripts/bootstrap-branch-protection.sh" evaluate
@@ -377,6 +359,7 @@ else
   ok "Rulesets active"
 
   unset RULESETS_PAT
+  prompt "Revoke the bootstrap PAT now: https://github.com/settings/tokens"
 fi
 
 # -------------------------------------------------------------------------
