@@ -135,8 +135,11 @@
     # 2026-10-12: the embedding pipeline is no longer deployed (its backfill
     # pinned ~12 cores for weeks); search answers from FTS5 alone, and the
     # vector tables already in cache.db stay on disk unused.
+    # Bump 707855d -> 990afd7 (2026-10-13): embeddings, the reranker and torch
+    # are removed from the package (closure 2.3 -> 1.2 GiB); schema v8 drops
+    # the vector tables on the first run after the deploy.
     aggregator-src = {
-      url = "github:jonathanmoregard/aggregator/707855d43dccc18da1c4aa7c5976997d2351c6db";
+      url = "github:jonathanmoregard/aggregator/990afd7b593f8aae7e719c7e0b5458da6874f935";
       flake = false;
     };
 
@@ -383,9 +386,9 @@
             only cache writer.
           ''
             (pkgsLinux.runCommand "no-global-cache-push" { } "touch $out");
-        # Not a VM lane: ai-throttle / host-telemetry runtime harness
-        # (modules/nixos/ai-throttle.nix) — fake sysfs, cgroup and systemctl,
-        # driven tick by tick. Seconds.
+        # Not a VM lane: host-telemetry runtime harness
+        # (modules/nixos/ai-throttle.nix) — fake sysfs, cgroup and proc trees.
+        # Seconds.
         ai-throttle = import ./tests/ai-throttle.nix { pkgs = pkgsLinux; };
         # Not a VM lane: fail-closed contract harness for the merged-or-
         # inactive worktree sweeper (home/worktree-sweep-script.nix). Builds

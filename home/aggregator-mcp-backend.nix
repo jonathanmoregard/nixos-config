@@ -50,11 +50,14 @@ in
       RestartSec = "5s";
 
       # Query backend is restartable and owns no ingest claim, so a hard kill
-      # cannot poison a row. Bound its model state (an opt-in rerank=True
-      # query loads the cross-encoder in-process).
+      # cannot poison a row. It answers from SQLite FTS5 alone and loads no
+      # model, so its footprint is the Python process plus whatever cache.db
+      # pages it has mapped (reclaimable, but counted against the cgroup).
+      # Observed peak with the current build: ~230 MiB; 1G throttles and 2G
+      # kills only a runaway, several times above that.
       MemoryAccounting = true;
-      MemoryHigh = "6G";
-      MemoryMax = "8G";
+      MemoryHigh = "1G";
+      MemoryMax = "2G";
 
       NoNewPrivileges = true;
       PrivateTmp = true;
