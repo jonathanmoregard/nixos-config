@@ -68,15 +68,15 @@ ORG_INSTALLATIONS="$org_installations"
 EOF
     }
 
-    write_quoted_config() {
+    write_shell_syntax_config() {
       local home_dir="$1" key_path="$2"
-      cat > "$home_dir/.config/github-app/config" <<EOF
-APP_ID="123"
-INSTALLATION_ID='456'
-KEY_PATH="$key_path"
-TOKEN_ROOT=$home_dir/.cache/gh-tokens
-ORG_INSTALLATIONS='KLAFFAT=987 other=654'
-EOF
+      printf '%s\r\n' \
+        'export APP_ID=123 # personal app id' \
+        "export INSTALLATION_ID='456'   " \
+        "export KEY_PATH=\"$key_path\"   " \
+        "TOKEN_ROOT=$home_dir/.cache/gh-tokens   " \
+        "export ORG_INSTALLATIONS='KLAFFAT=987 other=654'   " \
+        > "$home_dir/.config/github-app/config"
     }
 
     # The deployed package must be the production derivation, while this
@@ -97,9 +97,14 @@ EOF
     home_dir=$(make_home bad-app-id)
     key_path="$home_dir/.config/github-app/app.pem"
     : > "$key_path"
+    # Literal injection payload for the parser.
+    # shellcheck disable=SC2016
     write_config "$home_dir" '$(touch should-not-exist)' 456 "$key_path"
-    expect_failure bad-app-id "APP_ID in" env HOME="$home_dir" "$tool"
+    expect_failure bad-app-id "config key APP_ID requires shell expansion" \
+      env HOME="$home_dir" "$tool"
     [ ! -e should-not-exist ] || fail "config value was executed"
+    ! grep -Fq 'should-not-exist' bad-app-id.log \
+      || fail "expansion error disclosed APP_ID value"
 
     home_dir=$(make_home bad-installation-id)
     key_path="$home_dir/.config/github-app/app.pem"
@@ -107,6 +112,38 @@ EOF
     write_config "$home_dir" 123 not-a-number "$key_path"
     expect_failure bad-installation-id "INSTALLATION_ID in" \
       env HOME="$home_dir" "$tool"
+
+    # Paths needing shell expansion are refused with a data-only error that
+    # names the key but never echoes its value.
+    home_dir=$(make_home dollar-key-path)
+    # Literal shell expansion for refusal coverage.
+    # shellcheck disable=SC2016
+    write_config "$home_dir" 123 456 '$HOME/.config/github-app/app.pem'
+    expect_failure dollar-key-path \
+      "config key KEY_PATH requires shell expansion; this wrapper reads the file as data" \
+      env HOME="$home_dir" "$tool"
+    ! grep -Fq '.config/github-app/app.pem' dollar-key-path.log \
+      || fail "expansion error disclosed dollar KEY_PATH value"
+
+    home_dir=$(make_home tilde-key-path)
+    # Literal tilde expansion for refusal coverage.
+    # shellcheck disable=SC2088
+    write_config "$home_dir" 123 456 '~/.config/github-app/app.pem'
+    expect_failure tilde-key-path \
+      "config key KEY_PATH requires shell expansion; this wrapper reads the file as data" \
+      env HOME="$home_dir" "$tool"
+    ! grep -Fq '.config/github-app/app.pem' tilde-key-path.log \
+      || fail "expansion error disclosed tilde KEY_PATH value"
+
+    home_dir=$(make_home backtick-app-id)
+    # Literal command substitution for refusal coverage.
+    # shellcheck disable=SC2016
+    write_config "$home_dir" '`printf 123`' 456 \
+      "$home_dir/.config/github-app/app.pem"
+    expect_failure backtick-app-id "config key APP_ID requires shell expansion" \
+      env HOME="$home_dir" "$tool"
+    ! grep -Fq 'printf 123' backtick-app-id.log \
+      || fail "expansion error disclosed backtick APP_ID value"
 
     # Wrong fixed path, then the correct path without read permission.
     home_dir=$(make_home wrong-key-path)
@@ -123,13 +160,14 @@ EOF
     expect_failure unreadable-key "cannot read GitHub App private key" \
       env HOME="$home_dir" "$tool"
 
-    # Happy path without --owner: quoted values parse, the personal installation
-    # remains selected, caller policy args pass through, unrelated assignments
-    # are ignored, and inherited credentials are absent.
+    # Happy path without --owner: export prefixes, CRLF, quoted values, trailing
+    # spaces and an unquoted trailing comment parse as shell syntax while the
+    # personal installation remains selected. Caller policy args pass through,
+    # unrelated assignments are ignored, and inherited credentials are absent.
     home_dir=$(make_home success)
     key_path="$home_dir/.config/github-app/app.pem"
     : > "$key_path"
-    write_quoted_config "$home_dir" "$key_path"
+    write_shell_syntax_config "$home_dir" "$key_path"
     capture="$PWD/capture"
     mkdir -p "$capture"
     HOME="$home_dir" \
@@ -191,8 +229,30 @@ EOF
       env HOME="$home_dir" "$tool" --owner 'bad/owner'
     expect_failure missing-owner-value "--owner requires a non-empty <login>" \
       env HOME="$home_dir" "$tool" --owner
+    expect_failure equals-owner "must use the form --owner <login>" \
+      env HOME="$home_dir" "$tool" --owner=klaffat
     expect_failure misplaced-owner "must be the first two arguments" \
       env HOME="$home_dir" "$tool" --toolsets repos --owner klaffat
+
+    unset_org_home=$(make_home unset-org)
+    unset_org_key="$unset_org_home/.config/github-app/app.pem"
+    : > "$unset_org_key"
+    write_config "$unset_org_home" 123 456 "$unset_org_key"
+    grep -v '^ORG_INSTALLATIONS=' \
+      "$unset_org_home/.config/github-app/config" \
+      > "$unset_org_home/.config/github-app/config.tmp"
+    mv "$unset_org_home/.config/github-app/config.tmp" \
+      "$unset_org_home/.config/github-app/config"
+    expect_failure unset-org "is not listed in ORG_INSTALLATIONS" \
+      env HOME="$unset_org_home" "$tool" --owner klaffat
+
+    duplicate_home=$(make_home duplicate-org)
+    duplicate_key="$duplicate_home/.config/github-app/app.pem"
+    : > "$duplicate_key"
+    write_config "$duplicate_home" 123 456 "$duplicate_key" \
+      "klaffat=987 KLAFFAT=988"
+    expect_failure duplicate-owner "contains duplicate entries" \
+      env HOME="$duplicate_home" "$tool" --owner klaffat
 
     malformed_home=$(make_home malformed-org)
     malformed_key="$malformed_home/.config/github-app/app.pem"

@@ -20,6 +20,9 @@ pkgs.writeShellApplication {
     [ -n "''${HOME:-}" ] || die "HOME is unset; cannot locate GitHub App config"
 
     requested_owner=""
+    if [[ "''${1:-}" == --owner=* ]]; then
+      die "--owner must use the form --owner <login>"
+    fi
     if [ "''${1:-}" = --owner ]; then
       [ "$#" -ge 2 ] && [ -n "$2" ] \
         || die "--owner requires a non-empty <login>"
@@ -49,22 +52,59 @@ pkgs.writeShellApplication {
     seen_org_installations=""
 
     # Treat the config strictly as data. Values are never evaluated, and
-    # unrelated assignments (TOKEN_ROOT, etc.) are inert. Strip exactly one
-    # matching quote pair to preserve the shell config's simple value syntax
-    # without performing shell expansion or evaluation.
+    # unrelated assignments (TOKEN_ROOT, etc.) are inert. Accept the shell
+    # file's simple assignment syntax without performing expansion or
+    # evaluation.
     while IFS= read -r line || [ -n "$line" ]; do
+      line="''${line%$'\r'}"
       [[ "$line" =~ ^[[:space:]]*$ ]] && continue
       [[ "$line" =~ ^[[:space:]]*# ]] && continue
-      if ! [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      if ! [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
         die "malformed config line in $config"
       fi
 
-      key="''${BASH_REMATCH[1]}"
-      value="''${BASH_REMATCH[2]}"
+      key="''${BASH_REMATCH[2]}"
+      value="''${BASH_REMATCH[3]}"
+
+      # Trailing horizontal whitespace is shell syntax, not part of the value.
+      while [[ "$value" == *[[:space:]] ]]; do
+        value="''${value%?}"
+      done
+
+      # In an unquoted shell word, whitespace starts an optional trailing
+      # comment. A # without preceding whitespace remains data.
+      case "$value" in
+        \"* | \'*) ;;
+        *)
+          if [[ "$value" =~ ^(.*)[[:space:]]+\#.*$ ]]; then
+            value="''${BASH_REMATCH[1]}"
+            while [[ "$value" == *[[:space:]] ]]; do
+              value="''${value%?}"
+            done
+          fi
+          ;;
+      esac
+
+      # Strip one matching quote pair only. This is syntax recognition, not
+      # evaluation: the contents stay byte-for-byte data.
       case "$value" in
         \"*\") value="''${value:1:''${#value}-2}" ;;
         \'*\') value="''${value:1:''${#value}-2}" ;;
       esac
+
+      case "$key" in
+        APP_ID | INSTALLATION_ID | KEY_PATH | ORG_INSTALLATIONS)
+          case "$value" in
+            *'$'* | *'`'*)
+              die "config key $key requires shell expansion; this wrapper reads the file as data"
+              ;;
+          esac
+          if [ "$key" = KEY_PATH ] && [[ "$value" == *'~'* ]]; then
+            die "config key KEY_PATH requires shell expansion; this wrapper reads the file as data"
+          fi
+          ;;
+      esac
+
       case "$key" in
         APP_ID)
           [ -z "$seen_app_id" ] || die "duplicate APP_ID in $config"
