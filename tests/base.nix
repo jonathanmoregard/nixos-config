@@ -2183,6 +2183,13 @@ in
     assert "TimeoutStartSec=" in agg_unit, (
         f"aggregator-ingest.service lost its TimeoutStartSec backstop:\n{agg_unit}"
     )
+    # The fan-quiet invariant: the unattended ingest never competes with the
+    # desktop for more than a slice of one core.
+    for agg_limit in ("CPUQuota=", "CPUAffinity=", "CPUSchedulingPolicy=idle", "IOSchedulingClass=idle"):
+        assert agg_limit in agg_unit, (
+            f"aggregator-ingest.service lost {agg_limit}; an unlimited run "
+            f"spins the fans up every 30 minutes:\n{agg_unit}"
+        )
 
     # AGGREGATOR_NOTIFY_COMMAND: present, NON-EMPTY, and executable. All
     # three matter. `Environment=AGGREGATOR_NOTIFY_COMMAND=` (the empty

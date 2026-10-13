@@ -17,7 +17,6 @@ running. Each line in $STATE/host-telemetry/YYYY-MM-DD.jsonl holds:
   gpu_top       [[unit, gpu_ms], ...] units by iGPU time in the last interval
                 (from /proc/<pid>/fdinfo; only this user's processes are
                 readable, which covers every AI server on this host)
-  throttle      ai-throttle's current state, if it runs
 
 The fan speed itself is not here: this laptop's embedded controller drives the
 fans and exposes no RPM to Linux without the vendor's kernel module.
@@ -40,10 +39,6 @@ OUT_DIR = Path(os.environ.get("HOST_TELEMETRY_DIR", STATE_HOME / "host-telemetry
 INTERVAL = float(os.environ.get("HOST_TELEMETRY_INTERVAL_S", "60"))
 KEEP_DAYS = int(os.environ.get("HOST_TELEMETRY_KEEP_DAYS", "30"))
 TOP_N = 8
-THROTTLE_STATE = Path(os.environ.get(
-    "AI_THROTTLE_STATE",
-    os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "ai-throttle", "state.json"),
-))
 SNAPSHOT = OUT_DIR / ".last-sample.json"
 
 
@@ -190,12 +185,6 @@ def sample():
     rec = {"ts": int(time.time()), **sensors(), **system(),
            "cpu_top": top(cpu, prev.get("cpu", {}), 1000),
            "gpu_top": top(gpu, prev.get("gpu", {}), 1_000_000)}
-    try:
-        rec["throttle"] = json.loads(THROTTLE_STATE.read_text())
-        rec["throttle"] = {k: rec["throttle"].get(k)
-                           for k in ("paused", "reasons", "duty", "setpoint_c", "mean_c", "idle")}
-    except (OSError, ValueError):
-        rec["throttle"] = None
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     SNAPSHOT.write_text(json.dumps({"cpu": cpu, "gpu": gpu}))
     day = datetime.fromtimestamp(rec["ts"]).strftime("%Y-%m-%d")

@@ -357,6 +357,32 @@ in
       # which routes into OnFailure and tells a human — the point is that a
       # wedge is BOUNDED and LOUD, not that it is fast.
       TimeoutStartSec = "4h";
+      # Quiet by construction. A run is ~70 s of CPU, and unconstrained it
+      # fans out over several cores (bursts of ~240 % seen), which is what
+      # spun the laptop fans up every 30 minutes: fan speed follows package
+      # power and temperature, so the fix is fewer cores and lower priority,
+      # and the price is a longer wall time (nothing waits on this run).
+      #   CPUQuota             at most half a core in total.
+      #   Nice / CPUSchedulingPolicy=idle
+      #                        anything interactive pre-empts it.
+      #   IOSchedulingClass=idle
+      #                        the cache.db writes never compete with the
+      #                        desktop for the disk.
+      #   CPUAffinity          one CPU. CPUQuota alone caps the AVERAGE, not
+      #                        the burst: a multi-threaded phase spends its
+      #                        50 ms of each 100 ms period on many cores at
+      #                        once and measured the same 80 C package peak
+      #                        as the unlimited run. Pinned to one CPU the
+      #                        peak was 66 C. CPU 0 because it exists on every
+      #                        host and VM, unlike a higher number.
+      # A SIGSTOP duty-cycle governor (the old ai-throttle service) is not
+      # needed for this: the limits hold for the whole run, with no pausing
+      # of a process that holds the cache.db write lock.
+      CPUQuota = "50%";
+      CPUAffinity = "0";
+      Nice = 19;
+      CPUSchedulingPolicy = "idle";
+      IOSchedulingClass = "idle";
       # Journal captures errors + the per-source run report printed by the
       # CLI. This is where an operator reads what happened after the fact.
       StandardOutput = "journal";
