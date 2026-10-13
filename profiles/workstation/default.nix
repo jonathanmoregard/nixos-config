@@ -311,6 +311,13 @@
     mode = "0400";
   };
 
+  age.secrets.home-assistant-mcp-token = {
+    rekeyFile = ../../secrets/home-assistant-mcp-token.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   # add-secret:insert-here
 
   # ---------------------------------------------------------------------
