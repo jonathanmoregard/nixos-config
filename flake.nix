@@ -509,21 +509,21 @@
               inherit addSecretPkg;
               deployedBin = "${builtins.head matches}/bin/add-secret";
             };
-        # Not a VM lane: runtime-invocation harness for the Codex GitHub MCP
+        # Not a VM lane: runtime-invocation harness for the GitHub App MCP
         # credential wrapper. Uses a fake server to prove config failures,
         # exact argv construction, and stripping of inherited token auth.
-        codex-github-mcp =
+        github-app-mcp =
           let
             homePkgs = primaryConfig
               .home-manager.users.jonathan.home.packages;
             matches = builtins.filter
-              (p: (p.name or "") == "codex-github-mcp-server") homePkgs;
+              (p: (p.name or "") == "github-app-mcp-server") homePkgs;
           in
             if matches == []
-            then throw "codex-github-mcp-server not on ${primaryHost}'s PATH — did home.packages get pruned?"
-            else import ./tests/codex-github-mcp.nix {
+            then throw "github-app-mcp-server not on ${primaryHost}'s PATH — did home.packages get pruned?"
+            else import ./tests/github-app-mcp.nix {
               pkgs = pkgsLinux;
-              deployedBin = "${builtins.head matches}/bin/codex-github-mcp-server";
+              deployedBin = "${builtins.head matches}/bin/github-app-mcp-server";
             };
         # Not a VM lane: runtime-invocation harness for the Signal build-
         # expiry probe (overlays/signal-expiry.nix). Drives the deployed

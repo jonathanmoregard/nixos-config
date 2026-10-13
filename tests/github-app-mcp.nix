@@ -1,4 +1,4 @@
-# codex-github-mcp — runtime-invocation harness for the GitHub MCP credential
+# github-app-mcp — runtime-invocation harness for the GitHub MCP credential
 # wrapper. It drives the real wrapper text against a fake server, exercising
 # fail-closed config/key validation, inert parsing, personal/org installation
 # routing, argv construction, and removal of every token credential before exec.
@@ -17,15 +17,15 @@ let
       env | sort > "$CAPTURE_DIR/env"
     '';
   };
-  wrapper = import ../home/codex-github-mcp.nix {
+  wrapper = import ../home/github-app-mcp.nix {
     inherit pkgs;
     githubMcpServer = fakeServer;
   };
 in
-pkgs.runCommand "codex-github-mcp-harness"
+pkgs.runCommand "github-app-mcp-harness"
   {
     inherit deployedBin;
-    tool = "${wrapper}/bin/codex-github-mcp-server";
+    tool = "${wrapper}/bin/github-app-mcp-server";
     nativeBuildInputs = with pkgs; [ bash coreutils gnugrep ];
   } ''
     set -euo pipefail
@@ -82,7 +82,7 @@ EOF
     # The deployed package must be the production derivation, while this
     # harness uses the same wrapper with only its pinned server replaced.
     case "$deployedBin" in
-      /nix/store/*/bin/codex-github-mcp-server) ;;
+      /nix/store/*/bin/github-app-mcp-server) ;;
       *) fail "deployed wrapper has unexpected path: $deployedBin" ;;
     esac
 

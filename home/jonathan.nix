@@ -2,7 +2,7 @@
 let
   # gh + git-over-HTTPS authenticate as the GitHub App, never as the founder.
   ghHost = import ./gh-host-token.nix { inherit pkgs; };
-  codexGithubMcp = import ./codex-github-mcp.nix { inherit pkgs; };
+  githubAppMcp = import ./github-app-mcp.nix { inherit pkgs; };
 in
 {
   home.username = "jonathan";
@@ -25,7 +25,7 @@ in
     ghHost.gh
     ghHost.credentialHelper
     # App-only credential wrapper; the pinned server itself stays off PATH.
-    codexGithubMcp
+    githubAppMcp
     direnv
     jq
     # The git-broker MCP (~/.claude/mcps/git-broker) runs every Git op

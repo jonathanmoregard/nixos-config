@@ -1,6 +1,6 @@
 { pkgs, githubMcpServer ? pkgs.github-mcp-server }:
 
-# codex-github-mcp-server — credential wrapper for the official GitHub MCP
+# github-app-mcp-server — credential wrapper for the official GitHub MCP
 # server. Its command contract is `github-mcp-server stdio` followed by the
 # validated GitHub App credentials and then the caller's arguments. It accepts
 # only the configured App identity and fixed private-key path, strips inherited
@@ -10,10 +10,10 @@
 # MCP toolsets and tool exclusions are policy and live only in ai-client-config,
 # never here.
 pkgs.writeShellApplication {
-  name = "codex-github-mcp-server";
+  name = "github-app-mcp-server";
   text = ''
     die() {
-      echo "codex-github-mcp-server: $*" >&2
+      echo "github-app-mcp-server: $*" >&2
       exit 1
     }
 
