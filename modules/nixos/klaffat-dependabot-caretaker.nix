@@ -97,12 +97,12 @@ let
       require_credential checks "$checks_credential"
       metadata="$run/metadata.json"
       KLAFFAT_CARETAKER_METADATA_CREDENTIAL_FILE="$metadata_credential" "$metadata_cmd" > "$metadata"
-      jq -e '
+      jq -e --arg repo "$repo" '
         select(type == "array") |
         [.[] | select(.author == "dependabot[bot]")] as $bots |
         select(all($bots[];
           type == "object" and .state == "open" and .base == "main" and
-          .head_repo == "jonathanmoregard/klaffat" and
+          .head_repo == $repo and
           (.pr | type == "number" and floor == . and . > 0) and
           (.head_ref | type == "string" and test("^dependabot/[A-Za-z0-9._/-]+$")) and
           (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) and
@@ -111,13 +111,13 @@ let
         $bots | sort_by(.pr)
       ' "$metadata" > "$run/eligible.json" || refuse "metadata contained invalid Dependabot state"
       if [ -f "$state/ready.json" ]; then
-        ready_record="$(jq -cer '
+        ready_record="$(jq -cer --arg repo "$repo" '
           select(type == "object" and keys == ["base_sha", "pr", "sha", "state", "url"]) |
           select(.state == "ready") |
           select(.pr | type == "number" and floor == . and . > 0) |
           select(.sha | type == "string" and test("^[0-9a-f]{40}$")) |
           select(.base_sha | type == "string" and test("^[0-9a-f]{40}$")) |
-          select(.url == ("https://github.com/jonathanmoregard/klaffat/pull/" + (.pr | tostring)))
+          select(.url == ("https://github.com/" + $repo + "/pull/" + (.pr | tostring)))
         ' "$state/ready.json")" || refuse "invalid-ready-state"
         ready_pr="$(jq -r .pr <<<"$ready_record")"
         ready_sha="$(jq -r .sha <<<"$ready_record")"
@@ -415,7 +415,7 @@ let
       [ "$remote_candidate" = "$candidate" ] || refuse "head-changed-during-checks"
       remote_base="$(git -C "$repo_dir" ls-remote origin "refs/heads/$base" | ${pkgs.gawk}/bin/awk '{print $1}')"
       [ "$remote_base" = "$base_sha" ] || refuse "base-changed-during-checks"
-      ready="$(jq -cn --argjson pr "$pr" --arg sha "$candidate" --arg base "$base_sha" --arg url "https://github.com/jonathanmoregard/klaffat/pull/$pr" '{state:"ready",pr:$pr,sha:$sha,base_sha:$base,url:$url}')"
+      ready="$(jq -cn --argjson pr "$pr" --arg sha "$candidate" --arg base "$base_sha" --arg url "https://github.com/$repo/pull/$pr" '{state:"ready",pr:$pr,sha:$sha,base_sha:$base,url:$url}')"
       atomic_json "$notification/ready.json" "$ready"
       chmod 0644 "$notification/ready.json"
       touch "$notification/ready"
@@ -815,7 +815,7 @@ let
       printf '%s' "$current" | jq -e --arg head "$head" --arg base "$base" '
         .state == "open" and .user.login == "dependabot[bot]" and
         .base.ref == "main" and .base.sha == $base and
-        .head.repo.full_name == "jonathanmoregard/klaffat" and
+        .head.repo.full_name == ${builtins.toJSON cfg.repo} and
         .head.sha == $head
       ' >/dev/null
       printf -v body '@dependabot rebase\n\n<!-- klaffat-caretaker-refresh:%s:%s -->' "$head" "$base"
@@ -870,7 +870,7 @@ let
       ref="$(jq -er '.ref | select(test("^dependabot/[A-Za-z0-9._/-]+$"))' "$result")"
       old="$(jq -er '.expected_head | select(test("^[0-9a-f]{40}$"))' "$result")"
       candidate="$(jq -er '.candidate | select(test("^[0-9a-f]{40}$"))' "$result")"
-      test "$(jq -er '.repo == "jonathanmoregard/klaffat"' "$result")" = true
+      test "$(jq -er '.repo == ${builtins.toJSON cfg.repo}' "$result")" = true
       export GIT_ASKPASS="${publisherAskpass}/bin/klaffat-caretaker-askpass" GIT_TERMINAL_PROMPT=0 \
         GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
       remote_url="$(git -C "$repo_dir" -c core.hooksPath=/dev/null remote get-url origin)"
@@ -879,7 +879,7 @@ let
           local_remote="''${remote_url#file://}"
           [ -d "$local_remote" ] || exit 64
           ;;
-        https://github.com/jonathanmoregard/klaffat.git) ;;
+        ${lib.escapeShellArg "https://github.com/${cfg.repo}.git"}) ;;
         *) exit 64 ;;
       esac
       remote_head="$(git -C "$repo_dir" -c core.hooksPath=/dev/null -c credential.helper= ls-remote origin "refs/heads/$ref" | ${pkgs.gawk}/bin/awk '{print $1}')"
@@ -906,13 +906,13 @@ let
         pr_state="$(GH_TOKEN="$(cat "$credential")" gh api "repos/${cfg.repo}/pulls/$pr")"
         printf '%s' "$pr_state" | jq -e --arg sha "$sha" --arg base "$base_sha" '
           .state == "open" and .base.ref == "main" and
-          .base.sha == $base and .head.repo.full_name == "jonathanmoregard/klaffat" and .head.sha == $sha
+          .base.sha == $base and .head.repo.full_name == ${builtins.toJSON cfg.repo} and .head.sha == $sha
         ' >/dev/null || exit 65
         checks="$(GH_TOKEN="$(cat "$credential")" gh api "repos/${cfg.repo}/commits/$sha/check-runs?per_page=100")"
-        verdict="$(printf '%s' "$checks" | jq -er --argjson needed "$required" '
+        verdict="$(printf '%s' "$checks" | jq -er --arg repo ${lib.escapeShellArg cfg.repo} --argjson needed "$required" '
           [.check_runs[] | select(
             .app.slug == "github-actions" and
-            (.details_url | type == "string" and test("^https://github\\.com/jonathanmoregard/klaffat/actions/runs/[0-9]+/job/[0-9]+$"))
+            (.details_url | type == "string" and test("^https://github\\.com/" + ($repo | gsub("\\."; "\\.")) + "/actions/runs/[0-9]+/job/[0-9]+$"))
           ) | {name, status, conclusion}] as $runs |
           def matching($name): [$runs[] | select(.name == $name)];
           if any($needed[]; . as $name | matching($name) | length > 1) then "ambiguous"
@@ -950,13 +950,13 @@ let
       ack_dir=${lib.escapeShellArg "${cfg.notificationPath}/ack"}
       ack="$ack_dir/ready.json"
       [ -f "$ready" ] || exit 0
-      record="$(jq -cer '
+      record="$(jq -cer --arg repo ${lib.escapeShellArg cfg.repo} '
         select(type == "object" and keys == ["base_sha", "pr", "sha", "state", "url"]) |
         select(.state == "ready") |
         select(.pr | type == "number" and floor == . and . > 0) |
         select(.sha | type == "string" and test("^[0-9a-f]{40}$")) |
         select(.base_sha | type == "string" and test("^[0-9a-f]{40}$")) |
-        select(.url == ("https://github.com/jonathanmoregard/klaffat/pull/" + (.pr | tostring)))
+        select(.url == ("https://github.com/" + $repo + "/pull/" + (.pr | tostring)))
       ' "$ready")"
       if [ -f "$ack" ] && [ "$(cat "$ack")" = "$record" ]; then
         exit 0
@@ -976,7 +976,7 @@ in {
     enable = mkEnableOption "the fail-closed, one-PR Klaffat Dependabot caretaker";
     repo = mkOption { type = types.str; default = "jonathanmoregard/klaffat"; };
     base = mkOption { type = types.str; default = "main"; };
-    repoRemoteUrl = mkOption { type = types.str; default = "https://github.com/jonathanmoregard/klaffat.git"; };
+    repoRemoteUrl = mkOption { type = types.str; default = "https://github.com/${cfg.repo}.git"; };
     statePath = mkOption { type = types.str; default = "/var/lib/klaffat-dependabot-caretaker/state"; };
     workPath = mkOption { type = types.str; default = "/var/lib/klaffat-dependabot-caretaker/work"; };
     notificationPath = mkOption { type = types.str; default = "/var/lib/klaffat-dependabot-caretaker/notification"; };
@@ -1027,7 +1027,7 @@ in {
 
   config = mkIf cfg.enable {
     assertions = [
-      { assertion = cfg.repo == "jonathanmoregard/klaffat"; message = "klaffat caretaker only supports jonathanmoregard/klaffat"; }
+      { assertion = builtins.elem cfg.repo [ "jonathanmoregard/klaffat" "klaffat/klaffat" ]; message = "klaffat caretaker only supports jonathanmoregard/klaffat or klaffat/klaffat"; }
       { assertion = cfg.base == "main"; message = "klaffat caretaker only supports main"; }
       { assertion = config.users.users.${cfg.notifyUser}.isNormalUser or false; message = "klaffat caretaker notifyUser must be a normal local user"; }
     ];

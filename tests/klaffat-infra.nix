@@ -320,6 +320,14 @@ common.mkMinimalTest {
       # archive — is exercised end to end with no internet.
       services.klaffatInfra.repoRemoteUrl = originUrl;
 
+      # Ordered token candidates (one per repo owner during an owner move).
+      # The first is a stale file the origin rejects; the second is the real
+      # agenix secret. The fetch must fall through to it.
+      services.klaffatInfra.remoteTokenFiles = [
+        "/var/lib/klaffat-test-first-token"
+        "/run/agenix/klaffat-github-token"
+      ];
+
       # Swap the host-key-encrypted ciphertexts for fixtures this VM
       # can actually open. `file` (not `rekeyFile`) on both sides, so the
       # only thing that changes is the recipient. The token fixture
@@ -1227,12 +1235,40 @@ common.mkMinimalTest {
     #     that a 401 does not fall back to the mirror's last contents.
     token_file = machine.succeed("readlink -f /run/agenix/klaffat-github-token").strip()
     machine.succeed(f"printf 'WRONG' > {token_file}")
+    machine.succeed("printf 'WRONG' > /var/lib/klaffat-test-first-token")
     rc, out = run("${bin}/klaffat-infra plan -no-color")
     assert rc == 2, f"a wrong token should refuse with exit 2, got {rc}: {out!r}"
     assert "Authentication failed" in out, f"the server did not reject the token: {out!r}"
     assert "could not fetch ${originUrl}" in out, f"unexpected wrong-token refusal: {out!r}"
     assert "REMOTE-1" not in out, f"tofu ran on a stale mirror after a refused fetch: {out!r}"
     machine.succeed(f"printf 'TEST-github-token' > {token_file}")
+
+    # 7b2. Several token files: with the FIRST wrong and the SECOND right the
+    #      fetch falls through and the run succeeds; with the first right the
+    #      second is never needed (it may be wrong); with both wrong it
+    #      refused above. An absent or empty first file is skipped too.
+    #      (git echoes the first attempt's rejection, so only the outcome is
+    #      asserted, not the absence of that message.)
+    machine.succeed("printf 'WRONG' > /var/lib/klaffat-test-first-token")
+    rc, out = run("${bin}/klaffat-infra plan -no-color")
+    assert rc == 0 and "could not fetch" not in out, (
+        f"wrong first token must fall through to the right second one: {rc} {out!r}"
+    )
+    machine.succeed("printf 'TEST-github-token' > /var/lib/klaffat-test-first-token")
+    machine.succeed(f"printf 'WRONG' > {token_file}")
+    rc, out = run("${bin}/klaffat-infra plan -no-color")
+    assert rc == 0 and "could not fetch" not in out, (
+        f"right first token must succeed regardless of the second: {rc} {out!r}"
+    )
+    machine.succeed("rm -f /var/lib/klaffat-test-first-token")
+    rc, out = run("${bin}/klaffat-infra plan -no-color")
+    assert rc == 2 and "could not fetch" in out, (
+        f"absent first token and wrong second must refuse: {rc} {out!r}"
+    )
+    machine.succeed(f"printf 'TEST-github-token' > {token_file}")
+    machine.succeed("truncate -s0 /var/lib/klaffat-test-first-token")
+    rc, out = run("${bin}/klaffat-infra plan -no-color")
+    assert rc == 0, f"empty first token file must be skipped: {rc} {out!r}"
 
     # 7c. THE DECOY. A jonathan-owned checkout at the fixed path, carrying
     #     every trap the earlier designs were reproduced tripping. All of
