@@ -30,12 +30,17 @@
 #                               (harness synthesises stdin — never set
 #                               interactively; kills the confirm-reentry
 #                               safety)
+let
+  # `gh pr create` authenticates as the GitHub App (home/gh-host-token.nix),
+  # never through the founder's keyring credential.
+  ghHost = import ./gh-host-token.nix { inherit pkgs; };
+in
 pkgs.writeShellApplication {
   name = "add-secret";
   runtimeInputs = with pkgs; [
     age
     git
-    gh
+    ghHost.gh
     wl-clipboard
     xclip
     coreutils

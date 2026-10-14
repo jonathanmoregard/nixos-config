@@ -34,13 +34,18 @@
 # `ingest --all` runner and still wires one unit per source, which is what
 # this timer deliberately replaced.
 #
-# GitHub auth comes from gh's existing desktop-keyring OAuth entry. This unit
-# runs as jonathan, so gh reaches the same Secret Service entry as an
-# interactive shell. The wrapper must not export a copied token: an env token
-# shadows gh's keyring and expires independently. The packaged aggregator
+# GitHub auth is the GitHub App host token (home/gh-host-token.nix): the `gh`
+# on this unit's PATH is that fail-closed wrapper, not pkgs.gh. It reads
+# ~/.cache/gh-tokens/host[/<owner>]/token (minted every 20 min by
+# gh-token.service) at exec time and refuses when the file is missing or
+# stale — there is NO fallback to gh's keyring, which holds the founder's PAT
+# until that is revoked. The unit itself must not export a copied token: an
+# explicit GH_TOKEN passes through the wrapper untouched, so a copy here would
+# shadow the rotating token, skip the per-owner choice, and expire
+# independently. The packaged aggregator
 # constrains every GitHub subprocess to `gh api --method GET` and validates
 # each path against its fixed search-endpoint capability before spawning gh,
-# so broad OAuth scopes cannot turn this reader into a write path.
+# so the App's write permissions cannot turn this reader into a write path.
 #
 # NO agenix secret for ticktick, deliberately. The ticktick source reads
 # TICKTICK_ACCESS_TOKEN from the shared ~/.config/todo/env store, which
@@ -178,6 +183,10 @@ let
   caBundle = "/etc/ssl/certs/ca-bundle.crt";
 
   networkOnline = import ../../home/network-online-script.nix { inherit pkgs; };
+  # The App-token `gh` wrapper, fail closed; see the GitHub auth note in the
+  # header. Shared with the interactive shell (home/jonathan.nix) so the
+  # freshness rule and the refusal message cannot drift between them.
+  ghApp = (import ../../home/gh-host-token.nix { inherit pkgs; }).gh;
 
   # Activated only via OnFailure. Emits the journal marker FIRST and treats
   # the desktop toast as best-effort: a headless boot or a session with no
@@ -196,7 +205,7 @@ let
     fi
     if ! ${notifyCommand} -u critical -a aggregator \
       "aggregator ingest FAILED" \
-      "The all-sources ingest run exited non-zero. Likely: gh keyring authentication unavailable, no usable CA bundle, or a run that ended with errors (exit 3). Details: journalctl --user -u aggregator-ingest.service -n 200"; then
+      "The all-sources ingest run exited non-zero. Likely: GitHub App host token missing or stale (systemctl --user start gh-token.service), no usable CA bundle, or a run that ended with errors (exit 3). Details: journalctl --user -u aggregator-ingest.service -n 200"; then
       echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only"
     fi
   '';
@@ -204,7 +213,9 @@ let
   ingestScript = pkgs.writeShellApplication {
     name = "aggregator-ingest";
     # `gh` is the only external command the aggregator shells out to
-    # (aggregator/sources/github.py). `coreutils` keeps basic wrapper tools
+    # (aggregator/sources/github.py), and it is the App-token wrapper, never
+    # pkgs.gh: tests/base.nix runs the gh on this PATH without a host token
+    # and requires the wrapper's refusal. `coreutils` keeps basic wrapper tools
     # independent of whatever PATH the user manager inherited. `libnotify`
     # keeps a future bare notify command resolvable.
     #
@@ -213,7 +224,7 @@ let
     # tools that made the old failure mode possible one typo away.
     # `bash` for the network-wait probe's /dev/tcp connect (run under
     # `timeout`, which needs a program, not a builtin redirection).
-    runtimeInputs = [ pkgs.gh pkgs.coreutils pkgs.libnotify pkgs.bash ];
+    runtimeInputs = [ ghApp pkgs.coreutils pkgs.libnotify pkgs.bash ];
     text = ''
       set -euo pipefail
 
@@ -303,6 +314,13 @@ in
   systemd.user.services.aggregator-ingest = {
     description = "Aggregator: all-sources ingest";
     unitConfig.OnFailure = "aggregator-ingest-failure-notify.service";
+    # A switch must not restart this unit. Restarting a running oneshot means
+    # stop (SIGTERM, then SIGKILL after the stop timeout, which also fires
+    # OnFailure) plus a start job that completes only when the whole ingest
+    # does, and switch-to-configuration waits for it: on 2026-10-12 a deploy
+    # sat ~20 min behind one. Skipped instead, an in-flight run finishes on
+    # the old closure and the next timer tick runs the new one.
+    restartIfChanged = false;
     environment = {
       # Presence installs the aggregator's in-process notifier; the value
       # names the program. See the two-channel note in the header.
@@ -339,6 +357,32 @@ in
       # which routes into OnFailure and tells a human — the point is that a
       # wedge is BOUNDED and LOUD, not that it is fast.
       TimeoutStartSec = "4h";
+      # Quiet by construction. A run is ~70 s of CPU, and unconstrained it
+      # fans out over several cores (bursts of ~240 % seen), which is what
+      # spun the laptop fans up every 30 minutes: fan speed follows package
+      # power and temperature, so the fix is fewer cores and lower priority,
+      # and the price is a longer wall time (nothing waits on this run).
+      #   CPUQuota             at most half a core in total.
+      #   Nice / CPUSchedulingPolicy=idle
+      #                        anything interactive pre-empts it.
+      #   IOSchedulingClass=idle
+      #                        the cache.db writes never compete with the
+      #                        desktop for the disk.
+      #   CPUAffinity          one CPU. CPUQuota alone caps the AVERAGE, not
+      #                        the burst: a multi-threaded phase spends its
+      #                        50 ms of each 100 ms period on many cores at
+      #                        once and measured the same 80 C package peak
+      #                        as the unlimited run. Pinned to one CPU the
+      #                        peak was 66 C. CPU 0 because it exists on every
+      #                        host and VM, unlike a higher number.
+      # A SIGSTOP duty-cycle governor (the old ai-throttle service) is not
+      # needed for this: the limits hold for the whole run, with no pausing
+      # of a process that holds the cache.db write lock.
+      CPUQuota = "50%";
+      CPUAffinity = "0";
+      Nice = 19;
+      CPUSchedulingPolicy = "idle";
+      IOSchedulingClass = "idle";
       # Journal captures errors + the per-source run report printed by the
       # CLI. This is where an operator reads what happened after the fact.
       StandardOutput = "journal";

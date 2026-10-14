@@ -20,7 +20,7 @@
 #
 # Fast-path: a `preflight` job runs the same denylist regex as gate.yml
 # and emits `risk=TRIVIAL` for docs-only PRs. Heavy STEPS inside the
-# downstream jobs (flake-check, build-tuxedo, vm-minimal, vm-graphical)
+# downstream jobs (flake-check, build-tuxedo, vm-minimal)
 # are gated `if: needs.preflight.outputs.risk != 'TRIVIAL'`, so the
 # job COMPLETES SUCCESS with no work — that keeps branch-protection
 # required checks satisfied. Skipping the job itself would mark the
@@ -87,6 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - run: scripts/check-fork-guards.sh
@@ -104,6 +105,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -149,6 +151,7 @@ jobs:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
@@ -206,6 +209,12 @@ jobs:
       # expiry. Tiny runCommand — seconds.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.signal-expiry -L
+      # secret-redact contract (tests/secret-redact.nix): the built CLI
+      # with its pinned gitleaks — every gitleaks quirk it handles, every
+      # fail-closed exit, and the redaction the ~/.claude output hooks and
+      # aggregator ingest rely on. runCommand — under a minute.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.secret-redact -L
       # kitty session save/restore script contracts
       # (tests/kitty-scripts.nix): the single-line session-stub
       # invariant, pane 0's notice surviving as an argv element, grid
@@ -256,6 +265,7 @@ jobs:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
@@ -276,101 +286,36 @@ jobs:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/check-docs-commands.sh
 
-  discover:
-    # Upstream cache-status probe. For every vm-minimal lane, evaluate
-    # the output path and probe cachix's narinfo. Emit a JSON object
-    # mapping lane → "cached"|"miss" as the job output. Downstream
-    # vm-minimal lanes read this and skip EVERY setup step (checkout,
-    # free-disk, /nix loop mount, nix install, cachix-action, KVM
-    # verify, build) when the status is "cached". Cached lanes take
-    # ~5-10s.
-    #
-    # The job never fails: TRIVIAL preflight → emit all-cached;
-    # eval failure → emit all-miss (fail-safe, vm-minimal runs everything).
-    #
-    # `nix eval --raw …outPath` only
-    # needs nixpkgs eval data, not the full closure. First eval cold-
-    # fetches nixpkgs source (~30s); subsequent six lanes reuse it
-    # from this runner's /nix/store. Total discover runtime ~45-90s,
-    # parallel with build-tuxedo so it doesn't lengthen the critical path.
-    name: discover
+  security-static:
+    # Fast, offline, free security scanners (zizmor, actionlint,
+    # gitleaks over full history, shellcheck, poutine) from
+    # scripts/security-static.sh, pinned through flake.lock via
+    # packages.security-static. ~1 s of scanning plus tool fetch from
+    # cache.nixos.org. `--self-test` first proves every scanner still
+    # fails on a planted probe (unpinned action, fake credential, shell
+    # error), so a silently broken scanner can't pass as "clean".
+    # Runs on TRIVIAL PRs too: docs-only diffs can still leak a secret.
+    name: security-static
     runs-on: ubuntu-latest
     needs: [verify-fork-guards, preflight]
-    outputs:
-      statuses: ${{ steps.probe.outputs.statuses }}
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
+          # gitleaks scans the whole history, not just the PR tip.
+          fetch-depth: 0
+      - uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
         with:
-          # Same NIX_CONFIG covers the probe step via env, but discover
-          # also runs `nix eval` + `nix path-info --store https://...`
-          # which both benefit from the bumped http-connections; setting
-          # extra-conf here too keeps the layering symmetric with the
-          # other heavy jobs.
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          extra-conf: |
-            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
-            max-substitution-jobs = 64
-            http-connections = 64
-            narinfo-cache-positive-ttl = 600
-      - id: probe
-        env:
-          RISK: ${{ needs.preflight.outputs.risk }}
-          LANES: "base desktop keyring kitty claude-pane autodoro microvm"
-          CACHE_URL: https://jonathanmoregard.cachix.org
-        run: |
-          set -uo pipefail
-          all_cached='{"base":"cached","desktop":"cached","keyring":"cached","kitty":"cached","claude-pane":"cached","autodoro":"cached","microvm":"cached"}'
-          all_miss='{"base":"miss","desktop":"miss","keyring":"miss","kitty":"miss","claude-pane":"miss","autodoro":"miss","microvm":"miss"}'
-
-          # TRIVIAL preflight → vm-minimal already skips heavy work via
-          # its own `risk != 'TRIVIAL'` clause; emit all-cached so the
-          # status check echoes the same decision symmetrically.
-          if [ "$RISK" = "TRIVIAL" ]; then
-            echo "preflight=TRIVIAL — emitting all-cached"
-            echo "statuses=$all_cached" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Real probe. Build JSON as we go.
-          #
-          # IMPORTANT: capture nix eval's STDOUT only — its STDERR
-          # carries flake-eval warnings (`Git tree dirty`, deprecation
-          # notices, etc) which, if merged via `2>&1`, would land
-          # inside `$out` and corrupt the path passed to path-info.
-          # Stderr is redirected to a tmpfile so it stays visible in
-          # the workflow log on failure without polluting stdout.
-          json="{"
-          first=1
-          err_file=$(mktemp)
-          for lane in $LANES; do
-            attr=".#checks.x86_64-linux.vm-${lane}.outPath"
-            if ! out=$(nix eval --raw "$attr" 2>"$err_file"); then
-              echo "::warning::nix eval failed for lane=$lane — falling back to all-miss"
-              echo "--- eval stderr:"
-              cat "$err_file" >&2
-              rm -f "$err_file"
-              echo "statuses=$all_miss" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            if nix path-info --store "$CACHE_URL" "$out" >/dev/null 2>&1; then
-              s="cached"
-            else
-              s="miss"
-            fi
-            [ "$first" = "0" ] && json="${json},"
-            json="${json}\"${lane}\":\"${s}\""
-            first=0
-            echo "lane=$lane status=$s out=$out"
-          done
-          rm -f "$err_file"
-          json="${json}}"
-          echo "statuses=$json" >> "$GITHUB_OUTPUT"
-          echo "Discover summary: $json"
+      - name: Scanner self-test (planted probes must fail)
+        run: nix run .#security-static -- --self-test
+      - name: Scan
+        run: nix run .#security-static
 
   build-tuxedo:
     name: build tuxedo toplevel
@@ -382,6 +327,7 @@ jobs:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           # Pin to head SHA + explicit token. `gh run rerun` reuses the
           # original event payload, but GitHub's `refs/pull/<N>/merge`
           # virtual ref can lag-behind on rerun → actions/checkout
@@ -453,57 +399,43 @@ jobs:
     # ~16 GB against GHA's 10 GB repo cap: lanes never found it, and its
     # save step added minutes to (or hung) the critical path.
     #
+    # No cache pre-probe job gates the lanes. When a lane's check is
+    # already in cachix, `nix build` substitutes just that small output
+    # after a ~1 min eval, so an unchanged lane stays cheap. A gating
+    # probe cost every lane ~2.5 min of wall-clock to save that minute.
+    #
     # Branch-protection required-check names are
     # `vm-minimal (<lane>)` — update protection rules in the GH UI
     # when adding/removing a lane.
     name: vm-minimal (${{ matrix.lane }})
     runs-on: ubuntu-latest
-    needs: [verify-fork-guards, preflight, discover]
+    needs: [verify-fork-guards, preflight]
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        # `klaffat-infra` and `klaffat-dependabot-caretaker` are matrix-only,
-        # like listen-tools / camera-relay / auto-deploy. They are
-        # deliberately absent from `discover`'s LANES, so they never report
-        # "cached" and always execute. They gate credential handling and
-        # caretaker trust boundaries.
         lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker, security-batch]
     steps:
-      # Read this lane's cache status from the discover job. ALWAYS
-      # runs (no `if:`) so subsequent steps can reference
-      # `steps.lane-status.outputs.status`. On `cached` every later
-      # step short-circuits — the job reports SUCCESS with no work,
-      # required check `vm-minimal (<lane>)` stays green for branch
-      # protection.
-      #
-      # discover ALWAYS emits valid non-empty JSON (TRIVIAL → all-cached,
-      # eval failure → all-miss), so `fromJson()` here is safe.
-      - name: Lane cache status
-        id: lane-status
-        run: |
-          status='${{ fromJson(needs.discover.outputs.statuses)[matrix.lane] }}'
-          echo "lane=${{ matrix.lane }} status=$status"
-          echo "status=$status" >> "$GITHUB_OUTPUT"
-      - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Disk before (baseline)
-        if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: df -h / /mnt 2>/dev/null || df -h /
       - name: Free root disk (dotnet/ghc/android/docker/codeql)
-        if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/free-root-disk.sh
       - name: Mount /tmp on /mnt bind
-        if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/mount-tmp-loop.sh
       - name: Mount /nix on /mnt loopback (replaces free-disk-space)
-        if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: ./scripts/mount-nix-loop.sh
-      - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: DeterminateSystems/determinate-nix-action@7c4cc317e802185875512bfcb68259257279d767 # v3
         with:
           # Belt-and-braces against intermittent HTTP 401 from
@@ -520,7 +452,7 @@ jobs:
             narinfo-cache-positive-ttl = 600
       # cachix is the cross-run cache: push:main runs upload every new
       # path, including VM-specific closures.
-      - if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
           name: jonathanmoregard
@@ -533,12 +465,12 @@ jobs:
           # drain at job end, and a 3 GB zoom upload failed a green build.
           useDaemon: false
       - name: Verify KVM
-        if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: |
           test "${DETERMINATE_NIX_KVM:-}" = "1" || { echo "KVM not available"; exit 1; }
           ls -la /dev/kvm
       - name: Build vm-${{ matrix.lane }} (3 retries)
-        if: needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        if: needs.preflight.outputs.risk != 'TRIVIAL'
         env:
           TMPDIR: /mnt/tmp
         # Retry loop catches transient infra flakes (ENOSPC blips,
@@ -569,36 +501,5 @@ jobs:
           echo "::error::vm-${{ matrix.lane }} failed after $attempts attempts"
           exit 1
       - name: Disk after (post-build)
-        if: always() && needs.preflight.outputs.risk != 'TRIVIAL' && steps.lane-status.outputs.status != 'cached'
+        if: always() && needs.preflight.outputs.risk != 'TRIVIAL'
         run: df -h / /mnt /tmp 2>/dev/null || df -h /
-
-  vm-graphical:
-    name: vm-graphical
-    runs-on: ubuntu-latest
-    needs: [verify-fork-guards, preflight]
-    permissions:
-      contents: read
-    # Path-conditional: only runs when desktop-affecting files change.
-    # Docs-only PRs naturally skip via this gate, so the job completes
-    # SUCCESS-with-no-work for branch protection. The TRIVIAL gate is
-    # also redundant here (path filter is stricter) but kept for
-    # uniformity with the other heavy jobs.
-    steps:
-      - if: |
-          needs.preflight.outputs.risk != 'TRIVIAL' &&
-          (contains(github.event.pull_request.changed_files, 'home/cinnamon.nix') ||
-           contains(github.event.pull_request.changed_files, 'modules/nixos/desktop.nix') ||
-           contains(github.event.pull_request.changed_files, 'home/kitty.nix'))
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - if: |
-          needs.preflight.outputs.risk != 'TRIVIAL' &&
-          (contains(github.event.pull_request.changed_files, 'home/cinnamon.nix') ||
-           contains(github.event.pull_request.changed_files, 'modules/nixos/desktop.nix') ||
-           contains(github.event.pull_request.changed_files, 'home/kitty.nix'))
-        run: |
-          # Placeholder: VM-graphical check derivation TBD (spec E.1).
-          # Path-conditional; runs only when desktop-affecting files change.
-          echo "vm-graphical: not yet implemented (spec E.1)"

@@ -50,17 +50,17 @@
     "aggregator-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1790969923,
-        "narHash": "sha256-eCAEZdnhQyUaj6vtQd7PgZzPnJ69phwaesg/jHwIrP4=",
+        "lastModified": 1791873164,
+        "narHash": "sha256-RagG01+ZEk4TB3IwTq0Y3ur5YW+0+gzLVwSSKOvFZYs=",
         "owner": "jonathanmoregard",
         "repo": "aggregator",
-        "rev": "0c580d8afe4a8f87b84e6576e72cfbb9c87a6c11",
+        "rev": "990afd7b593f8aae7e719c7e0b5458da6874f935",
         "type": "github"
       },
       "original": {
         "owner": "jonathanmoregard",
         "repo": "aggregator",
-        "rev": "0c580d8afe4a8f87b84e6576e72cfbb9c87a6c11",
+        "rev": "990afd7b593f8aae7e719c7e0b5458da6874f935",
         "type": "github"
       }
     },

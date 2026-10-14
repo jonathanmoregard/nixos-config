@@ -3,7 +3,7 @@
 # tests/claude-pane.nix).
 #
 # Three builders:
-#   mkTest         — full dellan host import (HM + autoLogin + everything).
+#   mkTest         — full primary-host import (HM + autoLogin + everything).
 #                    Lanes that exercise the integrated graphical stack
 #                    use this; closure tracks the prod system.
 #   mkMinimalTest  — base profile + caller-supplied extraModules. No HM,
@@ -15,40 +15,20 @@
 #                    subset of feature modules. Cache hash is invariant to
 #                    edits in HM modules NOT imported by the per-test
 #                    entrypoint.
+#
+# Every builder names its node `workstation`, never a physical host: the
+# host mkTest models is flake.nix's `primaryHost`, so a machine upgrade is
+# a change to that one binding and no lane is touched.
 { pkgs, inputs }:
 
 let
   lib = pkgs.lib;
 
-  # Full-host node — mirrors hosts/dellan/default.nix under the test
-  # framework's read-only nixpkgs injection.
+  # Full-host node — the primary workstation (flake.nix `primaryHost`)
+  # under the test framework's read-only nixpkgs injection. See
+  # ./workstation-vm.nix for what is stripped and why.
   node = { config, ... }: {
-    imports = [
-      inputs.agenix.nixosModules.default
-      inputs.agenix-rekey.nixosModules.default
-      inputs.home-manager.nixosModules.home-manager
-      inputs.microvm.nixosModules.host
-      ../../hosts/dellan/default.nix
-      ../../modules/common.nix
-    ];
-
-    # Strip the laptop's real hardware/disk config — virtualisation module
-    # provides a virtio rootfs and the test framework boots without a
-    # bootloader.
-    disabledModules = [ ../../hosts/dellan/hardware-configuration.nix ];
-
-    boot.loader.systemd-boot.enable = lib.mkForce false;
-    boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
-
-    home-manager = {
-      useGlobalPkgs = true;
-      useUserPackages = true;
-      # Mirrors flake.nix's host blocks — home/aggregator-embed.nix imports
-      # the embed units from the pinned aggregator source tree, so the home
-      # config needs the source path.
-      extraSpecialArgs = { inherit (inputs) aggregator-src; };
-      users.jonathan = import ../../home/jonathan-linux.nix;
-    };
+    imports = [ (import ./workstation-vm.nix { inherit (inputs) workstation; }) ];
 
     users.users.jonathan = {
       linger = true;
@@ -87,7 +67,7 @@ let
     };
 
     # Do not boot the production microvms inside a test VM, and stub the
-    # host paths they share. This node imports hosts/dellan, so without
+    # host paths they share. This node imports the primary host, so without
     # both halves every full-host lane inherits research-agent and
     # scraper and tries to run them nested.
     #
@@ -185,11 +165,6 @@ let
     home-manager = {
       useGlobalPkgs = true;
       useUserPackages = true;
-      # Passed even though no per-lane HM entrypoint imports the aggregator
-      # module today: an unused specialArg costs nothing, and a lane that
-      # starts importing it should not fail with an unrelated "called
-      # without required argument" error.
-      extraSpecialArgs = { inherit (inputs) aggregator-src; };
       users.jonathan = import hm;
     };
 
@@ -212,20 +187,20 @@ in
   mkTest = { name, testScript, extraModules ? [] }: pkgs.testers.runNixOSTest {
     inherit name testScript;
     skipTypeCheck = true;
-    nodes.dellan = { imports = [ node ] ++ extraModules; };
+    nodes.workstation = { imports = [ node ] ++ extraModules; };
   };
 
   mkMinimalTest = { name, testScript, extraModules ? [] }:
     pkgs.testers.runNixOSTest {
       inherit name testScript;
       skipTypeCheck = true;
-      nodes.dellan = mkMinimalNode extraModules;
+      nodes.workstation = mkMinimalNode extraModules;
     };
 
   mkFeatureTest = { name, testScript, hm, extraModules ? [] }:
     pkgs.testers.runNixOSTest {
       inherit name testScript;
       skipTypeCheck = true;
-      nodes.dellan = mkFeatureNode { inherit extraModules hm; };
+      nodes.workstation = mkFeatureNode { inherit extraModules hm; };
     };
 }

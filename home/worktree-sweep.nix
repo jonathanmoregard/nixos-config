@@ -16,7 +16,7 @@
 # never had one under a root is never touched at all.
 #
 # Home-manager side (not a NixOS module) because the worktrees are
-# jonathan-owned and gh auth (keyring) is jonathan's.
+# jonathan-owned and gh's App host token lives in jonathan's ~/.cache.
 let
   # No arguments: the swept roots are the script's own defaults. The
   # drift gate in tests/worktree-sweep.nix compares this unit's ExecStart
@@ -36,7 +36,7 @@ in
       Nice = 10;
       # Light hardening only: the job's whole purpose is deleting
       # jonathan-owned worktrees under ~/Repos and ~/worktrees, and gh
-      # needs the keyring + network — ProtectHome/ProtectSystem=strict
+      # needs the host token + network — ProtectHome/ProtectSystem=strict
       # would neuter it.
       NoNewPrivileges = "yes";
       PrivateTmp = "yes";

@@ -194,7 +194,7 @@ Pre-push checklist:
 
 **The `Behavioural evidence` field is what historically went hollow.** Quote the actual command + observed output that proves the runtime path works. **User-realistic = what the user does** (run, press, hit), not what activates around it. `systemctl is-active` proves the unit is loaded; it does not prove the feature works. Valid examples:
 
-- `nix run .#feature-vm; ssh -p 2222 jonathan@localhost 'systemctl is-active research-agent'; curl localhost:8080/health → 200`
+- `nix run .#feature-vm -- --trusted up; nix run .#feature-vm -- run 'systemctl is-active research-agent; curl -s localhost:8080/health' → 200`
 - `xvfb-run kitty; xdotool key ctrl+shift+c; xclip -o -selection clipboard → "foo" (no trailing \n)`
 - "hardware-only change (touchpad palm rejection); cannot model in VM; will verify on real host after auto-deploy with `nixos-rebuild switch --rollback` ready"
 
@@ -228,6 +228,11 @@ nix eval .#checks.x86_64-linux --apply builtins.attrNames
 The non-VM lanes run in seconds; the `vm-*` lanes boot a machine. When a
 change spans areas, build each affected lane and record all of them in
 the `Local gate` field.
+
+The full-host lanes boot the daily driver named by `primaryHost` in
+`flake.nix` (as the test node `workstation`), and the drift-gate checks
+read that host's config. Moving to a new machine means changing
+`primaryHost`; no lane names a physical host.
 
 ## Testing skills
 
@@ -266,11 +271,8 @@ interactive VM. When in doubt, run it; the cost is cheap.
 | `verify fork-guards` | Fork-safety guards intact |
 | `flake check (eval)` | Flake evaluates |
 | `docs (eval)` | Doc assertions |
-| `discover` | Computes which `vm-minimal` lanes the diff needs |
-| `build dellan toplevel` | System derivation builds (the slow one, ~15min) |
-| `build tuxedo toplevel` | Tuxedo's system derivation, after dellan's (mostly cache hits) |
-| `vm-minimal (<lane>)` | One job per lane `discover` selected — matrix, not a fixed count |
-| `vm-graphical` | Runs only when desktop files change |
+| `build tuxedo toplevel` | Tuxedo's system derivation builds |
+| `vm-minimal (<lane>)` | One job per lane in the matrix; an unchanged lane substitutes its cached result |
 | `close-fork` | Skipped on non-fork PRs |
 
 Job names come from `.github/workflows/ci.yml`; `close-fork` from

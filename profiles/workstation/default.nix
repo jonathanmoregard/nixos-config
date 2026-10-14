@@ -149,7 +149,6 @@
 
   age.secrets.deploy-ssh-key.rekeyFile        = ../../secrets/deploy-ssh-key.age;
   age.secrets.github-webhook-secret.rekeyFile = ../../secrets/github-webhook-secret.age;
-  age.secrets.gh-janitor-token.rekeyFile      = ../../secrets/gh-janitor-token.age;
 
   # LLM provider + research-agent secrets consumed by the research-agent-mcp
   # and futuresearch-gate-mcp wrappers. Both read raw key values with
@@ -204,9 +203,11 @@
     group = "users";
     mode = "0400";
   };
-  # No github-readonly-pat here. `gh` owns and refreshes the GitHub OAuth
-  # credential in the desktop keyring; aggregator invokes only fixed GET
-  # search endpoints. Enforced by secrets-no-dead-credentials.
+  # No github-readonly-pat here. GitHub reads go through the App host token
+  # (home/gh-host-token.nix), minted and rotated by gh-token.service; the
+  # aggregator invokes only fixed GET search endpoints through that wrapper.
+  # Enforced by secrets-no-dead-credentials. No gh-janitor-token either: the
+  # installer's rulesets bootstrap uses a one-shot PAT it never stores.
   # No ticktick-api-token here on purpose. The aggregator's ticktick ingest
   # reads TICKTICK_ACCESS_TOKEN from ~/.config/todo/env, the same store
   # ~/.claude/todo/backends/ticktick.py rewrites whenever it refreshes the
@@ -298,6 +299,20 @@
   # home/claude-skills/nixos-agenix-secret/SKILL.md.
   age.secrets.gcal-ical-url = {
     rekeyFile = ../../secrets/gcal-ical-url.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
+  age.secrets.openrouter-jev-key = {
+    rekeyFile = ../../secrets/openrouter-jev-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
+  age.secrets.home-assistant-mcp-token = {
+    rekeyFile = ../../secrets/home-assistant-mcp-token.age;
     owner = "jonathan";
     group = "users";
     mode = "0400";

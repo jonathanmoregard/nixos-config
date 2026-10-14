@@ -10,9 +10,10 @@
 # nothing says which is live. The consumer (the aggregator's ticktick source)
 # now reads the shared store directly.
 #
-# Same ownership rule applies to GitHub. `gh auth` owns its OAuth credential
-# in the desktop keyring. A github-readonly-pat agenix declaration shadowed
-# that live credential through GH_TOKEN, then expired independently.
+# Same ownership rule applies to GitHub. The GitHub App host token
+# (home/gh-host-token.nix) is minted and rotated by gh-token.service. A
+# github-readonly-pat agenix declaration shadowed the live credential through
+# GH_TOKEN, then expired independently.
 #
 # Deliberately an eval check, not a VM assertion. Asserting "the file is
 # absent from /run/agenix" inside the test VM would pass vacuously — the VM
@@ -30,8 +31,9 @@ let
   # name -> where the real credential lives, quoted verbatim in the failure.
   deadCredentials = {
     github-readonly-pat =
-      "gh CLI keyring (oauth_token for github.com), refreshed and owned by "
-      + "gh auth; consume it through gh rather than copying it into agenix";
+      "the GitHub App host token (~/.cache/gh-tokens/host/token), minted and "
+      + "rotated by gh-token.service; consume it through the gh wrapper "
+      + "rather than copying a token into agenix";
     ticktick-api-token =
       "~/.config/todo/env (TICKTICK_ACCESS_TOKEN), rewritten on refresh by "
       + "~/.claude/todo/backends/ticktick.py; read it from there";
@@ -51,7 +53,7 @@ if offenders == [ ] then
   ''
 else
   throw ''
-    nixosConfigurations.dellan declares age.secrets that duplicate a credential owned
+    the primary host declares age.secrets that duplicate a credential owned
     elsewhere:
 
     ${report}
