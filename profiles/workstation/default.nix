@@ -139,6 +139,12 @@
 
   services.claudeEgressObserve.enable = true;
   services.klaffatInfra.enable = true;
+  # One read-only token per repo owner while klaffat moves to the org
+  # (klaffat issue #168): the personal one first, the org one after it.
+  services.klaffatInfra.remoteTokenFiles = [
+    config.age.secrets.klaffat-github-token.path
+    config.age.secrets.klaffat-github-token-org.path
+  ];
   services.klaffatLocalGoogle.enable = true;
 
   # ---------------------------------------------------------------------
