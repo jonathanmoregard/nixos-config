@@ -741,11 +741,7 @@ in
     # it would have silently re-armed that. Pull upstream by hand instead.
     */30 6-22 * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/habit-tracker.py >> /home/jonathan/.claude/logs/habit-tracker.log 2>&1
     */30 * * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/sunset-walk-tracker.py >> /home/jonathan/.claude/logs/sunset-walk-tracker.log 2>&1
-    # superpowers auto-commit + push: REMOVED 2026-10-15. Agents now load
-    # superpowers from the vendor/superpowers submodule pinned in ~/.claude,
-    # bumped by update-submodules.sh PRs; fork changes go through fork PRs.
-    # Upstream (obra/superpowers) drift is surfaced as a pending proposal
-    # by the weekly upstream-drift job below, never merged unattended.
+    # Upstream drift of vendored forks becomes a pending proposal; never merged unattended.
     30 10 * * 1 ${pkgs.python3}/bin/python3 /home/jonathan/.claude/scripts/upstream-drift.py >> /home/jonathan/.claude/logs/upstream-drift.log 2>&1
     11 16 * * * /home/jonathan/Repos/aggregator/sync-agent.sh >> /home/jonathan/Repos/aggregator/sync.log 2>&1
     # ~/.claude auto-commit + push: REMOVED 2026-08-31, deliberately.
