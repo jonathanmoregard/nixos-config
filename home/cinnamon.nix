@@ -14,7 +14,6 @@ in
     bibata-cursors
     xdotool
     scrot
-    xbindkeys
     copyq
     gnome-screenshot
   ];
@@ -67,16 +66,6 @@ in
     Type=Application
     Name=Beeper
     Exec=beeper
-    Hidden=false
-    X-GNOME-Autostart-enabled=true
-  '';
-
-  # xbindkeys autostart — binds defined in ~/.xbindkeysrc (managed via dotfiles repo)
-  home.file.".config/autostart/xbindkeys.desktop".text = ''
-    [Desktop Entry]
-    Type=Application
-    Name=xbindkeys
-    Exec=${pkgs.xbindkeys}/bin/xbindkeys
     Hidden=false
     X-GNOME-Autostart-enabled=true
   '';
