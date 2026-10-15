@@ -733,8 +733,6 @@ in
     CLAUDE_PIPELINE_INTERNAL=1
     0 9 * * 1 /home/jonathan/.claude/date-check.sh
     0 10 * * 1 /home/jonathan/.claude/scripts/update-submodules.sh >> /home/jonathan/.claude/logs/submodule-update.log 2>&1
-    0 11 * * 1 /home/jonathan/Repos/dotfiles/backup-crontab.sh >> /home/jonathan/Repos/dotfiles/backup-crontab.log 2>&1
-    23 14 * * * /home/jonathan/Repos/dotfiles/sync-agent.sh >> /home/jonathan/Repos/dotfiles/sync.log 2>&1
     0 10 * * 1 git -C /home/jonathan/Repos/everything-claude-code pull --ff-only >> /home/jonathan/.claude/logs/ecc-pull.log 2>&1
     # token-optimizer upstream-merge autosync: REMOVED 2026-10-03. It would
     # merge third-party upstream (alexgreensh/token-optimizer) hook code
@@ -842,9 +840,7 @@ in
   # services.cron.enable). Home-manager activation runs with a minimal PATH
   # that doesn't include /run/wrappers/bin, so `command -v crontab` returned
   # nothing here and the if-guard silently skipped the reinstall — leaving
-  # the active crontab stale after every `nixos-rebuild switch`. The
-  # backup-sync agent (~/Repos/dotfiles/sync-agent.sh, scheduled daily)
-  # didn't compensate either, because it bails out without gitleaks.
+  # the active crontab stale after every `nixos-rebuild switch`.
   # Result: cron entries on disk drifted from the active crontab for days
   # (caught when wellbeing trackers kept failing with /usr/bin/python3
   # after the python-path fix had already deployed).
@@ -949,7 +945,6 @@ in
     clone_if_missing survival-corpus "$HOME/Repos/survival-corpus"
     clone_if_missing superpowers "$HOME/Repos/superpowers"
     clone_if_missing voquill "$HOME/Repos/voquill"
-    clone_if_missing dotfiles "$HOME/Repos/dotfiles"
     clone_if_missing everything-claude-code "$HOME/Repos/everything-claude-code"
   '';
 }

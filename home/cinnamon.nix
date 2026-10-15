@@ -71,7 +71,7 @@ in
     X-GNOME-Autostart-enabled=true
   '';
 
-  # xbindkeys autostart — binds defined in ~/.xbindkeysrc (managed via dotfiles repo)
+  # xbindkeys autostart — binds defined in ~/.xbindkeysrc (not declared here)
   home.file.".config/autostart/xbindkeys.desktop".text = ''
     [Desktop Entry]
     Type=Application
