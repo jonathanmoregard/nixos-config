@@ -974,7 +974,7 @@ let
 in {
   options.services.klaffatDependabotCaretaker = {
     enable = mkEnableOption "the fail-closed, one-PR Klaffat Dependabot caretaker";
-    repo = mkOption { type = types.str; default = "jonathanmoregard/klaffat"; };
+    repo = mkOption { type = types.str; default = "klaffat/klaffat"; };
     base = mkOption { type = types.str; default = "main"; };
     repoRemoteUrl = mkOption { type = types.str; default = "https://github.com/${cfg.repo}.git"; };
     statePath = mkOption { type = types.str; default = "/var/lib/klaffat-dependabot-caretaker/state"; };
