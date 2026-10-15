@@ -139,6 +139,12 @@
 
   services.claudeEgressObserve.enable = true;
   services.klaffatInfra.enable = true;
+  # One read-only token per repo owner while klaffat moves to the org
+  # (klaffat issue #168): the personal one first, the org one after it.
+  services.klaffatInfra.remoteTokenFiles = [
+    config.age.secrets.klaffat-github-token.path
+    config.age.secrets.klaffat-github-token-org.path
+  ];
   services.klaffatLocalGoogle.enable = true;
 
   # ---------------------------------------------------------------------
@@ -315,6 +321,13 @@
     rekeyFile = ../../secrets/home-assistant-mcp-token.age;
     owner = "jonathan";
     group = "users";
+    mode = "0400";
+  };
+
+  age.secrets.klaffat-github-token-org = {
+    rekeyFile = ../../secrets/klaffat-github-token-org.age;
+    owner = "root";
+    group = "root";
     mode = "0400";
   };
 
