@@ -318,6 +318,13 @@
     mode = "0400";
   };
 
+  age.secrets.klaffat-github-token-org = {
+    rekeyFile = ../../secrets/klaffat-github-token-org.age;
+    owner = "root";
+    group = "root";
+    mode = "0400";
+  };
+
   # add-secret:insert-here
 
   # ---------------------------------------------------------------------
