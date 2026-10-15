@@ -142,7 +142,7 @@ is_hm_declared() {
 DOTFILES_STATUS=""
 for f in ~/.zshrc ~/.gitconfig ~/.huskyrc ~/.zshenv ~/.p10k.zsh \
          ~/.config/git/ignore ~/.config/ghostty/config.ghostty \
-         ~/.config/kitty/kitty.conf ~/.xbindkeysrc; do
+         ~/.config/kitty/kitty.conf; do
   if [ -L "$f" ]; then
     DOTFILES_STATUS+="  symlinked: $f -> $(readlink "$f")\n"
   elif [ -f "$f" ]; then
