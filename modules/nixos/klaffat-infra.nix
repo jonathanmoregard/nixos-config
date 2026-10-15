@@ -1657,7 +1657,7 @@ in
 
     repoRemoteUrl = lib.mkOption {
       type = lib.types.str;
-      default = "https://github.com/jonathanmoregard/klaffat.git";
+      default = "https://github.com/klaffat/klaffat.git";
       description = ''
         The one URL root fetches the klaffat repository from, into its own
         bare mirror, before every privileged run. `main`'s tip in that
@@ -1669,7 +1669,9 @@ in
         the agent's own homework.
 
         The repository was renamed from `kablong` to `klaffat` on
-        2026-09-05 and this default changed in the same commit. Should it
+        2026-09-05 and this default changed in the same commit; it moved
+        to the `klaffat` organization in October 2026 (klaffat issue
+        #168) and this default followed right after. Should it
         ever move again, change the two together — the wrappers refuse,
         loudly, when the fetch fails.
       '';
