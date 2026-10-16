@@ -741,14 +741,8 @@ in
     # it would have silently re-armed that. Pull upstream by hand instead.
     */30 6-22 * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/habit-tracker.py >> /home/jonathan/.claude/logs/habit-tracker.log 2>&1
     */30 * * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/sunset-walk-tracker.py >> /home/jonathan/.claude/logs/sunset-walk-tracker.log 2>&1
-    # superpowers is a PUBLIC fork of obra/superpowers and gitignores
-    # sync-agent.sh on purpose — local automation must not land in the
-    # tree or leak into an upstream PR. The previous line pointed at an
-    # in-repo copy that consequently did not exist, so every run since
-    # logged `No such file or directory` and synced nothing. The canonical
-    # script now takes a SYNC_REPO override so it can sync a repo it does
-    # not live inside; nothing needs to exist in the public tree.
-    37 15 * * * SYNC_REPO=/home/jonathan/Repos/superpowers /home/jonathan/.claude/skills/repo-autosync/sync-agent.sh >> /home/jonathan/Repos/superpowers/sync.log 2>&1
+    # Upstream drift of vendored forks becomes a pending proposal; never merged unattended.
+    30 10 * * 1 ${pkgs.python3}/bin/python3 /home/jonathan/.claude/scripts/upstream-drift.py >> /home/jonathan/.claude/logs/upstream-drift.log 2>&1
     11 16 * * * /home/jonathan/Repos/aggregator/sync-agent.sh >> /home/jonathan/Repos/aggregator/sync.log 2>&1
     # ~/.claude auto-commit + push: REMOVED 2026-08-31, deliberately.
     #
