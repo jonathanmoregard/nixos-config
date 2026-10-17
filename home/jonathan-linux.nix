@@ -733,7 +733,6 @@ in
     CLAUDE_PIPELINE_INTERNAL=1
     0 9 * * 1 /home/jonathan/.claude/date-check.sh
     0 10 * * 1 /home/jonathan/.claude/scripts/update-submodules.sh >> /home/jonathan/.claude/logs/submodule-update.log 2>&1
-    0 10 * * 1 git -C /home/jonathan/Repos/everything-claude-code pull --ff-only >> /home/jonathan/.claude/logs/ecc-pull.log 2>&1
     # token-optimizer upstream-merge autosync: REMOVED 2026-10-03. It would
     # merge third-party upstream (alexgreensh/token-optimizer) hook code
     # into a live, enabled plugin with no human review. Dormant since
