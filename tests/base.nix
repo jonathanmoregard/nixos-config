@@ -325,7 +325,7 @@ in
     # The profile's roots and protections are proven by the sandbox runs
     # below; only the hardening keys no run exercises are read back here.
     assert 'allowed_sandbox_modes' not in codex_requirements
-    assert 'allowed_approval_policies = ["never"]' in codex_requirements
+    assert 'allowed_approval_policies = ["never", "on-request"]' in codex_requirements
     assert 'allow_managed_hooks_only = true' in codex_requirements
 
     # Exact broad source roots work without prompts.
