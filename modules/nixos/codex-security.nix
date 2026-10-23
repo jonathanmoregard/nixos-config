@@ -6,7 +6,9 @@
   # definition; Codex rejects duplicate managed and loaded profile names.
   environment.etc."codex/requirements.toml".text = ''
     default_permissions = "repos_dev"
-    allowed_approval_policies = ["never"]
+    # Permit explicit approval prompts (including MCP writes). User config
+    # still defaults to never; the managed permission profiles remain enforced.
+    allowed_approval_policies = ["never", "on-request"]
     allow_managed_hooks_only = true
 
     [allowed_permission_profiles]
