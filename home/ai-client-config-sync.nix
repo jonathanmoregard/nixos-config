@@ -69,6 +69,8 @@ let
       run_dir=""
       publish_started=0
       stage="validate"
+      # Listed directories are authoritative mirror output; omitted children
+      # are pruned. Native runtime locations are excluded below.
       managed_paths=(
         ".codex/config.toml"
         ".codex/rules"
@@ -76,7 +78,7 @@ let
         ".codex/hooks"
         ".codex/hooks.json"
         ".codex/mcps"
-        ".codex/plugins"
+        ".codex/plugins/claude-mirror"
         ".codex/agents"
         ".codex/claude-setup-mirror"
         ".codex/AGENTS.md"
@@ -85,6 +87,41 @@ let
         "plugins/claude-mirror"
       )
 
+      # Only these generated paths belong to the mirror. Everything else,
+      # including Codex's bundled skills and installed plugins, stays outside it.
+      sync_filters=(
+        --exclude="/.codex/skills/.system/***"
+        # Active sessions cache these immutable hook commands and runtimes.
+        --filter="P /.codex/hooks/claude-mirror/***"
+      )
+      for relative in "''${managed_paths[@]}"; do
+        parent=$(dirname "$relative")
+        while [ "$parent" != "." ]; do
+          sync_filters+=( --include="/$parent/" )
+          parent=$(dirname "$parent")
+        done
+        sync_filters+=( --include="/$relative" --include="/$relative/***" --include="/$relative.bak-*" )
+      done
+      sync_filters+=( --exclude="*" )
+
+      sync_tree() {
+        local source_root="$1" target_root="$2"
+        shift 2
+        # Copy payloads before the entry points that reference them, including
+        # on first installation. Then update those entry points and prune.
+        # Keep private directory permissions and file executable bits.
+        rsync -rltE --checksum --omit-dir-times \
+          --exclude="/.codex/config.toml" \
+          --exclude="/.codex/hooks.json" \
+          --exclude="/.agents/plugins/marketplace.json" \
+          --exclude="/plugins/claude-mirror/.codex-plugin/plugin.json" \
+          --exclude="/plugins/claude-mirror/.mcp.json" \
+          --exclude="/plugins/claude-mirror/hooks.json" \
+          "$@" "''${sync_filters[@]}" -- "$source_root/" "$target_root/" || return
+        rsync -rltE --checksum --omit-dir-times --delete-after \
+          "$@" "''${sync_filters[@]}" -- "$source_root/" "$target_root/"
+      }
+
       mkdir -p "$state_dir"
 
       finish() {
@@ -92,30 +129,7 @@ let
         trap - EXIT
         if [ "$status" -ne 0 ] && [ "$publish_started" -eq 1 ]; then
           failed_stage="$stage"
-          rollback_failed=0
-          for index in "''${!managed_paths[@]}"; do
-            relative="''${managed_paths[$index]}"
-            target="$HOME/$relative"
-            case "$relative" in
-              ".agents/plugins"|"plugins/claude-mirror")
-                find "$target" -mindepth 1 -maxdepth 1 \
-                  -exec rm -rf -- {} + || rollback_failed=1
-                if [ -e "$run_dir/backup/$index.present" ]; then
-                  cp -a -- "$run_dir/backup/$index.value/." "$target/" \
-                    || rollback_failed=1
-                fi
-                ;;
-              *)
-                rm -rf -- "$target" || rollback_failed=1
-                if [ -e "$run_dir/backup/$index.present" ]; then
-                  mkdir -p "$(dirname "$target")"
-                  cp -a -- "$run_dir/backup/$index.value" "$target" \
-                    || rollback_failed=1
-                fi
-                ;;
-            esac
-          done
-          if [ "$rollback_failed" -ne 0 ]; then
+          if ! sync_tree "$run_dir/backup" "$HOME"; then
             stage="$failed_stage-rollback"
             status=70
           fi
@@ -345,14 +359,16 @@ let
       mkdir -p "$run_dir/backup"
       staged_home="$run_dir/staged-home"
       mkdir -p "$staged_home"
-      for index in "''${!managed_paths[@]}"; do
-        relative="''${managed_paths[$index]}"
-        target="$HOME/$relative"
-        if [ -e "$target" ] || [ -L "$target" ]; then
-          touch "$run_dir/backup/$index.present"
-          cp -a -- "$target" "$run_dir/backup/$index.value"
+      sync_tree "$HOME" "$run_dir/backup"
+      # These are merge inputs, not generated output to carry forward. Render
+      # every generated directory from scratch so omitted files become stale.
+      for relative in \
+        .codex/config.toml \
+        .codex/rules/default.rules \
+        .agents/plugins/marketplace.json; do
+        if [ -f "$run_dir/backup/$relative" ]; then
           mkdir -p "$(dirname "$staged_home/$relative")"
-          cp -a -- "$target" "$staged_home/$relative"
+          cp -a -- "$run_dir/backup/$relative" "$staged_home/$relative"
         fi
       done
       mkdir -p \
@@ -379,36 +395,9 @@ let
 
       stage="publish"
       publish_started=1
-      for index in "''${!managed_paths[@]}"; do
-        relative="''${managed_paths[$index]}"
-        source="$staged_home/$relative"
-        target="$HOME/$relative"
-        if { [ "$relative" = ".codex/skills" ] || [ "$relative" = "plugins/claude-mirror" ]; } && \
-          [ -d "$source" ] && \
-          [ ! -L "$source" ] && [ ! -L "$target" ]; then
-          # Replace individual files while existing skills remain readable;
-          # remove obsolete entries only after all transfers have succeeded.
-          mkdir -p "$target"
-          rsync -a --checksum --delete-after -- "$source/" "$target/"
-          continue
-        fi
-        case "$relative" in
-          ".agents/plugins"|"plugins/claude-mirror")
-            find "$target" -mindepth 1 -maxdepth 1 \
-              -exec rm -rf -- {} +
-            if [ -e "$source" ]; then
-              cp -a -- "$source/." "$target/"
-            fi
-            ;;
-          *)
-            rm -rf -- "$target"
-            if [ -e "$source" ] || [ -L "$source" ]; then
-              mkdir -p "$(dirname "$target")"
-              cp -a -- "$source" "$target"
-            fi
-            ;;
-        esac
-      done
+      # Renderer backups are not desired output. Hiding them only on the
+      # sender lets the same final prune remove old backups on the receiver.
+      sync_tree "$staged_home" "$HOME" --filter='H *.bak-*'
 
       stage="record"
       success_tmp="$state_dir/last-success.tmp.$$"
