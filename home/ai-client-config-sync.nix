@@ -57,6 +57,7 @@ let
       pkgs.findutils
       pkgs.git
       pkgs.python3
+      pkgs.rsync
       pkgs.util-linux
     ];
     text = ''
@@ -382,6 +383,15 @@ let
         relative="''${managed_paths[$index]}"
         source="$staged_home/$relative"
         target="$HOME/$relative"
+        if { [ "$relative" = ".codex/skills" ] || [ "$relative" = "plugins/claude-mirror" ]; } && \
+          [ -d "$source" ] && \
+          [ ! -L "$source" ] && [ ! -L "$target" ]; then
+          # Replace individual files while existing skills remain readable;
+          # remove obsolete entries only after all transfers have succeeded.
+          mkdir -p "$target"
+          rsync -a --checksum --delete-after -- "$source/" "$target/"
+          continue
+        fi
         case "$relative" in
           ".agents/plugins"|"plugins/claude-mirror")
             find "$target" -mindepth 1 -maxdepth 1 \

@@ -3291,6 +3291,11 @@ in
         "v1",
         "'import os' 'import time' 'from pathlib import Path' "
         "'time.sleep(2)' "
+        "'for relative in [\".codex/skills\", \"plugins/claude-mirror/skills\"]:' "
+        "'    skills = Path.home() / relative' "
+        "'    for name, value in [(\"updated\", \"old\"), (\"unchanged\", \"keep\"), (\"obsolete\", \"stale\")]:' "
+        "'        (skills / name).mkdir(parents=True, exist_ok=True)' "
+        "'        (skills / name / \"SKILL.md\").write_text(value)' "
         "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v1\\n\")' "
         "'source = Path.home() / \".claude\" / \"commands\" / \"external.md\"' "
         "'source_state = \"symlink\" if source.is_symlink() else \"materialized\"' "
@@ -3348,9 +3353,25 @@ in
 
     # A second invocation must clone again and execute the new remote HEAD,
     # not a cached checkout or the user's dirty development tree.
+    skill_inodes = {}
+    for index, skill_root in enumerate([
+        "/home/jonathan/.codex/skills",
+        "/home/jonathan/plugins/claude-mirror/skills",
+    ]):
+        # Hold the unchanged inode alive so delete-and-recreate cannot pass by reuse.
+        pin = f"/tmp/codex-skill-inode-pin-{index}"
+        workstation.succeed(f"ln {skill_root}/unchanged/SKILL.md {pin}")
+        skill_inodes[skill_root] = (
+            workstation.succeed(f"stat -c %i {skill_root}").strip(),
+            workstation.succeed(f"stat -c %i {pin}").strip(),
+        )
     commit_renderer(
         "v2",
-        "'import os' 'from pathlib import Path' "
+        "'import os, shutil' 'from pathlib import Path' "
+        "'for relative in [\".codex/skills\", \"plugins/claude-mirror/skills\"]:' "
+        "'    skills = Path.home() / relative' "
+        "'    (skills / \"updated\" / \"SKILL.md\").write_text(\"new-content\")' "
+        "'    shutil.rmtree(skills / \"obsolete\")' "
         "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v2\\n\")' "
         "'Path(os.environ[\"AI_CLIENT_CONFIG_NETWORK_OUTPUT\"]).write_text(\",\".join(sorted(p.name for p in Path(\"/sys/class/net\").iterdir())) + \"\\n\")' "
         "'bus = Path(os.environ[\"XDG_RUNTIME_DIR\"]) / \"bus\"' "
@@ -3360,6 +3381,11 @@ in
         "'(Path.home() / \".codex\" / \"unmanaged-proof\").write_text(\"persisted\\n\")'",
     )
     workstation.succeed(user_systemctl + " start ai-client-config-codex-sync.service'")
+    for skill_root, (root_inode, skill_inode) in skill_inodes.items():
+        assert workstation.succeed(f"stat -c %i {skill_root}").strip() == root_inode
+        assert workstation.succeed(f"stat -c %i {skill_root}/unchanged/SKILL.md").strip() == skill_inode
+        assert workstation.succeed(f"cat {skill_root}/updated/SKILL.md").strip() == "new-content"
+        workstation.fail(f"test -e {skill_root}/obsolete")
     assert workstation.succeed(f"cat {output}").strip() == "v2"
     assert workstation.succeed(f"cat {network_output}").strip() == "lo"
     assert workstation.succeed(f"cat {bus_output}").strip() == "hidden"
