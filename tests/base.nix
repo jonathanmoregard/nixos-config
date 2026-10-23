@@ -3245,6 +3245,10 @@ in
         f"install -d -o jonathan -g users {fixture} {fixture}/scripts && "
         "install -d -o jonathan -g users /home/jonathan/.codex/claude-setup-mirror && "
         "install -d -o jonathan -g users /home/jonathan/.codex/sessions && "
+        "install -d -o jonathan -g users /home/jonathan/.codex/skills/.system/builtin && "
+        "install -d -o jonathan -g users /home/jonathan/.codex/plugins/cache/provider && "
+        "install -d -o jonathan -g users /home/jonathan/.codex/rules && "
+        "install -d -o jonathan -g users /home/jonathan/.agents/plugins && "
         "install -d -o jonathan -g users /home/jonathan/.claude/commands && "
         "install -d -o jonathan -g users /home/jonathan/.claude/plugins/cache && "
         "install -d -o jonathan -g users /home/jonathan/.config/gh && "
@@ -3274,6 +3278,13 @@ in
         "chown jonathan:users /home/jonathan/.claude.json && "
         "printf 'stable\\n' > /home/jonathan/.codex/AGENTS.md && "
         "chown jonathan:users /home/jonathan/.codex/AGENTS.md && "
+        "printf 'builtin\\n' > /home/jonathan/.codex/skills/.system/builtin/SKILL.md && "
+        "printf 'cache\\n' > /home/jonathan/.codex/plugins/cache/provider/content && "
+        "printf 'runtime\\n' > /home/jonathan/.codex/sessions/runtime-state && "
+        "printf '# local config\\n' > /home/jonathan/.codex/config.toml && "
+        "printf '# local rules\\n' > /home/jonathan/.codex/rules/default.rules && "
+        "printf '{}\\n' > /home/jonathan/.agents/plugins/marketplace.json && "
+        "chown -R jonathan:users /home/jonathan/.codex /home/jonathan/.agents/plugins && "
         f"su - jonathan -c 'git init -b main {fixture} && "
         f"git -C {fixture} config user.name vm-test && "
         f"git -C {fixture} config user.email vm-test@example.invalid'"
@@ -3289,8 +3300,31 @@ in
 
     commit_renderer(
         "v1",
-        "'import os' 'import time' 'from pathlib import Path' "
+        "'import hashlib, json, os, time' 'from pathlib import Path' "
         "'time.sleep(2)' "
+        "'home = Path.home()' "
+        "'assert not (home / \".codex/AGENTS.md\").exists()' "
+        "'assert not (home / \".codex/skills/.system\").exists()' "
+        "'assert not (home / \".codex/plugins/cache\").exists()' "
+        "'assert (home / \".codex/config.toml\").read_text() == \"# local config\\n\"' "
+        "'assert (home / \".codex/rules/default.rules\").read_text() == \"# local rules\\n\"' "
+        "'assert (home / \".agents/plugins/marketplace.json\").read_text() == \"{}\\n\"' "
+        "'for relative in [\".codex/skills\", \".codex/scripts\", \".codex/agents\", \".codex/claude-setup-mirror\", \".agents/plugins\", \"plugins/claude-mirror/skills\"]:' "
+        "'    root = home / relative' "
+        "'    for name, value in [(\"updated\", \"old-value\"), (\"unchanged\", \"keep\"), (\"obsolete\", \"stale\")]:' "
+        "'        entry = root / name / \"fixture.txt\"' "
+        "'        entry.parent.mkdir(parents=True, exist_ok=True)' "
+        "'        entry.write_text(value)' "
+        "'        entry.chmod(0o640)' "
+        "'        os.utime(entry, (1700000000, 1700000000))' "
+        "'(home / \".codex/AGENTS.md\").write_text(\"stable\\n\")' "
+        "'wrapper_text = \"#!/bin/sh\\necho hook-v1\\n\"' "
+        "'digest = hashlib.sha256(wrapper_text.encode()).hexdigest()[:24]' "
+        "'wrapper = home / \".codex/hooks/claude-mirror\" / f\"sessionstart-{digest}.sh\"' "
+        "'wrapper.parent.mkdir(parents=True, exist_ok=True)' "
+        "'wrapper.write_text(wrapper_text)' "
+        "'wrapper.chmod(0o755)' "
+        "'(home / \".codex/hooks.json\").write_text(json.dumps({\"hooks\": {\"SessionStart\": [{\"hooks\": [{\"type\": \"command\", \"command\": str(wrapper)}]}]}}))' "
         "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v1\\n\")' "
         "'source = Path.home() / \".claude\" / \"commands\" / \"external.md\"' "
         "'source_state = \"symlink\" if source.is_symlink() else \"materialized\"' "
@@ -3345,12 +3379,69 @@ in
         "external-source\nmaterialized\nrepo-hidden\n"
         "external-plugin-source\nplugin-visible\nleak-hidden"
     ), source_text
+    import json as _sync_json
+    cached_hook = _sync_json.loads(
+        workstation.succeed("cat /home/jonathan/.codex/hooks.json")
+    )["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    assert workstation.succeed(cached_hook).strip() == "hook-v1"
 
     # A second invocation must clone again and execute the new remote HEAD,
     # not a cached checkout or the user's dirty development tree.
+    output_inodes = {}
+    for index, output_root in enumerate([
+        "/home/jonathan/.codex/skills",
+        "/home/jonathan/.codex/scripts",
+        "/home/jonathan/.codex/agents",
+        "/home/jonathan/.codex/claude-setup-mirror",
+        "/home/jonathan/.agents/plugins",
+        "/home/jonathan/plugins/claude-mirror/skills",
+    ]):
+        # Hold the unchanged inode alive so delete-and-recreate cannot pass by reuse.
+        pin = f"/tmp/codex-output-inode-pin-{index}"
+        workstation.succeed(f"ln {output_root}/unchanged/fixture.txt {pin}")
+        output_inodes[output_root] = (
+            workstation.succeed(f"stat -c %i {output_root}").strip(),
+            workstation.succeed(f"stat -c %i {pin}").strip(),
+        )
+    workstation.succeed(
+        "install -d -o jonathan -g users /home/jonathan/.codex/skills/skills/skills/obsolete && "
+        "printf 'nested cruft\\n' > /home/jonathan/.codex/skills/skills/skills/obsolete/SKILL.md && "
+        "printf 'old backup\\n' > /home/jonathan/.codex/scripts/legacy.bak-old && "
+        "chown -R jonathan:users /home/jonathan/.codex/skills/skills && "
+        "chown jonathan:users /home/jonathan/.codex/scripts/legacy.bak-old"
+    )
     commit_renderer(
         "v2",
-        "'import os' 'from pathlib import Path' "
+        "'import hashlib, json, os' 'from pathlib import Path' 'home = Path.home()' "
+        "'assert not (home / \".codex/AGENTS.md\").exists()' "
+        "'assert not (home / \".codex/hooks\").exists()' "
+        "'assert not (home / \".codex/skills/.system\").exists()' "
+        "'assert not (home / \".codex/skills/skills\").exists()' "
+        "'assert not (home / \".codex/plugins/cache\").exists()' "
+        "'assert not Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).exists()' "
+        "'assert not Path(os.environ[\"AI_CLIENT_CONFIG_SOURCE_OUTPUT\"]).exists()' "
+        "'assert (home / \".codex/config.toml\").read_text() == \"# local config\\n\"' "
+        "'assert (home / \".codex/rules/default.rules\").read_text() == \"# local rules\\n\"' "
+        "'assert (home / \".agents/plugins/marketplace.json\").read_text() == \"{}\\n\"' "
+        "'for relative in [\".codex/skills\", \".codex/scripts\", \".codex/agents\", \".codex/claude-setup-mirror\", \".agents/plugins\", \"plugins/claude-mirror/skills\"]:' "
+        "'    root = home / relative' "
+        "'    assert not (root / \"updated\").exists()' "
+        "'    assert not (root / \"obsolete\").exists()' "
+        "'    for name, value in [(\"updated\", \"new-value\"), (\"unchanged\", \"keep\")]:' "
+        "'        entry = root / name / \"fixture.txt\"' "
+        "'        entry.parent.mkdir(parents=True, exist_ok=True)' "
+        "'        entry.write_text(value)' "
+        "'        entry.chmod(0o640)' "
+        "'        os.utime(entry, (1700000000, 1700000000))' "
+        "'(home / \".codex/AGENTS.md\").write_text(\"stable\\n\")' "
+        "'wrapper_text = \"#!/bin/sh\\necho hook-v2\\n\"' "
+        "'digest = hashlib.sha256(wrapper_text.encode()).hexdigest()[:24]' "
+        "'wrapper = home / \".codex/hooks/claude-mirror\" / f\"sessionstart-{digest}.sh\"' "
+        "'wrapper.parent.mkdir(parents=True, exist_ok=True)' "
+        "'wrapper.write_text(wrapper_text)' "
+        "'wrapper.chmod(0o755)' "
+        "'(home / \".codex/hooks.json\").write_text(json.dumps({\"hooks\": {\"SessionStart\": [{\"hooks\": [{\"type\": \"command\", \"command\": str(wrapper)}]}]}}))' "
+        "'(home / \".codex/scripts/new.bak-rendered\").write_text(\"backup\\n\")' "
         "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"v2\\n\")' "
         "'Path(os.environ[\"AI_CLIENT_CONFIG_NETWORK_OUTPUT\"]).write_text(\",\".join(sorted(p.name for p in Path(\"/sys/class/net\").iterdir())) + \"\\n\")' "
         "'bus = Path(os.environ[\"XDG_RUNTIME_DIR\"]) / \"bus\"' "
@@ -3360,6 +3451,27 @@ in
         "'(Path.home() / \".codex\" / \"unmanaged-proof\").write_text(\"persisted\\n\")'",
     )
     workstation.succeed(user_systemctl + " start ai-client-config-codex-sync.service'")
+    # Active sessions retain commands from the previous hook registry.
+    current_hook = _sync_json.loads(
+        workstation.succeed("cat /home/jonathan/.codex/hooks.json")
+    )["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    assert current_hook != cached_hook
+    assert workstation.succeed(current_hook).strip() == "hook-v2"
+    assert workstation.succeed(cached_hook).strip() == "hook-v1"
+    for output_root, (root_inode, file_inode) in output_inodes.items():
+        assert workstation.succeed(f"stat -c %i {output_root}").strip() == root_inode
+        assert workstation.succeed(f"stat -c %i {output_root}/unchanged/fixture.txt").strip() == file_inode
+        assert workstation.succeed(f"cat {output_root}/updated/fixture.txt").strip() == "new-value"
+        assert workstation.succeed(f"stat -c %a {output_root}/updated/fixture.txt").strip() == "640"
+        workstation.fail(f"test -e {output_root}/obsolete")
+    workstation.fail("test -e /home/jonathan/.codex/skills/skills")
+    workstation.fail("test -e /home/jonathan/.codex/scripts/legacy.bak-old")
+    workstation.fail("test -e /home/jonathan/.codex/scripts/new.bak-rendered")
+    workstation.fail(f"test -e {source_output}")
+    workstation.fail(f"test -e {claude_state_output}")
+    assert workstation.succeed("cat /home/jonathan/.codex/skills/.system/builtin/SKILL.md").strip() == "builtin"
+    assert workstation.succeed("cat /home/jonathan/.codex/plugins/cache/provider/content").strip() == "cache"
+    assert workstation.succeed("cat /home/jonathan/.codex/sessions/runtime-state").strip() == "runtime"
     assert workstation.succeed(f"cat {output}").strip() == "v2"
     assert workstation.succeed(f"cat {network_output}").strip() == "lo"
     assert workstation.succeed(f"cat {bus_output}").strip() == "hidden"
