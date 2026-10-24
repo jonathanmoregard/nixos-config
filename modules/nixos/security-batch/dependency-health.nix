@@ -17,8 +17,9 @@
 #   Actions:           Read-only
 #   Metadata:          Read-only (mandatory)
 # Everything else (contents, checks, workflows, administration, …): No access.
-# No webhook, no user authorization. Installed on jonathanmoregard (only the
-# repos below) and on the klaffat org (klaffat/klaffat).
+# No webhook, no user authorization. Installable on "Any account" (one App,
+# two owners), installed on jonathanmoregard (only the repos below) and on
+# the klaffat org (klaffat/klaffat only).
 #
 # Provisioning, then fill in `app` below in the same PR:
 #   - the private key, as agenix secret `github-dependency-health-app-key`,
