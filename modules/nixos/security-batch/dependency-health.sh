@@ -11,9 +11,10 @@
 #   2. open PRs by dependabot[bot] created over 7 days ago (stale), or whose
 #      latest run of some workflow on the PR head concluded failure,
 #      timed_out or startup_failure (failing);
-#   3. per workflow that is still active, its latest scheduled run on the
-#      default branch, if that concluded failure, timed_out or
-#      startup_failure. The newest 100 scheduled runs are looked at.
+#   3. per workflow that is still active, its own latest scheduled run on
+#      the default branch (one query per workflow, so a busy hourly schedule
+#      cannot push a weekly one out of a shared page), if that concluded
+#      failure, timed_out or startup_failure.
 #
 # No diff against the previous run and no accepted.txt: acceptance lives in
 # GitHub (a dismissed alert is not open, a closed PR is not open), so a
@@ -153,23 +154,25 @@ check_repo() {
   # ── 3. scheduled workflows on the default branch ──
   if api "$d/repo.json" "repos/$repo" && branch=$(jq -er '.default_branch | strings' "$d/repo.json"); then
     if api "$d/workflows.json" "repos/$repo/actions/workflows?per_page=100" \
-       && jq -e '.workflows | type == "array"' "$d/workflows.json" > /dev/null \
-       && api "$d/schedule.json" "repos/$repo/actions/runs?event=schedule&branch=$(jq -rn --arg b "$branch" '$b | @uri')&per_page=100" \
-       && jq -e '.workflow_runs | type == "array"' "$d/schedule.json" > /dev/null; then
-      local red_runs
-      red_runs=$(jq -r --argjson f "$failed" --slurpfile w "$d/workflows.json" '
-        ($w[0].workflows | map(select(.state == "active") | .id)) as $active
-        | .workflow_runs | map(select(.workflow_id as $id | $active | index($id)))
-        | group_by(.workflow_id) | map(max_by(.created_at))
-        | map(select(.conclusion as $c | $f | index($c)))
-        | .[] | "  scheduled run failed: \(.path // .name // "?") \(.html_url // "")"' "$d/schedule.json")
-      if [ -n "$red_runs" ]; then
-        local k; k=$(grep -c . <<< "$red_runs")
-        parts+=("$(plural "$k" "failed scheduled run")")
-        echo "$red_runs" >> "$report"
-      fi
+       && jq -e '.workflows | type == "array"' "$d/workflows.json" > /dev/null; then
+      local wf red_runs=0 ubranch
+      ubranch=$(jq -rn --arg b "$branch" '$b | @uri')
+      for wf in $(jq -r '.workflows[] | select(.state == "active") | .id | numbers' "$d/workflows.json"); do
+        if api "$d/schedule-$wf.json" "repos/$repo/actions/workflows/$wf/runs?event=schedule&branch=$ubranch&per_page=1" \
+           && jq -e '.workflow_runs | type == "array"' "$d/schedule-$wf.json" > /dev/null; then
+          if jq -e --argjson f "$failed" '.workflow_runs[0].conclusion as $c | $c != null and ($f | index($c))' \
+               "$d/schedule-$wf.json" > /dev/null; then
+            red_runs=$((red_runs + 1))
+            jq -r '.workflow_runs[0] | "  scheduled run failed: \(.path // .name // "?") \(.html_url // "")"' \
+              "$d/schedule-$wf.json" >> "$report"
+          fi
+        else
+          bad+=("${reason:-malformed runs for workflow $wf}")
+        fi
+      done
+      [ "$red_runs" -eq 0 ] || parts+=("$(plural "$red_runs" "failed scheduled run")")
     else
-      bad+=("${reason:-malformed workflows or runs}")
+      bad+=("${reason:-malformed workflows}")
     fi
   else
     bad+=("${reason:-no default branch}")

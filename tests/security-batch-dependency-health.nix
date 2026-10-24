@@ -76,12 +76,18 @@ let
       dependabot_alerts) cat "$dir/alerts.json" 2>/dev/null || echo '[]' ;;
       pulls) cat "$dir/pulls.json" 2>/dev/null || echo '[]' ;;
       actions_workflows) cat "$dir/workflows.json" 2>/dev/null || echo '{"total_count":0,"workflows":[]}' ;;
-      actions_runs)
+      # Repo-wide or one workflow's runs, newest first, one page of
+      # per_page (GitHub's default 30), as the API pages them.
+      actions_runs|actions_workflows_*_runs)
+        wf=""; [ "$key" = actions_runs ] || { wf=''${key#actions_workflows_}; wf=''${wf%_runs}; }
         { cat "$dir/runs.json" 2>/dev/null || echo '[]'; } | jq -c \
+          --arg wf "$wf" --arg per "$(param per_page)" \
           --arg event "$(param event)" --arg branch "$(param branch)" --arg sha "$(param head_sha)" '
-          map(select(($event == "" or .event == $event) and ($branch == "" or .head_branch == $branch)
+          map(select(($wf == "" or (.workflow_id | tostring) == $wf)
+                     and ($event == "" or .event == $event) and ($branch == "" or .head_branch == $branch)
                      and ($sha == "" or .head_sha == $sha)))
-          | sort_by(.created_at) | reverse | {total_count: length, workflow_runs: .}' ;;
+          | sort_by(.created_at) | reverse
+          | {total_count: length, workflow_runs: .[0:(if $per == "" then 30 else ($per | tonumber) end)]}' ;;
       *) echo '{"message":"Not Found","status":"404"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
     esac
   '';
@@ -100,7 +106,7 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     ln -s ${fakeGh} fakebin/gh
     ln -s ${fakeGhToken} fakebin/gh-token
     export FAKE_DIR=$PWD/fake FAKE_LOG=$PWD/calls.log
-    printf -- '-----BEGIN RSA PRIVATE KEY-----\nfixture\n-----END RSA PRIVATE KEY-----\n' > fake/app-key
+    echo "fixture-app-key, opaque: the fake gh-token only compares it" > fake/app-key
     cp fake/app-key creds/github-app-key
     inst() { cksum <<< "$1" | cut -d' ' -f1; }
     # config <repo>... → config.json as the module writes it, with every
@@ -222,6 +228,16 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     grep -qE 'w1[234]\.yml|w99' "$run/report.txt" && fail "a non-current scheduled failure was reported"
     reset
 
+    #    A busy hourly workflow's 120 green runs must not push a weekly
+    #    workflow's failed latest run out of view.
+    workflows klaffat/klaffat 21:active 22:active
+    runs klaffat/klaffat 22 schedule main w1 '"failure"' "$(ago '6 days')"
+    for h in $(seq 1 120); do runs klaffat/klaffat 21 schedule main "h$h" '"success"' "$(ago "$h hours")"; done
+    check "''${repos[@]}"
+    [ "$rc" = 1 ] || fail "weekly failure behind a busy hourly workflow exited $rc"
+    grep -q 'w22.yml' "$run/report.txt" || fail "weekly failure missing from report.txt"
+    reset
+
     # 6. Alerts disabled, as the API says it: a finding, not a tool error.
     http jonathanmoregard/.claude dependabot_alerts '403 Dependabot alerts are disabled for this repository.'
     check "''${repos[@]}"
@@ -279,6 +295,12 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     echo '{"workflows": 5}' > "$(repo_dir klaffat/klaffat)/actions_workflows.raw"
     check "''${repos[@]}"
     [ "$rc" = 3 ] || fail "wrong-shaped JSON exited $rc"
+    reset
+    workflows klaffat/klaffat 11:active
+    http klaffat/klaffat actions_workflows_11_runs '502 Server Error'
+    check "''${repos[@]}"
+    [ "$rc" = 3 ] || fail "a workflow's runs failing to load exited $rc"
+    grep -q 'could not check klaffat: HTTP 502' <<< "$(summary)" || fail "workflow runs failure not named"
     reset
 
     check
