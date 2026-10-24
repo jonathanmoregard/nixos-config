@@ -1,0 +1,2 @@
+# Model ids whose retirement is known and handled; one per line, then why.
+# Format and semantics: model-retirement.sh. Remove the line once the pin moves.
