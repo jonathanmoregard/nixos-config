@@ -91,16 +91,18 @@ let
     } // extra;
   };
 
-  # Only jonathan (and root) may connect.
+  # Only github-app-clients (jonathan) and root may connect. root owns the
+  # inode: an owner may chmod a socket, so a jonathan-owned one could be
+  # opened to every local uid.
   brokerSocket = { description, path }: {
     inherit description;
     wantedBy = [ "sockets.target" ];
     socketConfig = {
       ListenStream = path;
       Accept = true;
-      SocketUser = "jonathan";
-      SocketGroup = "root";
-      SocketMode = "0600";
+      SocketUser = "root";
+      SocketGroup = "github-app-clients";
+      SocketMode = "0660";
     };
   };
 in
@@ -160,6 +162,7 @@ in
         description = "Holder of the GitHub App private key";
       };
       users.groups.github-app = { };
+      users.groups.github-app-clients.members = [ "jonathan" ];
     }
 
     (lib.mkIf enabled {

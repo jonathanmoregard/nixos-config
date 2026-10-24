@@ -3725,6 +3725,12 @@ in
     workstation.fail(
         f"runuser -u nobody -- {socat} -t 10 - UNIX-CONNECT:/run/github-app/token.sock < /dev/null"
     )
+    # jonathan cannot widen the sockets: root owns them.
+    for sock in ["token", "mcp"]:
+        assert workstation.succeed(
+            f"stat -c '%U %G %a' /run/github-app/{sock}.sock"
+        ).strip() == "root github-app-clients 660", sock
+        workstation.fail(f"su - jonathan -c 'chmod 666 /run/github-app/{sock}.sock'")
     def token_socket(request):
         return workstation.succeed(
             f"su - jonathan -c 'printf \"%s\\n\" \"{request}\""
