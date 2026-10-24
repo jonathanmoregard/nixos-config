@@ -330,7 +330,6 @@
         # In ci.yml's vm-minimal matrix. Gates credential handling and the
         # sudo password rule.
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
-        vm-klaffat-dependabot-caretaker = mkLane ./tests/klaffat-dependabot-caretaker.nix;
 
         # Not a VM lane: an eval-time assertion, because that is when the
         # fault would land. dellan is the machine holding the root-only
