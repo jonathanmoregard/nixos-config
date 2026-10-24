@@ -4133,11 +4133,32 @@ in
     # wrapper's guard rails. Runtime boot of Windows itself is
     # verified on the real laptop post-deploy via `win-vm fetch-iso <url>`
     # + `win-vm create` + `win-vm view`.
-    # /var/lib/libvirt/images must exist with group=libvirtd so
-    # `win-vm fetch-iso` can drop ISOs in without sudo.
+    # /var/lib/libvirt/images is root's; `win-vm fetch-iso` installs
+    # into it through sudo, and jonathan can still list it.
     img_perms = workstation.succeed("stat -c '%a %U %G' /var/lib/libvirt/images").strip()
-    assert img_perms == "770 root libvirtd", (
-        f"/var/lib/libvirt/images perms expected '770 root libvirtd', got {img_perms!r}"
+    assert img_perms == "755 root root", (
+        f"/var/lib/libvirt/images perms expected '755 root root', got {img_perms!r}"
+    )
+
+    # jonathan is the uid agents run as, so no group may make it root
+    # without a password: docker and libvirtd hand out the host's
+    # filesystem (a container or guest can mount any path), lxd/incus
+    # likewise, disk the raw block devices.
+    root_groups = {"docker", "libvirtd", "lxd", "incus-admin", "disk", "root"}
+    groups = set(workstation.succeed("id -nG jonathan").split())
+    assert not groups & root_groups, (
+        f"jonathan is in root-equivalent group(s): {sorted(groups & root_groups)}"
+    )
+    workstation.fail("test -e /run/docker.sock")
+    # libvirtd itself runs; without the group, qemu:///system must refuse
+    # jonathan until polkit authenticates him (no agent in the test, so a
+    # flat refusal).
+    workstation.wait_for_unit("libvirtd.socket")
+    virsh_out = workstation.fail(
+        "su - jonathan -c 'virsh --connect qemu:///system list --all' 2>&1"
+    )
+    assert "authentication" in virsh_out.lower() or "polkit" in virsh_out.lower(), (
+        f"qemu:///system did not demand authentication from jonathan:\n{virsh_out}"
     )
 
     # win-vm wrapper — runtime invocation of the case-dispatch layer +
