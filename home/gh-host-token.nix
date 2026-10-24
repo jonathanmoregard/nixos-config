@@ -42,6 +42,9 @@
 { pkgs }:
 let
   maxAgeMinutes = 55;
+  # The founder's GitHub login: jonathan.nix puts it into push URLs, and the
+  # credential helper prompts for the founder's token on those (see below).
+  founderLogin = "jonathanmoregard";
 
   # Shared verbatim by both scripts so neither the owner rules nor the
   # freshness rule can drift between them.
@@ -266,17 +269,32 @@ let
       protocol=""
       host=""
       path=""
+      username=""
       while IFS= read -r line || [ -n "$line" ]; do
         [ -z "$line" ] && break
         case "$line" in
           protocol=*) protocol="''${line#protocol=}" ;;
           host=*) host="''${line#host=}" ;;
           path=*) path="''${line#path=}" ;;
+          username=*) username="''${line#username=}" ;;
         esac
       done
       # Only github.com over https gets the token; anything else gets silence,
       # which lets git try its next helper or fail on its own.
       if [ "$protocol" != https ] || [ "$host" != github.com ]; then
+        exit 0
+      fi
+      # A push (pushInsteadOf adds the founder's login to the URL) from a
+      # terminal is the founder pushing by hand: answer the username only, so
+      # git prompts for the token kept in the password manager and stores it
+      # nowhere. Without a terminal (agents, units) the App token answers as
+      # usual. Nothing on this host holds the founder token, so a process that
+      # fakes a terminal gets a prompt it cannot answer.
+      if [ "$username" = ${founderLogin} ] && { : </dev/tty; } 2>/dev/null; then
+        printf '%s\n' \
+          "git: pushing as ${founderLogin}. Paste the token from your password manager entry \"GitHub push token\"." \
+          "     (Create or rotate it at https://github.com/settings/personal-access-tokens)" >/dev/tty
+        printf 'username=%s\n' ${founderLogin}
         exit 0
       fi
       ${tokenLib}
@@ -298,5 +316,5 @@ let
   };
 in
 {
-  inherit gh credentialHelper;
+  inherit gh credentialHelper founderLogin;
 }
