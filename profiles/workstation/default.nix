@@ -41,11 +41,8 @@
     # (via home/research-agent-mcp.nix) ssh's into the long-running
     # research-agent microvm for every research() call. The microvm is
     # synthesized as microvm@research-agent.service by microvm.nix.
-    #
-    # docker.nix kept for now (no remaining Nix consumer after this PR,
-    # but interactive use is out of scope — removing it host-wide is a
-    # separate audit).
-    ../../modules/nixos/docker.nix
+    # No Docker on the workstation: docker-group membership is root for
+    # anything running as jonathan, agents included.
     ../../modules/nixos/research-agent-microvm.nix
     ../../modules/nixos/research-agent-microvm-healthcheck.nix
 

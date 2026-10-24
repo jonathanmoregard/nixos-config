@@ -52,14 +52,9 @@ Usage:
   win-vm undefine          remove VM definition + disk (destructive)
   win-vm status            virsh domstate + disk sizes
 
-Runs against qemu:///system — you must be in the libvirtd group.
+Runs against qemu:///system, which asks for your password (polkit);
+fetch-iso asks for it through sudo.
 HELP
-    }
-
-    require_group() {
-      if ! id -nG | tr ' ' '\n' | grep -qx libvirtd; then
-        die "you are not in the libvirtd group — log out + back in after the module lands, or run 'newgrp libvirtd'"
-      fi
     }
 
     cmd="''${1:-help}"
@@ -69,23 +64,26 @@ HELP
       fetch-iso)
         url="''${1:-}"
         [ -n "$url" ] || die "missing <url>. Get one from: https://www.microsoft.com/software-download/windows11"
-        require_group
-        mkdir -p "$IMG_DIR" 2>/dev/null || sudo mkdir -p "$IMG_DIR"
-        log "downloading Win11 ISO to $ISO (~6 GiB)…"
+        # Download as jonathan (resumable), then install into the
+        # root-owned image dir with sudo.
+        partial="''${XDG_CACHE_HOME:-$HOME/.cache}/win-vm/Win11.iso"
+        mkdir -p "$(dirname "$partial")"
+        log "downloading Win11 ISO to $partial (~6 GiB)…"
         # -L follow redirects; -C - resume; -o output
-        if ! curl -L -C - -o "$ISO" "$url"; then
+        if ! curl -L -C - -o "$partial" "$url"; then
           die "download failed. URL may have expired — grab a fresh one."
         fi
-        size=$(stat -c '%s' "$ISO")
+        size=$(stat -c '%s' "$partial")
         # sanity floor: Win11 ISO is >4 GiB; anything smaller is a broken download
         if [ "$size" -lt 4000000000 ]; then
-          die "ISO is only $size bytes — download truncated or wrong URL. Remove $ISO and retry."
+          die "ISO is only $size bytes — download truncated or wrong URL. Remove $partial and retry."
         fi
+        sudo install -D -m 0644 "$partial" "$ISO"
+        rm -f "$partial"
         log "ok — $ISO ($size bytes)"
         ;;
 
       create)
-        require_group
         [ -f "$ISO" ] || die "no ISO at $ISO — run 'win-vm fetch-iso <url>' first"
         if virsh --connect "$URI" dominfo "$VM" >/dev/null 2>&1; then
           die "VM '$VM' already defined. 'win-vm undefine' first if you want to recreate."
@@ -112,17 +110,15 @@ HELP
         log "VM created. Attach with: win-vm view"
         ;;
 
-      view)     require_group; exec virt-viewer --connect "$URI" "$VM" ;;
-      start)    require_group; virsh --connect "$URI" start "$VM" ;;
-      stop)     require_group; virsh --connect "$URI" shutdown "$VM" ;;
-      destroy)  require_group; virsh --connect "$URI" destroy "$VM" ;;
+      view)     exec virt-viewer --connect "$URI" "$VM" ;;
+      start)    virsh --connect "$URI" start "$VM" ;;
+      stop)     virsh --connect "$URI" shutdown "$VM" ;;
+      destroy)  virsh --connect "$URI" destroy "$VM" ;;
       undefine)
-        require_group
         virsh --connect "$URI" destroy "$VM" 2>/dev/null || true
         virsh --connect "$URI" undefine "$VM" --nvram --remove-all-storage
         ;;
       status)
-        require_group
         virsh --connect "$URI" dominfo "$VM" 2>/dev/null || echo "not defined"
         [ -f "$DISK" ] && du -h "$DISK"
         [ -f "$ISO" ]  && du -h "$ISO"
