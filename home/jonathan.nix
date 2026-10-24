@@ -68,14 +68,16 @@ in
       # Send path=OWNER/NAME.git to the helper: one App installation covers
       # one owner, so the token is picked per owner (personal or org).
       credential."https://github.com".useHttpPath = true;
-      # GitHub over https only: the founder's SSH key never acts for an agent.
-      # Pushes carry the founder's login, so from a terminal the helper
-      # prompts for the founder's token; agents still push with the App token.
-      url."https://github.com/".insteadOf = [ "git@github.com:" "ssh://git@github.com/" ];
-      url."https://${ghHost.founderLogin}@github.com/".pushInsteadOf = [
-        "https://github.com/"
+      # GitHub over https only, so every fetch and push (agents' and the
+      # founder's own) goes through the App token above. The founder's SSH
+      # key is not registered on GitHub; these spellings would otherwise
+      # fail instead of reaching the repo.
+      url."https://github.com/".insteadOf = [
         "git@github.com:"
         "ssh://git@github.com/"
+        "ssh://github.com/"
+        "git@ssh.github.com:"
+        "ssh://git@ssh.github.com:443/"
       ];
       core.hooksPath = "~/.config/git/hooks";
       core.excludesfile = "~/.config/git/ignore";

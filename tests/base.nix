@@ -3710,50 +3710,23 @@ in
         "su - jonathan -c 'GH_TOKEN=explicit-dummy gh auth token'"
     ).strip() == "explicit-dummy"
 
-    # Founder pushes: pushInsteadOf puts jonathanmoregard@ into every github.com
-    # push URL (ssh remotes are rewritten to https first). With a terminal the
-    # helper answers no password, so git prompts for the founder's token from
-    # the password manager; without one (agents, units) it is the App token.
-    push_probe = "/tmp/push-probe"
-    fetch_probe = "/tmp/fetch-probe"
-    workstation.succeed(
-        "printf '%s\\n' '#!/bin/sh'"
-        " 'printf \"protocol=https\\nhost=github.com\\nusername=jonathanmoregard\\npath=jonathanmoregard/x.git\\n\\n\""
-        " | GIT_TERMINAL_PROMPT=0 git credential fill'"
-        f" > {push_probe}"
-        " && printf '%s\\n' '#!/bin/sh'"
-        " 'printf \"protocol=https\\nhost=github.com\\npath=jonathanmoregard/x.git\\n\\n\""
-        " | GIT_TERMINAL_PROMPT=0 git credential fill'"
-        f" > {fetch_probe}"
-        f" && chmod 755 {push_probe} {fetch_probe}"
-    )
-    git_out = workstation.succeed(as_jonathan(push_probe))
-    assert "username=x-access-token" in git_out and "password=vm-dummy-token" in git_out, (
-        f"a push without a terminal did not get the App token:\n{git_out}"
-    )
-
-    def on_tty(probe):
-        # script(1) gives the probe a controlling terminal, as a shell would.
-        return as_jonathan(f"script -qec {probe} /dev/null")
-
-    tty_push = workstation.fail(on_tty(push_probe))
-    assert "GitHub push token" in tty_push and "vm-dummy-token" not in tty_push, (
-        f"a terminal push did not prompt for the founder token:\n{tty_push}"
-    )
-    tty_fetch = workstation.succeed(on_tty(fetch_probe))
-    assert "password=vm-dummy-token" in tty_fetch, (
-        f"a terminal fetch did not get the App token:\n{tty_fetch}"
-    )
-    workstation.succeed(f"rm {push_probe} {fetch_probe}")
-    rewrite = workstation.succeed(as_jonathan(
-        "sh -c \"cd /tmp && rm -rf rw && git init -q rw && cd rw"
-        " && git remote add origin git@github.com:jonathanmoregard/x.git"
-        " && git remote get-url origin && git remote get-url --push origin\""
-    )).split()
-    assert rewrite == [
-        "https://github.com/jonathanmoregard/x.git",
-        "https://jonathanmoregard@github.com/jonathanmoregard/x.git",
-    ], f"github.com remotes not rewritten: {rewrite}"
+    # Every SSH spelling of a GitHub remote fetches AND pushes over plain
+    # https, so the App token above answers and no SSH key ever acts on GitHub.
+    for remote in [
+        "git@github.com:jonathanmoregard/x.git",
+        "ssh://git@github.com/jonathanmoregard/x.git",
+        "ssh://github.com/jonathanmoregard/x.git",
+        "git@ssh.github.com:jonathanmoregard/x.git",
+        "ssh://git@ssh.github.com:443/jonathanmoregard/x.git",
+    ]:
+        urls = workstation.succeed(as_jonathan(
+            "sh -c \"cd /tmp && rm -rf rw && git init -q rw && cd rw"
+            f" && git remote add origin {remote}"
+            " && git remote get-url origin && git remote get-url --push origin\""
+        )).split()
+        assert urls == ["https://github.com/jonathanmoregard/x.git"] * 2, (
+            f"GitHub remote {remote} not rewritten to https: {urls}"
+        )
     workstation.succeed("rm -rf /tmp/rw")
 
     # A helper configured before ours must never get a turn. git reads the
