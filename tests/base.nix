@@ -3710,6 +3710,25 @@ in
         "su - jonathan -c 'GH_TOKEN=explicit-dummy gh auth token'"
     ).strip() == "explicit-dummy"
 
+    # Every SSH spelling of a GitHub remote fetches AND pushes over plain
+    # https, so the App token above answers and no SSH key ever acts on GitHub.
+    for remote in [
+        "git@github.com:jonathanmoregard/x.git",
+        "ssh://git@github.com/jonathanmoregard/x.git",
+        "ssh://github.com/jonathanmoregard/x.git",
+        "git@ssh.github.com:jonathanmoregard/x.git",
+        "ssh://git@ssh.github.com:443/jonathanmoregard/x.git",
+    ]:
+        urls = workstation.succeed(as_jonathan(
+            "sh -c \"cd /tmp && rm -rf rw && git init -q rw && cd rw"
+            f" && git remote add origin {remote}"
+            " && git remote get-url origin && git remote get-url --push origin\""
+        )).split()
+        assert urls == ["https://github.com/jonathanmoregard/x.git"] * 2, (
+            f"GitHub remote {remote} not rewritten to https: {urls}"
+        )
+    workstation.succeed("rm -rf /tmp/rw")
+
     # A helper configured before ours must never get a turn. git reads the
     # system config ahead of the user's, so a decoy there stands in for any
     # founder credential stored elsewhere; the user config resets the helper
