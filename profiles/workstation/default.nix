@@ -62,6 +62,9 @@
     # Weekly CVE + sandbox-score sweep of both microVMs; results reach
     # Claude via /var/lib/unit-failures (modules/nixos/security-batch.nix).
     ../../modules/nixos/security-batch/research-agent.nix
+    # Nightly: open Dependabot alerts, stale or red update PRs, failed
+    # scheduled workflows across the active repos. Same path into Claude.
+    ../../modules/nixos/security-batch/dependency-health.nix
 
     # Host-level Android dev tooling. Provides adb on PATH + JDK17 for
     # the AGP 8.x gradle builds in ~/Repos/intender-app and pairs with

@@ -554,6 +554,17 @@
           runnerPackage = primaryConfig
             .services.securityBatch.research-agent.script;
         };
+        # Not a VM lane: the nightly dependency-health check
+        # (modules/nixos/security-batch/dependency-health.sh) against a fake
+        # gh — alerts, stale/red Dependabot PRs, failed scheduled runs,
+        # alerts disabled, loud tool errors, summary limits.
+        security-batch-dependency-health = import ./tests/security-batch-dependency-health.nix {
+          pkgs = pkgsLinux;
+          runnerScript = ./modules/nixos/security-batch/dependency-health.sh;
+          # Drift gate: the package the primary host deploys.
+          runnerPackage = primaryConfig
+            .services.securityBatch.dependency-health.script;
+        };
         signal-expiry = import ./tests/signal-expiry.nix {
           pkgs = pkgsLinux;
           checkScript = pkgsLinux.signal-expiry-check;
