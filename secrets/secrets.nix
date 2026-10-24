@@ -1,13 +1,14 @@
-# agenix rules for the klaffat provisioning secrets.
+# agenix rules for the host-key-only secrets: the klaffat provisioning
+# secrets and the GitHub App key.
 #
-# Only the `klaffat-*.age` files live here. Every OTHER `.age` file in
+# Only `klaffat-*.age` and `github-app-key.age` live here. Every OTHER `.age` file in
 # this directory is managed by agenix-rekey (see
 # modules/nixos/agenix-rekey-common.nix): its source is encrypted to
 # jonathan's USER key and `agenix rekey` produces the per-host copies in
 # secrets/rekeyed/<host>/. Those must not be listed here — a rules entry
 # would invite `agenix -e` to re-encrypt them under the wrong scheme.
 #
-# The klaffat secrets are deliberately outside that scheme. They are
+# These secrets are deliberately outside that scheme. They are
 # encrypted directly to dellan's HOST key, so jonathan — the principal an
 # AI agent runs as — cannot decrypt them. See the header of
 # modules/nixos/klaffat-infra.nix for the full rationale.
@@ -99,4 +100,13 @@ in
   # placeholder — until the founder edits the real token in, GitHub answers
   # 401 and every wrapper refuses.
   "klaffat-github-token.age".publicKeys = klaffat;
+
+  # The GitHub App private key (modules/nixos/github-app-broker): readable on
+  # the host by the github-app user only, so agents (jonathan) get tokens
+  # and the GitHub MCP through its sockets and never the key. Tuxedo only:
+  # it is the one host that runs agents. Rotating: generate a new key in the
+  # App's settings, then from THIS directory
+  #   sudo agenix -i /etc/ssh/ssh_host_ed25519_key -e github-app-key.age
+  # and delete the old key in GitHub.
+  "github-app-key.age".publicKeys = [ tuxedo-host ];
 }

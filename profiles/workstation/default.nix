@@ -36,6 +36,9 @@
     ../../modules/nixos/memory-pressure.nix
     ../../modules/nixos/claude-agent-users.nix
     ../../modules/nixos/codex-security.nix
+    # The GitHub App private key, readable only by the github-app user;
+    # agents get tokens and the GitHub MCP through its sockets.
+    ../../modules/nixos/github-app-broker
 
     # research-agent microvm. The MCP server spawned by Claude Code
     # (via home/research-agent-mcp.nix) ssh's into the long-running
@@ -143,6 +146,11 @@
     config.age.secrets.klaffat-github-token-org.path
   ];
   services.klaffatLocalGoogle.enable = true;
+  # The accounts whose installations of the GitHub App agents may use: the
+  # personal one and the klaffat org (the ORG_INSTALLATIONS owners in
+  # ~/.config/github-app/config). Installing the App anywhere else gives
+  # agents nothing until it is listed here.
+  services.githubAppBroker.allowedOwners = [ "jonathanmoregard" "klaffat" ];
 
   # ---------------------------------------------------------------------
   # CI/CD workflow — agenix secret declarations (now rekey-managed).

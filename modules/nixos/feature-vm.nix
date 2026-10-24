@@ -32,6 +32,9 @@ let
   # VM cannot use the real ones. Shared with the vm-klaffat-infra lane so
   # the smoke and the gate seed identical values.
   klaffatFixtures = import ../../tests/lib/klaffat-fixtures.nix { inherit pkgs; };
+  # A real-shaped App key (shared with the test lanes), so the GitHub App
+  # broker runs here whether or not the host's ciphertext exists yet.
+  githubAppKeyFixture = import ../../tests/lib/github-app-key-fixture.nix { inherit pkgs; };
   klaffatSecretNames = [
     "klaffat-hcloud-token"
     "klaffat-cloudflare-api-token"
@@ -49,7 +52,8 @@ let
   # every boot and `feature-vm apply` failing on "no identity matched".
   # The plaintexts are the literal strings below; the identity is
   # world-readable in /nix/store and opens nothing else.
-  fixtureSecretNames = lib.subtractLists klaffatSecretNames (builtins.attrNames config.age.secrets);
+  fixtureSecretNames = lib.subtractLists (klaffatSecretNames ++ [ "github-app-key" ])
+    (builtins.attrNames config.age.secrets);
   fixtures = pkgs.runCommand "feature-vm-secrets"
     {
       nativeBuildInputs = [ pkgs.age pkgs.openssh ];
@@ -204,16 +208,20 @@ in
     };
 
     # agenix opens only fixtures here: the klaffat ones (a real-shaped
-    # set shared with the vm-klaffat-infra lane) and the generic ones above.
+    # set shared with the vm-klaffat-infra lane), the GitHub App key the
+    # broker signs with, and the generic ones above.
     age.identityPaths = lib.mkForce [
       "${fixtures}/id_ed25519"
       "${klaffatFixtures}/id_ed25519"
+      "${githubAppKeyFixture}/id_ed25519"
     ];
     age.secrets = lib.genAttrs klaffatSecretNames (n: {
       file = lib.mkForce "${klaffatFixtures}/${n}.age";
     }) // lib.genAttrs fixtureSecretNames (n: {
       file = lib.mkForce "${fixtures}/${n}.age";
     });
+    services.githubAppBroker.keyCiphertext =
+      lib.mkForce "${githubAppKeyFixture}/github-app-key.age";
 
     # Add jonathan@dellan as an authorized SSH key inside the VM so
     # the user/CC on dellan can ssh in without copying keys around.

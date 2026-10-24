@@ -28,6 +28,17 @@ let
     {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vm-base","version":"1"}}}
   '';
 
+  # initialize, initialized, tools/list: one MCP session's opening exchange.
+  mcpToolsListJsonl = pkgs.writeText "vm-base-mcp-tools-list.jsonl" ''
+    {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vm-base","version":"1"}}}
+    {"jsonrpc":"2.0","method":"notifications/initialized"}
+    {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+  '';
+
+  githubAppKeyFixture = import ./lib/github-app-key-fixture.nix { inherit pkgs; };
+  fakeGithubApiPort = 8787;
+
+
   worktreeWorkflowSources = {
     claude = pkgs.writeText "workflow-CLAUDE.md" (builtins.readFile ../CLAUDE.md);
     nixosConfigDev = pkgs.writeText "workflow-nixos-config-dev.md"
@@ -290,6 +301,23 @@ in
     services.memoryPressure = {
       reservations.vmtest = 2 * 1024 * 1024 * 1024;
       desktopReserve = 2 * 1024 * 1024 * 1024;
+    };
+
+    # The App key broker talks to a fake API instead of GitHub
+    # (tests/lib/fake-github-api.py): it verifies every JWT against the
+    # fixture key, mints tokens naming the installation and repository, and
+    # knows the personal (456) and klaffat (789) installations the profile's
+    # allowedOwners admit, plus one on an account it does not (999).
+    services.githubAppBroker.apiUrl = "http://127.0.0.1:${toString fakeGithubApiPort}";
+    systemd.services.fake-github-api = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        ExecStart = "${pkgs.python3}/bin/python3 ${./lib/fake-github-api.py} "
+          + "${githubAppKeyFixture}/app.pub.pem ${toString fakeGithubApiPort} "
+          + "${pkgs.openssl}/bin/openssl /run/fake-github-api/requests "
+          + "456=jonathanmoregard 789=klaffat 999=stranger";
+        RuntimeDirectory = "fake-github-api";
+      };
     };
   }];
   testScript = ''
@@ -3638,33 +3666,141 @@ in
         user_systemctl + " unset-environment AI_CLIENT_CONFIG_REMOTE'"
     )
 
-    # gh-token.service executes a script that lives in ~/.claude under a
-    # pinned PATH (home/claude-services.nix). The first deployed run died with
-    # `env: 'bash': No such file or directory` (2026-10-11): the PATH carried
-    # the tools but not the interpreter. Stand in a stub with the real shebang
-    # and tool list; the unit must run it to completion. The VM has no App
-    # key, so the unit's ReadOnlyPaths pem is stubbed too.
-    mint_stub = "/home/jonathan/.claude/dev-container/bin/mint-gh-token"
-    mint_marker = "/home/jonathan/.cache/gh-tokens/vm-mint-ran"
+    # GitHub App private key (modules/nixos/github-app-broker): only the
+    # github-app system user can read it. jonathan — every agent on the
+    # laptop — gets installation tokens and the GitHub MCP from the broker's
+    # sockets, never the key. The key here is the fixture agenix opens in
+    # this VM (tests/lib/github-app-key-fixture.nix); the fake API on
+    # 127.0.0.1 accepts only JWTs that verify against it.
+    gh_app_key = "/run/agenix/github-app-key"
+    gh_tokens = "/home/jonathan/.cache/gh-tokens"
+    host_dir = gh_tokens + "/host"
+    host_token = host_dir + "/token"
+    org_token = host_dir + "/klaffat/token"
+    sandbox_dir = gh_tokens + "/vm-sandbox"
+    gh_app_config = "/home/jonathan/.config/github-app/config"
+    socat = "${pkgs.socat}/bin/socat"
+    # Fixture self-check: the broker's user can read the key, so a refusal
+    # for jonathan below is about who asks, not about a missing file.
+    workstation.succeed(f"runuser -u github-app -- test -r {gh_app_key}")
+    assert workstation.succeed(f"stat -L -c '%U %a' {gh_app_key}").strip() == "github-app 400"
+    workstation.fail(f"su - jonathan -c 'cat {gh_app_key}'")
+    workstation.fail(f"su - jonathan -c 'cp {gh_app_key} /tmp/stolen-key'")
+
+    # The timer must not mint behind the assertions' backs.
+    workstation.succeed(user_systemctl + " stop gh-token.timer'")
+    workstation.wait_for_unit("fake-github-api.service")
+    workstation.wait_for_open_port(${toString fakeGithubApiPort})
     workstation.succeed(
-        "install -d -o jonathan -g users -m 700 /home/jonathan/.config/github-app && "
-        "install -o jonathan -g users -m 600 /dev/null /home/jonathan/.config/github-app/app.pem && "
-        "install -d -o jonathan -g users /home/jonathan/.claude/dev-container/bin && "
-        "printf '%s\\n' '#!/usr/bin/env bash' 'set -euo pipefail' "
-        "'command -v curl jq openssl sed mktemp base64 date tr >/dev/null' "
-        f"'touch {mint_marker}' > {mint_stub} && "
-        f"chmod 755 {mint_stub} && chown jonathan:users {mint_stub}"
+        "su - jonathan -c 'install -d -m 700 /home/jonathan/.config/github-app"
+        f" && printf \"%s\\n\" APP_ID=123 INSTALLATION_ID=456"
+        f" \"ORG_INSTALLATIONS=\\\"klaffat=789\\\"\" > {gh_app_config}"
+        f" && install -d -m 700 {sandbox_dir} && printf 42 > {sandbox_dir}/repo_id'"
     )
+
+    # gh-token.service mints every token through the broker: the personal
+    # and org installation tokens for the host, and the repo-scoped token
+    # for each sandbox dir. Each lands owned by jonathan, mode 0600.
     workstation.succeed(user_systemctl + " start gh-token.service'")
-    workstation.succeed(f"test -f {mint_marker}")
-    workstation.succeed(f"rm -f {mint_stub} {mint_marker}")
+    for path, want in [
+        (host_token, "ghs_vm_456"),
+        (org_token, "ghs_vm_789"),
+        (sandbox_dir + "/token", "ghs_vm_456_42"),
+    ]:
+        got = workstation.succeed(f"su - jonathan -c 'cat {path}'").strip()
+        assert got == want, f"{path}: expected {want!r}, got {got!r}"
+        assert workstation.succeed(f"stat -c '%U %a' {path}").strip() == "jonathan 600", path
+    mint_journal = workstation.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u gh-token.service -n 50 --no-pager'"
+    )
+    assert '"repository_selection":"all"' in mint_journal, mint_journal
+    assert "ghs_vm" not in mint_journal, "a token reached the journal:\n" + mint_journal
+    # The consumers answer with the broker's token.
+    assert workstation.succeed(
+        "su - jonathan -c 'env -u GH_TOKEN -u GITHUB_TOKEN gh auth token'"
+    ).strip() == "ghs_vm_456"
+
+    # The token socket answers jonathan only, and only well-formed requests.
+    workstation.fail(
+        f"runuser -u nobody -- {socat} -t 10 - UNIX-CONNECT:/run/github-app/token.sock < /dev/null"
+    )
+    def token_socket(request):
+        return workstation.succeed(
+            f"su - jonathan -c 'printf \"%s\\n\" \"{request}\""
+            f" | {socat} -t 10 - UNIX-CONNECT:/run/github-app/token.sock'"
+        )
+
+    for bad in ["123 abc", "123 456 42 extra", "123 ../456", ""]:
+        out = token_socket(bad)
+        assert "token" not in out and "refused" in out, f"request {bad!r} answered: {out!r}"
+    # An installation of the App on an account allowedOwners does not list
+    # is refused, and GitHub is never asked for its token.
+    out = token_socket("123 999")
+    assert out.startswith("refused:") and "stranger" in out, out
+    github_requests = workstation.succeed("cat /run/fake-github-api/requests")
+    assert "GET /app/installations/999" in github_requests, github_requests
+    assert "POST /app/installations/999/" not in github_requests, github_requests
+
+    # Fail closed: with the broker gone the unit fails and names it; the
+    # tokens already minted are left alone, never replaced by something else.
+    workstation.succeed("systemctl stop github-app-token.socket")
+    workstation.fail(user_systemctl + " start gh-token.service'")
+    assert "/run/github-app/token.sock" in workstation.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u gh-token.service -n 20 --no-pager'"
+    )
+    assert workstation.succeed(f"cat {host_token}").strip() == "ghs_vm_456"
+    workstation.succeed("systemctl start github-app-token.socket")
+
+    # GitHub MCP: jonathan's wrapper relays stdio to a github-mcp-server
+    # that runs as github-app and authenticates with the key itself (App
+    # mode, refreshing its own tokens). Caller policy args pass through.
+    mcp_cmd = (
+        "github-app-mcp-server --toolsets context,repos,pull_requests"
+        " --exclude-tools merge_pull_request"
+    )
+    import json as _broker_json
+    mcp_out = workstation.succeed(
+        f"su - jonathan -c '(cat ${mcpToolsListJsonl}; sleep 10) | timeout 60 {mcp_cmd}'"
+    )
+    tools = [
+        tool["name"]
+        for line in mcp_out.splitlines() if line.strip()
+        for msg in [_broker_json.loads(line)] if msg.get("id") == 2
+        for tool in msg["result"]["tools"]
+    ]
+    assert "list_pull_requests" in tools, mcp_out
+    assert "merge_pull_request" not in tools, "excluded tool offered: " + str(tools)
+    workstation.succeed(
+        f"su - jonathan -c 'sleep 30 | timeout 60 {mcp_cmd}' >/dev/null 2>&1 &"
+    )
+    workstation.wait_until_succeeds("pgrep -u github-app -f bin/github-mcp-server", timeout=30)
+    workstation.fail("pgrep -u jonathan -f bin/github-mcp-server")
+    # Only the policy flags cross the socket: one that would point the
+    # key-holding server elsewhere is refused before it starts.
+    _, refused_out = workstation.execute(
+        "su - jonathan -c '(cat ${mcpToolsListJsonl}; sleep 2) | timeout 60"
+        " github-app-mcp-server --gh-host https://evil.example' 2>/dev/null"
+    )
+    assert refused_out.strip() == "", refused_out
+    workstation.wait_until_succeeds(
+        "journalctl -u 'github-app-mcp@*' --no-pager | grep -q 'refused: argument --gh-host is not allowed'",
+        timeout=30,
+    )
+    # Nothing the broker did put the key in the journal.
+    workstation.fail("journalctl --no-pager | grep -q 'PRIVATE KEY'")
+
+    # Back to the no-token baseline the gh/git assertions below start from.
+    # Config first, so nothing can mint between the two removals.
+    workstation.succeed(
+        f"rm {gh_app_config} && rm -r {sandbox_dir} && rm {host_token} {org_token}"
+    )
+    workstation.succeed("systemctl stop fake-github-api.service")
 
     # GitHub App host token (home/gh-host-token.nix): the `gh` on jonathan's
     # PATH and git's github.com credential helper must FAIL CLOSED without a
-    # fresh token, and never fall back to gh's keyring. The VM has no App
-    # key, so gh-token.service mints nothing and the token starts absent.
-    host_dir = "/home/jonathan/.cache/gh-tokens/host"
-    host_token = host_dir + "/token"
+    # fresh token, and never fall back to gh's keyring.
     assert workstation.succeed(f"stat -c %a {host_dir}").strip() == "700", (
         "host token dir must be private to jonathan"
     )

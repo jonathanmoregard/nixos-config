@@ -10,9 +10,18 @@
 { lib, pkgs, ... }:
 let
   hostDir = ../../hosts + "/${workstation.host}";
+  githubAppKeyFixture = import ./github-app-key-fixture.nix { inherit pkgs; };
 in
 {
   imports = workstation.modules ++ [ (hostDir + "/default.nix") ];
+
+  # The GitHub App key the broker signs with
+  # (modules/nixos/github-app-broker), as a fixture this VM can open: the
+  # real ciphertext is encrypted to the laptop's host key, and may not exist
+  # yet.
+  age.identityPaths = [ "${githubAppKeyFixture}/id_ed25519" ];
+  services.githubAppBroker.keyCiphertext =
+    lib.mkForce "${githubAppKeyFixture}/github-app-key.age";
 
   # The laptop's real hardware/disk config. The virtualisation module
   # provides a virtio rootfs and the test framework boots without a

@@ -3,10 +3,13 @@
 # units were installed imperatively (~/.config/systemd/user/) and would be
 # lost on a fresh rebuild without this declarative copy.
 #
-# These depend on supporting state under ~/.claude (dev-container scripts,
-# GitHub App private key). On a fresh install
-# the units will fail at first tick until that scaffolding is set up
-# separately.
+# Some depend on supporting state under ~/.claude (scripts, skills). On a
+# fresh install those units fail at first tick until that scaffolding is set
+# up separately.
+let
+  mintGhToken = import ./github-app-mint.nix { inherit pkgs; };
+  brokerSockets = import ../modules/nixos/github-app-broker/sockets.nix;
+in
 {
   # ReadWritePaths below must exist or the unit dies at NAMESPACE (226).
   # ~/.cache is not carried over to a fresh host, so create it here.
@@ -21,8 +24,8 @@
   # host/<owner>/ holds the org installation token for each ORG_INSTALLATIONS
   # entry in ~/.config/github-app/config (multi-owner: the wrapper and helper
   # pick it for that owner's repos, home/gh-host-token.nix). Declared 0700
-  # here for the klaffat org; mint-gh-token creates any other owner's dir
-  # 0700 itself.
+  # here for the klaffat org; mint-gh-token (home/github-app-mint.nix)
+  # creates any other owner's dir 0700 itself.
   systemd.user.tmpfiles.rules = [
     "d %h/.cache/gh-tokens 0755 - - -"
     "d %h/.cache/gh-tokens/host 0700 - - -"
@@ -31,18 +34,15 @@
   ];
 
   # gh-token — rotate GitHub App installation tokens: one per active sandbox,
-  # plus the host token every agent on this machine uses.
+  # plus the host token every agent on this machine uses. Minted through the
+  # App key broker (modules/nixos/github-app-broker); this unit never holds
+  # the App key.
   systemd.user.services.gh-token = {
     Unit.Description = "Rotate GitHub App installation tokens (host + active Claude sandboxes)";
     Service = {
       Type = "oneshot";
-      ExecStart = "%h/.claude/dev-container/bin/mint-gh-token";
-      # The script lives in ~/.claude, not the store, so it resolves its
-      # interpreter (`#!/usr/bin/env bash`) and tools from PATH. The user
-      # manager's PATH has no openssl (JWT signing) and no bash, so pin
-      # every tool it calls. tests/base.nix runs the unit against a stub
-      # script with the same shebang and tool list.
-      Environment = "PATH=${pkgs.lib.makeBinPath (with pkgs; [ bash coreutils curl gnused jq openssl ])}";
+      ExecStart = "${mintGhToken}/bin/mint-gh-token %h/.config/github-app/config"
+        + " %h/.cache/gh-tokens ${brokerSockets.token}";
       Nice = 5;
 
       NoNewPrivileges = "yes";
@@ -50,7 +50,6 @@
       ProtectSystem = "strict";
       ProtectHome = "read-only";
       ReadWritePaths = "%h/.cache/gh-tokens";
-      ReadOnlyPaths = "%h/.config/github-app/app.pem";
       ProtectKernelTunables = "yes";
       ProtectKernelModules = "yes";
       ProtectControlGroups = "yes";
