@@ -263,7 +263,7 @@ let
     "${config.home.homeDirectory}/.local/state/dcg/fallback-active.json";
 
   remedy =
-    "restore ~/.claude (git clone git@github.com:jonathanmoregard/.claude.git "
+    "restore ~/.claude (git clone git@github.com:jonathanmoregard/claude-config.git "
     + "~/.claude, or git -C ~/.claude checkout -- dcg.toml) and rebuild";
 
   # A dry run creates no files, so seeding would be a lie and validating

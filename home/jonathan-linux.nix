@@ -892,7 +892,7 @@ in
   # ~/.claude with runtime state (backups/, projects/, sessions/, cache/)
   # on first run, and the .claude *repo* needs to coexist with that state.
   # On a fresh host: move runtime dirs aside, `git clone
-  # git@github.com:jonathanmoregard/.claude.git ~/.claude`, restore
+  # git@github.com:jonathanmoregard/claude-config.git ~/.claude`, restore
   # runtime dirs, `git submodule update --init --recursive`.
   #
   # As of home/dcg.nix, `dcg.toml` is also in the "move aside" set: this
