@@ -131,7 +131,31 @@ pkgs.runCommand "github-app-mint-harness"
     expect "bad-repo never requested" bash -c "! grep -qF ']' '$state/requests'"
     expect "bad-repo good sandbox minted" content "$tr/good/token" tok-100-7
 
-    # 7. Broker unreachable: the run fails naming the socket, and the
+    # 7. The token file cannot be written: the run fails, logs no
+    #    "minted" line, and the previous token stays.
+    run nowrite ""; mint_now nowrite
+    printf old > "$tr/host/token"
+    chmod 0500 "$tr/host"
+    mint_now nowrite
+    chmod 0700 "$tr/host"
+    expect "nowrite rc=1" [ "$rc" = 1 ]
+    expect "nowrite reported" logged "cannot write $tr/host/token.new; previous token kept"
+    expect "nowrite no minted line" bash -c "! grep -qF '\"minted\"' <<< \"\$1\"" _ "$output"
+    expect "nowrite keeps previous token" content "$tr/host/token" old
+
+    # 8. The rename fails (a directory squats on the token path): the run
+    #    fails, the new token is not left behind, and nothing lands inside
+    #    the directory.
+    run norename ""
+    mkdir -p "$tr/host/token/x"
+    mint_now norename
+    expect "norename rc=1" [ "$rc" = 1 ]
+    expect "norename reported" logged "cannot replace $tr/host/token; previous token kept"
+    expect "norename no minted line" bash -c "! grep -qF '\"minted\"' <<< \"\$1\"" _ "$output"
+    expect "norename token.new removed" [ ! -e "$tr/host/token.new" ]
+    expect "norename nothing moved into the directory" [ ! -e "$tr/host/token/token.new" ]
+
+    # 9. Broker unreachable: the run fails naming the socket, and the
     #    previous token stays exactly as it was.
     run down ""; mint_now down
     kill "$broker_pid"; wait "$broker_pid" 2>/dev/null || true; rm -f "$socket"

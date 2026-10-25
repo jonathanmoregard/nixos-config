@@ -19,6 +19,8 @@
   ];
 
   networking.hostName = "tuxedo";
+  # secrets/github-app-key.age is encrypted to this host's key only.
+  services.githubAppBroker.enable = true;
 
   # The install created the agents before uids were pinned, so they took
   # 1000-1002 and jonathan 1003. Pin those live values rather than rewrite

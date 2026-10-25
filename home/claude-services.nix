@@ -1,4 +1,4 @@
-{ config, pkgs, ... }:
+{ config, lib, pkgs, osConfig ? { }, ... }:
 # Claude-related user services. Captured from live host on 2026-04-27 — these
 # units were installed imperatively (~/.config/systemd/user/) and would be
 # lost on a fresh rebuild without this declarative copy.
@@ -9,6 +9,9 @@
 let
   mintGhToken = import ./github-app-mint.nix { inherit pkgs; };
   brokerSockets = import ../modules/nixos/github-app-broker/sockets.nix;
+  # Only a host running the broker can mint; elsewhere (dellan) there is no
+  # App key to reach, so no token unit.
+  brokerOnHost = osConfig.services.githubAppBroker.enable or false;
 in
 {
   # ReadWritePaths below must exist or the unit dies at NAMESPACE (226).
@@ -37,7 +40,7 @@ in
   # plus the host token every agent on this machine uses. Minted through the
   # App key broker (modules/nixos/github-app-broker); this unit never holds
   # the App key.
-  systemd.user.services.gh-token = {
+  systemd.user.services.gh-token = lib.mkIf brokerOnHost {
     Unit.Description = "Rotate GitHub App installation tokens (host + active Claude sandboxes)";
     Service = {
       Type = "oneshot";
@@ -60,7 +63,7 @@ in
     };
   };
 
-  systemd.user.timers.gh-token = {
+  systemd.user.timers.gh-token = lib.mkIf brokerOnHost {
     Unit.Description = "Rotate GitHub App tokens every 20 minutes";
     Timer = {
       OnBootSec = "1min";

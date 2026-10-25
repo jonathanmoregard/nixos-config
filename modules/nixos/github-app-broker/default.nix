@@ -108,6 +108,9 @@ let
 in
 {
   options.services.githubAppBroker = {
+    # Per host: the ciphertext is encrypted to one host key, so a host
+    # that is not a recipient must not declare the secret at all.
+    enable = lib.mkEnableOption "the GitHub App key broker";
     keyCiphertext = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = if builtins.pathExists repoCiphertext then repoCiphertext else null;
@@ -134,7 +137,7 @@ in
     };
   };
 
-  config = lib.mkMerge [
+  config = lib.mkIf cfg.enable (lib.mkMerge [
     {
       assertions = [
         {
@@ -147,6 +150,9 @@ in
               nix shell nixpkgs#age -c age -R /etc/ssh/ssh_host_ed25519_key.pub \
                 -o secrets/github-app-key.age < /path/to/new-app-key.pem
             then commit it on the branch; the build goes green with it.
+            Migration is not done until, after the deploy, the OLD App key is
+            deleted in the App's settings on GitHub: agents could read it, and
+            it stays valid until revoked. Then delete ~/.config/github-app/app.pem.
           '';
         }
         {
@@ -195,5 +201,5 @@ in
         execStart = "${programs.mcpSession}/bin/github-app-mcp-session ${keyPath}";
       };
     })
-  ];
+  ]);
 }

@@ -52,8 +52,18 @@ pkgs.writeShellApplication {
         echo "mint-gh-token: no token for $dir: $response" >&2
         return 1
       fi
-      ( umask 077; printf '%s' "$token" > "$dir/token.new" )
-      mv "$dir/token.new" "$dir/token"
+      # Callers use `||`, which turns off errexit in here: check each step,
+      # and leave the previous token in place on any failure.
+      if ! ( umask 077; printf '%s' "$token" > "$dir/token.new" ); then
+        rm -f "$dir/token.new"
+        echo "mint-gh-token: cannot write $dir/token.new; previous token kept" >&2
+        return 1
+      fi
+      if ! mv -fT "$dir/token.new" "$dir/token"; then
+        rm -f "$dir/token.new"
+        echo "mint-gh-token: cannot replace $dir/token; previous token kept" >&2
+        return 1
+      fi
       jq -c --arg minted "$label" \
         '{minted: $minted, expires_at, repository_selection, permissions}' <<< "$response" \
         | sed 's/^/mint-gh-token: /'
