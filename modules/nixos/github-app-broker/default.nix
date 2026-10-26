@@ -157,10 +157,11 @@ in
         workflows = "write";
       };
       description = ''
-        Permissions requested with every installation token. GitHub grants
-        their intersection with the App's own, so granting the App more on
-        GitHub (administration, secrets, environments, ...) does not reach
-        tokens minted here.
+        The ceiling for every installation token. The broker requests their
+        intersection with what the installation holds (GitHub refuses a
+        request for more), so granting the App more on GitHub
+        (administration, secrets, environments, ...) does not reach tokens
+        minted here, and granting it less does not break minting.
       '';
     };
     allowedOwners = lib.mkOption {

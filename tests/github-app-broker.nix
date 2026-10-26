@@ -53,7 +53,8 @@ pkgs.runCommand "github-app-broker-harness"
     log="$PWD/github-requests"
     : > "$log"
     python3 ${./lib/fake-github-api.py} ${fixture}/app.pub.pem ${toString port} \
-      ${pkgs.openssl}/bin/openssl "$log" 456=jonathanmoregard 789=klaffat 999=stranger &
+      ${pkgs.openssl}/bin/openssl "$log" 456=jonathanmoregard 789=klaffat 999=stranger \
+      458=jonathanmoregard:contents=read,metadata=read 459=jonathanmoregard:issues=write &
     for _ in $(seq 100); do
       curl -s -o /dev/null http://127.0.0.1:${toString port}/ && break
       sleep 0.1
@@ -83,6 +84,18 @@ pkgs.runCommand "github-app-broker-harness"
       [ "$sent" = '{"permissions": {"contents": "write", "metadata": "read"}, "repository_ids": [42]}' ]
     mint '1 789\n'
     expect "org installation token" token_is ghs_vm_789
+
+    # GitHub refuses a token request naming more than the installation
+    # holds, so the cap is intersected first: an installation with less
+    # (458: contents read only) still mints, at its own lower levels.
+    mint '1 458\n'
+    expect "reduced installation still mints" token_is ghs_vm_458
+    expect "reduced installation asks only for what it holds" \
+      [ "$sent" = '{"permissions": {"contents": "read", "metadata": "read"}}' ]
+    # One holding none of the capped permissions is refused, not asked.
+    mint '1 459\n'
+    expect "installation outside the cap refused" refused
+    expect "installation outside the cap never minted" bash -c "! grep -q access_tokens <<< \"$asked\""
 
     # An installation of the App on an owner not configured is refused, and
     # GitHub is never asked for its token.

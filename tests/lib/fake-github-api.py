@@ -11,8 +11,13 @@
 # authenticated request is appended to <log> as `<METHOD> <path>`, and each
 # token request's JSON body (keys sorted) to <log>.bodies.
 #
+# Each installation holds DEFAULT_PERMISSIONS (the real App's set) unless
+# its argument names its own: `<id>=<login>:contents=read,metadata=read`.
+# Like GitHub, a token request asking for a permission the installation
+# lacks, or for write where it holds read, is answered 422.
+#
 # Usage: fake-github-api.py <public-key.pem> <port> <openssl> <log>
-#            <installation_id>=<account login>...
+#            <installation_id>=<account login>[:<perm>=<level>,...]...
 import base64
 import json
 import subprocess
@@ -22,7 +27,18 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PUBLIC_KEY, PORT, OPENSSL, LOG = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-ACCOUNTS = dict(arg.split("=", 1) for arg in sys.argv[5:])
+DEFAULT_PERMISSIONS = {
+    "actions": "read", "checks": "read", "contents": "write", "issues": "write",
+    "metadata": "read", "pull_requests": "write", "statuses": "read", "workflows": "write",
+}
+ACCOUNTS, PERMISSIONS = {}, {}
+for arg in sys.argv[5:]:
+    installation, rest = arg.split("=", 1)
+    login, _, perms = rest.partition(":")
+    ACCOUNTS[installation] = login
+    PERMISSIONS[installation] = (
+        dict(p.split("=", 1) for p in perms.split(",")) if perms else DEFAULT_PERMISSIONS
+    )
 
 
 def unb64(text):
@@ -76,7 +92,11 @@ class Handler(BaseHTTPRequestHandler):
         if len(path) != 3:
             self.reply(404, {"message": "Not Found"})
             return
-        self.reply(200, {"id": int(path[2]), "account": {"login": ACCOUNTS[path[2]]}})
+        self.reply(200, {
+            "id": int(path[2]),
+            "account": {"login": ACCOUNTS[path[2]]},
+            "permissions": PERMISSIONS[path[2]],
+        })
 
     def do_POST(self):
         path = self.authorized_path()
@@ -90,11 +110,18 @@ class Handler(BaseHTTPRequestHandler):
         with open(LOG + ".bodies", "a") as bodies:
             bodies.write(json.dumps(body, sort_keys=True) + "\n")
         repos = body.get("repository_ids", [])
+        held = PERMISSIONS[path[2]]
+        asked = body.get("permissions", {})
+        over = [k for k, v in asked.items() if k not in held or (v == "write" and held[k] == "read")]
+        if over:
+            self.reply(422, {"message": "The permissions requested are not granted to this installation.",
+                             "over": sorted(over)})
+            return
         token = "ghs_vm_" + path[2] + "".join("_" + str(r) for r in repos)
         self.reply(201, {
             "token": token,
             "expires_at": "2099-01-01T00:00:00Z",
-            "permissions": {"contents": "write"},
+            "permissions": asked or held,
             "repository_selection": "selected" if repos else "all",
         })
 

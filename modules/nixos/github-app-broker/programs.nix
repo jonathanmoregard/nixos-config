@@ -13,8 +13,10 @@
 let
   lib = pkgs.lib;
   owners = lib.concatMapStringsSep " " lib.toLower allowedOwners;
-  # Sent with every token request: GitHub grants the intersection with what
-  # the App holds, so widening the App on GitHub does not widen tokens.
+  # The ceiling for every token. GitHub refuses (422) a request naming a
+  # permission the installation lacks, so each request carries this cap
+  # intersected with what the installation holds: widening the App on GitHub
+  # does not widen tokens, and narrowing it does not break minting.
   permissionsJson = builtins.toJSON tokenPermissions;
 
   # Shared by both programs. `refuse` is defined by each, since only the
@@ -63,12 +65,13 @@ let
     }
 
     # require_allowed_owner <installation_id>: refuse unless the installation
-    # belongs to one of allowed_owners.
+    # belongs to one of allowed_owners. Leaves GitHub's answer in
+    # $installation for the permission intersection.
     require_allowed_owner() {
-      local response login
-      response=$(github GET "/app/installations/$1") \
+      local login
+      installation=$(github GET "/app/installations/$1") \
         || refuse "GitHub does not know installation $1 of this App"
-      login=$(jq -r '.account.login // empty | ascii_downcase' <<< "$response" 2>/dev/null) || login=""
+      login=$(jq -r '.account.login // empty | ascii_downcase' <<< "$installation" 2>/dev/null) || login=""
       [[ "$login" =~ ^[a-z0-9][a-z0-9-]{0,38}$ ]] \
         || refuse "GitHub named no account for installation $1"
       case " $allowed_owners " in
@@ -110,7 +113,16 @@ in
       require_app_id "$app_id"
       sign_jwt "$app_id"
       require_allowed_owner "$installation_id"
-      permissions=${lib.escapeShellArg permissionsJson}
+      # Each capped permission the installation holds, at the lower of the
+      # two levels; one it does not hold is left out.
+      permissions=$(jq -c --argjson cap ${lib.escapeShellArg permissionsJson} '
+        (.permissions // {}) as $held
+        | $cap | with_entries(
+            select($held[.key] != null)
+            | .value = (if .value == "write" and ($held[.key] == "write" or $held[.key] == "admin")
+                        then "write" else "read" end))
+      ' <<< "$installation" 2>/dev/null) || refuse "GitHub named no permissions for installation $installation_id"
+      [ "$permissions" != '{}' ] || refuse "installation $installation_id holds none of the permitted permissions"
       body="{\"permissions\":$permissions}"
       [ -z "$repo_id" ] || body="{\"permissions\":$permissions,\"repository_ids\":[$repo_id]}"
       if ! response=$(github POST "/app/installations/$installation_id/access_tokens" -d "$body"); then
