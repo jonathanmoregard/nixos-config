@@ -33,11 +33,9 @@
 # string so the config doesn't need to change. The wrapped binary lives
 # inside the project venv at a different absolute path, so no PATH loop.
 let
-  # Lakera Guard tuned-policy pointer, single-sourced in home/lakera.nix
-  # (shared with futuresearch-gate-mcp.nix and claude-services.nix).
+  # Lakera Guard tuned-policy pointer, single-sourced in home/lakera.nix.
   lakera = import ./lakera.nix;
-  # Model Armor endpoint ids, single-sourced in home/model-armor.nix
-  # (shared with futuresearch-gate-mcp.nix).
+  # Model Armor endpoint ids, single-sourced in home/model-armor.nix.
   modelArmor = import ./model-armor.nix;
 in
 {
