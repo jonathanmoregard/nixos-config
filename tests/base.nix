@@ -3301,6 +3301,19 @@ in
         "/home/jonathan/Repos/sync-plugin-fixture/skills/external-plugin/SKILL.md && "
         "ln -s /home/jonathan/Repos/sync-plugin-fixture "
         "/home/jonathan/Repos/sync-plugin-link && "
+        # A collection shaped like the claude-config runtime projection:
+        # ~/.claude/agents is itself a symlink, and its entries are relative
+        # symlinks one hop further out, the way the skill farm is laid out.
+        # ~/Repos is hidden inside the renderer namespace (asserted below as
+        # repo-hidden), so any entry that survives as a symlink dangles.
+        "install -d -o jonathan -g users "
+        "/home/jonathan/Repos/sync-projection-fixture/agents && "
+        "install -d -o jonathan -g users "
+        "/home/jonathan/Repos/sync-projection-fixture/target/alpha && "
+        "printf '%s\\n' 'projected-source' > "
+        "/home/jonathan/Repos/sync-projection-fixture/target/alpha/SKILL.md && "
+        "ln -s ../target/alpha "
+        "/home/jonathan/Repos/sync-projection-fixture/agents/alpha && "
         "printf '%s\\n' '{\"enabledPlugins\":{\"external@test\":true}}' > "
         "/home/jonathan/.claude/settings.json && "
         "printf '%s\\n' '{\"plugins\":{\"external@test\":[{\"installPath\":\"/home/jonathan/Repos/sync-plugin-link\"}]}}' > "
@@ -3308,9 +3321,24 @@ in
         "printf 'credential-sentinel\\n' > /home/jonathan/.config/gh/leak-sentinel && "
         "ln -s /home/jonathan/.config/gh/leak-sentinel "
         "/home/jonathan/.claude/plugins/cache/leak-sentinel && "
+        # One level below the declared entry point, so the deliberate
+        # "nested symlinks stay symlinks" property is observable. The target is
+        # readable by the service (~/Repos is in BindReadOnlyPaths) but hidden
+        # inside the renderer namespace, so a cp -L regression shows up as
+        # nested-leak-visible rather than as an unrelated ENOENT failure —
+        # which is what a sentinel under ~/.config/gh would have produced,
+        # since ProtectHome=tmpfs keeps that directory from the service too.
+        "printf 'nested-secret\\n' > "
+        "/home/jonathan/Repos/sync-source-fixture/nested-secret && "
+        "ln -s /home/jonathan/Repos/sync-source-fixture/nested-secret "
+        "/home/jonathan/Repos/sync-projection-fixture/target/alpha/leak && "
         "chown -R jonathan:users /home/jonathan/.claude /home/jonathan/.config/gh "
         "/home/jonathan/Repos/sync-source-fixture "
         "/home/jonathan/Repos/sync-plugin-fixture && "
+        "chown -Rh jonathan:users /home/jonathan/Repos/sync-projection-fixture && "
+        "ln -s /home/jonathan/Repos/sync-projection-fixture/agents "
+        "/home/jonathan/.claude/agents && "
+        "chown -h jonathan:users /home/jonathan/.claude/agents && "
         "chown -h jonathan:users /home/jonathan/Repos/sync-plugin-link && "
         "ln -s /home/jonathan/Repos/sync-source-fixture/external.md "
         "/home/jonathan/.claude/commands/external.md && "
@@ -3374,7 +3402,11 @@ in
         "'plugin_state = plugin.read_text().strip() + \"\\nplugin-visible\" if plugin.exists() else \"plugin-hidden\"' "
         "'leak = Path.home() / \".claude\" / \"plugins\" / \"cache\" / \"leak-sentinel\"' "
         "'leak_state = leak.read_text().strip() if leak.exists() else \"leak-hidden\"' "
-        "'Path(os.environ[\"AI_CLIENT_CONFIG_SOURCE_OUTPUT\"]).write_text(source.read_text() + source_state + \"\\n\" + repo_state + \"\\n\" + plugin_state + \"\\n\" + leak_state + \"\\n\")' "
+        "'projected = Path.home() / \".claude\" / \"agents\" / \"alpha\" / \"SKILL.md\"' "
+        "'projected_state = (projected.read_text().strip() + \"\\nprojected-materialized\") if projected.is_file() else (\"projected-symlink\" if projected.is_symlink() else \"projected-dangling\")' "
+        "'nested = Path.home() / \".claude\" / \"agents\" / \"alpha\" / \"leak\"' "
+        "'nested_state = \"nested-leak-visible\" if nested.exists() else (\"nested-leak-contained\" if nested.is_symlink() else \"nested-leak-absent\")' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_SOURCE_OUTPUT\"]).write_text(source.read_text() + source_state + \"\\n\" + repo_state + \"\\n\" + plugin_state + \"\\n\" + leak_state + \"\\n\" + projected_state + \"\\n\" + nested_state + \"\\n\")' "
         "'Path(os.environ[\"AI_CLIENT_CONFIG_CLAUDE_STATE_OUTPUT\"]).write_text((Path.home() / \".claude.json\").read_text())'",
     )
     user_systemctl = (
@@ -3418,7 +3450,11 @@ in
     source_text = workstation.succeed(f"cat {source_output}").strip()
     assert source_text == (
         "external-source\nmaterialized\nrepo-hidden\n"
-        "external-plugin-source\nplugin-visible\nleak-hidden"
+        "external-plugin-source\nplugin-visible\nleak-hidden\n"
+        # A symlinked collection is walked, not copied wholesale: its entries
+        # arrive materialized, while a symlink one level deeper still stays a
+        # symlink and therefore dangles.
+        "projected-source\nprojected-materialized\nnested-leak-contained"
     ), source_text
     import json as _sync_json
     cached_hook = _sync_json.loads(
