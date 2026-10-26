@@ -328,6 +328,7 @@
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
         vm-nix-gc       = mkLane ./tests/nix-gc.nix;
         vm-security-batch = mkLane ./tests/security-batch.nix;
+        vm-sandbox-seccomp = mkLane ./tests/sandbox-seccomp.nix;
         # In ci.yml's vm-minimal matrix. Gates credential handling and the
         # sudo password rule.
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
