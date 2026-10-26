@@ -162,10 +162,10 @@
   age.secrets.github-webhook-secret.rekeyFile = ../../secrets/github-webhook-secret.age;
 
   # LLM provider + research-agent secrets consumed by the research-agent-mcp
-  # wrapper. It reads raw key values with
-  # `$(< file)` and exports the matching env var itself — `.age` files
+  # wrapper. Its non-dumpable Python bootstrap reads each raw key value and
+  # populates the matching env var in the final server process — `.age` files
   # contain the raw key only (no `KEY=` prefix). owner=jonathan + mode=0400
-  # because the consumers run as the user, not root.
+  # because the consumer runs as the user, not root.
   age.secrets.anthropic-api-key = {
     rekeyFile = ../../secrets/anthropic-api-key.age;
     owner = "jonathan";
@@ -183,7 +183,7 @@
   # rejects loudly, so this must be provisioned (a real key, not an empty
   # placeholder) before injection-scanner's fail-closed Lakera lands on
   # main. Consumed by the research-agent-mcp wrapper, same raw-value
-  # `$(< file)` pattern as the keys above.
+  # bootstrap pattern as the keys above.
   age.secrets.lakera-api-key = {
     rekeyFile = ../../secrets/lakera-api-key.age;
     owner = "jonathan";
