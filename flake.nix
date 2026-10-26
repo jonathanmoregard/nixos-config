@@ -198,6 +198,7 @@
         (import ./overlays/beeper.nix)
         (import ./overlays/auphonic-cli.nix)
         (import ./overlays/signal-expiry.nix)
+        (import ./overlays/sandbox-runtime.nix)
         # `pkgs.dcg` — the destructive-command guard the Claude Code hook
         # stack shells out to. Declarative on purpose: the previous
         # `cargo install` copy was deleted by the Mint → NixOS migration
