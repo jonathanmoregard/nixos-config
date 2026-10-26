@@ -35,6 +35,66 @@ let
     {"jsonrpc":"2.0","id":2,"method":"tools/list"}
   '';
 
+  # Dependency-free stand-in for mcp_server.server. The production wrapper
+  # runs this through its real uv -> bootstrap path, so the probe observes the
+  # actual argv, stdio, environment and /proc policy without contacting any
+  # provider or copying the wrapper's implementation into the test.
+  researchAgentMcpProbePy = pkgs.writeText "vm-base-research-agent-mcp-probe.py" ''
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import time
+
+    expected = {
+        "ANTHROPIC_API_KEY": "vm-base-anthropic",
+        "OPENAI_API_KEY": "vm-base-openai",
+        "LAKERA_API_KEY": "vm-base-lakera",
+        "EXA_API_KEY": "vm-base-exa",
+        "TAVILY_API_KEY": "vm-base-tavily",
+        "CLAUDE_CODE_OAUTH_TOKEN": "vm-base-claude-token",
+        "EUIPO_CLIENT_ID": "",
+        "EUIPO_CLIENT_SECRET": "",
+        "EBAY_CLIENT_ID": "",
+        "EBAY_CLIENT_SECRET": "",
+        "TRADERA_APP_ID": "",
+        "TRADERA_APP_KEY": "",
+    }
+    wrong = [name for name, value in expected.items() if os.environ.get(name) != value]
+    if wrong:
+        print("wrong or missing secret variables: " + ", ".join(wrong), file=sys.stderr)
+        raise SystemExit(91)
+
+    if sys.argv[1:] == ["--exit-37"]:
+        raise SystemExit(37)
+
+    line = sys.stdin.readline().rstrip("\n")
+    print(f"stdio={line} argv={sys.argv[1:]!r}", flush=True)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    Path("/tmp/research-agent-mcp-probe.pids").write_text(
+        f"{os.getpid()} {os.getppid()} {child.pid}\n"
+    )
+    try:
+        time.sleep(120)
+    finally:
+        child.terminate()
+  '';
+
+  researchAgentMcpProbePyproject = pkgs.writeText "vm-base-research-agent-mcp-pyproject.toml" ''
+    [project]
+    name = "vm-base-research-agent-mcp-probe"
+    version = "0.0.0"
+    requires-python = ">=3.11"
+  '';
+
+  researchAgentMcpProbeProject = pkgs.runCommand
+    "vm-base-research-agent-mcp-probe-project" { } ''
+      mkdir -p "$out/mcp_server"
+      touch "$out/mcp_server/__init__.py"
+      cp ${researchAgentMcpProbePy} "$out/mcp_server/server.py"
+      cp ${researchAgentMcpProbePyproject} "$out/pyproject.toml"
+    '';
+
   githubAppKeyFixture = import ./lib/github-app-key-fixture.nix { inherit pkgs; };
   fakeGithubApiPort = 8787;
 
@@ -330,6 +390,169 @@ in
     workstation.wait_for_unit("home-manager-jonathan.service")
     # systemd --user for jonathan comes up via linger
     workstation.wait_for_unit("default.target", "jonathan")
+
+    # research-agent-mcp must make the final Python process non-dumpable
+    # before it reads any of its twelve agenix secrets. That turns the
+    # process's /proc files into root-owned, same-UID-unreadable files. uv is
+    # intentionally still dumpable, but it must never receive a secret in its
+    # environment. The local probe project keeps this an offline process test.
+    workstation.succeed(
+        "cp -r ${researchAgentMcpProbeProject}/. /home/jonathan/Repos/research-agent/ && "
+        "chown -R jonathan:users /home/jonathan/Repos/research-agent"
+    )
+    research_mcp_path = workstation.succeed(
+        "su - jonathan -c 'command -v research-agent-mcp'"
+    ).strip()
+    # The VM has no network and no warm uv cache, so uv would try to download
+    # a managed CPython. Point it at the system interpreter instead; the
+    # wrapper -> uv -> bootstrap chain under test is otherwise unchanged.
+    mcp_env = (
+        "env HOME=/home/jonathan "
+        "PYTHONPATH=/home/jonathan/Repos/research-agent "
+        "UV_PYTHON_DOWNLOADS=never "
+        "UV_PYTHON=${pkgs.python3}/bin/python3 "
+    )
+    secret_values = {
+        "anthropic-api-key": "vm-base-anthropic",
+        "openai-api-key": "vm-base-openai",
+        "lakera-api-key": "vm-base-lakera",
+        "exa-api-key": "vm-base-exa",
+        "tavily-api-key": "vm-base-tavily",
+        "claude-token": "vm-base-claude-token",
+        "euipo-client-id": "",
+        "euipo-client-secret": "",
+        "ebay-client-id": "",
+        "ebay-client-secret": "",
+        "tradera-app-id": "",
+        "tradera-app-key": "",
+    }
+    for name, value in secret_values.items():
+        workstation.succeed(
+            f"printf %s {value!r} > /run/agenix/{name}; "
+            f"chown jonathan:users /run/agenix/{name}; "
+            f"chmod 0400 /run/agenix/{name}"
+        )
+
+    # Missing and unreadable files both stop before mcp_server.server runs;
+    # an empty but readable placeholder remains a valid value.
+    workstation.succeed(
+        "mv /run/agenix/openai-api-key /run/agenix/openai-api-key.aside"
+    )
+    rc, out = workstation.execute(
+        f"runuser -u jonathan -- {mcp_env}"
+        f"timeout 30 {research_mcp_path} </dev/null 2>&1"
+    )
+    assert rc not in (0, 124), (rc, out)
+    assert "/run/agenix/openai-api-key" in out, out
+    workstation.succeed(
+        "mv /run/agenix/openai-api-key.aside /run/agenix/openai-api-key; "
+        "printf %s vm-base-openai > /run/agenix/openai-api-key; "
+        "chown jonathan:users /run/agenix/openai-api-key; "
+        "chmod 0000 /run/agenix/openai-api-key"
+    )
+    rc, out = workstation.execute(
+        f"runuser -u jonathan -- {mcp_env}"
+        f"timeout 30 {research_mcp_path} </dev/null 2>&1"
+    )
+    assert rc not in (0, 124), (rc, out)
+    assert "/run/agenix/openai-api-key" in out, out
+    workstation.succeed("chmod 0400 /run/agenix/openai-api-key")
+
+    # Stdin comes from a file rather than a pipe into a nested `sh -c`: the
+    # driver shell runs with `set -u`, and it would expand `$!` itself before
+    # the inner shell ever saw the background job.
+    workstation.succeed(
+        "printf 'stdio-marker\\n' > /tmp/research-agent-mcp-probe.in"
+    )
+    wrapper_pid = workstation.succeed(
+        f"runuser -u jonathan -- {mcp_env}"
+        f"{research_mcp_path} alpha 'two words' "
+        "</tmp/research-agent-mcp-probe.in "
+        ">/tmp/research-agent-mcp-probe.out "
+        "2>/tmp/research-agent-mcp-probe.err & echo $!"
+    ).strip()
+    workstation.wait_until_succeeds(
+        "test -s /tmp/research-agent-mcp-probe.pids", timeout=30
+    )
+    server_pid, uv_pid, child_pid = workstation.succeed(
+        "cat /tmp/research-agent-mcp-probe.pids"
+    ).split()
+    probe_out = workstation.succeed(
+        "cat /tmp/research-agent-mcp-probe.out"
+    ).strip()
+    assert probe_out == "stdio=stdio-marker argv=['alpha', 'two words']", probe_out
+
+    rc, out = workstation.execute(
+        f"runuser -u jonathan -- cat /proc/{server_pid}/environ 2>&1"
+    )
+    assert rc != 0 and "Permission denied" in out, (rc, out)
+    server_environ_owner = workstation.succeed(
+        f"stat -c '%U %G' /proc/{server_pid}/environ"
+    ).strip()
+    assert server_environ_owner == "root root", server_environ_owner
+
+    rc, _ = workstation.execute(
+        f"runuser -u jonathan -- cat /proc/{uv_pid}/environ >/dev/null 2>&1"
+    )
+    uv_environ_owner = workstation.succeed(
+        f"stat -c '%U %G' /proc/{uv_pid}/environ"
+    ).strip()
+    if rc == 0:
+        workstation.succeed(
+            f"! tr '\\0' '\\n' < /proc/{uv_pid}/environ | "
+            "grep -Eq '^(ANTHROPIC_API_KEY|OPENAI_API_KEY|LAKERA_API_KEY|"
+            "EXA_API_KEY|TAVILY_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|"
+            "EUIPO_CLIENT_ID|EUIPO_CLIENT_SECRET|EBAY_CLIENT_ID|"
+            "EBAY_CLIENT_SECRET|TRADERA_APP_ID|TRADERA_APP_KEY)='"
+        )
+    else:
+        assert uv_environ_owner == "root root", uv_environ_owner
+
+    # execve resets dumpability in descendants, so bootstrap also strips all
+    # twelve secret variables from every Python subprocess environment. The
+    # child can remain dumpable only because there is no secret left to read.
+    workstation.succeed(
+        f"runuser -u jonathan -- cat /proc/{child_pid}/environ >/dev/null"
+    )
+    workstation.succeed(
+        f"! tr '\\0' '\\n' < /proc/{child_pid}/environ | "
+        "grep -Eq '^(ANTHROPIC_API_KEY|OPENAI_API_KEY|LAKERA_API_KEY|"
+        "EXA_API_KEY|TAVILY_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|"
+        "EUIPO_CLIENT_ID|EUIPO_CLIENT_SECRET|EBAY_CLIENT_ID|"
+        "EBAY_CLIENT_SECRET|TRADERA_APP_ID|TRADERA_APP_KEY)='"
+    )
+
+    bootstrap = next(
+        line
+        for line in workstation.succeed(
+            f"tr '\\0' '\\n' < /proc/{server_pid}/cmdline"
+        ).splitlines()
+        if line.endswith("research-agent-mcp-bootstrap.py")
+    )
+    workstation.succeed(
+        f"kill {child_pid} {server_pid} {uv_pid} {wrapper_pid} 2>/dev/null || true"
+    )
+
+    # A seccomp denial makes prctl(2) fail. The bootstrap must report that
+    # security-control failure and stop before importing the server module.
+    # SystemCallErrorNumber turns the denial into an errno return instead of
+    # systemd's default SIGSYS kill, which is the case the code handles.
+    rc, out = workstation.execute(
+        "systemd-run --quiet --wait --pipe --collect "
+        "--property=Type=exec --property=User=jonathan "
+        "--property=WorkingDirectory=/home/jonathan/Repos/research-agent "
+        "--property=Environment=HOME=/home/jonathan "
+        "--property=SystemCallFilter=~prctl "
+        "--property=SystemCallErrorNumber=EPERM "
+        f"${pkgs.python3}/bin/python3 {bootstrap} </dev/null 2>&1"
+    )
+    assert rc != 0 and "PR_SET_DUMPABLE" in out, (rc, out)
+
+    rc, out = workstation.execute(
+        f"runuser -u jonathan -- {mcp_env}"
+        f"{research_mcp_path} --exit-37 </dev/null 2>&1"
+    )
+    assert rc == 37, (rc, out)
     # Deploy-webhook Funnel: this node's tailscale was never `up`'d, so the
     # unit must skip cleanly (active, not failed) rather than wedge boot.
     workstation.wait_for_unit("nixos-deploy-funnel.service")
