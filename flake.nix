@@ -509,9 +509,18 @@
               inherit addSecretPkg;
               deployedBin = "${builtins.head matches}/bin/add-secret";
             };
+        # Not a VM lane: request-handling harness for the GitHub App key
+        # broker's two socket programs — strict request grammar, the owner
+        # restriction and the MCP flag allowlist — against a fake GitHub
+        # that verifies the JWT. vm-base owns sockets, key mode and the
+        # real MCP server. Seconds.
+        github-app-broker = import ./tests/github-app-broker.nix { pkgs = pkgsLinux; };
+        # Not a VM lane: scenario harness for mint-gh-token, the jonathan-side
+        # GitHub App token refresher, against a fake key broker socket.
+        github-app-mint = import ./tests/github-app-mint.nix { pkgs = pkgsLinux; };
         # Not a VM lane: runtime-invocation harness for the GitHub App MCP
-        # credential wrapper. Uses a fake server to prove config failures,
-        # exact argv construction, and stripping of inherited token auth.
+        # wrapper. Uses a fake relay to prove config failures, owner routing
+        # and the header it sends to the App key broker.
         github-app-mcp =
           let
             homePkgs = primaryConfig

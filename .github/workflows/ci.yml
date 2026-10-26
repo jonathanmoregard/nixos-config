@@ -236,6 +236,19 @@ jobs:
       # systemd-analyze. Tiny runCommand — seconds.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.security-batch-research-agent -L
+      # GitHub App key broker contracts: the broker's request grammar,
+      # owner restriction and MCP flag allowlist against a JWT-verifying
+      # fake GitHub (tests/github-app-broker.nix); mint-gh-token's token
+      # cache, including write/rename failures keeping the old token
+      # (tests/github-app-mint.nix); the MCP relay
+      # (tests/github-app-mcp.nix). Boot nothing — seconds each. vm-base
+      # drives the real sockets end to end.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.github-app-broker -L
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.github-app-mint -L
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.github-app-mcp -L
 
   docs:
     # Validate that every `nix run .#<attr>` reference in this repo's
