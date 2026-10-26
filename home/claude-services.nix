@@ -192,7 +192,19 @@ in
       RandomizedDelaySec = "1min";
       Unit = "claude-pull.service";
     };
-    Install.WantedBy = [ "timers.target" ];
+    # TEMPORARILY NOT ENABLED (no Install.WantedBy), so a reboot or a rebuild
+    # does not start this timer.
+    #
+    # Why: claude-config master now carries the relocated runtime/ layout
+    # (hooks/, skills/, agents/, commands/, scripts/ and the config files moved
+    # under runtime/), but the read-only bind mounts that project them back to
+    # their old paths do not exist yet. A pull would therefore move files out
+    # from under ~50 registered hook paths, the statusLine and the MCP server
+    # commands, breaking the Claude Code harness.
+    #
+    # Re-enable (restore `Install.WantedBy = [ "timers.target" ];`) as the LAST
+    # step of the claude-config runtime-layout cutover, once the bind mounts
+    # are in place. The unit stays defined so that is a one-line change.
   };
 
   # claude-marketplace-pull — the same puller, second target.
