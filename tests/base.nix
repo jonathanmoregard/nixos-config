@@ -5250,5 +5250,184 @@ in
     workstation.succeed("systemctl reset-failed home-manager-jonathan.service")
     workstation.succeed("systemctl start home-manager-jonathan.service")
     workstation.succeed("test -f /home/jonathan/.claude/dcg.toml")
+
+    # claude-runtime-mounts — project claude-config's runtime subset into
+    # ~/.claude read-only, and leave the dev trees unreachable by that route.
+    #
+    # The claim under test is NOT "a dev tree is gone". It is the asymmetry:
+    # every ~/.claude spelling misses the dev trees while the checkout path
+    # still reaches them. A test that only asserted the first half would read
+    # as filesystem isolation and would pass for the wrong reason.
+    checkout = "/home/jonathan/Repos/claude-config"
+    workstation.succeed(
+        f"install -d -o jonathan -g users {checkout}/runtime/hooks "
+        f"{checkout}/runtime/skills {checkout}/tests "
+        f"{checkout}/vendor/superpowers/hooks {checkout}/vendor/superpowers/skills "
+        f"{checkout}/vendor/everything-claude-code/skills "
+        f"{checkout}/vendor/everything-claude-code/tests && "
+        f"printf 'guard\\n' > {checkout}/runtime/hooks/bash-guard.py && "
+        f"printf 'skill\\n' > {checkout}/runtime/skills/keep.md && "
+        f"printf '{{}}\\n' > {checkout}/runtime/settings.json && "
+        f"printf 'pin\\n' > {checkout}/runtime/.claude-powerline.json && "
+        f"printf 'DEVONLY\\n' > {checkout}/tests/dev-only-marker && "
+        f"printf 'sp-hook\\n' > {checkout}/vendor/superpowers/hooks/sp.sh && "
+        f"printf 'sp-skill\\n' > {checkout}/vendor/superpowers/skills/sp.md && "
+        f"printf '{{}}\\n' > {checkout}/vendor/superpowers/package.json && "
+        f"printf 'ecc-skill\\n' > {checkout}/vendor/everything-claude-code/skills/ecc.md && "
+        f"printf 'ECCDEV\\n' > {checkout}/vendor/everything-claude-code/tests/ecc-dev-marker && "
+        f"chown -R jonathan:users {checkout}"
+    )
+
+    # Mountpoints come from systemd.tmpfiles.rules in the module. They are
+    # already there from boot, but re-run so the assertions below do not
+    # depend on boot ordering against home-manager creating ~/.claude.
+    # systemd-tmpfiles-setup.service sets RefuseManualStart; the resetup unit
+    # is the one NixOS provides for re-applying rules.
+    workstation.succeed("systemctl start systemd-tmpfiles-resetup.service")
+
+    mount_units = [
+        workstation.succeed(
+            f"systemd-escape -p --suffix=mount /home/jonathan/.claude/{relative}"
+        ).strip()
+        for relative in [
+            "runtime",
+            "vendor/superpowers/hooks",
+            "vendor/superpowers/skills",
+            "vendor/superpowers/package.json",
+            "vendor/everything-claude-code/skills",
+        ]
+    ]
+    # Quote the unit name: systemd-escape renders '-' in a path segment as
+    # \x2d, and an unquoted backslash is eaten by the shell, so systemctl
+    # would look up a name that does not exist (exit 5).
+    for unit in mount_units:
+        workstation.succeed(f"systemctl start '{unit}'")
+        assert workstation.succeed(
+            f"systemctl is-active '{unit}'"
+        ).strip() == "active", unit
+
+    # Content arrives through the projection.
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/runtime/hooks/bash-guard.py"
+    ).strip() == "guard"
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/vendor/superpowers/skills/sp.md"
+    ).strip() == "sp-skill"
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/vendor/superpowers/package.json"
+    ).strip() == "{}"
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/vendor/everything-claude-code/skills/ecc.md"
+    ).strip() == "ecc-skill"
+
+    # Read-only, so a hook cannot rewrite its own source through ~/.claude.
+    workstation.fail("touch /home/jonathan/.claude/runtime/should-not-write")
+    workstation.fail(
+        "su - jonathan -c 'touch /home/jonathan/.claude/runtime/skills/nope'"
+    )
+
+    # THE ASYMMETRY. Dev trees are not reachable under ~/.claude by any
+    # spelling, and are still perfectly readable at the checkout path.
+    for spelling in [
+        "/home/jonathan/.claude/tests",
+        "/home/jonathan/.claude/runtime/tests",
+        "/home/jonathan/.claude/vendor/everything-claude-code/tests",
+    ]:
+        workstation.fail(f"test -e {spelling}")
+    assert workstation.succeed(f"cat {checkout}/tests/dev-only-marker").strip() == "DEVONLY"
+    assert workstation.succeed(
+        f"cat {checkout}/vendor/everything-claude-code/tests/ecc-dev-marker"
+    ).strip() == "ECCDEV"
+
+    # The per-entry links, written by the user unit once the mount is up.
+    workstation.succeed(
+        "systemctl start claude-runtime-links.service"
+    )
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/hooks"
+    ).strip() == "runtime/hooks"
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/.claude-powerline.json"
+    ).strip() == "runtime/.claude-powerline.json"
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/hooks/bash-guard.py"
+    ).strip() == "guard"
+
+    # settings.json is deliberately not projected: Claude Code writes it, and
+    # a link into the read-only mount would make that write fail.
+    workstation.fail("test -L /home/jonathan/.claude/settings.json")
+
+    # A real path in the way is LEFT ALONE, never replaced. The old flat
+    # tracked files collide with these links, and clearing them is a cutover
+    # step taken deliberately with the operator present — an activation unit
+    # must not delete a live home directory to make room for a symlink.
+    workstation.succeed(
+        "install -d -o jonathan -g users /home/jonathan/Repos/claude-config/runtime/commands && "
+        "printf 'projected\\n' > /home/jonathan/Repos/claude-config/runtime/commands/c.md && "
+        "install -d -o jonathan -g users /home/jonathan/.claude/commands && "
+        "printf 'PRECIOUS\\n' > /home/jonathan/.claude/commands/live-only.md && "
+        "chown -R jonathan:users /home/jonathan/.claude/commands "
+        "/home/jonathan/Repos/claude-config/runtime/commands"
+    )
+    workstation.succeed("systemctl restart claude-runtime-links.service")
+    workstation.fail("test -L /home/jonathan/.claude/commands")
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/commands/live-only.md"
+    ).strip() == "PRECIOUS"
+    # No `|| fallback`: a fallback that returns the whole journal, or an
+    # empty match with status 0, would turn this into an assertion about
+    # nothing.
+    links_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -n 40 --no-pager"
+    )
+    assert "is not a symlink; left alone" in links_log, links_log
+    assert "/home/jonathan/.claude/commands" in links_log, links_log
+
+    # Activation must still succeed with the projection mounted. This is what
+    # the compatTargets removal in home/claude-skills.nix buys: a home.file
+    # target under .claude/skills would now land inside a read-only mount and
+    # fail the rebuild.
+    workstation.succeed("systemctl restart home-manager-jonathan.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus home-manager-jonathan.service"
+    ).strip() == "0"
+    workstation.succeed(
+        "test -e /home/jonathan/.claude/skills-hm/nixos-config-dev/SKILL.md"
+    )
+
+    # A missing or half-built checkout must be LOUD. The mount skips on its
+    # ConditionPathExists, which keeps boot safe, but the links unit then has
+    # no projection to link against. If it also skipped quietly, every
+    # per-entry symlink would dangle and the next session would come up with
+    # no hooks, no permission rules and no MCP servers while looking healthy.
+    # So it exits 75 and lands in `failed`, where systemctl --failed and the
+    # SessionStart unit-failure report can see it.
+    workstation.succeed("mv /home/jonathan/Repos/claude-config/runtime /home/jonathan/Repos/claude-config/runtime-gone")
+    runtime_mount = workstation.succeed(
+        "systemd-escape -p --suffix=mount /home/jonathan/.claude/runtime"
+    ).strip()
+    workstation.succeed("systemctl stop claude-runtime-links.service")
+    workstation.succeed(f"systemctl stop '{runtime_mount}'")
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    assert workstation.succeed(
+        f"systemctl show -P ConditionResult '{runtime_mount}'"
+    ).strip() == "no"
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus claude-runtime-links.service"
+    ).strip() == "75"
+    assert workstation.succeed(
+        "systemctl is-failed claude-runtime-links.service"
+    ).strip() == "failed"
+    assert "claude-runtime-links" in workstation.succeed(
+        "systemctl --failed --no-legend"
+    )
+
+    # Restore, so the lane does not end on a deliberately failed unit.
+    workstation.succeed("mv /home/jonathan/Repos/claude-config/runtime-gone /home/jonathan/Repos/claude-config/runtime")
+    workstation.succeed("systemctl reset-failed claude-runtime-links.service")
+    workstation.succeed("systemctl start claude-runtime-links.service")
+    assert workstation.succeed(
+        "systemctl is-active claude-runtime-links.service"
+    ).strip() == "active"
   '';
 }

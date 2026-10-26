@@ -55,11 +55,14 @@ let
 
   # Permanent home. Outside the claude-config runtime projection, so it
   # stays writable by home-manager after cutover.
+  #
+  # The transitional `.claude/skills/<name>` copies are gone as of the
+  # cutover: that path is now a symlink into the read-only projection, so a
+  # home.file target there fails activation. claude-config carries
+  # runtime/skills/<name> -> ~/.claude/skills-hm/<name> instead, which is what
+  # puts these four back on the path agents read.
   hmTargets = map (entry ".claude/skills-hm") skills;
-
-  # Transitional: delete at claude-config L2 cutover (see header).
-  compatTargets = map (entry ".claude/skills") skills;
 in
 {
-  home.file = builtins.listToAttrs (hmTargets ++ compatTargets);
+  home.file = builtins.listToAttrs hmTargets;
 }
