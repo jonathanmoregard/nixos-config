@@ -46,12 +46,22 @@
 # ~/.local/state/claude-tasks/dot-claude/pending_for_human.md.
 #
 # HARD PRECONDITION, and it is not enforceable from this repo:
-# jonathanmoregard/claude-config#25 must be merged before this deploys. It
-# adds runtime/skills/nixos-{config-dev,automated-testing,agent-testing,
-# agenix-secret} as absolute symlinks into ~/.claude/skills-hm, which is where
-# home/claude-skills.nix writes them. Deploying this first replaces
-# ~/.claude/skills with a projection that does not contain those four, and
-# they become undiscoverable.
+# jonathanmoregard/claude-config#25 must be merged, and present in the backing
+# checkout, before the CUTOVER MARKER is created — not before this module
+# merges or deploys. It adds runtime/skills/nixos-{config-dev,
+# automated-testing,agent-testing,agenix-secret} as absolute symlinks into
+# ~/.claude/skills-hm, which is where home/claude-skills.nix writes them.
+# Enabling the projection without it replaces ~/.claude/skills with a
+# projection that does not contain those four, and they become undiscoverable.
+# The marker is what sequences this; merge order between the two repositories
+# does not matter.
+#
+# Also ordered by the marker, not by a merge: runtime/dcg.toml. home/dcg.nix
+# seeds ~/.claude/dcg.toml from a store fallback when that path is absent at
+# activation, so the cutover must create the per-entry links (step 5) before
+# the next home-manager activation — otherwise activation writes a real file
+# where the link belongs, and claude-runtime-links then reports it blocked
+# forever rather than clobbering it.
 { config, lib, pkgs, ... }:
 let
   user = "jonathan";
@@ -279,8 +289,24 @@ let
       done < "$stale_list"
 
       echo "claude-runtime-links: $linked link(s) written, $blocked path(s) left alone"
+
+      # A left-alone path is not a tidy-up note, it is stale live content: the
+      # agent reading ~/.claude/<entry> gets the old real directory, or
+      # somebody else's symlink, instead of the projection — while every other
+      # signal says the migration is done. So exit non-zero once all the work
+      # is finished, which lands the unit in `failed` and puts it in
+      # `systemctl --failed` and the SessionStart report.
+      #
+      # This is a true signal rather than a permanent alarm, because in the
+      # finished state nothing is blocked: the cutover deletes the old flat
+      # tracked files, compatTargets stops writing ~/.claude/skills, and
+      # settings.json is exempt by name rather than counted. It does mean the
+      # unit stays `failed` for the length of the cutover window — from the
+      # moment the marker goes in until compatTargets is dropped — which is
+      # correct: the cutover is, at that point, incomplete.
       if [ "$blocked" -gt 0 ]; then
-        echo "claude-runtime-links: cutover is incomplete while any path is left alone" >&2
+        echo "claude-runtime-links: cutover is incomplete — $blocked path(s) left alone, and agents still read the old content there" >&2
+        exit 75
       fi
     '';
   };

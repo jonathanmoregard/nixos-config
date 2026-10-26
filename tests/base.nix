@@ -5629,9 +5629,24 @@ in
     # `start`: this is a oneshot with RemainAfterExit, it already ran and
     # exited 0 in the pre-marker block above, and `start` on an active unit is
     # a no-op that would assert nothing here.
-    workstation.succeed(
+    #
+    # And `fail`, not `succeed`: ~/.claude/skills is a real home-manager
+    # directory at this point (compatTargets, which stay until the cutover
+    # change), so one path is left alone and the unit exits 75 by design. A
+    # left-alone path means agents still read the old content there, which must
+    # not report as healthy. Every assertion below is about what the unit did
+    # before it refused.
+    workstation.fail(
         "systemctl restart claude-runtime-links.service"
     )
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus claude-runtime-links.service"
+    ).strip() == "75"
+    incomplete_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -n 20 --no-pager"
+    )
+    assert "cutover is incomplete" in incomplete_log, incomplete_log
+    assert "agents still read the old content" in incomplete_log, incomplete_log
     assert workstation.succeed(
         "readlink /home/jonathan/.claude/hooks"
     ).strip() == "runtime/hooks"
@@ -5658,7 +5673,7 @@ in
         "chown -R jonathan:users /home/jonathan/.claude/commands "
         "/home/jonathan/Repos/claude-config/runtime/commands"
     )
-    workstation.succeed("systemctl restart claude-runtime-links.service")
+    workstation.fail("systemctl restart claude-runtime-links.service")
     workstation.fail("test -L /home/jonathan/.claude/commands")
     assert workstation.succeed(
         "cat /home/jonathan/.claude/commands/live-only.md"
@@ -5693,7 +5708,7 @@ in
         "ln -sfn /etc /home/jonathan/.claude/foreign-entry && "
         "chown -h jonathan:users /home/jonathan/.claude/foreign-entry"
     )
-    workstation.succeed("systemctl restart claude-runtime-links.service")
+    workstation.fail("systemctl restart claude-runtime-links.service")
     assert workstation.succeed(
         "readlink /home/jonathan/.claude/foreign-entry"
     ).strip() == "/etc"
@@ -5721,7 +5736,23 @@ in
     ).strip() == "runtime/hooks"
     workstation.succeed(f"mv {marker}.away {marker}")
     workstation.succeed("systemctl reset-failed claude-runtime-links.service")
-    workstation.succeed("systemctl restart claude-runtime-links.service")
+    # Fails again, for the other reason: the marker is back, so it links, and
+    # then refuses because ~/.claude/skills is still a real home-manager
+    # directory. Distinguish the two by the message, not the exit code — and
+    # read only THIS run's output. A fixed `-n N` window spans the previous
+    # runs, which already carry the dangling-links message, so the negative
+    # half of this assertion would be about the wrong run. Cursor-scoped, the
+    # same way the dcg block above does it.
+    links_cursor = workstation.succeed(
+        "journalctl -u claude-runtime-links.service --no-pager -n 0 --show-cursor"
+    ).rsplit("-- cursor:", 1)[1].strip()
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    relinked_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service --no-pager -o cat "
+        f"--after-cursor '{links_cursor}'"
+    )
+    assert "refusing to leave them dangling" not in relinked_log, relinked_log
+    assert "cutover is incomplete" in relinked_log, relinked_log
 
     # systemd-tmpfiles runs on every nixos-rebuild switch, and after cutover
     # its rules point at the live read-only binds. With `d`/`f` it would try
@@ -5784,18 +5815,21 @@ in
         "readlink /home/jonathan/.claude/hooks"
     ).strip() == "runtime/hooks"
 
-    # Restore, so the lane does not end on a deliberately failed unit.
+    # Restore the projection. The unit still exits 75 — ~/.claude/skills is a
+    # real home-manager directory for as long as compatTargets exist, so this
+    # lane cannot reach the complete-cutover state where nothing is blocked.
+    # That half of the contract (blocked == 0 -> exit 0) is covered by the
+    # adversarial harness's clean-run case instead; here the point is that the
+    # projection and the links come back.
     workstation.succeed("mv /home/jonathan/Repos/claude-config/runtime-gone /home/jonathan/Repos/claude-config/runtime")
     workstation.succeed("systemctl reset-failed claude-runtime-links.service")
-    workstation.succeed("systemctl restart claude-runtime-links.service")
-    assert workstation.succeed(
-        "systemctl is-active claude-runtime-links.service"
-    ).strip() == "active"
+    workstation.fail("systemctl restart claude-runtime-links.service")
     # And the projection came back with it, pulled up by RequiresMountsFor
     # rather than started by hand.
     workstation.succeed("mountpoint -q /home/jonathan/.claude/runtime")
     assert workstation.succeed(
         "cat /home/jonathan/.claude/hooks/bash-guard.py"
     ).strip() == "guard"
+    workstation.succeed("systemctl reset-failed claude-runtime-links.service")
   '';
 }
