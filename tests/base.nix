@@ -309,6 +309,20 @@ in
         "journalctl -b -u nixos-deploy-funnel.service "
         "| grep -q 'skipping funnel'"
     )
+
+    # sudo never caches a password: an agent sharing jonathan's terminal
+    # must not ride a sudo he just typed. Authenticate once, then a
+    # non-interactive sudo from the SAME parent (with no tty, sudo keys its
+    # timestamp on the parent process) must still demand a password.
+    rc, out = workstation.execute(
+        "timeout 60 runuser -u jonathan -- bash -c "
+        "'echo test | sudo -S -p \"\" true && sudo -n true' </dev/null 2>&1"
+    )
+    assert rc != 0, f"sudo reused a cached password: {out!r}"
+    assert "password is required" in out, (
+        f"expected the second sudo to demand a password, got {out!r}"
+    )
+
     # This lane runs longer than OnBootSec. Keep default network sync from
     # racing fixture-controlled service invocations near test end.
     workstation.succeed(
