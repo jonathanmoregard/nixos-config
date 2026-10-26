@@ -28,6 +28,9 @@ let
   # Lakera Guard tuned-policy pointer, single-sourced in home/lakera.nix
   # (shared with research-agent-mcp.nix and claude-services.nix).
   lakera = import ./lakera.nix;
+  # Model Armor endpoint ids, single-sourced in home/model-armor.nix
+  # (shared with research-agent-mcp.nix).
+  modelArmor = import ./model-armor.nix;
 in
 {
   home.packages = [
@@ -55,6 +58,13 @@ in
         # payload["project_id"] when this is set, selecting the tuned
         # L3 project policy instead of the account default.
         export LAKERA_PROJECT_ID=${lakera.lakeraProjectId}
+
+        # Model Armor, the second L2 vendor (see home/model-armor.nix).
+        # Path only: modelarmor.py reads the service-account key itself.
+        export MODEL_ARMOR_CREDENTIALS_FILE=/run/agenix/model-armor-sa-key
+        export MODEL_ARMOR_PROJECT=${modelArmor.project}
+        export MODEL_ARMOR_LOCATION=${modelArmor.location}
+        export MODEL_ARMOR_TEMPLATE=${modelArmor.template}
 
         # The scanner's Lakera call uses stdlib urllib, which finds no
         # CA bundle on NixOS with a uv-managed CPython — cert verify
