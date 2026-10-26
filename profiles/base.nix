@@ -95,6 +95,14 @@
   # modules/nixos/nixos-auto-deploy.nix.
   security.sudo.wheelNeedsPassword = true;
 
+  # ...and never caches it. With the default 5-minute timestamp, a process
+  # sharing jonathan's terminal (an agent's shell, launched from the tab he
+  # just typed his password into) ran sudo for free. Every sudo prompts;
+  # `sudo -i` is the way to run several. Asserted by vm-base.
+  security.sudo.extraConfig = lib.mkBefore ''
+    Defaults timestamp_timeout=0
+  '';
+
   # Enable zsh system-wide (required for it to be a valid login shell)
   programs.zsh.enable = true;
 

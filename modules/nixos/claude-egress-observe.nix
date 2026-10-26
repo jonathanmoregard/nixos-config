@@ -572,6 +572,8 @@ in
         "mcp.tavily.com"
         # MCP: injection scanner used by the research-agent wrappers
         "api.lakera.ai"
+        # Model Armor (token exchange via oauth2.googleapis.com, listed below)
+        "modelarmor.europe-west4.rep.googleapis.com"
         # MCP: reddit
         "www.reddit.com"
         "oauth.reddit.com"
