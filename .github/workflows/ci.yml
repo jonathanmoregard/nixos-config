@@ -249,13 +249,6 @@ jobs:
         run: nix build .#checks.x86_64-linux.github-app-mint -L
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.github-app-mcp -L
-      # srt's Unix-socket filter is real only while apply-seccomp is in the
-      # package (overlays/sandbox-runtime.nix). nixpkgs ships without it, and
-      # when it is absent srt logs one debug line and applies no filter at
-      # all — which every build in this workflow would still call green.
-      # Opens an AF_UNIX socket with and without the helper. Seconds.
-      - if: needs.preflight.outputs.risk != 'TRIVIAL'
-        run: nix build .#checks.x86_64-linux.sandbox-unix-socket-block -L
 
   docs:
     # Validate that every `nix run .#<attr>` reference in this repo's
@@ -435,7 +428,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker, security-batch]
+        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, klaffat-dependabot-caretaker, security-batch, sandbox-seccomp]
     steps:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
