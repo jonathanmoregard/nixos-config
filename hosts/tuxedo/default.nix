@@ -21,6 +21,8 @@
   networking.hostName = "tuxedo";
   # secrets/github-app-key.age is encrypted to this host's key only.
   services.githubAppBroker.enable = true;
+  # claude-code-dev-box (public: `gh api /apps/claude-code-dev-box`).
+  services.githubAppBroker.appId = 3433130;
 
   # The install created the agents before uids were pinned, so they took
   # 1000-1002 and jonathan 1003. Pin those live values rather than rewrite
