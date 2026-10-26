@@ -687,7 +687,6 @@ in
     ./ai-client-config-sync.nix
     ./claude-skills.nix
     ./research-agent-mcp.nix
-    ./futuresearch-gate-mcp.nix
     ./ha-mcp.nix
     ./aggregator-mcp-backend.nix
     # Must stay AFTER ./jonathan.nix: it redefines claude()/claudee()

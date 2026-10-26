@@ -12,8 +12,7 @@
 #
 # Imported by every wrapper that spawns the scanner:
 #   - home/research-agent-mcp.nix   (research-agent-mcp)
-#   - home/futuresearch-gate-mcp.nix (futuresearch-gate-mcp)
-# Change an id HERE and both call sites follow.
+# Change an id HERE and every call site follows.
 {
   project = "jm-pi-scanner";
   location = "europe-west4";
