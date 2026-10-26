@@ -391,6 +391,11 @@
         # (modules/nixos/ai-throttle.nix) — fake sysfs, cgroup and proc trees.
         # Seconds.
         ai-throttle = import ./tests/ai-throttle.nix { pkgs = pkgsLinux; };
+        # Not a VM lane: behavioural proof that overlays/sandbox-runtime.nix
+        # still ships apply-seccomp. Without it srt's Unix-socket policy fails
+        # open silently, and every build stays green. Seconds.
+        sandbox-unix-socket-block =
+          import ./tests/sandbox-unix-socket-block.nix { pkgs = pkgsLinux; };
         # Not a VM lane: fail-closed contract harness for the merged-or-
         # inactive worktree sweeper (home/worktree-sweep-script.nix). Builds
         # a fixture bare repo + worktrees with real git, stubs gh, and
