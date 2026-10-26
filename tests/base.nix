@@ -5631,8 +5631,9 @@ in
     # a no-op that would assert nothing here.
     #
     # And `fail`, not `succeed`: ~/.claude/skills is a real home-manager
-    # directory at this point (compatTargets, which stay until the cutover
-    # change), so one path is left alone and the unit exits 75 by design. A
+    # directory at this point (home/claude-skills.nix still writes it, and is
+    # deleted at cutover), so one path is left alone and the unit exits 75 by
+    # design. A
     # left-alone path means agents still read the old content there, which must
     # not report as healthy. Every assertion below is about what the unit did
     # before it refused.
@@ -5696,8 +5697,8 @@ in
     # A symlink pointing somewhere OTHER than runtime/ is somebody's property
     # — a home-manager store link, or one the operator made — and is left
     # alone rather than retargeted. This is the shape of the hazard that makes
-    # removing compatTargets a cutover step: while ~/.claude/skills is still a
-    # home-manager link, this unit must not take it over.
+    # deleting home/claude-skills.nix a cutover step: while ~/.claude/skills is
+    # still a home-manager link, this unit must not take it over.
     workstation.succeed(
         "install -d -o jonathan -g users "
         "/home/jonathan/Repos/claude-config/runtime/foreign-entry && "
@@ -5769,17 +5770,16 @@ in
     # Activation still succeeds with the projection mounted. Scope, stated
     # honestly: ~/.claude/skills is a real directory at this point, so this
     # does NOT exercise the home.file-into-a-read-only-mount collision — it
-    # guards the tmpfiles/mount/activation interaction only. The collision
-    # assertion belongs with the change that removes compatTargets and makes
-    # ~/.claude/skills a symlink, which is the cutover step; asserting it here
-    # would be claiming coverage this lane does not have.
+    # guards the tmpfiles/mount/activation interaction only. That collision is
+    # designed out rather than deferred: the cutover deletes
+    # home/claude-skills.nix, after which this repo writes nothing under
+    # ~/.claude and there is no collision left to assert. claude-config owns
+    # those skills from #26 onward, so nothing here needs to assert where they
+    # land either.
     workstation.succeed("systemctl restart home-manager-jonathan.service")
     assert workstation.succeed(
         "systemctl show -P ExecMainStatus home-manager-jonathan.service"
     ).strip() == "0"
-    workstation.succeed(
-        "test -e /home/jonathan/.claude/skills-hm/nixos-config-dev/SKILL.md"
-    )
 
     # A missing or half-built checkout must be LOUD. The mount skips on its
     # ConditionPathExists, which keeps boot safe, but the links unit then has
@@ -5816,8 +5816,9 @@ in
     ).strip() == "runtime/hooks"
 
     # Restore the projection. The unit still exits 75 — ~/.claude/skills is a
-    # real home-manager directory for as long as compatTargets exist, so this
-    # lane cannot reach the complete-cutover state where nothing is blocked.
+    # real home-manager directory for as long as home/claude-skills.nix exists
+    # in this repo, so this lane cannot reach the complete-cutover state where
+    # nothing is blocked. Deleting that file is the cutover step, not this one.
     # That half of the contract (blocked == 0 -> exit 0) is covered by the
     # adversarial harness's clean-run case instead; here the point is that the
     # projection and the links come back.

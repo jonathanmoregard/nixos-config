@@ -46,15 +46,22 @@
 # ~/.local/state/claude-tasks/dot-claude/pending_for_human.md.
 #
 # HARD PRECONDITION, and it is not enforceable from this repo:
-# jonathanmoregard/claude-config#25 must be merged, and present in the backing
+# jonathanmoregard/claude-config#26 must be merged, and present in the backing
 # checkout, before the CUTOVER MARKER is created — not before this module
-# merges or deploys. It adds runtime/skills/nixos-{config-dev,
-# automated-testing,agent-testing,agenix-secret} as absolute symlinks into
-# ~/.claude/skills-hm, which is where home/claude-skills.nix writes them.
+# merges or deploys. It makes runtime/skills/nixos-{config-dev,
+# automated-testing,agent-testing,agenix-secret,binary-debug} real directories
+# in claude-config, so the projection itself carries those five skills.
 # Enabling the projection without it replaces ~/.claude/skills with a
-# projection that does not contain those four, and they become undiscoverable.
+# projection that does not contain them, and they become undiscoverable.
 # The marker is what sequences this; merge order between the two repositories
 # does not matter.
+#
+# #26 supersedes #25, which carried the same skills as absolute symlinks into
+# ~/.claude/skills-hm — the location home/claude-skills.nix writes. That
+# indirection is gone: claude-config owns the skill content outright, so
+# nothing under ~/.claude has to stay writable on its behalf, and the matching
+# deletion of home/claude-skills.nix is a cutover step rather than a
+# standing collision hazard for this module to work around.
 #
 # Also ordered by the marker, not by a merge: runtime/dcg.toml. home/dcg.nix
 # seeds ~/.claude/dcg.toml from a store fallback when that path is absent at
@@ -299,11 +306,12 @@ let
       #
       # This is a true signal rather than a permanent alarm, because in the
       # finished state nothing is blocked: the cutover deletes the old flat
-      # tracked files, compatTargets stops writing ~/.claude/skills, and
-      # settings.json is exempt by name rather than counted. It does mean the
-      # unit stays `failed` for the length of the cutover window — from the
-      # moment the marker goes in until compatTargets is dropped — which is
-      # correct: the cutover is, at that point, incomplete.
+      # tracked files, home/claude-skills.nix is deleted so this repo stops
+      # writing ~/.claude/skills at all, and settings.json is exempt by name
+      # rather than counted. It does mean the unit stays `failed` for the
+      # length of the cutover window — from the moment the marker goes in
+      # until that deletion deploys — which is correct: the cutover is, at
+      # that point, incomplete.
       if [ "$blocked" -gt 0 ]; then
         echo "claude-runtime-links: cutover is incomplete — $blocked path(s) left alone, and agents still read the old content there" >&2
         exit 75
