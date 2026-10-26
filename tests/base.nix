@@ -5278,12 +5278,66 @@ in
         f"chown -R jonathan:users {checkout}"
     )
 
+    # No ordering cycle at boot. The mounts land after local-fs.target
+    # because systemd-tmpfiles-setup.service creates their mountpoints and
+    # itself runs after local-fs.target, so they must opt out of the default
+    # mount dependencies (which include Before=local-fs.target). Getting that
+    # wrong does not fail the mount — systemd breaks the cycle by DELETING a
+    # job from it, and on this config it picked systemd-tmpfiles-setup, after
+    # which nix-daemon, nscd and home-manager activation all failed at boot.
+    # Conditions are evaluated after the job queue is built, so the cycle
+    # happens whether or not the cutover marker exists.
+    cycles = workstation.succeed("journalctl -b --no-pager | grep -i 'ordering cycle' || true")
+    assert ".claude" not in cycles, cycles
+    assert workstation.succeed(
+        "systemctl is-active systemd-tmpfiles-setup.service"
+    ).strip() == "active"
+
     # Mountpoints come from systemd.tmpfiles.rules in the module. They are
     # already there from boot, but re-run so the assertions below do not
     # depend on boot ordering against home-manager creating ~/.claude.
     # systemd-tmpfiles-setup.service sets RefuseManualStart; the resetup unit
     # is the one NixOS provides for re-applying rules.
     workstation.succeed("systemctl start systemd-tmpfiles-resetup.service")
+
+    # Before the cutover marker exists, the whole projection must be inert:
+    # the mounts skip on their condition and the links unit skips too, so a
+    # deploy that lands before cutover changes nothing.
+    marker = "/home/jonathan/.claude/.projection-enabled"
+    workstation.fail(f"test -e {marker}")
+    runtime_mount_pre = workstation.succeed(
+        "systemd-escape -p --suffix=mount /home/jonathan/.claude/runtime"
+    ).strip()
+    workstation.succeed(f"systemctl start '{runtime_mount_pre}'")
+    assert workstation.succeed(
+        f"systemctl show -P ConditionResult '{runtime_mount_pre}'"
+    ).strip() == "no"
+    # A unit whose conditions were never evaluated also reports
+    # ConditionResult=no, so that assertion alone cannot tell "skipped" from
+    # "never started". The timestamp is non-zero only once systemd has
+    # actually checked.
+    assert workstation.succeed(
+        f"systemctl show -P ConditionTimestampMonotonic '{runtime_mount_pre}'"
+    ).strip() != "0"
+    workstation.fail("mountpoint -q /home/jonathan/.claude/runtime")
+
+    # The links unit carries no condition on the marker, deliberately: "no
+    # marker" and "marker deleted after cutover, every link now dangling" look
+    # identical to systemd and are opposite outcomes in fact. So it runs, finds
+    # no marker and no links of its own, says so, and exits 0.
+    workstation.succeed("systemctl restart claude-runtime-links.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus claude-runtime-links.service"
+    ).strip() == "0"
+    pre_marker_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -b --no-pager"
+    )
+    assert "no cutover marker" in pre_marker_log, pre_marker_log
+    workstation.fail("test -L /home/jonathan/.claude/hooks")
+
+    # Cutover: the operator creates the marker by hand. Everything below is
+    # the post-cutover world.
+    workstation.succeed(f"install -o jonathan -g users -m 0644 /dev/null {marker}")
 
     mount_units = [
         workstation.succeed(
@@ -5334,14 +5388,26 @@ in
         "/home/jonathan/.claude/vendor/everything-claude-code/tests",
     ]:
         workstation.fail(f"test -e {spelling}")
+    # The `..` escape specifically. This is what "bind mounts, never
+    # symlinks" rests on: a symlink-based rig would pass the three test -e
+    # checks above and still resolve `..` to the on-disk parent, handing the
+    # dev tree straight back.
+    workstation.fail("cat /home/jonathan/.claude/runtime/../tests/dev-only-marker")
+    workstation.fail(
+        "su - jonathan -c 'cat /home/jonathan/.claude/runtime/../tests/dev-only-marker'"
+    )
+
     assert workstation.succeed(f"cat {checkout}/tests/dev-only-marker").strip() == "DEVONLY"
     assert workstation.succeed(
         f"cat {checkout}/vendor/everything-claude-code/tests/ecc-dev-marker"
     ).strip() == "ECCDEV"
 
-    # The per-entry links, written by the user unit once the mount is up.
+    # The per-entry links, written once the mount is up. `restart`, not
+    # `start`: this is a oneshot with RemainAfterExit, it already ran and
+    # exited 0 in the pre-marker block above, and `start` on an active unit is
+    # a no-op that would assert nothing here.
     workstation.succeed(
-        "systemctl start claude-runtime-links.service"
+        "systemctl restart claude-runtime-links.service"
     )
     assert workstation.succeed(
         "readlink /home/jonathan/.claude/hooks"
@@ -5380,13 +5446,79 @@ in
     links_log = workstation.succeed(
         "journalctl -u claude-runtime-links.service -n 40 --no-pager"
     )
-    assert "is not a symlink; left alone" in links_log, links_log
-    assert "/home/jonathan/.claude/commands" in links_log, links_log
+    # The whole line, not its two halves separately: ~/.claude/skills is a
+    # real home-manager directory, so "is not a symlink; left alone" is
+    # already in this journal from the boot run and matching it alone would
+    # assert nothing about commands/.
+    assert (
+        "claude-runtime-links: /home/jonathan/.claude/commands exists and is "
+        "not a symlink; left alone"
+    ) in links_log, links_log
 
-    # Activation must still succeed with the projection mounted. This is what
-    # the compatTargets removal in home/claude-skills.nix buys: a home.file
-    # target under .claude/skills would now land inside a read-only mount and
-    # fail the rebuild.
+    # A symlink pointing somewhere OTHER than runtime/ is somebody's property
+    # — a home-manager store link, or one the operator made — and is left
+    # alone rather than retargeted. This is the shape of the hazard that makes
+    # removing compatTargets a cutover step: while ~/.claude/skills is still a
+    # home-manager link, this unit must not take it over.
+    workstation.succeed(
+        "install -d -o jonathan -g users "
+        "/home/jonathan/Repos/claude-config/runtime/foreign-entry && "
+        "printf 'projected\\n' > "
+        "/home/jonathan/Repos/claude-config/runtime/foreign-entry/p.md && "
+        "chown -R jonathan:users "
+        "/home/jonathan/Repos/claude-config/runtime/foreign-entry && "
+        "ln -sfn /etc /home/jonathan/.claude/foreign-entry && "
+        "chown -h jonathan:users /home/jonathan/.claude/foreign-entry"
+    )
+    workstation.succeed("systemctl restart claude-runtime-links.service")
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/foreign-entry"
+    ).strip() == "/etc"
+    foreign_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -n 40 --no-pager"
+    )
+    assert "not into runtime/; left alone" in foreign_log, foreign_log
+    workstation.succeed("rm /home/jonathan/.claude/foreign-entry")
+
+    # Removing the marker after cutover must be LOUD, not a quiet return to
+    # the pre-cutover no-op: the links written at cutover are all still there
+    # and all dangle the moment the mounts stop honouring their condition.
+    workstation.succeed(f"mv {marker} {marker}.away")
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus claude-runtime-links.service"
+    ).strip() == "75"
+    marker_gone_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -n 20 --no-pager"
+    )
+    assert "refusing to leave them dangling" in marker_gone_log, marker_gone_log
+    # It refused rather than tidying up: the links are untouched.
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/hooks"
+    ).strip() == "runtime/hooks"
+    workstation.succeed(f"mv {marker}.away {marker}")
+    workstation.succeed("systemctl reset-failed claude-runtime-links.service")
+    workstation.succeed("systemctl restart claude-runtime-links.service")
+
+    # systemd-tmpfiles runs on every nixos-rebuild switch, and after cutover
+    # its rules point at the live read-only binds. With `d`/`f` it would try
+    # to chmod them and fail EROFS on every switch; `d-`/`f-` is what keeps
+    # that from being load-bearing on the checkout's modes. Prove it with the
+    # projection mounted, which is the state that makes it possible.
+    workstation.succeed("mountpoint -q /home/jonathan/.claude/runtime")
+    workstation.succeed("systemctl restart systemd-tmpfiles-resetup.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus systemd-tmpfiles-resetup.service"
+    ).strip() == "0"
+    workstation.succeed("mountpoint -q /home/jonathan/.claude/runtime")
+
+    # Activation still succeeds with the projection mounted. Scope, stated
+    # honestly: ~/.claude/skills is a real directory at this point, so this
+    # does NOT exercise the home.file-into-a-read-only-mount collision — it
+    # guards the tmpfiles/mount/activation interaction only. The collision
+    # assertion belongs with the change that removes compatTargets and makes
+    # ~/.claude/skills a symlink, which is the cutover step; asserting it here
+    # would be claiming coverage this lane does not have.
     workstation.succeed("systemctl restart home-manager-jonathan.service")
     assert workstation.succeed(
         "systemctl show -P ExecMainStatus home-manager-jonathan.service"
@@ -5421,13 +5553,26 @@ in
     assert "claude-runtime-links" in workstation.succeed(
         "systemctl --failed --no-legend"
     )
+    # Refusing means refusing to touch anything, not tidying up on the way
+    # out: the links written while the projection was up are still there, so
+    # the config comes back whole as soon as the mount does. If the exit-75
+    # path ever reached the stale sweep, all ~52 would be gone here.
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/hooks"
+    ).strip() == "runtime/hooks"
 
     # Restore, so the lane does not end on a deliberately failed unit.
     workstation.succeed("mv /home/jonathan/Repos/claude-config/runtime-gone /home/jonathan/Repos/claude-config/runtime")
     workstation.succeed("systemctl reset-failed claude-runtime-links.service")
-    workstation.succeed("systemctl start claude-runtime-links.service")
+    workstation.succeed("systemctl restart claude-runtime-links.service")
     assert workstation.succeed(
         "systemctl is-active claude-runtime-links.service"
     ).strip() == "active"
+    # And the projection came back with it, pulled up by RequiresMountsFor
+    # rather than started by hand.
+    workstation.succeed("mountpoint -q /home/jonathan/.claude/runtime")
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/hooks/bash-guard.py"
+    ).strip() == "guard"
   '';
 }
