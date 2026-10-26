@@ -328,6 +328,13 @@
     mode = "0400";
   };
 
+  age.secrets.model-armor-sa-key = {
+    rekeyFile = ../../secrets/model-armor-sa-key.age;
+    owner = "jonathan";
+    group = "users";
+    mode = "0400";
+  };
+
   # add-secret:insert-here
 
   # ---------------------------------------------------------------------
