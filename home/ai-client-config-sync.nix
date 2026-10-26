@@ -278,18 +278,43 @@ let
         fi
       }
 
+      # Resolve the collection itself, then enumerate its entries and
+      # materialize each one through snapshot_entry. A collection that is a
+      # symlink to a directory is still a collection: it must be walked, not
+      # copied wholesale. `cp -a` implies `-d`, so a wholesale copy preserves
+      # every entry that is a symlink as a symlink, and those targets are not
+      # in the renderer's namespace — the farm would arrive dangling. Entries
+      # are addressed by "$relative/<basename>" rather than by stripping
+      # $HOME, because the resolved collection may sit outside $HOME.
       snapshot_collection() {
         local relative="$1"
         local source="$HOME/$relative"
-        local entry
-        if [ -L "$source" ] || [ ! -d "$source" ]; then
+        local resolved entry
+        if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+          return
+        fi
+        if ! resolved=$(realpath -e -- "$source"); then
+          echo "ai-client-config sync: unresolved source $relative" >&2
+          exit 66
+        fi
+        if [ ! -d "$resolved" ]; then
           snapshot_entry "$relative"
           return
         fi
+        # find's exit status is invisible through process substitution, so an
+        # unreadable collection would enumerate as empty, the snapshot would
+        # hold nothing for it, and the publish step would then prune every
+        # rendered entry under it — a silent wipe reported as success. Write
+        # the listing to a file so the failure is observable.
+        local listing="$run_dir/collection-listing"
+        if ! find -P "$resolved" -mindepth 1 -maxdepth 1 -print0 > "$listing"; then
+          echo "ai-client-config sync: cannot enumerate $relative" >&2
+          exit 66
+        fi
         mkdir -p "$source_home/$relative"
         while IFS= read -r -d "" entry; do
-          snapshot_entry "''${entry#"$HOME/"}"
-        done < <(find -P "$source" -mindepth 1 -maxdepth 1 -print0)
+          snapshot_entry "$relative/''${entry##*/}"
+        done < "$listing"
       }
 
       mkdir -p "$source_home/.claude"
