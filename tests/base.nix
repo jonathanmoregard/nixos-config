@@ -4042,16 +4042,18 @@ in
         f"rm -r {probe_dir} {org_repo} && rm {gh_stub} {host_token} {org_token}"
     )
 
-    # claude-pull — the pull half of ~/.claude's continuous delivery. The
-    # timer must be linked and armed in the live user session.
-    for prop, expected in [("is-enabled", "enabled"), ("is-active", "active")]:
-        got = workstation.succeed(
+    # claude-pull is held OFF (home/claude-services.nix): the runtime/ layout
+    # on claude-config master has no bind mounts yet, so a pull would break
+    # the harness. The timer must not be enabled or running after a rebuild
+    # or reboot. Revert this block when the timer is re-enabled.
+    for cmd in ["is-enabled", "is-active"]:
+        got = workstation.execute(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-            f"systemctl --user {prop} claude-pull.timer'"
-        ).strip()
-        assert got == expected, (
-            f"claude-pull.timer {prop}={got!r}, expected {expected!r} "
-            f"— merged PRs would never reach the host"
+            f"systemctl --user {cmd} claude-pull.timer'"
+        )[1].strip()
+        assert got not in ("enabled", "active"), (
+            f"claude-pull.timer {cmd}={got!r} — a pull would relocate "
+            f"~/.claude files out from under the hooks"
         )
 
     # claude-marketplace-pull — the same puller, second target.
