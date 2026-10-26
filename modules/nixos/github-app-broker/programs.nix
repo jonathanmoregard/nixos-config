@@ -6,12 +6,16 @@
 # The request line is the caller's data: it is matched whole against a fixed
 # grammar (single spaces, numeric ids, a length cap) before anything is done
 # with it, never evaluated, and never echoed back except as the flag name a
-# refusal names. Before the key signs for an installation, GitHub is asked
-# whose it is; only `allowedOwners` are served.
-{ pkgs, apiUrl, allowedOwners, githubMcpServer ? pkgs.github-mcp-server }:
+# refusal names. Only `appId` is signed for, and before the key signs for an
+# installation, GitHub is asked whose it is; only `allowedOwners` are served.
+{ pkgs, apiUrl, appId, allowedOwners, tokenPermissions
+, githubMcpServer ? pkgs.github-mcp-server }:
 let
   lib = pkgs.lib;
   owners = lib.concatMapStringsSep " " lib.toLower allowedOwners;
+  # Sent with every token request: GitHub grants the intersection with what
+  # the App holds, so widening the App on GitHub does not widen tokens.
+  permissionsJson = builtins.toJSON tokenPermissions;
 
   # Shared by both programs. `refuse` is defined by each, since only the
   # token socket may answer on stdout.
@@ -20,6 +24,7 @@ let
     key="$1"
     api_url=${lib.escapeShellArg apiUrl}
     allowed_owners=${lib.escapeShellArg owners}
+    app_id_configured=${toString appId}
 
     # read_request <max-bytes>: one newline-terminated line into $line. A
     # line that hits the cap, a missing newline and a silent caller are all
@@ -72,6 +77,11 @@ let
       esac
     }
 
+    # require_app_id <app_id>: the client names the App, the broker decides.
+    require_app_id() {
+      [ "$1" = "$app_id_configured" ] || refuse "app id $1 is not the configured App"
+    }
+
     id='[0-9]{1,20}'
   '';
 in
@@ -97,10 +107,12 @@ in
       installation_id="''${BASH_REMATCH[2]}"
       repo_id="''${BASH_REMATCH[4]}"
 
+      require_app_id "$app_id"
       sign_jwt "$app_id"
       require_allowed_owner "$installation_id"
-      body='{}'
-      [ -z "$repo_id" ] || body="{\"repository_ids\":[$repo_id]}"
+      permissions=${lib.escapeShellArg permissionsJson}
+      body="{\"permissions\":$permissions}"
+      [ -z "$repo_id" ] || body="{\"permissions\":$permissions,\"repository_ids\":[$repo_id]}"
       if ! response=$(github POST "/app/installations/$installation_id/access_tokens" -d "$body"); then
         echo "github-app-mint-token: GitHub refused installation $installation_id: $response" >&2
         printf 'error: GitHub refused installation %s: %s\n' "$installation_id" "$response"
@@ -156,13 +168,21 @@ in
         i=$((i + 1))
       done
 
+      # Lockdown is not the client's to drop: content from users without
+      # push access (the usual prompt-injection carrier) stays hidden.
+      lockdown=(--lockdown-mode)
+      for flag in "''${args[@]}"; do
+        [ "$flag" != --lockdown-mode ] || lockdown=()
+      done
+
+      require_app_id "$app_id"
       sign_jwt "$app_id"
       require_allowed_owner "$installation_id"
       exec ${githubMcpServer}/bin/github-mcp-server stdio \
         --app-id "$app_id" \
         --app-installation-id "$installation_id" \
         --app-private-key-path "$key" \
-        "''${args[@]}"
+        "''${args[@]}" "''${lockdown[@]}"
     '';
   };
 }

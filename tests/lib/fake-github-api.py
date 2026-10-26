@@ -8,7 +8,8 @@
 # half and that GitHub would accept (RS256, exp at most 10 minutes ahead), so
 # an answer proves the broker signed with the key it was given. The minted
 # token names the installation and repository ids it was minted for. Every
-# authenticated request is appended to <log> as `<METHOD> <path>`.
+# authenticated request is appended to <log> as `<METHOD> <path>`, and each
+# token request's JSON body (keys sorted) to <log>.bodies.
 #
 # Usage: fake-github-api.py <public-key.pem> <port> <openssl> <log>
 #            <installation_id>=<account login>...
@@ -86,6 +87,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length) or b"{}")
+        with open(LOG + ".bodies", "a") as bodies:
+            bodies.write(json.dumps(body, sort_keys=True) + "\n")
         repos = body.get("repository_ids", [])
         token = "ghs_vm_" + path[2] + "".join("_" + str(r) for r in repos)
         self.reply(201, {

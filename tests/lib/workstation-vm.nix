@@ -22,6 +22,8 @@ in
   age.identityPaths = [ "${githubAppKeyFixture}/id_ed25519" ];
   services.githubAppBroker.keyCiphertext =
     lib.mkForce "${githubAppKeyFixture}/github-app-key.age";
+  # The App id tests/base.nix writes into jonathan's client config.
+  services.githubAppBroker.appId = lib.mkForce 123;
 
   # The laptop's real hardware/disk config. The virtualisation module
   # provides a virtio rootfs and the test framework boots without a

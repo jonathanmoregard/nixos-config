@@ -3,26 +3,33 @@
 # running as that user.
 #
 # Agents run as jonathan. They get what the key is FOR — installation tokens
-# and the GitHub MCP server — over two unix sockets that only jonathan may
+# and the GitHub MCP server — over two unix sockets that only `clients` may
 # connect to, and never the key itself, an App JWT, or a way to mint off
 # this host:
 #
 #   token.sock  one request line `<app_id> <installation_id> [<repo_id>]`;
 #               answers GitHub's installation-token JSON (a whole-installation
-#               token, or one scoped to that repository). The App JWT is
-#               signed here and sent only to `apiUrl`.
+#               token, or one scoped to that repository), always capped to
+#               `tokenPermissions`. The App JWT is signed here and sent only
+#               to `apiUrl`.
 #   mcp.sock    one header line `<app_id> <installation_id> <args...>`, then
 #               the MCP stdio stream: github-mcp-server runs here in App mode,
 #               refreshing its own tokens for the whole session. Only the
-#               tool-policy flags cross (which tools, read-only, lockdown);
-#               anything that could point the server elsewhere or make it
-#               write files is refused.
+#               tool-policy flags cross (which tools, read-only); lockdown
+#               mode is always on. Anything that could point the server
+#               elsewhere or make it write files is refused. The server mints
+#               its own tokens, so `tokenPermissions` does not cap it: the
+#               App's own permissions on GitHub do.
 #
 # The ids come from the client (jonathan's ~/.config/github-app/config), so
-# the broker checks them against GitHub before signing for them: the
-# installation must belong to one of `allowedOwners`. A wrong app id fails at
-# GitHub (the JWT does not verify), and a repository id outside the
-# installation is refused by GitHub, so neither widens what jonathan reaches.
+# the broker checks them before signing for them: the app id must be `appId`,
+# and the installation must belong to one of `allowedOwners` (asked of
+# GitHub). A repository id outside the installation is refused by GitHub, so
+# it does not widen what a client reaches.
+#
+# What this does NOT do yet: every process running as a client uid can ask.
+# The broker keeps the key from agents; it limits what they can do with it
+# only once agents run as their own uids and jonathan leaves `clients`.
 # Request handling lives in ./programs.nix (harness: tests/github-app-broker.nix).
 #
 # Invariants: no secret ever appears on a command line (/proc/*/cmdline is
@@ -51,7 +58,7 @@ let
 
   programs = import ./programs.nix {
     inherit pkgs;
-    inherit (cfg) apiUrl allowedOwners;
+    inherit (cfg) apiUrl appId allowedOwners tokenPermissions;
   };
   keyPath = config.age.secrets.github-app-key.path;
 
@@ -91,7 +98,7 @@ let
     } // extra;
   };
 
-  # Only github-app-clients (jonathan) and root may connect. root owns the
+  # Only github-app-clients (`clients`) and root may connect. root owns the
   # inode: an owner may chmod a socket, so a jonathan-owned one could be
   # opened to every local uid.
   brokerSocket = { description, path }: {
@@ -119,6 +126,41 @@ in
       description = ''
         The App private key, age-encrypted to the host key only. Test and
         feature VMs point this at tests/lib/github-app-key-fixture.nix.
+      '';
+    };
+    appId = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      description = ''
+        The GitHub App's numeric id (App settings page, "App ID"). The broker
+        signs for this App only; a request naming another is refused.
+      '';
+    };
+    clients = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "jonathan" ];
+      description = ''
+        Users who may connect to the broker's sockets. Every process running
+        as one of them can mint tokens and open MCP sessions.
+      '';
+    };
+    tokenPermissions = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.enum [ "read" "write" ]);
+      default = {
+        actions = "read";
+        checks = "read";
+        contents = "write";
+        issues = "write";
+        metadata = "read";
+        pull_requests = "write";
+        statuses = "read";
+        workflows = "write";
+      };
+      description = ''
+        Permissions requested with every installation token. GitHub grants
+        their intersection with the App's own, so granting the App more on
+        GitHub (administration, secrets, environments, ...) does not reach
+        tokens minted here.
       '';
     };
     allowedOwners = lib.mkOption {
@@ -160,6 +202,10 @@ in
             && lib.all (o: builtins.match "[A-Za-z0-9][A-Za-z0-9-]{0,38}" o != null) cfg.allowedOwners;
           message = "services.githubAppBroker.allowedOwners must list the GitHub logins whose App installations agents may use.";
         }
+        {
+          assertion = cfg.appId != null;
+          message = "services.githubAppBroker.appId must be set to the GitHub App's id (App settings page, \"App ID\").";
+        }
       ];
 
       users.users.github-app = {
@@ -168,7 +214,7 @@ in
         description = "Holder of the GitHub App private key";
       };
       users.groups.github-app = { };
-      users.groups.github-app-clients.members = [ "jonathan" ];
+      users.groups.github-app-clients.members = cfg.clients;
     }
 
     (lib.mkIf enabled {

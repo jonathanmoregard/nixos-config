@@ -7,7 +7,9 @@
 # (jonathanmoregard), 789 (klaffat) and 999 (stranger, not allowed).
 #
 # Covers the strict request grammar (anything else refused before GitHub is
-# asked), the owner restriction, and the MCP flag allowlist, against a fake
+# asked), the configured App id, the owner restriction, the permission cap
+# sent with every token request, forced MCP lockdown and the MCP flag
+# allowlist, against a fake
 # github-mcp-server that records its argv and stdin. Socket permissions, the
 # key's file mode and the real MCP server are vm-base's.
 # Boots nothing; runs in seconds.
@@ -31,7 +33,9 @@ let
   programs = import ../modules/nixos/github-app-broker/programs.nix {
     inherit pkgs;
     apiUrl = "http://127.0.0.1:${toString port}";
+    appId = 1;
     allowedOwners = [ "JonathanMoregard" "klaffat" ];
+    tokenPermissions = { contents = "write"; metadata = "read"; };
     githubMcpServer = fakeServer;
   };
 in
@@ -58,10 +62,11 @@ pkgs.runCommand "github-app-broker-harness"
     # mint <request bytes>: one token-socket connection. Sets $out_text,
     # $rc and $asked (the GitHub requests it caused).
     mint() {
-      : > "$log"
+      : > "$log"; : > "$log.bodies"
       rc=0
       out_text=$(printf '%b' "$1" | ${programs.mintToken}/bin/github-app-mint-token "$key" 2>/dev/null) || rc=$?
       asked=$(cat "$log")
+      sent=$(cat "$log.bodies")
     }
     token_is() { [ "$rc" = 0 ] && [ "$(${pkgs.jq}/bin/jq -r .token <<< "$out_text")" = "$1" ]; }
     refused() { [ "$rc" != 0 ] && [[ "$out_text" == refused:* ]] && [[ "$out_text" != *ghs_* ]]; }
@@ -70,8 +75,12 @@ pkgs.runCommand "github-app-broker-harness"
     mint '1 456\n'
     expect "personal installation token" token_is ghs_vm_456
     expect "owner looked up before minting" grep -qx 'GET /app/installations/456' <<< "$asked"
+    expect "token capped to tokenPermissions" \
+      [ "$sent" = '{"permissions": {"contents": "write", "metadata": "read"}}' ]
     mint '1 456 42\n'
     expect "repo-scoped token" token_is ghs_vm_456_42
+    expect "repo-scoped token capped too" \
+      [ "$sent" = '{"permissions": {"contents": "write", "metadata": "read"}, "repository_ids": [42]}' ]
     mint '1 789\n'
     expect "org installation token" token_is ghs_vm_789
 
@@ -83,6 +92,13 @@ pkgs.runCommand "github-app-broker-harness"
     expect "unlisted owner never minted" bash -c "! grep -q access_tokens <<< \"$asked\""
     mint '1 31337\n'
     expect "unknown installation refused" refused
+
+    # Only the configured App is signed for: another id is refused before
+    # GitHub hears of it.
+    mint '2 456\n'
+    expect "other app id refused" refused
+    expect "other app id names itself" grep -q "app id 2 is not the configured App" <<< "$out_text"
+    expect "other app id never reached GitHub" [ -z "$asked" ]
 
     # Anything but `<app_id> <installation_id> [<repo_id>]` in single
     # spaces is refused before GitHub hears of it.
@@ -131,6 +147,21 @@ pkgs.runCommand "github-app-broker-harness"
 
     mcp '1 999 --toolsets repos'
     expect "mcp unlisted owner refused" mcp_refused
+    mcp '2 456 --toolsets repos'
+    expect "mcp other app id refused" mcp_refused
+    expect "mcp other app id never reached GitHub" [ ! -s "$log" ]
+
+    # Lockdown is forced: a client that leaves it out gets it anyway, once.
+    mcp '1 789 --toolsets repos --read-only'
+    expect "mcp without lockdown starts" started
+    printf '%s\n' stdio --app-id 1 --app-installation-id 789 --app-private-key-path "$key" \
+      --toolsets repos --read-only --lockdown-mode > expected-argv
+    expect "mcp lockdown forced" cmp -s expected-argv "$capture/argv"
+    mcp '1 789'
+    expect "mcp with no args starts" started
+    printf '%s\n' stdio --app-id 1 --app-installation-id 789 --app-private-key-path "$key" \
+      --lockdown-mode > expected-argv
+    expect "mcp lockdown forced with no args" cmp -s expected-argv "$capture/argv"
 
     # Only tool-policy flags cross; everything else is refused, whatever
     # its spelling.
