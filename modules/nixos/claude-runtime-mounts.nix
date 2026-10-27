@@ -26,6 +26,9 @@
 #     vendor/superpowers/package.json -> the checkout (a symlink, never a bind)
 #     vendor/everything-claude-code/skills <- bind, ro
 #     projects/ plugins/ ...        untracked live state, projected by nothing
+#                                   — and where the plugin clones, the
+#                                   permission ledger and the per-tool
+#                                   state.json have to land too
 #
 # `vendor/` cannot move into `runtime/` — it holds two submodules — so only
 # the four subpaths the harness actually loads are projected, each its own
@@ -57,10 +60,23 @@
 # The marker is what sequences this; merge order between the two repositories
 # does not matter.
 #
-# claude-config owns the skill content outright, so nothing under ~/.claude
-# has to stay writable on its behalf and this repo declares no home.file
-# target there at all. That is what leaves this module with no standing
-# collision to work around.
+# THIRD PRECONDITION, also claude-config's and also sequenced by the marker:
+# `skills/`, `permission-ledger/` and `tools/` must hold no live state under
+# ~/.claude when the marker is created. Each is a tracked directory that also
+# accumulates writes in place — plugin clones, the ledger's .jsonl and
+# decided.json, a per-tool state.json — so each is a real directory at
+# ~/.claude/<entry>, and a real directory is reported blocked rather than
+# clobbered.
+#
+# Moving those writes out is the fix; `unlinkedEntries` is not. Exempting an
+# entry projects nothing in its place, so it would withhold the very content
+# the projection exists to deliver. Everything this repo names under those
+# three directories only reads, which a read-only mount serves unchanged.
+#
+# claude-config owns the skill content outright, so no home-manager target
+# under ~/.claude has to stay writable on its behalf and this repo declares
+# no home.file target there at all. That is what leaves this module with no
+# standing collision to work around.
 #
 # Also ordered by the marker, not by a merge: runtime/dcg.toml. home/dcg.nix
 # seeds ~/.claude/dcg.toml from a store fallback when that path is absent at
@@ -192,6 +208,10 @@ let
   # than by making a path read-only. Tracked separately; until it lands,
   # ~/.claude/settings.json stays an ordinary writable file and simply does
   # not receive repository updates.
+  #
+  # Exempting a directory drops its whole projected tree, so a directory that
+  # merely holds live state does not belong here — move the state out instead.
+  # See the THIRD PRECONDITION at the top.
   unlinkedEntries = [ "settings.json" ];
 
   linkRuntime = pkgs.writeShellApplication {
