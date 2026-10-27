@@ -565,6 +565,17 @@
           runnerPackage = primaryConfig
             .services.securityBatch.research-agent.script;
         };
+        # Not a VM lane: the weekly model-retirement check
+        # (modules/nixos/security-batch/model-retirement.sh) against a fake
+        # curl — shutdown windows, 404, lifecycle, accepted, lookup and
+        # manifest failures, keys off argv.
+        security-batch-model-retirement = import ./tests/security-batch-model-retirement.nix {
+          pkgs = pkgsLinux;
+          runnerScript = ./modules/nixos/security-batch/model-retirement.sh;
+          # Drift gate: the package the primary host deploys.
+          runnerPackage = primaryConfig
+            .services.securityBatch.model-retirement.script;
+        };
         signal-expiry = import ./tests/signal-expiry.nix {
           pkgs = pkgsLinux;
           checkScript = pkgsLinux.signal-expiry-check;
