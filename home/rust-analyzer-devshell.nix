@@ -59,7 +59,7 @@ let
 in
 (pkgs.writeShellApplication {
   name = "rust-analyzer-devshell";
-  runtimeInputs = [ pkgs.coreutils pkgs.gnused pkgs.bash pkgs.nix ];
+  runtimeInputs = [ pkgs.coreutils pkgs.bash pkgs.nix ];
   text = ''
     # Both pins are overridable for the same reason: a harness has to
     # displace them to observe anything (the SWEEP_GH_BIN pattern in
@@ -100,7 +100,17 @@ in
     # again, with nothing pointing at the flake that failed to evaluate.
     if ! probe_err=$("$nix_bin" develop --quiet "$root" --command true 2>&1 >/dev/null); then
       echo "rust-analyzer-devshell: route=plain ($root devShell would not start)" >&2
-      printf '%s\n' "$probe_err" | head -20 | sed 's/^/rust-analyzer-devshell:   /' >&2
+      # Truncated without a pipeline, on purpose. A `| head -20` consumer
+      # closes the pipe after 20 lines, and a nix evaluation trace easily
+      # exceeds the 64 KiB pipe buffer — writing into that closed pipe
+      # raised SIGPIPE, errexit+pipefail turned it into the wrapper's exit
+      # status, and the server this branch exists to start never started
+      # (exit 141). The diagnostic must never be able to cost the editor
+      # its language server.
+      if [ -n "$probe_err" ]; then
+        mapfile -t -n 20 probe_lines <<<"$probe_err"
+        printf 'rust-analyzer-devshell:   %s\n' "''${probe_lines[@]}" >&2
+      fi
       exec "$server" "$@"
     fi
 

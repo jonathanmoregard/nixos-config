@@ -93,6 +93,12 @@ pkgs.runCommand "rust-analyzer-devshell"
   if [ "$1" = true ]; then
     if [ "''${RA_STUB_PROBE_FAIL:-0}" = 1 ]; then
       echo "stub nix: error: fixture flake does not evaluate" >&2
+      # A nix evaluation trace is routinely larger than a pipe buffer.
+      i=0
+      while [ "$i" -lt "''${RA_STUB_PROBE_FAIL_LINES:-0}" ]; do
+        echo "stub nix: trace line $i ........................................" >&2
+        i=$((i + 1))
+      done
       exit 1
     fi
     exit 0
@@ -193,7 +199,19 @@ pkgs.runCommand "rust-analyzer-devshell"
     || { echo "[D] probe missing:"; cat "$NIX_STUB_LOG"; exit 1; }
   grep -q 'bash -c' "$NIX_STUB_LOG" \
     && { echo "[D] started a session after a failed probe:"; cat "$NIX_STUB_LOG"; exit 1; }
-  echo "[D] unusable devShell -> pinned server, no session"
+
+  # A diagnostic larger than a 64 KiB pipe buffer must not cost the editor
+  # its language server. Truncating the trace through `| head -20` closed
+  # the pipe early, and errexit+pipefail turned the resulting SIGPIPE into
+  # the wrapper's own exit status (141) on the one branch whose entire
+  # purpose is to start a server anyway.
+  RA_STUB_PROBE_FAIL=1 RA_STUB_PROBE_FAIL_LINES=10000 run repo 2 --ra-devshell-probe
+  grep -q 'unexpected flag' err.txt \
+    || { echo "[D] a long diagnostic stopped the server from starting:"; tail -3 err.txt; exit 1; }
+  reported=$(grep -c 'trace line' err.txt || true)
+  [ "$reported" -le 20 ] \
+    || { echo "[D] diagnostic not truncated: $reported trace lines"; exit 1; }
+  echo "[D] unusable devShell -> pinned server, no session, diagnostic bounded"
 
   # ── E. stdout belongs to the LSP stream, the shellHook does not ─────────
   # --print-config-schema is the one server invocation that writes real
