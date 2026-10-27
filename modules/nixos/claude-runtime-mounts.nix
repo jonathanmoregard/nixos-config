@@ -78,7 +78,22 @@ let
 
   # What every agent path resolves to, and where the repository actually is.
   live = "${home}/.claude";
-  checkout = "${home}/Repos/claude-config";
+
+  # The DEPLOY clone, not the dev checkout. Changed 2026-10-27: this was
+  # ${home}/Repos/claude-config, which made the live config depend on a tree
+  # that gets branched, edited and rebased — a `git switch` there changed what
+  # every running agent read, instantly, with no deploy step. The clone here is
+  # written only by claude-runtime-deploy.service, running as the claude-deploy
+  # system user, so ${user} can read the served content and cannot move it.
+  # See modules/nixos/claude-runtime-deploy.nix for why that unit is not root
+  # and why it refuses to exec anything ${user} could have written.
+  #
+  # Every parent of this path must stay 0755: `link_file`'s `-e` test and the
+  # package.json symlink below traverse the SOURCE path as ${user}, so a 0750
+  # directory anywhere above makes a complete checkout look half-built and the
+  # links unit refuse with exit 75. The tmpfiles rules in the deploy module own
+  # those modes.
+  checkout = "/var/lib/claude-runtime/checkout";
 
   # The cutover gate. Nothing here mounts until this file exists, and it is
   # created by hand during cutover, with the operator present.
