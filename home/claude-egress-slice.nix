@@ -21,10 +21,18 @@
 # precedence over every PATH entry, so it is the only launch point that
 # actually intercepts the real invocation.
 #
-# For the same reason the function must resolve the binary with
-# `whence -p claude` AT CALL TIME rather than pinning a store path: the
-# native installer self-updates, and pinning would mean phase 1 observed
-# a different workload than phase 2 constrains.
+# For the same reason the launch path must resolve the binary from PATH
+# AT CALL TIME rather than pinning a store path: the native installer
+# self-updates, and pinning would mean phase 1 observed a different
+# workload than phase 2 constrains.
+#
+# That argument is about the NAME `claude` only, and it still holds. What
+# the function no longer holds is the logic: that moved to
+# home/claude-egress-launch.nix, a package named `claude-egress-launch`,
+# so the VSCodium extension can spawn the identical code path through
+# `claudeCode.claudeProcessWrapper`. A function intercepts the name; a
+# package is what a GUI can launch. Both are needed, and the logic is
+# written once.
 #
 # ── Why the definitions live here and not in home/jonathan.nix ────────
 #
@@ -44,6 +52,12 @@
 # tty and signal delivery are identical without it. The surviving-shell
 # property is asserted behaviourally in tests/claude-egress.nix.
 { config, lib, pkgs, ... }:
+let
+  # THE launch path, shared verbatim with home/vscodium.nix's
+  # claudeCode.claudeProcessWrapper. See home/claude-egress-launch.nix for
+  # why the logic cannot live in this zsh function alone.
+  claudeEgressLaunch = import ./claude-egress-launch.nix { inherit pkgs; };
+in
 {
   # The slice is a long-lived unit rather than a per-invocation transient
   # one. nftables bakes the cgroup's INODE into the rule at parse time
@@ -52,6 +66,12 @@
   # continuously — with `users.users.<user>.linger` keeping
   # user@<uid>.service alive across logout — makes rebinding the
   # exception rather than the rule.
+  # On PATH as well as referenced by store path: it makes the GUI launch
+  # path runnable by hand (`claude-egress-launch --version`), which is how
+  # tests/claude-egress.nix exercises the extension's spawn without
+  # building VSCodium into the test VM.
+  home.packages = [ claudeEgressLaunch ];
+
   systemd.user.slices.claude-egress = {
     Unit = {
       Description = "Observed cgroup for interactive Claude Code sessions";
@@ -70,45 +90,21 @@
     # lives in `_claude_selects_session`, defined once in
     # home/jonathan.nix and called from both wrappers so the shadowing
     # copy here cannot drift from the one it shadows.
-    _claude_slice() {
-      local bin runner nop
-      bin="$(whence -p claude 2>/dev/null)"
-      if [[ -z "$bin" ]]; then
-        print -ru2 -- "claude-egress: no 'claude' binary on PATH"
-        return 127
-      fi
-
-      runner="$(whence -p systemd-run 2>/dev/null)"
-      nop="$(whence -p true 2>/dev/null)"
-      # `local -x`, never a bare `export`: the default has to reach the
-      # child, but exporting it would set it in the CALLING interactive
-      # shell for the rest of that terminal's life — and on the fallback
-      # path below it is a guess this function just proved wrong. zsh
-      # restores the caller's value (or its absence) on return.
-      local -x XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-
-      # Observation degrades; the tool never fails to start. Every exit
-      # below still runs Claude Code — it just says so on stderr, because
-      # an unobserved session that looks observed is the failure mode
-      # this design exists to avoid.
-      if [[ -z "$runner" || ! -S "$XDG_RUNTIME_DIR/bus" ]]; then
-        print -ru2 -- "claude-egress: UNOBSERVED (no systemd-run, or no user bus at $XDG_RUNTIME_DIR/bus)"
-        "$bin" "$@"
-        return $?
-      fi
-
-      # Probe with a no-op before committing the real invocation. Testing
-      # the scope up front is what makes the fallback reachable at all —
-      # once systemd-run is running the session there is no way back.
-      if [[ -n "$nop" ]] \
-         && ! "$runner" --user --scope --quiet --slice=claude-egress.slice -- "$nop" >/dev/null 2>&1; then
-        print -ru2 -- "claude-egress: UNOBSERVED (a scope in claude-egress.slice would not start)"
-        "$bin" "$@"
-        return $?
-      fi
-
-      "$runner" --user --scope --quiet --slice=claude-egress.slice -- "$bin" "$@"
-    }
+    # One line on purpose. The resolution, the no-op probe, the degrade
+    # paths and the systemd-run invocation all live in
+    # home/claude-egress-launch.nix, because the VSCodium extension
+    # spawns a process and cannot see a shell function — and two copies
+    # of this logic would drift silently toward "looks observed, isn't".
+    #
+    # Still not `exec`: that would replace this interactive login shell,
+    # so quitting Claude Code would close the terminal (the PR #184
+    # failure class). The script execs internally, in its own process,
+    # which is free.
+    #
+    # XDG_RUNTIME_DIR no longer needs zsh's `local -x` dance either: the
+    # default is applied inside the child, so it cannot leak into the
+    # calling terminal by construction rather than by care.
+    _claude_slice() { "${claudeEgressLaunch}/bin/claude-egress-launch" "$@" }
 
     # Every branch goes through _claude_slice, so the slice confinement
     # is unconditional — the --continue decision only picks the argv.

@@ -25,6 +25,11 @@
 let
   jsonFormat = pkgs.formats.json { };
 
+  # The same script home/claude-egress-slice.nix hands the interactive
+  # zsh `claude()`. Imported, not transcribed: a second copy of the
+  # systemd-run invocation would drift toward "looks observed, isn't".
+  claudeEgressLaunch = import ./claude-egress-launch.nix { inherit pkgs; };
+
   settings = {
     # ── Editor ──────────────────────────────────────────────────────────
     "editor.formatOnSave" = true;
@@ -92,6 +97,13 @@ let
     "gitlens.currentLine.format" = "\${author}, \${agoOrDate} ";
     "gitlens.codeLens.authors.enabled" = false;
     "gitlens.codeLens.recentChange.enabled" = false;
+
+    # ── Claude Code ─────────────────────────────────────────────────────
+    # Launch through the egress wrapper, so an editor-spawned session
+    # lands in claude-egress.slice exactly like a terminal one. Without
+    # this the extension spawns the CLI directly and its traffic is
+    # invisible to the nftables rule bound to that cgroup.
+    "claudeCode.claudeProcessWrapper" = "${claudeEgressLaunch}/bin/claude-egress-launch";
 
     # ── Nix ─────────────────────────────────────────────────────────────
     # nix-ide shells out to the language server by name, and a VSCodium
