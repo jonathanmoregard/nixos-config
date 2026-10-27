@@ -10,6 +10,7 @@
 #       schedule = "Sun 03:00";            # OnCalendar
 #       timeout = "2h";                    # required: a wedged fetch must not hold the unit forever
 #       acceptedFindings = ./<name>.accepted.txt;
+#       acceptHint = "…";                  # optional: how to accept, if not accepted.txt
 #       credentials.gh-token = config.age.secrets.foo.path;   # optional → $CREDENTIALS_DIRECTORY/gh-token
 #       script = pkgs.writeShellApplication {
 #         name = "security-batch-<name>";
@@ -118,6 +119,10 @@ let
     '';
   };
 
+  # Per-runner acceptHint for the template below, as `case` arms.
+  acceptHints = lib.concatStrings (lib.mapAttrsToList
+    (name: r: "${name}) hint=${lib.escapeShellArg r.acceptHint} ;;\n") runners);
+
   # OnFailure target, one template for every runner. Root (the record dir is
   # root-owned and trusted as such by the hook), but the runner-written summary
   # is read with the runner's own uid so a planted symlink cannot make root
@@ -142,7 +147,10 @@ let
         what="run did not finish ($result), no verdict"
       fi
       # The hook shows 300 chars of summary and 120 of inspect.
-      summary="security-batch $name: $what; accept in security-batch/$name.accepted.txt"
+      case "$name" in
+      ${acceptHints}*) hint="" ;;
+      esac
+      summary="security-batch $name: $what; $hint"
 
       mkdir -p -- ${failuresDir}
       chmod 0755 -- ${failuresDir}
@@ -175,6 +183,11 @@ let
       script = mkOption {
         type = types.package;
         description = "Runner executable (lib.getExe), e.g. writeShellApplication.";
+      };
+      acceptHint = mkOption {
+        type = types.str;
+        default = "accept in security-batch/${name}.accepted.txt";
+        description = "How a finding is accepted; ends the failure record's summary.";
       };
       acceptedFindings = mkOption {
         type = types.path;
