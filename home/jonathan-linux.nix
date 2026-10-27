@@ -672,6 +672,7 @@ in
     ./calibre-plugins.nix
     ./ghostty.nix
     ./kitty.nix
+    ./vscodium.nix
     ./git-hooks.nix
     ./autodoro.nix
     ./claude-mcp-sync.nix
