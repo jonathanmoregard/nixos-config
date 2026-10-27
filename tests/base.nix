@@ -4301,19 +4301,25 @@ in
         f"rm -r {probe_dir} {org_repo} && rm {gh_stub} {host_token} {org_token}"
     )
 
-    # claude-pull is held OFF (home/claude-services.nix): the runtime/ layout
-    # on claude-config master has no bind mounts yet, so a pull would break
-    # the harness. The timer must not be enabled or running after a rebuild
-    # or reboot. Revert this block when the timer is re-enabled.
+    # `active` as well as `enabled`: a timer can be declared, enabled and
+    # still dormant, and a dormant puller means CD stops with nothing failed
+    # for a monitor to see.
     for cmd in ["is-enabled", "is-active"]:
         got = workstation.execute(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
             f"systemctl --user {cmd} claude-pull.timer'"
         )[1].strip()
-        assert got not in ("enabled", "active"), (
-            f"claude-pull.timer {cmd}={got!r} — a pull would relocate "
-            f"~/.claude files out from under the hooks"
+        assert got == ("enabled" if cmd == "is-enabled" else "active"), (
+            f"claude-pull.timer {cmd}={got!r} — CD for the Claude config repo "
+            f"is not running, and nothing else reports that"
         )
+    # Persistent= is why the schedule is OnCalendar rather than
+    # OnUnitActiveSec, where it would have no effect: this is a laptop that
+    # suspends, and a merge landing while it sleeps should arrive on resume.
+    assert workstation.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -P Persistent claude-pull.timer'"
+    ).strip() == "yes"
 
     # claude-marketplace-pull — the same puller, second target.
     #
