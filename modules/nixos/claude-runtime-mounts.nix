@@ -20,7 +20,7 @@
 #   ~/.claude/                      what every agent path resolves to
 #     runtime/                      <- bind, ro
 #     <entry> -> runtime/<entry>    one symlink per projected entry
-#     settings.json                 <- bind, ro (a file; never a symlink)
+#     settings.json                 NOT projected — see unlinkedEntries
 #     vendor/superpowers/hooks      <- bind, ro
 #     vendor/superpowers/skills     <- bind, ro
 #     vendor/superpowers/package.json -> the checkout (a symlink, never a bind)
@@ -101,24 +101,6 @@ let
     { at = "vendor/superpowers/hooks"; from = "${checkout}/vendor/superpowers/hooks"; }
     { at = "vendor/superpowers/skills"; from = "${checkout}/vendor/superpowers/skills"; }
     { at = "vendor/everything-claude-code/skills"; from = "${checkout}/vendor/everything-claude-code/skills"; }
-
-    # settings.json is a MOUNT and not one of the per-entry symlinks below,
-    # and that distinction is the whole protection. Measured, in a real mount
-    # namespace, for both ways a program saves a file:
-    #
-    #   read-only file bind   in-place write -> EROFS
-    #                         temp + rename  -> EBUSY
-    #   symlink into the ro   in-place write -> EROFS
-    #   mount                 temp + rename  -> SUCCEEDS, and replaces the
-    #                                           symlink with a real file
-    #
-    # An atomic writer — how editors and most config writers save — therefore
-    # walks straight through a symlink and silently un-projects the entry,
-    # leaving a local fork that every status signal reports as healthy. A file
-    # bind refuses both. Claude Code writes this file (the accidental
-    # "set as default model" is the usual way), so it gets the shape that
-    # refuses, and the repository stays the only writer.
-    { at = "settings.json"; from = "${checkout}/runtime/settings.json"; isFile = true; }
   ];
 
   # Projected as a SYMLINK rather than a bind mount — the opposite call from
@@ -189,10 +171,29 @@ let
   # Nix cannot read ~/Repos at eval time. Hard-coding 52 names here would
   # drift silently the first time that repo adds one.
   #
-  # settings.json is excluded from LINKING because it is bind-mounted instead
-  # (see the projections list). Linking it as well would point a symlink at a
-  # path that is already a mountpoint: the loop below would find a non-symlink
-  # there, report it blocked, and the unit would exit 75 forever.
+  # settings.json is deliberately NOT projected, by either shape, and the
+  # reasoning changed enough to be worth recording.
+  #
+  # A read-only FILE BIND MOUNT was tried and reverted. It refuses both writer
+  # strategies, but it pins an INODE, so once claude-pull replaced
+  # runtime/settings.json the projection served the old content indefinitely
+  # while `mountpoint -q` still reported healthy — the exact defect that moved
+  # package.json off a file bind, re-created on the one file the repository
+  # updates most often.
+  #
+  # A per-entry symlink into the read-only mount WOULD track updates, and
+  # contrary to the generic case it would not be silently replaced: Claude
+  # Code's user-settings writer resolves the link, writes its temp file beside
+  # the TARGET and renames onto the target, keeping the link. The documented
+  # consequence is that `/model` then fails with EROFS, because the target is
+  # on a filesystem that refuses writes. That is a working `/model` traded for
+  # a locked file, and `/model` is used daily here.
+  #
+  # So this file is owned through Claude Code's MANAGED SETTINGS layer instead
+  # — the mechanism built for policy that users must not override — rather
+  # than by making a path read-only. Tracked separately; until it lands,
+  # ~/.claude/settings.json stays an ordinary writable file and simply does
+  # not receive repository updates.
   unlinkedEntries = [ "settings.json" ];
 
   linkRuntime = pkgs.writeShellApplication {
@@ -508,13 +509,16 @@ in
       # Every projection, not just runtime/: this unit refuses unless all of
       # them are mounted, so it should pull up and order against each one.
       RequiresMountsFor = map mountPoint projections;
-      # A git checkout can touch the watched directory several times in a
-      # second, and the default 5-starts-in-10s limit would put the unit in
-      # `failed` for rate-limiting rather than for anything about the
-      # projection — a false alarm in the one channel that is supposed to mean
-      # something.
-      StartLimitIntervalSec = 60;
-      StartLimitBurst = 20;
+      # No start limit at all, and this is deliberate rather than careless. A
+      # start-limit hit on a path-triggered service PROPAGATES to the .path
+      # unit: measured with transient units, the path unit goes `failed` with
+      # Result=unit-start-limit-hit and never fires again, so the watcher dies
+      # silently and permanently. A rate limit here would convert a burst of
+      # git activity into a dead reconciler — strictly worse than the
+      # rate-limiting it was meant to prevent. The timer below is what keeps a
+      # missed or raced event bounded; the reconcile itself is idempotent and
+      # cheap, so repeated runs cost nothing worth protecting against.
+      StartLimitIntervalSec = 0;
     };
     serviceConfig = {
       Type = "oneshot";
@@ -554,6 +558,27 @@ in
     wantedBy = [ "multi-user.target" ];
     pathConfig = {
       PathChanged = "${checkout}/runtime";
+      Unit = "claude-runtime-links.service";
+    };
+  };
+
+  # The level-triggered half, and the watcher above is not sufficient without
+  # it. PathChanged is edge-triggered and the directory is NOT watched while
+  # the service it triggered is running, so an entry that appears after the
+  # reconcile has already globbed runtime/* is missed until some later
+  # top-level event — which may never come. inotify also drops events under
+  # pressure and does not survive a watch being re-established.
+  #
+  # So the path unit is for latency and this is for correctness: any state the
+  # watcher missed is repaired within the interval. Ten minutes matches
+  # claude-pull's own cadence, which is what lands new entries in the first
+  # place; the offset keeps the reconcile just after a pull rather than
+  # racing it.
+  systemd.timers.claude-runtime-links = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnCalendar = "*:02,12,22,32,42,52";
+      Persistent = true;
       Unit = "claude-runtime-links.service";
     };
   };
