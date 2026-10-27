@@ -685,7 +685,6 @@ in
     ./router-services.nix
     ./claude-services.nix
     ./ai-client-config-sync.nix
-    ./claude-skills.nix
     ./research-agent-mcp.nix
     ./ha-mcp.nix
     ./aggregator-mcp-backend.nix

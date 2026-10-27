@@ -101,10 +101,10 @@ let
 
   worktreeWorkflowSources = {
     claude = pkgs.writeText "workflow-CLAUDE.md" (builtins.readFile ../CLAUDE.md);
-    nixosConfigDev = pkgs.writeText "workflow-nixos-config-dev.md"
-      (builtins.readFile ../home/claude-skills/nixos-config-dev/SKILL.md);
-    agenixSecret = pkgs.writeText "workflow-nixos-agenix-secret.md"
-      (builtins.readFile ../home/claude-skills/nixos-agenix-secret/SKILL.md);
+    # The nixos-config-dev and nixos-agenix-secret skills used to be read from
+    # home/claude-skills/ here. jonathanmoregard/claude-config#26 onward owns
+    # them, so this repo can no longer read them and the equivalent prose gate
+    # lives in that repo's tests/enforced/test_skill_worktree_prose.py instead.
     jonathan = pkgs.writeText "workflow-jonathan.nix"
       (builtins.readFile ../home/jonathan.nix);
     jonathanLinux = pkgs.writeText "workflow-jonathan-linux.nix"
@@ -2084,14 +2084,6 @@ in
     # no automation depends on or advances shared refs/heads/main.
     workflow_sources = {
         "CLAUDE.md": ("${worktreeWorkflowSources.claude}", "feat/<slug>"),
-        "nixos-config-dev": (
-            "${worktreeWorkflowSources.nixosConfigDev}",
-            "feat/<slug>",
-        ),
-        "nixos-agenix-secret": (
-            "${worktreeWorkflowSources.agenixSecret}",
-            "feat/<slug>",
-        ),
         "home/jonathan.nix": (
             "${worktreeWorkflowSources.jonathan}",
             "feat/foo",
@@ -2384,7 +2376,16 @@ in
         "--no-pager' | grep -q 'session-reflect backfill drain failed'",
         timeout=60,
     )
+    # Remove the PARENT too, not just the planted script's directory. This
+    # fixture is the only thing that creates ~/.claude/skills in this lane now
+    # that home/claude-skills.nix is gone, and the claude-runtime-mounts block
+    # ~3000 lines below asserts the projection can take that path over — an
+    # empty directory left here is enough to make it report the cutover
+    # incomplete and exit 75. `rmdir`, not `rm -rf`: if anything other than
+    # this fixture ever writes under ~/.claude/skills, this must fail here and
+    # say so rather than quietly deleting somebody else's content.
     workstation.succeed("rm -rf /home/jonathan/.claude/skills/session-reflect")
+    workstation.succeed("rmdir /home/jonathan/.claude/skills")
     workstation.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user reset-failed session-reflect-backfill.service'"
@@ -5630,24 +5631,34 @@ in
     # exited 0 in the pre-marker block above, and `start` on an active unit is
     # a no-op that would assert nothing here.
     #
-    # And `fail`, not `succeed`: ~/.claude/skills is a real home-manager
-    # directory at this point (home/claude-skills.nix still writes it, and is
-    # deleted at cutover), so one path is left alone and the unit exits 75 by
-    # design. A
-    # left-alone path means agents still read the old content there, which must
-    # not report as healthy. Every assertion below is about what the unit did
-    # before it refused.
-    workstation.fail(
+    # And `succeed`, with exit 0: this repo no longer writes anything under
+    # ~/.claude, so nothing collides and nothing is left alone. Before the
+    # cutover this call was `fail` with exit 75, because home/claude-skills.nix
+    # made ~/.claude/skills a real home-manager directory the unit had to
+    # refuse to take over. Deleting that file removes the last blocked path, so
+    # the complete-cutover half of the contract — blocked == 0 therefore exit 0
+    # — is now reachable here rather than only in the adversarial harness.
+    workstation.succeed(
         "systemctl restart claude-runtime-links.service"
     )
     assert workstation.succeed(
         "systemctl show -P ExecMainStatus claude-runtime-links.service"
-    ).strip() == "75"
-    incomplete_log = workstation.succeed(
+    ).strip() == "0"
+    complete_log = workstation.succeed(
         "journalctl -u claude-runtime-links.service -n 20 --no-pager"
     )
-    assert "cutover is incomplete" in incomplete_log, incomplete_log
-    assert "agents still read the old content" in incomplete_log, incomplete_log
+    assert "cutover is incomplete" not in complete_log, complete_log
+    assert "0 path(s) left alone" in complete_log, complete_log
+    # The payoff of deleting home/claude-skills.nix: ~/.claude/skills is the
+    # projection now, not a home-manager directory, so the skills claude-config
+    # owns are what agents read. Asserted by content as well as by link target
+    # — a link that resolves nowhere would satisfy readlink alone.
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/skills"
+    ).strip() == "runtime/skills"
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/skills/keep.md"
+    ).strip() == "skill"
     assert workstation.succeed(
         "readlink /home/jonathan/.claude/hooks"
     ).strip() == "runtime/hooks"
@@ -5685,10 +5696,12 @@ in
     links_log = workstation.succeed(
         "journalctl -u claude-runtime-links.service -n 40 --no-pager"
     )
-    # The whole line, not its two halves separately: ~/.claude/skills is a
-    # real home-manager directory, so "is not a symlink; left alone" is
-    # already in this journal from the boot run and matching it alone would
-    # assert nothing about commands/.
+    # The whole line, not its two halves separately. The original reason was
+    # that ~/.claude/skills was a real home-manager directory, so the boot run
+    # already put "is not a symlink; left alone" in this journal and matching
+    # that alone asserted nothing about commands/. The cutover removed that
+    # particular decoy, but the shape stays: any other left-alone path in the
+    # window would supply the same half-match.
     assert (
         "claude-runtime-links: /home/jonathan/.claude/commands exists and is "
         "not a symlink; left alone"
@@ -5696,9 +5709,12 @@ in
 
     # A symlink pointing somewhere OTHER than runtime/ is somebody's property
     # — a home-manager store link, or one the operator made — and is left
-    # alone rather than retargeted. This is the shape of the hazard that makes
-    # deleting home/claude-skills.nix a cutover step: while ~/.claude/skills is
-    # still a home-manager link, this unit must not take it over.
+    # alone rather than retargeted. This was the shape of the hazard that made
+    # deleting home/claude-skills.nix a cutover step rather than something the
+    # unit could do for itself. That file is gone now, so the hazard has no
+    # instance in this repo — which is exactly why it still needs asserting:
+    # any future home.file target under ~/.claude, or anything the operator
+    # links by hand, reintroduces it.
     workstation.succeed(
         "install -d -o jonathan -g users "
         "/home/jonathan/Repos/claude-config/runtime/foreign-entry && "
@@ -5738,8 +5754,11 @@ in
     workstation.succeed(f"mv {marker}.away {marker}")
     workstation.succeed("systemctl reset-failed claude-runtime-links.service")
     # Fails again, for the other reason: the marker is back, so it links, and
-    # then refuses because ~/.claude/skills is still a real home-manager
-    # directory. Distinguish the two by the message, not the exit code — and
+    # then refuses because ~/.claude/commands is a real directory — the one
+    # this lane created above and deliberately never cleaned up. Before the
+    # cutover the blocked path here was ~/.claude/skills; the exit code is the
+    # same either way, which is the point of the next two asserts.
+    # Distinguish the two reasons by the message, not the exit code — and
     # read only THIS run's output. A fixed `-n N` window spans the previous
     # runs, which already carry the dangling-links message, so the negative
     # half of this assertion would be about the wrong run. Cursor-scoped, the
@@ -5767,15 +5786,17 @@ in
     ).strip() == "0"
     workstation.succeed("mountpoint -q /home/jonathan/.claude/runtime")
 
-    # Activation still succeeds with the projection mounted. Scope, stated
-    # honestly: ~/.claude/skills is a real directory at this point, so this
-    # does NOT exercise the home.file-into-a-read-only-mount collision — it
-    # guards the tmpfiles/mount/activation interaction only. That collision is
-    # designed out rather than deferred: the cutover deletes
-    # home/claude-skills.nix, after which this repo writes nothing under
-    # ~/.claude and there is no collision left to assert. claude-config owns
-    # those skills from #26 onward, so nothing here needs to assert where they
-    # land either.
+    # Activation still succeeds with the projection mounted, and now in the
+    # state that actually matters: ~/.claude/skills is a symlink into the
+    # read-only mount by this point, and this repo declares no home.file target
+    # under ~/.claude at all. Before the cutover ~/.claude/skills was a real
+    # home-manager directory here, so the run could only guard the
+    # tmpfiles/mount/activation interaction and said so. The
+    # home.file-into-a-read-only-mount collision is designed out rather than
+    # deferred — deleting home/claude-skills.nix is what removed the last
+    # writer, and claude-config has owned those skills since its #26 — so what
+    # this asserts is that activation does not trip over the projection it now
+    # has to coexist with.
     workstation.succeed("systemctl restart home-manager-jonathan.service")
     assert workstation.succeed(
         "systemctl show -P ExecMainStatus home-manager-jonathan.service"
@@ -5815,13 +5836,12 @@ in
         "readlink /home/jonathan/.claude/hooks"
     ).strip() == "runtime/hooks"
 
-    # Restore the projection. The unit still exits 75 — ~/.claude/skills is a
-    # real home-manager directory for as long as home/claude-skills.nix exists
-    # in this repo, so this lane cannot reach the complete-cutover state where
-    # nothing is blocked. Deleting that file is the cutover step, not this one.
-    # That half of the contract (blocked == 0 -> exit 0) is covered by the
-    # adversarial harness's clean-run case instead; here the point is that the
-    # projection and the links come back.
+    # Restore the projection. The unit still exits 75, but no longer for the
+    # old reason: ~/.claude/commands is a real directory this lane created
+    # earlier and never cleaned up, so blocked >= 1 for the whole tail of this
+    # block. The complete-cutover state (blocked == 0 -> exit 0) is asserted at
+    # the top of the block instead, where nothing has collided yet; here the
+    # point is only that the projection and the links come back.
     workstation.succeed("mv /home/jonathan/Repos/claude-config/runtime-gone /home/jonathan/Repos/claude-config/runtime")
     workstation.succeed("systemctl reset-failed claude-runtime-links.service")
     workstation.fail("systemctl restart claude-runtime-links.service")

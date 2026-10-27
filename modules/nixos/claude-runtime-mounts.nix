@@ -57,11 +57,12 @@
 # does not matter.
 #
 # #26 supersedes #25, which carried the same skills as absolute symlinks into
-# ~/.claude/skills-hm — the location home/claude-skills.nix writes. That
-# indirection is gone: claude-config owns the skill content outright, so
-# nothing under ~/.claude has to stay writable on its behalf, and the matching
-# deletion of home/claude-skills.nix is a cutover step rather than a
-# standing collision hazard for this module to work around.
+# ~/.claude/skills-hm — the location home/claude-skills.nix used to write.
+# That indirection is gone, and so is the file: claude-config owns the skill
+# content outright, nothing under ~/.claude has to stay writable on its
+# behalf, and this repo declares no home.file target under ~/.claude at all.
+# So there is no standing collision for this module to work around — the one
+# that existed was removed deliberately rather than designed around.
 #
 # Also ordered by the marker, not by a merge: runtime/dcg.toml. home/dcg.nix
 # seeds ~/.claude/dcg.toml from a store fallback when that path is absent at
@@ -305,13 +306,19 @@ let
       # `systemctl --failed` and the SessionStart report.
       #
       # This is a true signal rather than a permanent alarm, because in the
-      # finished state nothing is blocked: the cutover deletes the old flat
-      # tracked files, home/claude-skills.nix is deleted so this repo stops
-      # writing ~/.claude/skills at all, and settings.json is exempt by name
+      # finished state nothing is blocked: the cutover clears the old flat
+      # tracked files, home/claude-skills.nix is gone so this repo no longer
+      # writes ~/.claude/skills at all, and settings.json is exempt by name
       # rather than counted. It does mean the unit stays `failed` for the
       # length of the cutover window — from the moment the marker goes in
-      # until that deletion deploys — which is correct: the cutover is, at
-      # that point, incomplete.
+      # until ~/.claude/skills is cleared and this deletion has deployed —
+      # which is correct: the cutover is, at that point, incomplete.
+      #
+      # That ordering is also what keeps home-manager out of a read-only
+      # mount. ~/.claude/skills stays a real directory for as long as it is
+      # blocked, so home-manager's orphan cleanup of the old skills/nixos-*
+      # links operates on a real directory; the path only becomes a symlink
+      # into the projection once nothing is left there to remove.
       if [ "$blocked" -gt 0 ]; then
         echo "claude-runtime-links: cutover is incomplete — $blocked path(s) left alone, and agents still read the old content there" >&2
         exit 75
