@@ -5570,8 +5570,11 @@ in
             "runtime",
             "vendor/superpowers/hooks",
             "vendor/superpowers/skills",
-            "vendor/superpowers/package.json",
             "vendor/everything-claude-code/skills",
+            # A file bind, and the only entry projected this way on purpose —
+            # it is the one thing under ~/.claude that something tries to
+            # write. See the settings.json assertions at the end of this block.
+            "settings.json",
         ]
     ]
     # Quote the unit name: systemd-escape renders '-' in a path segment as
@@ -5591,11 +5594,17 @@ in
         "cat /home/jonathan/.claude/vendor/superpowers/skills/sp.md"
     ).strip() == "sp-skill"
     assert workstation.succeed(
-        "cat /home/jonathan/.claude/vendor/superpowers/package.json"
-    ).strip() == "{}"
-    assert workstation.succeed(
         "cat /home/jonathan/.claude/vendor/everything-claude-code/skills/ecc.md"
     ).strip() == "ecc-skill"
+    # package.json is NOT here yet: it is a symlink written by the links unit
+    # rather than a mount, so it arrives later in this block. Asserted, so the
+    # ordering is a stated fact rather than an accident.
+    workstation.fail("test -e /home/jonathan/.claude/vendor/superpowers/package.json")
+    # settings.json, by contrast, is a mount and is readable the moment the
+    # mount units are up.
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/settings.json"
+    ).strip() == "{}"
 
     # Read-only, so a hook cannot rewrite its own source through ~/.claude.
     workstation.fail("touch /home/jonathan/.claude/runtime/should-not-write")
@@ -5832,5 +5841,101 @@ in
         "cat /home/jonathan/.claude/hooks/bash-guard.py"
     ).strip() == "guard"
     workstation.succeed("systemctl reset-failed claude-runtime-links.service")
+
+    # ---- the UPDATE path -------------------------------------------------
+    #
+    # Everything above tests a STATIC projection: mount it, link it, read it.
+    # None of it covers what happens when new content lands, which is the
+    # state the machine spends all its time in once claude-pull is running
+    # again. Three separate holes, each with its own negative control.
+
+    # L1. claude-pull must be told which repository it operates on. Its
+    # fallback derives the repo from the script's own location, and under the
+    # projection that location is inside ~/.claude — `runtime` is a MOUNT, not
+    # a symlink, so realpath never leaves the live directory. Prove the
+    # fallback is actually broken here rather than asserting the fix alone:
+    # discovery from the projected script path finds no repository at all.
+    workstation.fail(
+        "su jonathan -c 'git -C /home/jonathan/.claude/runtime/scripts "
+        "rev-parse --show-toplevel'"
+    )
+    # So the unit cannot rely on it. The override is the seam the script
+    # already exposes, and the two sibling pull units already use.
+    unit = workstation.succeed(
+        "cat /home/jonathan/.config/systemd/user/claude-pull.service"
+    )
+    assert "CLAUDE_PULL_REPO=/home/jonathan/Repos/claude-config" in unit, unit
+
+    # L2. A single-file bind mount pins an INODE, so a git update that
+    # replaces the file leaves the projection serving the old content forever
+    # while `mountpoint -q` still reports healthy. Replace it the way git
+    # does — new file, rename over the old one — and require the live read to
+    # follow. This is the assertion that fails against a file bind mount.
+    sp_pkg = f"{checkout}/vendor/superpowers/package.json"
+    workstation.succeed(
+        f"printf 'NEWVERSION\\n' > {sp_pkg}.new && "
+        f"chown jonathan:users {sp_pkg}.new && "
+        f"mv -f {sp_pkg}.new {sp_pkg}"
+    )
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/vendor/superpowers/package.json"
+    ).strip() == "NEWVERSION"
+    # And it is reachable as one file, not as a door into the submodule: the
+    # dev trees this projection exists to exclude stay unreachable by it.
+    workstation.fail(
+        "test -e /home/jonathan/.claude/vendor/superpowers/package.json/../src"
+    )
+
+    # L3. A new TOP-LEVEL runtime entry needs a new symlink, and nothing was
+    # re-running the links unit after a pull. The watcher must notice without
+    # anyone asking it to.
+    assert workstation.succeed(
+        "systemctl is-active claude-runtime-links.path"
+    ).strip() == "active"
+    workstation.succeed(
+        f"install -d -o jonathan -g users {checkout}/runtime/newentry && "
+        f"printf 'arrived\\n' > {checkout}/runtime/newentry/n.md && "
+        f"chown -R jonathan:users {checkout}/runtime/newentry"
+    )
+    # No systemctl call here on purpose — if this needs a manual kick, the
+    # hole is still open. The unit still exits 75 (~/.claude/skills is a real
+    # home-manager directory in this lane), so wait on the LINK, not on the
+    # unit's exit status: it writes every link it can before it refuses.
+    workstation.wait_until_succeeds(
+        "test -L /home/jonathan/.claude/newentry", timeout=60
+    )
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/newentry/n.md"
+    ).strip() == "arrived"
+    # Removal reconciles too, by the same route and with no manual kick.
+    workstation.succeed(f"rm -r {checkout}/runtime/newentry")
+    workstation.wait_until_succeeds(
+        "test ! -e /home/jonathan/.claude/newentry", timeout=60
+    )
+    workstation.succeed("systemctl reset-failed claude-runtime-links.service")
+
+    # L4. settings.json is projected read-only rather than left writable.
+    # A bind mount, NOT a per-entry symlink, and the difference is the whole
+    # point: measured outside this lane, an atomic writer (temp file + rename,
+    # which is how editors and most config writers save) REPLACES a symlink
+    # with a real file and silently un-projects it, while the same write
+    # against a file bind mount fails with EBUSY. Both writer strategies must
+    # be refused, so both are exercised.
+    workstation.succeed("mountpoint -q /home/jonathan/.claude/settings.json")
+    workstation.fail(
+        "su jonathan -c 'printf CLOBBER >> /home/jonathan/.claude/settings.json'"
+    )
+    workstation.fail(
+        "su jonathan -c 'printf CLOBBER > /home/jonathan/.claude/.s.tmp && "
+        "mv -f /home/jonathan/.claude/.s.tmp /home/jonathan/.claude/settings.json'"
+    )
+    workstation.succeed("rm -f /home/jonathan/.claude/.s.tmp")
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/settings.json"
+    ).strip() == "{}"
+    # Still the repository's copy, not a local fork of it.
+    assert workstation.succeed(
+        f"cat {checkout}/runtime/settings.json"
+    ).strip() == "{}"
   '';
 }
