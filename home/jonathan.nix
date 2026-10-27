@@ -38,17 +38,7 @@ in
     cargo
     python3
     uv
-    # Editor: VSCodium with Rust, TOML and Git support baked in (declarative
-    # extensions). GitLens comes from the nixpkgs extension set rather than
-    # VSCodium's Open VSX marketplace, which does not carry it.
-    (vscode-with-extensions.override {
-      vscode = vscodium;
-      vscodeExtensions = with vscode-extensions; [
-        rust-lang.rust-analyzer
-        tamasfe.even-better-toml
-        eamodio.gitlens
-      ];
-    })
+    # Editor: see home/vscodium.nix (package, extensions, settings, keys).
     # Intentionally NOT included (drift-scan 2026-04-19):
     # - terraform: not used for now
     # - yt-dlp: not wanted
