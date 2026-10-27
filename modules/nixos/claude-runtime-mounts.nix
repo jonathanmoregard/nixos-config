@@ -72,6 +72,10 @@
 # forever rather than clobbering it.
 { config, lib, pkgs, ... }:
 let
+  # The durable failure record the SessionStart hook reads, shared with
+  # nix-gc and security-batch — see lib/unit-failure-record.nix.
+  ufr = import ./lib/unit-failure-record.nix { inherit pkgs; };
+
   user = "jonathan";
   group = "users";
   home = "/home/${user}";
@@ -519,6 +523,18 @@ in
       # missed or raced event bounded; the reconcile itself is idempotent and
       # cheap, so repeated runs cost nothing worth protecting against.
       StartLimitIntervalSec = 0;
+      # Exit 75 is this module's entire signal, and until now it reached
+      # `systemctl --failed` and nowhere else. The SessionStart hook that tells
+      # a session about failing units
+      # (~/.claude/hooks/unit-failure-health.py) reads ONLY
+      # /var/lib/unit-failures/<unit>.json, and those records are written by a
+      # unit's own OnFailure notifier — it never shells out to systemctl. So a
+      # cutover left half-done, with agents still reading the old content at
+      # live paths, was invisible to the agents it affects. That is the
+      # 2026-08-31 constraint (failure notifications must reach Claude) going
+      # unmet by the one unit whose failure means "the projection is not what
+      # it looks like".
+      OnFailure = "claude-runtime-links-failure-notify.service";
     };
     serviceConfig = {
       Type = "oneshot";
@@ -536,6 +552,43 @@ in
       User = user;
       Group = group;
       ExecStart = "${linkRuntime}/bin/claude-runtime-links";
+      # The other half of the record contract: a successful run clears it, so
+      # silence means healthy rather than unreported. `+` runs this as root —
+      # the unit itself runs as ${user} and the record directory is root-owned,
+      # deliberately, so that only root writes what the hook trusts.
+      ExecStopPost = "+${pkgs.writeShellScript "claude-runtime-links-clear" (ufr.clearOnSuccess "claude-runtime-links")}";
+    };
+  };
+
+  # Activated only via OnFailure (no wantedBy), as root, because the record
+  # directory is root-owned. Journal first, then the record.
+  #
+  # One summary covers every exit-75 path (a projection not mounted, an empty
+  # runtime, a marker deleted out from under live links, a blocked entry),
+  # because they all cost the same thing: an agent reads something other than
+  # the projection while every other signal says the migration is done. Which
+  # one it was is in the journal, which is what `inspect` points at.
+  systemd.services.claude-runtime-links-failure-notify = {
+    description = "Record that the ~/.claude runtime projection is incomplete";
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = lib.getExe (pkgs.writeShellApplication {
+        name = "claude-runtime-links-failure-notify";
+        runtimeInputs = ufr.runtimeInputs;
+        text = ''
+          ${ufr.writerFunction}
+
+          result="''${MONITOR_SERVICE_RESULT:-unknown}"
+          status="''${MONITOR_EXIT_STATUS:-unknown}"
+          echo "claude-runtime-links FAILED (result=$result status=$status): the ${live} runtime projection is incomplete; inspect: journalctl -u claude-runtime-links.service -n 50"
+
+          write_unit_failure_record ${ufr.recordPath "claude-runtime-links"} \
+            claude-runtime-links.service "$result" "$status" \
+            "The ${live} runtime projection is incomplete, so agents may be reading pre-cutover content at live paths while everything else looks healthy. Exit 75 means a projection is not mounted, or an entry could not be linked and was left alone." \
+            "journalctl -u claude-runtime-links.service -n 50"
+          echo "claude-runtime-links-failure-notify: recorded ${ufr.recordPath "claude-runtime-links"}"
+        '';
+      });
     };
   };
 

@@ -62,9 +62,12 @@ let
   runners = config.services.securityBatch;
 
   stateRoot = "/var/lib/security-batch";
-  failuresDir = "/var/lib/unit-failures";
+  # The record shape and its atomic write live in one place, shared with
+  # nix-gc and claude-runtime-links — see lib/unit-failure-record.nix.
+  ufr = import ./lib/unit-failure-record.nix { inherit pkgs; };
+  failuresDir = ufr.failuresDir;
   userOf = name: "secbatch-${name}";
-  recordOf = name: "${failuresDir}/security-batch-${name}.json";
+  recordOf = name: ufr.recordPath "security-batch-${name}";
 
   # Exit code reserved for "offline, nothing ran"; listed in SuccessExitStatus
   # so it is not a failure, and distinguished from 0 so it clears nothing.
@@ -124,8 +127,10 @@ let
   # disclose a file, and only a fixed character set survives.
   notify = pkgs.writeShellApplication {
     name = "security-batch-notify";
-    runtimeInputs = [ pkgs.coreutils pkgs.jq pkgs.util-linux ];
+    runtimeInputs = ufr.runtimeInputs ++ [ pkgs.util-linux ];
     text = ''
+      ${ufr.writerFunction}
+
       name="$1"
       [[ "$name" =~ ^[a-z][a-z0-9-]{0,22}$ ]] || { echo "bad runner name" >&2; exit 1; }
       unit="security-batch-$name.service"
@@ -144,19 +149,10 @@ let
       # The hook shows 300 chars of summary and 120 of inspect.
       summary="security-batch $name: $what; accept in security-batch/$name.accepted.txt"
 
-      mkdir -p -- ${failuresDir}
-      chmod 0755 -- ${failuresDir}
-      tmp=$(mktemp ${failuresDir}/.security-batch-"$name".XXXXXX)
-      jq -n --arg unit "$unit" --arg result "$result" --arg status "$status" \
-        --arg invocation "''${MONITOR_INVOCATION_ID:-}" \
-        --arg failed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --arg summary "$summary" \
-        --arg inspect "ls ${stateRoot}/$name/latest/; journalctl -u $unit -n 200" \
-        '{unit: $unit, result: $result, exit_status: $status, invocation_id: $invocation, failed_at: $failed_at, summary: $summary, inspect: $inspect}' \
-        > "$tmp"
-      chmod 0644 -- "$tmp"
-      mv -f -- "$tmp" "${failuresDir}/security-batch-$name.json"
-      echo "security-batch-notify: recorded ${failuresDir}/security-batch-$name.json"
+      record="${failuresDir}/security-batch-$name.json"
+      write_unit_failure_record "$record" "$unit" "$result" "$status" "$summary" \
+        "ls ${stateRoot}/$name/latest/; journalctl -u $unit -n 200"
+      echo "security-batch-notify: recorded $record"
     '';
   };
 

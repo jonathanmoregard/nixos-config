@@ -5558,6 +5558,22 @@ in
     assert "no cutover marker" in pre_marker_log, pre_marker_log
     workstation.fail("test -L /home/jonathan/.claude/hooks")
 
+    # A successful run clears the failure record, which is the half that keeps
+    # the channel worth reading: without it the first failed cutover attempt
+    # announces itself at every SessionStart forever, including after it is
+    # fixed, and the hook's budget is silence. Planted rather than produced,
+    # because the run that produces one is further down and this is the only
+    # place in the lane where the unit exits 0 — ~/.claude/skills is a real
+    # home-manager directory from the marker onwards, so every later run is
+    # blocked by design.
+    workstation.succeed(
+        "install -d -m 0755 /var/lib/unit-failures && "
+        "printf '{\"unit\":\"claude-runtime-links.service\"}\\n' "
+        "> /var/lib/unit-failures/claude-runtime-links.json"
+    )
+    workstation.succeed("systemctl restart claude-runtime-links.service")
+    workstation.fail("test -e /var/lib/unit-failures/claude-runtime-links.json")
+
     # Cutover: the operator creates the marker by hand. Everything below is
     # the post-cutover world.
     workstation.succeed(f"install -o jonathan -g users -m 0644 /dev/null {marker}")
@@ -5811,6 +5827,36 @@ in
     assert "claude-runtime-links" in workstation.succeed(
         "systemctl --failed --no-legend"
     )
+
+    # `systemctl --failed` is not a channel any agent reads. The SessionStart
+    # hook that tells a session about failing units reads ONLY
+    # /var/lib/unit-failures/<unit>.json, and those records come from a unit's
+    # own OnFailure notifier — so without one, the single signal this whole
+    # module emits reaches the operator's terminal and nobody else, while the
+    # agents still reading pre-cutover content at live paths are told nothing.
+    # Assert the record, not the notifier's existence: `systemd-analyze verify`
+    # ignores OnFailure= entirely (measured 2026-08-20), so the wiring can only
+    # be proven by making the unit fail and looking for the record.
+    links_record = "/var/lib/unit-failures/claude-runtime-links.json"
+    workstation.wait_until_succeeds(f"test -s {links_record}", timeout=30)
+    print("[diag] links failure record:\n" + workstation.succeed(f"cat {links_record}"))
+    import json as _links_json
+
+    rec = _links_json.loads(workstation.succeed(f"cat {links_record}"))
+    assert rec["unit"] == "claude-runtime-links.service", rec
+    assert rec["exit_status"] == "75", rec
+    assert rec["result"] == "exit-code", rec
+    assert rec["failed_at"] and rec["invocation_id"], rec
+    # The hook truncates at 300 and 120; a record that overruns is a record
+    # whose point is cut off in the one place it gets read.
+    assert len(rec["summary"]) <= 300 and len(rec["inspect"]) <= 120, rec
+    assert "incomplete" in rec["summary"], rec
+    assert "claude-runtime-links" in rec["inspect"], rec
+    # Root-owned and world-readable, like the other producers': the hook runs
+    # as the user and must be able to read a file only root can have written.
+    assert workstation.succeed(
+        f"stat -c '%U:%G %a' {links_record}"
+    ).strip() == "root:root 644"
     # Refusing means refusing to touch anything, not tidying up on the way
     # out: the links written while the projection was up are still there, so
     # the config comes back whole as soon as the mount does. If the exit-75
