@@ -581,9 +581,16 @@ in
         "systemctl --user stop ai-client-config-codex-sync.timer'"
     )
 
-    # Codex hooks are advisory and fail open on timeout/error. The managed
-    # native profile must therefore be the machine-enforced floor; user,
-    # project, and CLI settings cannot widen it.
+    # Codex hooks are advisory and fail open on timeout/error, so the managed
+    # native profile is the machine-enforced floor.
+    #
+    # Scope, because the previous wording ("user, project, and CLI settings
+    # cannot widen it") was broader than anything measured: the runs below
+    # exercise `codex sandbox` WITH --include-managed-config. Without that
+    # flag the managed profile does not apply to that subcommand at all —
+    # `-P :danger-full-access` escapes the workspace roots for an unconfined
+    # caller. `codex exec` is enforced unflagged; `codex exec resume` and the
+    # TUI are untested. See modules/nixos/codex-security.nix.
     codex_requirements = workstation.succeed(
         "cat /etc/codex/requirements.toml"
     )
