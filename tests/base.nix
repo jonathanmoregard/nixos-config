@@ -38,8 +38,11 @@ let
     # the unit's runtimeInputs say so: measured 2026-10-27, `flock` was missing
     # and the puller read `command not found` (127) as "another run holds the
     # lock", exiting 0 — a tick that skips forever while the unit reports
-    # success. This file is what makes that regression fail the lane.
-    for tool in flock git python3 sed grep; do
+    # success. `getent` is the same shape found in review a day later: its
+    # absence reads as "the host is offline", which also exits 0 and also
+    # bypasses the alert counter. This file is what makes either regression
+    # fail the lane.
+    for tool in flock getent git python3 sed grep; do
       if command -v "$tool" >/dev/null 2>&1; then
         printf '%s ok\n' "$tool"
       else

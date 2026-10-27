@@ -123,6 +123,13 @@ let
       gnused
       gnugrep
       python3
+      # getent is its own derivation, not part of coreutils or glibc's bin
+      # output here. The puller's offline probe is `timeout 5 getent ahosts
+      # github.com`, and a 127 from that reads as "this host is offline": the
+      # tick exits 0 AND skips the counter behind the six-strike
+      # fetch-failure alert, so a broken remote on an online host would be
+      # unreportable. Found in review 2026-10-28, same shape as flock.
+      getent
     ];
     text = ''
       # 0755/0644 on everything written here, and that is load-bearing rather
@@ -229,9 +236,16 @@ let
       # exact wrong-content-served-while-green shape this whole split exists
       # to prevent, arrived at through a missing binary.
       #
+      # Review then found the same shape a second time, in the puller's offline
+      # probe: a missing `getent` makes `timeout 5 getent ahosts` fail, which
+      # that branch reads as "the host is offline" — exit 0, and the
+      # consecutive-failure counter behind the six-strike alert never written,
+      # so a broken remote is unreportable. Two instances is why this is a
+      # list rather than a flock special case.
+      #
       # So the dependencies are pinned in runtimeInputs above, and a future
       # regression in that list fails LOUDLY here instead.
-      for tool in flock git python3 sed grep; do
+      for tool in flock getent git python3 sed grep; do
         command -v "$tool" >/dev/null 2>&1 || {
           log "$tool is not on PATH and the puller needs it; refusing rather than reporting a skipped tick"
           exit 75
