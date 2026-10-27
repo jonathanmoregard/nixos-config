@@ -20,9 +20,10 @@
 #   ~/.claude/                      what every agent path resolves to
 #     runtime/                      <- bind, ro
 #     <entry> -> runtime/<entry>    one symlink per projected entry
+#     settings.json                 NOT projected — see unlinkedEntries
 #     vendor/superpowers/hooks      <- bind, ro
 #     vendor/superpowers/skills     <- bind, ro
-#     vendor/superpowers/package.json <- bind, ro (a file)
+#     vendor/superpowers/package.json -> the checkout (a symlink, never a bind)
 #     vendor/everything-claude-code/skills <- bind, ro
 #     projects/ plugins/ ...        untracked live state, projected by nothing
 #
@@ -99,8 +100,34 @@ let
     { at = "runtime"; from = "${checkout}/runtime"; }
     { at = "vendor/superpowers/hooks"; from = "${checkout}/vendor/superpowers/hooks"; }
     { at = "vendor/superpowers/skills"; from = "${checkout}/vendor/superpowers/skills"; }
-    { at = "vendor/superpowers/package.json"; from = "${checkout}/vendor/superpowers/package.json"; isFile = true; }
     { at = "vendor/everything-claude-code/skills"; from = "${checkout}/vendor/everything-claude-code/skills"; }
+  ];
+
+  # Projected as a SYMLINK rather than a bind mount — the opposite call from
+  # settings.json directly above, for the opposite reason, and not an
+  # inconsistency.
+  #
+  # A file bind mount pins an INODE. Git replaces files by writing a new one
+  # and renaming over the name, so a submodule update leaves a file bind
+  # serving the old content indefinitely while `mountpoint -q` still reports
+  # healthy. Measured: after the source goes 7.0.0 -> 8.0.0, the bind still
+  # reads 7.0.0 and reports mounted; a symlink reads 8.0.0. The sibling
+  # DIRECTORY mounts do not have this problem — they pin a directory inode and
+  # look children up by name every time.
+  #
+  # Nothing writes package.json, so the silent-replacement risk that rules
+  # symlinks out for settings.json does not apply, and staleness is the only
+  # failure mode left. A file symlink also cannot be walked into, so none of
+  # superpowers' tests/, src/ or nested .claude/ becomes reachable by it.
+  # `at` is relative to the live config dir, `from` to the checkout, so both
+  # ends stay parameterised — the harness can point the pair at a fixture
+  # without this script growing a test-only branch, exactly as `live` already
+  # allows.
+  fileLinks = [
+    {
+      at = "vendor/superpowers/package.json";
+      from = "vendor/superpowers/package.json";
+    }
   ];
 
   mountPoint = p: "${live}/${p.at}";
@@ -144,11 +171,29 @@ let
   # Nix cannot read ~/Repos at eval time. Hard-coding 52 names here would
   # drift silently the first time that repo adds one.
   #
-  # settings.json is deliberately NOT linked: Claude Code writes it (the model
-  # pin is a live, tracked modification right now), and a read-only projection
-  # would make that write fail. It stays a real file in ~/.claude. The cost is
-  # that it no longer receives repository updates automatically — see the
-  # reconciliation note in the PR.
+  # settings.json is deliberately NOT projected, by either shape, and the
+  # reasoning changed enough to be worth recording.
+  #
+  # A read-only FILE BIND MOUNT was tried and reverted. It refuses both writer
+  # strategies, but it pins an INODE, so once claude-pull replaced
+  # runtime/settings.json the projection served the old content indefinitely
+  # while `mountpoint -q` still reported healthy — the exact defect that moved
+  # package.json off a file bind, re-created on the one file the repository
+  # updates most often.
+  #
+  # A per-entry symlink into the read-only mount WOULD track updates, and
+  # contrary to the generic case it would not be silently replaced: Claude
+  # Code's user-settings writer resolves the link, writes its temp file beside
+  # the TARGET and renames onto the target, keeping the link. The documented
+  # consequence is that `/model` then fails with EROFS, because the target is
+  # on a filesystem that refuses writes. That is a working `/model` traded for
+  # a locked file, and `/model` is used daily here.
+  #
+  # So this file is owned through Claude Code's MANAGED SETTINGS layer instead
+  # — the mechanism built for policy that users must not override — rather
+  # than by making a path read-only. Tracked separately; until it lands,
+  # ~/.claude/settings.json stays an ordinary writable file and simply does
+  # not receive repository updates.
   unlinkedEntries = [ "settings.json" ];
 
   linkRuntime = pkgs.writeShellApplication {
@@ -159,6 +204,10 @@ let
       # the behaviour can be exercised against a fixture without a test-only
       # code path. The unit never passes one.
       live=''${1:-${lib.escapeShellArg live}}
+      # Second optional argument, same purpose as the first: the backing
+      # checkout, which the absolute-target symlinks below point into. The
+      # unit never passes either one.
+      checkout_dir=''${2:-${lib.escapeShellArg checkout}}
       runtime="$live/runtime"
       marker="$live/.projection-enabled"
 
@@ -264,6 +313,59 @@ let
         ln -sT "$want" "$link"
         linked=$((linked + 1))
       done
+
+      # Symlinks with absolute targets outside runtime/, reconciled under the
+      # same don't-clobber discipline as the loop above: retarget only a link
+      # already pointing where this unit puts them, never replace a real file
+      # or somebody else's link.
+      #
+      # These are NOT covered by owned_links (maxdepth 1, relative runtime/
+      # target), so the stale sweep below leaves them alone — correct while the
+      # list is additive, but dropping an entry from fileLinks will need its
+      # own removal step rather than being swept.
+      link_file() {
+        local link="$1" want="$2"
+
+        # A dangling link is worse than none: the reader gets ENOENT from a
+        # path that looks projected. If the source is missing the checkout is
+        # half-built, which is the same condition the mount check refuses on.
+        if [ ! -e "$want" ]; then
+          echo "claude-runtime-links: $want is missing; refusing to link $link to it" >&2
+          exit 75
+        fi
+
+        if [ -L "$link" ]; then
+          local current
+          current=$(readlink "$link")
+          [ "$current" = "$want" ] && return 0
+          # Owned == already pointing into the checkout. Anything else is
+          # somebody's property and is reported, not retargeted.
+          case "$current" in
+          "$checkout_dir"/*)
+            ln -sfnT "$want" "$link"
+            linked=$((linked + 1))
+            ;;
+          *)
+            blocked=$((blocked + 1))
+            [ "$blocked" -le 10 ] && echo "claude-runtime-links: $link is a symlink to $current, not into the checkout; left alone" >&2
+            ;;
+          esac
+          return 0
+        fi
+
+        if [ -e "$link" ]; then
+          blocked=$((blocked + 1))
+          [ "$blocked" -le 10 ] && echo "claude-runtime-links: $link exists and is not a symlink; left alone" >&2
+          return 0
+        fi
+
+        ln -sT "$want" "$link"
+        linked=$((linked + 1))
+      }
+
+      ${lib.concatMapStringsSep "\n      "
+        (f: "link_file \"$live\"/${lib.escapeShellArg f.at} \"$checkout_dir\"/${lib.escapeShellArg f.from}")
+        fileLinks}
 
       # Drop links this unit owns whose target has left the runtime set.
       # A broken symlink is `-type l -xtype l`: -xtype follows the link, and
@@ -404,16 +506,80 @@ in
     wantedBy = [ "multi-user.target" ];
     after = [ "home-manager-${user}.service" "systemd-tmpfiles-resetup.service" ];
     unitConfig = {
-      # All five, not just runtime/: this unit refuses unless every projection
-      # is mounted, so it should pull up and order against every one of them.
+      # Every projection, not just runtime/: this unit refuses unless all of
+      # them are mounted, so it should pull up and order against each one.
       RequiresMountsFor = map mountPoint projections;
+      # No start limit at all, and this is deliberate rather than careless. A
+      # start-limit hit on a path-triggered service PROPAGATES to the .path
+      # unit: measured with transient units, the path unit goes `failed` with
+      # Result=unit-start-limit-hit and never fires again, so the watcher dies
+      # silently and permanently. A rate limit here would convert a burst of
+      # git activity into a dead reconciler — strictly worse than the
+      # rate-limiting it was meant to prevent. The timer below is what keeps a
+      # missed or raced event bounded; the reconcile itself is idempotent and
+      # cheap, so repeated runs cost nothing worth protecting against.
+      StartLimitIntervalSec = 0;
     };
     serviceConfig = {
       Type = "oneshot";
-      RemainAfterExit = true;
+      # NOT RemainAfterExit. It used to be, and combined with the path unit
+      # below that is a silent half-failure: a .path issues a `start` job, and
+      # `start` on an already-active unit is a no-op, so the watcher would fire
+      # exactly once and then never again. Measured with transient units:
+      #
+      #   oneshot, non-remaining     new entry RETRIGGERED, removal RETRIGGERED
+      #   oneshot, RemainAfterExit   new entry RETRIGGERED, removal NO RE-TRIGGER
+      #
+      # A test that only added an entry would have passed either way, which is
+      # why the lane asserts the removal too. Nothing requires this unit to
+      # stay `active (exited)`; the ordering edges are After=, not Requires=.
       User = user;
       Group = group;
       ExecStart = "${linkRuntime}/bin/claude-runtime-links";
+    };
+  };
+
+  # What closes the update loop. The links unit reconciles the whole entry set
+  # when it runs, but nothing re-ran it after claude-pull landed new commits,
+  # so a newly added TOP-LEVEL runtime entry stayed unlinked — present in the
+  # repository, absent from ~/.claude — until someone noticed by hand.
+  #
+  # An inotify watch on a directory reports its DIRECT entries, which is
+  # exactly the set that needs symlinks: a new skill under runtime/skills/
+  # already resolves through the existing runtime/skills link and needs
+  # nothing from this.
+  #
+  # System-level rather than a user path unit, because the unit it starts is a
+  # system unit; going the other way would need a polkit rule granting
+  # jonathan the right to restart it. Pre-cutover the watched directory does
+  # not exist yet, which is inert: systemd watches the nearest existing parent
+  # and waits.
+  systemd.paths.claude-runtime-links = {
+    wantedBy = [ "multi-user.target" ];
+    pathConfig = {
+      PathChanged = "${checkout}/runtime";
+      Unit = "claude-runtime-links.service";
+    };
+  };
+
+  # The level-triggered half, and the watcher above is not sufficient without
+  # it. PathChanged is edge-triggered and the directory is NOT watched while
+  # the service it triggered is running, so an entry that appears after the
+  # reconcile has already globbed runtime/* is missed until some later
+  # top-level event — which may never come. inotify also drops events under
+  # pressure and does not survive a watch being re-established.
+  #
+  # So the path unit is for latency and this is for correctness: any state the
+  # watcher missed is repaired within the interval. Ten minutes matches
+  # claude-pull's own cadence, which is what lands new entries in the first
+  # place; the offset keeps the reconcile just after a pull rather than
+  # racing it.
+  systemd.timers.claude-runtime-links = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnCalendar = "*:02,12,22,32,42,52";
+      Persistent = true;
+      Unit = "claude-runtime-links.service";
     };
   };
 }
