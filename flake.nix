@@ -436,6 +436,20 @@
           deployedZshenv = primaryConfig
             .home-manager.users.jonathan.home.file."./.zshenv".source;
         };
+        # Not a VM lane: runtime-invocation harness for the rust-analyzer
+        # devShell wrapper (home/rust-analyzer-devshell.nix) — flake walk-up,
+        # the two degrade routes that keep the editor's language server
+        # alive, and the LSP-stdout-vs-shellHook split that the whole
+        # approach stands on. Boots nothing; seconds.
+        rust-analyzer-devshell = import ./tests/rust-analyzer-devshell.nix {
+          pkgs = pkgsLinux;
+          raDevshell = import ./home/rust-analyzer-devshell.nix { pkgs = pkgsLinux; };
+          # Drift gate: the settings.json the primary host really deploys,
+          # read for the server path the editor will spawn.
+          deployedSettings = primaryConfig
+            .home-manager.users.jonathan
+            .home.file.".config/VSCodium/User/settings.json".source;
+        };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
         # credential whose real home is elsewhere (see the test's header for
         # why this is not a VM assertion). Pure eval; instant.
