@@ -166,6 +166,20 @@ in
       Type = "oneshot";
       # %h expands to $HOME under home-manager's systemd --user.
       ExecStart = "%h/.claude/scripts/claude-pull.sh";
+      # Name the repository instead of letting the script derive it from its
+      # own location. That fallback stops working once claude-config's runtime
+      # subset is projected into ~/.claude: the script is then reached through
+      # ~/.claude/scripts -> runtime/scripts, and `runtime` is a MOUNT rather
+      # than a symlink, so `readlink -f` resolves to
+      # /home/jonathan/.claude/runtime/scripts and never leaves ~/.claude.
+      # `rev-parse --show-toplevel` from there walks up past a ~/.claude that
+      # no longer holds a .git and fails — or, if one is ever left behind,
+      # quietly pulls the OLD checkout instead. The other two pull units
+      # (marketplaces, klaffat) already name their repository for the same
+      # reason; this one is the last to rely on discovery.
+      Environment = [
+        "CLAUDE_PULL_REPO=${config.home.homeDirectory}/Repos/claude-config"
+      ];
       # Background maintenance — never compete with an interactive session.
       Nice = 10;
       IOSchedulingClass = "idle";
