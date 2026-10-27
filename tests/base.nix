@@ -637,32 +637,76 @@ in
 
     # Built-in profile selection plus both legacy and native CLI overrides
     # cannot replace or widen the managed profile.
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P :danger-full-access "
-        "--include-managed-config -C /home/jonathan/Repos -- "
-        "touch /home/jonathan/codex-danger-profile-escape'"
+    #
+    # Every run here carries its own control, because a failing `codex
+    # sandbox` is not evidence of enforcement. Measured on codex 0.161.0:
+    #   - `codex sandbox -C DIR CMD` without `-P` exits 2 on clap argument
+    #     validation ("the following required arguments were not provided:
+    #     --permission-profile") before any sandbox or policy decision;
+    #   - `-P repos_dev` without `--include-managed-config` exits 1 with
+    #     "default_permissions requires a `[permissions]` table": the
+    #     managed profile is only defined when that flag is passed.
+    # This block's earlier `workstation.fail(...)` runs lacked `-P`, so they
+    # died on the first of these and stayed green whatever the policy did;
+    # their trailing `test -e` backstop was just as vacuous, since a command
+    # that never ran leaves no escape file either.
+    #
+    # Shape: one run writes a control file INSIDE a managed workspace root
+    # (must succeed: the run started and policy allows the write) and then
+    # attempts the escape OUTSIDE it (must be refused). A run that never
+    # started fails the `ctl=0` assertion instead of passing as protection.
+    def codex_sandbox_confined(name, args):
+        ctl = f"/home/jonathan/Repos/ctl-{name}"
+        esc = f"/home/jonathan/{name}"
+        out = workstation.succeed(
+            f"su - jonathan -c 'codex sandbox {args} "
+            f"-C /home/jonathan/Repos -- sh -c "
+            f"\"touch {ctl}; echo ctl=\\$?; touch {esc} 2>&1; echo esc=\\$?\"'"
+        )
+        assert "ctl=0" in out, f"{name}: control write did not run: {out!r}"
+        assert "esc=1" in out, f"{name}: escape was not refused: {out!r}"
+        # The refusal comes from the sandbox's read-only bind, not from
+        # Unix permissions (jonathan owns /home/jonathan).
+        assert "Read-only file system" in out, (
+            f"{name}: escape refused for an unexpected reason: {out!r}"
+        )
+        workstation.succeed(f"test -e {ctl}")
+        workstation.fail(f"test -e {esc}")
+
+    # A built-in unrestricted profile is not rejected by
+    # allowed_permission_profiles: it runs, and the managed floor still
+    # confines it ("Read-only file system" outside the roots).
+    codex_sandbox_confined(
+        "codex-danger-profile-escape",
+        "-P :danger-full-access --include-managed-config",
     )
-    workstation.fail(
-        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
-        "-c sandbox_mode=\"danger-full-access\" sandbox -- "
-        "touch /home/jonathan/codex-legacy-escape'"
+
+    # The legacy `sandbox_mode` key runs and is ignored under a managed
+    # permission profile.
+    codex_sandbox_confined(
+        "codex-legacy-escape",
+        "-P repos_dev --include-managed-config "
+        "-c sandbox_mode=\"danger-full-access\"",
     )
-    workstation.fail(
-        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
-        "-c default_permissions=\":danger-full-access\" sandbox -- "
-        "touch /home/jonathan/codex-default-escape'"
-    )
-    workstation.fail(
-        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
+
+    # Redefining the managed profile from the CLI is rejected outright before
+    # the command runs, so the ctl/esc shape cannot apply; pin the measured
+    # reason instead of any non-zero exit.
+    rc, out = workstation.execute(
+        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
+        "-C /home/jonathan/Repos "
         "-c permissions.repos_dev.filesystem.\"/home/jonathan\"=\"write\" "
-        "sandbox -- touch /home/jonathan/codex-profile-escape'"
+        "-- touch /home/jonathan/codex-profile-escape' 2>&1"
     )
-    workstation.fail(
-        "test -e /home/jonathan/codex-danger-profile-escape -o "
-        "-e /home/jonathan/codex-legacy-escape -o "
-        "-e /home/jonathan/codex-default-escape -o "
-        "-e /home/jonathan/codex-profile-escape"
-    )
+    assert rc == 1, f"profile widening: expected exit 1, got {rc}: {out!r}"
+    assert (
+        "requirements.toml permissions profile `repos_dev` conflicts with a "
+        "config-defined profile of the same name"
+    ) in out, f"profile widening not rejected for the expected reason: {out!r}"
+
+    # `-c default_permissions=...` is not tested: `codex sandbox` requires
+    # `-P`, which supersedes default_permissions, and the
+    # `-P :danger-full-access` run above covers profile resolution.
 
     # home-manager-jonathan TimeoutStartSec floor.
     #
