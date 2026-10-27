@@ -215,6 +215,9 @@
         # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
         # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
         (import ./overlays/claude-code.nix)
+        # `pkgs.vscodium` newer than nixpkgs: the GitHub PR review extension
+        # needs an editor >= 1.129. See overlays/vscodium.nix.
+        (import ./overlays/vscodium.nix)
         # Native Codex CLI package with prebuilt store paths from the
         # codex-cli Cachix cache.
         codex-cli-nix.overlays.default

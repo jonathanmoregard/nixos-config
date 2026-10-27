@@ -174,6 +174,15 @@ in
         zhuangtongfa.material-theme
         vscode-icons-team.vscode-icons
         esbenp.prettier-vscode
+        # PR review inside the editor: inline diff against the base, the PR
+        # description as a tab, and review comments on a selection. Needs an
+        # editor >= 1.129 (overlays/vscodium.nix bumps it there).
+        github.vscode-pull-request-github
+        # Claude in the editor: alt+k sends the selection to a conversation,
+        # and proposed diffs land as accept/reject. The CLI is the system
+        # one (overlays/claude-code.nix); this extension cannot update
+        # itself from a read-only store path, which is the point.
+        anthropic.claude-code
       ];
     })
   ];
