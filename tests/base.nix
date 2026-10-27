@@ -664,6 +664,54 @@ in
         "-e /home/jonathan/codex-profile-escape"
     )
 
+    # Claude Code's session back-channel does not reach commands Codex runs
+    # (modules/nixos/codex-security.nix). CLAUDE_CODE_MESSAGING_SOCKET and
+    # CLAUDE_CODE_MESSAGING_TOKEN together are enough to drive the Claude
+    # session that spawned Codex, and a Claude session running `codex exec`
+    # hands its whole environment down.
+    #
+    # Deliberately NO --include-managed-config: that flag is how the runs above
+    # load the managed profile, and the call sites this protects
+    # (skills/advice-refine-test-loop/scripts/codex-advise.sh) do not pass it.
+    # Asserting without it is what proves /etc/codex/config.toml is honoured on
+    # the path that actually carries the variables, instead of only when a flag
+    # opts into it.
+    #
+    # -P :read-only is the BUILT-IN profile, chosen so profile resolution
+    # cannot confound the measurement. Two earlier shapes failed before any
+    # environment was read, and neither failure was about the exclusion:
+    #
+    #   no -P at all     -> exit 2, "the following required arguments were not
+    #                       provided: --permission-profile" (this VM has no
+    #                       ~/.codex/config.toml to select a default; the
+    #                       codex-sync timer is stopped above)
+    #   -P repos_dev     -> exit 1, "default_permissions requires a
+    #                       `[permissions]` table" — the managed profile's
+    #                       definition lives in /etc/codex/requirements.toml
+    #                       and is not loaded without --include-managed-config
+    #
+    # A built-in profile needs no managed table, so this run turns on exactly
+    # one question: is /etc/codex/config.toml honoured by an invocation that
+    # does NOT pass --include-managed-config? If it is not, the declaration is
+    # inert for every call site that matters and this assertion says so.
+    #
+    # The variables are injected rather than assumed. This VM has no Claude
+    # Code session, so "they are absent" is already true with no exclusion
+    # declared at all, and a bare absence check would pass against nothing.
+    # KEEP_ME_CONTROL is the other half: it has to survive, or the run proved
+    # only that `env` printed nothing worth reading.
+    codex_env = workstation.succeed(
+        "su - jonathan -c 'CLAUDE_CODE_MESSAGING_SOCKET=/tmp/fake.sock "
+        "CLAUDE_CODE_MESSAGING_TOKEN=faketoken KEEP_ME_CONTROL=1 "
+        "codex sandbox -P :read-only -C /home/jonathan/Repos -- env'"
+    )
+    assert "KEEP_ME_CONTROL=1" in codex_env, (
+        "the control variable did not survive into the sandbox, so this run "
+        f"says nothing about what was excluded:\n{codex_env}"
+    )
+    assert "CLAUDE_CODE_MESSAGING_SOCKET" not in codex_env, codex_env
+    assert "CLAUDE_CODE_MESSAGING_TOKEN" not in codex_env, codex_env
+
     # home-manager-jonathan TimeoutStartSec floor.
     #
     # systemd's default TimeoutStartSec is 5min; jonathan's HM closure
