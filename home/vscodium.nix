@@ -199,8 +199,21 @@ in
     })
   ];
 
-  home.file.".config/VSCodium/User/settings.json".source =
-    jsonFormat.generate "vscodium-settings.json" settings;
-  home.file.".config/VSCodium/User/keybindings.json".source =
-    jsonFormat.generate "vscodium-keybindings.json" keybindings;
+  # `force` because home-manager otherwise ABORTS activation when a real file
+  # occupies one of these paths, and a failed activation poisons
+  # nixos-deploy. VSCodium writes settings.json itself the first time the
+  # Settings UI saves, and the Claude Code extension's settings migration
+  # calls update(..., Global) on first run — so the window for a file to
+  # appear here is not hypothetical. The trade is deliberate: a file written
+  # between two deploys is overwritten rather than stopping the deploy. These
+  # two paths are declared here in full, so there is nothing in them worth
+  # preserving that is not already in this file.
+  home.file.".config/VSCodium/User/settings.json" = {
+    source = jsonFormat.generate "vscodium-settings.json" settings;
+    force = true;
+  };
+  home.file.".config/VSCodium/User/keybindings.json" = {
+    source = jsonFormat.generate "vscodium-keybindings.json" keybindings;
+    force = true;
+  };
 }
