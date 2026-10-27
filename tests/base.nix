@@ -5571,7 +5571,6 @@ in
             "runtime",
             "vendor/superpowers/hooks",
             "vendor/superpowers/skills",
-            "vendor/superpowers/package.json",
             "vendor/everything-claude-code/skills",
         ]
     ]
@@ -5592,11 +5591,12 @@ in
         "cat /home/jonathan/.claude/vendor/superpowers/skills/sp.md"
     ).strip() == "sp-skill"
     assert workstation.succeed(
-        "cat /home/jonathan/.claude/vendor/superpowers/package.json"
-    ).strip() == "{}"
-    assert workstation.succeed(
         "cat /home/jonathan/.claude/vendor/everything-claude-code/skills/ecc.md"
     ).strip() == "ecc-skill"
+    # package.json is NOT here yet: it is a symlink written by the links unit
+    # rather than a mount, so it arrives later in this block. Asserted, so the
+    # ordering is a stated fact rather than an accident.
+    workstation.fail("test -e /home/jonathan/.claude/vendor/superpowers/package.json")
 
     # Read-only, so a hook cannot rewrite its own source through ~/.claude.
     workstation.fail("touch /home/jonathan/.claude/runtime/should-not-write")
@@ -5670,7 +5670,11 @@ in
     ).strip() == "guard"
 
     # settings.json is deliberately not projected: Claude Code writes it, and
-    # a link into the read-only mount would make that write fail.
+    # a link into the read-only mount would make that write fail. Confirmed
+    # since: its writer resolves the symlink and writes its temp file beside
+    # the TARGET, so the link survives but `/model` fails EROFS on the
+    # read-only filesystem. Ownership of this file moves to the
+    # managed-settings layer rather than to a read-only path.
     workstation.fail("test -L /home/jonathan/.claude/settings.json")
 
     # A real path in the way is LEFT ALONE, never replaced. The old flat
@@ -5852,5 +5856,121 @@ in
         "cat /home/jonathan/.claude/hooks/bash-guard.py"
     ).strip() == "guard"
     workstation.succeed("systemctl reset-failed claude-runtime-links.service")
+
+    # ---- the UPDATE path -------------------------------------------------
+    #
+    # Everything above tests a STATIC projection: mount it, link it, read it.
+    # None of it covers what happens when new content lands, which is the
+    # state the machine spends all its time in once claude-pull is running
+    # again. Three separate holes, each with its own negative control.
+
+    # L1. claude-pull must be told which repository it operates on. Its
+    # fallback derives the repo from the script's own location, and under the
+    # projection that location is inside ~/.claude — `runtime` is a MOUNT, not
+    # a symlink, so realpath never leaves the live directory.
+    #
+    # The directory has to EXIST for this control to test the right thing. The
+    # first version asserted against a path the fixture never created, so it
+    # failed with ENOENT and would have passed whatever `readlink -f` did —
+    # proving nothing about the claim. Create it, confirm the script really is
+    # reachable through the projection, and only then show that repository
+    # discovery from there finds nothing.
+    workstation.succeed(
+        f"install -d -o jonathan -g users {checkout}/runtime/scripts && "
+        f"printf '#!/bin/sh\\n' > {checkout}/runtime/scripts/claude-pull.sh && "
+        f"chmod +x {checkout}/runtime/scripts/claude-pull.sh && "
+        f"chown -R jonathan:users {checkout}/runtime/scripts"
+    )
+    workstation.wait_until_succeeds(
+        "test -x /home/jonathan/.claude/scripts/claude-pull.sh", timeout=120
+    )
+    # Reached through the projection, and `readlink -f` stays inside ~/.claude
+    # because runtime/ is a mountpoint rather than a symlink. That is the whole
+    # mechanism behind the broken fallback.
+    assert workstation.succeed(
+        "readlink -f /home/jonathan/.claude/scripts/claude-pull.sh"
+    ).strip() == "/home/jonathan/.claude/runtime/scripts/claude-pull.sh"
+    # And from there, discovery finds no repository at all.
+    workstation.fail(
+        "su jonathan -c 'git -C /home/jonathan/.claude/runtime/scripts "
+        "rev-parse --show-toplevel'"
+    )
+    # So the unit cannot rely on it. The override is the seam the script
+    # already exposes, and the two sibling pull units already use.
+    unit = workstation.succeed(
+        "cat /home/jonathan/.config/systemd/user/claude-pull.service"
+    )
+    assert "CLAUDE_PULL_REPO=/home/jonathan/Repos/claude-config" in unit, unit
+
+    # L2. A single-file bind mount pins an INODE, so a git update that
+    # replaces the file leaves the projection serving the old content forever
+    # while `mountpoint -q` still reports healthy. Replace it the way git
+    # does — new file, rename over the old one — and require the live read to
+    # follow. This is the assertion that fails against a file bind mount.
+    sp_pkg = f"{checkout}/vendor/superpowers/package.json"
+    workstation.succeed(
+        f"printf 'NEWVERSION\\n' > {sp_pkg}.new && "
+        f"chown jonathan:users {sp_pkg}.new && "
+        f"mv -f {sp_pkg}.new {sp_pkg}"
+    )
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/vendor/superpowers/package.json"
+    ).strip() == "NEWVERSION"
+    # And it is reachable as one file, not as a door into the submodule: the
+    # dev trees this projection exists to exclude stay unreachable by it.
+    workstation.fail(
+        "test -e /home/jonathan/.claude/vendor/superpowers/package.json/../src"
+    )
+
+    # L3. A new TOP-LEVEL runtime entry needs a new symlink, and nothing was
+    # re-running the links unit after a pull. The watcher must notice without
+    # anyone asking it to.
+    assert workstation.succeed(
+        "systemctl is-active claude-runtime-links.path"
+    ).strip() == "active"
+    workstation.succeed(
+        f"install -d -o jonathan -g users {checkout}/runtime/newentry && "
+        f"printf 'arrived\\n' > {checkout}/runtime/newentry/n.md && "
+        f"chown -R jonathan:users {checkout}/runtime/newentry"
+    )
+    # No systemctl call here on purpose — if this needs a manual kick, the
+    # hole is still open. The unit still exits 75 (~/.claude/skills is a real
+    # home-manager directory in this lane), so wait on the LINK, not on the
+    # unit's exit status: it writes every link it can before it refuses.
+    workstation.wait_until_succeeds(
+        "test -L /home/jonathan/.claude/newentry", timeout=60
+    )
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/newentry/n.md"
+    ).strip() == "arrived"
+    # Removal reconciles too, by the same route and with no manual kick.
+    #
+    # `! -L`, NOT `! -e`: -e FOLLOWS the symlink, so `! -e` is already true the
+    # instant the source directory goes, before any sweep runs. That made the
+    # first version of this assertion vacuous — it passed without the stale
+    # sweep existing at all, which means it would also have passed with
+    # RemainAfterExit left in place, the exact footgun it is here to catch.
+    workstation.succeed(f"rm -r {checkout}/runtime/newentry")
+    workstation.wait_until_succeeds(
+        "test ! -L /home/jonathan/.claude/newentry", timeout=120
+    )
+    workstation.succeed("systemctl reset-failed claude-runtime-links.service")
+
+    # L4. settings.json stays UNPROJECTED, and that is now a deliberate
+    # position rather than a gap. Both projection shapes were tried and both
+    # were wrong for this file: a read-only file bind pins an inode and goes
+    # stale the first time claude-pull replaces the source, and a per-entry
+    # symlink into the read-only mount makes `/model` fail EROFS, because
+    # Claude Code's writer resolves the link and writes beside the target.
+    # Ownership moves to Claude Code's managed-settings layer instead, which
+    # is tracked separately. Until then the file is an ordinary writable one,
+    # so assert exactly that and nothing stronger.
+    # Not a mountpoint either (the `! -L` half is asserted further up), and
+    # still writable by its owner — which is the property that keeps /model
+    # working and is what the reverted bind mount would have taken away.
+    workstation.fail("mountpoint -q /home/jonathan/.claude/settings.json")
+    workstation.succeed(
+        "su jonathan -c 'printf \\n >> /home/jonathan/.claude/settings.json'"
+    )
   '';
 }
