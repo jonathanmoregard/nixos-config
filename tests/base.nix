@@ -4305,11 +4305,40 @@ in
     # on claude-config master has no bind mounts yet, so a pull would break
     # the harness. The timer must not be enabled or running after a rebuild
     # or reboot. Revert this block when the timer is re-enabled.
-    for cmd in ["is-enabled", "is-active"]:
-        got = workstation.execute(
+    #
+    # Require a word systemd actually printed before reading anything into it.
+    # `is-enabled` on a held unit exits non-zero, so the probe cannot use
+    # succeed() and the exit status cannot carry the verdict — which is how the
+    # earlier `got not in ("enabled", "active")` form came to pass whenever the
+    # probe ITSELF failed: a renamed unit, an `su` that could not start a
+    # session, a missing XDG_RUNTIME_DIR each produce output that is not the
+    # string "enabled", and read as "the timer is safely off". Demanding a
+    # recognised state first means a broken probe fails the lane instead of
+    # certifying the thing it never managed to ask about.
+    systemd_load_states = {
+        "enabled", "enabled-runtime", "linked", "linked-runtime",
+        "alias", "masked", "masked-runtime", "static", "indirect",
+        "disabled", "generated", "transient",
+    }
+    systemd_active_states = {
+        "active", "reloading", "inactive", "failed",
+        "activating", "deactivating",
+    }
+    for cmd, known in (
+        ("is-enabled", systemd_load_states),
+        ("is-active", systemd_active_states),
+    ):
+        rc, out = workstation.execute(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-            f"systemctl --user {cmd} claude-pull.timer'"
-        )[1].strip()
+            f"systemctl --user {cmd} claude-pull.timer' 2>/dev/null"
+        )
+        got = out.strip()
+        assert got in known, (
+            f"systemctl --user {cmd} claude-pull.timer printed {got!r} "
+            f"(rc={rc}), which is not a systemd state — the probe failed "
+            f"rather than answering, so this block proves nothing about "
+            f"whether the timer is held off"
+        )
         assert got not in ("enabled", "active"), (
             f"claude-pull.timer {cmd}={got!r} — a pull would relocate "
             f"~/.claude files out from under the hooks"
