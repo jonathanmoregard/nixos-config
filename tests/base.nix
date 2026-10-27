@@ -4305,14 +4305,51 @@ in
     # on claude-config master has no bind mounts yet, so a pull would break
     # the harness. The timer must not be enabled or running after a rebuild
     # or reboot. Revert this block when the timer is re-enabled.
-    for cmd in ["is-enabled", "is-active"]:
-        got = workstation.execute(
+    #
+    # Require a word systemd actually printed before reading anything into it.
+    # `is-enabled` on a held unit exits non-zero, so the probe cannot use
+    # succeed() and the exit status cannot carry the verdict — which is how the
+    # earlier `got not in ("enabled", "active")` form came to pass whenever the
+    # probe ITSELF failed: a renamed unit, an `su` that could not start a
+    # session, a missing XDG_RUNTIME_DIR each produce output that is not the
+    # string "enabled", and read as "the timer is safely off". Demanding a
+    # recognised state first means a broken probe fails the lane instead of
+    # certifying the thing it never managed to ask about.
+    # Name the states that satisfy "held off" and accept nothing else. An
+    # earlier form asked only `got not in ("enabled", "active")`, which let two
+    # genuinely unsafe answers through: `enabled-runtime` means enabled for
+    # this boot, and `activating` means the timer is starting right now. Both
+    # are the thing this block exists to catch.
+    #
+    # Measured on the deployed host 2026-10-27: `is-enabled` -> "linked"
+    # (rc=1), `is-active` -> "inactive" (rc=3). "linked" rather than "static"
+    # or "disabled" because home-manager symlinks the unit file in from the
+    # store and #372 removed its Install.WantedBy, so there is no [Install]
+    # section to report enablement from. The allowlist carries the shapes that
+    # all mean "present but not enabled" rather than pinning HM's current one,
+    # so a switch between them stays green while every enabled-ish state —
+    # enabled, enabled-runtime, linked-runtime, alias — fails.
+    held_off_load_states = {"linked", "static", "disabled", "indirect", "masked"}
+    for cmd, allowed in (
+        ("is-enabled", held_off_load_states),
+        ("is-active", {"inactive"}),
+    ):
+        rc, out = workstation.execute(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-            f"systemctl --user {cmd} claude-pull.timer'"
-        )[1].strip()
-        assert got not in ("enabled", "active"), (
-            f"claude-pull.timer {cmd}={got!r} — a pull would relocate "
-            f"~/.claude files out from under the hooks"
+            f"systemctl --user {cmd} claude-pull.timer' 2>/dev/null"
+        )
+        got = out.strip()
+        # One assertion covers both failure modes, so a probe that never
+        # answered fails here too: a renamed unit, an `su` that could not open
+        # a session, or a missing XDG_RUNTIME_DIR all print something outside
+        # this set. `is-enabled` on a held unit exits non-zero, so succeed() is
+        # unavailable and the exit status cannot carry the verdict.
+        assert got in allowed, (
+            f"systemctl --user {cmd} claude-pull.timer = {got!r} (rc={rc}); "
+            f"expected one of {sorted(allowed)}. Either the timer is no longer "
+            f"held off — a pull would relocate ~/.claude files out from under "
+            f"the hooks — or the probe failed to ask, in which case this block "
+            f"proves nothing either way"
         )
 
     # claude-marketplace-pull — the same puller, second target.
