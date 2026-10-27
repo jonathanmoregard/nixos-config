@@ -30,6 +30,11 @@ let
   # systemd-run invocation would drift toward "looks observed, isn't".
   claudeEgressLaunch = import ./claude-egress-launch.nix { inherit pkgs; };
 
+  # Same shape, same reason as claudeEgressLaunch: a binary the extension
+  # spawns, kept in its own file so the check lane can drive the exact
+  # derivation the editor runs.
+  rustAnalyzerDevshell = import ./rust-analyzer-devshell.nix { inherit pkgs; };
+
   settings = {
     # ── Editor ──────────────────────────────────────────────────────────
     "editor.formatOnSave" = true;
@@ -104,6 +109,16 @@ let
     # this the extension spawns the CLI directly and its traffic is
     # invisible to the nftables rule bound to that cgroup.
     "claudeCode.claudeProcessWrapper" = "${claudeEgressLaunch}/bin/claude-egress-launch";
+
+    # ── Rust ────────────────────────────────────────────────────────────
+    # Same desktop-menu PATH problem as nix.serverPath below, one layer
+    # deeper: rust-analyzer needs more than its own binary. It runs cargo,
+    # cargo runs every build script, and a build script links — so on a host
+    # with no global compiler the editor reported `linker cc not found` for
+    # half the dependency graph while the project's own `nix develop` had cc,
+    # pkg-config and OPENSSL_* all along. The wrapper enters the workspace's
+    # devShell first and execs the pinned server inside it.
+    "rust-analyzer.server.path" = "${rustAnalyzerDevshell}/bin/rust-analyzer-devshell";
 
     # ── Nix ─────────────────────────────────────────────────────────────
     # nix-ide shells out to the language server by name, and a VSCodium

@@ -230,6 +230,17 @@ jobs:
       # to a failure that actually cost a day's sessions.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.kitty-scripts -L
+      # rust-analyzer devShell wrapper contracts
+      # (tests/rust-analyzer-devshell.nix): the editor's --version probe
+      # never evaluating a flake, the walk-up from a crate subdirectory,
+      # both degrade routes still starting a language server, and — the
+      # one the approach stands on — a devShell shellHook's stdout going
+      # to stderr while the server's own stdout arrives byte-intact. A
+      # regression there is a corrupted LSP stream, which surfaces as an
+      # editor protocol error rather than as anything pointing here.
+      # Stubs nix, boots nothing, runs in seconds.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.rust-analyzer-devshell -L
       # research-agent security sweep verdict logic
       # (tests/security-batch-research-agent.nix): seed, new CVE,
       # accepted, score regression, tool errors, against fake vulnix /
