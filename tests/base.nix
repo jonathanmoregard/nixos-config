@@ -682,9 +682,13 @@ in
     # environment was read, and neither failure was about the exclusion:
     #
     #   no -P at all     -> exit 2, "the following required arguments were not
-    #                       provided: --permission-profile" (this VM has no
-    #                       ~/.codex/config.toml to select a default; the
-    #                       codex-sync timer is stopped above)
+    #                       provided: --permission-profile". Passing -C selects
+    #                       the native CLI form, where -P is mandatory; a bare
+    #                       `codex sandbox <cmd>` with neither flag does run,
+    #                       taking default_permissions from user config. So the
+    #                       trigger is the argument shape, not the environment
+    #                       — the host refuses this same shape despite having
+    #                       default_permissions in ~/.codex/config.toml.
     #   -P repos_dev     -> exit 1, "default_permissions requires a
     #                       `[permissions]` table" — the managed profile's
     #                       definition lives in /etc/codex/requirements.toml
