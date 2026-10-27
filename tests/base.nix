@@ -5489,6 +5489,21 @@ in
         f"printf 'skill\\n' > {checkout}/runtime/skills/keep.md && "
         f"printf '{{}}\\n' > {checkout}/runtime/settings.json && "
         f"printf 'pin\\n' > {checkout}/runtime/.claude-powerline.json && "
+        # dcg.toml is the one entry where this flake and the projection
+        # compete for the same path: home/dcg.nix's arm 1 SEEDS a real
+        # ~/.claude/dcg.toml whenever that path is absent (asserted some
+        # 150 lines above this), and `runtime/dcg.toml` is tracked in
+        # claude-config, so the links unit wants to put a symlink there.
+        # Leaving it out of this fixture is what let the exit-0 assertion
+        # below pass while saying nothing about the host.
+        # Valid dcg config, because once this entry is linked, dcg itself has
+        # to be able to load it: home.activation.dcgConfigVerdict asks
+        # `dcg config` and REFUSES activation when the user layer is not
+        # loaded, so an unparseable projected file would fail every later
+        # rebuild. Distinguishable from the seed by one appended comment, so
+        # "whose content is live here" is answerable.
+        f"install -m 0644 ${../home/dcg-fallback.toml} {checkout}/runtime/dcg.toml && "
+        f"printf '\\n# PROJECTED\\n' >> {checkout}/runtime/dcg.toml && "
         f"printf 'DEVONLY\\n' > {checkout}/tests/dev-only-marker && "
         f"printf 'sp-hook\\n' > {checkout}/vendor/superpowers/hooks/sp.sh && "
         f"printf 'sp-skill\\n' > {checkout}/vendor/superpowers/skills/sp.md && "
@@ -5626,19 +5641,57 @@ in
     # `start` so this runs whatever state the pre-marker block left the unit
     # in.
     #
-    # Exit 0 is the whole point: nothing in this repo writes under ~/.claude,
-    # so no path is left alone and the unit has nothing to refuse.
+    # FIRST the collision this flake itself creates. home/dcg.nix seeds a real
+    # ~/.claude/dcg.toml on any activation where that path is absent, and
+    # dcg.toml is a projected entry, so after the cutover deletes the old flat
+    # files the next activation plants a real file exactly where the link
+    # belongs. The unit must refuse it rather than delete an operator's
+    # hand-edited pattern list — and the refusal is exit 75, which means a
+    # cutover that stops here looks "mounted and healthy" while one entry is
+    # still pre-cutover content.
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus claude-runtime-links.service"
+    ).strip() == "75"
+    dcg_collision_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -n 20 --no-pager"
+    )
+    assert (
+        "claude-runtime-links: /home/jonathan/.claude/dcg.toml exists and is "
+        "not a symlink; left alone"
+    ) in dcg_collision_log, dcg_collision_log
+    # Left alone means LEFT ALONE: home-manager's seeded content is still
+    # there, byte-for-byte, not replaced by the projection's copy.
+    workstation.fail("test -L /home/jonathan/.claude/dcg.toml")
+    workstation.succeed(
+        "cmp ${../home/dcg-fallback.toml} /home/jonathan/.claude/dcg.toml"
+    )
+    workstation.fail("grep -q '# PROJECTED' /home/jonathan/.claude/dcg.toml")
+
+    # THEN the operator step that clears it, which is what the runbook has to
+    # carry: remove the seeded file, and only then does the cutover complete.
+    workstation.succeed("rm /home/jonathan/.claude/dcg.toml")
     workstation.succeed(
         "systemctl restart claude-runtime-links.service"
     )
     assert workstation.succeed(
         "systemctl show -P ExecMainStatus claude-runtime-links.service"
     ).strip() == "0"
+    # Scoped to THIS invocation, not to a line count. A tail wide enough to
+    # hold the run above would carry its "cutover is incomplete" into an
+    # assertion that the cutover is complete, and the test would be reading
+    # the previous failure as the current result.
+    complete_invocation = workstation.succeed(
+        "systemctl show -P InvocationID claude-runtime-links.service"
+    ).strip()
+    assert complete_invocation, "the unit reported no InvocationID"
     complete_log = workstation.succeed(
-        "journalctl -u claude-runtime-links.service -n 20 --no-pager"
+        f"journalctl _SYSTEMD_INVOCATION_ID={complete_invocation} --no-pager"
     )
     assert "cutover is incomplete" not in complete_log, complete_log
     assert "0 path(s) left alone" in complete_log, complete_log
+    workstation.succeed("test -L /home/jonathan/.claude/dcg.toml")
+    workstation.succeed("grep -q '# PROJECTED' /home/jonathan/.claude/dcg.toml")
     # By content as well as by link target: a link resolving nowhere would
     # satisfy readlink on its own.
     assert workstation.succeed(
@@ -5774,9 +5827,17 @@ in
 
     # Activation has to coexist with the projection: by this point
     # ~/.claude/skills is a symlink into a read-only mount, and home-manager
-    # must neither write through it nor trip over it. It declares no home.file
-    # target under ~/.claude, so there is nothing for it to write there at all
-    # — which is what makes the collision designed out rather than deferred.
+    # must neither write through it nor trip over it. No home.file target under
+    # ~/.claude is declared, so there is nothing for it to WRITE there.
+    #
+    # That is not the whole coupling, and an earlier version of this comment
+    # claimed it was. home.activation.dcgConfigVerdict asks `dcg config`
+    # whether the user layer loaded, and refuses activation when it did not —
+    # and that layer resolves, through ~/.config/dcg/config.toml, to
+    # ~/.claude/dcg.toml, which is now a symlink into the read-only mount. So
+    # this restart also asserts that a PROJECTED dcg.toml is one dcg can load:
+    # swap the fixture's copy for an unparseable one and this line fails, which
+    # is how it was found.
     workstation.succeed("systemctl restart home-manager-jonathan.service")
     assert workstation.succeed(
         "systemctl show -P ExecMainStatus home-manager-jonathan.service"
