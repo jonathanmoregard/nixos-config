@@ -5473,5 +5473,364 @@ in
     workstation.succeed("systemctl reset-failed home-manager-jonathan.service")
     workstation.succeed("systemctl start home-manager-jonathan.service")
     workstation.succeed("test -f /home/jonathan/.claude/dcg.toml")
+
+    # claude-runtime-mounts — project claude-config's runtime subset into
+    # ~/.claude read-only, and leave the dev trees unreachable by that route.
+    #
+    # The claim under test is NOT "a dev tree is gone". It is the asymmetry:
+    # every ~/.claude spelling misses the dev trees while the checkout path
+    # still reaches them. A test that only asserted the first half would read
+    # as filesystem isolation and would pass for the wrong reason.
+    checkout = "/home/jonathan/Repos/claude-config"
+    workstation.succeed(
+        f"install -d -o jonathan -g users {checkout}/runtime/hooks "
+        f"{checkout}/runtime/skills {checkout}/tests "
+        f"{checkout}/vendor/superpowers/hooks {checkout}/vendor/superpowers/skills "
+        f"{checkout}/vendor/everything-claude-code/skills "
+        f"{checkout}/vendor/everything-claude-code/tests && "
+        f"printf 'guard\\n' > {checkout}/runtime/hooks/bash-guard.py && "
+        f"printf 'skill\\n' > {checkout}/runtime/skills/keep.md && "
+        f"printf '{{}}\\n' > {checkout}/runtime/settings.json && "
+        f"printf 'pin\\n' > {checkout}/runtime/.claude-powerline.json && "
+        f"printf 'DEVONLY\\n' > {checkout}/tests/dev-only-marker && "
+        f"printf 'sp-hook\\n' > {checkout}/vendor/superpowers/hooks/sp.sh && "
+        f"printf 'sp-skill\\n' > {checkout}/vendor/superpowers/skills/sp.md && "
+        f"printf '{{}}\\n' > {checkout}/vendor/superpowers/package.json && "
+        f"printf 'ecc-skill\\n' > {checkout}/vendor/everything-claude-code/skills/ecc.md && "
+        f"printf 'ECCDEV\\n' > {checkout}/vendor/everything-claude-code/tests/ecc-dev-marker && "
+        f"chown -R jonathan:users {checkout}"
+    )
+
+    # No ordering cycle at boot. The mounts land after local-fs.target
+    # because systemd-tmpfiles-setup.service creates their mountpoints and
+    # itself runs after local-fs.target, so they must opt out of the default
+    # mount dependencies (which include Before=local-fs.target). Getting that
+    # wrong does not fail the mount — systemd breaks the cycle by DELETING a
+    # job from it, and on this config it picked systemd-tmpfiles-setup, after
+    # which nix-daemon, nscd and home-manager activation all failed at boot.
+    # Conditions are evaluated after the job queue is built, so the cycle
+    # happens whether or not the cutover marker exists.
+    cycles = workstation.succeed("journalctl -b --no-pager | grep -i 'ordering cycle' || true")
+    assert ".claude" not in cycles, cycles
+    assert workstation.succeed(
+        "systemctl is-active systemd-tmpfiles-setup.service"
+    ).strip() == "active"
+
+    # Mountpoints come from systemd.tmpfiles.rules in the module. They are
+    # already there from boot, but re-run so the assertions below do not
+    # depend on boot ordering against home-manager creating ~/.claude.
+    # systemd-tmpfiles-setup.service sets RefuseManualStart; the resetup unit
+    # is the one NixOS provides for re-applying rules.
+    workstation.succeed("systemctl start systemd-tmpfiles-resetup.service")
+
+    # Before the cutover marker exists, the whole projection must be inert:
+    # the mounts skip on their condition and the links unit skips too, so a
+    # deploy that lands before cutover changes nothing.
+    marker = "/home/jonathan/.claude/.projection-enabled"
+    workstation.fail(f"test -e {marker}")
+    runtime_mount_pre = workstation.succeed(
+        "systemd-escape -p --suffix=mount /home/jonathan/.claude/runtime"
+    ).strip()
+    workstation.succeed(f"systemctl start '{runtime_mount_pre}'")
+    assert workstation.succeed(
+        f"systemctl show -P ConditionResult '{runtime_mount_pre}'"
+    ).strip() == "no"
+    # A unit whose conditions were never evaluated also reports
+    # ConditionResult=no, so that assertion alone cannot tell "skipped" from
+    # "never started". The timestamp is non-zero only once systemd has
+    # actually checked.
+    assert workstation.succeed(
+        f"systemctl show -P ConditionTimestampMonotonic '{runtime_mount_pre}'"
+    ).strip() != "0"
+    workstation.fail("mountpoint -q /home/jonathan/.claude/runtime")
+
+    # The links unit carries no condition on the marker, deliberately: "no
+    # marker" and "marker deleted after cutover, every link now dangling" look
+    # identical to systemd and are opposite outcomes in fact. So it runs, finds
+    # no marker and no links of its own, says so, and exits 0.
+    workstation.succeed("systemctl restart claude-runtime-links.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus claude-runtime-links.service"
+    ).strip() == "0"
+    pre_marker_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -b --no-pager"
+    )
+    assert "no cutover marker" in pre_marker_log, pre_marker_log
+    workstation.fail("test -L /home/jonathan/.claude/hooks")
+
+    # Cutover: the operator creates the marker by hand. Everything below is
+    # the post-cutover world.
+    workstation.succeed(f"install -o jonathan -g users -m 0644 /dev/null {marker}")
+
+    mount_units = [
+        workstation.succeed(
+            f"systemd-escape -p --suffix=mount /home/jonathan/.claude/{relative}"
+        ).strip()
+        for relative in [
+            "runtime",
+            "vendor/superpowers/hooks",
+            "vendor/superpowers/skills",
+            "vendor/superpowers/package.json",
+            "vendor/everything-claude-code/skills",
+        ]
+    ]
+    # Quote the unit name: systemd-escape renders '-' in a path segment as
+    # \x2d, and an unquoted backslash is eaten by the shell, so systemctl
+    # would look up a name that does not exist (exit 5).
+    for unit in mount_units:
+        workstation.succeed(f"systemctl start '{unit}'")
+        assert workstation.succeed(
+            f"systemctl is-active '{unit}'"
+        ).strip() == "active", unit
+
+    # Content arrives through the projection.
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/runtime/hooks/bash-guard.py"
+    ).strip() == "guard"
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/vendor/superpowers/skills/sp.md"
+    ).strip() == "sp-skill"
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/vendor/superpowers/package.json"
+    ).strip() == "{}"
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/vendor/everything-claude-code/skills/ecc.md"
+    ).strip() == "ecc-skill"
+
+    # Read-only, so a hook cannot rewrite its own source through ~/.claude.
+    workstation.fail("touch /home/jonathan/.claude/runtime/should-not-write")
+    workstation.fail(
+        "su - jonathan -c 'touch /home/jonathan/.claude/runtime/skills/nope'"
+    )
+
+    # THE ASYMMETRY. Dev trees are not reachable under ~/.claude by any
+    # spelling, and are still perfectly readable at the checkout path.
+    for spelling in [
+        "/home/jonathan/.claude/tests",
+        "/home/jonathan/.claude/runtime/tests",
+        "/home/jonathan/.claude/vendor/everything-claude-code/tests",
+    ]:
+        workstation.fail(f"test -e {spelling}")
+    # The `..` escape specifically. This is what "bind mounts, never
+    # symlinks" rests on: a symlink-based rig would pass the three test -e
+    # checks above and still resolve `..` to the on-disk parent, handing the
+    # dev tree straight back.
+    workstation.fail("cat /home/jonathan/.claude/runtime/../tests/dev-only-marker")
+    workstation.fail(
+        "su - jonathan -c 'cat /home/jonathan/.claude/runtime/../tests/dev-only-marker'"
+    )
+
+    assert workstation.succeed(f"cat {checkout}/tests/dev-only-marker").strip() == "DEVONLY"
+    assert workstation.succeed(
+        f"cat {checkout}/vendor/everything-claude-code/tests/ecc-dev-marker"
+    ).strip() == "ECCDEV"
+
+    # The per-entry links, written once the mount is up. `restart`, not
+    # `start`: this is a oneshot with RemainAfterExit, it already ran and
+    # exited 0 in the pre-marker block above, and `start` on an active unit is
+    # a no-op that would assert nothing here.
+    #
+    # And `fail`, not `succeed`: ~/.claude/skills is a real home-manager
+    # directory at this point (home/claude-skills.nix still writes it, and is
+    # deleted at cutover), so one path is left alone and the unit exits 75 by
+    # design. A
+    # left-alone path means agents still read the old content there, which must
+    # not report as healthy. Every assertion below is about what the unit did
+    # before it refused.
+    workstation.fail(
+        "systemctl restart claude-runtime-links.service"
+    )
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus claude-runtime-links.service"
+    ).strip() == "75"
+    incomplete_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -n 20 --no-pager"
+    )
+    assert "cutover is incomplete" in incomplete_log, incomplete_log
+    assert "agents still read the old content" in incomplete_log, incomplete_log
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/hooks"
+    ).strip() == "runtime/hooks"
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/.claude-powerline.json"
+    ).strip() == "runtime/.claude-powerline.json"
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/hooks/bash-guard.py"
+    ).strip() == "guard"
+
+    # settings.json is deliberately not projected: Claude Code writes it, and
+    # a link into the read-only mount would make that write fail.
+    workstation.fail("test -L /home/jonathan/.claude/settings.json")
+
+    # A real path in the way is LEFT ALONE, never replaced. The old flat
+    # tracked files collide with these links, and clearing them is a cutover
+    # step taken deliberately with the operator present — an activation unit
+    # must not delete a live home directory to make room for a symlink.
+    workstation.succeed(
+        "install -d -o jonathan -g users /home/jonathan/Repos/claude-config/runtime/commands && "
+        "printf 'projected\\n' > /home/jonathan/Repos/claude-config/runtime/commands/c.md && "
+        "install -d -o jonathan -g users /home/jonathan/.claude/commands && "
+        "printf 'PRECIOUS\\n' > /home/jonathan/.claude/commands/live-only.md && "
+        "chown -R jonathan:users /home/jonathan/.claude/commands "
+        "/home/jonathan/Repos/claude-config/runtime/commands"
+    )
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    workstation.fail("test -L /home/jonathan/.claude/commands")
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/commands/live-only.md"
+    ).strip() == "PRECIOUS"
+    # No `|| fallback`: a fallback that returns the whole journal, or an
+    # empty match with status 0, would turn this into an assertion about
+    # nothing.
+    links_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -n 40 --no-pager"
+    )
+    # The whole line, not its two halves separately: ~/.claude/skills is a
+    # real home-manager directory, so "is not a symlink; left alone" is
+    # already in this journal from the boot run and matching it alone would
+    # assert nothing about commands/.
+    assert (
+        "claude-runtime-links: /home/jonathan/.claude/commands exists and is "
+        "not a symlink; left alone"
+    ) in links_log, links_log
+
+    # A symlink pointing somewhere OTHER than runtime/ is somebody's property
+    # — a home-manager store link, or one the operator made — and is left
+    # alone rather than retargeted. This is the shape of the hazard that makes
+    # deleting home/claude-skills.nix a cutover step: while ~/.claude/skills is
+    # still a home-manager link, this unit must not take it over.
+    workstation.succeed(
+        "install -d -o jonathan -g users "
+        "/home/jonathan/Repos/claude-config/runtime/foreign-entry && "
+        "printf 'projected\\n' > "
+        "/home/jonathan/Repos/claude-config/runtime/foreign-entry/p.md && "
+        "chown -R jonathan:users "
+        "/home/jonathan/Repos/claude-config/runtime/foreign-entry && "
+        "ln -sfn /etc /home/jonathan/.claude/foreign-entry && "
+        "chown -h jonathan:users /home/jonathan/.claude/foreign-entry"
+    )
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/foreign-entry"
+    ).strip() == "/etc"
+    foreign_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -n 40 --no-pager"
+    )
+    assert "not into runtime/; left alone" in foreign_log, foreign_log
+    workstation.succeed("rm /home/jonathan/.claude/foreign-entry")
+
+    # Removing the marker after cutover must be LOUD, not a quiet return to
+    # the pre-cutover no-op: the links written at cutover are all still there
+    # and all dangle the moment the mounts stop honouring their condition.
+    workstation.succeed(f"mv {marker} {marker}.away")
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus claude-runtime-links.service"
+    ).strip() == "75"
+    marker_gone_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -n 20 --no-pager"
+    )
+    assert "refusing to leave them dangling" in marker_gone_log, marker_gone_log
+    # It refused rather than tidying up: the links are untouched.
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/hooks"
+    ).strip() == "runtime/hooks"
+    workstation.succeed(f"mv {marker}.away {marker}")
+    workstation.succeed("systemctl reset-failed claude-runtime-links.service")
+    # Fails again, for the other reason: the marker is back, so it links, and
+    # then refuses because ~/.claude/skills is still a real home-manager
+    # directory. Distinguish the two by the message, not the exit code — and
+    # read only THIS run's output. A fixed `-n N` window spans the previous
+    # runs, which already carry the dangling-links message, so the negative
+    # half of this assertion would be about the wrong run. Cursor-scoped, the
+    # same way the dcg block above does it.
+    links_cursor = workstation.succeed(
+        "journalctl -u claude-runtime-links.service --no-pager -n 0 --show-cursor"
+    ).rsplit("-- cursor:", 1)[1].strip()
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    relinked_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service --no-pager -o cat "
+        f"--after-cursor '{links_cursor}'"
+    )
+    assert "refusing to leave them dangling" not in relinked_log, relinked_log
+    assert "cutover is incomplete" in relinked_log, relinked_log
+
+    # systemd-tmpfiles runs on every nixos-rebuild switch, and after cutover
+    # its rules point at the live read-only binds. With `d`/`f` it would try
+    # to chmod them and fail EROFS on every switch; `d-`/`f-` is what keeps
+    # that from being load-bearing on the checkout's modes. Prove it with the
+    # projection mounted, which is the state that makes it possible.
+    workstation.succeed("mountpoint -q /home/jonathan/.claude/runtime")
+    workstation.succeed("systemctl restart systemd-tmpfiles-resetup.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus systemd-tmpfiles-resetup.service"
+    ).strip() == "0"
+    workstation.succeed("mountpoint -q /home/jonathan/.claude/runtime")
+
+    # Activation still succeeds with the projection mounted. Scope, stated
+    # honestly: ~/.claude/skills is a real directory at this point, so this
+    # does NOT exercise the home.file-into-a-read-only-mount collision — it
+    # guards the tmpfiles/mount/activation interaction only. That collision is
+    # designed out rather than deferred: the cutover deletes
+    # home/claude-skills.nix, after which this repo writes nothing under
+    # ~/.claude and there is no collision left to assert. claude-config owns
+    # those skills from #26 onward, so nothing here needs to assert where they
+    # land either.
+    workstation.succeed("systemctl restart home-manager-jonathan.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus home-manager-jonathan.service"
+    ).strip() == "0"
+
+    # A missing or half-built checkout must be LOUD. The mount skips on its
+    # ConditionPathExists, which keeps boot safe, but the links unit then has
+    # no projection to link against. If it also skipped quietly, every
+    # per-entry symlink would dangle and the next session would come up with
+    # no hooks, no permission rules and no MCP servers while looking healthy.
+    # So it exits 75 and lands in `failed`, where systemctl --failed and the
+    # SessionStart unit-failure report can see it.
+    workstation.succeed("mv /home/jonathan/Repos/claude-config/runtime /home/jonathan/Repos/claude-config/runtime-gone")
+    runtime_mount = workstation.succeed(
+        "systemd-escape -p --suffix=mount /home/jonathan/.claude/runtime"
+    ).strip()
+    workstation.succeed("systemctl stop claude-runtime-links.service")
+    workstation.succeed(f"systemctl stop '{runtime_mount}'")
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    assert workstation.succeed(
+        f"systemctl show -P ConditionResult '{runtime_mount}'"
+    ).strip() == "no"
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus claude-runtime-links.service"
+    ).strip() == "75"
+    assert workstation.succeed(
+        "systemctl is-failed claude-runtime-links.service"
+    ).strip() == "failed"
+    assert "claude-runtime-links" in workstation.succeed(
+        "systemctl --failed --no-legend"
+    )
+    # Refusing means refusing to touch anything, not tidying up on the way
+    # out: the links written while the projection was up are still there, so
+    # the config comes back whole as soon as the mount does. If the exit-75
+    # path ever reached the stale sweep, all ~52 would be gone here.
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/hooks"
+    ).strip() == "runtime/hooks"
+
+    # Restore the projection. The unit still exits 75 — ~/.claude/skills is a
+    # real home-manager directory for as long as home/claude-skills.nix exists
+    # in this repo, so this lane cannot reach the complete-cutover state where
+    # nothing is blocked. Deleting that file is the cutover step, not this one.
+    # That half of the contract (blocked == 0 -> exit 0) is covered by the
+    # adversarial harness's clean-run case instead; here the point is that the
+    # projection and the links come back.
+    workstation.succeed("mv /home/jonathan/Repos/claude-config/runtime-gone /home/jonathan/Repos/claude-config/runtime")
+    workstation.succeed("systemctl reset-failed claude-runtime-links.service")
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    # And the projection came back with it, pulled up by RequiresMountsFor
+    # rather than started by hand.
+    workstation.succeed("mountpoint -q /home/jonathan/.claude/runtime")
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/hooks/bash-guard.py"
+    ).strip() == "guard"
+    workstation.succeed("systemctl reset-failed claude-runtime-links.service")
   '';
 }

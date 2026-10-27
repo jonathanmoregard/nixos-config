@@ -58,6 +58,14 @@ let
   hmTargets = map (entry ".claude/skills-hm") skills;
 
   # Transitional: delete at claude-config L2 cutover (see header).
+  #
+  # These MUST survive until the cutover deploy itself, and dropping them in
+  # the same change that adds the projection was a mistake caught in review.
+  # Removing them makes home-manager's orphan cleanup delete the live
+  # ~/.claude/skills/nixos-* links on the next activation, and the replacement
+  # read path — runtime/skills/<name>, via the projection — is not reachable
+  # until ~/.claude/skills is itself a symlink into the mount, which only
+  # happens at cutover. In between, these four skills silently disappear.
   compatTargets = map (entry ".claude/skills") skills;
 in
 {

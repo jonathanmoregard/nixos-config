@@ -16,6 +16,10 @@
     ../../modules/nixos/local-stt.nix
     # Tuxedo only: quiet background AI (freeze when hot/battery/dictating) + telemetry.
     ../../modules/nixos/ai-throttle.nix
+
+    # Projects claude-config's runtime subset into ~/.claude. tuxedo only:
+    # it is the host where ~/.claude is a live agent config.
+    ../../modules/nixos/claude-runtime-mounts.nix
   ];
 
   networking.hostName = "tuxedo";
