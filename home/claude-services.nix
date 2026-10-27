@@ -193,11 +193,19 @@ in
   systemd.user.timers.claude-pull = {
     Unit.Description = "Poll origin for merged ~/.claude PRs every 10 minutes";
     Timer = {
-      # Calendar rather than monotonic (unlike its neighbours) precisely so
-      # Persistent= applies: it has no effect on OnUnitActiveSec= timers.
-      # This is a laptop that suspends, and a merge landing while it sleeps
-      # should arrive on resume, not at the next natural boundary.
+      # Calendar rather than monotonic, for the reason spelled out on the
+      # gh-token timer above: the monotonic clock stops during suspend, so a
+      # calendar elapse that passed while the laptop slept fires on resume
+      # whereas OnUnitActiveSec= would wait out its whole interval. That
+      # resume behaviour comes from the calendar schedule, NOT from
+      # Persistent= — an earlier version of this comment credited Persistent=
+      # with it, which is wrong.
       OnCalendar = "*:0/10";
+      # Persistent= covers the other gap: time the TIMER ITSELF was inactive,
+      # i.e. the machine powered off or the user manager down. systemd stamps
+      # the last trigger under ~/.local/share/systemd/timers and fires once on
+      # activation if a tick was missed. It only applies to calendar timers,
+      # which is a second reason the schedule above is not monotonic.
       Persistent = true;
       # Nothing downstream cares about the exact second; the slack lets
       # systemd coalesce this tick with other wakeups instead of waking the

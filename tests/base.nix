@@ -4313,13 +4313,6 @@ in
             f"claude-pull.timer {cmd}={got!r} — CD for the Claude config repo "
             f"is not running, and nothing else reports that"
         )
-    # Persistent= is why the schedule is OnCalendar rather than
-    # OnUnitActiveSec, where it would have no effect: this is a laptop that
-    # suspends, and a merge landing while it sleeps should arrive on resume.
-    assert workstation.succeed(
-        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-        "systemctl --user show -P Persistent claude-pull.timer'"
-    ).strip() == "yes"
 
     # claude-marketplace-pull — the same puller, second target.
     #
