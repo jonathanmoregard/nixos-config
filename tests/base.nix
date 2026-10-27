@@ -3983,11 +3983,26 @@ in
         got = workstation.succeed(f"su - jonathan -c 'cat {path}'").strip()
         assert got == want, f"{path}: expected {want!r}, got {got!r}"
         assert workstation.succeed(f"stat -c '%U %a' {path}").strip() == "jonathan 600", path
-    mint_journal = workstation.succeed(
+    # journald ingests asynchronously, so a mint line can trail the
+    # `systemctl start` that produced it. Wait for the line instead of racing
+    # it; a real regression still fails, and the dump below says which kind:
+    # an empty journal means the unit never answered, a mint line with another
+    # repository_selection means it answered wrongly.
+    mint_journal_cmd = (
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "journalctl --user -u gh-token.service -n 50 --no-pager'"
     )
-    assert '"repository_selection":"all"' in mint_journal, mint_journal
+    mint_journal = ""
+    for _ in range(30):
+        mint_journal = workstation.succeed(mint_journal_cmd)
+        if '"repository_selection":"all"' in mint_journal:
+            break
+        workstation.sleep(1)
+    assert '"repository_selection":"all"' in mint_journal, (
+        "the three tokens minted correctly (asserted above) but"
+        " gh-token.service's journal carried no org-scoped mint within 30s:\n"
+        + mint_journal
+    )
     assert "ghs_vm" not in mint_journal, "a token reached the journal:\n" + mint_journal
     # The consumers answer with the broker's token.
     assert workstation.succeed(
