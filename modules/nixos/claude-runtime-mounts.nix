@@ -26,6 +26,9 @@
 #     vendor/superpowers/package.json -> the checkout (a symlink, never a bind)
 #     vendor/everything-claude-code/skills <- bind, ro
 #     projects/ plugins/ ...        untracked live state, projected by nothing
+#                                   — and where the plugin clones, the
+#                                   permission ledger and the per-tool
+#                                   state.json have to land too
 #
 # `vendor/` cannot move into `runtime/` — it holds two submodules — so only
 # the four subpaths the harness actually loads are projected, each its own
@@ -57,12 +60,23 @@
 # The marker is what sequences this; merge order between the two repositories
 # does not matter.
 #
-# #26 supersedes #25, which carried the same skills as absolute symlinks into
-# ~/.claude/skills-hm — the location home/claude-skills.nix writes. That
-# indirection is gone: claude-config owns the skill content outright, so
-# nothing under ~/.claude has to stay writable on its behalf, and the matching
-# deletion of home/claude-skills.nix is a cutover step rather than a
-# standing collision hazard for this module to work around.
+# THIRD PRECONDITION, also claude-config's and also sequenced by the marker:
+# `skills/`, `permission-ledger/` and `tools/` must hold no live state under
+# ~/.claude when the marker is created. Each is a tracked directory that also
+# accumulates writes in place — plugin clones, the ledger's .jsonl and
+# decided.json, a per-tool state.json — so each is a real directory at
+# ~/.claude/<entry>, and a real directory is reported blocked rather than
+# clobbered.
+#
+# Moving those writes out is the fix; `unlinkedEntries` is not. Exempting an
+# entry projects nothing in its place, so it would withhold the very content
+# the projection exists to deliver. Everything this repo names under those
+# three directories only reads, which a read-only mount serves unchanged.
+#
+# claude-config owns the skill content outright, so no home-manager target
+# under ~/.claude has to stay writable on its behalf and this repo declares
+# no home.file target there at all. That is what leaves this module with no
+# standing collision to work around.
 #
 # Also ordered by the marker, not by a merge: runtime/dcg.toml. home/dcg.nix
 # seeds ~/.claude/dcg.toml from a store fallback when that path is absent at
@@ -209,6 +223,10 @@ let
   # than by making a path read-only. Tracked separately; until it lands,
   # ~/.claude/settings.json stays an ordinary writable file and simply does
   # not receive repository updates.
+  #
+  # Exempting a directory drops its whole projected tree, so a directory that
+  # merely holds live state does not belong here — move the state out instead.
+  # See the THIRD PRECONDITION at the top.
   unlinkedEntries = [ "settings.json" ];
 
   linkRuntime = pkgs.writeShellApplication {
@@ -421,14 +439,16 @@ let
       # is finished, which lands the unit in `failed` and puts it in
       # `systemctl --failed` and the SessionStart report.
       #
-      # This is a true signal rather than a permanent alarm, because in the
-      # finished state nothing is blocked: the cutover deletes the old flat
-      # tracked files, home/claude-skills.nix is deleted so this repo stops
-      # writing ~/.claude/skills at all, and settings.json is exempt by name
-      # rather than counted. It does mean the unit stays `failed` for the
-      # length of the cutover window — from the moment the marker goes in
-      # until that deletion deploys — which is correct: the cutover is, at
-      # that point, incomplete.
+      # A true signal rather than a permanent alarm: nothing here is blocked
+      # once ~/.claude holds no real entries of its own, and settings.json is
+      # exempt by name rather than counted. While anything IS blocked the unit
+      # sits in `failed`, which is the intended report — the projection is
+      # genuinely incomplete until then.
+      #
+      # Leaving a blocked path alone is also what keeps home-manager clear of
+      # the read-only mount: a path stays real for as long as it is blocked, so
+      # anything home-manager still owns there it can still remove, and the
+      # path only becomes a symlink into the projection once nothing is left.
       if [ "$blocked" -gt 0 ]; then
         echo "claude-runtime-links: cutover is incomplete — $blocked path(s) left alone, and agents still read the old content there" >&2
         exit 75

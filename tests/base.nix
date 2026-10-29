@@ -128,10 +128,9 @@ let
 
   worktreeWorkflowSources = {
     claude = pkgs.writeText "workflow-CLAUDE.md" (builtins.readFile ../CLAUDE.md);
-    nixosConfigDev = pkgs.writeText "workflow-nixos-config-dev.md"
-      (builtins.readFile ../home/claude-skills/nixos-config-dev/SKILL.md);
-    agenixSecret = pkgs.writeText "workflow-nixos-agenix-secret.md"
-      (builtins.readFile ../home/claude-skills/nixos-agenix-secret/SKILL.md);
+    # The nixos-* skills are absent on purpose: claude-config owns them, so
+    # this repo cannot read their text, and the equivalent prose gate lives in
+    # that repo's tests/enforced/test_skill_worktree_prose.py.
     jonathan = pkgs.writeText "workflow-jonathan.nix"
       (builtins.readFile ../home/jonathan.nix);
     jonathanLinux = pkgs.writeText "workflow-jonathan-linux.nix"
@@ -2113,14 +2112,6 @@ in
     # no automation depends on or advances shared refs/heads/main.
     workflow_sources = {
         "CLAUDE.md": ("${worktreeWorkflowSources.claude}", "feat/<slug>"),
-        "nixos-config-dev": (
-            "${worktreeWorkflowSources.nixosConfigDev}",
-            "feat/<slug>",
-        ),
-        "nixos-agenix-secret": (
-            "${worktreeWorkflowSources.agenixSecret}",
-            "feat/<slug>",
-        ),
         "home/jonathan.nix": (
             "${worktreeWorkflowSources.jonathan}",
             "feat/foo",
@@ -2413,7 +2404,13 @@ in
         "--no-pager' | grep -q 'session-reflect backfill drain failed'",
         timeout=60,
     )
+    # Remove the PARENT too, not just the planted script's directory: the
+    # claude-runtime-mounts block far below asserts the projection takes
+    # ~/.claude/skills over, and an empty directory left here blocks it exactly
+    # as a full one would. `rmdir` rather than `rm -rf` so that anything else
+    # appearing under there fails loudly instead of being deleted silently.
     workstation.succeed("rm -rf /home/jonathan/.claude/skills/session-reflect")
+    workstation.succeed("rmdir /home/jonathan/.claude/skills")
     workstation.succeed(
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "systemctl --user reset-failed session-reflect-backfill.service'"
@@ -5793,6 +5790,21 @@ in
         f"printf 'skill\\n' > {checkout}/runtime/skills/keep.md && "
         f"printf '{{}}\\n' > {checkout}/runtime/settings.json && "
         f"printf 'pin\\n' > {checkout}/runtime/.claude-powerline.json && "
+        # dcg.toml is the one entry where this flake and the projection
+        # compete for the same path: home/dcg.nix's arm 1 SEEDS a real
+        # ~/.claude/dcg.toml whenever that path is absent (asserted some
+        # 150 lines above this), and `runtime/dcg.toml` is tracked in
+        # claude-config, so the links unit wants to put a symlink there.
+        # Leaving it out of this fixture is what let the exit-0 assertion
+        # below pass while saying nothing about the host.
+        # Valid dcg config, because once this entry is linked, dcg itself has
+        # to be able to load it: home.activation.dcgConfigVerdict asks
+        # `dcg config` and REFUSES activation when the user layer is not
+        # loaded, so an unparseable projected file would fail every later
+        # rebuild. Distinguishable from the seed by one appended comment, so
+        # "whose content is live here" is answerable.
+        f"install -m 0644 ${../home/dcg-fallback.toml} {checkout}/runtime/dcg.toml && "
+        f"printf '\\n# PROJECTED\\n' >> {checkout}/runtime/dcg.toml && "
         f"printf 'DEVONLY\\n' > {checkout}/tests/dev-only-marker && "
         f"printf 'sp-hook\\n' > {checkout}/vendor/superpowers/hooks/sp.sh && "
         f"printf 'sp-skill\\n' > {checkout}/vendor/superpowers/skills/sp.md && "
@@ -5926,29 +5938,69 @@ in
         f"cat {checkout}/vendor/everything-claude-code/tests/ecc-dev-marker"
     ).strip() == "ECCDEV"
 
-    # The per-entry links, written once the mount is up. `restart`, not
-    # `start`: this is a oneshot with RemainAfterExit, it already ran and
-    # exited 0 in the pre-marker block above, and `start` on an active unit is
-    # a no-op that would assert nothing here.
+    # The per-entry links, written once the mount is up. `restart` rather than
+    # `start` so this runs whatever state the pre-marker block left the unit
+    # in.
     #
-    # And `fail`, not `succeed`: ~/.claude/skills is a real home-manager
-    # directory at this point (home/claude-skills.nix still writes it, and is
-    # deleted at cutover), so one path is left alone and the unit exits 75 by
-    # design. A
-    # left-alone path means agents still read the old content there, which must
-    # not report as healthy. Every assertion below is about what the unit did
-    # before it refused.
-    workstation.fail(
+    # FIRST the collision this flake itself creates. home/dcg.nix seeds a real
+    # ~/.claude/dcg.toml on any activation where that path is absent, and
+    # dcg.toml is a projected entry, so after the cutover deletes the old flat
+    # files the next activation plants a real file exactly where the link
+    # belongs. The unit must refuse it rather than delete an operator's
+    # hand-edited pattern list — and the refusal is exit 75, which means a
+    # cutover that stops here looks "mounted and healthy" while one entry is
+    # still pre-cutover content.
+    workstation.fail("systemctl restart claude-runtime-links.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus claude-runtime-links.service"
+    ).strip() == "75"
+    dcg_collision_log = workstation.succeed(
+        "journalctl -u claude-runtime-links.service -n 20 --no-pager"
+    )
+    assert (
+        "claude-runtime-links: /home/jonathan/.claude/dcg.toml exists and is "
+        "not a symlink; left alone"
+    ) in dcg_collision_log, dcg_collision_log
+    # Left alone means LEFT ALONE: home-manager's seeded content is still
+    # there, byte-for-byte, not replaced by the projection's copy.
+    workstation.fail("test -L /home/jonathan/.claude/dcg.toml")
+    workstation.succeed(
+        "cmp ${../home/dcg-fallback.toml} /home/jonathan/.claude/dcg.toml"
+    )
+    workstation.fail("grep -q '# PROJECTED' /home/jonathan/.claude/dcg.toml")
+
+    # THEN the operator step that clears it, which is what the runbook has to
+    # carry: remove the seeded file, and only then does the cutover complete.
+    workstation.succeed("rm /home/jonathan/.claude/dcg.toml")
+    workstation.succeed(
         "systemctl restart claude-runtime-links.service"
     )
     assert workstation.succeed(
         "systemctl show -P ExecMainStatus claude-runtime-links.service"
-    ).strip() == "75"
-    incomplete_log = workstation.succeed(
-        "journalctl -u claude-runtime-links.service -n 20 --no-pager"
+    ).strip() == "0"
+    # Scoped to THIS invocation, not to a line count. A tail wide enough to
+    # hold the run above would carry its "cutover is incomplete" into an
+    # assertion that the cutover is complete, and the test would be reading
+    # the previous failure as the current result.
+    complete_invocation = workstation.succeed(
+        "systemctl show -P InvocationID claude-runtime-links.service"
+    ).strip()
+    assert complete_invocation, "the unit reported no InvocationID"
+    complete_log = workstation.succeed(
+        f"journalctl _SYSTEMD_INVOCATION_ID={complete_invocation} --no-pager"
     )
-    assert "cutover is incomplete" in incomplete_log, incomplete_log
-    assert "agents still read the old content" in incomplete_log, incomplete_log
+    assert "cutover is incomplete" not in complete_log, complete_log
+    assert "0 path(s) left alone" in complete_log, complete_log
+    workstation.succeed("test -L /home/jonathan/.claude/dcg.toml")
+    workstation.succeed("grep -q '# PROJECTED' /home/jonathan/.claude/dcg.toml")
+    # By content as well as by link target: a link resolving nowhere would
+    # satisfy readlink on its own.
+    assert workstation.succeed(
+        "readlink /home/jonathan/.claude/skills"
+    ).strip() == "runtime/skills"
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/skills/keep.md"
+    ).strip() == "skill"
     assert workstation.succeed(
         "readlink /home/jonathan/.claude/hooks"
     ).strip() == "runtime/hooks"
@@ -5991,10 +6043,9 @@ in
     links_log = workstation.succeed(
         "journalctl -u claude-runtime-links.service -n 40 --no-pager"
     )
-    # The whole line, not its two halves separately: ~/.claude/skills is a
-    # real home-manager directory, so "is not a symlink; left alone" is
-    # already in this journal from the boot run and matching it alone would
-    # assert nothing about commands/.
+    # The whole line, not its two halves separately: any other left-alone path
+    # in this journal window supplies "is not a symlink; left alone" on its
+    # own, so matching that half would assert nothing about commands/.
     assert (
         "claude-runtime-links: /home/jonathan/.claude/commands exists and is "
         "not a symlink; left alone"
@@ -6002,9 +6053,10 @@ in
 
     # A symlink pointing somewhere OTHER than runtime/ is somebody's property
     # — a home-manager store link, or one the operator made — and is left
-    # alone rather than retargeted. This is the shape of the hazard that makes
-    # deleting home/claude-skills.nix a cutover step: while ~/.claude/skills is
-    # still a home-manager link, this unit must not take it over.
+    # alone rather than retargeted. Nothing in this repo produces such a link
+    # today, which is why it is worth asserting: any future home.file target
+    # under ~/.claude, or anything the operator links by hand, brings it back,
+    # and taking it over is how the unit would eat somebody else's config.
     workstation.succeed(
         "install -d -o claude-deploy -g claude-deploy "
         "/var/lib/claude-runtime/checkout/runtime/foreign-entry && "
@@ -6044,8 +6096,10 @@ in
     workstation.succeed(f"mv {marker}.away {marker}")
     workstation.succeed("systemctl reset-failed claude-runtime-links.service")
     # Fails again, for the other reason: the marker is back, so it links, and
-    # then refuses because ~/.claude/skills is still a real home-manager
-    # directory. Distinguish the two by the message, not the exit code — and
+    # then refuses because ~/.claude/commands is a real directory — the one
+    # this lane created above and deliberately never cleaned up.
+    # Distinguish the two reasons by the message, not the exit code, which is
+    # 75 either way — and
     # read only THIS run's output. A fixed `-n N` window spans the previous
     # runs, which already carry the dangling-links message, so the negative
     # half of this assertion would be about the wrong run. Cursor-scoped, the
@@ -6073,15 +6127,19 @@ in
     ).strip() == "0"
     workstation.succeed("mountpoint -q /home/jonathan/.claude/runtime")
 
-    # Activation still succeeds with the projection mounted. Scope, stated
-    # honestly: ~/.claude/skills is a real directory at this point, so this
-    # does NOT exercise the home.file-into-a-read-only-mount collision — it
-    # guards the tmpfiles/mount/activation interaction only. That collision is
-    # designed out rather than deferred: the cutover deletes
-    # home/claude-skills.nix, after which this repo writes nothing under
-    # ~/.claude and there is no collision left to assert. claude-config owns
-    # those skills from #26 onward, so nothing here needs to assert where they
-    # land either.
+    # Activation has to coexist with the projection: by this point
+    # ~/.claude/skills is a symlink into a read-only mount, and home-manager
+    # must neither write through it nor trip over it. No home.file target under
+    # ~/.claude is declared, so there is nothing for it to WRITE there.
+    #
+    # That is not the whole coupling, and an earlier version of this comment
+    # claimed it was. home.activation.dcgConfigVerdict asks `dcg config`
+    # whether the user layer loaded, and refuses activation when it did not —
+    # and that layer resolves, through ~/.config/dcg/config.toml, to
+    # ~/.claude/dcg.toml, which is now a symlink into the read-only mount. So
+    # this restart also asserts that a PROJECTED dcg.toml is one dcg can load:
+    # swap the fixture's copy for an unparseable one and this line fails, which
+    # is how it was found.
     workstation.succeed("systemctl restart home-manager-jonathan.service")
     assert workstation.succeed(
         "systemctl show -P ExecMainStatus home-manager-jonathan.service"
@@ -6121,13 +6179,15 @@ in
         "readlink /home/jonathan/.claude/hooks"
     ).strip() == "runtime/hooks"
 
-    # Restore the projection. The unit still exits 75 — ~/.claude/skills is a
-    # real home-manager directory for as long as home/claude-skills.nix exists
-    # in this repo, so this lane cannot reach the complete-cutover state where
-    # nothing is blocked. Deleting that file is the cutover step, not this one.
-    # That half of the contract (blocked == 0 -> exit 0) is covered by the
-    # adversarial harness's clean-run case instead; here the point is that the
-    # projection and the links come back.
+    # Restore the projection. Still exit 75, because ~/.claude/commands stays
+    # a real directory for the whole tail of this block — the point here is
+    # only that the projection and the links come back. Exit 0 is asserted at
+    # the top of the block, before anything has collided.
+    #
+    # The reason this comment no longer names ~/.claude/skills: that directory
+    # was home-manager's for as long as home/claude-skills.nix existed, and
+    # deleting that file is exactly what this branch does. The path below moved
+    # with the serving source, which is the deploy clone since #390.
     workstation.succeed("mv /var/lib/claude-runtime/checkout/runtime-gone /var/lib/claude-runtime/checkout/runtime")
     workstation.succeed("systemctl reset-failed claude-runtime-links.service")
     workstation.fail("systemctl restart claude-runtime-links.service")
