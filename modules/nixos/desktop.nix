@@ -36,11 +36,13 @@
   # display-manager-coupled.
   security.pam.services.lightdm.enableGnomeKeyring = true;
 
-  # gpg-agent: socket-activated PGP agent. pinentry-gtk2 matches Cinnamon's GTK
-  # stack so seahorse + CLI gpg share the same passphrase prompt UX.
+  # gpg-agent: socket-activated PGP agent. pinentry-gnome3 matches Cinnamon's
+  # GTK stack so seahorse + CLI gpg share the same passphrase prompt UX.
+  # (Was pinentry-gtk2 until the 2026-10 nixpkgs bump, which removed it along
+  # with the deprecated GTK2 engine it depended on — eval failed outright.)
   programs.gnupg.agent = {
     enable = true;
-    pinentryPackage = pkgs.pinentry-gtk2;
+    pinentryPackage = pkgs.pinentry-gnome3;
   };
 
   # cron daemon — required for the home-manager-installed user crontab
