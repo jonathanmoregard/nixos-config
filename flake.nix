@@ -212,9 +212,10 @@
         # ~/.claude output hooks and aggregator ingest. See
         # overlays/secret-redact.nix.
         (import ./overlays/secret-redact.nix)
-        # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
-        # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
-        (import ./overlays/claude-code.nix)
+        # `linuxPackages.tuxedo-drivers` builds at all: its Makefile splices
+        # $(MAKEFLAGS) into a shell recipe, which nixpkgs' kernel module
+        # signing flag no longer survives. See overlays/tuxedo-drivers.nix.
+        (import ./overlays/tuxedo-drivers.nix)
         # `pkgs.vscodium` newer than nixpkgs: the GitHub PR review extension
         # needs an editor >= 1.129. See overlays/vscodium.nix.
         (import ./overlays/vscodium.nix)

@@ -207,8 +207,8 @@ in
         github.vscode-pull-request-github
         # Claude in the editor: alt+k sends the selection to a conversation,
         # and proposed diffs land as accept/reject. The CLI is the system
-        # one (overlays/claude-code.nix); this extension cannot update
-        # itself from a read-only store path, which is the point.
+        # one from nixpkgs; this extension cannot update itself from a
+        # read-only store path, which is the point.
         anthropic.claude-code
       ];
     })
