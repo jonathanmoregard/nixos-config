@@ -754,11 +754,11 @@ in
     # nobody reviewing it.
     #
     # ~/.claude is now read-only: work happens in worktrees under
-    # ~/worktrees/claude-<slug>, reaches master through a PR, and comes
-    # back down via claude-pull.timer (see home/claude-services.nix),
-    # which is fast-forward-only and is now the ONLY writer to that
-    # checkout. Nothing replaces the push half, because there is no
-    # longer meant to be one.
+    # ~/worktrees/claude-<slug> and reaches master through a PR. Since
+    # 2026-10-27 it comes back down into a DEPLOY clone outside this home
+    # (modules/nixos/claude-runtime-deploy.nix), fast-forward-only, and that
+    # unit is the only writer to the tree ~/.claude is served from. Nothing
+    # replaces the push half, because there is no longer meant to be one.
     #
     # Deliberately not commented-out-in-place: a dormant cron line is an
     # invitation to re-enable without re-reading why it went.

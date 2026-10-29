@@ -157,69 +157,39 @@ in
   # tweak). The script is fast-forward-only by construction — unlike
   # /etc/nixos, ~/.claude is a live working tree that sessions write to,
   # so nixos-deploy's `git reset --hard` would destroy in-flight work.
-  systemd.user.services.claude-pull = {
-    Unit = {
-      Description = "Fast-forward ~/.claude to origin (CD for the Claude config repo)";
-      After = [ "default.target" ];
-    };
-    Service = {
-      Type = "oneshot";
-      # %h expands to $HOME under home-manager's systemd --user.
-      ExecStart = "%h/.claude/scripts/claude-pull.sh";
-      # Name the repository instead of letting the script derive it from its
-      # own location. That fallback stops working once claude-config's runtime
-      # subset is projected into ~/.claude: the script is then reached through
-      # ~/.claude/scripts -> runtime/scripts, and `runtime` is a MOUNT rather
-      # than a symlink, so `readlink -f` resolves to
-      # /home/jonathan/.claude/runtime/scripts and never leaves ~/.claude.
-      # `rev-parse --show-toplevel` from there walks up past a ~/.claude that
-      # no longer holds a .git and fails — or, if one is ever left behind,
-      # quietly pulls the OLD checkout instead. The other two pull units
-      # (marketplaces, klaffat) already name their repository for the same
-      # reason; this one is the last to rely on discovery.
-      Environment = [
-        "CLAUDE_PULL_REPO=${config.home.homeDirectory}/Repos/claude-config"
-      ];
-      # Background maintenance — never compete with an interactive session.
-      Nice = 10;
-      IOSchedulingClass = "idle";
-      # The script bounds its own fetch at 60s; this is the backstop for a
-      # hang anywhere else in the run. Comfortably under the 10min cadence
-      # so a wedged tick cannot overlap the next one.
-      TimeoutStartSec = 180;
-    };
-  };
-
-  systemd.user.timers.claude-pull = {
-    Unit.Description = "Poll origin for merged ~/.claude PRs every 10 minutes";
-    Timer = {
-      # Calendar rather than monotonic (unlike its neighbours) precisely so
-      # Persistent= applies: it has no effect on OnUnitActiveSec= timers.
-      # This is a laptop that suspends, and a merge landing while it sleeps
-      # should arrive on resume, not at the next natural boundary.
-      OnCalendar = "*:0/10";
-      Persistent = true;
-      # Nothing downstream cares about the exact second; the slack lets
-      # systemd coalesce this tick with other wakeups instead of waking the
-      # machine on its own, and keeps it out of the on-the-minute stampede.
-      AccuracySec = "1min";
-      RandomizedDelaySec = "1min";
-      Unit = "claude-pull.service";
-    };
-    # TEMPORARILY NOT ENABLED (no Install.WantedBy), so a reboot or a rebuild
-    # does not start this timer.
-    #
-    # Why: claude-config master now carries the relocated runtime/ layout
-    # (hooks/, skills/, agents/, commands/, scripts/ and the config files moved
-    # under runtime/), but the read-only bind mounts that project them back to
-    # their old paths do not exist yet. A pull would therefore move files out
-    # from under ~50 registered hook paths, the statusLine and the MCP server
-    # commands, breaking the Claude Code harness.
-    #
-    # Re-enable (restore `Install.WantedBy = [ "timers.target" ];`) as the LAST
-    # step of the claude-config runtime-layout cutover, once the bind mounts
-    # are in place. The unit stays defined so that is a one-line change.
-  };
+  # RETIRED 2026-10-27, and deliberately not replaced by a user unit.
+  #
+  # The service and timer that used to live here pulled claude-config into
+  # ~/Repos/claude-config, which was also the tree ~/.claude was SERVED from.
+  # That coupling is the thing Jonathan objected to: "Repos/claude-config is
+  # the dev version, and .claude is the deployed artefact. Real weird for
+  # production to depend on dev." The serving tree now lives at
+  # /var/lib/claude-runtime/checkout, written only by
+  # claude-runtime-deploy.service running as the claude-deploy system user —
+  # see modules/nixos/claude-runtime-deploy.nix, which carries the full
+  # reasoning, including why it is not root and why its ExecStart is
+  # store-pinned rather than %h-relative.
+  #
+  # Two consequences worth stating plainly, because neither is a regression:
+  #
+  #   * ~/Repos/claude-config no longer auto-updates. It is a DEV checkout:
+  #     branches, worktrees and rebases live there, and an unattended
+  #     fast-forward of a tree someone may be mid-rebase on is not a service.
+  #     Pull it by hand, or cut a worktree from origin/master as the policy
+  #     already requires.
+  #   * the whole "TEMPORARILY NOT ENABLED" hold that used to sit on this
+  #     timer is gone with it. That hold existed because a pull would relocate
+  #     files out from under ~50 registered hook paths in the LIVE ~/.claude
+  #     before any mount existed. The deploy unit cannot do that: it only ever
+  #     writes its own clone, which nothing reads until the cutover marker is
+  #     created, so it is enabled from the start — and in fact must run before
+  #     the marker, since the clone has to exist for the mounts to have a
+  #     source.
+  #
+  # The sibling pullers below (claude-marketplace-pull, klaffat-pull) stay as
+  # user units: they target OTHER repositories that are not served through the
+  # projection, and %h is correct for a unit whose service manager is the
+  # user's own.
 
   # claude-marketplace-pull — the same puller, second target.
   #

@@ -685,7 +685,8 @@ in
         # only has an effect on OnCalendar= and this is a laptop that
         # suspends: without catch-up, a machine asleep over a boundary
         # skips the snapshot and the window it covers loses its names.
-        # Same reasoning as claude-pull.timer in home/claude-services.nix.
+        # Same reasoning as the claude-config puller in
+        # modules/nixos/claude-runtime-deploy.nix.
         OnCalendar = "*:0/30";
         Persistent = true;
         AccuracySec = "1min";
