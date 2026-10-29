@@ -276,8 +276,13 @@ jobs:
     # `jonathanmoregard/nixos-config@main` lives in the .claude repo's
     # own CI (Phase 2 of proposal #128). Adding a cross-repo lint here
     # would need a PAT with read access to .claude — tracked as a
-    # follow-up; not load-bearing because every nixos-* skill that
-    # references this flake now lives in-repo (home/claude-skills/).
+    # follow-up. It USED to be non-load-bearing because every nixos-*
+    # skill that references this flake lived in-repo under
+    # home/claude-skills/; those moved to claude-config's runtime/skills/
+    # when the runtime projection took over delivery, so `nix run .#`
+    # references inside them are no longer covered by any job here. A
+    # renamed flake attribute now breaks those skills with this job still
+    # green. The cross-repo lint is what would close it.
     #
     # No build cost: pure `nix eval --apply 'x: null'` per unique
     # attribute, no realization. Total job runtime ~30-60s warm.

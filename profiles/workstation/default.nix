@@ -307,7 +307,7 @@
   # `add-secret` inserts new `age.secrets.<name>` blocks immediately
   # ABOVE this marker. Do not remove — the tool refuses to insert
   # without it. See home/add-secret.nix + skill doc
-  # home/claude-skills/nixos-agenix-secret/SKILL.md.
+  # ~/.claude/skills/nixos-agenix-secret/SKILL.md.
   age.secrets.gcal-ical-url = {
     rekeyFile = ../../secrets/gcal-ical-url.age;
     owner = "jonathan";
@@ -415,7 +415,7 @@
   #
   # `add-secret <name>` — one-command wrapper for the agenix-rekey add
   # flow (host-file edit → encrypt → rekey → commit → PR). See
-  # home/add-secret.nix + home/claude-skills/nixos-agenix-secret/SKILL.md.
+  # home/add-secret.nix + ~/.claude/skills/nixos-agenix-secret/SKILL.md.
   # Smoke-tested via checks.x86_64-linux.add-secret-smoke; the smoke
   # harness asserts the store path here matches the one it tested
   # (drift gate).
