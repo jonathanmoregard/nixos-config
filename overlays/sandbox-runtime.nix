@@ -14,6 +14,12 @@ let
 
     dontConfigure = true;
 
+    # Mirrors the package's own vendor/seccomp/build.ts. Keep the two in
+    # step: apply-seccomp.c pulls its filters in as generated C arrays, so a
+    # ruleset that build.ts emits and this phase does not is a compile error
+    # here, not a silent downgrade. That is what srt 0.0.68 -> 0.0.81 did —
+    # it split the single filter into `unix` and `namespaces`, and this phase
+    # still generated only the first.
     buildPhase = ''
       runHook preBuild
 
@@ -22,12 +28,28 @@ let
         -o build/seccomp-unix-block \
         vendor/seccomp-src/seccomp-unix-block.c \
         -lseccomp
-      build/seccomp-unix-block build/unix-block.bpf x86_64
-      xxd -i -n unix_block_bpf build/unix-block.bpf \
-        | sed \
-            -e '1s/^unsigned char/static const unsigned char/' \
-            -e '/^unsigned int unix_block_bpf_len =/d' \
-        > build/unix-block-bpf.h
+
+      # Separate arrays rather than one stacked filter, as upstream notes, so
+      # a command opted out of `namespaces` still keeps `unix`.
+      for rules in unix namespaces; do
+        build/seccomp-unix-block "build/x86_64.$rules.bpf" x86_64 "$rules"
+      done
+
+      {
+        echo '#if defined(__x86_64__)'
+        xxd -i -n unix_block_bpf build/x86_64.unix.bpf \
+          | sed \
+              -e '1s/^unsigned char/static const unsigned char/' \
+              -e '/^unsigned int unix_block_bpf_len =/d'
+        xxd -i -n namespace_block_bpf build/x86_64.namespaces.bpf \
+          | sed \
+              -e '1s/^unsigned char/static const unsigned char/' \
+              -e '/^unsigned int namespace_block_bpf_len =/d'
+        echo '#else'
+        echo '#error "these filters were generated for another architecture"'
+        echo '#endif'
+      } > build/unix-block-bpf.h
+
       $CC -static -O2 -Wall -Wextra \
         -I build \
         -o build/apply-seccomp \
