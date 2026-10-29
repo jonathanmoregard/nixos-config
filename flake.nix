@@ -212,6 +212,10 @@
         # ~/.claude output hooks and aggregator ingest. See
         # overlays/secret-redact.nix.
         (import ./overlays/secret-redact.nix)
+        # `linuxPackages.tuxedo-drivers` builds at all: its Makefile splices
+        # $(MAKEFLAGS) into a shell recipe, which nixpkgs' kernel module
+        # signing flag no longer survives. See overlays/tuxedo-drivers.nix.
+        (import ./overlays/tuxedo-drivers.nix)
         # `pkgs.vscodium` newer than nixpkgs: the GitHub PR review extension
         # needs an editor >= 1.129. See overlays/vscodium.nix.
         (import ./overlays/vscodium.nix)
