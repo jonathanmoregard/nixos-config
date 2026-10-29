@@ -24,6 +24,33 @@ let
     printf '%s\n' "''${GH_TOKEN:-}"
   '';
 
+  # Stand-in for claude-config's runtime/scripts/claude-pull.sh, so this lane
+  # can drive modules/nixos/claude-runtime-deploy.nix's wrapper END TO END,
+  # offline. The real puller lives in the other repository and is tested there;
+  # what this lane owns is the half that only exists here - bootstrapping the
+  # clone, refusing to execute anything jonathan could have written, and the
+  # environment handed over. The stub records that environment.
+  claudePullerStub = pkgs.writeShellScript "claude-pull-stub" ''
+    printf '%s|%s|%s\n' "''${CLAUDE_PULL_REPO:-}" "''${CLAUDE_PULL_STATE_ROOT:-}" \
+      "''${CLAUDE_PULL_UNIT:-}" > "''${CLAUDE_PULL_STATE_ROOT:-/tmp}/handoff"
+    # ...and the PATH it was handed over with. The real puller needs these, and
+    # a systemd system service inherits a PATH that holds none of them unless
+    # the unit's runtimeInputs say so: measured 2026-10-27, `flock` was missing
+    # and the puller read `command not found` (127) as "another run holds the
+    # lock", exiting 0 — a tick that skips forever while the unit reports
+    # success. `getent` is the same shape found in review a day later: its
+    # absence reads as "the host is offline", which also exits 0 and also
+    # bypasses the alert counter. This file is what makes either regression
+    # fail the lane.
+    for tool in flock getent git python3 sed grep; do
+      if command -v "$tool" >/dev/null 2>&1; then
+        printf '%s ok\n' "$tool"
+      else
+        printf '%s MISSING\n' "$tool"
+      fi
+    done > "''${CLAUDE_PULL_STATE_ROOT:-/tmp}/tools"
+  '';
+
   mcpInitializeJson = pkgs.writeText "vm-base-mcp-initialize.json" ''
     {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vm-base","version":"1"}}}
   '';
@@ -1882,8 +1909,10 @@ in
     # checkout is the running configuration, so an unattended 13:47 commit
     # of whatever a session left half-finished landed on master unreviewed.
     # Work now happens in worktrees under ~/worktrees/claude-<slug> and
-    # returns via claude-pull.timer, which is fast-forward-only and the only
-    # writer to that checkout.
+    # returns through a PR. As of 2026-10-27 it does not return to THIS
+    # checkout at all: the live config is served from a deploy clone that
+    # claude-runtime-deploy.service owns, and ~/Repos/claude-config is a dev
+    # tree nothing auto-updates.
     #
     # Asserted as an ABSENCE on purpose: a re-add would silently restore an
     # unattended writer to the config the harness reads live.
@@ -3980,11 +4009,26 @@ in
         got = workstation.succeed(f"su - jonathan -c 'cat {path}'").strip()
         assert got == want, f"{path}: expected {want!r}, got {got!r}"
         assert workstation.succeed(f"stat -c '%U %a' {path}").strip() == "jonathan 600", path
-    mint_journal = workstation.succeed(
+    # journald ingests asynchronously, so a mint line can trail the
+    # `systemctl start` that produced it. Wait for the line instead of racing
+    # it; a real regression still fails, and the dump below says which kind:
+    # an empty journal means the unit never answered, a mint line with another
+    # repository_selection means it answered wrongly.
+    mint_journal_cmd = (
         "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
         "journalctl --user -u gh-token.service -n 50 --no-pager'"
     )
-    assert '"repository_selection":"all"' in mint_journal, mint_journal
+    mint_journal = ""
+    for _ in range(30):
+        mint_journal = workstation.succeed(mint_journal_cmd)
+        if '"repository_selection":"all"' in mint_journal:
+            break
+        workstation.sleep(1)
+    assert '"repository_selection":"all"' in mint_journal, (
+        "the three tokens minted correctly (asserted above) but"
+        " gh-token.service's journal carried no org-scoped mint within 30s:\n"
+        + mint_journal
+    )
     assert "ghs_vm" not in mint_journal, "a token reached the journal:\n" + mint_journal
     # The consumers answer with the broker's token.
     assert workstation.succeed(
@@ -4298,25 +4342,277 @@ in
         f"rm -r {probe_dir} {org_repo} && rm {gh_stub} {host_token} {org_token}"
     )
 
-    # claude-pull is held OFF (home/claude-services.nix): the runtime/ layout
-    # on claude-config master has no bind mounts yet, so a pull would break
-    # the harness. The timer must not be enabled or running after a rebuild
-    # or reboot. Revert this block when the timer is re-enabled.
+    # CD for the Claude config repo is a SYSTEM unit now, running as a user
+    # jonathan cannot write, against a clone outside his home
+    # (modules/nixos/claude-runtime-deploy.nix). The old user timer is gone;
+    # these assertions are what stop it coming back by accident, because a
+    # user-owned puller writing the serving tree is the coupling the split
+    # removed.
     for cmd in ["is-enabled", "is-active"]:
         got = workstation.execute(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
             f"systemctl --user {cmd} claude-pull.timer'"
         )[1].strip()
         assert got not in ("enabled", "active"), (
-            f"claude-pull.timer {cmd}={got!r} — a pull would relocate "
-            f"~/.claude files out from under the hooks"
+            f"the retired user unit claude-pull.timer is back: {cmd}={got!r}."
+            " CD for this repo belongs to claude-runtime-deploy.timer, which"
+            " writes a clone jonathan cannot modify"
         )
+    for cmd in ["is-enabled", "is-active"]:
+        got = workstation.succeed(
+            f"systemctl {cmd} claude-runtime-deploy.timer"
+        ).strip()
+        assert got == ("enabled" if cmd == "is-enabled" else "active"), (
+            f"claude-runtime-deploy.timer {cmd}={got!r} — the serving tree"
+            " has no CD, and nothing else reports that"
+        )
+
+    # Runs as the deploy user, not root and not jonathan. Root was considered
+    # and rejected: identical DAC against jonathan, but it would put root on a
+    # network-facing `git fetch` + `submodule update`.
+    assert workstation.succeed(
+        "systemctl show -P User claude-runtime-deploy.service"
+    ).strip() == "claude-deploy"
+
+    # The ExecStart must be a store path. `%h` in a system unit expands to the
+    # SERVICE MANAGER's home and ignores User=, so a %h-relative ExecStart
+    # would have the deployer execute whatever ~/.claude/scripts — a
+    # jonathan-owned symlink — points at, and that code would then hold write
+    # access to the serving tree. This assertion is the regression guard for
+    # exactly that, found in review 2026-10-27.
+    exec_start = workstation.succeed(
+        "systemctl show -P ExecStart claude-runtime-deploy.service"
+    ).strip()
+    assert "/nix/store/" in exec_start, exec_start
+    assert "/home/jonathan" not in exec_start, exec_start
+
+    # `systemctl show -P ExecStart` renders the property in systemd's
+    # STRUCTURED form — `{ path=/nix/store/…; argv[]=…; ignore_errors=no }` —
+    # so the value is not a command line. Exec'ing it raw gave `sh: line 1: {:
+    # command not found`, which the two assertions above cannot catch because
+    # they pass against the structured string too. Keep asserting on the whole
+    # property (it covers argv as well as path), and take `path=` for the
+    # binary the block below actually runs.
+    deploy_bin = exec_start.split("path=", 1)[1].split(";", 1)[0].strip()
+    assert deploy_bin.startswith("/nix/store/"), exec_start
+
+    # -- The deploy wrapper, driven for real and offline --------------------
+    #
+    # Through the CLAUDE_RUNTIME_DEPLOY_* seams the script exposes for exactly
+    # this, against a local repository over file://. Production passes none of
+    # them. A test that only read the unit file would prove the wiring and
+    # nothing about the behaviour.
+    deploy_root = "/var/lib/claude-runtime-test"
+    # Nix interpolates the store path; Python only ever sees a string.
+    puller_stub = "${claudePullerStub}"
+    seed = f"{deploy_root}/seed"
+    target = f"{deploy_root}/checkout"
+    deploy_state = f"{deploy_root}/state"
+
+    def run_deploy(checkout=None, state=None, remote=None):
+        env = (
+            f"CLAUDE_RUNTIME_DEPLOY_CHECKOUT={checkout or target} "
+            f"CLAUDE_RUNTIME_DEPLOY_STATE={state or deploy_state} "
+            f"CLAUDE_RUNTIME_DEPLOY_REMOTE={remote or f'file://{seed}'}"
+        )
+        return workstation.execute(
+            f"su claude-deploy -s /bin/sh -c '{env} {deploy_bin}' 2>&1"
+        )
+
+    workstation.succeed(
+        f"install -d -o claude-deploy -g claude-deploy {deploy_root} "
+        f"{deploy_state} {seed}/runtime/scripts && "
+        f"install -m 0755 -o claude-deploy -g claude-deploy {puller_stub} "
+        f"{seed}/runtime/scripts/claude-pull.sh && "
+        # install -d applies -o/-g to the named directories, not reliably to
+        # the leading components it creates on the way, which left seed/ owned
+        # by root and the git init below failing with "Permission denied".
+        f"chown -R claude-deploy:claude-deploy {deploy_root} && "
+        f"su claude-deploy -s /bin/sh -c 'cd {seed} && "
+        "git -c init.defaultBranch=master init -q && "
+        "git -c user.name=seed -c user.email=seed@example.invalid "
+        "-c commit.gpgsign=false add -A && "
+        "git -c user.name=seed -c user.email=seed@example.invalid "
+        "-c commit.gpgsign=false commit -q -m seed'"
+    )
+    seed_head = workstation.succeed(
+        f"su claude-deploy -s /bin/sh -c 'git -C {seed} rev-parse HEAD'"
+    ).strip()
+
+    # Bootstrap: no checkout yet, so the wrapper clones one and then hands over
+    # to the puller inside it.
+    rc, out = run_deploy()
+    assert rc == 0, out
+    assert workstation.succeed(
+        f"su claude-deploy -s /bin/sh -c 'git -C {target} rev-parse HEAD'"
+    ).strip() == seed_head, out
+    handoff = workstation.succeed(f"cat {deploy_state}/handoff").strip()
+    assert handoff == f"{target}|{deploy_state}|claude-runtime-deploy", handoff
+
+    # The PATH the puller was handed. See the stub's own comment: a missing
+    # `flock` was read as a held lock and the unit called that success, so the
+    # tools the puller needs are asserted rather than assumed.
+    tools = workstation.succeed(f"cat {deploy_state}/tools")
+    assert "MISSING" not in tools, tools
+
+    # Idempotent: a second tick finds the clone, skips the bootstrap and hands
+    # over again. "Already up to date" is the normal case, ten times an hour.
+    workstation.succeed(f"rm {deploy_state}/handoff")
+    rc, out = run_deploy()
+    assert rc == 0, out
+    assert "cloning" not in out, out
+    workstation.succeed(f"test -f {deploy_state}/handoff")
+
+    # jonathan cannot write the served tree. This is the property the whole
+    # split exists for: a dev-side git operation or a mis-aimed agent can no
+    # longer move what the mounts serve.
+    assert workstation.succeed(
+        f"su jonathan -c 'cat {target}/runtime/scripts/claude-pull.sh'"
+    ).strip() != ""
+    workstation.fail(f"su jonathan -c 'touch {target}/runtime/scripts/injected.sh'")
+    workstation.fail(f"su jonathan -c 'rm -rf {target}/runtime'")
+
+    # And no user-side git against the deploy tree, which is why nothing in
+    # this repository points a jonathan-run git at it: git's ownership check
+    # (CVE-2022-24765) aborts every command that DISCOVERS the repository,
+    # read-only ones included. safe.directory is not the answer; not pointing
+    # user-side git here is.
+    rc, git_out = workstation.execute(f"su jonathan -c 'git -C {target} status' 2>&1")
+    assert rc != 0, git_out
+    assert "dubious ownership" in git_out, git_out
+
+    # Refusal 1: a non-empty directory that is not a checkout is somebody
+    # else's content, or the wreckage of a failed clone. Cloning "into" it
+    # would either fail obscurely or succeed against a tree nobody placed.
+    occupied = f"{deploy_root}/occupied"
+    workstation.succeed(
+        f"install -d -o claude-deploy -g claude-deploy {occupied} && "
+        f"install -m 0644 -o claude-deploy -g claude-deploy {puller_stub} "
+        f"{occupied}/not-a-checkout"
+    )
+    rc, out = run_deploy(checkout=occupied)
+    assert rc == 75, out
+    assert "is not a git checkout" in out, out
+
+    # Refusal 2: a group- or world-writable puller. The wrapper exec's a script
+    # out of the served tree, which is only safe while that tree's ownership
+    # holds - so it checks rather than assumes.
+    workstation.succeed(f"chmod g+w {target}/runtime/scripts/claude-pull.sh")
+    rc, out = run_deploy()
+    assert rc == 75, out
+    assert "group- or world-writable" in out, out
+    workstation.succeed(f"chmod g-w {target}/runtime/scripts/claude-pull.sh")
+
+    # Refusal 3: a half-built checkout with no puller in it. Loud, not silent.
+    workstation.succeed(
+        f"mv {target}/runtime/scripts/claude-pull.sh {target}/runtime/scripts/moved"
+    )
+    rc, out = run_deploy()
+    assert rc == 75, out
+    assert "is missing" in out, out
+    workstation.succeed(f"rm -r {deploy_root}")
+
+    # -- The same wrapper, this time as the real unit under its real sandbox --
+    #
+    # Everything above ran the script through `su`, which proves the script and
+    # nothing about the unit around it. ProtectSystem=strict, ProtectHome,
+    # ReadWritePaths=, PrivateTmp and RestrictAddressFamilies decide whether
+    # the production tick can write what it needs to, and a ReadWritePaths that
+    # misses a path fails ONLY in production — the exact shape of failure this
+    # whole lane exists to catch. So the unit is started for real, with one
+    # drop-in overriding the REMOTE alone: the checkout path, the state root,
+    # the user and every hardening directive stay as production has them.
+    real_root = "/var/lib/claude-runtime"
+    real_seed = "/var/lib/claude-runtime-seed"
+    real_checkout = f"{real_root}/checkout"
+    workstation.succeed(
+        f"install -d -o claude-deploy -g claude-deploy {real_seed}/runtime/scripts && "
+        f"install -m 0755 -o claude-deploy -g claude-deploy {puller_stub} "
+        f"{real_seed}/runtime/scripts/claude-pull.sh && "
+        f"chown -R claude-deploy:claude-deploy {real_seed} && "
+        f"su claude-deploy -s /bin/sh -c 'cd {real_seed} && "
+        "git -c init.defaultBranch=master init -q && "
+        "git -c user.name=seed -c user.email=seed@example.invalid "
+        "-c commit.gpgsign=false add -A && "
+        "git -c user.name=seed -c user.email=seed@example.invalid "
+        "-c commit.gpgsign=false commit -q -m seed'"
+    )
+    workstation.succeed(
+        "install -d /run/systemd/system/claude-runtime-deploy.service.d && "
+        "printf '[Service]\\nEnvironment=CLAUDE_RUNTIME_DEPLOY_REMOTE=file://%s\\n' "
+        f"'{real_seed}' > "
+        "/run/systemd/system/claude-runtime-deploy.service.d/99-local-remote.conf && "
+        "systemctl daemon-reload"
+    )
+
+    # The timer is Persistent= with no stamp, so it fires on first boot, where
+    # this VM has no network and the clone fails. That failure is the expected
+    # offline outcome rather than the thing under test — but it leaves behind
+    # the question that matters: does a failed clone wedge the next tick? It
+    # does not. git removes a destination directory it created when the clone
+    # fails (measured 2026-10-27 on the host with a non-repo file:// remote),
+    # so the wrapper's "exists, is not a checkout, and is not empty" refusal
+    # cannot be triggered by its own earlier failure.
+    workstation.execute("systemctl reset-failed claude-runtime-deploy.service")
+    workstation.succeed(f"test ! -e {real_checkout}")
+
+    workstation.succeed("systemctl start claude-runtime-deploy.service")
+    for prop, want in [("Result", "success"), ("ExecMainStatus", "0")]:
+        got = workstation.succeed(
+            f"systemctl show -P {prop} claude-runtime-deploy.service"
+        ).strip()
+        assert got == want, (
+            f"claude-runtime-deploy.service {prop}={got!r}: "
+            + workstation.succeed(
+                "journalctl -u claude-runtime-deploy.service -b --no-pager | tail -40"
+            )
+        )
+    real_seed_head = workstation.succeed(
+        f"su claude-deploy -s /bin/sh -c 'git -C {real_seed} rev-parse HEAD'"
+    ).strip()
+    assert workstation.succeed(
+        f"su claude-deploy -s /bin/sh -c 'git -C {real_checkout} rev-parse HEAD'"
+    ).strip() == real_seed_head
+
+    # The health record lands in the system state root, under the sandbox, and
+    # jonathan can READ it — that is the whole mechanism by which the
+    # SessionStart hook reports a broken sync it is not allowed to repair.
+    real_handoff = workstation.succeed(f"cat {real_root}/state/handoff").strip()
+    assert real_handoff == f"{real_checkout}|{real_root}/state|claude-runtime-deploy", (
+        real_handoff
+    )
+    workstation.succeed(f"su jonathan -c 'test -r {real_root}/state/handoff'")
+
+    # And the PATH the unit itself hands over, which is the measurement that
+    # matters: this is the inherited system-service PATH plus runtimeInputs,
+    # not a login shell's.
+    real_tools = workstation.succeed(f"cat {real_root}/state/tools")
+    assert "MISSING" not in real_tools, real_tools
+
+    # And the property the split exists for, now against the production path
+    # rather than a fixture one.
+    workstation.fail(f"su jonathan -c 'touch {real_checkout}/injected'")
+    rc, git_out = workstation.execute(
+        f"su jonathan -c 'git -C {real_checkout} status' 2>&1"
+    )
+    assert rc != 0, git_out
+    assert "dubious ownership" in git_out, git_out
+
+    # Back to a bare runtime root, because the mounts block below builds its
+    # own fixture at this path and a leftover clone would change what the links
+    # unit finds there.
+    workstation.succeed(
+        f"rm /run/systemd/system/claude-runtime-deploy.service.d/99-local-remote.conf && "
+        "systemctl daemon-reload && "
+        f"rm -r {real_checkout} {real_root}/state {real_seed} && "
+        f"install -d -o claude-deploy -g claude-deploy -m 0755 {real_root}/state"
+    )
 
     # claude-marketplace-pull — the same puller, second target.
     #
     # ~/.claude/plugins/marketplaces/jonathanmoregard is an INDEPENDENT nested
-    # checkout: `plugins/` is gitignored in ~/.claude, so claude-pull.timer
-    # never touched it however often it ran. It is also the tree the
+    # checkout: `plugins/` is gitignored in ~/.claude, so the claude-config
+    # puller never touched it however often it ran. It is also the tree the
     # harness actually resolves plugins from, which is why it going stale is
     # worse than ~/.claude going stale — measured 2026-08-31 at 35 commits
     # behind origin, meaning every session in that window served skills,
@@ -5478,9 +5774,14 @@ in
     # every ~/.claude spelling misses the dev trees while the checkout path
     # still reaches them. A test that only asserted the first half would read
     # as filesystem isolation and would pass for the wrong reason.
-    checkout = "/home/jonathan/Repos/claude-config"
+    # The DEPLOY clone, written only by claude-runtime-deploy.service as
+    # the claude-deploy system user. Was ~/Repos/claude-config until
+    # 2026-10-27, which made the live config depend on a tree that gets
+    # branched and rebased. Fixture ownership mirrors production: jonathan
+    # can read every served byte and write none of them.
+    checkout = "/var/lib/claude-runtime/checkout"
     workstation.succeed(
-        f"install -d -o jonathan -g users {checkout}/runtime/hooks "
+        f"install -d -o claude-deploy -g claude-deploy {checkout}/runtime/hooks "
         f"{checkout}/runtime/skills {checkout}/tests "
         f"{checkout}/vendor/superpowers/hooks {checkout}/vendor/superpowers/skills "
         f"{checkout}/vendor/everything-claude-code/skills "
@@ -5510,7 +5811,7 @@ in
         f"printf '{{}}\\n' > {checkout}/vendor/superpowers/package.json && "
         f"printf 'ecc-skill\\n' > {checkout}/vendor/everything-claude-code/skills/ecc.md && "
         f"printf 'ECCDEV\\n' > {checkout}/vendor/everything-claude-code/tests/ecc-dev-marker && "
-        f"chown -R jonathan:users {checkout}"
+        f"chown -R claude-deploy:claude-deploy {checkout}"
     )
 
     # No ordering cycle at boot. The mounts land after local-fs.target
@@ -5723,12 +6024,13 @@ in
     # step taken deliberately with the operator present — an activation unit
     # must not delete a live home directory to make room for a symlink.
     workstation.succeed(
-        "install -d -o jonathan -g users /home/jonathan/Repos/claude-config/runtime/commands && "
-        "printf 'projected\\n' > /home/jonathan/Repos/claude-config/runtime/commands/c.md && "
+        "install -d -o claude-deploy -g claude-deploy /var/lib/claude-runtime/checkout/runtime/commands && "
+        "printf 'projected\\n' > /var/lib/claude-runtime/checkout/runtime/commands/c.md && "
         "install -d -o jonathan -g users /home/jonathan/.claude/commands && "
         "printf 'PRECIOUS\\n' > /home/jonathan/.claude/commands/live-only.md && "
-        "chown -R jonathan:users /home/jonathan/.claude/commands "
-        "/home/jonathan/Repos/claude-config/runtime/commands"
+        "chown -R jonathan:users /home/jonathan/.claude/commands && "
+        "chown -R claude-deploy:claude-deploy "
+        "/var/lib/claude-runtime/checkout/runtime/commands"
     )
     workstation.fail("systemctl restart claude-runtime-links.service")
     workstation.fail("test -L /home/jonathan/.claude/commands")
@@ -5756,12 +6058,12 @@ in
     # under ~/.claude, or anything the operator links by hand, brings it back,
     # and taking it over is how the unit would eat somebody else's config.
     workstation.succeed(
-        "install -d -o jonathan -g users "
-        "/home/jonathan/Repos/claude-config/runtime/foreign-entry && "
+        "install -d -o claude-deploy -g claude-deploy "
+        "/var/lib/claude-runtime/checkout/runtime/foreign-entry && "
         "printf 'projected\\n' > "
-        "/home/jonathan/Repos/claude-config/runtime/foreign-entry/p.md && "
-        "chown -R jonathan:users "
-        "/home/jonathan/Repos/claude-config/runtime/foreign-entry && "
+        "/var/lib/claude-runtime/checkout/runtime/foreign-entry/p.md && "
+        "chown -R claude-deploy:claude-deploy "
+        "/var/lib/claude-runtime/checkout/runtime/foreign-entry && "
         "ln -sfn /etc /home/jonathan/.claude/foreign-entry && "
         "chown -h jonathan:users /home/jonathan/.claude/foreign-entry"
     )
@@ -5850,7 +6152,7 @@ in
     # no hooks, no permission rules and no MCP servers while looking healthy.
     # So it exits 75 and lands in `failed`, where systemctl --failed and the
     # SessionStart unit-failure report can see it.
-    workstation.succeed("mv /home/jonathan/Repos/claude-config/runtime /home/jonathan/Repos/claude-config/runtime-gone")
+    workstation.succeed("mv /var/lib/claude-runtime/checkout/runtime /var/lib/claude-runtime/checkout/runtime-gone")
     runtime_mount = workstation.succeed(
         "systemd-escape -p --suffix=mount /home/jonathan/.claude/runtime"
     ).strip()
@@ -5881,7 +6183,12 @@ in
     # a real directory for the whole tail of this block — the point here is
     # only that the projection and the links come back. Exit 0 is asserted at
     # the top of the block, before anything has collided.
-    workstation.succeed("mv /home/jonathan/Repos/claude-config/runtime-gone /home/jonathan/Repos/claude-config/runtime")
+    #
+    # The reason this comment no longer names ~/.claude/skills: that directory
+    # was home-manager's for as long as home/claude-skills.nix existed, and
+    # deleting that file is exactly what this branch does. The path below moved
+    # with the serving source, which is the deploy clone since #390.
+    workstation.succeed("mv /var/lib/claude-runtime/checkout/runtime-gone /var/lib/claude-runtime/checkout/runtime")
     workstation.succeed("systemctl reset-failed claude-runtime-links.service")
     workstation.fail("systemctl restart claude-runtime-links.service")
     # And the projection came back with it, pulled up by RequiresMountsFor
@@ -5911,10 +6218,10 @@ in
     # reachable through the projection, and only then show that repository
     # discovery from there finds nothing.
     workstation.succeed(
-        f"install -d -o jonathan -g users {checkout}/runtime/scripts && "
+        f"install -d -o claude-deploy -g claude-deploy {checkout}/runtime/scripts && "
         f"printf '#!/bin/sh\\n' > {checkout}/runtime/scripts/claude-pull.sh && "
         f"chmod +x {checkout}/runtime/scripts/claude-pull.sh && "
-        f"chown -R jonathan:users {checkout}/runtime/scripts"
+        f"chown -R claude-deploy:claude-deploy {checkout}/runtime/scripts"
     )
     workstation.wait_until_succeeds(
         "test -x /home/jonathan/.claude/scripts/claude-pull.sh", timeout=120
@@ -5930,12 +6237,23 @@ in
         "su jonathan -c 'git -C /home/jonathan/.claude/runtime/scripts "
         "rev-parse --show-toplevel'"
     )
-    # So the unit cannot rely on it. The override is the seam the script
-    # already exposes, and the two sibling pull units already use.
-    unit = workstation.succeed(
-        "cat /home/jonathan/.config/systemd/user/claude-pull.service"
+    # So no unit may rely on it — and as of 2026-10-27 none does, because CD
+    # for this repository is a SYSTEM unit against a clone outside ~/.claude
+    # entirely. The user unit that used to need this override is retired; what
+    # replaced it is asserted earlier in this lane (store-pinned ExecStart,
+    # User=claude-deploy, and the wrapper driven end to end). Both halves still
+    # matter here: this path is how the OLD discovery broke, and the two
+    # sibling pullers (marketplaces, klaffat) still reach their scripts this
+    # way and still name their repositories explicitly.
+    workstation.fail(
+        "test -e /home/jonathan/.config/systemd/user/claude-pull.service"
     )
-    assert "CLAUDE_PULL_REPO=/home/jonathan/Repos/claude-config" in unit, unit
+    for sibling in ["claude-marketplace-pull", "klaffat-pull"]:
+        unit = workstation.succeed(
+            f"cat /home/jonathan/.config/systemd/user/{sibling}.service"
+        )
+        assert "CLAUDE_PULL_REPO=" in unit, unit
+        assert "/var/lib/claude-runtime" not in unit, unit
 
     # L2. A single-file bind mount pins an INODE, so a git update that
     # replaces the file leaves the projection serving the old content forever
@@ -5964,9 +6282,9 @@ in
         "systemctl is-active claude-runtime-links.path"
     ).strip() == "active"
     workstation.succeed(
-        f"install -d -o jonathan -g users {checkout}/runtime/newentry && "
+        f"install -d -o claude-deploy -g claude-deploy {checkout}/runtime/newentry && "
         f"printf 'arrived\\n' > {checkout}/runtime/newentry/n.md && "
-        f"chown -R jonathan:users {checkout}/runtime/newentry"
+        f"chown -R claude-deploy:claude-deploy {checkout}/runtime/newentry"
     )
     # No systemctl call here on purpose — if this needs a manual kick, the
     # hole is still open. The unit still exits 75 (~/.claude/skills is a real
