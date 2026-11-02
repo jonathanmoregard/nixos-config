@@ -288,6 +288,23 @@ let
           echo "claude-runtime-links: $live/$relative is not a mount point; refusing to link" >&2
           exit 75
         fi
+        # Mounted is not the same as serving. A directory bind pins its
+        # source's inode, and git removes and recreates a directory whenever
+        # a commit empties it and re-adds its contents; the mount then serves
+        # the unlinked inode — empty — and `mountpoint -q` above still passes.
+        # The kernel marks such a source `//deleted`, which findmnt shows.
+        # Measured (#391): with this check absent, each vendor projection
+        # exited 0 while serving nothing. Restarting the mount unit repairs it.
+        if ! source=$(findmnt -rno SOURCE --mountpoint "$live/$relative"); then
+          echo "claude-runtime-links: cannot read the mount source of $live/$relative; refusing to link" >&2
+          exit 75
+        fi
+        case "$source" in
+        *//deleted*)
+          echo "claude-runtime-links: $live/$relative is mounted from a deleted directory ($source); restart its mount unit; refusing to link" >&2
+          exit 75
+          ;;
+        esac
       done
       if [ -z "$(ls -A "$runtime" 2>/dev/null)" ]; then
         echo "claude-runtime-links: $runtime is empty; refusing to link" >&2

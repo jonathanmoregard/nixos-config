@@ -12,10 +12,106 @@
 #   than the newest known generation, the service halts. Cleared by
 #   running `nixos-rebuild switch` forward (advances the profile to a
 #   new latest, drift gone, auto-deploy resumes on next tick).
+#
+# FETCH / APPLY SPLIT (issue #389)
+#
+# Applying a configuration needs root; downloading one does not. The
+# network-facing half (pack negotiation, pack parsing, object writing)
+# runs as the `nixos-fetch` system user in its own sandboxed unit,
+# `nixos-deploy-fetch.service`, into a bare repo nobody else writes. Root
+# keeps every decision: lock, hold, rollback guard, poison latch,
+# last-good, notifications, and the switch itself.
+#
+# The split only buys anything if root does not apply whatever the fetch
+# user hands it, so root never reads a ref, a SHA or a checkout from the
+# fetch stage. It works like this:
+#
+#   1. root reads ONE ref from the remote itself (`git ls-remote`,
+#      validated as a 40-hex SHA). That SHA is the deploy decision, and it
+#      rests on the same thing today's deploy rests on: TLS to the remote.
+#   2. root starts the fetch unit and waits for it.
+#   3. root imports exactly that SHA from the fetch user's repo into the
+#      root-owned working tree's own object store. The upload-pack on the
+#      far end of that local transport runs as nixos-fetch (setpriv), so
+#      the fetch user's repo and its config are only ever opened by the
+#      fetch user. Git's content addressing binds the SHA to the whole
+#      tree and history: the fetch user can withhold objects (a failed
+#      tick, retried, never poisoned) but cannot change what the SHA
+#      names.
+#   4. root refuses to build a working tree that any other uid owns or
+#      that is group/world-writable.
+#
+# Rejected: have root trust the fetch stage's branch tip and check it
+# with ancestry plus commit signatures. Commits on main are signed only
+# by GitHub's web-flow key, which signs ANY web-made commit on GitHub,
+# forks included, so a fork commit on top of main would pass both
+# checks. A pinned signing key root could verify offline would let root
+# skip step 1's network read entirely; none exists today.
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.nixos-auto-deploy;
   memoryRunner = config.services.buildCoordination.runnerPackage;
+
+  fetchUser = "nixos-fetch";
+  fetchStateDir = "/var/lib/nixos-deploy-fetch";
+  # The fetch user's bare repo. Only ever opened by the fetch user.
+  stagingRepo = "${fetchStateDir}/source.git";
+
+  # Both halves bound their network op the same way. ssh options only
+  # apply to an ssh remote; the production remote is HTTPS.
+  gitSshCommand = "ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4${lib.optionalString (cfg.sshKeyFile != null) " -i ${cfg.sshKeyFile} -o IdentitiesOnly=yes"}";
+
+  # Root's side of the import runs this as the "remote" upload-pack. It
+  # ignores the path git passes and serves only the pinned staging repo,
+  # as the fetch user, with no capabilities, so root's git never opens
+  # that repo or reads its config.
+  #
+  # GIT_PROTOCOL is carried across the env reset on purpose: root's own
+  # git sets it (version=2), and v2 is what lets root want a SHA that is
+  # not the staging repo's advertised tip. Dropping it (found by the VM
+  # lane) falls back to v0, where a hostile or merely raced tip makes the
+  # import fail. That fails closed, but it breaks the honest path.
+  uploadPackAsFetchUser = pkgs.writeShellScript "nixos-deploy-upload-pack-as-fetch-user" ''
+    exec ${pkgs.util-linux}/bin/setpriv \
+      --reuid=${fetchUser} --regid=${fetchUser} --clear-groups \
+      --no-new-privs --inh-caps=-all --bounding-set=-all --reset-env \
+      ${pkgs.coreutils}/bin/env GIT_CONFIG_GLOBAL=/dev/null GIT_PROTOCOL="''${GIT_PROTOCOL:-}" \
+      ${pkgs.git}/bin/git-upload-pack --strict --timeout=60 ${stagingRepo}
+  '';
+
+  fetchScript = pkgs.writeShellApplication {
+    name = "nixos-deploy-fetch";
+    runtimeInputs = with pkgs; [ git openssh coreutils ];
+    text = ''
+      set -euo pipefail
+      umask 077
+      export GIT_CONFIG_GLOBAL=/dev/null
+      export GIT_TERMINAL_PROMPT=0
+      export HOME=${fetchStateDir}
+      export GIT_SSL_CAINFO=/etc/ssl/certs/ca-bundle.crt
+      repo=${stagingRepo}
+      if [ ! -e "$repo/HEAD" ]; then
+        git init --quiet --bare "$repo"
+      fi
+      # Bound every network op so a stalled TCP/ssh connection (DNS
+      # hang, half-open socket, GitHub blip) ABORTS instead of wedging
+      # the deploy forever while root holds the deploy flock. Incident
+      # 2026-06-14: a fetch stall left nixos-deploy "activating" for 17h,
+      # and every later timer tick hit `flock -n` and silently no-op'd.
+      # ConnectTimeout caps the handshake; ServerAlive* tears down a
+      # connection that goes silent mid-transfer (3 missed 15s probes ->
+      # abort). StrictHostKeyChecking=yes against the pinned github.com
+      # keys (programs.ssh.knownHosts below).
+      export GIT_SSH_COMMAND=${lib.escapeShellArg gitSshCommand}
+      # Belt-and-braces over the keepalives: bound the whole fetch.
+      if ! timeout 120 git --git-dir="$repo" fetch --quiet --no-tags \
+          ${lib.escapeShellArg cfg.remote} \
+          ${lib.escapeShellArg "+refs/heads/${cfg.branch}:refs/heads/${cfg.branch}"}; then
+        echo "git fetch failed or timed out (120s)"
+        exit 1
+      fi
+    '';
+  };
 
   rebuildStarter = pkgs.writeShellApplication {
     name = "nixos-deploy-rebuild-starter";
@@ -40,6 +136,7 @@ let
       gnugrep
       gnused
       gawk
+      findutils
     ];
     text = ''
       set -euo pipefail
@@ -105,35 +202,61 @@ let
       { IFS= read -r recorded_sha || true; } < "$STATE/last-good" 2>/dev/null || true
 
       cd "${cfg.workingDir}"
-      # Bound every network op so a stalled TCP/ssh connection (DNS
-      # hang, half-open socket, GitHub blip) ABORTS instead of wedging
-      # the deploy forever while holding the flock. Incident 2026-06-14:
-      # a fetch stall left nixos-deploy "activating" for 17h, and every
-      # later timer tick hit `flock -n` and silently no-op'd, so merged
-      # PRs never reached the host. ConnectTimeout caps the handshake;
-      # ServerAlive* tears down a connection that goes silent
-      # mid-transfer (3 missed 15s probes -> abort).
-      # StrictHostKeyChecking=yes against the declaratively pinned
-      # github.com keys (programs.ssh.knownHosts below): no trust-on-
-      # first-use window on a fresh host, where this fetch decides what
-      # root switches to.
-      export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4${lib.optionalString (cfg.sshKeyFile != null) " -i ${cfg.sshKeyFile} -o IdentitiesOnly=yes"}"
-      # Belt-and-braces over the ssh keepalives: bound the whole fetch
-      # so a connected-but-stalled upload-pack still can't run unbounded.
-      # On failure: release the flock (exit) and let the next timer tick
-      # retry — a transient network blip is NOT a poisoned commit, so we
-      # must not fall through to the poison-latch path below.
-      if ! timeout 120 git fetch --quiet origin "${cfg.branch}"; then
-        echo "git fetch failed or timed out (120s); releasing lock, will retry next tick"
+
+      # Step 4: decide WHAT to deploy. Root reads the branch's SHA from
+      # the remote itself: one ref, no objects, and the only network
+      # input root acts on. Everything bulk comes from the fetch stage,
+      # which cannot change what this SHA names (see the header).
+      # Same bounds as the fetch stage (incident 2026-06-14: an unbounded
+      # network op wedged this unit for 17h holding the flock). On
+      # failure: release the flock (exit) and let the next tick retry —
+      # a transient network blip is NOT a poisoned commit.
+      export GIT_SSH_COMMAND=${lib.escapeShellArg gitSshCommand}
+      export GIT_TERMINAL_PROMPT=0
+      if ! ls_remote=$(timeout 60 git ls-remote --exit-code \
+          ${lib.escapeShellArg cfg.remote} ${lib.escapeShellArg "refs/heads/${cfg.branch}"}); then
+        echo "git ls-remote failed or timed out (60s); releasing lock, will retry next tick"
         exit 1
       fi
-      target_sha=$(git rev-parse "origin/${cfg.branch}")
+      target_sha=$(printf '%s\n' "$ls_remote" | awk -v ref=${lib.escapeShellArg "refs/heads/${cfg.branch}"} '$2 == ref {print $1}')
+      if ! printf '%s' "$target_sha" | grep -qxE '[0-9a-f]{40}'; then
+        echo "git ls-remote returned no usable SHA for ${cfg.branch}: ''${ls_remote@Q}; will retry next tick"
+        exit 1
+      fi
 
-      # Step 5: poison-latch check + auto-clear.
+      # Step 5a: exact poison match needs no objects; skip before fetching.
       if grep -qFx "$target_sha" "$STATE/poison-latch"; then
         echo "$target_sha is poisoned; skipping"
         exit 0
       fi
+
+      # Step 5b: the unprivileged fetch stage downloads the objects.
+      if ! ${config.systemd.package}/bin/systemctl start nixos-deploy-fetch.service; then
+        echo "fetch stage failed (nixos-deploy-fetch.service); releasing lock, will retry next tick"
+        exit 1
+      fi
+
+      # Step 5c: import exactly target_sha from the fetch stage into this
+      # root-owned repo. The upload-pack end runs as ${fetchUser}; the lock
+      # fd is closed for it so it cannot hold or grow the lock file.
+      # fsckObjects rejects malformed objects (e.g. `.git` tree entries)
+      # before they land. A missing object is a retry, not a poisoned SHA.
+      if ! git -c fetch.fsckObjects=true -c protocol.version=2 \
+          fetch --quiet --no-tags --no-write-fetch-head \
+          --upload-pack=${uploadPackAsFetchUser} \
+          "file://${stagingRepo}" "+$target_sha:refs/nixos-deploy/incoming" \
+          {lock_fd}>&-; then
+        echo "import of $target_sha from the fetch stage failed; releasing lock, will retry next tick"
+        exit 1
+      fi
+      if [ "$(git rev-parse --verify --quiet 'refs/nixos-deploy/incoming^{commit}')" != "$target_sha" ]; then
+        echo "imported ref does not name $target_sha; refusing, will retry next tick"
+        exit 1
+      fi
+      # Keep `git log origin/${cfg.branch}` in this tree truthful for humans.
+      git update-ref "refs/remotes/origin/${cfg.branch}" "$target_sha"
+
+      # Step 5d: poison-latch auto-clear (needs the imported history).
       if [ -s "$STATE/poison-latch" ]; then
         all_ancestors=true
         while read -r poisoned; do
@@ -155,7 +278,24 @@ let
         exit 0
       fi
 
-      # Step 7: deploy.
+      # Step 7: deploy — but only from a tree no other uid can modify.
+      # Checked, not assumed: if anything in the working tree (or a
+      # directory above it) is owned by a non-root uid or is group/world
+      # writable, that uid could change what root evaluates between this
+      # reset and the build. Not the commit's fault, so no poison.
+      foreign=$(find "$PWD" -xdev \( ! -uid 0 -o \( ! -type l -perm /022 \) \) -print -quit)
+      dir=$PWD
+      while [ -z "$foreign" ] && [ "$dir" != / ]; do
+        dir=$(dirname "$dir")
+        if [ "$(stat -c %u "$dir")" != 0 ] || [ $((8#$(stat -c %a "$dir") & 8#022)) -ne 0 ]; then
+          foreign=$dir
+        fi
+      done
+      if [ -n "$foreign" ]; then
+        echo "refusing to build $target_sha: $foreign is owned by a non-root uid or group/world-writable"
+        echo "  fix ownership/modes under $PWD (expected root-owned, no g/o write); next tick retries"
+        exit 1
+      fi
       echo "deploying $target_sha"
       git reset --hard "$target_sha"
       rebuild_marker=$(mktemp "$STATE/rebuild-started.XXXXXX")
@@ -203,8 +343,22 @@ in
       type = lib.types.path;
       default = "/etc/nixos";
       description = ''
-        Local clone of the deploy repo. Must already exist on `branch`,
-        owned by root (deploy script writes via `git reset --hard`).
+        Local clone of the deploy repo that root builds from. Must
+        already exist as a git repo, entirely root-owned with no
+        group/world write: the deploy refuses to build it otherwise.
+        Never fetched into from the network; root imports the target
+        commit from the unprivileged fetch stage.
+      '';
+    };
+
+    remote = lib.mkOption {
+      type = lib.types.str;
+      default = "https://github.com/jonathanmoregard/nixos-config.git";
+      description = ''
+        Git remote both halves read: root resolves `branch` here
+        (`git ls-remote`, one ref), the fetch user downloads objects
+        from it. Store-pinned, so nothing on the host can repoint it.
+        HTTPS needs no credential because the repo is public.
       '';
     };
 
@@ -233,10 +387,11 @@ in
       type = lib.types.nullOr lib.types.path;
       default = null;
       description = ''
-        SSH private key for `git fetch`. Required because the working
-        dir's origin is git@github.com.
-        Typical wiring: `config.age.secrets.deploy-ssh-key.path`.
-        If null, falls back to root's ~/.ssh/id_ed25519.
+        SSH private key, used only when `remote` is an ssh URL (the
+        default HTTPS remote ignores it). Both halves pass it to ssh, so
+        for an ssh remote it must be readable by the `nixos-fetch` user
+        as well as root; a root-only key makes the fetch stage fail
+        loudly rather than fall back to anything.
       '';
     };
 
@@ -333,6 +488,57 @@ in
         # SAME target_sha and re-converges. Net: bounded-wedge +
         # self-healing beats unbounded-wedge.
         TimeoutStartSec = "60min";
+      };
+    };
+
+    # The network half. Same shape as claude-runtime-deploy's
+    # claude-deploy user: a system user with no home, owning only its own
+    # state. It can write nothing root builds from (DAC: /etc/nixos is
+    # root-owned; sandbox: ProtectSystem=strict besides).
+    users.groups.${fetchUser} = { };
+    users.users.${fetchUser} = {
+      isSystemUser = true;
+      group = fetchUser;
+      home = "/var/empty";
+    };
+
+    # No timer and no wantedBy: only nixos-deploy starts this, while
+    # holding its lock, after it has decided which SHA it wants.
+    systemd.services.nixos-deploy-fetch = {
+      description = "nixos-deploy fetch stage (unprivileged)";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        User = fetchUser;
+        Group = fetchUser;
+        ExecStart = "${fetchScript}/bin/nixos-deploy-fetch";
+        StateDirectory = "nixos-deploy-fetch";
+        StateDirectoryMode = "0700";
+        # The in-script fetch is bounded at 120s; this backstops the rest.
+        TimeoutStartSec = 300;
+        Nice = 10;
+        IOSchedulingClass = "idle";
+
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        NoNewPrivileges = true;
+        CapabilityBoundingSet = "";
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        RestrictSUIDSGID = true;
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        LockPersonality = true;
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+        MemoryMax = "1G";
+        TasksMax = 64;
       };
     };
 

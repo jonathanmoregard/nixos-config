@@ -637,35 +637,87 @@ in
         "-C /home/jonathan/worktrees -- touch /home/jonathan/worktrees/profile-write'"
     )
 
-    # Home outside explicit roots stays read-only.
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
-        "-C /home/jonathan/Repos -- touch /home/jonathan/codex-policy-escape'"
+    # Every negative run from here on carries its own control, inside ONE
+    # invocation: a write that must SUCCEED in a managed root, then the
+    # escape that must be REFUSED. A bare `workstation.fail` on a `codex
+    # sandbox` run cannot tell "policy refused the write" from "the command
+    # never ran", and that is not a hypothetical worry in this file: three
+    # runs in the block below passed for exactly that reason until #382,
+    # because they omitted `-P` and died on clap argument validation (exit
+    # 2) before any sandbox or policy decision. A trailing
+    # `test -e <escape>` backstop does not rescue such a run either — a
+    # command that never executed leaves no escape file.
+    #
+    # `expect_absent=False` is for an escape target that legitimately exists
+    # already (a linked worktree's `.git` file). There the proof is the
+    # refusal itself; asserting absence would assert the repo is broken.
+    def codex_sandbox_probe(name, args, cwd, ctl, esc,
+                            reason="Read-only file system",
+                            expect_absent=True):
+        out = workstation.succeed(
+            f"su - jonathan -c 'codex sandbox {args} -C {cwd} -- sh -c "
+            f"\"touch {ctl}; echo ctl=\\$?; touch {esc} 2>&1; echo esc=\\$?\"'"
+        )
+        # Logged so the measured refusal text is visible on a GREEN run too,
+        # not only when an assertion trips.
+        print(f"codex_sandbox_probe {name}: {out!r}")
+        assert "ctl=0" in out, f"{name}: control write did not run: {out!r}"
+        assert "esc=1" in out, f"{name}: escape was not refused: {out!r}"
+        # Pin the reason: an escape blocked by Unix permissions rather than
+        # by the sandbox would prove nothing, since jonathan owns these trees.
+        assert reason in out, (
+            f"{name}: escape refused for an unexpected reason "
+            f"(expected {reason!r}): {out!r}"
+        )
+        workstation.succeed(f"test -e {ctl}")
+        if expect_absent:
+            workstation.fail(f"test -e {esc}")
+
+    # Home outside the explicit roots stays read-only.
+    codex_sandbox_probe(
+        "codex-policy-escape",
+        "-P repos_dev --include-managed-config",
+        "/home/jonathan/Repos",
+        "/home/jonathan/Repos/ctl-policy-escape",
+        "/home/jonathan/codex-policy-escape",
     )
-    workstation.fail("test -e /home/jonathan/codex-policy-escape")
 
     # :workspace protection covers normal and linked-worktree metadata even
-    # though their source trees live below broad writable roots.
+    # though their source trees live below broad writable roots. Each control
+    # writes a plain file in the SAME tree as the metadata the run then fails
+    # to touch, so a refusal is attributable to metadata protection and not
+    # to the tree being unwritable.
     workstation.succeed(
         "su - jonathan -c 'cd /home/jonathan/Repos && mkdir profile-repo && "
         "cd profile-repo && git init -q && touch tracked && git add tracked && "
         "git -c user.name=VM -c user.email=vm@example.invalid commit -qm initial && "
         "git worktree add -q /home/jonathan/worktrees/profile-linked -b linked'"
     )
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
-        "-C /home/jonathan/Repos/profile-repo -- "
-        "touch /home/jonathan/Repos/profile-repo/.git/escape'"
+    codex_sandbox_probe(
+        "codex-gitdir-escape",
+        "-P repos_dev --include-managed-config",
+        "/home/jonathan/Repos/profile-repo",
+        "/home/jonathan/Repos/profile-repo/ctl-gitdir",
+        "/home/jonathan/Repos/profile-repo/.git/escape",
     )
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
-        "-C /home/jonathan/worktrees/profile-linked -- "
-        "touch /home/jonathan/worktrees/profile-linked/.git'"
+    # A linked worktree's `.git` is a FILE pointing at the real gitdir, so
+    # this is a metadata write to an existing path, not a create.
+    codex_sandbox_probe(
+        "codex-linked-gitfile",
+        "-P repos_dev --include-managed-config",
+        "/home/jonathan/worktrees/profile-linked",
+        "/home/jonathan/worktrees/profile-linked/ctl-gitfile",
+        "/home/jonathan/worktrees/profile-linked/.git",
+        expect_absent=False,
     )
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
-        "-C /home/jonathan/worktrees/profile-linked -- "
-        "touch /home/jonathan/Repos/profile-repo/.git/worktrees/profile-linked/escape'"
+    # Reaching the linked worktree's administrative directory from inside
+    # that worktree: the target lives under the MAIN repo's .git/worktrees/.
+    codex_sandbox_probe(
+        "codex-linked-gitdir-escape",
+        "-P repos_dev --include-managed-config",
+        "/home/jonathan/worktrees/profile-linked",
+        "/home/jonathan/worktrees/profile-linked/ctl-linked-gitdir",
+        "/home/jonathan/Repos/profile-repo/.git/worktrees/profile-linked/escape",
     )
 
     # Built-in profile selection plus both legacy and native CLI overrides
@@ -688,23 +740,17 @@ in
     # (must succeed: the run started and policy allows the write) and then
     # attempts the escape OUTSIDE it (must be refused). A run that never
     # started fails the `ctl=0` assertion instead of passing as protection.
+    # Escape out of /home/jonathan/Repos into the home directory above it.
+    # Delegates to codex_sandbox_probe so there is one ctl/esc idiom in this
+    # file rather than two that can drift apart.
     def codex_sandbox_confined(name, args):
-        ctl = f"/home/jonathan/Repos/ctl-{name}"
-        esc = f"/home/jonathan/{name}"
-        out = workstation.succeed(
-            f"su - jonathan -c 'codex sandbox {args} "
-            f"-C /home/jonathan/Repos -- sh -c "
-            f"\"touch {ctl}; echo ctl=\\$?; touch {esc} 2>&1; echo esc=\\$?\"'"
+        codex_sandbox_probe(
+            name,
+            args,
+            "/home/jonathan/Repos",
+            f"/home/jonathan/Repos/ctl-{name}",
+            f"/home/jonathan/{name}",
         )
-        assert "ctl=0" in out, f"{name}: control write did not run: {out!r}"
-        assert "esc=1" in out, f"{name}: escape was not refused: {out!r}"
-        # The refusal comes from the sandbox's read-only bind, not from
-        # Unix permissions (jonathan owns /home/jonathan).
-        assert "Read-only file system" in out, (
-            f"{name}: escape refused for an unexpected reason: {out!r}"
-        )
-        workstation.succeed(f"test -e {ctl}")
-        workstation.fail(f"test -e {esc}")
 
     # A built-in unrestricted profile is not rejected by
     # allowed_permission_profiles: it runs, and the managed floor still
@@ -5214,9 +5260,89 @@ in
     )
     assert dcg_marker["component"] == "dcg", dcg_marker
     assert dcg_marker["state"] == "fallback-active", dcg_marker
-    assert dcg_marker["target"] == "/home/jonathan/.claude/dcg.toml", dcg_marker
+    # `target` is the dcg USER LAYER — the path dcg itself loads and reports
+    # in `dcg config` — not the file behind it. Changed deliberately: it
+    # used to name ~/.claude/dcg.toml, which after the runtime-projection
+    # cutover is a link into a read-only mount whenever the projection is
+    # healthy, so a reader cross-checking the marker against live dcg state
+    # was handed a path dcg never reports. The seeded file is still named,
+    # in `remedy`, as the thing to remove.
+    assert dcg_marker["target"] == "/home/jonathan/.config/dcg/config.toml", (
+        dcg_marker
+    )
     assert dcg_marker["fallback_source"].startswith("/nix/store/"), dcg_marker
-    assert dcg_marker["remedy"].strip(), dcg_marker
+    # The remedy must reach the marker AS WRITTEN. It carries its commands in
+    # backticks, and it used to be spliced raw into double-quoted bash, so
+    # bash ran every backticked span as a command substitution during
+    # activation and wrote what was left: "before cutover ; after cutover
+    # then ; then rebuild". A non-empty check passed on that. Every command
+    # must survive, non-empty — no surviving backticks means the shell ate
+    # them, and EXECUTED them on the way.
+    dcg_remedy_cmds = _re.findall(r"`([^`]*)`", dcg_marker["remedy"])
+    assert dcg_remedy_cmds and all(c.strip() for c in dcg_remedy_cmds), (
+        "the marker's remedy lost its commands between home/dcg.nix and "
+        f"the file: {dcg_marker['remedy']!r}"
+    )
+    # And it must carry the post-cutover operator step — the same one the
+    # claude-runtime-links collision arm below performs to finish a cutover:
+    # take the seeded copy out of the way, then let the links unit put the
+    # link back.
+    #
+    # MOVED, never removed. This asserted `rm ~/.claude/dcg.toml` until
+    # 2026-11-02, when review pointed out that a remedy reached from a
+    # fallback diagnosis is also printed by readers that have NOT established
+    # the file is the seed. A backup costs nothing, and the one case where
+    # the marker's byte-identity contract is wrong is exactly the case where
+    # deleting it cannot be undone. The `rm` form is asserted ABSENT so it
+    # cannot come back by a later edit that only reads the prose.
+    assert "mv ~/.claude/dcg.toml" in dcg_marker["remedy"], dcg_marker
+    assert "rm ~/.claude/dcg.toml" not in dcg_marker["remedy"], dcg_marker
+    assert "systemctl restart claude-runtime-links" in dcg_marker["remedy"], (
+        dcg_marker
+    )
+    # ORDER. #394 measured that a bind mount whose source directory was
+    # replaced stays `mountpoint`-green while serving nothing, and that
+    # starting claude-runtime-deploy does not re-bind it. So the remedy must
+    # send the operator to the MOUNT unit, and must have them prove the
+    # projection serves a replacement BEFORE the seed is moved aside —
+    # otherwise following it on such a host leaves dcg with no user layer at
+    # all, which is worse than the state being reported.
+    # And it must send them to a unit that EXISTS. This asserted the string
+    # `claude-runtime-mounts` until 2026-11-02, and there is no such unit:
+    # that is the name of a module FILE, while the units it generates are
+    # per-path mounts (home-jonathan-.claude-runtime.mount). The assertion was
+    # green on a name systemctl cannot resolve, so the one step that repairs a
+    # dead projection could not be run as printed. A string check could not
+    # have caught that — only asking systemd can.
+    assert "systemd-escape --path --suffix=mount" in dcg_marker["remedy"], (
+        "the remedy does not DERIVE the projection's mount unit. The name is "
+        "escaped, so a literal is both unreadable and liable to rot: "
+        f"{dcg_marker['remedy']!r}"
+    )
+    # Run the remedy's own derivation here, and prove what it produces is a
+    # real unit.
+    dcg_mount_unit = workstation.succeed(
+        "systemd-escape --path --suffix=mount /home/jonathan/.claude/runtime"
+    ).strip()
+    workstation.succeed(f"systemctl cat {dcg_mount_unit} > /dev/null")
+    # Every unit the remedy names outright has to resolve too, so no future
+    # edit can reintroduce a name nothing can find. Suffixes are required by
+    # the sibling check in claude-config's hook for the same reason they are
+    # useful here: `systemctl status foo` silently means `foo.service`, which
+    # is exactly how a .mount got mistaken for one.
+    dcg_named_units = sorted(set(_re.findall(
+        r"[\w.@-]+\.(?:service|mount|timer|path|socket|target)\b",
+        dcg_marker["remedy"],
+    )))
+    assert dcg_named_units, dcg_marker["remedy"]
+    for _unit in dcg_named_units:
+        workstation.succeed(f"systemctl cat {_unit} > /dev/null")
+    assert dcg_marker["remedy"].index("runtime/dcg.toml") < dcg_marker[
+        "remedy"
+    ].index("mv ~/.claude/dcg.toml"), (
+        "the remedy moves the seed aside before having the operator check "
+        f"that the projection serves a replacement: {dcg_marker['remedy']!r}"
+    )
     # The seed's CONTENT hash, and it must describe the file the marker
     # names. This is the field the NEXT activation reads back to decide
     # whether a seeded target may be refreshed in place (arm (i) below), so
@@ -5738,6 +5864,12 @@ in
         "degraded state is again a banner in a unit log nobody reads: "
         f"{dcg_marker!r}"
     )
+    # The banner is a separate interpolation site from the marker, so it is
+    # checked on its own: the same remedy, verbatim, not a shell-mangled one.
+    assert "Fix: " + dcg_marker["remedy"] + "." in reseed_log, (
+        "the seed banner does not carry the marker's remedy verbatim:\n"
+        + reseed_log[-3000:]
+    )
     dcg_assert_denied_by_user_config(
         "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"
     )
@@ -6093,10 +6225,31 @@ in
     workstation.fail("grep -q '# PROJECTED' /home/jonathan/.claude/dcg.toml")
 
     # THEN the operator step that clears it, which is what the runbook has to
-    # carry: remove the seeded file, and only then does the cutover complete.
-    workstation.succeed("rm /home/jonathan/.claude/dcg.toml")
+    # carry: take the seeded file out of the way, and only then does the
+    # cutover complete.
+    #
+    # Performed EXACTLY as the marker's `remedy` words it, `mv` and all, so
+    # this arm proves the documented instruction rather than a paraphrase of
+    # it. The remedy is asserted to say `mv` and not `rm` some 4900 lines
+    # above; running `rm` here would leave the two free to drift, with the
+    # lane green either way.
+    #
+    # The projection's own copy is confirmed readable FIRST, which is the
+    # order the remedy imposes: #394 measured a bind mount serving nothing
+    # while `mountpoint` stayed green, and a seed moved aside on such a host
+    # would leave dcg with no user layer at all.
+    workstation.succeed("head -1 /home/jonathan/.claude/runtime/dcg.toml")
+    workstation.succeed(
+        "mv /home/jonathan/.claude/dcg.toml "
+        "/home/jonathan/dcg.toml.seed-backup"
+    )
     workstation.succeed(
         "systemctl restart claude-runtime-links.service"
+    )
+    # Moved, not destroyed: the operator can still diff what activation had
+    # seeded against the fallback it came from.
+    workstation.succeed(
+        "cmp ${../home/dcg-fallback.toml} /home/jonathan/dcg.toml.seed-backup"
     )
     assert workstation.succeed(
         "systemctl show -P ExecMainStatus claude-runtime-links.service"
@@ -6133,6 +6286,105 @@ in
     assert workstation.succeed(
         "cat /home/jonathan/.claude/hooks/bash-guard.py"
     ).strip() == "guard"
+
+    # A DEAD SOURCE (#391). A directory bind pins its source directory's
+    # inode, and git removes and recreates a directory whenever a commit
+    # empties it and re-adds its contents — a submodule update can do the
+    # same. The mount then serves the unlinked inode, which is empty, while
+    # `mountpoint -q` stays green. findmnt is what shows it: the SOURCE gains
+    # a `//deleted` suffix.
+    #
+    # Constructed here, for every projection, from the one point in this lane
+    # where the links unit is known to exit 0 — so a refusal below is
+    # attributable to the dead source and to nothing else, which is the
+    # confound the first measurement in #391 could not rule out. Measured
+    # before this check existed: runtime/ was refused only by accident,
+    # through its "is empty" test, and each of the three vendor projections
+    # exited 0 while serving an empty directory.
+    #
+    # The watcher and the timer are stopped for the block, because replacing
+    # runtime/ fires the path unit, and a triggered run landing between a
+    # restart below and the read of its status would be measured instead.
+    # Every row is collected before anything is asserted, so a failure
+    # reports the whole table rather than its first line.
+    workstation.succeed(
+        "systemctl stop claude-runtime-links.path claude-runtime-links.timer"
+    )
+    dead_rows = []
+    for relative in [
+        "runtime",
+        "vendor/superpowers/hooks",
+        "vendor/superpowers/skills",
+        "vendor/everything-claude-code/skills",
+    ]:
+        src = f"{checkout}/{relative}"
+        dst = f"/home/jonathan/.claude/{relative}"
+        unit = workstation.succeed(
+            f"systemd-escape -p --suffix=mount {dst}"
+        ).strip()
+        row = {"at": relative}
+        row["inode_before"] = workstation.succeed(f"stat -c %i {src}").strip()
+        # What git does to the directory: its contents go, the directory goes,
+        # and a new directory with the same contents takes the name.
+        workstation.succeed(
+            f"cp -a {src} {src}.new && rm -r {src} && mv {src}.new {src}"
+        )
+        row["inode_after"] = workstation.succeed(f"stat -c %i {src}").strip()
+        row["green"] = workstation.execute(f"mountpoint -q {dst}")[0] == 0
+        row["served"] = workstation.succeed(f"ls -A {dst}").strip()
+        row["source"] = workstation.succeed(f"findmnt -rno SOURCE {dst}").strip()
+        workstation.execute("systemctl restart claude-runtime-links.service")
+        row["status"] = workstation.succeed(
+            "systemctl show -P ExecMainStatus claude-runtime-links.service"
+        ).strip()
+        invocation = workstation.succeed(
+            "systemctl show -P InvocationID claude-runtime-links.service"
+        ).strip()
+        row["log"] = workstation.succeed(
+            f"journalctl _SYSTEMD_INVOCATION_ID={invocation} --no-pager -o cat"
+        )
+        # The repair, and the control that makes the refusal mean something:
+        # restarting the mount unit binds the live directory again, and the
+        # links unit goes straight back to exit 0.
+        workstation.succeed(f"systemctl restart '{unit}'")
+        workstation.succeed("systemctl reset-failed claude-runtime-links.service")
+        workstation.execute("systemctl restart claude-runtime-links.service")
+        row["repaired_status"] = workstation.succeed(
+            "systemctl show -P ExecMainStatus claude-runtime-links.service"
+        ).strip()
+        row["repaired_served"] = workstation.succeed(f"ls -A {dst}").strip()
+        dead_rows.append(row)
+    dead_table = "\n".join(
+        f"{r['at']}: inode {r['inode_before']}->{r['inode_after']} "
+        f"green={r['green']} served={r['served']!r} source={r['source']} "
+        f"status={r['status']} repaired={r['repaired_status']}"
+        f"\n  log: {r['log'].strip()!r}"
+        for r in dead_rows
+    )
+    for r in dead_rows:
+        dst = f"/home/jonathan/.claude/{r['at']}"
+        # The condition really was constructed — new inode, mount still
+        # green, projected path empty, findmnt naming the deleted source.
+        # Without these the refusal could be asserted against a run that never
+        # killed anything.
+        assert r["inode_before"] != r["inode_after"], dead_table
+        assert r["green"], dead_table
+        assert r["served"] == "", dead_table
+        assert r["source"].endswith("//deleted]"), dead_table
+        # And it is refused, for that reason: the message names the dead
+        # source, so runtime/'s accidental "is empty" refusal does not count.
+        assert r["status"] == "75", dead_table
+        assert f"{dst} is mounted from a deleted directory" in r["log"], dead_table
+        assert r["repaired_status"] == "0", dead_table
+        assert r["repaired_served"] != "", dead_table
+    # The links survived the refusal: nothing was swept while runtime/ was
+    # dead, so the config is whole again the moment the mount is.
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/hooks/bash-guard.py"
+    ).strip() == "guard"
+    workstation.succeed(
+        "systemctl start claude-runtime-links.path claude-runtime-links.timer"
+    )
 
     # settings.json is deliberately not projected: Claude Code writes it, and
     # a link into the read-only mount would make that write fail. Confirmed
