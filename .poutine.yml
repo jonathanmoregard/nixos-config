@@ -1,0 +1,7 @@
+# poutine config for scripts/security-static.sh (nix run .#security-static).
+skip:
+  # Every action in .github/workflows is pinned to a full commit SHA and
+  # zizmor's unpinned-uses audit enforces that. "Unverified creator" only
+  # says the publisher lacks a GitHub Marketplace badge (cachix,
+  # nix-community, DeterminateSystems), which is not a finding here.
+  - rule: github_action_from_unverified_creator_used

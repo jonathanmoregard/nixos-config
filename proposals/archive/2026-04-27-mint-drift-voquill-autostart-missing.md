@@ -7,7 +7,7 @@ source: mint-drift-agent
 
 ## Voquill (local).desktop autostart not captured in config
 
-The live autostart directory contains 'Voquill (local).desktop' which does not correspond to any home.file entry in cinnamon.nix. The four other autostart entries (Beeper, Dropbox, KeePassXC, xbindkeys) are all declared; this one is not. On a fresh install Voquill would not launch at login.
+The live autostart directory contains 'Voquill (local).desktop' which does not correspond to any home.file entry in cinnamon.nix. The other autostart entries (Beeper, Dropbox, KeePassXC) are all declared; this one is not. On a fresh install Voquill would not launch at login.
 
 ```
 First inspect the live file to get the correct Exec line:

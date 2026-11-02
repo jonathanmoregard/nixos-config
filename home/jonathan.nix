@@ -1,4 +1,9 @@
 { pkgs, ... }:
+let
+  # gh + git-over-HTTPS authenticate as the GitHub App, never as the founder.
+  ghHost = import ./gh-host-token.nix { inherit pkgs; };
+  githubAppMcp = import ./github-app-mcp.nix { inherit pkgs; };
+in
 {
   home.username = "jonathan";
   home.homeDirectory = "/home/jonathan";
@@ -14,12 +19,23 @@
     # Credential pass of the permission-ledger aggregator and the proposal
     # intake gate (~/.claude); both fail open ("unavailable") without it.
     detect-secrets
-    gh
+    # `gh` here is the App-token wrapper (home/gh-host-token.nix), not pkgs.gh:
+    # it shadows /run/current-system/sw/bin/gh and fails closed without a
+    # fresh host token.
+    ghHost.gh
+    ghHost.credentialHelper
+    # App-only credential wrapper; the pinned server itself stays off PATH.
+    githubAppMcp
     direnv
     jq
     # The git-broker MCP (~/.claude/mcps/git-broker) runs every Git op
     # inside bwrap resolved from PATH and fails closed without it.
     bubblewrap
+    # The sandbox policy back-check (~/.claude/runtime/scripts/sandbox-backcheck.py)
+    # parses every replayed command with `shfmt -ln bash --to-json`; without it
+    # on PATH each call classifies as "unknown:shfmt-unavailable" and the survey
+    # reports nothing. Override the binary with SANDBOX_BACKCHECK_SHFMT.
+    shfmt
     # Fonts
     nerd-fonts.jetbrains-mono
     # Dev toolchains
@@ -27,6 +43,7 @@
     cargo
     python3
     uv
+    # Editor: see home/vscodium.nix (package, extensions, settings, keys).
     # Intentionally NOT included (drift-scan 2026-04-19):
     # - terraform: not used for now
     # - yt-dlp: not wanted
@@ -40,7 +57,26 @@
       user.email = "jonathan.more@hotmail.com";
       init.defaultBranch = "main";
       pull.rebase = true;
-      credential."https://github.com".helper = "!/run/current-system/sw/bin/gh auth git-credential";
+      # GitHub App host token, fail closed (home/gh-host-token.nix). Absolute
+      # store path: git runs it as-is, no PATH lookup. The empty entry first
+      # resets any helper configured earlier (system config, a later
+      # `gh auth setup-git`), so nothing can answer for github.com ahead of
+      # the App token. tests/base.nix proves it with a decoy system helper.
+      credential."https://github.com".helper = [ "" "${ghHost.credentialHelper}/bin/gh-app-credential" ];
+      # Send path=OWNER/NAME.git to the helper: one App installation covers
+      # one owner, so the token is picked per owner (personal or org).
+      credential."https://github.com".useHttpPath = true;
+      # GitHub over https only, so every fetch and push (agents' and the
+      # founder's own) goes through the App token above. The founder's SSH
+      # key is not registered on GitHub; these spellings would otherwise
+      # fail instead of reaching the repo.
+      url."https://github.com/".insteadOf = [
+        "git@github.com:"
+        "ssh://git@github.com/"
+        "ssh://github.com/"
+        "git@ssh.github.com:"
+        "ssh://git@ssh.github.com:443/"
+      ];
       core.hooksPath = "~/.config/git/hooks";
       core.excludesfile = "~/.config/git/ignore";
 
@@ -262,14 +298,6 @@
       # Powerlevel10k
       source ${pkgs.zsh-powerlevel10k}/share/zsh-powerlevel10k/powerlevel10k.zsh-theme
       [[ -f ~/.p10k.zsh ]] && source ~/.p10k.zsh
-
-      # gh wrapper: ensure auth before gh commands
-      gh() {
-        if ! command gh auth status &>/dev/null 2>&1; then
-          command gh auth login
-        fi
-        command gh "$@"
-      }
 
       # claude wrapper: clear + resume most recent session by default.
       # Use `claudee` to start a fresh session.

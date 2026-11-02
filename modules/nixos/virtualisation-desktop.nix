@@ -9,7 +9,11 @@
 #   - libvirtd + qemu_kvm + swtpm (TPM 2.0 — Win11 install requirement)
 #   - OVMFFull (UEFI firmware — required for Q35 + Secure Boot)
 #   - virt-manager (GUI), virt-viewer (SPICE client), virt-install (CLI)
-#   - jonathan added to `libvirtd` + `kvm` groups so no-sudo virsh works
+#   - jonathan in `kvm` but NOT `libvirtd`: libvirtd-group membership is
+#     root for anything running as jonathan (a guest can be handed any
+#     host path or disk), agents included. qemu:///system therefore asks
+#     for jonathan's password through polkit (virsh/virt-install in the
+#     terminal, virt-manager in a dialog).
 #   - `win-vm` on PATH — subcommands: fetch-iso, create, view, start, stop
 #
 # The Win11 ISO is NOT baked into the closure. Microsoft's download page
@@ -32,8 +36,8 @@
   # responsive and lets USB devices pass through virt-viewer.
   virtualisation.spiceUSBRedirection.enable = true;
 
-  # virt-manager (GUI) — this option also wires the polkit rules so
-  # libvirtd-group members drive libvirt without sudo prompts.
+  # virt-manager (GUI). jonathan is deliberately not in libvirtd, so it
+  # authenticates through the desktop's polkit agent.
   programs.virt-manager.enable = true;
 
   environment.systemPackages = [
@@ -43,12 +47,12 @@
     (import ../../home/win-vm.nix { inherit pkgs; })
   ];
 
-  users.users.jonathan.extraGroups = [ "libvirtd" "kvm" ];
+  users.users.jonathan.extraGroups = [ "kvm" ];
 
-  # Persistent VM disks + ISOs live here. 0770 root:libvirtd so
-  # libvirtd's qemu can read/write and members of libvirtd (jonathan)
-  # can drop ISOs in.
+  # Persistent VM disks + ISOs live here, written by libvirtd (root) and
+  # by `win-vm fetch-iso` through sudo. World-listable so win-vm can
+  # check for the ISO and disk without a group.
   systemd.tmpfiles.rules = [
-    "d /var/lib/libvirt/images 0770 root libvirtd -"
+    "d /var/lib/libvirt/images 0755 root root -"
   ];
 }

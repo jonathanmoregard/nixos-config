@@ -61,7 +61,7 @@ gh pr checks <PR_NUMBER>
 
 # 5. Merge in the GitHub UI (the CLI `gh pr merge` is denied at the
 #    safe-bash MCP layer). Auto-deploy webhook fires on push:main → nixos-deploy.service
-#    runs `git fetch + reset --hard + nixos-rebuild switch` on dellan.
+#    runs unprivileged fetch → SHA-pinned import + reset --hard → nixos-rebuild switch on dellan.
 #    Desktop notification fires on success/failure.
 
 # 6. Clean up
@@ -133,7 +133,6 @@ Adding a new test: drop `tests/<feature>.nix` (use existing files as templates),
 | `build dellan toplevel` | Builds `nixosConfigurations.dellan.config.system.build.toplevel` |
 | `build tuxedo toplevel` | Builds `nixosConfigurations.tuxedo.config.system.build.toplevel` after dellan, reusing its store snapshot; pushes to cachix for tuxedo's auto-deploy |
 | `vm-minimal (<lane>)` | Ephemeral VM e2e test; one matrix lane per `tests/<feature>.nix` (base / desktop / keyring / kitty / claude-pane) |
-| `vm-graphical` | Path-conditional; runs only if you touched `home/cinnamon.nix` / `home/kitty.nix` / `modules/nixos/desktop.nix` / theme files |
 
 Branch protection: required status checks (above) are the gate. No required review on this solo-author repo. All `gh pr merge` invocations (including no flags) are denied at the safe-bash MCP layer — merges happen via the GitHub UI's merge button so the click is a deliberate gesture, not a CLI autopilot path past the checks.
 
@@ -159,7 +158,11 @@ Edits *through* symlinks write to nixos-config (intended). Adding a link = edit 
 `nixos-deploy.service` (systemd, root) on dellan:
 1. GitHub `push: main` event → webhook over Tailscale Funnel
 2. Handler validates HMAC + replay-protects via `X-GitHub-Delivery` UUID
-3. `git fetch origin main` + `git reset --hard origin/main` in `/etc/nixos`
+3. Fetch/apply split (#389): root reads the `main` SHA itself (`git ls-remote`,
+   one ref), the unprivileged `nixos-deploy-fetch.service` (user `nixos-fetch`)
+   downloads objects into `/var/lib/nixos-deploy-fetch/source.git`, root imports
+   exactly that SHA into `/etc/nixos` and `git reset --hard`s to it. Root refuses
+   to build if anything under `/etc/nixos` is non-root-owned or g/o-writable.
 4. `nixos-rebuild switch --flake /etc/nixos#dellan`
 5. On success: writes `last-good` SHA, libnotify low-priority desktop notification
 6. On failure: writes `current-poison` SHA + appends to `poisoned.log`,
@@ -223,7 +226,7 @@ Arrival order and evidence sources are recorded in
 ## Known gaps / manual steps
 
 - **Dropbox**: daemon autostarts but `~/Dropbox` folder requires GUI login to Dropbox on first run.
-- **`~/.claude` repo**: NOT auto-cloned. Claude Code populates `~/.claude` with runtime state (backups, projects, sessions, cache) on first run, and the [.claude repo](https://github.com/jonathanmoregard/.claude.git) needs to coexist with that. Bootstrap: move runtime dirs aside, `git clone git@github.com:jonathanmoregard/.claude.git ~/.claude`, move dirs back in, then `cd ~/.claude && git submodule update --init --recursive`.
+- **Claude config repo**: NOT auto-cloned, and it does not go in `~/.claude`. Clone it to `~/Repos/claude-config` (`git clone https://github.com/jonathanmoregard/claude-config.git ~/Repos/claude-config && git -C ~/Repos/claude-config submodule update --init --recursive`, which is the remote the host actually uses). `~/.claude` stays Claude Code's own runtime state (credentials, projects, sessions, cache) and receives the repository's `runtime/` subtree as read-only bind mounts plus one symlink per entry — `modules/nixos/claude-runtime-mounts.nix`, gated on `~/.claude/.projection-enabled`. Never clone the repository over `~/.claude`: it would put the repo's `tests/` tree at a path every agent reads, which is the one thing that projection exists to prevent.
 - **Beeper**: installed via nixpkgs (unfree, allowed). Requires account login on first run. nixpkgs version lags upstream — see `overlays/beeper.nix` for version bump.
 - **`~/.huskyrc`**: declared in `home/jonathan.nix` (loads nvm for husky pre-commit hooks). NVM itself is not declared in this flake — install via `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash` if needed.
 

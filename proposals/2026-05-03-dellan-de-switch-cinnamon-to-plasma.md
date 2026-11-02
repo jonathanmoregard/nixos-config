@@ -40,7 +40,6 @@ Reimplement `home/cinnamon.nix` (~350 LOC dconf bundle) as KDE config:
 - Night light keys (cinnamon settings-daemon → kwinrc NightColor)
 - Default applications, MIME (xdg.mimeApps stays — not DE-specific)
 - Autostart entries (.desktop files at same path — DE-agnostic)
-- xbindkeys → kglobalshortcutsrc
 - Nemo file manager → Dolphin (or keep nemo as alt)
 - Grayscale applet → KWin grayscale shortcut binding
 

@@ -640,7 +640,7 @@ Each step is annotated `[auto]` (Claude can do start-to-finish in one autonomous
 12. **`[human-checkpoint]`** STOP. Wait for at least one green run of all named status checks on `main` (eval, build, vm-minimal, classify, label-gate). An autonomous implementer MUST NOT proceed past this checkpoint without explicit user confirmation; doing so risks locking out merges if the next step's Rulesets reference a status check that hasn't produced a check-run yet.
 13. **D.2** Bootstrap script for Rulesets, in `enforcement: "evaluate"` mode first — `[human]` (PAT with `repo:admin` for ruleset CRUD)
 14. **D.2 (active)** Flip Rulesets to `enforcement: "active"` once verified — `[human-checkpoint]` (verifies dry-run results match expectations before activation)
-15. **E.1** VM-graphical tier + screenshot baseline scaffolding — `[auto]`
+15. **E.1** ~~VM-graphical tier + screenshot baseline scaffolding~~ — **DROPPED 2026-10-12**: the placeholder `vm-graphical` CI job tested nothing; the `vm-minimal (desktop)` lane covers the desktop stack. `[auto]`
 16. **claude-agent** user split + gh-wrapper PATH scoping (threat model) — `[auto]`
 17. **E.2** VM-realapp tier (opt-in) — `[auto]`
 

@@ -6,7 +6,7 @@
 # injects token values via TEST_PAT (no prompts).
 #
 # Asserts:
-#   - All 3 .age files materialize at $FAKE/secrets/
+#   - Both .age files (deploy key, webhook secret) materialize at $FAKE/secrets/
 #   - Each ciphertext is > 350 bytes (above empty-plaintext baseline)
 #   - Each decrypts to the expected plaintext
 #   - Phase 3 git commit lands in the fake repo
@@ -52,7 +52,6 @@ let
 in {
   "deploy-ssh-key.age".publicKeys        = [ k1 k2 ];
   "github-webhook-secret.age".publicKeys = [ k1 k2 ];
-  "gh-janitor-token.age".publicKeys      = [ k1 k2 ];
 }
 EOF
 
@@ -65,7 +64,6 @@ cat > "$FAKE/hosts/dellan/default.nix" <<'EOF'
 
   age.secrets.deploy-ssh-key.rekeyFile        = ../../secrets/deploy-ssh-key.age;
   age.secrets.github-webhook-secret.rekeyFile = ../../secrets/github-webhook-secret.age;
-  age.secrets.gh-janitor-token.rekeyFile      = ../../secrets/gh-janitor-token.age;
 
   services.githubWebhook = {
     enable = true;
@@ -106,12 +104,12 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Assertion: all 3 .age files exist
+# Assertion: both .age files exist
 # -------------------------------------------------------------------------
 
-heading "All 3 .age files present"
+heading "Both .age files present"
 
-for name in deploy-ssh-key github-webhook-secret gh-janitor-token; do
+for name in deploy-ssh-key github-webhook-secret; do
   f="$FAKE/secrets/${name}.age"
   if [ -f "$f" ]; then
     ok "$name.age exists"
@@ -126,7 +124,7 @@ done
 
 heading "Ciphertext sizes above empty-baseline (>350)"
 
-for name in deploy-ssh-key github-webhook-secret gh-janitor-token; do
+for name in deploy-ssh-key github-webhook-secret; do
   f="$FAKE/secrets/${name}.age"
   size=$(wc -c < "$f")
   if [ "$size" -gt 350 ]; then
@@ -146,13 +144,20 @@ decrypt() {
   rage -d -i "$TESTDIR/k1" "$1"
 }
 
-actual_pat=$(decrypt "$FAKE/secrets/gh-janitor-token.age")
-expected_pat_line="GH_TOKEN=$EXPECTED_PAT"
-if [ "$actual_pat" = "$expected_pat_line" ]; then
-  ok "gh-janitor-token decrypts to GH_TOKEN=<pat> (env-format)"
+# The rulesets PAT is a one-shot bootstrap credential: Phase 7 uses it and
+# unsets it. It must never be written to disk, encrypted or not — a stored
+# full-`repo` PAT decrypted on every boot with no reader is pure exposure.
+if [ -e "$FAKE/secrets/gh-janitor-token.age" ]; then
+  nope "install.sh stored the rulesets PAT as secrets/gh-janitor-token.age"
 else
-  nope "gh-janitor-token mismatch. Expected: $expected_pat_line  Got: $actual_pat"
+  ok "no gh-janitor-token.age written"
 fi
+for f in "$FAKE"/secrets/*.age; do
+  if decrypt "$f" | grep -qF "$EXPECTED_PAT"; then
+    nope "$(basename "$f") contains the rulesets PAT"
+  fi
+done
+ok "no .age file contains the rulesets PAT"
 
 actual_webhook=$(decrypt "$FAKE/secrets/github-webhook-secret.age")
 if [[ "$actual_webhook" =~ ^WEBHOOK_SECRET=[a-f0-9]{64}$ ]]; then
@@ -199,10 +204,10 @@ fi
 
 # All three "already exists; skipping" should appear
 skip_count=$(grep -c "already exists; skipping" "$TESTDIR/install2.log")
-if [ "$skip_count" -ge 3 ]; then
-  ok "All 3 secret phases skipped as expected (skip count: $skip_count)"
+if [ "$skip_count" -ge 2 ]; then
+  ok "Both secret phases skipped as expected (skip count: $skip_count)"
 else
-  nope "Expected >=3 skip messages, got $skip_count"
+  nope "Expected >=2 skip messages, got $skip_count"
 fi
 
 # -------------------------------------------------------------------------

@@ -41,8 +41,8 @@ seconds the transcription is about to need:
     performance -- sleep 30` runs as a child and power-profiles-daemon keeps
     the hold exactly as long as that child lives; one child at a time, so a
     burst of pings cannot stack holds;
-  - touches ai-throttle's foreground hint file, so the governor pauses the
-    background units (embedding backfill) on its next tick instead of after
+  - touches the foreground hint file, so a reader of the hint can pause the
+    background work at once instead of after
     the dictation's CPU time has shown up in cpu.stat.
 
 Every transcription takes the same boost inline, so the gain exists without
@@ -62,7 +62,7 @@ Settings come from the environment (the systemd unit sets them):
                            using the full-window one (20)
   LOCAL_STT_POWERPROFILESCTL  the powerprofilesctl binary (default: the one
                            on PATH; none found = no performance hold)
-  LOCAL_STT_THROTTLE_HINT  ai-throttle's foreground hint file (default
+  LOCAL_STT_THROTTLE_HINT  the foreground hint file (default
                            $XDG_RUNTIME_DIR/ai-throttle/foreground-hint)
 """
 

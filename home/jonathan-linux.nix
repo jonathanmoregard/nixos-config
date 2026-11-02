@@ -357,9 +357,10 @@ let
   #      listed as skipped instead;
   #   2. the proposal inventory (path + status, every category, archived
   #      and rejected included) so dedup is a comparison, not a sweep.
-  # Exit 3 = nothing in the window: the wrapper skips the model call.
-  # Manifest eligibility (sessionend complete) stays with the model per
-  # prompt.md Step 2.
+  # Exit 3 = nothing in the window. The block is still printed, with the
+  # window marked empty, so a run fed only by PR review feedback keeps its
+  # inventory. Manifest eligibility (sessionend complete) stays with the
+  # model per prompt.md Step 2.
   rsiReviewInputs = pkgs.writeShellApplication {
     name = "rsi-review-inputs";
     runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.gawk ];
@@ -385,17 +386,18 @@ let
           window+=("- \`$path\` (modified $stamp)")
         fi
       done
-      if [ "''${#window[@]}" -eq 0 ]; then
-        echo "rsi-review-inputs: no readable reflections modified in the last 24h under $sessions" >&2
-        exit 3
-      fi
       echo "## Precomputed inputs (appended by the rsi-daily-review wrapper)"
       echo
       echo "### Step 2 window"
       echo
-      echo "The wrapper has already selected Step 2's candidates (top-level final.json, modified in the last 24h, newest first, at most 12). Use exactly this list: do not glob, grep or otherwise search for reflections. Apply Step 2's manifest checks to each entry."
-      echo
-      printf '%s\n' "''${window[@]}"
+      if [ "''${#window[@]}" -eq 0 ]; then
+        echo "rsi-review-inputs: no readable reflections modified in the last 24h under $sessions" >&2
+        echo "No reflections were modified in the last 24h: skip Step 2 and do not search for reflections."
+      else
+        echo "The wrapper has already selected Step 2's candidates (top-level final.json, modified in the last 24h, newest first, at most 12). Use exactly this list: do not glob, grep or otherwise search for reflections. Apply Step 2's manifest checks to each entry."
+        echo
+        printf '%s\n' "''${window[@]}"
+      fi
       if [ "''${#skipped[@]}" -gt 0 ]; then
         echo
         echo "Skipped for size — report these in your final summary, never open them:"
@@ -416,12 +418,21 @@ let
       else
         echo "(no proposal sink at $proposals yet)"
       fi
+      [ "''${#window[@]}" -gt 0 ] || exit 3
     '';
   };
 
+  # The user's own PR review comments, a second review input. The
+  # script's docstring states what it collects and why PR conversation
+  # comments are left out. Its GitHub identity is the App installation
+  # token, through the gh wrapper passed below as --gh.
+  rsiPrFeedback = pkgs.writers.writePython3Bin "rsi-pr-feedback" { }
+    (builtins.readFile ./rsi-pr-feedback.py);
+  ghApp = (import ./gh-host-token.nix { inherit pkgs; }).gh;
+
   rsiDailyReview = pkgs.writeShellApplication {
     name = "rsi-daily-review";
-    runtimeInputs = [ rsiProposalSink rsiReviewInputs pkgs.coreutils pkgs.jq pkgs.util-linux ];
+    runtimeInputs = [ rsiProposalSink rsiReviewInputs rsiPrFeedback pkgs.coreutils pkgs.jq pkgs.util-linux ];
     text = ''
       prompt_file="$HOME/.claude/recursive-self-improvement/config/prompt.md"
       # Proposals land in the state-dir sink, NOT in ~/.claude. ~/.claude
@@ -518,23 +529,47 @@ let
       proposals directory, and pushing happens behind the proposals
       intake gate."
       # Window + inventory, selected deterministically (see rsiReviewInputs).
-      # An empty window means there is nothing to review: skip the model
-      # call rather than pay for a pass that can only search in vain.
       inputs_rc=0
       inputs="$(rsi-review-inputs "$HOME/.claude/reflections/sessions" \
         "$(dirname "$dest")")" || inputs_rc=$?
-      if [ "$inputs_rc" -eq 3 ]; then
-        echo "rsi-daily-review: no reflections in the 24h window — skipping (no model call)"
-        exit 0
-      elif [ "$inputs_rc" -ne 0 ]; then
+      if [ "$inputs_rc" -ne 0 ] && [ "$inputs_rc" -ne 3 ]; then
         echo "rsi-daily-review: rsi-review-inputs failed rc=$inputs_rc" >&2
         exit "$inputs_rc"
+      fi
+      # PR review feedback (see rsiPrFeedback) is an optional input: a gh
+      # outage, missing auth or a timeout costs this input, never the
+      # review. Auth: the GitHub App installation token minted by
+      # gh-token.service into ~/.cache/gh-tokens/host/token, read by the
+      # gh-host-token wrapper; missing or stale fails closed, never the PAT.
+      pr_rc=0
+      pr_feedback="$(timeout 600 rsi-pr-feedback --gh ${ghApp}/bin/gh \
+        --login jonathanmoregard \
+        --owner jonathanmoregard --owner klaffat \
+        --since "$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)")" || pr_rc=$?
+      if [ "$pr_rc" -ne 0 ]; then
+        if [ "$pr_rc" -ne 3 ]; then
+          msg="rsi-daily-review: rsi-pr-feedback failed rc=$pr_rc — continuing without PR feedback"
+          echo "$msg" >&2
+          logger -p user.warning -t rsi-daily-review "$msg" || true
+        fi
+        pr_feedback=""
+      fi
+      # Nothing to review: skip the model call rather than pay for a pass
+      # that can only search in vain.
+      if [ "$inputs_rc" -eq 3 ] && [ -z "$pr_feedback" ]; then
+        echo "rsi-daily-review: no reflections and no PR feedback in the 24h window — skipping (no model call)"
+        exit 0
       fi
       # Logged so each night's window is auditable next to the run.
       printf '%s\n' "$inputs" | grep '/final.json' || true
       override="$override
 
       $inputs"
+      if [ -n "$pr_feedback" ]; then
+        override="$override
+
+      $pr_feedback"
+      fi
       # The prompt goes to claude on STDIN, not as an argv string. The
       # kernel caps one argv string at 128 KiB (MAX_ARG_STRLEN), and the
       # inventory above grows ~100 B per proposal: as an argument the run
@@ -637,6 +672,7 @@ in
     ./calibre-plugins.nix
     ./ghostty.nix
     ./kitty.nix
+    ./vscodium.nix
     ./git-hooks.nix
     ./cache-publisher-enqueue.nix
     ./autodoro.nix
@@ -651,10 +687,8 @@ in
     ./router-services.nix
     ./claude-services.nix
     ./ai-client-config-sync.nix
-    ./claude-skills.nix
     ./research-agent-mcp.nix
-    ./futuresearch-gate-mcp.nix
-    ./aggregator-embed.nix
+    ./ha-mcp.nix
     ./aggregator-mcp-backend.nix
     # Must stay AFTER ./jonathan.nix: it redefines claude()/claudee()
     # through `programs.zsh.initContent = lib.mkAfter`, and the later
@@ -673,7 +707,9 @@ in
   # (permission-ledger injection pass, RSI research cron). Without it those
   # passes report "unavailable" and emit samples unscanned.
   # See overlays/prompt-injection-scan.nix.
-  home.packages = [ pkgs.prompt-injection-scan ];
+  # secret-redact: the ~/.claude output hooks call it on every tool result and
+  # withhold the result when it is missing. See overlays/secret-redact.nix.
+  home.packages = [ pkgs.prompt-injection-scan pkgs.secret-redact ];
 
   # User crontab — declarative source of truth. Re-applied on every rebuild
   # (overwrites any ad-hoc `crontab -e` edits).
@@ -697,9 +733,6 @@ in
     CLAUDE_PIPELINE_INTERNAL=1
     0 9 * * 1 /home/jonathan/.claude/date-check.sh
     0 10 * * 1 /home/jonathan/.claude/scripts/update-submodules.sh >> /home/jonathan/.claude/logs/submodule-update.log 2>&1
-    0 11 * * 1 /home/jonathan/Repos/dotfiles/backup-crontab.sh >> /home/jonathan/Repos/dotfiles/backup-crontab.log 2>&1
-    23 14 * * * /home/jonathan/Repos/dotfiles/sync-agent.sh >> /home/jonathan/Repos/dotfiles/sync.log 2>&1
-    0 10 * * 1 git -C /home/jonathan/Repos/everything-claude-code pull --ff-only >> /home/jonathan/.claude/logs/ecc-pull.log 2>&1
     # token-optimizer upstream-merge autosync: REMOVED 2026-10-03. It would
     # merge third-party upstream (alexgreensh/token-optimizer) hook code
     # into a live, enabled plugin with no human review. Dormant since
@@ -707,14 +740,8 @@ in
     # it would have silently re-armed that. Pull upstream by hand instead.
     */30 6-22 * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/habit-tracker.py >> /home/jonathan/.claude/logs/habit-tracker.log 2>&1
     */30 * * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/sunset-walk-tracker.py >> /home/jonathan/.claude/logs/sunset-walk-tracker.log 2>&1
-    # superpowers is a PUBLIC fork of obra/superpowers and gitignores
-    # sync-agent.sh on purpose — local automation must not land in the
-    # tree or leak into an upstream PR. The previous line pointed at an
-    # in-repo copy that consequently did not exist, so every run since
-    # logged `No such file or directory` and synced nothing. The canonical
-    # script now takes a SYNC_REPO override so it can sync a repo it does
-    # not live inside; nothing needs to exist in the public tree.
-    37 15 * * * SYNC_REPO=/home/jonathan/Repos/superpowers /home/jonathan/.claude/skills/repo-autosync/sync-agent.sh >> /home/jonathan/Repos/superpowers/sync.log 2>&1
+    # Upstream drift of vendored forks becomes a pending proposal; never merged unattended.
+    30 10 * * 1 ${pkgs.python3}/bin/python3 /home/jonathan/.claude/scripts/upstream-drift.py >> /home/jonathan/.claude/logs/upstream-drift.log 2>&1
     11 16 * * * /home/jonathan/Repos/aggregator/sync-agent.sh >> /home/jonathan/Repos/aggregator/sync.log 2>&1
     # ~/.claude auto-commit + push: REMOVED 2026-08-31, deliberately.
     #
@@ -727,11 +754,11 @@ in
     # nobody reviewing it.
     #
     # ~/.claude is now read-only: work happens in worktrees under
-    # ~/worktrees/claude-<slug>, reaches master through a PR, and comes
-    # back down via claude-pull.timer (see home/claude-services.nix),
-    # which is fast-forward-only and is now the ONLY writer to that
-    # checkout. Nothing replaces the push half, because there is no
-    # longer meant to be one.
+    # ~/worktrees/claude-<slug> and reaches master through a PR. Since
+    # 2026-10-27 it comes back down into a DEPLOY clone outside this home
+    # (modules/nixos/claude-runtime-deploy.nix), fast-forward-only, and that
+    # unit is the only writer to the tree ~/.claude is served from. Nothing
+    # replaces the push half, because there is no longer meant to be one.
     #
     # Deliberately not commented-out-in-place: a dormant cron line is an
     # invitation to re-enable without re-reading why it went.
@@ -806,9 +833,7 @@ in
   # services.cron.enable). Home-manager activation runs with a minimal PATH
   # that doesn't include /run/wrappers/bin, so `command -v crontab` returned
   # nothing here and the if-guard silently skipped the reinstall — leaving
-  # the active crontab stale after every `nixos-rebuild switch`. The
-  # backup-sync agent (~/Repos/dotfiles/sync-agent.sh, scheduled daily)
-  # didn't compensate either, because it bails out without gitleaks.
+  # the active crontab stale after every `nixos-rebuild switch`.
   # Result: cron entries on disk drifted from the active crontab for days
   # (caught when wellbeing trackers kept failing with /usr/bin/python3
   # after the python-path fix had already deployed).
@@ -913,7 +938,6 @@ in
     clone_if_missing survival-corpus "$HOME/Repos/survival-corpus"
     clone_if_missing superpowers "$HOME/Repos/superpowers"
     clone_if_missing voquill "$HOME/Repos/voquill"
-    clone_if_missing dotfiles "$HOME/Repos/dotfiles"
     clone_if_missing everything-claude-code "$HOME/Repos/everything-claude-code"
   '';
 }

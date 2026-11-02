@@ -3,7 +3,7 @@
 # add-secret — one-command wrapper for adding a new agenix-rekey secret.
 #
 # Collapses the manual flow documented in
-# home/claude-skills/nixos-agenix-secret/SKILL.md (edit host file →
+# ~/.claude/skills/nixos-agenix-secret/SKILL.md (edit host file →
 # `edit-view -- edit` → `rekey` → git add/commit/push/PR) into a single
 # invocation.
 #
@@ -30,12 +30,17 @@
 #                               (harness synthesises stdin — never set
 #                               interactively; kills the confirm-reentry
 #                               safety)
+let
+  # `gh pr create` authenticates as the GitHub App (home/gh-host-token.nix),
+  # never through the founder's keyring credential.
+  ghHost = import ./gh-host-token.nix { inherit pkgs; };
+in
 pkgs.writeShellApplication {
   name = "add-secret";
   runtimeInputs = with pkgs; [
     age
     git
-    gh
+    ghHost.gh
     wl-clipboard
     xclip
     coreutils
@@ -194,9 +199,10 @@ To edit its value, use the manual edit path:
           # Actually TRY to open /dev/tty — `[ -r /dev/tty ]` returns
           # true in sandboxes where the device node exists but isn't
           # connected to anything (open() then fails with ENXIO).
-          # `exec 3</dev/tty` returns non-zero on that ENXIO, which is
-          # what we key off.
-          if exec 3</dev/tty 2>/dev/null; then
+          # Scope stderr suppression to this group. A bare
+          # `exec 3</dev/tty 2>/dev/null` keeps stderr redirected for the
+          # rest of this subshell and silently swallows both prompts.
+          if { exec 3</dev/tty; } 2>/dev/null; then
             printf 'value for %s: ' "$NAME" >&2
             IFS= read -rs v1 <&3
             printf '\n' >&2
@@ -296,7 +302,7 @@ To edit its value, use the manual edit path:
     if ! grep -qF "$MARKER" "$DECL_FILE"; then
       rm -f "$AGE_FILE"
       die "marker '$MARKER' not found in $DECL_FILE — cannot safely insert.
-Add the marker on its own line where new age.secrets should go, or fall back to the manual path in home/claude-skills/nixos-agenix-secret/SKILL.md."
+Add the marker on its own line where new age.secrets should go, or fall back to the manual path in ~/.claude/skills/nixos-agenix-secret/SKILL.md."
     fi
 
     DECL_BACKUP="$DECL_FILE.add-secret-backup"

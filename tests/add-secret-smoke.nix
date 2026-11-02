@@ -1,11 +1,12 @@
 # add-secret-smoke — runtime-invocation harness for the add-secret
-# wrapper (home/add-secret.nix; the exact derivation dellan puts on
+# wrapper (home/add-secret.nix; the exact derivation the primary host puts on
 # PATH is asserted below via deployedBin, not a rebuilt copy).
 #
 # What this exercises (fast — cheap runCommand, seconds):
 #   - name validation rejects invalid shapes (uppercase, leading digit)
 #   - preflight refuses when not in a nixos-config worktree root
 #   - refuses when the secret is already declared in the target file
+#   - interactive prompt mode displays both prompts and completes under a PTY
 #   - happy path (TEST_MODE=1):
 #       - writes secrets/<name>.age (valid age file — starts with the
 #         `age-encryption.org/v1` header)
@@ -21,7 +22,7 @@
 #     The working-Wayland branch needs a compositor and is not covered.
 #
 # What is NOT exercised here (requires real nix eval / real gh / real
-# rekey — must be manually tested on dellan; see the PR body):
+# rekey — must be manually tested on the workstation; see the PR body):
 #   - `nix eval` sanity check
 #   - `agenix-rekey rekey`
 #   - git commit / push / gh pr create
@@ -33,7 +34,7 @@ pkgs.runCommand "add-secret-smoke"
   {
     inherit deployedBin;
     tool = "${addSecretPkg}/bin/add-secret";
-    nativeBuildInputs = with pkgs; [ bash coreutils git gnugrep gnused age openssh xorg-server xclip ];
+    nativeBuildInputs = with pkgs; [ bash coreutils git gnugrep gnused age openssh util-linux xorg-server xclip ];
   } ''
     set -euo pipefail
 
@@ -46,10 +47,10 @@ pkgs.runCommand "add-secret-smoke"
     }
 
     # --- drift gate ----------------------------------------------------
-    # Whatever ends up on dellan's PATH must be the same store path we
+    # Whatever ends up on the primary host's PATH must be the same store path we
     # just smoked.
     [ "$deployedBin" = "$tool" ] || \
-      fail "dellan add-secret ($deployedBin) != tested tool ($tool)"
+      fail "deployed add-secret ($deployedBin) != tested tool ($tool)"
 
     # --- fixture: minimal worktree layout that satisfies preflight ------
     export HOME="$PWD/home"
@@ -284,6 +285,28 @@ NIXFILE
     [ ! -f "$PWD/f-explicit-prompt/secrets/explicit-prompt.age" ] \
       || fail "--prompt override was ignored — .age file created from piped stdin"
 
+    # --- 10b. prompt remains visible on the controlling tty --------------
+    # Regression: bare `exec 3</dev/tty 2>/dev/null` permanently redirected
+    # stderr inside read_value's command-substitution subshell, swallowing
+    # both prompts and making the command look hung. `script` supplies a
+    # real PTY and the two confirmation lines complete the prompt flow.
+    mkfixture "$PWD/f-prompt-tty"
+    # Absolute path taken before the subshell's `cd`: the redirect below is
+    # expanded after it, when $PWD is already the fixture.
+    prompt_input="$PWD/prompt-input"
+    printf 'prompt-value\nprompt-value\n' >"$prompt_input"
+    ( cd "$PWD/f-prompt-tty" && \
+        timeout 5 script -qec \
+          "ADD_SECRET_TEST_MODE=1 '$tool' prompt-tty --prompt" \
+          /dev/null <"$prompt_input" ) \
+      >prompt-tty.log 2>&1 || fail "prompt mode hung or failed under a controlling tty"
+    grep -q "value for prompt-tty:" prompt-tty.log \
+      || fail "prompt mode did not display its first prompt"
+    grep -q "confirm" prompt-tty.log \
+      || fail "prompt mode did not display its confirmation prompt"
+    [ -f "$PWD/f-prompt-tty/secrets/prompt-tty.age" ] \
+      || fail "prompt mode did not write the .age file"
+
     # --- 11. a host file with its own marker keeps its declarations -----
     # (example-server shape): --host example-server writes there, never into
     # the workstation profile.
@@ -362,6 +385,6 @@ NIXFILE
     [ ! -f "$PWD/f-clip-none/secrets/clip-none.age" ] \
       || fail "clipboard refusal left secrets/clip-none.age behind"
 
-    echo "ok: name-validate, preflight, dup-refuse, happy-path, custom-attrs, exists-refuse, KEY= strip, auto-detect-stdin, auto-detect-empty-refuse, explicit-prompt-override, host-marker, no-marker-refuse, clipboard-x11, clipboard-wayland-fallback, clipboard-no-session"
+    echo "ok: name-validate, preflight, dup-refuse, happy-path, custom-attrs, exists-refuse, KEY= strip, auto-detect-stdin, auto-detect-empty-refuse, explicit-prompt-override, prompt-tty, host-marker, no-marker-refuse, clipboard-x11, clipboard-wayland-fallback, clipboard-no-session"
     touch "$out"
   ''

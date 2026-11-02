@@ -14,7 +14,6 @@ in
     bibata-cursors
     xdotool
     scrot
-    xbindkeys
     copyq
     gnome-screenshot
   ];
@@ -67,16 +66,6 @@ in
     Type=Application
     Name=Beeper
     Exec=beeper
-    Hidden=false
-    X-GNOME-Autostart-enabled=true
-  '';
-
-  # xbindkeys autostart — binds defined in ~/.xbindkeysrc (managed via dotfiles repo)
-  home.file.".config/autostart/xbindkeys.desktop".text = ''
-    [Desktop Entry]
-    Type=Application
-    Name=xbindkeys
-    Exec=${pkgs.xbindkeys}/bin/xbindkeys
     Hidden=false
     X-GNOME-Autostart-enabled=true
   '';
@@ -239,6 +228,9 @@ in
       tap-to-click = true;
       tap-and-drag = true;
       disable-while-typing = true;
+      # The Fn touchpad-toggle hotkey flips this key in the user dconf db, where
+      # it survives reboots (cursor stuck mid-screen). Pin it so a rebuild re-enables.
+      send-events = "enabled";
     };
 
     # --- Touchpad gestures ---

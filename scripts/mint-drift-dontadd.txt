@@ -31,7 +31,6 @@ winetricks                    # apt name variant
 # --- Already declared / resolved (avoid re-flagging) ---
 ^tailscale                    # declared in modules/nixos/tailscale.nix + imported by dellan
 ^gh-cli                       # declared in modules/common.nix systemPackages
-^xbindkeys-autostart          # declared in home/cinnamon.nix
 ^huskyrc                      # declared in home/jonathan.nix as ~/.huskyrc
 ^voquill-autostart            # declared in home/cinnamon.nix
 ^claude-sandbox-proxy         # declared in home/claude-services.nix

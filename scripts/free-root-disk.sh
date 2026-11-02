@@ -11,13 +11,22 @@
 # because `/` itself can be starved.
 #
 # This script scrubs the largest preinstalled toolchains nothing in this
-# repo uses. ~5-10s total — cheap insurance against the runner-image
-# variance flake. Compare jlumbroso/free-disk-space at ~2.5min.
+# repo uses. That takes ~2-2.5 min (millions of small files), so it only
+# runs when / is short: current images (2026-10) ship / at 145G with
+# ~86G free, and the sparse /nix loop plus /tmp peak around 45-55G.
 
 set -euo pipefail
 
 echo "before:"
 df -h /
+
+min_free_gb=70
+free_gb=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+if [ "$free_gb" -ge "$min_free_gb" ]; then
+  echo "/ has ${free_gb}G free (>= ${min_free_gb}G); skipping cleanup"
+  exit 0
+fi
+echo "/ has only ${free_gb}G free (< ${min_free_gb}G); cleaning up"
 
 sudo rm -rf \
   /usr/share/dotnet \

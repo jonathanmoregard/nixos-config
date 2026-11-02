@@ -1,26 +1,51 @@
-{ config, pkgs, ... }:
+{ config, lib, pkgs, osConfig ? { }, ... }:
 # Claude-related user services. Captured from live host on 2026-04-27 — these
 # units were installed imperatively (~/.config/systemd/user/) and would be
 # lost on a fresh rebuild without this declarative copy.
 #
-# These depend on supporting state under ~/.claude (dev-container scripts,
-# GitHub App private key). On a fresh install
-# the units will fail at first tick until that scaffolding is set up
-# separately.
+# Some depend on supporting state under ~/.claude (scripts, skills). On a
+# fresh install those units fail at first tick until that scaffolding is set
+# up separately.
+let
+  mintGhToken = import ./github-app-mint.nix { inherit pkgs; };
+  brokerSockets = import ../modules/nixos/github-app-broker/sockets.nix;
+  # Only a host running the broker can mint; elsewhere (dellan) there is no
+  # App key to reach, so no token unit.
+  brokerOnHost = osConfig.services.githubAppBroker.enable or false;
+in
 {
   # ReadWritePaths below must exist or the unit dies at NAMESPACE (226).
   # ~/.cache is not carried over to a fresh host, so create it here.
   # 0755 matches dellan's long-lived dir.
+  #
+  # host/ + scope=installation switch on mint-gh-token's host mode: a
+  # whole-installation App token in host/token, read by the gh wrapper and
+  # git credential helper (home/gh-host-token.nix). 0700: the token is the
+  # laptop's only GitHub credential once the founder PAT is gone. `f+`
+  # rewrites the marker each boot so a hand edit cannot narrow or widen it.
+  #
+  # host/<owner>/ holds the org installation token for each ORG_INSTALLATIONS
+  # entry in ~/.config/github-app/config (multi-owner: the wrapper and helper
+  # pick it for that owner's repos, home/gh-host-token.nix). Declared 0700
+  # here for the klaffat org; mint-gh-token (home/github-app-mint.nix)
+  # creates any other owner's dir 0700 itself.
   systemd.user.tmpfiles.rules = [
     "d %h/.cache/gh-tokens 0755 - - -"
+    "d %h/.cache/gh-tokens/host 0700 - - -"
+    "f+ %h/.cache/gh-tokens/host/scope 0644 - - - installation"
+    "d %h/.cache/gh-tokens/host/klaffat 0700 - - -"
   ];
 
-  # gh-token — rotate GitHub App installation tokens for active sandboxes.
-  systemd.user.services.gh-token = {
-    Unit.Description = "Rotate GitHub App installation tokens for active Claude sandboxes";
+  # gh-token — rotate GitHub App installation tokens: one per active sandbox,
+  # plus the host token every agent on this machine uses. Minted through the
+  # App key broker (modules/nixos/github-app-broker); this unit never holds
+  # the App key.
+  systemd.user.services.gh-token = lib.mkIf brokerOnHost {
+    Unit.Description = "Rotate GitHub App installation tokens (host + active Claude sandboxes)";
     Service = {
       Type = "oneshot";
-      ExecStart = "%h/.claude/dev-container/bin/mint-gh-token";
+      ExecStart = "${mintGhToken}/bin/mint-gh-token %h/.config/github-app/config"
+        + " %h/.cache/gh-tokens ${brokerSockets.token}";
       Nice = 5;
 
       NoNewPrivileges = "yes";
@@ -28,7 +53,6 @@
       ProtectSystem = "strict";
       ProtectHome = "read-only";
       ReadWritePaths = "%h/.cache/gh-tokens";
-      ReadOnlyPaths = "%h/.config/github-app/app.pem";
       ProtectKernelTunables = "yes";
       ProtectKernelModules = "yes";
       ProtectControlGroups = "yes";
@@ -39,16 +63,20 @@
     };
   };
 
-  systemd.user.timers.gh-token = {
-    Unit.Description = "Rotate GitHub App tokens every 50 minutes";
+  systemd.user.timers.gh-token = lib.mkIf brokerOnHost {
+    Unit.Description = "Rotate GitHub App tokens every 20 minutes";
     Timer = {
       OnBootSec = "1min";
-      OnUnitActiveSec = "50min";
-      # No Persistent: it only belongs on OnCalendar timers. On a monotonic
-      # timer it restores last-trigger from the previous boot's stamp, and if
-      # the user manager starts after OnBootSec has elapsed (login >1min after
-      # boot) systemd treats the boot tick as already fired and the timer
-      # never elapses — observed 2026-09-30, tokens went stale for 3h.
+      # Realtime, not OnUnitActiveSec: the monotonic clock stops during
+      # suspend, so after a night asleep a monotonic timer would leave the
+      # (60-minute) host token expired for up to its whole interval, and the
+      # fail-closed gh wrapper would refuse every call meanwhile. A calendar
+      # elapse that passed during suspend fires on resume.
+      OnCalendar = "*:0/20";
+      # No Persistent: OnBootSec already covers boot. Persistent on the old
+      # monotonic timer restored last-trigger from the previous boot's stamp
+      # and, if the user manager started after OnBootSec had elapsed, the
+      # timer never elapsed: observed 2026-09-30, tokens went stale for 3h.
     };
     Install.WantedBy = [ "timers.target" ];
   };
@@ -129,43 +157,39 @@
   # tweak). The script is fast-forward-only by construction — unlike
   # /etc/nixos, ~/.claude is a live working tree that sessions write to,
   # so nixos-deploy's `git reset --hard` would destroy in-flight work.
-  systemd.user.services.claude-pull = {
-    Unit = {
-      Description = "Fast-forward ~/.claude to origin (CD for the Claude config repo)";
-      After = [ "default.target" ];
-    };
-    Service = {
-      Type = "oneshot";
-      # %h expands to $HOME under home-manager's systemd --user.
-      ExecStart = "%h/.claude/scripts/claude-pull.sh";
-      # Background maintenance — never compete with an interactive session.
-      Nice = 10;
-      IOSchedulingClass = "idle";
-      # The script bounds its own fetch at 60s; this is the backstop for a
-      # hang anywhere else in the run. Comfortably under the 10min cadence
-      # so a wedged tick cannot overlap the next one.
-      TimeoutStartSec = 180;
-    };
-  };
-
-  systemd.user.timers.claude-pull = {
-    Unit.Description = "Poll origin for merged ~/.claude PRs every 10 minutes";
-    Timer = {
-      # Calendar rather than monotonic (unlike its neighbours) precisely so
-      # Persistent= applies: it has no effect on OnUnitActiveSec= timers.
-      # This is a laptop that suspends, and a merge landing while it sleeps
-      # should arrive on resume, not at the next natural boundary.
-      OnCalendar = "*:0/10";
-      Persistent = true;
-      # Nothing downstream cares about the exact second; the slack lets
-      # systemd coalesce this tick with other wakeups instead of waking the
-      # machine on its own, and keeps it out of the on-the-minute stampede.
-      AccuracySec = "1min";
-      RandomizedDelaySec = "1min";
-      Unit = "claude-pull.service";
-    };
-    Install.WantedBy = [ "timers.target" ];
-  };
+  # RETIRED 2026-10-27, and deliberately not replaced by a user unit.
+  #
+  # The service and timer that used to live here pulled claude-config into
+  # ~/Repos/claude-config, which was also the tree ~/.claude was SERVED from.
+  # That coupling is the thing Jonathan objected to: "Repos/claude-config is
+  # the dev version, and .claude is the deployed artefact. Real weird for
+  # production to depend on dev." The serving tree now lives at
+  # /var/lib/claude-runtime/checkout, written only by
+  # claude-runtime-deploy.service running as the claude-deploy system user —
+  # see modules/nixos/claude-runtime-deploy.nix, which carries the full
+  # reasoning, including why it is not root and why its ExecStart is
+  # store-pinned rather than %h-relative.
+  #
+  # Two consequences worth stating plainly, because neither is a regression:
+  #
+  #   * ~/Repos/claude-config no longer auto-updates. It is a DEV checkout:
+  #     branches, worktrees and rebases live there, and an unattended
+  #     fast-forward of a tree someone may be mid-rebase on is not a service.
+  #     Pull it by hand, or cut a worktree from origin/master as the policy
+  #     already requires.
+  #   * the whole "TEMPORARILY NOT ENABLED" hold that used to sit on this
+  #     timer is gone with it. That hold existed because a pull would relocate
+  #     files out from under ~50 registered hook paths in the LIVE ~/.claude
+  #     before any mount existed. The deploy unit cannot do that: it only ever
+  #     writes its own clone, which nothing reads until the cutover marker is
+  #     created, so it is enabled from the start — and in fact must run before
+  #     the marker, since the clone has to exist for the mounts to have a
+  #     source.
+  #
+  # The sibling pullers below (claude-marketplace-pull, klaffat-pull) stay as
+  # user units: they target OTHER repositories that are not served through the
+  # projection, and %h is correct for a unit whose service manager is the
+  # user's own.
 
   # claude-marketplace-pull — the same puller, second target.
   #

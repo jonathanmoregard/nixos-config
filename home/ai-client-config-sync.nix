@@ -1,6 +1,8 @@
 { lib, pkgs, ... }:
 let
   networkOnline = import ./network-online-script.nix { inherit pkgs; };
+  ghHost = import ./gh-host-token.nix { inherit pkgs; };
+  credentialHelper = "${ghHost.credentialHelper}/bin/gh-app-credential";
 
   renderInNamespace = pkgs.writeShellScript "ai-client-config-render-isolated" ''
     set -euo pipefail
@@ -55,6 +57,7 @@ let
       pkgs.findutils
       pkgs.git
       pkgs.python3
+      pkgs.rsync
       pkgs.util-linux
     ];
     text = ''
@@ -66,6 +69,8 @@ let
       run_dir=""
       publish_started=0
       stage="validate"
+      # Listed directories are authoritative mirror output; omitted children
+      # are pruned. Native runtime locations are excluded below.
       managed_paths=(
         ".codex/config.toml"
         ".codex/rules"
@@ -73,7 +78,7 @@ let
         ".codex/hooks"
         ".codex/hooks.json"
         ".codex/mcps"
-        ".codex/plugins"
+        ".codex/plugins/claude-mirror"
         ".codex/agents"
         ".codex/claude-setup-mirror"
         ".codex/AGENTS.md"
@@ -82,6 +87,41 @@ let
         "plugins/claude-mirror"
       )
 
+      # Only these generated paths belong to the mirror. Everything else,
+      # including Codex's bundled skills and installed plugins, stays outside it.
+      sync_filters=(
+        --exclude="/.codex/skills/.system/***"
+        # Active sessions cache these immutable hook commands and runtimes.
+        --filter="P /.codex/hooks/claude-mirror/***"
+      )
+      for relative in "''${managed_paths[@]}"; do
+        parent=$(dirname "$relative")
+        while [ "$parent" != "." ]; do
+          sync_filters+=( --include="/$parent/" )
+          parent=$(dirname "$parent")
+        done
+        sync_filters+=( --include="/$relative" --include="/$relative/***" --include="/$relative.bak-*" )
+      done
+      sync_filters+=( --exclude="*" )
+
+      sync_tree() {
+        local source_root="$1" target_root="$2"
+        shift 2
+        # Copy payloads before the entry points that reference them, including
+        # on first installation. Then update those entry points and prune.
+        # Keep private directory permissions and file executable bits.
+        rsync -rltE --checksum --omit-dir-times \
+          --exclude="/.codex/config.toml" \
+          --exclude="/.codex/hooks.json" \
+          --exclude="/.agents/plugins/marketplace.json" \
+          --exclude="/plugins/claude-mirror/.codex-plugin/plugin.json" \
+          --exclude="/plugins/claude-mirror/.mcp.json" \
+          --exclude="/plugins/claude-mirror/hooks.json" \
+          "$@" "''${sync_filters[@]}" -- "$source_root/" "$target_root/" || return
+        rsync -rltE --checksum --omit-dir-times --delete-after \
+          "$@" "''${sync_filters[@]}" -- "$source_root/" "$target_root/"
+      }
+
       mkdir -p "$state_dir"
 
       finish() {
@@ -89,30 +129,7 @@ let
         trap - EXIT
         if [ "$status" -ne 0 ] && [ "$publish_started" -eq 1 ]; then
           failed_stage="$stage"
-          rollback_failed=0
-          for index in "''${!managed_paths[@]}"; do
-            relative="''${managed_paths[$index]}"
-            target="$HOME/$relative"
-            case "$relative" in
-              ".agents/plugins"|"plugins/claude-mirror")
-                find "$target" -mindepth 1 -maxdepth 1 \
-                  -exec rm -rf -- {} + || rollback_failed=1
-                if [ -e "$run_dir/backup/$index.present" ]; then
-                  cp -a -- "$run_dir/backup/$index.value/." "$target/" \
-                    || rollback_failed=1
-                fi
-                ;;
-              *)
-                rm -rf -- "$target" || rollback_failed=1
-                if [ -e "$run_dir/backup/$index.present" ]; then
-                  mkdir -p "$(dirname "$target")"
-                  cp -a -- "$run_dir/backup/$index.value" "$target" \
-                    || rollback_failed=1
-                fi
-                ;;
-            esac
-          done
-          if [ "$rollback_failed" -ne 0 ]; then
+          if ! sync_tree "$run_dir/backup" "$HOME"; then
             stage="$failed_stage-rollback"
             status=70
           fi
@@ -168,20 +185,25 @@ let
           clone_args=(-c protocol.file.allow=always clone "''${clone_args[@]}")
       elif [[ "$remote_normalized" =~ ^https://([^/@]+@)?github[.]com(:443)?(/|$) ]]; then
           # This service deliberately cannot see the user's Git config under
-          # ProtectHome=tmpfs. Use gh's existing desktop-keyring credential
-          # explicitly, and scope the helper to github.com so no other remote
-          # can receive it. Environment tokens would shadow that keyring.
-          unset GH_TOKEN GITHUB_TOKEN
-          export GH_CONFIG_DIR="$HOME/.config/gh"
+          # ProtectHome=tmpfs. Name the GitHub App host-token helper
+          # explicitly (home/gh-host-token.nix; only that token's directory
+          # is bound in), scoped to github.com so no other remote can receive
+          # it. It fails closed: no token, no clone, and no keyring fallback.
+          # useHttpPath hands the helper path=OWNER/NAME.git so it picks that
+          # owner's installation token (personal or org); the probe asks for
+          # exactly the path the clone will.
           stage="authenticate"
-          if ! ${lib.getExe pkgs.gh} auth token --hostname github.com \
-            >/dev/null 2>&1; then
-            echo "ai-client-config sync: GitHub authentication unavailable; run 'gh auth login --hostname github.com --git-protocol https' in your desktop session" >&2
+          probe_path="''${remote#*://}"
+          probe_path="''${probe_path#*/}"
+          if ! printf 'protocol=https\nhost=github.com\npath=%s\n\n' "$probe_path" \
+            | ${credentialHelper} get >/dev/null; then
+            echo "ai-client-config sync: GitHub App host token unavailable; run 'systemctl --user start gh-token.service' and check 'journalctl --user -u gh-token.service'" >&2
             exit 69
           fi
           clone_args=(
             -c credential.helper=
-            -c "credential.https://github.com.helper=!${lib.getExe pkgs.gh} auth git-credential"
+            -c "credential.https://github.com.helper=${credentialHelper}"
+            -c credential.https://github.com.useHttpPath=true
             clone
             "''${clone_args[@]}"
           )
@@ -256,18 +278,43 @@ let
         fi
       }
 
+      # Resolve the collection itself, then enumerate its entries and
+      # materialize each one through snapshot_entry. A collection that is a
+      # symlink to a directory is still a collection: it must be walked, not
+      # copied wholesale. `cp -a` implies `-d`, so a wholesale copy preserves
+      # every entry that is a symlink as a symlink, and those targets are not
+      # in the renderer's namespace — the farm would arrive dangling. Entries
+      # are addressed by "$relative/<basename>" rather than by stripping
+      # $HOME, because the resolved collection may sit outside $HOME.
       snapshot_collection() {
         local relative="$1"
         local source="$HOME/$relative"
-        local entry
-        if [ -L "$source" ] || [ ! -d "$source" ]; then
+        local resolved entry
+        if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+          return
+        fi
+        if ! resolved=$(realpath -e -- "$source"); then
+          echo "ai-client-config sync: unresolved source $relative" >&2
+          exit 66
+        fi
+        if [ ! -d "$resolved" ]; then
           snapshot_entry "$relative"
           return
         fi
+        # find's exit status is invisible through process substitution, so an
+        # unreadable collection would enumerate as empty, the snapshot would
+        # hold nothing for it, and the publish step would then prune every
+        # rendered entry under it — a silent wipe reported as success. Write
+        # the listing to a file so the failure is observable.
+        local listing="$run_dir/collection-listing"
+        if ! find -P "$resolved" -mindepth 1 -maxdepth 1 -print0 > "$listing"; then
+          echo "ai-client-config sync: cannot enumerate $relative" >&2
+          exit 66
+        fi
         mkdir -p "$source_home/$relative"
         while IFS= read -r -d "" entry; do
-          snapshot_entry "''${entry#"$HOME/"}"
-        done < <(find -P "$source" -mindepth 1 -maxdepth 1 -print0)
+          snapshot_entry "$relative/''${entry##*/}"
+        done < "$listing"
       }
 
       mkdir -p "$source_home/.claude"
@@ -337,14 +384,16 @@ let
       mkdir -p "$run_dir/backup"
       staged_home="$run_dir/staged-home"
       mkdir -p "$staged_home"
-      for index in "''${!managed_paths[@]}"; do
-        relative="''${managed_paths[$index]}"
-        target="$HOME/$relative"
-        if [ -e "$target" ] || [ -L "$target" ]; then
-          touch "$run_dir/backup/$index.present"
-          cp -a -- "$target" "$run_dir/backup/$index.value"
+      sync_tree "$HOME" "$run_dir/backup"
+      # These are merge inputs, not generated output to carry forward. Render
+      # every generated directory from scratch so omitted files become stale.
+      for relative in \
+        .codex/config.toml \
+        .codex/rules/default.rules \
+        .agents/plugins/marketplace.json; do
+        if [ -f "$run_dir/backup/$relative" ]; then
           mkdir -p "$(dirname "$staged_home/$relative")"
-          cp -a -- "$target" "$staged_home/$relative"
+          cp -a -- "$run_dir/backup/$relative" "$staged_home/$relative"
         fi
       done
       mkdir -p \
@@ -371,27 +420,9 @@ let
 
       stage="publish"
       publish_started=1
-      for index in "''${!managed_paths[@]}"; do
-        relative="''${managed_paths[$index]}"
-        source="$staged_home/$relative"
-        target="$HOME/$relative"
-        case "$relative" in
-          ".agents/plugins"|"plugins/claude-mirror")
-            find "$target" -mindepth 1 -maxdepth 1 \
-              -exec rm -rf -- {} +
-            if [ -e "$source" ]; then
-              cp -a -- "$source/." "$target/"
-            fi
-            ;;
-          *)
-            rm -rf -- "$target"
-            if [ -e "$source" ] || [ -L "$source" ]; then
-              mkdir -p "$(dirname "$target")"
-              cp -a -- "$source" "$target"
-            fi
-            ;;
-        esac
-      done
+      # Renderer backups are not desired output. Hiding them only on the
+      # sender lets the same final prune remove old backups on the receiver.
+      sync_tree "$staged_home" "$HOME" --filter='H *.bak-*'
 
       stage="record"
       success_tmp="$state_dir/last-success.tmp.$$"
@@ -461,17 +492,17 @@ in
       PrivateTmp = "yes";
       ProtectSystem = "strict";
       ProtectHome = "tmpfs";
-      # gh keeps the token in Secret Service. Expose only its config metadata
-      # and the user-bus socket needed for the pre-render credential lookup.
+      # GitHub credentials: only the App host-token directory (a directory,
+      # not the file, so the timer's atomic rename stays visible). No gh
+      # config and no user bus: the founder's keyring is out of reach.
       # Trusted wrapper snapshots explicit Claude config entry points and
       # enabled plugin roots. renderInNamespace masks the live home and runtime
       # directory, then exposes only the sparse source snapshot read-only.
       BindReadOnlyPaths = lib.concatStringsSep " " [
         "-%h/.claude"
         "-%h/.claude.json"
-        "-%h/.config/gh"
+        "-%h/.cache/gh-tokens/host"
         "-%h/Repos"
-        "-%t/bus"
       ];
       BindPaths = lib.concatStringsSep " " [
         "%h/.codex"

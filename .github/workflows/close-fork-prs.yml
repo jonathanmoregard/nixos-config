@@ -14,7 +14,9 @@
 # a GitHub-hosted runner is correct (no privilege, no persistent state).
 name: close-fork-prs
 
-on:
+# zizmor: ignore[dangerous-triggers] — metadata-only job, never checks out
+# or runs PR code (see header); this trigger is how fork PRs get closed.
+on:  # zizmor: ignore[dangerous-triggers]
   pull_request_target:
     types: [opened, reopened]
 

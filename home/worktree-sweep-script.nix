@@ -66,7 +66,10 @@ pkgs.writeShellApplication {
   name = "worktree-sweep";
   runtimeInputs = with pkgs; [ git jq coreutils ];
   text = ''
-    GH_BIN="''${SWEEP_GH_BIN:-${pkgs.gh}/bin/gh}"
+    # The App-token wrapper (home/gh-host-token.nix), not pkgs.gh: no host
+    # token means `gh auth status` fails and the sweep degrades to age-only
+    # cleanup, exactly as for any other auth outage.
+    GH_BIN="''${SWEEP_GH_BIN:-${(import ./gh-host-token.nix { inherit pkgs; }).gh}/bin/gh}"
     MAX_AGE_DAYS=${toString maxAgeDays}
 
     log() { echo "[worktree-sweep] $*"; }

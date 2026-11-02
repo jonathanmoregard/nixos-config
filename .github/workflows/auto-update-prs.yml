@@ -43,13 +43,15 @@
 #    token is a separate actor; the synchronize event it generates
 #    triggers CI normally.
 #
-#    Required secrets (set at repo level):
+#    Required secrets, in the `auto-update` environment (deployment
+#    branches: main only), never at repo level: a repo secret is
+#    readable by any workflow file pushed to any branch, an
+#    environment secret only by jobs running on main.
 #      AUTO_UPDATE_APP_ID          — the GitHub App's numeric ID
 #      AUTO_UPDATE_APP_PRIVATE_KEY — the App's .pem private key
 #    Required GitHub App permissions:
 #      Contents: Read & write
 #      Pull requests: Read & write
-#      Checks: Read, Commit statuses: Read (red-CI filter)
 #    The App must be installed on this repo.
 #
 # `gh pr update-branch` returns non-zero on merge conflict; logged as
@@ -77,6 +79,7 @@ jobs:
   update:
     if: github.repository == 'jonathanmoregard/nixos-config'
     runs-on: ubuntu-latest
+    environment: auto-update
     steps:
       - name: Generate App installation token
         id: app-token
@@ -88,9 +91,6 @@ jobs:
           # permission the App installation holds.
           permission-contents: write
           permission-pull-requests: write
-          # Read-only: the red-CI filter reads statusCheckRollup.
-          permission-checks: read
-          permission-statuses: read
 
       - name: Update one behind, green auto-merge PR
         env:

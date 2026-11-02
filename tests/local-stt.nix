@@ -276,7 +276,7 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   # the router answers 204 at once and, for the seconds the transcription is
   # about to need, holds the performance power profile (powerprofilesctl
   # launch keeps the hold while its child lives; one child at a time) and
-  # leaves a foreground hint that ai-throttle reads to pause the background
+  # leaves a foreground hint that a hint reader can use to pause background
   # units on its next tick. A transcription takes the same hold inline, so
   # the gain exists without any ping.
   # The transcriptions above already took the hold: one launch whose child

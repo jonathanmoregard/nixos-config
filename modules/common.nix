@@ -17,6 +17,7 @@
     # --- pre-existing core ---
     claude-code
     codex          # OpenAI Codex CLI — cross-vendor validator lane
+    sandbox-runtime # srt — bubblewrap sandbox with Unix-socket seccomp filtering
     git
     gh
     ripgrep        # rg — fast grep, respects .gitignore
@@ -119,9 +120,11 @@
     # it). Trusted-public-keys is additive.
     substituters = [
       "https://jonathanmoregard.cachix.org"
+      "https://codex-cli.cachix.org"
     ];
     trusted-public-keys = [
-      "jonathanmoregard.cachix.org-1:Qzksr/c2ciAaV4j/U2mGFd1HTgOAicks8gJNs1Ztxo8="
+      "jonathanmoregard.cachix.org-1:dx2ddtW26xQClPgpJYu0ba6B3n/2FGGLw96vpREEw7w="
+      "codex-cli.cachix.org-1:1Br3H1hHoRYG22n//cGKJOk3cQXgYobUel6O8DgSing="
     ];
   };
 }

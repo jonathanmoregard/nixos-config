@@ -6,7 +6,7 @@
 # lid-guard lid-close keys + agent-activity tool (home/lid-guard.nix).
 #
 # Excludes kitty, ghostty, autodoro, drift-analyzer, router-services,
-# claude-services, claude-skills, research-agent-mcp.
+# claude-services, research-agent-mcp.
 { ... }:
 {
   imports = [
