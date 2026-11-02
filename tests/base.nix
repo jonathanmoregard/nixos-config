@@ -5261,10 +5261,36 @@ in
     # projection serves a replacement BEFORE the seed is moved aside —
     # otherwise following it on such a host leaves dcg with no user layer at
     # all, which is worse than the state being reported.
-    assert "claude-runtime-mounts" in dcg_marker["remedy"], (
-        "the remedy never names the mount unit, which is the only thing that "
-        f"repairs a dead bind source: {dcg_marker['remedy']!r}"
+    # And it must send them to a unit that EXISTS. This asserted the string
+    # `claude-runtime-mounts` until 2026-11-02, and there is no such unit:
+    # that is the name of a module FILE, while the units it generates are
+    # per-path mounts (home-jonathan-.claude-runtime.mount). The assertion was
+    # green on a name systemctl cannot resolve, so the one step that repairs a
+    # dead projection could not be run as printed. A string check could not
+    # have caught that — only asking systemd can.
+    assert "systemd-escape --path --suffix=mount" in dcg_marker["remedy"], (
+        "the remedy does not DERIVE the projection's mount unit. The name is "
+        "escaped, so a literal is both unreadable and liable to rot: "
+        f"{dcg_marker['remedy']!r}"
     )
+    # Run the remedy's own derivation here, and prove what it produces is a
+    # real unit.
+    dcg_mount_unit = workstation.succeed(
+        "systemd-escape --path --suffix=mount /home/jonathan/.claude/runtime"
+    ).strip()
+    workstation.succeed(f"systemctl cat {dcg_mount_unit} > /dev/null")
+    # Every unit the remedy names outright has to resolve too, so no future
+    # edit can reintroduce a name nothing can find. Suffixes are required by
+    # the sibling check in claude-config's hook for the same reason they are
+    # useful here: `systemctl status foo` silently means `foo.service`, which
+    # is exactly how a .mount got mistaken for one.
+    dcg_named_units = sorted(set(_re.findall(
+        r"[\w.@-]+\.(?:service|mount|timer|path|socket|target)\b",
+        dcg_marker["remedy"],
+    )))
+    assert dcg_named_units, dcg_marker["remedy"]
+    for _unit in dcg_named_units:
+        workstation.succeed(f"systemctl cat {_unit} > /dev/null")
     assert dcg_marker["remedy"].index("runtime/dcg.toml") < dcg_marker[
         "remedy"
     ].index("mv ~/.claude/dcg.toml"), (
