@@ -5214,9 +5214,89 @@ in
     )
     assert dcg_marker["component"] == "dcg", dcg_marker
     assert dcg_marker["state"] == "fallback-active", dcg_marker
-    assert dcg_marker["target"] == "/home/jonathan/.claude/dcg.toml", dcg_marker
+    # `target` is the dcg USER LAYER — the path dcg itself loads and reports
+    # in `dcg config` — not the file behind it. Changed deliberately: it
+    # used to name ~/.claude/dcg.toml, which after the runtime-projection
+    # cutover is a link into a read-only mount whenever the projection is
+    # healthy, so a reader cross-checking the marker against live dcg state
+    # was handed a path dcg never reports. The seeded file is still named,
+    # in `remedy`, as the thing to remove.
+    assert dcg_marker["target"] == "/home/jonathan/.config/dcg/config.toml", (
+        dcg_marker
+    )
     assert dcg_marker["fallback_source"].startswith("/nix/store/"), dcg_marker
-    assert dcg_marker["remedy"].strip(), dcg_marker
+    # The remedy must reach the marker AS WRITTEN. It carries its commands in
+    # backticks, and it used to be spliced raw into double-quoted bash, so
+    # bash ran every backticked span as a command substitution during
+    # activation and wrote what was left: "before cutover ; after cutover
+    # then ; then rebuild". A non-empty check passed on that. Every command
+    # must survive, non-empty — no surviving backticks means the shell ate
+    # them, and EXECUTED them on the way.
+    dcg_remedy_cmds = _re.findall(r"`([^`]*)`", dcg_marker["remedy"])
+    assert dcg_remedy_cmds and all(c.strip() for c in dcg_remedy_cmds), (
+        "the marker's remedy lost its commands between home/dcg.nix and "
+        f"the file: {dcg_marker['remedy']!r}"
+    )
+    # And it must carry the post-cutover operator step — the same one the
+    # claude-runtime-links collision arm below performs to finish a cutover:
+    # take the seeded copy out of the way, then let the links unit put the
+    # link back.
+    #
+    # MOVED, never removed. This asserted `rm ~/.claude/dcg.toml` until
+    # 2026-11-02, when review pointed out that a remedy reached from a
+    # fallback diagnosis is also printed by readers that have NOT established
+    # the file is the seed. A backup costs nothing, and the one case where
+    # the marker's byte-identity contract is wrong is exactly the case where
+    # deleting it cannot be undone. The `rm` form is asserted ABSENT so it
+    # cannot come back by a later edit that only reads the prose.
+    assert "mv ~/.claude/dcg.toml" in dcg_marker["remedy"], dcg_marker
+    assert "rm ~/.claude/dcg.toml" not in dcg_marker["remedy"], dcg_marker
+    assert "systemctl restart claude-runtime-links" in dcg_marker["remedy"], (
+        dcg_marker
+    )
+    # ORDER. #394 measured that a bind mount whose source directory was
+    # replaced stays `mountpoint`-green while serving nothing, and that
+    # starting claude-runtime-deploy does not re-bind it. So the remedy must
+    # send the operator to the MOUNT unit, and must have them prove the
+    # projection serves a replacement BEFORE the seed is moved aside —
+    # otherwise following it on such a host leaves dcg with no user layer at
+    # all, which is worse than the state being reported.
+    # And it must send them to a unit that EXISTS. This asserted the string
+    # `claude-runtime-mounts` until 2026-11-02, and there is no such unit:
+    # that is the name of a module FILE, while the units it generates are
+    # per-path mounts (home-jonathan-.claude-runtime.mount). The assertion was
+    # green on a name systemctl cannot resolve, so the one step that repairs a
+    # dead projection could not be run as printed. A string check could not
+    # have caught that — only asking systemd can.
+    assert "systemd-escape --path --suffix=mount" in dcg_marker["remedy"], (
+        "the remedy does not DERIVE the projection's mount unit. The name is "
+        "escaped, so a literal is both unreadable and liable to rot: "
+        f"{dcg_marker['remedy']!r}"
+    )
+    # Run the remedy's own derivation here, and prove what it produces is a
+    # real unit.
+    dcg_mount_unit = workstation.succeed(
+        "systemd-escape --path --suffix=mount /home/jonathan/.claude/runtime"
+    ).strip()
+    workstation.succeed(f"systemctl cat {dcg_mount_unit} > /dev/null")
+    # Every unit the remedy names outright has to resolve too, so no future
+    # edit can reintroduce a name nothing can find. Suffixes are required by
+    # the sibling check in claude-config's hook for the same reason they are
+    # useful here: `systemctl status foo` silently means `foo.service`, which
+    # is exactly how a .mount got mistaken for one.
+    dcg_named_units = sorted(set(_re.findall(
+        r"[\w.@-]+\.(?:service|mount|timer|path|socket|target)\b",
+        dcg_marker["remedy"],
+    )))
+    assert dcg_named_units, dcg_marker["remedy"]
+    for _unit in dcg_named_units:
+        workstation.succeed(f"systemctl cat {_unit} > /dev/null")
+    assert dcg_marker["remedy"].index("runtime/dcg.toml") < dcg_marker[
+        "remedy"
+    ].index("mv ~/.claude/dcg.toml"), (
+        "the remedy moves the seed aside before having the operator check "
+        f"that the projection serves a replacement: {dcg_marker['remedy']!r}"
+    )
     # The seed's CONTENT hash, and it must describe the file the marker
     # names. This is the field the NEXT activation reads back to decide
     # whether a seeded target may be refreshed in place (arm (i) below), so
@@ -5738,6 +5818,12 @@ in
         "degraded state is again a banner in a unit log nobody reads: "
         f"{dcg_marker!r}"
     )
+    # The banner is a separate interpolation site from the marker, so it is
+    # checked on its own: the same remedy, verbatim, not a shell-mangled one.
+    assert "Fix: " + dcg_marker["remedy"] + "." in reseed_log, (
+        "the seed banner does not carry the marker's remedy verbatim:\n"
+        + reseed_log[-3000:]
+    )
     dcg_assert_denied_by_user_config(
         "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"
     )
@@ -6093,10 +6179,31 @@ in
     workstation.fail("grep -q '# PROJECTED' /home/jonathan/.claude/dcg.toml")
 
     # THEN the operator step that clears it, which is what the runbook has to
-    # carry: remove the seeded file, and only then does the cutover complete.
-    workstation.succeed("rm /home/jonathan/.claude/dcg.toml")
+    # carry: take the seeded file out of the way, and only then does the
+    # cutover complete.
+    #
+    # Performed EXACTLY as the marker's `remedy` words it, `mv` and all, so
+    # this arm proves the documented instruction rather than a paraphrase of
+    # it. The remedy is asserted to say `mv` and not `rm` some 4900 lines
+    # above; running `rm` here would leave the two free to drift, with the
+    # lane green either way.
+    #
+    # The projection's own copy is confirmed readable FIRST, which is the
+    # order the remedy imposes: #394 measured a bind mount serving nothing
+    # while `mountpoint` stayed green, and a seed moved aside on such a host
+    # would leave dcg with no user layer at all.
+    workstation.succeed("head -1 /home/jonathan/.claude/runtime/dcg.toml")
+    workstation.succeed(
+        "mv /home/jonathan/.claude/dcg.toml "
+        "/home/jonathan/dcg.toml.seed-backup"
+    )
     workstation.succeed(
         "systemctl restart claude-runtime-links.service"
+    )
+    # Moved, not destroyed: the operator can still diff what activation had
+    # seeded against the fallback it came from.
+    workstation.succeed(
+        "cmp ${../home/dcg-fallback.toml} /home/jonathan/dcg.toml.seed-backup"
     )
     assert workstation.succeed(
         "systemctl show -P ExecMainStatus claude-runtime-links.service"
