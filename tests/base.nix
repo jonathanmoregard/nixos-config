@@ -607,9 +607,16 @@ in
         "systemctl --user stop ai-client-config-codex-sync.timer'"
     )
 
-    # Codex hooks are advisory and fail open on timeout/error. The managed
-    # native profile must therefore be the machine-enforced floor; user,
-    # project, and CLI settings cannot widen it.
+    # Codex hooks are advisory and fail open on timeout/error, so the managed
+    # native profile is the machine-enforced floor.
+    #
+    # Scope, because the previous wording ("user, project, and CLI settings
+    # cannot widen it") was broader than anything measured: the runs below
+    # exercise `codex sandbox` WITH --include-managed-config. Without that
+    # flag the managed profile does not apply to that subcommand at all —
+    # `-P :danger-full-access` escapes the workspace roots for an unconfined
+    # caller. `codex exec` is enforced unflagged; `codex exec resume` and the
+    # TUI are untested. See modules/nixos/codex-security.nix.
     codex_requirements = workstation.succeed(
         "cat /etc/codex/requirements.toml"
     )
@@ -663,32 +670,128 @@ in
 
     # Built-in profile selection plus both legacy and native CLI overrides
     # cannot replace or widen the managed profile.
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P :danger-full-access "
-        "--include-managed-config -C /home/jonathan/Repos -- "
-        "touch /home/jonathan/codex-danger-profile-escape'"
+    #
+    # Every run here carries its own control, because a failing `codex
+    # sandbox` is not evidence of enforcement. Measured on codex 0.161.0:
+    #   - `codex sandbox -C DIR CMD` without `-P` exits 2 on clap argument
+    #     validation ("the following required arguments were not provided:
+    #     --permission-profile") before any sandbox or policy decision;
+    #   - `-P repos_dev` without `--include-managed-config` exits 1 with
+    #     "default_permissions requires a `[permissions]` table": the
+    #     managed profile is only defined when that flag is passed.
+    # This block's earlier `workstation.fail(...)` runs lacked `-P`, so they
+    # died on the first of these and stayed green whatever the policy did;
+    # their trailing `test -e` backstop was just as vacuous, since a command
+    # that never ran leaves no escape file either.
+    #
+    # Shape: one run writes a control file INSIDE a managed workspace root
+    # (must succeed: the run started and policy allows the write) and then
+    # attempts the escape OUTSIDE it (must be refused). A run that never
+    # started fails the `ctl=0` assertion instead of passing as protection.
+    def codex_sandbox_confined(name, args):
+        ctl = f"/home/jonathan/Repos/ctl-{name}"
+        esc = f"/home/jonathan/{name}"
+        out = workstation.succeed(
+            f"su - jonathan -c 'codex sandbox {args} "
+            f"-C /home/jonathan/Repos -- sh -c "
+            f"\"touch {ctl}; echo ctl=\\$?; touch {esc} 2>&1; echo esc=\\$?\"'"
+        )
+        assert "ctl=0" in out, f"{name}: control write did not run: {out!r}"
+        assert "esc=1" in out, f"{name}: escape was not refused: {out!r}"
+        # The refusal comes from the sandbox's read-only bind, not from
+        # Unix permissions (jonathan owns /home/jonathan).
+        assert "Read-only file system" in out, (
+            f"{name}: escape refused for an unexpected reason: {out!r}"
+        )
+        workstation.succeed(f"test -e {ctl}")
+        workstation.fail(f"test -e {esc}")
+
+    # A built-in unrestricted profile is not rejected by
+    # allowed_permission_profiles: it runs, and the managed floor still
+    # confines it ("Read-only file system" outside the roots).
+    codex_sandbox_confined(
+        "codex-danger-profile-escape",
+        "-P :danger-full-access --include-managed-config",
     )
-    workstation.fail(
-        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
-        "-c sandbox_mode=\"danger-full-access\" sandbox -- "
-        "touch /home/jonathan/codex-legacy-escape'"
+
+    # The legacy `sandbox_mode` key runs and is ignored under a managed
+    # permission profile.
+    codex_sandbox_confined(
+        "codex-legacy-escape",
+        "-P repos_dev --include-managed-config "
+        "-c sandbox_mode=\"danger-full-access\"",
     )
-    workstation.fail(
-        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
-        "-c default_permissions=\":danger-full-access\" sandbox -- "
-        "touch /home/jonathan/codex-default-escape'"
-    )
-    workstation.fail(
-        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
+
+    # Redefining the managed profile from the CLI is rejected outright before
+    # the command runs, so the ctl/esc shape cannot apply; pin the measured
+    # reason instead of any non-zero exit.
+    rc, out = workstation.execute(
+        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
+        "-C /home/jonathan/Repos "
         "-c permissions.repos_dev.filesystem.\"/home/jonathan\"=\"write\" "
-        "sandbox -- touch /home/jonathan/codex-profile-escape'"
+        "-- touch /home/jonathan/codex-profile-escape' 2>&1"
     )
-    workstation.fail(
-        "test -e /home/jonathan/codex-danger-profile-escape -o "
-        "-e /home/jonathan/codex-legacy-escape -o "
-        "-e /home/jonathan/codex-default-escape -o "
-        "-e /home/jonathan/codex-profile-escape"
+    assert rc == 1, f"profile widening: expected exit 1, got {rc}: {out!r}"
+    assert (
+        "requirements.toml permissions profile `repos_dev` conflicts with a "
+        "config-defined profile of the same name"
+    ) in out, f"profile widening not rejected for the expected reason: {out!r}"
+
+    # `-c default_permissions=...` is not tested: `codex sandbox` requires
+    # `-P`, which supersedes default_permissions, and the
+    # `-P :danger-full-access` run above covers profile resolution.
+
+    # Claude Code's session back-channel does not reach commands Codex runs
+    # (modules/nixos/codex-security.nix). CLAUDE_CODE_MESSAGING_SOCKET and
+    # CLAUDE_CODE_MESSAGING_TOKEN together are enough to drive the Claude
+    # session that spawned Codex, and a Claude session running `codex exec`
+    # hands its whole environment down.
+    #
+    # Deliberately NO --include-managed-config: that flag is how the runs above
+    # load the managed profile, and the call sites this protects
+    # (skills/advice-refine-test-loop/scripts/codex-advise.sh) do not pass it.
+    # Asserting without it is what proves /etc/codex/config.toml is honoured on
+    # the path that actually carries the variables, instead of only when a flag
+    # opts into it.
+    #
+    # -P :read-only is the BUILT-IN profile, chosen so profile resolution
+    # cannot confound the measurement. Two earlier shapes failed before any
+    # environment was read, and neither failure was about the exclusion:
+    #
+    #   no -P at all     -> exit 2, "the following required arguments were not
+    #                       provided: --permission-profile". Passing -C selects
+    #                       the native CLI form, where -P is mandatory; a bare
+    #                       `codex sandbox <cmd>` with neither flag does run,
+    #                       taking default_permissions from user config. So the
+    #                       trigger is the argument shape, not the environment
+    #                       — the host refuses this same shape despite having
+    #                       default_permissions in ~/.codex/config.toml.
+    #   -P repos_dev     -> exit 1, "default_permissions requires a
+    #                       `[permissions]` table" — the managed profile's
+    #                       definition lives in /etc/codex/requirements.toml
+    #                       and is not loaded without --include-managed-config
+    #
+    # A built-in profile needs no managed table, so this run turns on exactly
+    # one question: is /etc/codex/config.toml honoured by an invocation that
+    # does NOT pass --include-managed-config? If it is not, the declaration is
+    # inert for every call site that matters and this assertion says so.
+    #
+    # The variables are injected rather than assumed. This VM has no Claude
+    # Code session, so "they are absent" is already true with no exclusion
+    # declared at all, and a bare absence check would pass against nothing.
+    # KEEP_ME_CONTROL is the other half: it has to survive, or the run proved
+    # only that `env` printed nothing worth reading.
+    codex_env = workstation.succeed(
+        "su - jonathan -c 'CLAUDE_CODE_MESSAGING_SOCKET=/tmp/fake.sock "
+        "CLAUDE_CODE_MESSAGING_TOKEN=faketoken KEEP_ME_CONTROL=1 "
+        "codex sandbox -P :read-only -C /home/jonathan/Repos -- env'"
     )
+    assert "KEEP_ME_CONTROL=1" in codex_env, (
+        "the control variable did not survive into the sandbox, so this run "
+        f"says nothing about what was excluded:\n{codex_env}"
+    )
+    assert "CLAUDE_CODE_MESSAGING_SOCKET" not in codex_env, codex_env
+    assert "CLAUDE_CODE_MESSAGING_TOKEN" not in codex_env, codex_env
 
     # home-manager-jonathan TimeoutStartSec floor.
     #
