@@ -13,9 +13,10 @@
 #   - a Dependabot PR older than 7 days, or one whose latest run of some
 #     workflow failed: exit 1; a young green one, a rerun that went green,
 #     and a human's old PR are not findings;
-#   - the latest scheduled run of an active workflow on the default branch
-#     failed: exit 1; an older failure, a feature-branch failure, and a
-#     deleted workflow's failure are not;
+#   - the latest completed scheduled run of an active workflow on the default
+#     branch failed: exit 1, even while a newer run is queued or running; an
+#     older failure, a feature-branch failure, and a deleted workflow's
+#     failure are not;
 #   - alerts disabled (the API says so): a finding, exit 1;
 #   - repositories are discovered from each installation; archived repos are
 #     skipped, and one owner's listing failure does not hide the other owner;
@@ -131,10 +132,11 @@ let
         per=$(param per_page); [ -n "$per" ] || per=30
         { cat "$dir/runs.json" 2>/dev/null || echo '[]'; } | jq -c \
           --arg wf "$wf" --arg per "$(param per_page)" \
-          --arg event "$(param event)" --arg branch "$(param branch)" --arg sha "$(param head_sha)" '
+          --arg event "$(param event)" --arg branch "$(param branch)" --arg sha "$(param head_sha)" \
+          --arg status "$(param status)" '
           map(select(($wf == "" or (.workflow_id | tostring) == $wf)
                      and ($event == "" or .event == $event) and ($branch == "" or .head_branch == $branch)
-                     and ($sha == "" or .head_sha == $sha)))
+                     and ($sha == "" or .head_sha == $sha) and ($status == "" or .status == $status)))
           | sort_by(.created_at) | reverse' |
           if $paginate; then
             jq -c --argjson per "$per" '. as $all
@@ -344,6 +346,15 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     check "''${repos[@]}"
     [ "$rc" = 1 ] || fail "weekly failure behind a busy hourly workflow exited $rc"
     grep -q 'w22.yml' "$run/report.txt" || fail "weekly failure missing from report.txt"
+    reset
+
+    #    A queued or running scheduled run does not clear the failure before it.
+    workflows klaffat/klaffat 23:active
+    runs klaffat/klaffat 23 schedule main d1 '"failure"' "$(ago '1 day')"
+    runs klaffat/klaffat 23 schedule main d2 null "$(ago '5 minutes')"
+    check "''${repos[@]}"
+    [ "$rc" = 1 ] || fail "failure behind a running scheduled run exited $rc"
+    grep -q 'w23.yml' "$run/report.txt" || fail "failure behind a running scheduled run missing from report.txt"
     reset
 
     # 6. Alerts disabled, as the API says it: a finding, not a tool error.

@@ -13,7 +13,7 @@
 #   2. open PRs by dependabot[bot] created over 7 days ago (stale), or whose
 #      latest run of some workflow on the PR head concluded failure,
 #      timed_out or startup_failure (failing);
-#   3. per workflow that is still active, its own latest scheduled run on
+#   3. per workflow that is still active, its own latest COMPLETED scheduled run on
 #      the default branch (one query per workflow, so a busy hourly schedule
 #      cannot push a weekly one out of a shared page), if that concluded
 #      failure, timed_out or startup_failure.
@@ -191,7 +191,7 @@ check_repo() {
       ubranch=$(jq -rn --arg b "$branch" '$b | @uri')
       if jq -r '.[] | select(.state == "active") | .id' "$d/workflows.json" > "$d/active-workflows.txt"; then
         while IFS= read -r wf; do
-          if api "$d/schedule-$wf.json" "repos/$repo/actions/workflows/$wf/runs?event=schedule&branch=$ubranch&per_page=1" \
+          if api "$d/schedule-$wf.json" "repos/$repo/actions/workflows/$wf/runs?event=schedule&branch=$ubranch&status=completed&per_page=1" \
              && jq -e '.workflow_runs | type == "array" and all(type == "object"
                and (.workflow_id | type == "number") and (.status | type == "string")
                and (.conclusion | type == "string" or type == "null")
