@@ -6114,6 +6114,105 @@ in
         "cat /home/jonathan/.claude/hooks/bash-guard.py"
     ).strip() == "guard"
 
+    # A DEAD SOURCE (#391). A directory bind pins its source directory's
+    # inode, and git removes and recreates a directory whenever a commit
+    # empties it and re-adds its contents — a submodule update can do the
+    # same. The mount then serves the unlinked inode, which is empty, while
+    # `mountpoint -q` stays green. findmnt is what shows it: the SOURCE gains
+    # a `//deleted` suffix.
+    #
+    # Constructed here, for every projection, from the one point in this lane
+    # where the links unit is known to exit 0 — so a refusal below is
+    # attributable to the dead source and to nothing else, which is the
+    # confound the first measurement in #391 could not rule out. Measured
+    # before this check existed: runtime/ was refused only by accident,
+    # through its "is empty" test, and each of the three vendor projections
+    # exited 0 while serving an empty directory.
+    #
+    # The watcher and the timer are stopped for the block, because replacing
+    # runtime/ fires the path unit, and a triggered run landing between a
+    # restart below and the read of its status would be measured instead.
+    # Every row is collected before anything is asserted, so a failure
+    # reports the whole table rather than its first line.
+    workstation.succeed(
+        "systemctl stop claude-runtime-links.path claude-runtime-links.timer"
+    )
+    dead_rows = []
+    for relative in [
+        "runtime",
+        "vendor/superpowers/hooks",
+        "vendor/superpowers/skills",
+        "vendor/everything-claude-code/skills",
+    ]:
+        src = f"{checkout}/{relative}"
+        dst = f"/home/jonathan/.claude/{relative}"
+        unit = workstation.succeed(
+            f"systemd-escape -p --suffix=mount {dst}"
+        ).strip()
+        row = {"at": relative}
+        row["inode_before"] = workstation.succeed(f"stat -c %i {src}").strip()
+        # What git does to the directory: its contents go, the directory goes,
+        # and a new directory with the same contents takes the name.
+        workstation.succeed(
+            f"cp -a {src} {src}.new && rm -r {src} && mv {src}.new {src}"
+        )
+        row["inode_after"] = workstation.succeed(f"stat -c %i {src}").strip()
+        row["green"] = workstation.execute(f"mountpoint -q {dst}")[0] == 0
+        row["served"] = workstation.succeed(f"ls -A {dst}").strip()
+        row["source"] = workstation.succeed(f"findmnt -rno SOURCE {dst}").strip()
+        workstation.execute("systemctl restart claude-runtime-links.service")
+        row["status"] = workstation.succeed(
+            "systemctl show -P ExecMainStatus claude-runtime-links.service"
+        ).strip()
+        invocation = workstation.succeed(
+            "systemctl show -P InvocationID claude-runtime-links.service"
+        ).strip()
+        row["log"] = workstation.succeed(
+            f"journalctl _SYSTEMD_INVOCATION_ID={invocation} --no-pager -o cat"
+        )
+        # The repair, and the control that makes the refusal mean something:
+        # restarting the mount unit binds the live directory again, and the
+        # links unit goes straight back to exit 0.
+        workstation.succeed(f"systemctl restart '{unit}'")
+        workstation.succeed("systemctl reset-failed claude-runtime-links.service")
+        workstation.execute("systemctl restart claude-runtime-links.service")
+        row["repaired_status"] = workstation.succeed(
+            "systemctl show -P ExecMainStatus claude-runtime-links.service"
+        ).strip()
+        row["repaired_served"] = workstation.succeed(f"ls -A {dst}").strip()
+        dead_rows.append(row)
+    dead_table = "\n".join(
+        f"{r['at']}: inode {r['inode_before']}->{r['inode_after']} "
+        f"green={r['green']} served={r['served']!r} source={r['source']} "
+        f"status={r['status']} repaired={r['repaired_status']}"
+        f"\n  log: {r['log'].strip()!r}"
+        for r in dead_rows
+    )
+    for r in dead_rows:
+        dst = f"/home/jonathan/.claude/{r['at']}"
+        # The condition really was constructed — new inode, mount still
+        # green, projected path empty, findmnt naming the deleted source.
+        # Without these the refusal could be asserted against a run that never
+        # killed anything.
+        assert r["inode_before"] != r["inode_after"], dead_table
+        assert r["green"], dead_table
+        assert r["served"] == "", dead_table
+        assert r["source"].endswith("//deleted]"), dead_table
+        # And it is refused, for that reason: the message names the dead
+        # source, so runtime/'s accidental "is empty" refusal does not count.
+        assert r["status"] == "75", dead_table
+        assert f"{dst} is mounted from a deleted directory" in r["log"], dead_table
+        assert r["repaired_status"] == "0", dead_table
+        assert r["repaired_served"] != "", dead_table
+    # The links survived the refusal: nothing was swept while runtime/ was
+    # dead, so the config is whole again the moment the mount is.
+    assert workstation.succeed(
+        "cat /home/jonathan/.claude/hooks/bash-guard.py"
+    ).strip() == "guard"
+    workstation.succeed(
+        "systemctl start claude-runtime-links.path claude-runtime-links.timer"
+    )
+
     # settings.json is deliberately not projected: Claude Code writes it, and
     # a link into the read-only mount would make that write fail. Confirmed
     # since: its writer resolves the symlink and writes its temp file beside
