@@ -4451,15 +4451,35 @@ in
     # these assertions are what stop it coming back by accident, because a
     # user-owned puller writing the serving tree is the coupling the split
     # removed.
-    for cmd in ["is-enabled", "is-active"]:
-        got = workstation.execute(
+    #
+    # Assert the retired unit is ABSENT, not merely "not enabled", and say so
+    # with a positive allowlist. The earlier `got not in ("enabled", "active")`
+    # form passed on two answers meaning the opposite of absent —
+    # `enabled-runtime` is enabled for this boot and `activating` is starting
+    # right now — and it also passed whenever the PROBE failed rather than the
+    # unit being gone, because a renamed unit, an `su` that could not open a
+    # session or a missing XDG_RUNTIME_DIR all print neither string. Naming the
+    # expected answers closes both holes at once: anything else, "" included,
+    # fails and reports what it actually got.
+    #
+    # `is-enabled` on a unit systemd does not know exits non-zero, so the probe
+    # cannot use succeed() and the exit status cannot carry the verdict.
+    for cmd, allowed in (
+        ("is-enabled", {"not-found"}),
+        ("is-active", {"inactive", "unknown"}),
+    ):
+        rc, out = workstation.execute(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-            f"systemctl --user {cmd} claude-pull.timer'"
-        )[1].strip()
-        assert got not in ("enabled", "active"), (
-            f"the retired user unit claude-pull.timer is back: {cmd}={got!r}."
-            " CD for this repo belongs to claude-runtime-deploy.timer, which"
-            " writes a clone jonathan cannot modify"
+            f"systemctl --user {cmd} claude-pull.timer' 2>/dev/null"
+        )
+        got = out.strip()
+        assert got in allowed, (
+            f"systemctl --user {cmd} claude-pull.timer = {got!r} (rc={rc}); "
+            f"expected one of {sorted(allowed)}. Either the retired user unit "
+            f"claude-pull.timer is back — CD for this repo belongs to "
+            f"claude-runtime-deploy.timer, which writes a clone jonathan "
+            f"cannot modify — or the probe failed to ask, in which case this "
+            f"block proves nothing either way"
         )
     for cmd in ["is-enabled", "is-active"]:
         got = workstation.succeed(
