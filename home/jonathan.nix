@@ -31,6 +31,11 @@ in
     # The git-broker MCP (~/.claude/mcps/git-broker) runs every Git op
     # inside bwrap resolved from PATH and fails closed without it.
     bubblewrap
+    # The sandbox policy back-check (~/.claude/runtime/scripts/sandbox-backcheck.py)
+    # parses every replayed command with `shfmt -ln bash --to-json`; without it
+    # on PATH each call classifies as "unknown:shfmt-unavailable" and the survey
+    # reports nothing. Override the binary with SANDBOX_BACKCHECK_SHFMT.
+    shfmt
     # Fonts
     nerd-fonts.jetbrains-mono
     # Dev toolchains
