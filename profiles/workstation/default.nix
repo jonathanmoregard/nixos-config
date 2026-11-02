@@ -36,16 +36,16 @@
     ../../modules/nixos/memory-pressure.nix
     ../../modules/nixos/claude-agent-users.nix
     ../../modules/nixos/codex-security.nix
+    # The GitHub App private key, readable only by the github-app user;
+    # agents get tokens and the GitHub MCP through its sockets.
+    ../../modules/nixos/github-app-broker
 
     # research-agent microvm. The MCP server spawned by Claude Code
     # (via home/research-agent-mcp.nix) ssh's into the long-running
     # research-agent microvm for every research() call. The microvm is
     # synthesized as microvm@research-agent.service by microvm.nix.
-    #
-    # docker.nix kept for now (no remaining Nix consumer after this PR,
-    # but interactive use is out of scope — removing it host-wide is a
-    # separate audit).
-    ../../modules/nixos/docker.nix
+    # No Docker on the workstation: docker-group membership is root for
+    # anything running as jonathan, agents included.
     ../../modules/nixos/research-agent-microvm.nix
     ../../modules/nixos/research-agent-microvm-healthcheck.nix
 
@@ -136,7 +136,6 @@
     # verification) and in secrets/secrets.nix (no offline recovery
     # recipient yet).
     ../../modules/nixos/klaffat-infra.nix
-    ../../modules/nixos/klaffat-dependabot-caretaker.nix
     ../../modules/nixos/klaffat-local-google.nix
   ];
 
@@ -149,6 +148,11 @@
     config.age.secrets.klaffat-github-token-org.path
   ];
   services.klaffatLocalGoogle.enable = true;
+  # The accounts whose installations of the GitHub App agents may use: the
+  # personal one and the klaffat org (the ORG_INSTALLATIONS owners in
+  # ~/.config/github-app/config). Installing the App anywhere else gives
+  # agents nothing until it is listed here.
+  services.githubAppBroker.allowedOwners = [ "jonathanmoregard" "klaffat" ];
 
   # ---------------------------------------------------------------------
   # CI/CD workflow — agenix secret declarations (now rekey-managed).
@@ -160,10 +164,10 @@
   age.secrets.github-webhook-secret.rekeyFile = ../../secrets/github-webhook-secret.age;
 
   # LLM provider + research-agent secrets consumed by the research-agent-mcp
-  # and futuresearch-gate-mcp wrappers. Both read raw key values with
-  # `$(< file)` and export the matching env var themselves — `.age` files
+  # wrapper. Its non-dumpable Python bootstrap reads each raw key value and
+  # populates the matching env var in the final server process — `.age` files
   # contain the raw key only (no `KEY=` prefix). owner=jonathan + mode=0400
-  # because the consumers run as the user, not root.
+  # because the consumer runs as the user, not root.
   age.secrets.anthropic-api-key = {
     rekeyFile = ../../secrets/anthropic-api-key.age;
     owner = "jonathan";
@@ -180,8 +184,8 @@
   # Lakera layer is FAIL-CLOSED: if this key is missing or empty the scan
   # rejects loudly, so this must be provisioned (a real key, not an empty
   # placeholder) before injection-scanner's fail-closed Lakera lands on
-  # main. Consumed by the research-agent-mcp and futuresearch-gate-mcp
-  # wrappers, same raw-value `$(< file)` pattern as the keys above.
+  # main. Consumed by the research-agent-mcp wrapper, same raw-value
+  # bootstrap pattern as the keys above.
   age.secrets.lakera-api-key = {
     rekeyFile = ../../secrets/lakera-api-key.age;
     owner = "jonathan";
@@ -305,7 +309,7 @@
   # `add-secret` inserts new `age.secrets.<name>` blocks immediately
   # ABOVE this marker. Do not remove — the tool refuses to insert
   # without it. See home/add-secret.nix + skill doc
-  # home/claude-skills/nixos-agenix-secret/SKILL.md.
+  # ~/.claude/skills/nixos-agenix-secret/SKILL.md.
   age.secrets.gcal-ical-url = {
     rekeyFile = ../../secrets/gcal-ical-url.age;
     owner = "jonathan";
@@ -338,6 +342,13 @@
     rekeyFile = ../../secrets/github-dependency-health-app-key.age;
     owner = "root";
     group = "root";
+    mode = "0400";
+  };
+
+  age.secrets.model-armor-sa-key = {
+    rekeyFile = ../../secrets/model-armor-sa-key.age;
+    owner = "jonathan";
+    group = "users";
     mode = "0400";
   };
 
@@ -413,7 +424,7 @@
   #
   # `add-secret <name>` — one-command wrapper for the agenix-rekey add
   # flow (host-file edit → encrypt → rekey → commit → PR). See
-  # home/add-secret.nix + home/claude-skills/nixos-agenix-secret/SKILL.md.
+  # home/add-secret.nix + ~/.claude/skills/nixos-agenix-secret/SKILL.md.
   # Smoke-tested via checks.x86_64-linux.add-secret-smoke; the smoke
   # harness asserts the store path here matches the one it tested
   # (drift gate).

@@ -3,8 +3,10 @@
 # keyring: until then the unwrapped /run/current-system/sw/bin/gh and an
 # explicit GH_TOKEN can still reach GitHub as the founder.
 #
-# gh-token.service (home/claude-services.nix) runs ~/.claude's mint-gh-token,
-# which mints whole-installation GitHub App tokens every 20 minutes:
+# gh-token.service (home/claude-services.nix) runs mint-gh-token
+# (home/github-app-mint.nix), which mints whole-installation GitHub App tokens
+# through the App key broker (modules/nixos/github-app-broker) every 20
+# minutes:
 #
 #   ~/.cache/gh-tokens/host/token           personal installation (0600)
 #   ~/.cache/gh-tokens/host/<owner>/token   one per ORG_INSTALLATIONS entry in
