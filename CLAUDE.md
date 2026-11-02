@@ -61,7 +61,7 @@ gh pr checks <PR_NUMBER>
 
 # 5. Merge in the GitHub UI (the CLI `gh pr merge` is denied at the
 #    safe-bash MCP layer). Auto-deploy webhook fires on push:main → nixos-deploy.service
-#    runs `git fetch + reset --hard + nixos-rebuild switch` on dellan.
+#    runs unprivileged fetch → SHA-pinned import + reset --hard → nixos-rebuild switch on dellan.
 #    Desktop notification fires on success/failure.
 
 # 6. Clean up
@@ -158,7 +158,11 @@ Edits *through* symlinks write to nixos-config (intended). Adding a link = edit 
 `nixos-deploy.service` (systemd, root) on dellan:
 1. GitHub `push: main` event → webhook over Tailscale Funnel
 2. Handler validates HMAC + replay-protects via `X-GitHub-Delivery` UUID
-3. `git fetch origin main` + `git reset --hard origin/main` in `/etc/nixos`
+3. Fetch/apply split (#389): root reads the `main` SHA itself (`git ls-remote`,
+   one ref), the unprivileged `nixos-deploy-fetch.service` (user `nixos-fetch`)
+   downloads objects into `/var/lib/nixos-deploy-fetch/source.git`, root imports
+   exactly that SHA into `/etc/nixos` and `git reset --hard`s to it. Root refuses
+   to build if anything under `/etc/nixos` is non-root-owned or g/o-writable.
 4. `nixos-rebuild switch --flake /etc/nixos#dellan`
 5. On success: writes `last-good` SHA, libnotify low-priority desktop notification
 6. On failure: writes `current-poison` SHA + appends to `poisoned.log`,
