@@ -40,7 +40,9 @@ set -euo pipefail
 run=${RUN_DIR:?}
 config=${1:?usage: dependency-health.sh <config.json>}
 key="${CREDENTIALS_DIRECTORY:-/nonexistent}/github-app-key"
-mapfile -t owners < <(jq -r '.installations | keys[]' "$config")
+owners_output=$(jq -r '.installations | keys[]' "$config")
+owners=()
+[ -z "$owners_output" ] || mapfile -t owners <<< "$owners_output"
 repos=()
 app_id=$(jq -r '.app_id // empty' "$config")
 declare -A tokens=()
@@ -110,7 +112,13 @@ check_repo() {
 
   # ── 1. alerts ──
   if api "$d/alerts.json" "repos/$repo/dependabot/alerts?state=open&per_page=100" --paginate \
-     && jq -e 'type == "array" and all(type == "object")' "$d/alerts.json" > /dev/null; then
+     && jq -e 'type == "array" and all(type == "object"
+       and (.security_vulnerability.severity | type == "string")
+       and (.security_advisory.severity | type == "string")
+       and (.security_advisory.ghsa_id | type == "string")
+       and (.dependency.package.ecosystem | type == "string")
+       and (.dependency.package.name | type == "string")
+       and (.html_url | type == "string"))' "$d/alerts.json" > /dev/null; then
     local count sev
     count=$(jq length "$d/alerts.json")
     if [ "$count" -gt 0 ]; then
@@ -131,25 +139,39 @@ check_repo() {
 
   # ── 2. Dependabot PRs ──
   if api "$d/pulls.json" "repos/$repo/pulls?state=open&per_page=100" --paginate \
-     && jq -e 'type == "array"' "$d/pulls.json" > /dev/null; then
+     && jq -e 'type == "array" and all(type == "object"
+       and (.number | type == "number") and (.created_at | type == "string")
+       and (.user.login | type == "string") and (.head.sha | type == "string")
+       and (.html_url | type == "string"))' "$d/pulls.json" > /dev/null; then
     local stale=0 failing=0 number created sha url age
-    while IFS=$'\t' read -r number created sha url; do
-      age=$(( ($(date -u +%s) - $(date -u -d "$created" +%s)) / 86400 ))
-      if api "$d/runs-$number.json" "repos/$repo/actions/runs?head_sha=$sha&per_page=100" \
-         && jq -e '.workflow_runs | type == "array"' "$d/runs-$number.json" > /dev/null; then
-        local red
-        red=$(jq -r --argjson f "$failed" '.workflow_runs | group_by(.workflow_id) | map(max_by(.created_at))
-          | map(select(.conclusion as $c | $f | index($c))) | map(.path // .name // "?") | join(",")' "$d/runs-$number.json")
-        if [ -n "$red" ]; then
-          failing=$((failing + 1)); echo "  pr #$number failing: $red ${age}d $url" >> "$report"
-        elif [ "$age" -gt "$stale_days" ]; then
-          stale=$((stale + 1)); echo "  pr #$number stale: ${age}d $url" >> "$report"
+    if jq -r '.[] | select(.user.login == "dependabot[bot]")
+         | [(.number | tostring), .created_at, .head.sha, .html_url] | @tsv' \
+         "$d/pulls.json" > "$d/dependabot-pulls.tsv"; then
+      while IFS=$'\t' read -r number created sha url; do
+        age=$(( ($(date -u +%s) - $(date -u -d "$created" +%s)) / 86400 ))
+        if api "$d/runs-$number.json" "repos/$repo/actions/runs?head_sha=$sha&per_page=100" \
+             --paginate --jq '.workflow_runs' \
+           && jq -e 'type == "array" and all(type == "object"
+             and (.workflow_id | type == "number") and (.status | type == "string")
+             and (.conclusion | type == "string" or type == "null")
+             and (.created_at | type == "string")
+             and ((.path // .name // "?") | type == "string")
+             and (.html_url | type == "string"))' "$d/runs-$number.json" > /dev/null; then
+          local red
+          red=$(jq -r --argjson f "$failed" 'group_by(.workflow_id) | map(max_by(.created_at))
+            | map(select(.conclusion as $c | $f | index($c))) | map(.path // .name // "?") | join(",")' "$d/runs-$number.json")
+          if [ -n "$red" ]; then
+            failing=$((failing + 1)); echo "  pr #$number failing: $red ${age}d $url" >> "$report"
+          elif [ "$age" -gt "$stale_days" ]; then
+            stale=$((stale + 1)); echo "  pr #$number stale: ${age}d $url" >> "$report"
+          fi
+        else
+          bad+=("${reason:-malformed runs for PR $number}")
         fi
-      else
-        bad+=("${reason:-malformed runs for PR $number}")
-      fi
-    done < <(jq -r '.[] | select(.user.login == "dependabot[bot]")
-      | [(.number | tostring), .created_at, .head.sha, .html_url] | @tsv' "$d/pulls.json")
+      done < "$d/dependabot-pulls.tsv"
+    else
+      bad+=("malformed pulls")
+    fi
     [ "$stale" -eq 0 ] || parts+=("$(plural "$stale" "stale PR")")
     [ "$failing" -eq 0 ] || parts+=("$(plural "$failing" "failing PR")")
   else
@@ -158,23 +180,34 @@ check_repo() {
 
   # ── 3. scheduled workflows on the default branch ──
   if api "$d/repo.json" "repos/$repo" && branch=$(jq -er '.default_branch | strings' "$d/repo.json"); then
-    if api "$d/workflows.json" "repos/$repo/actions/workflows?per_page=100" \
-       && jq -e '.workflows | type == "array"' "$d/workflows.json" > /dev/null; then
+    if api "$d/workflows.json" "repos/$repo/actions/workflows?per_page=100" --paginate --jq '.workflows' \
+       && jq -e 'type == "array" and all(type == "object"
+         and (.id | type == "number") and (.state | type == "string"))' \
+            "$d/workflows.json" > /dev/null; then
       local wf red_runs=0 ubranch
       ubranch=$(jq -rn --arg b "$branch" '$b | @uri')
-      for wf in $(jq -r '.workflows[] | select(.state == "active") | .id | numbers' "$d/workflows.json"); do
-        if api "$d/schedule-$wf.json" "repos/$repo/actions/workflows/$wf/runs?event=schedule&branch=$ubranch&per_page=1" \
-           && jq -e '.workflow_runs | type == "array"' "$d/schedule-$wf.json" > /dev/null; then
-          if jq -e --argjson f "$failed" '.workflow_runs[0].conclusion as $c | $c != null and ($f | index($c))' \
-               "$d/schedule-$wf.json" > /dev/null; then
-            red_runs=$((red_runs + 1))
-            jq -r '.workflow_runs[0] | "  scheduled run failed: \(.path // .name // "?") \(.html_url // "")"' \
-              "$d/schedule-$wf.json" >> "$report"
+      if jq -r '.[] | select(.state == "active") | .id' "$d/workflows.json" > "$d/active-workflows.txt"; then
+        while IFS= read -r wf; do
+          if api "$d/schedule-$wf.json" "repos/$repo/actions/workflows/$wf/runs?event=schedule&branch=$ubranch&per_page=1" \
+             && jq -e '.workflow_runs | type == "array" and all(type == "object"
+               and (.workflow_id | type == "number") and (.status | type == "string")
+               and (.conclusion | type == "string" or type == "null")
+               and (.created_at | type == "string")
+               and ((.path // .name // "?") | type == "string")
+               and (.html_url | type == "string"))' "$d/schedule-$wf.json" > /dev/null; then
+            if jq -e --argjson f "$failed" '.workflow_runs[0].conclusion as $c | $c != null and ($f | index($c))' \
+                 "$d/schedule-$wf.json" > /dev/null; then
+              red_runs=$((red_runs + 1))
+              jq -r '.workflow_runs[0] | "  scheduled run failed: \(.path // .name // "?") \(.html_url // "")"' \
+                "$d/schedule-$wf.json" >> "$report"
+            fi
+          else
+            bad+=("${reason:-malformed runs for workflow $wf}")
           fi
-        else
-          bad+=("${reason:-malformed runs for workflow $wf}")
-        fi
-      done
+        done < "$d/active-workflows.txt"
+      else
+        bad+=("malformed workflows")
+      fi
       [ "$red_runs" -eq 0 ] || parts+=("$(plural "$red_runs" "failed scheduled run")")
     else
       bad+=("${reason:-malformed workflows}")
@@ -205,11 +238,16 @@ else
     fi
     listing="$run/repositories-$owner.json"
     if api "$listing" "installation/repositories?per_page=100" --paginate --jq '.repositories' \
-       && jq -e 'type == "array" and all(type == "object" and (.full_name | type == "string"))' \
+       && jq -e 'type == "array" and all(type == "object"
+         and (.full_name | type == "string") and (.archived | type == "boolean")
+         and (.disabled | type == "boolean"))' \
             "$listing" > /dev/null; then
-      while IFS= read -r repo; do repos+=("$repo"); done < <(
-        jq -r '.[] | select(.archived != true and .disabled != true) | .full_name' "$listing"
-      )
+      if jq -r '.[] | select(.archived != true and .disabled != true) | .full_name' \
+           "$listing" > "$run/repositories-$owner.txt"; then
+        while IFS= read -r repo; do repos+=("$repo"); done < "$run/repositories-$owner.txt"
+      else
+        errors+=("could not check $owner: malformed repository listing")
+      fi
     else
       errors+=("could not check $owner: ${reason:-malformed repository listing}")
     fi

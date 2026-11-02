@@ -53,7 +53,16 @@ let
     set -euo pipefail
     echo "gh $*" >> "$FAKE_LOG"
     [ "$1" = api ] || { echo "fake gh: only 'gh api' is faked" >&2; exit 2; }
-    endpoint=''${*: -1}
+    shift
+    paginate=false jq_expr=
+    while [ "$#" -gt 1 ]; do
+      case "$1" in
+        --paginate) paginate=true; shift ;;
+        --jq) jq_expr=$2; shift 2 ;;
+        *) echo "fake gh: unexpected option $1" >&2; exit 2 ;;
+      esac
+    done
+    endpoint=$1
     if [ -e "$FAKE_DIR/offline" ]; then
       echo "error connecting to api.github.com" >&2; exit 1
     fi
@@ -89,20 +98,13 @@ let
       jq -cn --arg m "$msg" --arg c "$code" '{message: $m, status: $c}'
       echo "gh: $msg (HTTP $code)" >&2; exit 1
     fi
+    emit() { if [ -n "$jq_expr" ]; then jq -c "$jq_expr"; else cat; fi; }
     if [ -f "$dir/$key.raw" ]; then
-      if [ "$key" = installation_repositories ] && [[ " $* " = *' --jq .repositories '* ]]; then
-        jq -c '.repositories' "$dir/$key.raw"
-      else
-        cat "$dir/$key.raw"
-      fi
+      emit < "$dir/$key.raw"
       exit 0
     fi
     if [ "$key" = installation_repositories ]; then
-      if [[ " $* " = *' --jq .repositories '* ]]; then
-        jq -c '.repositories' "$dir/repositories.json"
-      else
-        cat "$dir/repositories.json"
-      fi
+      emit < "$dir/repositories.json"
       exit 0
     fi
     param() { tr '&' '\n' <<< "$query" | sed -n "s/^$1=//p"; }
@@ -110,19 +112,37 @@ let
       repo) jq -cn --arg f "$owner/$name" '{full_name: $f, default_branch: "main"}' ;;
       dependabot_alerts) cat "$dir/alerts.json" 2>/dev/null || echo '[]' ;;
       pulls) cat "$dir/pulls.json" 2>/dev/null || echo '[]' ;;
-      actions_workflows) cat "$dir/workflows.json" 2>/dev/null || echo '{"total_count":0,"workflows":[]}' ;;
-      # Repo-wide or one workflow's runs, newest first, one page of
-      # per_page (GitHub's default 30), as the API pages them.
+      actions_workflows)
+        per=$(param per_page); [ -n "$per" ] || per=30
+        if $paginate; then
+          { cat "$dir/workflows.json" 2>/dev/null || echo '{"total_count":0,"workflows":[]}'; } | jq -c \
+            --argjson per "$per" '.workflows as $all
+              | ([range(0; ($all | length); $per)] | if length == 0 then [0] else . end)[] as $i
+              | {total_count: ($all | length), workflows: $all[$i:$i + $per]}' | emit
+        else
+          { cat "$dir/workflows.json" 2>/dev/null || echo '{"total_count":0,"workflows":[]}'; } | jq -c \
+            --argjson per "$per" '.workflows as $all
+              | {total_count: ($all | length), workflows: $all[0:$per]}' | emit
+        fi ;;
+      # Repo-wide or one workflow's runs, newest first, paged by per_page
+      # (GitHub's default 30). --paginate follows every page.
       actions_runs|actions_workflows_*_runs)
         wf=""; [ "$key" = actions_runs ] || { wf=''${key#actions_workflows_}; wf=''${wf%_runs}; }
+        per=$(param per_page); [ -n "$per" ] || per=30
         { cat "$dir/runs.json" 2>/dev/null || echo '[]'; } | jq -c \
           --arg wf "$wf" --arg per "$(param per_page)" \
           --arg event "$(param event)" --arg branch "$(param branch)" --arg sha "$(param head_sha)" '
           map(select(($wf == "" or (.workflow_id | tostring) == $wf)
                      and ($event == "" or .event == $event) and ($branch == "" or .head_branch == $branch)
                      and ($sha == "" or .head_sha == $sha)))
-          | sort_by(.created_at) | reverse
-          | {total_count: length, workflow_runs: .[0:(if $per == "" then 30 else ($per | tonumber) end)]}' ;;
+          | sort_by(.created_at) | reverse' |
+          if $paginate; then
+            jq -c --argjson per "$per" '. as $all
+              | ([range(0; length; $per)] | if length == 0 then [0] else . end)[] as $i
+              | {total_count: ($all | length), workflow_runs: $all[$i:$i + $per]}' | emit
+          else
+            jq -c --argjson per "$per" '{total_count: length, workflow_runs: .[0:$per]}' | emit
+          fi ;;
       *) echo '{"message":"Not Found","status":"404"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
     esac
   '';
@@ -262,6 +282,19 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     grep -q 'claude-config: 1 failing PR' <<< "$(summary)" || fail "failing PR not summarised"
     reset
 
+    #    A second workflow's failure remains visible behind a full first page
+    #    of newer green runs from one busy workflow.
+    pr klaffat/klaffat 30 "$(ago '1 day')" 'dependabot[bot]' sha30
+    runs klaffat/klaffat 32 pull_request dependabot/x sha30 '"failure"' "$(ago '23 hours')"
+    for m in $(seq 1 100); do
+      runs klaffat/klaffat 31 pull_request dependabot/x sha30 '"success"' "$(ago "$m minutes")"
+    done
+    check "''${repos[@]}"
+    [ "$rc" = 1 ] || fail "PR failure on the second runs page exited $rc"
+    grep -q 'klaffat: 1 failing PR' <<< "$(summary)" || fail "second-page PR failure not summarised"
+    grep -q 'w32.yml' "$run/report.txt" || fail "second-page PR failure missing from report.txt"
+    reset
+
     # 5. Scheduled runs on the default branch: only an active workflow whose
     #    latest scheduled run failed counts.
     workflows klaffat/klaffat 11:active 12:active 14:active 13:disabled_manually
@@ -276,6 +309,18 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     grep -q 'klaffat: 1 failed scheduled run' <<< "$(summary)" || fail "scheduled failure not summarised"
     grep -q 'w11.yml' "$run/report.txt" || fail "failing workflow missing from report.txt"
     grep -qE 'w1[234]\.yml|w99' "$run/report.txt" && fail "a non-current scheduled failure was reported"
+    reset
+
+    #    Active workflows after the first 100 are checked too.
+    many_workflows=()
+    for i in $(seq 1 101); do many_workflows+=("$i:active"); done
+    workflows klaffat/klaffat "''${many_workflows[@]}"
+    runs klaffat/klaffat 101 schedule main s101 '"failure"' "$(ago '1 day')"
+    check "''${repos[@]}"
+    [ "$rc" = 1 ] || fail "scheduled failure on the second workflows page exited $rc"
+    grep -q 'klaffat: 1 failed scheduled run' <<< "$(summary)" \
+      || fail "second-page scheduled failure not summarised"
+    grep -q 'w101.yml' "$run/report.txt" || fail "second-page scheduled failure missing from report.txt"
     reset
 
     #    A busy hourly workflow's 120 green runs must not push a weekly
@@ -355,6 +400,18 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     check "''${repos[@]}"
     [ "$rc" = 3 ] || fail "malformed JSON exited $rc"
     grep -q 'could not check klaffat: malformed' <<< "$(summary)" || fail "malformed JSON not named"
+    reset
+    echo '[42]' > "$(repo_dir klaffat/klaffat)/pulls.raw"
+    check "''${repos[@]}"
+    [ "$rc" = 3 ] || fail "malformed pull entry exited $rc"
+    grep -q 'could not check klaffat: malformed pulls' <<< "$(summary)" || fail "malformed pull entry not named"
+    reset
+    pr klaffat/klaffat 33 "$(ago '1 day')" 'dependabot[bot]' sha33
+    echo '{"total_count":1,"workflow_runs":[{}]}' > "$(repo_dir klaffat/klaffat)/actions_runs.raw"
+    check "''${repos[@]}"
+    [ "$rc" = 3 ] || fail "malformed workflow run entry exited $rc"
+    grep -q 'could not check klaffat: malformed runs for PR 33' <<< "$(summary)" \
+      || fail "malformed workflow run entry not named"
     reset
     echo '{"workflows": 5}' > "$(repo_dir klaffat/klaffat)/actions_workflows.raw"
     check "''${repos[@]}"
