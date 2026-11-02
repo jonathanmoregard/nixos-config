@@ -262,9 +262,21 @@ let
   fallbackMarker =
     "${config.home.homeDirectory}/.local/state/dcg/fallback-active.json";
 
+  # NEVER instruct a clone over ~/.claude here. This string is read by an
+  # operator whose dcg.toml is missing, and `dcg.toml` lives in the config
+  # repository, which after the runtime-projection cutover is NOT ~/.claude but
+  # ~/Repos/claude-config, with ~/.claude/dcg.toml a link into a read-only
+  # projection of it. A clone into ~/.claude would reinstate the whole flat
+  # tree — `tests/` included — at the live path the cutover exists to keep test
+  # code out of, and would do it while looking like a repair.
+  #
+  # One line that is correct on both sides of the cutover: restore the file in
+  # whichever checkout owns it, and on the projected side re-run the links unit
+  # so the path resolves again.
   remedy =
-    "restore ~/.claude (git clone git@github.com:jonathanmoregard/.claude.git "
-    + "~/.claude, or git -C ~/.claude checkout -- dcg.toml) and rebuild";
+    "restore dcg.toml: before cutover `git -C ~/.claude checkout -- dcg.toml`; "
+    + "after cutover `git -C ~/Repos/claude-config checkout -- runtime/dcg.toml` "
+    + "then `sudo systemctl restart claude-runtime-links`; then rebuild";
 
   # A dry run creates no files, so seeding would be a lie and validating
   # afterwards would report a state this run deliberately did not make.

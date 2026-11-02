@@ -8,7 +8,7 @@
 #                          some scripts assume on PATH)
 #
 # Excludes cinnamon, desktop-apps, ghostty, autodoro, drift-analyzer,
-# router-services, claude-services, claude-skills, research-agent-mcp.
+# router-services, claude-services, research-agent-mcp.
 { ... }:
 {
   imports = [
