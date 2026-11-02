@@ -607,9 +607,16 @@ in
         "systemctl --user stop ai-client-config-codex-sync.timer'"
     )
 
-    # Codex hooks are advisory and fail open on timeout/error. The managed
-    # native profile must therefore be the machine-enforced floor; user,
-    # project, and CLI settings cannot widen it.
+    # Codex hooks are advisory and fail open on timeout/error, so the managed
+    # native profile is the machine-enforced floor.
+    #
+    # Scope, because the previous wording ("user, project, and CLI settings
+    # cannot widen it") was broader than anything measured: the runs below
+    # exercise `codex sandbox` WITH --include-managed-config. Without that
+    # flag the managed profile does not apply to that subcommand at all —
+    # `-P :danger-full-access` escapes the workspace roots for an unconfined
+    # caller. `codex exec` is enforced unflagged; `codex exec resume` and the
+    # TUI are untested. See modules/nixos/codex-security.nix.
     codex_requirements = workstation.succeed(
         "cat /etc/codex/requirements.toml"
     )
@@ -663,32 +670,76 @@ in
 
     # Built-in profile selection plus both legacy and native CLI overrides
     # cannot replace or widen the managed profile.
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P :danger-full-access "
-        "--include-managed-config -C /home/jonathan/Repos -- "
-        "touch /home/jonathan/codex-danger-profile-escape'"
+    #
+    # Every run here carries its own control, because a failing `codex
+    # sandbox` is not evidence of enforcement. Measured on codex 0.161.0:
+    #   - `codex sandbox -C DIR CMD` without `-P` exits 2 on clap argument
+    #     validation ("the following required arguments were not provided:
+    #     --permission-profile") before any sandbox or policy decision;
+    #   - `-P repos_dev` without `--include-managed-config` exits 1 with
+    #     "default_permissions requires a `[permissions]` table": the
+    #     managed profile is only defined when that flag is passed.
+    # This block's earlier `workstation.fail(...)` runs lacked `-P`, so they
+    # died on the first of these and stayed green whatever the policy did;
+    # their trailing `test -e` backstop was just as vacuous, since a command
+    # that never ran leaves no escape file either.
+    #
+    # Shape: one run writes a control file INSIDE a managed workspace root
+    # (must succeed: the run started and policy allows the write) and then
+    # attempts the escape OUTSIDE it (must be refused). A run that never
+    # started fails the `ctl=0` assertion instead of passing as protection.
+    def codex_sandbox_confined(name, args):
+        ctl = f"/home/jonathan/Repos/ctl-{name}"
+        esc = f"/home/jonathan/{name}"
+        out = workstation.succeed(
+            f"su - jonathan -c 'codex sandbox {args} "
+            f"-C /home/jonathan/Repos -- sh -c "
+            f"\"touch {ctl}; echo ctl=\\$?; touch {esc} 2>&1; echo esc=\\$?\"'"
+        )
+        assert "ctl=0" in out, f"{name}: control write did not run: {out!r}"
+        assert "esc=1" in out, f"{name}: escape was not refused: {out!r}"
+        # The refusal comes from the sandbox's read-only bind, not from
+        # Unix permissions (jonathan owns /home/jonathan).
+        assert "Read-only file system" in out, (
+            f"{name}: escape refused for an unexpected reason: {out!r}"
+        )
+        workstation.succeed(f"test -e {ctl}")
+        workstation.fail(f"test -e {esc}")
+
+    # A built-in unrestricted profile is not rejected by
+    # allowed_permission_profiles: it runs, and the managed floor still
+    # confines it ("Read-only file system" outside the roots).
+    codex_sandbox_confined(
+        "codex-danger-profile-escape",
+        "-P :danger-full-access --include-managed-config",
     )
-    workstation.fail(
-        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
-        "-c sandbox_mode=\"danger-full-access\" sandbox -- "
-        "touch /home/jonathan/codex-legacy-escape'"
+
+    # The legacy `sandbox_mode` key runs and is ignored under a managed
+    # permission profile.
+    codex_sandbox_confined(
+        "codex-legacy-escape",
+        "-P repos_dev --include-managed-config "
+        "-c sandbox_mode=\"danger-full-access\"",
     )
-    workstation.fail(
-        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
-        "-c default_permissions=\":danger-full-access\" sandbox -- "
-        "touch /home/jonathan/codex-default-escape'"
-    )
-    workstation.fail(
-        "su - jonathan -c 'cd /home/jonathan/Repos && codex "
+
+    # Redefining the managed profile from the CLI is rejected outright before
+    # the command runs, so the ctl/esc shape cannot apply; pin the measured
+    # reason instead of any non-zero exit.
+    rc, out = workstation.execute(
+        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
+        "-C /home/jonathan/Repos "
         "-c permissions.repos_dev.filesystem.\"/home/jonathan\"=\"write\" "
-        "sandbox -- touch /home/jonathan/codex-profile-escape'"
+        "-- touch /home/jonathan/codex-profile-escape' 2>&1"
     )
-    workstation.fail(
-        "test -e /home/jonathan/codex-danger-profile-escape -o "
-        "-e /home/jonathan/codex-legacy-escape -o "
-        "-e /home/jonathan/codex-default-escape -o "
-        "-e /home/jonathan/codex-profile-escape"
-    )
+    assert rc == 1, f"profile widening: expected exit 1, got {rc}: {out!r}"
+    assert (
+        "requirements.toml permissions profile `repos_dev` conflicts with a "
+        "config-defined profile of the same name"
+    ) in out, f"profile widening not rejected for the expected reason: {out!r}"
+
+    # `-c default_permissions=...` is not tested: `codex sandbox` requires
+    # `-P`, which supersedes default_permissions, and the
+    # `-P :danger-full-access` run above covers profile resolution.
 
     # Claude Code's session back-channel does not reach commands Codex runs
     # (modules/nixos/codex-security.nix). CLAUDE_CODE_MESSAGING_SOCKET and
@@ -4400,15 +4451,35 @@ in
     # these assertions are what stop it coming back by accident, because a
     # user-owned puller writing the serving tree is the coupling the split
     # removed.
-    for cmd in ["is-enabled", "is-active"]:
-        got = workstation.execute(
+    #
+    # Assert the retired unit is ABSENT, not merely "not enabled", and say so
+    # with a positive allowlist. The earlier `got not in ("enabled", "active")`
+    # form passed on two answers meaning the opposite of absent —
+    # `enabled-runtime` is enabled for this boot and `activating` is starting
+    # right now — and it also passed whenever the PROBE failed rather than the
+    # unit being gone, because a renamed unit, an `su` that could not open a
+    # session or a missing XDG_RUNTIME_DIR all print neither string. Naming the
+    # expected answers closes both holes at once: anything else, "" included,
+    # fails and reports what it actually got.
+    #
+    # `is-enabled` on a unit systemd does not know exits non-zero, so the probe
+    # cannot use succeed() and the exit status cannot carry the verdict.
+    for cmd, allowed in (
+        ("is-enabled", {"not-found"}),
+        ("is-active", {"inactive", "unknown"}),
+    ):
+        rc, out = workstation.execute(
             "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
-            f"systemctl --user {cmd} claude-pull.timer'"
-        )[1].strip()
-        assert got not in ("enabled", "active"), (
-            f"the retired user unit claude-pull.timer is back: {cmd}={got!r}."
-            " CD for this repo belongs to claude-runtime-deploy.timer, which"
-            " writes a clone jonathan cannot modify"
+            f"systemctl --user {cmd} claude-pull.timer' 2>/dev/null"
+        )
+        got = out.strip()
+        assert got in allowed, (
+            f"systemctl --user {cmd} claude-pull.timer = {got!r} (rc={rc}); "
+            f"expected one of {sorted(allowed)}. Either the retired user unit "
+            f"claude-pull.timer is back — CD for this repo belongs to "
+            f"claude-runtime-deploy.timer, which writes a clone jonathan "
+            f"cannot modify — or the probe failed to ask, in which case this "
+            f"block proves nothing either way"
         )
     for cmd in ["is-enabled", "is-active"]:
         got = workstation.succeed(
