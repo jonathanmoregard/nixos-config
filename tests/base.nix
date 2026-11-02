@@ -637,35 +637,87 @@ in
         "-C /home/jonathan/worktrees -- touch /home/jonathan/worktrees/profile-write'"
     )
 
-    # Home outside explicit roots stays read-only.
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
-        "-C /home/jonathan/Repos -- touch /home/jonathan/codex-policy-escape'"
+    # Every negative run from here on carries its own control, inside ONE
+    # invocation: a write that must SUCCEED in a managed root, then the
+    # escape that must be REFUSED. A bare `workstation.fail` on a `codex
+    # sandbox` run cannot tell "policy refused the write" from "the command
+    # never ran", and that is not a hypothetical worry in this file: three
+    # runs in the block below passed for exactly that reason until #382,
+    # because they omitted `-P` and died on clap argument validation (exit
+    # 2) before any sandbox or policy decision. A trailing
+    # `test -e <escape>` backstop does not rescue such a run either — a
+    # command that never executed leaves no escape file.
+    #
+    # `expect_absent=False` is for an escape target that legitimately exists
+    # already (a linked worktree's `.git` file). There the proof is the
+    # refusal itself; asserting absence would assert the repo is broken.
+    def codex_sandbox_probe(name, args, cwd, ctl, esc,
+                            reason="Read-only file system",
+                            expect_absent=True):
+        out = workstation.succeed(
+            f"su - jonathan -c 'codex sandbox {args} -C {cwd} -- sh -c "
+            f"\"touch {ctl}; echo ctl=\\$?; touch {esc} 2>&1; echo esc=\\$?\"'"
+        )
+        # Logged so the measured refusal text is visible on a GREEN run too,
+        # not only when an assertion trips.
+        print(f"codex_sandbox_probe {name}: {out!r}")
+        assert "ctl=0" in out, f"{name}: control write did not run: {out!r}"
+        assert "esc=1" in out, f"{name}: escape was not refused: {out!r}"
+        # Pin the reason: an escape blocked by Unix permissions rather than
+        # by the sandbox would prove nothing, since jonathan owns these trees.
+        assert reason in out, (
+            f"{name}: escape refused for an unexpected reason "
+            f"(expected {reason!r}): {out!r}"
+        )
+        workstation.succeed(f"test -e {ctl}")
+        if expect_absent:
+            workstation.fail(f"test -e {esc}")
+
+    # Home outside the explicit roots stays read-only.
+    codex_sandbox_probe(
+        "codex-policy-escape",
+        "-P repos_dev --include-managed-config",
+        "/home/jonathan/Repos",
+        "/home/jonathan/Repos/ctl-policy-escape",
+        "/home/jonathan/codex-policy-escape",
     )
-    workstation.fail("test -e /home/jonathan/codex-policy-escape")
 
     # :workspace protection covers normal and linked-worktree metadata even
-    # though their source trees live below broad writable roots.
+    # though their source trees live below broad writable roots. Each control
+    # writes a plain file in the SAME tree as the metadata the run then fails
+    # to touch, so a refusal is attributable to metadata protection and not
+    # to the tree being unwritable.
     workstation.succeed(
         "su - jonathan -c 'cd /home/jonathan/Repos && mkdir profile-repo && "
         "cd profile-repo && git init -q && touch tracked && git add tracked && "
         "git -c user.name=VM -c user.email=vm@example.invalid commit -qm initial && "
         "git worktree add -q /home/jonathan/worktrees/profile-linked -b linked'"
     )
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
-        "-C /home/jonathan/Repos/profile-repo -- "
-        "touch /home/jonathan/Repos/profile-repo/.git/escape'"
+    codex_sandbox_probe(
+        "codex-gitdir-escape",
+        "-P repos_dev --include-managed-config",
+        "/home/jonathan/Repos/profile-repo",
+        "/home/jonathan/Repos/profile-repo/ctl-gitdir",
+        "/home/jonathan/Repos/profile-repo/.git/escape",
     )
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
-        "-C /home/jonathan/worktrees/profile-linked -- "
-        "touch /home/jonathan/worktrees/profile-linked/.git'"
+    # A linked worktree's `.git` is a FILE pointing at the real gitdir, so
+    # this is a metadata write to an existing path, not a create.
+    codex_sandbox_probe(
+        "codex-linked-gitfile",
+        "-P repos_dev --include-managed-config",
+        "/home/jonathan/worktrees/profile-linked",
+        "/home/jonathan/worktrees/profile-linked/ctl-gitfile",
+        "/home/jonathan/worktrees/profile-linked/.git",
+        expect_absent=False,
     )
-    workstation.fail(
-        "su - jonathan -c 'codex sandbox -P repos_dev --include-managed-config "
-        "-C /home/jonathan/worktrees/profile-linked -- "
-        "touch /home/jonathan/Repos/profile-repo/.git/worktrees/profile-linked/escape'"
+    # Reaching the linked worktree's administrative directory from inside
+    # that worktree: the target lives under the MAIN repo's .git/worktrees/.
+    codex_sandbox_probe(
+        "codex-linked-gitdir-escape",
+        "-P repos_dev --include-managed-config",
+        "/home/jonathan/worktrees/profile-linked",
+        "/home/jonathan/worktrees/profile-linked/ctl-linked-gitdir",
+        "/home/jonathan/Repos/profile-repo/.git/worktrees/profile-linked/escape",
     )
 
     # Built-in profile selection plus both legacy and native CLI overrides
@@ -688,23 +740,17 @@ in
     # (must succeed: the run started and policy allows the write) and then
     # attempts the escape OUTSIDE it (must be refused). A run that never
     # started fails the `ctl=0` assertion instead of passing as protection.
+    # Escape out of /home/jonathan/Repos into the home directory above it.
+    # Delegates to codex_sandbox_probe so there is one ctl/esc idiom in this
+    # file rather than two that can drift apart.
     def codex_sandbox_confined(name, args):
-        ctl = f"/home/jonathan/Repos/ctl-{name}"
-        esc = f"/home/jonathan/{name}"
-        out = workstation.succeed(
-            f"su - jonathan -c 'codex sandbox {args} "
-            f"-C /home/jonathan/Repos -- sh -c "
-            f"\"touch {ctl}; echo ctl=\\$?; touch {esc} 2>&1; echo esc=\\$?\"'"
+        codex_sandbox_probe(
+            name,
+            args,
+            "/home/jonathan/Repos",
+            f"/home/jonathan/Repos/ctl-{name}",
+            f"/home/jonathan/{name}",
         )
-        assert "ctl=0" in out, f"{name}: control write did not run: {out!r}"
-        assert "esc=1" in out, f"{name}: escape was not refused: {out!r}"
-        # The refusal comes from the sandbox's read-only bind, not from
-        # Unix permissions (jonathan owns /home/jonathan).
-        assert "Read-only file system" in out, (
-            f"{name}: escape refused for an unexpected reason: {out!r}"
-        )
-        workstation.succeed(f"test -e {ctl}")
-        workstation.fail(f"test -e {esc}")
 
     # A built-in unrestricted profile is not rejected by
     # allowed_permission_profiles: it runs, and the managed floor still
