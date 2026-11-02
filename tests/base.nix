@@ -5091,9 +5091,36 @@ in
     )
     assert dcg_marker["component"] == "dcg", dcg_marker
     assert dcg_marker["state"] == "fallback-active", dcg_marker
-    assert dcg_marker["target"] == "/home/jonathan/.claude/dcg.toml", dcg_marker
+    # `target` is the dcg USER LAYER — the path dcg itself loads and reports
+    # in `dcg config` — not the file behind it. Changed deliberately: it
+    # used to name ~/.claude/dcg.toml, which after the runtime-projection
+    # cutover is a link into a read-only mount whenever the projection is
+    # healthy, so a reader cross-checking the marker against live dcg state
+    # was handed a path dcg never reports. The seeded file is still named,
+    # in `remedy`, as the thing to remove.
+    assert dcg_marker["target"] == "/home/jonathan/.config/dcg/config.toml", (
+        dcg_marker
+    )
     assert dcg_marker["fallback_source"].startswith("/nix/store/"), dcg_marker
-    assert dcg_marker["remedy"].strip(), dcg_marker
+    # The remedy must reach the marker AS WRITTEN. It carries its commands in
+    # backticks, and it used to be spliced raw into double-quoted bash, so
+    # bash ran every backticked span as a command substitution during
+    # activation and wrote what was left: "before cutover ; after cutover
+    # then ; then rebuild". A non-empty check passed on that. Every command
+    # must survive, non-empty — no surviving backticks means the shell ate
+    # them, and EXECUTED them on the way.
+    dcg_remedy_cmds = _re.findall(r"`([^`]*)`", dcg_marker["remedy"])
+    assert dcg_remedy_cmds and all(c.strip() for c in dcg_remedy_cmds), (
+        "the marker's remedy lost its commands between home/dcg.nix and "
+        f"the file: {dcg_marker['remedy']!r}"
+    )
+    # And it must carry the post-cutover operator step — the same one the
+    # claude-runtime-links collision arm below performs to finish a cutover:
+    # remove the seeded copy, then let the links unit put the link back.
+    assert "rm ~/.claude/dcg.toml" in dcg_marker["remedy"], dcg_marker
+    assert "systemctl restart claude-runtime-links" in dcg_marker["remedy"], (
+        dcg_marker
+    )
     # The seed's CONTENT hash, and it must describe the file the marker
     # names. This is the field the NEXT activation reads back to decide
     # whether a seeded target may be refreshed in place (arm (i) below), so
@@ -5614,6 +5641,12 @@ in
         "the re-seeded fallback left no marker, so the only trace of the "
         "degraded state is again a banner in a unit log nobody reads: "
         f"{dcg_marker!r}"
+    )
+    # The banner is a separate interpolation site from the marker, so it is
+    # checked on its own: the same remedy, verbatim, not a shell-mangled one.
+    assert "Fix: " + dcg_marker["remedy"] + "." in reseed_log, (
+        "the seed banner does not carry the marker's remedy verbatim:\n"
+        + reseed_log[-3000:]
     )
     dcg_assert_denied_by_user_config(
         "curl -X DELETE https://example.com/x", "BOOTSTRAP FALLBACK"

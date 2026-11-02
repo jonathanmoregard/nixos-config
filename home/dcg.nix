@@ -196,7 +196,13 @@
 #             { "schema":          1,
 #               "component":       "dcg",
 #               "state":           "fallback-active",
-#               "target":          "/home/<user>/.claude/dcg.toml",
+#               "target":          "/home/<user>/.config/dcg/config.toml",
+#                                  # the dcg user layer, i.e. the path dcg
+#                                  # loads and `dcg config` reports — not the
+#                                  # file behind it (~/.claude/dcg.toml, which
+#                                  # post-cutover is normally a link into a
+#                                  # read-only mount). cmp/sha256sum follow
+#                                  # the link, so the claim below re-runs as-is.
 #               "fallback_source": "/nix/store/…-dcg-fallback.toml",
 #               "fallback_sha256": "e55b…",  # sha256 of that file, base16
 #               "observed_at":     "2026-08-24T09:11:22Z",   # UTC, ISO-8601
@@ -262,21 +268,44 @@ let
   fallbackMarker =
     "${config.home.homeDirectory}/.local/state/dcg/fallback-active.json";
 
+  # The dcg USER LAYER: the path dcg itself loads and names in `dcg config`
+  # (`.config_sources[] | select(.level == "user") | .path`). Named once so the
+  # link below and the marker's `target` cannot drift apart.
+  userLayerRel = ".config/dcg/config.toml";
+  userLayer = "${config.home.homeDirectory}/${userLayerRel}";
+
   # NEVER instruct a clone over ~/.claude here. This string is read by an
-  # operator whose dcg.toml is missing, and `dcg.toml` lives in the config
-  # repository, which after the runtime-projection cutover is NOT ~/.claude but
-  # ~/Repos/claude-config, with ~/.claude/dcg.toml a link into a read-only
-  # projection of it. A clone into ~/.claude would reinstate the whole flat
-  # tree — `tests/` included — at the live path the cutover exists to keep test
-  # code out of, and would do it while looking like a repair.
+  # operator whose dcg.toml is missing. After the runtime-projection cutover
+  # ~/.claude is a symlink farm over a read-only bind of the claude-config
+  # DEPLOY clone (modules/nixos/claude-runtime-deploy.nix), and
+  # ~/Repos/claude-config is a dev checkout nothing reads at runtime — so
+  # neither a clone into ~/.claude nor a `git checkout` in the dev tree
+  # restores anything that dcg loads.
   #
-  # One line that is correct on both sides of the cutover: restore the file in
-  # whichever checkout owns it, and on the projected side re-run the links unit
-  # so the path resolves again.
+  # What the marker actually means on a projected host: ~/.claude/dcg.toml was
+  # ABSENT at activation (the links unit had not run yet, or swept the link
+  # because the deployed runtime/ lost dcg.toml), so the seed planted a real
+  # file where the link belongs, and claude-runtime-links now reports it
+  # "exists and is not a symlink; left alone". The fix is the operator step
+  # tests/base.nix performs to finish a cutover: make sure the projection
+  # carries dcg.toml, remove the seeded copy (safe: the marker exists only
+  # while it is byte-identical to the fallback), and let the links unit put
+  # the link back. The pre-projection branch is kept for hosts whose
+  # ~/.claude is still the flat checkout.
+  #
+  # Carries shell commands in backticks, so it must NEVER be spliced raw into
+  # the activation script: inside double quotes bash runs each backticked span
+  # as a command substitution — executing the remedy during activation and
+  # writing the empty leftovers into the marker. It reaches the script only as
+  # `dcgRemedy`, through lib.escapeShellArg.
   remedy =
-    "restore dcg.toml: before cutover `git -C ~/.claude checkout -- dcg.toml`; "
-    + "after cutover `git -C ~/Repos/claude-config checkout -- runtime/dcg.toml` "
-    + "then `sudo systemctl restart claude-runtime-links`; then rebuild";
+    "on a projected host (~/.claude/.projection-enabled exists): "
+    + "if `ls ~/.claude/runtime/dcg.toml` fails, restore runtime/dcg.toml on "
+    + "claude-config master and run `sudo systemctl start claude-runtime-deploy`; "
+    + "then `rm ~/.claude/dcg.toml && sudo systemctl restart claude-runtime-links`. "
+    + "On a flat ~/.claude checkout: `git -C ~/.claude checkout -- dcg.toml`. "
+    + "Then `sudo systemctl restart home-manager-${config.home.username}` "
+    + "to re-check and clear this marker";
 
   # A dry run creates no files, so seeding would be a lie and validating
   # afterwards would report a state this run deliberately did not make.
@@ -296,7 +325,7 @@ in
 {
   home.packages = [ pkgs.dcg ];
 
-  home.file.".config/dcg/config.toml".source =
+  home.file.${userLayerRel}.source =
     config.lib.file.mkOutOfStoreSymlink claudeConfig;
 
   # ── Entry 1: seed, and record whether the fallback is in force ────────
@@ -309,6 +338,8 @@ in
     dcgFallbackSource="${fallbackSource}"
     dcgFallbackSha="${fallbackSha}"
     dcgMarker="${fallbackMarker}"
+    dcgUserLayer="${userLayer}"
+    dcgRemedy=${lib.escapeShellArg remedy}
 
     if ${notDryRun}; then
 
@@ -368,7 +399,7 @@ in
           "#  dropped the whole user layer silently, permitting" \
           "#  curl -X DELETE with exit 0 and no output at all." \
           "#" \
-          "#  Fix: ${remedy}." \
+          "#  Fix: $dcgRemedy." \
           "################################################################" \
           "" \
           >&2
@@ -410,7 +441,7 @@ in
           "#  Your real dcg pattern list is STILL NOT loaded. The fallback" \
           "#  covers destructive HTTP verbs only." \
           "#" \
-          "#  Fix: ${remedy}." \
+          "#  Fix: $dcgRemedy." \
           "################################################################" \
           "" \
           >&2
@@ -426,11 +457,11 @@ in
       if ${pkgs.diffutils}/bin/cmp -s "$dcgTarget" "$dcgFallbackSource"; then
         # Temp + rename, so a reader never sees a half-written object.
         ${pkgs.jq}/bin/jq -n \
-          --arg target "$dcgTarget" \
+          --arg target "$dcgUserLayer" \
           --arg fallback "$dcgFallbackSource" \
           --arg fallbackSha "$dcgFallbackSha" \
           --arg observed "$(${pkgs.coreutils}/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
-          --arg remedy "${remedy}" \
+          --arg remedy "$dcgRemedy" \
           '{ schema: 1,
              component: "dcg",
              state: "fallback-active",
@@ -455,7 +486,7 @@ in
             ${pkgs.libnotify}/bin/notify-send \
               --urgency=critical --app-name=dcg \
               "dcg is running the BOOTSTRAP FALLBACK" \
-              "$dcgTarget is nixos-config's fallback, not your pattern list. Destructive HTTP verbs are blocked; nothing else you added is. Fix: ${remedy}." \
+              "$dcgTarget is nixos-config's fallback, not your pattern list. Destructive HTTP verbs are blocked; nothing else you added is. Fix: $dcgRemedy." \
             || true
         fi
       else
