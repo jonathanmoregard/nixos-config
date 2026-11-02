@@ -77,6 +77,26 @@ TRANSIENT = ("unable to download", "http error 404", "could not resolve host", "
              "http error 5", "http error 429", "temporary failure")
 
 
+# A candidate's drvPath is whatever the flake says, and it is passed to nix as
+# a positional argument. Deliberately loose — it must reject argv payloads
+# without ever rejecting a real derivation, because a false negative here
+# stops publication silently. `--version` is the motivating case: nix accepts
+# the flag, exits 0 and prints non-JSON, which used to crash the run.
+DRV_PATH_RE = re.compile(r"^/nix/store/[^/\s]+\.drv$")
+
+
+def store_path(p):
+    """Absolute store path for a name `nix derivation show` may give either way.
+
+    The pinned Nix (json version 4) keys its graph by BASENAME and reports
+    `outputs.<name>.path` as a basename too; other versions use absolute
+    paths. Everything else here — path-info, the upstream query, cachix —
+    works in absolute paths, and the chroot eval store keeps the same virtual
+    /nix/store prefix, which is the whole basis for comparing an anonymous
+    path to a local one. Normalise once, at every edge that reads that JSON."""
+    return p if p.startswith("/") else f"/nix/store/{p}"
+
+
 def nix_error(args, stderr):
     """A failed nix call is a skip, unless it looks like the network: then retry."""
     msg = f"nix {args[0]} failed: {stderr.strip()[-300:]}"
@@ -357,14 +377,22 @@ class Publisher:
         would then say nothing about the path being uploaded. Taking the paths
         from the derivation is what binds the upload to the recipe the audit
         cleared."""
-        d = json.loads(self.w.nix(["derivation", "show", *self.fresh(), drv]))
+        if not DRV_PATH_RE.match(drv):
+            raise Skip(f"drvPath {drv!r} is not a store derivation path")
+        try:
+            d = json.loads(self.w.nix(["derivation", "show", *self.fresh(), drv]))
+        except ValueError as e:
+            raise Skip(f"derivation show for {drv} returned non-JSON: {e}")
         d = d.get("derivations", d)
+        # Keyed by basename in the pinned Nix, absolute in other versions.
         e = d.get(drv)
+        if not isinstance(e, dict):
+            e = d.get(os.path.basename(drv))
         if not isinstance(e, dict):
             raise Skip(f"{drv} is not in the anonymous store: no derivation was "
                        f"instantiated for the drvPath the flake stated")
-        outs = [o.get("path") for o in (e.get("outputs") or {}).values() if isinstance(o, dict)]
-        outs = [p for p in outs if p]
+        outs = [store_path(o["path"]) for o in (e.get("outputs") or {}).values()
+                if isinstance(o, dict) and o.get("path")]
         if not outs:
             raise Skip(f"{drv} declares no output paths")
         return outs
@@ -408,7 +436,10 @@ class Publisher:
         size = sum(v.get("narSize", 0) for p, v in closure.items() if p not in up)
         if size < self.cfg["min_nar"]:
             return [], False  # built, and simply not worth pushing: conclusive
-        return keep, False
+        # `unbuilt` still matters when keep is non-empty: a multi-output
+        # package can have one output built and another not, and retiring the
+        # commit on the strength of the first would lose the rest for good.
+        return keep, unbuilt
 
     def audit_build_graph(self, drv):
         """Prove every byte the build consumed is public.
@@ -435,7 +466,7 @@ class Publisher:
                 if algo not in ("sha256", "sha512"):
                     # A weak hash lets public and private bytes share a path.
                     raise Skip(f"fixed-output {name} uses hash algorithm {algo!r}")
-                fods.append(name if name.startswith("/") else f"/nix/store/{name}")
+                fods.append(store_path(name))
         if not fods:
             return
         # A FOD has exactly one output, so --outputs prints one line per drv.
@@ -504,6 +535,12 @@ class Publisher:
             if self.commit_status(o, r, rev) != 200:
                 raise Skip(f"lock input {o}/{r}@{rev[:12]} stopped being fetchable before upload")
         self.w.cachix_push(pushed)
+        if incomplete:
+            # Pushed what exists; the commit must stay queued for the rest.
+            # A later attempt re-offers these paths, which cachix deduplicates.
+            self.log(f"pushed {len(pushed)} path(s) for {owner}/{repo}@{sha[:12]}"
+                     + "".join(f"\n  {p}" for p in pushed))
+            raise Retry("other outputs of this commit are not built yet")
         return pushed
 
 
@@ -586,7 +623,18 @@ def run(cfg, world, log=print):
             continue
         owner, repo, sha = ENTRY_RE.match(st["entry"]).groups()
         try:
-            pushed = pub.process(owner, repo, sha)
+            try:
+                pushed = pub.process(owner, repo, sha)
+            except (RateLimited, Retry, Skip):
+                raise
+            except Exception as e:
+                # Entries are processed in sorted order, so an entry that
+                # raises anything unexpected would be met again on every run
+                # and starve every entry sorting after it — and a repo owner
+                # whose name begins with a digit sorts before all letters.
+                # Degrade to the retry path: bounded, and it keeps the queue
+                # moving. Nothing here is a reason to publish.
+                raise Retry(f"unexpected {type(e).__name__}: {e}") from e
             log(f"done {owner}/{repo}@{sha[:12]}: pushed {len(pushed)} path(s)" + "".join(f"\n  {p}" for p in pushed))
             final = True
         except RateLimited as e:

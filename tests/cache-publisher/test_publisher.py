@@ -59,6 +59,13 @@ class World:
         # flake's attrset claimed, or to [] for a drvPath that was never
         # instantiated there (a literal string in the flake).
         self.drv_outs = {}
+        # Make evaluation report a drvPath that is really a nix flag, as a
+        # hostile flake can: `--version` is accepted, exits 0 and prints
+        # non-JSON. `unexpected`/`unexpected_for` raise something that is
+        # neither Retry nor Skip, which used to escape run() entirely.
+        self.drv_flag = False
+        self.unexpected = None
+        self.unexpected_for = None
         self.local = {OUT: {"ultimate": True, "ca": None, "narSize": 5 * MiB, "deriver": OUT + ".drv"}}
         self.closure = {OUT: {"narSize": 5 * MiB}, DEP: {"narSize": 3 * MiB}, GLIBC: {"narSize": 30 * MiB}}
         # build graph of the candidate, as `nix derivation show -r` in the eval store
@@ -109,6 +116,10 @@ class World:
         self.nix_calls.append(args)
         # systemd-run-based wrappers expand ${VAR}; keep args free of it
         assert not any("${" in a for a in args), args
+        if self.unexpected:
+            raise self.unexpected
+        if self.unexpected_for and any(f"github:{self.unexpected_for}/" in a for a in args):
+            raise subprocess.TimeoutExpired("nix", 1800)
         if self.nix_fail:
             raise cp.nix_error(args, self.nix_fail)
         if args[:2] == ["flake", "metadata"]:
@@ -126,21 +137,28 @@ class World:
             return ""
         if args[0] == "eval":
             assert args[1:3] == ["--store", "/eval"], args  # anonymous fresh store, never local
-            return json.dumps({a: {"drv": f"/nix/store/{a}.drv", "outs": o} for a, o in self.packages.items()})
+            return json.dumps({a: {"drv": "--version" if self.drv_flag else f"/nix/store/{a}.drv",
+                                   "outs": o} for a, o in self.packages.items()})
         if args[0] == "derivation":
             assert args[2:4] == ["--store", "/eval"], args
-            # The real `derivation show` keys the graph by store path and
-            # includes the derivation asked about, so the candidate's own drv
-            # is present with the outputs IT declares — which is what binds a
-            # pushed path to the audited recipe.
+            # Real `nix derivation show` (json version 4, the pinned Nix)
+            # keys the graph by BASENAME and reports outputs.<n>.path as a
+            # basename too — verified against nix 2.34.9. Reproducing that
+            # exactly is load-bearing: a stub that hands back absolute paths
+            # lets an absolute-path lookup pass here and skip every candidate
+            # in production. The graph includes the derivation asked about, so
+            # the candidate's own drv is present with the outputs IT declares,
+            # which is what binds a pushed path to the audited recipe.
             g = dict(self.graph)
             for a, evaluated in self.packages.items():
                 real = self.drv_outs.get(a, evaluated)
                 if real == [] and a in self.drv_outs:
                     continue  # never instantiated in the eval store
-                g[f"/nix/store/{a}.drv"] = {
+                g[f"{a}.drv"] = {
                     "env": {},
-                    "outputs": {f"out{i}" if i else "out": {"path": p} for i, p in enumerate(real)},
+                    "outputs": {f"out{i}" if i else "out":
+                                {"path": p.removeprefix("/nix/store/")}
+                                for i, p in enumerate(real)},
                 }
             return json.dumps({"derivations": g, "version": 4})
         if args[0] == "path-info":
@@ -229,10 +247,17 @@ class Case(unittest.TestCase):
         self.assertEqual(self.w.nix_calls, [])  # nothing private is even fetched
 
     def test_200_but_private_or_internal_never_pushes(self):
-        for v in ("private200", "internal"):
+        # A distinct sha per visibility, because the first iteration retires
+        # its sha into `done` and `run` drops a later entry for a done sha —
+        # with one sha the second case silently never ran, and deleting the
+        # `visibility == "public"` check kept the whole suite green.
+        for sha, v in ((SHA, "private200"), (SHA2, "internal")):
+            self.w.commits.add(f"me/tool@{sha}")
             self.w.repos["me/tool"] = v
-            self.run_once()
+            self.w.seen.clear()
+            self.run_once(f"me/tool {sha}")
             self.assertEqual(self.w.pushed, [], v)
+            self.assertEqual(self.w.seen.get("me/tool"), v, v)
 
     def test_flip_to_private_before_upload_never_pushes(self):
         self.w.repos["me/tool"] = ["public", "private"]
@@ -458,6 +483,57 @@ class Case(unittest.TestCase):
         self.assertEqual(len(self.done()), 1)
         self.assertEqual(self.w.pushed, [])
 
+    def test_partially_built_multi_output_pushes_and_stays_queued(self):
+        # One output built, one not. The built one goes, and the commit must
+        # NOT be retired, or the second output is lost for good.
+        self.w.packages = {"default": [OUT, DEP]}
+        self.run_once()
+        self.assertEqual(self.w.pushed, [[OUT]])
+        self.assertEqual(len(self.pending()), 1)
+        self.assertEqual(self.done(), [])
+        # now the second output appears
+        self.w.local[DEP] = {"ultimate": True, "ca": None, "narSize": 3 * MiB,
+                             "deriver": OUT + ".drv"}
+        self.w.t += 4000
+        self.run_once(None)
+        self.assertEqual(self.w.pushed[-1], [OUT, DEP])
+        self.assertEqual(self.pending(), [])
+
+    # ── a single entry cannot wedge the queue ───────────────────────────────
+    def test_drv_path_that_is_a_nix_flag_is_skipped(self):
+        # `nix derivation show --store /eval --version` exits 0 and prints
+        # non-JSON, which crashed the run. Entries are processed in sorted
+        # order, so one such entry starved every entry after it, every run.
+        self.w.packages = {"default": [OUT]}
+        self.w.drv_flag = True
+        self.run_once()
+        self.assertEqual(self.w.pushed, [])
+        self.assertIn("not a store derivation path", self.log())
+
+    def test_unexpected_exception_retries_instead_of_wedging(self):
+        self.w.unexpected = subprocess.TimeoutExpired("nix", 1800)
+        self.run_once()
+        self.assertEqual(self.w.pushed, [])
+        self.assertEqual(len(self.pending()), 1)   # kept, with backoff
+        self.assertEqual(self.done(), [])
+        self.assertIn("unexpected TimeoutExpired", self.log())
+        # and it expires rather than retrying forever
+        self.w.t += 49 * 3600
+        self.run_once(None)
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(len(self.done()), 1)
+
+    def test_one_poison_entry_does_not_starve_later_entries(self):
+        # '0bad' sorts before 'me', which is the starvation order that made
+        # this fatal rather than merely noisy.
+        self.w.repos["0bad/repo"] = "public"
+        self.w.commits.add(f"0bad/repo@{SHA}")
+        self.w.unexpected_for = "0bad/repo"
+        self.enqueue(f"0bad/repo {SHA}")
+        self.run_once()
+        self.assertEqual(self.w.pushed, [[OUT]])  # me/tool still published
+        self.assertIn("unexpected TimeoutExpired", self.log())
+
     def test_built_but_nothing_worth_pushing_is_retired(self):
         # Built locally and simply too small: a conclusive answer. It must be
         # retired, not left re-evaluating every hour for 48 h.
@@ -630,6 +706,74 @@ class RealNixEval(unittest.TestCase):
         got = json.loads(p.stdout)["evil"]
         self.assertEqual(got["drv"], "/nix/store/00000000000000000000000000000001-harmless.drv")
         self.assertEqual(got["outs"], ["/nix/store/00000000000000000000000000000002-private"])
+
+
+@unittest.skipUnless(shutil.which("nix"), "needs a real nix")
+class RealNixDrvOutputs(unittest.TestCase):
+    """`drv_outputs` parses `nix derivation show`, whose shape only real Nix
+    can settle. The pinned 2.34.9 (json version 4) keys the graph by BASENAME
+    and reports `outputs.<n>.path` as a basename, while `drvPath` from
+    evaluation is absolute. An absolute-only lookup therefore matches nothing,
+    skips every candidate and retires the commit: publication silently off,
+    and no stub notices, because the stub's fidelity is the only thing under
+    test there. Hence this runs against the real thing."""
+
+    def run_nix(self, env, args):
+        p = subprocess.run(["nix", "--extra-experimental-features", "nix-command flakes", *args],
+                           capture_output=True, text=True, env=env)
+        if p.returncode != 0:
+            raise AssertionError(f"nix {args[0]} failed: {p.stderr}")
+        return p.stdout
+
+    def test_drv_outputs_equals_evaluated_out_paths(self):
+        probe = ('(derivation { name = "probe"; system = builtins.currentSystem; '
+                 'builder = "/bin/sh"; args = [ "-c" "true" ]; '
+                 'outputs = [ "out" "lib" ]; })')
+        outer = self
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "s")
+            # Setup needs --impure for builtins.currentSystem; production does
+            # not, so only the fixture uses this config.
+            setup = dict(os.environ, NIX_CONFIG=cp.NIX_CONFIG, HOME=d)
+            # Forcing drvPath instantiates the .drv into that store.
+            drv = self.run_nix(setup, ["eval", "--impure", "--store", store, "--raw",
+                                       "--expr", f"{probe}.drvPath"]).strip()
+            evaluated = json.loads(self.run_nix(setup, [
+                "eval", "--impure", "--store", store, "--json", "--expr",
+                f'map (o: (builtins.getAttr o {probe}).outPath) [ "out" "lib" ]']))
+
+            # `drv_outputs` itself runs under exactly what World.nix sets in
+            # production — NIX_CONFIG_FRESH, with restrict-eval and pure-eval.
+            # Reading a .drv needs no evaluation, so it must work there.
+            prod = dict(os.environ, NIX_CONFIG=cp.NIX_CONFIG_FRESH, HOME=d)
+
+            class W:
+                def nix(self, args):
+                    return outer.run_nix(prod, args)
+
+            pub = cp.Publisher({"eval_store": store}, W(), log=lambda *a: None)
+            got = pub.drv_outputs(drv)
+        self.assertTrue(drv.startswith("/nix/store/"), drv)
+        self.assertEqual(len(got), 2, got)
+        self.assertTrue(all(p.startswith("/nix/store/") for p in got), got)
+        self.assertEqual(sorted(got), sorted(evaluated))
+
+    def test_drv_outputs_skips_a_drv_that_was_never_instantiated(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "s")
+            env = dict(os.environ, NIX_CONFIG=cp.NIX_CONFIG, HOME=d)
+            outer = self
+
+            class W:
+                def nix(self, args):
+                    try:
+                        return outer.run_nix(env, args)
+                    except AssertionError as e:
+                        raise cp.nix_error(args, str(e))
+
+            pub = cp.Publisher({"eval_store": store}, W(), log=lambda *a: None)
+            with self.assertRaises((cp.Skip, cp.Retry)):
+                pub.drv_outputs("/nix/store/" + "0" * 32 + "-never-made.drv")
 
 
 if __name__ == "__main__":
