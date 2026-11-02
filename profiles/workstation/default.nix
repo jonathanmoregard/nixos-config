@@ -133,7 +133,6 @@
     # verification) and in secrets/secrets.nix (no offline recovery
     # recipient yet).
     ../../modules/nixos/klaffat-infra.nix
-    ../../modules/nixos/klaffat-dependabot-caretaker.nix
     ../../modules/nixos/klaffat-local-google.nix
   ];
 
