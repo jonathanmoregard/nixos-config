@@ -3,7 +3,7 @@
 #
 # Sourced into a writeShellApplication by scripts/feature-vm.nix, which
 # defines MEMORY_RUNNER and SCREENCAP before this text. See `usage` below
-# and home/claude-skills/nixos-agent-testing/SKILL.md for the workflow.
+# and ~/.claude/skills/nixos-agent-testing/SKILL.md for the workflow.
 
 usage() {
   cat >&2 <<'EOF'

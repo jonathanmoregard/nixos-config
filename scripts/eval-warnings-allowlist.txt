@@ -3,3 +3,18 @@
 # acceptable and when it can be removed. An unexplained entry defeats
 # the whole gate: the 2048-MiB microvm outage (PR #117) happened while
 # upstream warned about it on every single eval.
+
+# uv2nix's lib/build.nix reads `stdenv.isLinux` / `stdenv.isDarwin`, the
+# aliases nixpkgs started warning about between the 2026-08-05 and
+# 2026-10-27 pins. Upstream uv2nix fixed it (085c0833) and this repo's own
+# uv2nix input now carries the fix — but prose-decorate, tts-tool and
+# substack-url-tool each lock their own older uv2nix, and those copies are
+# what build the python CLIs in this host's closure. The warning is
+# eval-only: a deprecated alias that still returns the right boolean, so
+# nothing about the built closure changes.
+#
+# Remove these two lines once all three tool flakes have bumped uv2nix past
+# 085c0833 and their inputs are re-locked here. Until then the alternative
+# is a red gate on every eval, which trains the gate to be ignored.
+stdenv\.isDarwin is deprecated
+stdenv\.isLinux is deprecated

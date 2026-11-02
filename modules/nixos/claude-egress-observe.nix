@@ -572,6 +572,8 @@ in
         "mcp.tavily.com"
         # MCP: injection scanner used by the research-agent wrappers
         "api.lakera.ai"
+        # Model Armor (token exchange via oauth2.googleapis.com, listed below)
+        "modelarmor.europe-west4.rep.googleapis.com"
         # MCP: reddit
         "www.reddit.com"
         "oauth.reddit.com"
@@ -683,7 +685,8 @@ in
         # only has an effect on OnCalendar= and this is a laptop that
         # suspends: without catch-up, a machine asleep over a boundary
         # skips the snapshot and the window it covers loses its names.
-        # Same reasoning as claude-pull.timer in home/claude-services.nix.
+        # Same reasoning as the claude-config puller in
+        # modules/nixos/claude-runtime-deploy.nix.
         OnCalendar = "*:0/30";
         Persistent = true;
         AccuracySec = "1min";

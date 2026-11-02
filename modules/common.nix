@@ -17,6 +17,7 @@
     # --- pre-existing core ---
     claude-code
     codex          # OpenAI Codex CLI — cross-vendor validator lane
+    sandbox-runtime # srt — bubblewrap sandbox with Unix-socket seccomp filtering
     git
     gh
     ripgrep        # rg — fast grep, respects .gitignore

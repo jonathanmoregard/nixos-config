@@ -16,9 +16,21 @@
     ../../modules/nixos/local-stt.nix
     # Tuxedo only: quiet background AI (freeze when hot/battery/dictating) + telemetry.
     ../../modules/nixos/ai-throttle.nix
+
+    # Projects claude-config's runtime subset into ~/.claude. tuxedo only:
+    # it is the host where ~/.claude is a live agent config.
+    ../../modules/nixos/claude-runtime-mounts.nix
+    # Keeps the tree those mounts are served FROM up to date, as a system user
+    # jonathan cannot write. Pairs with the module above and must be imported
+    # with it: the mounts name that clone as their source.
+    ../../modules/nixos/claude-runtime-deploy.nix
   ];
 
   networking.hostName = "tuxedo";
+  # secrets/github-app-key.age is encrypted to this host's key only.
+  services.githubAppBroker.enable = true;
+  # claude-code-dev-box (public: `gh api /apps/claude-code-dev-box`).
+  services.githubAppBroker.appId = 3433130;
 
   # The install created the agents before uids were pinned, so they took
   # 1000-1002 and jonathan 1003. Pin those live values rather than rewrite

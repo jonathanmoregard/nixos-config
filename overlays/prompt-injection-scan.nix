@@ -18,7 +18,7 @@
 # less trigger-word-biased: measured on the 613 unique real permission-ledger
 # tool-argument texts (2026-10-02) it flagged 233 at 0.5; this model 33.
 #
-# Why not the injection-scanner repo (research-agent / futuresearch-gate):
+# Why not the injection-scanner repo (research-agent):
 # its layers are hosted (Lakera Guard on a 10k/month quota shared with the
 # fleet, plus a paid-API honeypot). Sending captured tool arguments — which
 # may hold credentials — to third parties nightly is the wrong trade for a

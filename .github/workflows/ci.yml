@@ -230,12 +230,36 @@ jobs:
       # to a failure that actually cost a day's sessions.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.kitty-scripts -L
+      # rust-analyzer devShell wrapper contracts
+      # (tests/rust-analyzer-devshell.nix): the editor's --version probe
+      # never evaluating a flake, the walk-up from a crate subdirectory,
+      # both degrade routes still starting a language server, and — the
+      # one the approach stands on — a devShell shellHook's stdout going
+      # to stderr while the server's own stdout arrives byte-intact. A
+      # regression there is a corrupted LSP stream, which surfaces as an
+      # editor protocol error rather than as anything pointing here.
+      # Stubs nix, boots nothing, runs in seconds.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.rust-analyzer-devshell -L
       # research-agent security sweep verdict logic
       # (tests/security-batch-research-agent.nix): seed, new CVE,
       # accepted, score regression, tool errors, against fake vulnix /
       # systemd-analyze. Tiny runCommand — seconds.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.security-batch-research-agent -L
+      # GitHub App key broker contracts: the broker's request grammar,
+      # owner restriction and MCP flag allowlist against a JWT-verifying
+      # fake GitHub (tests/github-app-broker.nix); mint-gh-token's token
+      # cache, including write/rename failures keeping the old token
+      # (tests/github-app-mint.nix); the MCP relay
+      # (tests/github-app-mcp.nix). Boot nothing — seconds each. vm-base
+      # drives the real sockets end to end.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.github-app-broker -L
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.github-app-mint -L
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.github-app-mcp -L
 
   docs:
     # Validate that every `nix run .#<attr>` reference in this repo's
@@ -252,8 +276,13 @@ jobs:
     # `jonathanmoregard/nixos-config@main` lives in the .claude repo's
     # own CI (Phase 2 of proposal #128). Adding a cross-repo lint here
     # would need a PAT with read access to .claude — tracked as a
-    # follow-up; not load-bearing because every nixos-* skill that
-    # references this flake now lives in-repo (home/claude-skills/).
+    # follow-up. It USED to be non-load-bearing because every nixos-*
+    # skill that references this flake lived in-repo under
+    # home/claude-skills/; those moved to claude-config's runtime/skills/
+    # when the runtime projection took over delivery, so `nix run .#`
+    # references inside them are no longer covered by any job here. A
+    # renamed flake attribute now breaks those skills with this job still
+    # green. The cross-repo lint is what would close it.
     #
     # No build cost: pure `nix eval --apply 'x: null'` per unique
     # attribute, no realization. Total job runtime ~30-60s warm.
@@ -415,7 +444,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, security-batch]
+        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, security-batch, sandbox-seccomp]
     steps:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

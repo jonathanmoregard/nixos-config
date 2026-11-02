@@ -198,6 +198,7 @@
         (import ./overlays/beeper.nix)
         (import ./overlays/auphonic-cli.nix)
         (import ./overlays/signal-expiry.nix)
+        (import ./overlays/sandbox-runtime.nix)
         # `pkgs.dcg` — the destructive-command guard the Claude Code hook
         # stack shells out to. Declarative on purpose: the previous
         # `cargo install` copy was deleted by the Mint → NixOS migration
@@ -211,9 +212,13 @@
         # ~/.claude output hooks and aggregator ingest. See
         # overlays/secret-redact.nix.
         (import ./overlays/secret-redact.nix)
-        # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
-        # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
-        (import ./overlays/claude-code.nix)
+        # `linuxPackages.tuxedo-drivers` builds at all: its Makefile splices
+        # $(MAKEFLAGS) into a shell recipe, which nixpkgs' kernel module
+        # signing flag no longer survives. See overlays/tuxedo-drivers.nix.
+        (import ./overlays/tuxedo-drivers.nix)
+        # `pkgs.vscodium` newer than nixpkgs: the GitHub PR review extension
+        # needs an editor >= 1.129. See overlays/vscodium.nix.
+        (import ./overlays/vscodium.nix)
         # Native Codex CLI package with prebuilt store paths from the
         # codex-cli Cachix cache.
         codex-cli-nix.overlays.default
@@ -327,6 +332,7 @@
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
         vm-nix-gc       = mkLane ./tests/nix-gc.nix;
         vm-security-batch = mkLane ./tests/security-batch.nix;
+        vm-sandbox-seccomp = mkLane ./tests/sandbox-seccomp.nix;
         # In ci.yml's vm-minimal matrix. Gates credential handling and the
         # sudo password rule.
         vm-klaffat-infra = mkLane ./tests/klaffat-infra.nix;
@@ -430,6 +436,20 @@
           deployedZshenv = primaryConfig
             .home-manager.users.jonathan.home.file."./.zshenv".source;
         };
+        # Not a VM lane: runtime-invocation harness for the rust-analyzer
+        # devShell wrapper (home/rust-analyzer-devshell.nix) — flake walk-up,
+        # the two degrade routes that keep the editor's language server
+        # alive, and the LSP-stdout-vs-shellHook split that the whole
+        # approach stands on. Boots nothing; seconds.
+        rust-analyzer-devshell = import ./tests/rust-analyzer-devshell.nix {
+          pkgs = pkgsLinux;
+          raDevshell = import ./home/rust-analyzer-devshell.nix { pkgs = pkgsLinux; };
+          # Drift gate: the settings.json the primary host really deploys,
+          # read for the server path the editor will spawn.
+          deployedSettings = primaryConfig
+            .home-manager.users.jonathan
+            .home.file.".config/VSCodium/User/settings.json".source;
+        };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
         # credential whose real home is elsewhere (see the test's header for
         # why this is not a VM assertion). Pure eval; instant.
@@ -508,9 +528,18 @@
               inherit addSecretPkg;
               deployedBin = "${builtins.head matches}/bin/add-secret";
             };
+        # Not a VM lane: request-handling harness for the GitHub App key
+        # broker's two socket programs — strict request grammar, the owner
+        # restriction and the MCP flag allowlist — against a fake GitHub
+        # that verifies the JWT. vm-base owns sockets, key mode and the
+        # real MCP server. Seconds.
+        github-app-broker = import ./tests/github-app-broker.nix { pkgs = pkgsLinux; };
+        # Not a VM lane: scenario harness for mint-gh-token, the jonathan-side
+        # GitHub App token refresher, against a fake key broker socket.
+        github-app-mint = import ./tests/github-app-mint.nix { pkgs = pkgsLinux; };
         # Not a VM lane: runtime-invocation harness for the GitHub App MCP
-        # credential wrapper. Uses a fake server to prove config failures,
-        # exact argv construction, and stripping of inherited token auth.
+        # wrapper. Uses a fake relay to prove config failures, owner routing
+        # and the header it sends to the App key broker.
         github-app-mcp =
           let
             homePkgs = primaryConfig
