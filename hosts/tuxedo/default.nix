@@ -20,6 +20,10 @@
     # Projects claude-config's runtime subset into ~/.claude. tuxedo only:
     # it is the host where ~/.claude is a live agent config.
     ../../modules/nixos/claude-runtime-mounts.nix
+    # Keeps the tree those mounts are served FROM up to date, as a system user
+    # jonathan cannot write. Pairs with the module above and must be imported
+    # with it: the mounts name that clone as their source.
+    ../../modules/nixos/claude-runtime-deploy.nix
   ];
 
   networking.hostName = "tuxedo";

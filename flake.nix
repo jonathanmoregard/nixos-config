@@ -212,9 +212,13 @@
         # ~/.claude output hooks and aggregator ingest. See
         # overlays/secret-redact.nix.
         (import ./overlays/secret-redact.nix)
-        # `pkgs.claude-code` newer than nixpkgs: older CLIs refuse current
-        # model ids (opus-5-5, fable-5-1). See overlays/claude-code.nix.
-        (import ./overlays/claude-code.nix)
+        # `linuxPackages.tuxedo-drivers` builds at all: its Makefile splices
+        # $(MAKEFLAGS) into a shell recipe, which nixpkgs' kernel module
+        # signing flag no longer survives. See overlays/tuxedo-drivers.nix.
+        (import ./overlays/tuxedo-drivers.nix)
+        # `pkgs.vscodium` newer than nixpkgs: the GitHub PR review extension
+        # needs an editor >= 1.129. See overlays/vscodium.nix.
+        (import ./overlays/vscodium.nix)
         # Native Codex CLI package with prebuilt store paths from the
         # codex-cli Cachix cache.
         codex-cli-nix.overlays.default
@@ -432,6 +436,20 @@
           # one with it in place.
           deployedZshenv = primaryConfig
             .home-manager.users.jonathan.home.file."./.zshenv".source;
+        };
+        # Not a VM lane: runtime-invocation harness for the rust-analyzer
+        # devShell wrapper (home/rust-analyzer-devshell.nix) — flake walk-up,
+        # the two degrade routes that keep the editor's language server
+        # alive, and the LSP-stdout-vs-shellHook split that the whole
+        # approach stands on. Boots nothing; seconds.
+        rust-analyzer-devshell = import ./tests/rust-analyzer-devshell.nix {
+          pkgs = pkgsLinux;
+          raDevshell = import ./home/rust-analyzer-devshell.nix { pkgs = pkgsLinux; };
+          # Drift gate: the settings.json the primary host really deploys,
+          # read for the server path the editor will spawn.
+          deployedSettings = primaryConfig
+            .home-manager.users.jonathan
+            .home.file.".config/VSCodium/User/settings.json".source;
         };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
         # credential whose real home is elsewhere (see the test's header for

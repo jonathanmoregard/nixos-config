@@ -7,7 +7,7 @@
 # JSON payload.
 #
 # Excludes everything else (cinnamon, desktop-apps, ghostty, autodoro,
-# drift-analyzer, router-services, claude-services, claude-skills,
+# drift-analyzer, router-services, claude-services,
 # research-agent-mcp, jonathan.nix's shell/git/p10k/nodejs/rust toolchain)
 # so vm-claude-pane's drvPath is invariant to edits in those files.
 { ... }:
