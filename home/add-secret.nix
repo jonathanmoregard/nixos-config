@@ -3,7 +3,7 @@
 # add-secret — one-command wrapper for adding a new agenix-rekey secret.
 #
 # Collapses the manual flow documented in
-# home/claude-skills/nixos-agenix-secret/SKILL.md (edit host file →
+# ~/.claude/skills/nixos-agenix-secret/SKILL.md (edit host file →
 # `edit-view -- edit` → `rekey` → git add/commit/push/PR) into a single
 # invocation.
 #
@@ -302,7 +302,7 @@ To edit its value, use the manual edit path:
     if ! grep -qF "$MARKER" "$DECL_FILE"; then
       rm -f "$AGE_FILE"
       die "marker '$MARKER' not found in $DECL_FILE — cannot safely insert.
-Add the marker on its own line where new age.secrets should go, or fall back to the manual path in home/claude-skills/nixos-agenix-secret/SKILL.md."
+Add the marker on its own line where new age.secrets should go, or fall back to the manual path in ~/.claude/skills/nixos-agenix-secret/SKILL.md."
     fi
 
     DECL_BACKUP="$DECL_FILE.add-secret-backup"
