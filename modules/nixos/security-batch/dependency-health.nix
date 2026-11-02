@@ -18,27 +18,18 @@
 #   Metadata:          Read-only (mandatory)
 # Everything else (contents, checks, workflows, administration, …): No access.
 # No webhook, no user authorization. Installable on "Any account" (one App,
-# two owners), installed on jonathanmoregard (only the repos below) and on
-# the klaffat org (klaffat/klaffat only).
+# two owners), installed on "All repositories" for both jonathanmoregard and
+# the klaffat org.
 #
-# Provisioning, then fill in `app` below in the same PR:
-#   - the private key, as agenix secret `github-dependency-health-app-key`,
-#     owner root 0400 — systemd hands it to the runner (LoadCredential); no
-#     user, agent or other service can read it:
-#       add-secret github-dependency-health-app-key --host tuxedo --owner root --group root --from-stdin < app.private-key.pem
-#   - app.id: the App ID on the App's settings page;
-#   - app.installations: per owner, the number at the end of
-#     https://github.com/settings/installations/<id> (personal) and
-#     https://github.com/organizations/klaffat/settings/installations/<id>.
-# The App id and installation ids are identifiers, not secrets.
+# Provisioned: the private key is the agenix secret
+# `github-dependency-health-app-key`, declared in
+# profiles/workstation/default.nix with owner root and mode 0400. systemd
+# hands it to the runner (LoadCredential); no user, agent or other service can
+# read it. The App id and installation ids below are identifiers, not secrets.
 #
 # Installation tokens are minted per run by gh-token (nixpkgs; Link-/gh-token)
 # from that key: one per owner, held in the process, expiring within the hour.
 #
-# Until the key is declared and `app` filled in, the runner still runs and
-# fails loudly ("GitHub App not provisioned") every night, so the missing
-# check is visible rather than silent; the build does not depend on the
-# secret.
 { config, lib, pkgs, ... }:
 let
   # owner/name; the summary names repos by `name`, so keep names unique.
@@ -53,10 +44,10 @@ let
     "jonathanmoregard/smarthome"
   ];
   app = {
-    id = null;
+    id = 5578924;
     installations = {
-      # jonathanmoregard = 12345678;
-      # klaffat = 12345678;
+      jonathanmoregard = 177815240;
+      klaffat = 177815386;
     };
   };
   keySecret = "github-dependency-health-app-key";
