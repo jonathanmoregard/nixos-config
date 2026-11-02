@@ -1,6 +1,7 @@
-# Nightly dependency health of the repos below: open Dependabot alerts,
-# Dependabot PRs that are stale (> 7 days) or red, and scheduled workflows
-# whose latest run on the default branch failed. Logic: dependency-health.sh.
+# Nightly dependency health of every active repo visible to the configured
+# GitHub App installations: open Dependabot alerts, Dependabot PRs that are
+# stale (> 7 days) or red, and scheduled workflows whose latest run on the
+# default branch failed. Logic: dependency-health.sh.
 # A finding reaches Claude sessions through the security-batch failure record
 # (modules/nixos/security-batch.nix) and stays there until it is handled.
 #
@@ -32,17 +33,6 @@
 #
 { config, lib, pkgs, ... }:
 let
-  # owner/name; the summary names repos by `name`, so keep names unique.
-  repos = [
-    "klaffat/klaffat"
-    "jonathanmoregard/.claude"
-    "jonathanmoregard/nixos-config"
-    "jonathanmoregard/injection-scanner"
-    "jonathanmoregard/research-agent"
-    "jonathanmoregard/aggregator"
-    "jonathanmoregard/ai-client-config"
-    "jonathanmoregard/smarthome"
-  ];
   app = {
     id = 5578924;
     installations = {
@@ -52,7 +42,6 @@ let
   };
   keySecret = "github-dependency-health-app-key";
   runnerConfig = pkgs.writeText "dependency-health.json" (builtins.toJSON {
-    inherit repos;
     app_id = app.id;
     inherit (app) installations;
   });
@@ -62,7 +51,8 @@ in
 
   services.securityBatch.dependency-health = {
     schedule = "*-*-* 04:30";
-    # Eight installation-token mints and a few dozen REST GETs.
+    # One installation-token mint and repository listing per owner, then a
+    # few REST GETs per active repo.
     timeout = "15min";
     acceptHint = "accept in GitHub: dismiss alert or @dependabot ignore";
     credentials = lib.optionalAttrs (config.age.secrets ? ${keySecret}) {

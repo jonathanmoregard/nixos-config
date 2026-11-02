@@ -2,9 +2,9 @@
 # dependency-health check (modules/nixos/security-batch/dependency-health.sh).
 # No VM, no network: `gh-token` is a fake that mints a token per App
 # installation only for the provisioned key, and `gh` a fake that answers the
-# REST endpoints from per-repo fixture files, filters runs by the query the
-# way GitHub does, and answers 401 unless the token is the one minted for the
-# installation on the endpoint's owner.
+# installation's repository listing and per-repo REST endpoints from fixture
+# files, filters runs by the query the way GitHub does, and answers 401 unless
+# the token is the one minted for the installation on the endpoint's owner.
 #
 # What must hold:
 #   - every repo clean: exit 0;
@@ -17,6 +17,8 @@
 #     failed: exit 1; an older failure, a feature-branch failure, and a
 #     deleted workflow's failure are not;
 #   - alerts disabled (the API says so): a finding, exit 1;
+#   - repositories are discovered from each installation; archived repos are
+#     skipped, and one owner's listing failure does not hide the other owner;
 #   - each owner's repos are read with that owner's installation token;
 #   - App not provisioned (no key, no app id), an owner with no installation,
 #     a key GitHub rejects, a wrong installation id, a 403 that is not
@@ -57,19 +59,52 @@ let
     fi
     path=''${endpoint%%\?*}
     query=""; [[ "$endpoint" != *\?* ]] || query=''${endpoint#*\?}
-    IFS=/ read -r _ owner name rest <<< "$path"
-    if [ "''${GH_TOKEN:-}" != "ghs_fixture_$(cksum <<< "$owner" | cut -d' ' -f1)" ]; then
-      echo '{"message":"Bad credentials","status":"401"}'
-      echo "gh: Bad credentials (HTTP 401)" >&2; exit 1
+    if [ "$path" = installation/repositories ]; then
+      owner=
+      for candidate in "$FAKE_DIR"/*; do
+        [ -d "$candidate" ] || continue
+        candidate_owner=''${candidate##*/}
+        if [ "''${GH_TOKEN:-}" = "ghs_fixture_$(cksum <<< "$candidate_owner" | cut -d' ' -f1)" ]; then
+          owner=$candidate_owner
+          break
+        fi
+      done
+      if [ -z "$owner" ]; then
+        echo '{"message":"Bad credentials","status":"401"}'
+        echo "gh: Bad credentials (HTTP 401)" >&2; exit 1
+      fi
+      dir="$FAKE_DIR/$owner"
+      key=installation_repositories
+    else
+      IFS=/ read -r _ owner name rest <<< "$path"
+      if [ "''${GH_TOKEN:-}" != "ghs_fixture_$(cksum <<< "$owner" | cut -d' ' -f1)" ]; then
+        echo '{"message":"Bad credentials","status":"401"}'
+        echo "gh: Bad credentials (HTTP 401)" >&2; exit 1
+      fi
+      dir="$FAKE_DIR/$owner/$name"
+      key=$(tr / _ <<< "''${rest:-repo}")
     fi
-    dir="$FAKE_DIR/$owner/$name"
-    key=$(tr / _ <<< "''${rest:-repo}")
     if [ -f "$dir/$key.http" ]; then   # "<code> <message>"
       read -r code msg < "$dir/$key.http"
       jq -cn --arg m "$msg" --arg c "$code" '{message: $m, status: $c}'
       echo "gh: $msg (HTTP $code)" >&2; exit 1
     fi
-    if [ -f "$dir/$key.raw" ]; then cat "$dir/$key.raw"; exit 0; fi
+    if [ -f "$dir/$key.raw" ]; then
+      if [ "$key" = installation_repositories ] && [[ " $* " = *' --jq .repositories '* ]]; then
+        jq -c '.repositories' "$dir/$key.raw"
+      else
+        cat "$dir/$key.raw"
+      fi
+      exit 0
+    fi
+    if [ "$key" = installation_repositories ]; then
+      if [[ " $* " = *' --jq .repositories '* ]]; then
+        jq -c '.repositories' "$dir/repositories.json"
+      else
+        cat "$dir/repositories.json"
+      fi
+      exit 0
+    fi
     param() { tr '&' '\n' <<< "$query" | sed -n "s/^$1=//p"; }
     case "$key" in
       repo) jq -cn --arg f "$owner/$name" '{full_name: $f, default_branch: "main"}' ;;
@@ -109,13 +144,17 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     echo "fixture-app-key, opaque: the fake gh-token only compares it" > fake/app-key
     cp fake/app-key creds/github-app-key
     inst() { cksum <<< "$1" | cut -d' ' -f1; }
-    # config <repo>... → config.json as the module writes it, with every
-    # owner's real installation id; the bad cases edit it with jq afterwards.
+    # config <repo>... → config.json as the module writes it plus each
+    # installation's repository listing. Bad cases edit either with jq.
     config() {
       printf '%s\n' "$@" | jq -nR --argjson app 4242 '[inputs | select(. != "")] as $r
-        | {app_id: $app, repos: $r, installations: ($r | map(split("/")[0]) | unique | map({(.): 0}) | add // {})}' > config.json
+        | {app_id: $app, installations: ($r | map(split("/")[0]) | unique | map({(.): 0}) | add // {})}' > config.json
       for o in $(jq -r '.installations | keys[]' config.json); do
         jq --arg o "$o" --argjson i "$(inst "$o")" '.installations[$o] = $i' config.json > c.tmp && mv c.tmp config.json
+        mkdir -p "fake/$o"
+        printf '%s\n' "$@" | jq -nR --arg o "$o" '[inputs | select(startswith($o + "/"))
+          | {full_name: ., name: (split("/")[1]), archived: false, disabled: false}]
+          | {total_count: length, repositories: .}' > "fake/$o/repositories.json"
       done
     }
 
@@ -153,6 +192,7 @@ pkgs.runCommand "security-batch-dependency-health-harness"
         "$d/runs.json" > "$d/r.tmp" && mv "$d/r.tmp" "$d/runs.json"
     }
     http() { local d; d=$(repo_dir "$1"); echo "$3" > "$d/$2.http"; }
+    installation_http() { mkdir -p "fake/$1"; echo "$2 $3" > "fake/$1/installation_repositories.http"; }
     reset() { rm -rf fake/*/ fake/offline; }
 
     n=0
@@ -166,7 +206,7 @@ pkgs.runCommand "security-batch-dependency-health-harness"
         bash ${runnerScript} "$PWD/config.json" > "$run/out" 2>&1 || rc=$?
     }
     summary() { cat "$run/summary.txt"; }
-    repos=(klaffat/klaffat jonathanmoregard/.claude)
+    repos=(klaffat/klaffat jonathanmoregard/claude-config)
 
     # 1. Every repo clean, including a young green Dependabot PR, a rerun that
     #    went green, and a human's month-old PR.
@@ -181,6 +221,16 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     grep -q 'dependabot/alerts?state=open' calls.log || fail "alerts never queried"
     grep -q 'ghs_fixture' calls.log && fail "token reached gh argv"
     [ "$(grep -c 'gh-token generate' fake/gh-token.log)" = 2 ] || fail "not one token per owner"
+    reset
+
+    #    Archived repositories are discovered but not checked or counted.
+    config "''${repos[@]}" jonathanmoregard/retired
+    jq '(.repositories[] | select(.full_name == "jonathanmoregard/retired")).archived = true' \
+      fake/jonathanmoregard/repositories.json > r.tmp && mv r.tmp fake/jonathanmoregard/repositories.json
+    rerun
+    [ "$rc" = 0 ] || fail "archived repo listing exited $rc"
+    grep -q '2 repos checked, none need attention' <<< "$(summary)" || fail "archived repo counted"
+    grep -q '^jonathanmoregard/retired$' "$run/report.txt" && fail "archived repo was checked"
     reset
 
     # 2. Open alerts, across two pages: exit 1, repo and severity counts named.
@@ -204,12 +254,12 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     reset
 
     # 4. A young Dependabot PR whose latest run of a workflow failed.
-    pr jonathanmoregard/.claude 3 "$(ago '1 day')" 'dependabot[bot]' sha3
-    runs jonathanmoregard/.claude 5 pull_request dependabot/x sha3 '"success"' "$(ago '20 hours')"
-    runs jonathanmoregard/.claude 5 pull_request dependabot/x sha3 '"failure"' "$(ago '19 hours')"
+    pr jonathanmoregard/claude-config 3 "$(ago '1 day')" 'dependabot[bot]' sha3
+    runs jonathanmoregard/claude-config 5 pull_request dependabot/x sha3 '"success"' "$(ago '20 hours')"
+    runs jonathanmoregard/claude-config 5 pull_request dependabot/x sha3 '"failure"' "$(ago '19 hours')"
     check "''${repos[@]}"
     [ "$rc" = 1 ] || fail "failing PR exited $rc"
-    grep -q '.claude: 1 failing PR' <<< "$(summary)" || fail "failing PR not summarised"
+    grep -q 'claude-config: 1 failing PR' <<< "$(summary)" || fail "failing PR not summarised"
     reset
 
     # 5. Scheduled runs on the default branch: only an active workflow whose
@@ -239,20 +289,32 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     reset
 
     # 6. Alerts disabled, as the API says it: a finding, not a tool error.
-    http jonathanmoregard/.claude dependabot_alerts '403 Dependabot alerts are disabled for this repository.'
+    http jonathanmoregard/claude-config dependabot_alerts '403 Dependabot alerts are disabled for this repository.'
     check "''${repos[@]}"
     [ "$rc" = 1 ] || fail "alerts disabled exited $rc"
-    grep -q '.claude: alerts disabled' <<< "$(summary)" || fail "alerts disabled not summarised"
+    grep -q 'claude-config: alerts disabled' <<< "$(summary)" || fail "alerts disabled not summarised"
     reset
 
     # 7. Tool errors fail loudly (3), name the repo, and the other repo still runs.
     http klaffat/klaffat dependabot_alerts '403 Resource not accessible by integration'
-    alerts jonathanmoregard/.claude critical
+    alerts jonathanmoregard/claude-config critical
     check "''${repos[@]}"
     [ "$rc" = 3 ] || fail "403 without 'disabled' exited $rc"
     grep -q 'could not check klaffat: HTTP 403 Resource not accessible by integration' <<< "$(summary)" \
       || fail "403 not named"
-    grep -q '.claude: 1 alert 1 critical' <<< "$(summary)" || fail "other repo's finding hidden by a tool error"
+    grep -q 'claude-config: 1 alert 1 critical' <<< "$(summary)" || fail "other repo's finding hidden by a tool error"
+    reset
+
+    # An installation listing failure names the owner and does not stop the
+    # other owner's repositories from being checked.
+    config "''${repos[@]}"
+    installation_http klaffat 403 'Resource not accessible by integration'
+    rerun
+    [ "$rc" = 3 ] || fail "installation listing 403 exited $rc"
+    grep -q 'could not check klaffat: HTTP 403 Resource not accessible by integration' <<< "$(summary)" \
+      || fail "installation listing 403 not named"
+    grep -q '^jonathanmoregard/claude-config$' "$run/report.txt" || fail "other owner was not checked"
+    grep -q '^klaffat/klaffat$' "$run/report.txt" && fail "repo from failed listing was checked"
     reset
 
     # A wrong installation id for one owner: that owner fails, the other runs.
@@ -261,15 +323,16 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     rerun
     [ "$rc" = 3 ] || fail "wrong installation exited $rc"
     grep -q 'could not check klaffat: HTTP 401 Bad credentials' <<< "$(summary)" || fail "401 not named"
-    grep -q 'could not check .claude' <<< "$(summary)" && fail "a bad klaffat installation broke .claude"
-    jq 'del(.installations.klaffat)' config.json > c.tmp && mv c.tmp config.json
+    grep -q 'could not check claude-config' <<< "$(summary)" && fail "a bad klaffat installation broke claude-config"
+    jq '.installations.klaffat = null' config.json > c.tmp && mv c.tmp config.json
     rerun
     [ "$rc" = 3 ] || fail "owner without installation exited $rc"
     grep -q 'could not check klaffat: no App installation for klaffat' <<< "$(summary)" || fail "missing installation not named"
     echo not-the-key > creds/github-app-key
     check "''${repos[@]}"
     [ "$rc" = 3 ] || fail "rejected key exited $rc"
-    grep -q 'could not check klaffat: App token for klaffat failed' <<< "$(summary)" || fail "token failure not named"
+    grep -q 'could not check jonathanmoregard: App token for jonathanmoregard failed' <<< "$(summary)" \
+      || fail "token failure not named"
     rm creds/github-app-key
     check "''${repos[@]}"
     [ "$rc" = 3 ] || fail "missing key exited $rc"
@@ -284,7 +347,8 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     touch fake/offline
     check "''${repos[@]}"
     [ "$rc" = 3 ] || fail "network failure exited $rc"
-    grep -q 'could not check klaffat: .*error connecting' <<< "$(summary)" || fail "network failure not named"
+    grep -q 'could not check jonathanmoregard: .*error connecting' <<< "$(summary)" \
+      || fail "network failure not named"
     reset
 
     mkdir -p fake/klaffat/klaffat; echo '<html>rate limited</html>' > fake/klaffat/klaffat/pulls.raw

@@ -1,10 +1,12 @@
 # shellcheck shell=bash
-# security-batch runner: nightly dependency health of the watched repos
+# security-batch runner: nightly dependency health of every active repo in
+# the configured GitHub App installations
 # (runs under modules/nixos/security-batch.nix; contract in that file's
 # header). Argument: a JSON config written by dependency-health.nix,
-#   {"repos": ["owner/name", ...], "app_id": N, "installations": {"owner": N}}
+#   {"app_id": N, "installations": {"owner": N}}
 #
-# Per repo, read-only REST through `gh api`:
+# Each installation is listed first; archived and disabled repos are skipped.
+# Per remaining repo, read-only REST through `gh api`:
 #   1. open Dependabot alerts, counted by severity. A 403/404 whose message
 #      says alerts are disabled is the finding "alerts disabled"; any other
 #      error is a tool error (an under-scoped token must not look clean);
@@ -27,19 +29,22 @@
 # expires within the hour.
 #
 # Output: summary.txt, one line in the framework's character set (repos by
-# name, counts only); report.txt, per repo: IDs, packages, severities, URLs.
+# name, owner/name only on collisions, counts only); report.txt, per repo:
+# IDs, packages, severities, URLs.
 # No GitHub free text (titles, advisory summaries) in either.
 #
-# Exit: 0 clean, 1 findings, 3 a repo could not be fully checked (every repo
-# and step still runs).
+# Exit: 0 clean, 1 findings, 3 an owner or repo could not be fully checked
+# (every other owner, repo and step still runs).
 set -euo pipefail
 
 run=${RUN_DIR:?}
 config=${1:?usage: dependency-health.sh <config.json>}
 key="${CREDENTIALS_DIRECTORY:-/nonexistent}/github-app-key"
-mapfile -t repos < <(jq -r '.repos[]' "$config")
+mapfile -t owners < <(jq -r '.installations | keys[]' "$config")
+repos=()
 app_id=$(jq -r '.app_id // empty' "$config")
 declare -A tokens=()
+declare -A repo_name_counts=()
 export GH_TOKEN=""
 stale_days=7
 failed='["failure", "timed_out", "startup_failure"]'
@@ -93,7 +98,7 @@ use_token() {
 }
 
 check_repo() {
-  local repo=$1 name=${1##*/} d branch parts=() bad=()
+  local repo=$1 name=$2 d branch parts=() bad=()
   d="$run/repos/${repo//\//_}"
   mkdir -p "$d"
   echo "$repo" >> "$report"
@@ -190,12 +195,39 @@ check_repo() {
 missing=()
 [ -n "$app_id" ] || missing+=("no app id")
 [ -s "$key" ] || missing+=("no key")
-if [ "${#repos[@]}" -eq 0 ]; then
-  errors+=("could not check: no repos configured")
-elif [ "${#missing[@]}" -gt 0 ]; then
+if [ "${#missing[@]}" -gt 0 ]; then
   errors+=("could not check any repo: GitHub App not provisioned, $(IFS=,; echo "${missing[*]}"), see dependency-health.nix")
 else
-  for repo in "${repos[@]}"; do check_repo "$repo"; done
+  for owner in "${owners[@]}"; do
+    if ! use_token "$owner"; then
+      errors+=("could not check $owner: $reason")
+      continue
+    fi
+    listing="$run/repositories-$owner.json"
+    if api "$listing" "installation/repositories?per_page=100" --paginate --jq '.repositories' \
+       && jq -e 'type == "array" and all(type == "object" and (.full_name | type == "string"))' \
+            "$listing" > /dev/null; then
+      while IFS= read -r repo; do repos+=("$repo"); done < <(
+        jq -r '.[] | select(.archived != true and .disabled != true) | .full_name' "$listing"
+      )
+    else
+      errors+=("could not check $owner: ${reason:-malformed repository listing}")
+    fi
+  done
+
+  if [ "${#repos[@]}" -eq 0 ]; then
+    errors+=("could not check: no repos")
+  else
+    for repo in "${repos[@]}"; do
+      name=${repo##*/}
+      repo_name_counts[$name]=$(( ${repo_name_counts[$name]:-0} + 1 ))
+    done
+    for repo in "${repos[@]}"; do
+      name=${repo##*/}
+      [ "${repo_name_counts[$name]}" -eq 1 ] || name=$repo
+      check_repo "$repo" "$name"
+    done
+  fi
 fi
 
 # ── verdict ──
