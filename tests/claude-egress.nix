@@ -17,6 +17,11 @@
 #   3. Slice absent         — table loads, networking survives, bind exits 0
 #   4. Rebind               — a recreated cgroup is re-bound, not silently dead
 #   5. Launcher resolution  — the zsh function beats a planted ~/.local/bin
+#  5b. GUI spawn path       — claude-egress-launch, called the way the
+#                             VSCodium extension calls it (by name, no
+#                             shell function in sight), still lands in the
+#                             slice, degrades loudly without a user bus,
+#                             and exits 127 when no CLI exists
 #   6. Firewall untouched   — iptables backend still owns the firewall
 #
 # 2 is deliberately ordered AFTER 1 and written as a count DELTA: as a
@@ -404,6 +409,63 @@ in
     )
     assert "claude-egress.slice" in log, (
         f"claudee did not place the binary in the slice:\n{log}"
+    )
+
+    # ── 5b. The GUI spawn path ────────────────────────────────────────
+    # home/vscodium.nix points the Claude Code extension's
+    # claudeCode.claudeProcessWrapper at claude-egress-launch — the same
+    # store path the zsh function above calls. The extension spawns a
+    # process, so it never sees a shell function: before that wrapper,
+    # every editor-launched session ran outside the slice while looking
+    # identical from the user's side.
+    #
+    # Called by NAME here, deliberately: that resolves the package on
+    # PATH rather than the `claude()` function, which is exactly what the
+    # editor does. VSCodium itself is not built into this VM — the
+    # wrapper is the whole contract between them.
+    wrapper = zsh("command -v claude-egress-launch").strip().splitlines()[-1]
+    print("[5b] wrapper: " + wrapper)
+
+    clear_fake_log()
+    zsh(f"{wrapper} --from-gui")
+    log = fake_log()
+    print("[5b] gui spawn:\n" + log)
+    assert "claude-egress.slice" in log, (
+        "an editor-spawned session did not land in claude-egress.slice — "
+        f"the nftables rule bound to that cgroup would never see it:\n{log}"
+    )
+    assert "exe: /home/jonathan/.local/bin/claude" in log, (
+        "the GUI path did not resolve the self-updating native installer "
+        f"from PATH:\n{log}"
+    )
+    assert "argv: --from-gui" in log and "--continue" not in log, (
+        "the wrapper must forward the editor's argv verbatim and inject "
+        f"nothing:\n{log}"
+    )
+
+    # Degrade, don't block: no user bus is the case a desktop-spawned
+    # process really hits, and it must still start Claude Code while
+    # saying on stderr that the session is unobserved.
+    clear_fake_log()
+    nobus = zsh(f"XDG_RUNTIME_DIR=/run/nonexistent {wrapper} --nobus", runtime=False)
+    log = fake_log()
+    print("[5b] no bus:\n" + nobus + "\n" + log)
+    assert "UNOBSERVED" in nobus, (
+        f"a session outside the slice did not announce itself:\n{nobus}"
+    )
+    assert "argv: --nobus" in log, (
+        f"the degrade path failed to start Claude Code at all:\n{log}"
+    )
+
+    # No claude anywhere on PATH is a hard 127, never a silent success:
+    # `env -i` empties PATH, and the wrapper's own runtimeInputs still
+    # supply the coreutils it needs to say so.
+    missing = workstation.fail(
+        f"timeout 300 su - jonathan -c \"env -i PATH=/var/empty {wrapper} --gone\" 2>&1"
+    )
+    print("[5b] no claude:\n" + missing)
+    assert "no 'claude' binary on PATH" in missing, (
+        f"a missing CLI did not produce the documented error:\n{missing}"
     )
 
     # ── --continue must not override an explicit session selection ────

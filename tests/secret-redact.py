@@ -96,6 +96,30 @@ def find(texts) -> dict[str, str]:
                                                   deadline=time.monotonic() + 120) for t, r in per_text.items()}
 
 
+def generic_key(attempts: int = 10) -> str:
+    """A random value that gitleaks' generic-api-key rule actually flags.
+
+    Not every draw is. Measured on the pinned gitleaks, a few draws in a
+    hundred are read straight through even inside `api_key = "..."`, so an
+    assertion that draws once and assumes detection fails at that rate — it
+    cost a green PR run on 2026-10-27, with "batching never changes a text's
+    result" named as the failure while batching was working correctly.
+
+    A fixed literal would be the obvious alternative, but a real-looking
+    32-char secret committed here is precisely what the scanners in CI exist
+    to reject. So draw, verify against the pinned binary, redraw.
+    """
+    for _ in range(attempts):
+        value = rand(31) + "k"
+        if value not in redacted([f'api_key = "{value}"'])[0]:
+            TOKENS.append(value)
+            return value
+    raise AssertionError(
+        f"none of {attempts} generic-api-key draws was flagged by gitleaks at all. "
+        "That is the rule or its allowlist changing, not a redaction bug: the CLI "
+        "was never given a finding to apply.")
+
+
 def fake_gitleaks(name: str, body: str) -> str:
     path = os.path.join(SCRATCH, f"fake-{name}")
     with open(path, "w", encoding="utf-8") as fh:
@@ -117,8 +141,7 @@ rc, out, err, _ = cli([f"A={t}\nnext line", "nothing here"])
 check("a token becomes [REDACTED:<rule>:<n>chars], counted per text under its rule",
       rc == 0 and out["texts"] == [f"A=[REDACTED:gitlab-pat:{len(t)}chars]\nnext line", "nothing here"]
       and out["counts"] == [{"gitlab-pat": 1}, {}], out)
-key = rand(31) + "k"
-TOKENS.append(key)
+key = generic_key()
 texts = [f'api_key = "{key}"', f"later, bare: {key} ."]
 check("each text is redacted alone: batching never changes a text's result",
       redacted(texts) == [redacted([t])[0] for t in texts] and key not in redacted(texts)[0])
