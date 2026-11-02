@@ -247,6 +247,12 @@ jobs:
       # systemd-analyze. Tiny runCommand — seconds.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.security-batch-research-agent -L
+      # dependency-health runner verdict logic
+      # (tests/security-batch-dependency-health.nix): alerts, stale and
+      # red Dependabot PRs, scheduled-workflow failures, pagination and
+      # malformed responses, against fake gh / gh-token. Seconds.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.security-batch-dependency-health -L
       # GitHub App key broker contracts: the broker's request grammar,
       # owner restriction and MCP flag allowlist against a JWT-verifying
       # fake GitHub (tests/github-app-broker.nix); mint-gh-token's token
