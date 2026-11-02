@@ -298,14 +298,35 @@ let
   # as a command substitution — executing the remedy during activation and
   # writing the empty leftovers into the marker. It reaches the script only as
   # `dcgRemedy`, through lib.escapeShellArg.
+  # ORDER MATTERS, and the seeded copy is MOVED rather than removed.
+  #
+  # The projection is proved to serve a replacement BEFORE the seed is taken
+  # out of the way, because the two failures compound: #394 measured that a
+  # bind mount whose source directory was replaced stays `mountpoint`-green
+  # while serving nothing, and that starting claude-runtime-deploy does NOT
+  # re-bind it — only restarting the mount unit does. An operator who dropped
+  # the seed first on such a host would be left with no user layer at all,
+  # which is a strictly worse state than the one this marker reports.
+  #
+  # And `mv`, not `rm`: the marker's contract says the seeded file is
+  # byte-identical to the fallback, so removing it is defensible in theory,
+  # but a cheap backup costs nothing and the one case where the contract is
+  # wrong is exactly the case where deleting it is unrecoverable.
   remedy =
-    "on a projected host (~/.claude/.projection-enabled exists): "
-    + "if `ls ~/.claude/runtime/dcg.toml` fails, restore runtime/dcg.toml on "
-    + "claude-config master and run `sudo systemctl start claude-runtime-deploy`; "
-    + "then `rm ~/.claude/dcg.toml && sudo systemctl restart claude-runtime-links`. "
-    + "On a flat ~/.claude checkout: `git -C ~/.claude checkout -- dcg.toml`. "
-    + "Then `sudo systemctl restart home-manager-${config.home.username}` "
-    + "to re-check and clear this marker";
+    "on a projected host (~/.claude/.projection-enabled exists): FIRST prove "
+    + "the projection serves the real file — `head -1 ~/.claude/runtime/dcg.toml` "
+    + "must succeed. If it does not, repair it before touching anything: "
+    + "`systemctl status claude-runtime-mounts claude-runtime-deploy`, and "
+    + "`sudo systemctl restart claude-runtime-mounts` if a mount's source is "
+    + "gone (the deploy alone does not re-bind one), or restore runtime/dcg.toml "
+    + "on claude-config master and `sudo systemctl start claude-runtime-deploy` "
+    + "if the tree itself lacks it. Only then move the seeded copy aside — "
+    + "`mv ~/.claude/dcg.toml ~/dcg.toml.seed-backup && sudo systemctl restart "
+    + "claude-runtime-links`. On a flat ~/.claude checkout: "
+    + "`git -C ~/.claude checkout -- dcg.toml`. Then `sudo systemctl restart "
+    + "home-manager-${config.home.username}` to re-check and clear this marker, "
+    + "and confirm with `dcg config --format json` that the user layer reads "
+    + "`loaded`";
 
   # A dry run creates no files, so seeding would be a lie and validating
   # afterwards would report a state this run deliberately did not make.
