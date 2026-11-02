@@ -334,6 +334,13 @@
     mode = "0400";
   };
 
+  age.secrets.github-dependency-health-app-key = {
+    rekeyFile = ../../secrets/github-dependency-health-app-key.age;
+    owner = "root";
+    group = "root";
+    mode = "0400";
+  };
+
   # add-secret:insert-here
 
   # ---------------------------------------------------------------------
