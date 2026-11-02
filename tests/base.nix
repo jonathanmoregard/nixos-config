@@ -1541,6 +1541,39 @@ in
 
     # Interactive login warning follows machine-readable finding count, not
     # report existence: every successful analyzer run publishes latest.md.
+    #
+    # Stop the analyzer's own timer first, because this is the one block that
+    # fixtures the REAL state path rather than a fixture root, and a live run
+    # owns that path too.
+    #
+    # MEASURED in the VM: forcing the run the timer would fire returns rc=0 —
+    # the analyzer succeeds here — and rewrites last-success as
+    # 'timestamp=...\nfindings=2\n', after which the clean login below warns.
+    # So a live run clobbering this fixture is a real, reachable failure, and
+    # it was observed once as the clean arm warning and passing on re-run.
+    # The block immediately above has just unset NIXOS_DRIFT_NIX_ENV_BIN, so
+    # a run landing here succeeds rather than failing harmlessly.
+    #
+    # The trigger is the HOURLY BOUNDARY, not a boot catch-up. `systemctl
+    # --user list-timers` in the VM reports LAST='-' with NEXT at the top of
+    # the hour, so Persistent=true does NOT fire a catch-up at startup as one
+    # might expect; the unit is simply scheduled for the next OnCalendar=hourly
+    # elapse (home/drift-analyzer.nix), plus up to RandomizedDelaySec=5min. A
+    # test run that straddles the hour therefore races, and a re-run after the
+    # boundary passes — which is exactly the intermittency seen. That timing
+    # is inferred from list-timers rather than reproduced; the clobber itself
+    # is reproduced, and the stop below closes the window whichever trigger
+    # fires, so the fix does not depend on the inference being right.
+    #
+    # Stopping the timer removes future triggers; stopping the service blocks
+    # until an in-flight oneshot exits, so the fixture write below cannot be
+    # overwritten afterwards. The service is deliberately NOT masked: the
+    # preceding block starts it on purpose to prove the OnFailure edge fires.
+    workstation.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user stop nixos-drift-analyzer.timer "
+        "nixos-drift-analyzer.service'"
+    )
     workstation.succeed(
         "install -d -o jonathan -g users "
         "/home/jonathan/.local/share/nixos-drift-analyzer "
@@ -1553,7 +1586,20 @@ in
         "/home/jonathan/.local/state/nixos-drift-analyzer"
     )
     clean_login = workstation.succeed("su - jonathan -c 'zsh -lic true'")
-    assert "Drift report available" not in clean_login, clean_login
+    # Read the state file back INTO the failure message. Without it, a
+    # clobbered fixture and a genuinely broken login hook produce the same
+    # output, which is what made the original flake expensive to diagnose.
+    clean_state = workstation.succeed(
+        "cat /home/jonathan/.local/state/nixos-drift-analyzer/last-success"
+    )
+    assert "Drift report available" not in clean_login, (
+        "login warned about drift while the state file should have said "
+        f"findings=0.\nstate file after the login: {clean_state!r}\n"
+        f"login output: {clean_login!r}\n"
+        "findings=0 there means the login hook misreads a clean count; "
+        "anything else means a live analyzer run replaced the fixture and "
+        "the timer stop above did not hold"
+    )
     workstation.succeed(
         "printf 'timestamp=smoke\\nfindings=2\\n' "
         "> /home/jonathan/.local/state/nixos-drift-analyzer/last-success && "
@@ -1561,7 +1607,14 @@ in
         "/home/jonathan/.local/state/nixos-drift-analyzer/last-success"
     )
     finding_login = workstation.succeed("su - jonathan -c 'zsh -lic true'")
-    assert "Drift report available" in finding_login, finding_login
+    finding_state = workstation.succeed(
+        "cat /home/jonathan/.local/state/nixos-drift-analyzer/last-success"
+    )
+    assert "Drift report available" in finding_login, (
+        "login did not warn about drift while the state file should have said "
+        f"findings=2.\nstate file after the login: {finding_state!r}\n"
+        f"login output: {finding_login!r}"
+    )
 
     # RSI daily-reviewer cron. The plugin's install.sh keys idempotency on
     # the tag comment, so the declarative line must keep it or a reinstall
