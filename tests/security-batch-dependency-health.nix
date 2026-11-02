@@ -273,6 +273,19 @@ pkgs.runCommand "security-batch-dependency-health-harness"
     grep -qi 'ignore previous' "$run/summary.txt" && fail "PR title reached summary.txt"
     reset
 
+    # 3b. 179 hours is past 7 days even though it truncates to 7 whole days.
+    pr klaffat/klaffat 10 "$(ago '179 hours')" 'dependabot[bot]' sha10
+    check "''${repos[@]}"
+    [ "$rc" = 1 ] || fail "179-hour PR exited $rc"
+    grep -q 'klaffat: 1 stale PR' <<< "$(summary)" || fail "179-hour PR not stale"
+    reset
+
+    # 3c. 167 hours is still fresh.
+    pr klaffat/klaffat 11 "$(ago '167 hours')" 'dependabot[bot]' sha11
+    check "''${repos[@]}"
+    [ "$rc" = 0 ] || fail "167-hour PR exited $rc"
+    reset
+
     # 4. A young Dependabot PR whose latest run of a workflow failed.
     pr jonathanmoregard/claude-config 3 "$(ago '1 day')" 'dependabot[bot]' sha3
     runs jonathanmoregard/claude-config 5 pull_request dependabot/x sha3 '"success"' "$(ago '20 hours')"

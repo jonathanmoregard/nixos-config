@@ -143,12 +143,15 @@ check_repo() {
        and (.number | type == "number") and (.created_at | type == "string")
        and (.user.login | type == "string") and (.head.sha | type == "string")
        and (.html_url | type == "string"))' "$d/pulls.json" > /dev/null; then
-    local stale=0 failing=0 number created sha url age
+    local stale=0 failing=0 number created sha url age age_s
     if jq -r '.[] | select(.user.login == "dependabot[bot]")
          | [(.number | tostring), .created_at, .head.sha, .html_url] | @tsv' \
          "$d/pulls.json" > "$d/dependabot-pulls.tsv"; then
       while IFS=$'\t' read -r number created sha url; do
-        age=$(( ($(date -u +%s) - $(date -u -d "$created" +%s)) / 86400 ))
+        # Compare elapsed seconds; whole days are for display only, or a
+        # 7-day-23-hour PR would truncate to 7 and pass as fresh.
+        age_s=$(( $(date -u +%s) - $(date -u -d "$created" +%s) ))
+        age=$(( age_s / 86400 ))
         if api "$d/runs-$number.json" "repos/$repo/actions/runs?head_sha=$sha&per_page=100" \
              --paginate --jq '.workflow_runs' \
            && jq -e 'type == "array" and all(type == "object"
@@ -162,7 +165,7 @@ check_repo() {
             | map(select(.conclusion as $c | $f | index($c))) | map(.path // .name // "?") | join(",")' "$d/runs-$number.json")
           if [ -n "$red" ]; then
             failing=$((failing + 1)); echo "  pr #$number failing: $red ${age}d $url" >> "$report"
-          elif [ "$age" -gt "$stale_days" ]; then
+          elif [ "$age_s" -gt $(( stale_days * 86400 )) ]; then
             stale=$((stale + 1)); echo "  pr #$number stale: ${age}d $url" >> "$report"
           fi
         else
