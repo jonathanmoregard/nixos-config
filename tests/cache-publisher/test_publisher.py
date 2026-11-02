@@ -26,6 +26,9 @@ DEP = "/nix/store/0000000000000000000000000000000b-libfoo-2.0"
 GLIBC = "/nix/store/0000000000000000000000000000000c-glibc-2.40"
 SRCP = "/nix/store/0000000000000000000000000000000d-source"
 FODP = "/nix/store/0000000000000000000000000000000e-vendored.tar.gz"
+# A locally built path the publisher must never upload: stands in for a
+# private repo's output that a public flake names but did not produce.
+PRIV = "/nix/store/0000000000000000000000000000000f-klaffat-secret-1.0"
 MiB = 1024 * 1024
 
 
@@ -50,6 +53,12 @@ class World:
         self.meta = {"revision": SHA, "locks": lock(nixpkgs=NIXPKGS)}
         self.no_flake = False
         self.packages = {"default": [OUT]}
+        # What the anonymous store's own copy of `<attr>.drv` declares as its
+        # output paths, per attr. Defaults to the evaluated ones (an honest
+        # flake); set an entry to make the derivation disagree with what the
+        # flake's attrset claimed, or to [] for a drvPath that was never
+        # instantiated there (a literal string in the flake).
+        self.drv_outs = {}
         self.local = {OUT: {"ultimate": True, "ca": None, "narSize": 5 * MiB, "deriver": OUT + ".drv"}}
         self.closure = {OUT: {"narSize": 5 * MiB}, DEP: {"narSize": 3 * MiB}, GLIBC: {"narSize": 30 * MiB}}
         # build graph of the candidate, as `nix derivation show -r` in the eval store
@@ -120,7 +129,20 @@ class World:
             return json.dumps({a: {"drv": f"/nix/store/{a}.drv", "outs": o} for a, o in self.packages.items()})
         if args[0] == "derivation":
             assert args[2:4] == ["--store", "/eval"], args
-            return json.dumps({"derivations": self.graph, "version": 4})
+            # The real `derivation show` keys the graph by store path and
+            # includes the derivation asked about, so the candidate's own drv
+            # is present with the outputs IT declares — which is what binds a
+            # pushed path to the audited recipe.
+            g = dict(self.graph)
+            for a, evaluated in self.packages.items():
+                real = self.drv_outs.get(a, evaluated)
+                if real == [] and a in self.drv_outs:
+                    continue  # never instantiated in the eval store
+                g[f"/nix/store/{a}.drv"] = {
+                    "env": {},
+                    "outputs": {f"out{i}" if i else "out": {"path": p} for i, p in enumerate(real)},
+                }
+            return json.dumps({"derivations": g, "version": 4})
         if args[0] == "path-info":
             rest = args[4:]
             assert rest[0] == "--store", args
@@ -360,6 +382,91 @@ class Case(unittest.TestCase):
         self.run_once()
         self.assertEqual(self.w.pushed, [])
 
+    # ── output paths are bound to the audited derivation ────────────────────
+    # `candidates` reads drvPath and outPath out of the flake, and a flake can
+    # state them independently: a hand-written attrset may pair a harmless
+    # derivation's drvPath with any string as its outPath, which pure
+    # evaluation accepts (a literal instantiates nothing). Auditing the
+    # harmless graph then says nothing about the path being uploaded, so the
+    # paths that decide the upload come from the derivation itself.
+    def test_output_path_not_declared_by_candidate_drv_never_pushes(self):
+        self.w.drv_outs["default"] = [OUT]          # what the recipe builds
+        self.w.packages = {"default": [PRIV]}       # what the flake claims
+        self.w.local[PRIV] = {"ultimate": True, "ca": None, "narSize": 5 * MiB,
+                              "deriver": PRIV + ".drv"}
+        self.w.closure[PRIV] = {"narSize": 5 * MiB}
+        self.run_once()
+        self.assertEqual(self.w.pushed, [])
+        self.assertNotIn(PRIV, str(self.w.pushed))
+        self.assertIn("does not declare", self.log())
+
+    def test_candidate_drv_absent_from_eval_store_never_pushes(self):
+        # drvPath was a literal string, so the anonymous evaluation never
+        # instantiated a derivation for it.
+        self.w.drv_outs["default"] = []
+        self.run_once()
+        self.assertEqual(self.w.pushed, [])
+        self.assertIn("not in the anonymous store", self.log())
+
+    def test_honest_multi_output_package_still_pushes(self):
+        self.w.packages = {"default": [OUT, DEP]}
+        self.w.local[DEP] = {"ultimate": True, "ca": None, "narSize": 3 * MiB,
+                             "deriver": OUT + ".drv"}
+        self.run_once()
+        self.assertEqual(self.w.pushed, [[OUT, DEP]])
+
+    # ── local availability is not a verdict ─────────────────────────────────
+    # Nothing built locally yet is a "not yet", not a "no": the hook enqueues
+    # on push, which routinely happens before the build finishes. Retiring the
+    # commit there would discard every later entry for that sha (`done` is
+    # checked before the spool entry becomes pending), suppressing the upload
+    # permanently.
+    def test_unbuilt_commit_is_not_retired(self):
+        self.w.local = {}
+        self.run_once()
+        self.assertEqual(self.w.pushed, [])
+        self.assertEqual(len(self.pending()), 1)
+        self.assertEqual(self.done(), [])
+
+    def test_unbuilt_commit_publishes_once_built(self):
+        built = dict(self.w.local)
+        self.w.local = {}
+        self.run_once()
+        self.w.local = built
+        self.w.t += 4000
+        self.run_once(None)
+        self.assertEqual(self.w.pushed, [[OUT]])
+
+    def test_unbuilt_commit_reenqueued_after_build_publishes(self):
+        # The reviewer's reproduction: process unbuilt, build it, enqueue the
+        # same sha again (hook push or hourly scan).
+        built = dict(self.w.local)
+        self.w.local = {}
+        self.run_once()
+        self.w.local = built
+        self.w.t += 4000
+        self.run_once()
+        self.assertEqual(self.w.pushed, [[OUT]])
+
+    def test_unbuilt_commit_eventually_expires(self):
+        # Bounded: an entry that never gets built must not be retried forever.
+        self.w.local = {}
+        self.run_once()
+        self.w.t += 49 * 3600
+        self.run_once(None)
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(len(self.done()), 1)
+        self.assertEqual(self.w.pushed, [])
+
+    def test_built_but_nothing_worth_pushing_is_retired(self):
+        # Built locally and simply too small: a conclusive answer. It must be
+        # retired, not left re-evaluating every hour for 48 h.
+        self.w.closure = {OUT: {"narSize": 4096}, GLIBC: {"narSize": 30 * MiB}}
+        self.run_once()
+        self.assertEqual(self.w.pushed, [])
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(len(self.done()), 1)
+
     def add_fod(self, name="vendored.drv", url="https://registry.npmjs.org/x.tgz", structured=False):
         d = {"env": {"out": "x"}, "outputs": {"out": {"hash": "sha256-x", "method": "nar"}}}
         if structured:
@@ -499,6 +606,30 @@ class RealNixEval(unittest.TestCase):
         p = self.probe(cp.NIX_CONFIG_FRESH)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("access to URI", p.stderr)
+
+    def test_candidates_expression_accepts_unrelated_drv_and_out(self):
+        """Why Publisher.drv_outputs exists. Under the publisher's own
+        fresh-store config, a derivation-shaped attrset can pair one
+        derivation's drvPath with any string as its outPath: the expression
+        reads two independent attributes, and a literal instantiates nothing.
+        So `outs` carries no provenance and must never decide an upload.
+
+        If this starts failing, Nix began enforcing the binding itself and the
+        guard can be revisited — it is not a regression in the publisher."""
+        attrs = ('{ evil = { type = "derivation"; '
+                 'drvPath = "/nix/store/00000000000000000000000000000001-harmless.drv"; '
+                 'outputs = [ "out" ]; '
+                 'out.outPath = "/nix/store/00000000000000000000000000000002-private"; }; }')
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, NIX_CONFIG=cp.NIX_CONFIG_FRESH, HOME=d)
+            p = subprocess.run(["nix", "--extra-experimental-features", "nix-command flakes",
+                                "eval", "--json", "--store", os.path.join(d, "s"),
+                                "--expr", f"({cp.CANDIDATES_APPLY}) {attrs}"],
+                               capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        got = json.loads(p.stdout)["evil"]
+        self.assertEqual(got["drv"], "/nix/store/00000000000000000000000000000001-harmless.drv")
+        self.assertEqual(got["outs"], ["/nix/store/00000000000000000000000000000002-private"])
 
 
 if __name__ == "__main__":

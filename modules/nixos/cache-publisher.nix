@@ -28,12 +28,21 @@
 #          git+ssh, git+file, indirect and unlocked inputs reject. No
 #          flake.nix → nothing to publish (also how plain JS/text repos drop
 #          out).
-#       d. packages.<system>.* output paths from that anonymous evaluation
-#          that are valid locally, built here, not fixed-output, not on
-#          cache.nixos.org, with > 1 MiB of closure cache.nixos.org lacks
-#          (the "compiled code" heuristic). Input-addressed paths hash the
-#          whole recipe, so a local path equal to the anonymous one was built
-#          from exactly that public recipe.
+#       d. output paths read from each candidate DERIVATION in the anonymous
+#          store — never the outPath the flake's attrset stated. The two are
+#          independent: a derivation-shaped attrset may pair a harmless
+#          drvPath with any string as its outPath, and pure evaluation accepts
+#          it (a literal instantiates nothing), which would leave gate (e)
+#          auditing one recipe while a different path was uploaded. Of the
+#          derivation's own outputs, those valid locally, built here, not
+#          fixed-output, not on cache.nixos.org, with > 1 MiB of closure
+#          cache.nixos.org lacks (the "compiled code" heuristic).
+#          Input-addressed paths hash the whole recipe, so a local path equal
+#          to one the anonymous derivation declares was built from exactly
+#          that public recipe.
+#          Nothing built locally yet is a "not yet", not a "no": the commit
+#          stays queued for retry rather than being retired, because the
+#          pre-push hook enqueues on push, which routinely beats the build.
 #       e. build-graph audit in the anonymous store: every fixed-output
 #          derivation is either served by cache.nixos.org or downloaded right
 #          now, anonymously, into that store (Nix checks the hash). A URL is

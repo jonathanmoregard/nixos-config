@@ -66,6 +66,12 @@ NIX_CONFIG_FRESH = NIX_CONFIG + (
     "allowed-uris = github: https://github.com/ https://api.github.com/ "
     "https://codeload.github.com/ https://channels.nixos.org/ https://releases.nixos.org/\n")
 
+# Reads each `packages.<system>.<attr>` as a derivation-shaped attrset. Both
+# fields are whatever the flake says they are — `drv` is not proof of `outs`
+# (see Publisher.drv_outputs), so nothing is pushed on the strength of `outs`.
+CANDIDATES_APPLY = ('ps: builtins.mapAttrs (n: p: { drv = p.drvPath; '
+                    'outs = map (o: (builtins.getAttr o p).outPath) (p.outputs or ["out"]); }) ps')
+
 TRANSIENT = ("unable to download", "http error 404", "could not resolve host", "couldn't resolve host",
              "timeout", "timed out", "connection refused", "network is unreachable",
              "http error 5", "http error 429", "temporary failure")
@@ -333,26 +339,58 @@ class Publisher:
         return ["--store", self.cfg["eval_store"]]
 
     def candidates(self, ref):
-        expr = ('ps: builtins.mapAttrs (n: p: { drv = p.drvPath; '
-                'outs = map (o: (builtins.getAttr o p).outPath) (p.outputs or ["out"]); }) ps')
-        out = self.w.nix(["eval", *self.fresh(), "--json", f"{ref}#packages.{self.cfg['system']}", "--apply", expr])
+        out = self.w.nix(["eval", *self.fresh(), "--json", f"{ref}#packages.{self.cfg['system']}",
+                          "--apply", CANDIDATES_APPLY])
         attrs = json.loads(out)
         return {a: v for a, v in attrs.items()
                 if isinstance(v, dict) and isinstance(v.get("outs"), list) and v.get("drv")}
+
+    def drv_outputs(self, drv):
+        """The output paths `drv` itself declares, read from the anonymous
+        store the evaluation instantiated it into.
+
+        `candidates` takes drvPath and outPath from the flake, and a flake
+        states them independently: a hand-written attrset can pair a harmless
+        derivation's drvPath with any string as its outPath, and pure
+        evaluation does not object — a literal instantiates nothing, so there
+        is no derivation tying the two together. Auditing that harmless graph
+        would then say nothing about the path being uploaded. Taking the paths
+        from the derivation is what binds the upload to the recipe the audit
+        cleared."""
+        d = json.loads(self.w.nix(["derivation", "show", *self.fresh(), drv]))
+        d = d.get("derivations", d)
+        e = d.get(drv)
+        if not isinstance(e, dict):
+            raise Skip(f"{drv} is not in the anonymous store: no derivation was "
+                       f"instantiated for the drvPath the flake stated")
+        outs = [o.get("path") for o in (e.get("outputs") or {}).values() if isinstance(o, dict)]
+        outs = [p for p in outs if p]
+        if not outs:
+            raise Skip(f"{drv} declares no output paths")
+        return outs
 
     def select(self, outs):
         """Outputs worth pushing: valid locally, built here, not FOD, not
         upstream, and with more than min_nar bytes of closure that
         cache.nixos.org does not already serve (the "compiled code" test:
         a text-only repo's outputs are tiny, a wrapper around locally built
-        libraries is not)."""
+        libraries is not).
+
+        Returns (keep, incomplete). `incomplete` marks an empty result that
+        local state can still change: an output not built yet, or a closure
+        only partly present. The caller must not retire the commit on one of
+        those — the pre-push hook enqueues on push, which routinely beats the
+        build, and `done` is consulted before a spool entry becomes pending,
+        so retiring early discards every later entry for that sha."""
         info = self.path_info(outs)
         upstream = self.upstream_set([p for p in outs if info.get(p)])
         keep = []
+        unbuilt = False
         for p in outs:
             v = info.get(p)
             if not v:
-                continue  # not built locally: nothing to push, nothing to build
+                unbuilt = True  # not built locally YET: a build may follow
+                continue
             if not v.get("ultimate"):
                 continue
             if (v.get("ca") or "").startswith("fixed:"):
@@ -361,14 +399,16 @@ class Publisher:
                 continue
             keep.append(p)
         if not keep:
-            return []
+            return [], unbuilt
         closure = json.loads(self.w.nix(["path-info", "--json", "--json-format", "1", *self.local(),
                                          "--recursive", *keep]))
         if any(v is None for v in closure.values()):
-            return []  # incomplete locally: cachix could not push it anyway
+            return [], True  # incomplete locally: cachix could not push it anyway
         up = self.upstream_set(closure)
         size = sum(v.get("narSize", 0) for p, v in closure.items() if p not in up)
-        return keep if size >= self.cfg["min_nar"] else []
+        if size < self.cfg["min_nar"]:
+            return [], False  # built, and simply not worth pushing: conclusive
+        return keep, False
 
     def audit_build_graph(self, drv):
         """Prove every byte the build consumed is public.
@@ -418,11 +458,27 @@ class Publisher:
         ref = f"github:{owner}/{repo}/{sha}"
         inputs = self.audit_lock(ref)  # also the "no flake.nix" skip: nothing to publish
         pushed = []
+        incomplete = False
         for attr, c in sorted(self.candidates(ref).items()):
-            # Output paths come from the anonymous evaluation, so a local
-            # path with the same name was built from exactly that public
-            # recipe (input-addressed paths hash the whole build graph).
-            keep = self.select(c["outs"])
+            # The paths that decide the upload come from the derivation in the
+            # anonymous store, never from what the flake's attrset claimed:
+            # the two are independent (see drv_outputs), and only the
+            # derivation's own outputs are covered by audit_build_graph below.
+            # Input-addressed paths hash the whole build graph, so a local path
+            # equal to one of those was built from exactly that public recipe.
+            try:
+                outs = self.drv_outputs(c["drv"])
+            except Skip as e:
+                self.log(f"skip {owner}/{repo}#{attr}: {e}")
+                continue
+            claimed = sorted(set(c["outs"]) - set(outs))
+            if claimed:
+                self.log(f"skip {owner}/{repo}#{attr}: {c['drv']} does not declare "
+                         f"{', '.join(claimed)} — the evaluated output paths are not "
+                         f"the derivation's own")
+                continue
+            keep, inc = self.select(outs)
+            incomplete = incomplete or inc
             if not keep:
                 self.log(f"skip {owner}/{repo}#{attr}: nothing built locally above threshold")
                 continue
@@ -433,6 +489,9 @@ class Publisher:
                 continue
             pushed += keep
         if not pushed:
+            if incomplete:
+                # Not a verdict: a build finishing later changes the answer.
+                raise Retry("nothing built locally yet")
             return []
         # The last word belongs to GitHub, right before upload: the repo, the
         # commit and every GitHub lock input, uncached.
