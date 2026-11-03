@@ -266,6 +266,20 @@ jobs:
         run: nix build .#checks.x86_64-linux.github-app-mint -L
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.github-app-mcp -L
+      # cache-publisher gate contracts (tests/cache-publisher/test_publisher.py
+      # via the cache-publisher-unit runCommand): the visibility, lock-audit,
+      # derivation-provenance and queue-transition decisions that keep a
+      # private repo's outputs out of the public cache, five of them driving
+      # real nix. This is a runCommand, so `flake check --no-build` evaluates
+      # it without ever running it — which is exactly how #400 shipped 19
+      # green checks having executed none of this feature's 64 tests, while
+      # five review rounds then found seven defects in it (one a real leak
+      # path, two in tests that passed while asserting nothing). Stubs
+      # GitHub/nix/cachix, boots nothing, runs in seconds; the
+      # vm-cache-publisher lane proves the units and privilege split in a real
+      # machine, this proves the decisions that lane cannot see.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.cache-publisher-unit -L
 
   docs:
     # Validate that every `nix run .#<attr>` reference in this repo's
@@ -450,7 +464,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, security-batch, sandbox-seccomp]
+        lane: [base, desktop, keyring, kitty, claude-pane, autodoro, microvm, listen-tools, camera-relay, auto-deploy, klaffat-infra, security-batch, sandbox-seccomp, cache-publisher]
     steps:
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

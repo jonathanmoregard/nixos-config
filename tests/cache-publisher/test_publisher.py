@@ -380,6 +380,38 @@ class Case(unittest.TestCase):
         self.assertEqual(self.w.pushed, [])
         self.assertEqual(len(self.pending()), 1)
 
+    def test_rate_limited_archive_fetch_retries_not_retires(self):
+        """A 403 from inside nix must not retire the sha permanently.
+
+        Verbatim stderr shape from nix 2.34.9 for a `github:` input (measured:
+        the status arrives inside a "Failed to open archive" wrapper, and the
+        "unable to download" prefix is what classifies it). GitHub answers
+        anonymous rate limiting with 403, not 429, and the hourly scan enqueues
+        hundreds of commits, so this is the path a busy queue actually takes.
+        If it ever classified as Skip, `done` would be written and the repo
+        would never be reconsidered."""
+        self.w.nix_fail = (
+            "error: Failed to open archive (Source threw exception: error: unable to download "
+            "'https://github.com/me/tool/archive/333333333333.tar.gz': HTTP error 403\n\n"
+            "       response body:\n\n       403: rate limit exceeded)")
+        self.run_once()
+        self.assertEqual(self.w.pushed, [])
+        self.assertEqual(len(self.pending()), 1)
+        self.assertEqual(self.done(), [])
+
+    def test_git_repository_fetch_failure_retries_not_retires(self):
+        """A failed git fetch of a lock input must not retire the sha either.
+
+        Measured shape for a `git+https` input: nix reports "Failed to fetch
+        git repository" and the HTTP status never appears, so none of the
+        status-based needles can catch it. Same class as the 404 above — a
+        network-shaped failure is a "not now", not a verdict about the repo."""
+        self.w.nix_fail = "error: Failed to fetch git repository 'https://github.com/me/tool'"
+        self.run_once()
+        self.assertEqual(self.w.pushed, [])
+        self.assertEqual(len(self.pending()), 1)
+        self.assertEqual(self.done(), [])
+
     # ── selection + closure audit ───────────────────────────────────────────
     def test_tiny_closure_not_pushed(self):
         # only upstream bytes beyond a tiny output: nothing worth pushing
