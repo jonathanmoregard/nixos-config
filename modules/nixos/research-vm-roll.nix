@@ -509,8 +509,13 @@ in
     # Read first by the dual-mode MCP server (§12.4): `legacy-ok` admits
     # the legacy protocol, `broker-only` refuses it whatever the broker's
     # state. A deploy-state fact, root-owned, never a liveness probe.
-    environment.etc."research-agent/egress-era".text =
-      if cfg.legacyPaths then "legacy-ok" else "broker-only";
+    # A copied regular file, not the default /etc/static symlink: the
+    # server opens it O_NOFOLLOW, and a symlink reads as `era-unreadable`,
+    # failing every dial closed.
+    environment.etc."research-agent/egress-era" = {
+      text = if cfg.legacyPaths then "legacy-ok" else "broker-only";
+      mode = "0444";
+    };
 
     environment.systemPackages = [ protocheck ];
 

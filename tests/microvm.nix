@@ -947,6 +947,11 @@ pkgs.testers.runNixOSTest {
     assert st == ["jonathan", "jonathan"], f"slot dir chain must stay jonathan's: {st}"
 
     # --- The era file the new MCP reads first (§12.4): transition era.
+    # The MCP server reads the era with O_NOFOLLOW (research-agent
+    # mcp_server/server.py `_read_small`): a symlink reads as
+    # `era-unreadable` and fails EVERY dial closed. `cat` follows links,
+    # so it alone would agree with a /etc/static symlink.
+    workstation.succeed("test -f /etc/research-agent/egress-era && test ! -L /etc/research-agent/egress-era")
     era = workstation.succeed("cat /etc/research-agent/egress-era").strip()
     assert era == "legacy-ok", f"egress-era must be legacy-ok in the expand step, got {era!r}"
 
