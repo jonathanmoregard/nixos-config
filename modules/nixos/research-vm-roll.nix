@@ -202,15 +202,15 @@ let
           verdict=bad
           if h=$(health); then
             verdict=$(jq -r '
-              if (.sessions | type) == "number" and (.pending_artifacts | type) == "number" then
-                (if .sessions == 0 and .pending_artifacts == 0 then "idle" else "busy \(.sessions) \(.pending_artifacts)" end)
-              elif has("sessions") or has("pending_artifacts") then "bad"
+              if (.open_sessions | type) == "number" and (.pending_artifacts | type) == "number" then
+                (if .open_sessions == 0 and .pending_artifacts == 0 then "idle" else "busy \(.open_sessions) \(.pending_artifacts)" end)
+              elif has("open_sessions") or has("pending_artifacts") then "bad"
               else "legacy" end' <<<"$h" 2>/dev/null || echo bad)
           fi
           now=$(date +%s)
           case "$verdict" in
             idle)
-              log "scraper idle: 0 sessions, 0 pending artifacts"
+              log "scraper idle: 0 open sessions, 0 pending artifacts"
               return 0 ;;
             legacy)
               # Today's scraper reports no counters, so its idleness cannot
@@ -485,8 +485,8 @@ in
         default = 300;
         description = ''
           Safety cap, not the criterion: how long the scraper roll holds
-          every slot waiting for /health to report 0 sessions and 0
-          pending artifacts before it gives every slot back and defers
+          every slot waiting for /health to report 0 open_sessions and 0
+          pending_artifacts before it gives every slot back and defers
           (exit 0; research-vm-roll-retry-scraper.timer retries after as
           long again). Must stay well under the MCP's 1800 s slot wait.
           Also how long it holds them before

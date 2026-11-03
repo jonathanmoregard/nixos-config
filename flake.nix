@@ -161,6 +161,20 @@
     # deliberate PR with a re-run vm-microvm lane.
     microvm.url = "github:astro/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
+
+    # research-agent code read by checks ONLY. The hosts run whatever
+    # ~/Repos/research-agent holds (pulled every 30 min); this pin lets a
+    # lane hold its fakes to the real contract. Referencing it from
+    # nixosConfigurations would make the host depend on a test pin. Verify
+    # with: the tuxedo toplevel drvPath is identical with and without
+    # `--override-input research-agent-new`.
+    # new: the egress-broker branch head (research-agent#41); bump to the
+    # merge commit in nixos-B. Revs in the URL, like aggregator-src above:
+    # `nix flake update` on a fully pinned ref changes nothing.
+    research-agent-new = {
+      url = "github:jonathanmoregard/research-agent/43cdf2bd5810a5a7e7489b39a59ff5523431c04d";
+      flake = false;
+    };
   };
 
   outputs = flakeInputs@{ self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
@@ -306,7 +320,7 @@
     # fan-out (.github/workflows/ci.yml) enumerates the lanes.
     checks.${linuxSystem} =
       let
-        mkLane = path: import path {
+        mkLaneWith = extra: path: import path {
           pkgs = pkgsLinux;
           inputs = {
             inherit nixpkgs home-manager agenix agenix-rekey microvm;
@@ -315,8 +329,9 @@
               host = primaryHost;
               modules = workstationModules;
             };
-          };
+          } // extra;
         };
+        mkLane = mkLaneWith { };
       in {
         vm-base = mkLane ./tests/base.nix;
         vm-auto-deploy  = mkLane ./tests/auto-deploy.nix;
@@ -326,7 +341,9 @@
         vm-kitty        = mkLane ./tests/kitty.nix;
         vm-claude-pane  = mkLane ./tests/claude-pane.nix;
         vm-autodoro     = mkLane ./tests/autodoro.nix;
-        vm-microvm      = mkLane ./tests/microvm.nix;
+        # research-agent-new: read at eval time only, to pin the fake
+        # scraper's /health field names to the real scraper's.
+        vm-microvm      = mkLaneWith { researchAgentNew = flakeInputs.research-agent-new; } ./tests/microvm.nix;
         vm-listen-tools = mkLane ./tests/listen-tools.nix;
         vm-android-dev  = mkLane ./tests/android-dev.nix;
         vm-claude-egress = mkLane ./tests/claude-egress.nix;

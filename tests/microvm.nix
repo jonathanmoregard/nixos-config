@@ -32,6 +32,18 @@
 let
   lib = pkgs.lib;
 
+  # The real scraper's /health idle counters (research-agent
+  # scraper/server.py, read from the pinned source at eval time). The fake
+  # scraper below reports exactly these names, so the drained-roll subtests
+  # hold the roll to the real contract. Root cause this pins: the fake once
+  # said `sessions`, agreeing with a roll that read `.sessions` while the
+  # real scraper says `open_sessions` — vm-microvm stayed green while the
+  # real scraper could never be rolled.
+  scraperHealthSrc = builtins.readFile "${inputs.researchAgentNew}/scraper/server.py";
+  openSessionsKey = "open_sessions";
+  pendingArtifactsKey = "pending_artifacts";
+  idleKeysPinned = lib.all (k: lib.hasInfix "\"${k}\": " scraperHealthSrc) [ openSessionsKey pendingArtifactsKey ];
+
   # The fakes' own code digest. Internal to the stand-ins below, the way
   # research-agent's broker/scraper compute theirs: the nixos side never
   # hashes checkout content (it only reloads the broker and reads the
@@ -272,6 +284,8 @@ let
     ExecStopPost=
   '';
 in
+assert lib.assertMsg idleKeysPinned
+  "vm-microvm: research-agent scraper/server.py /health no longer reports ${openSessionsKey} and ${pendingArtifactsKey}; the fake scraper and the roll must follow the real field names";
 pkgs.testers.runNixOSTest {
   name = "vm-microvm";
   skipTypeCheck = true;
@@ -952,7 +966,7 @@ pkgs.testers.runNixOSTest {
     workstation.succeed(
         "mkdir -p /run/fake-scraper /run/fake-vm",
         "chmod 0777 /run/fake-scraper /run/fake-vm",
-        "echo '{\"sessions\": 0, \"pending_artifacts\": 0}' > /run/fake-scraper/counters.json",
+        "echo '{\"${openSessionsKey}\": 0, \"${pendingArtifactsKey}\": 0}' > /run/fake-scraper/counters.json",
         f"install -d -m 0755 -o jonathan -g users {CHECKOUT}/scraper",
         as_jonathan(f"sh -c 'echo v1 > {CHECKOUT}/scraper/server.py'"),
     )
@@ -980,7 +994,7 @@ pkgs.testers.runNixOSTest {
 
     def set_counters(sessions, pending):
         workstation.succeed(
-            f"echo '{{\"sessions\": {sessions}, \"pending_artifacts\": {pending}}}' > /run/fake-scraper/counters.json"
+            f"echo '{{\"${openSessionsKey}\": {sessions}, \"${pendingArtifactsKey}\": {pending}}}' > /run/fake-scraper/counters.json"
         )
 
     def bump_scraper_code(tag):
