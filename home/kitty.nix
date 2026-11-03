@@ -1717,6 +1717,15 @@ let
     Order within a tab is row-major -- left-to-right along a row, then
     down to the next row. Past the last pane, the next tab's first pane
     in the same order; past the last tab, back to the first.
+
+    Usage: kitty-pane-cycle [--reverse] [--plan]
+
+      --reverse  walk the same order backwards
+      --plan     print the decision instead of acting on it
+
+    --reverse is not a second traversal: the order is built once and the
+    flag only flips the sign of the step (see plan()), so forward and
+    backward cannot disagree about what the order is.
     """
     import glob
     import json
@@ -1747,15 +1756,30 @@ let
         grid, which is why it is read off kitty's source rather than
         inferred from a sample.
 
-        Only the ORDER of the derived edges is load-bearing, never their
-        size: `one` is always left of / above `two` whatever the bias, so
-        an inherited bias cannot reorder siblings.
+        Sizes are not load-bearing, only the resulting order -- but a
+        bias CAN tie two siblings, so the third element of each tuple is
+        a tree-order sequence number and the tie breaks on it. `one` is
+        always left of / above `two`, and it is visited first, so a tie
+        resolves to tree order rather than to whatever group id happened
+        to be smaller.
+
+        The tie is real, not theoretical: `set_bias` clamps into
+        [0, 1] (splits.py:532-534) and `layout_action maximize` sets a
+        pair's bias to exactly 1.0 or 0.0 (splits.py:1035). At bias 0.0
+        the cut is zero, so both children share an edge and would
+        otherwise sort by id. Such a bias is also serialized, since
+        kitty omits the field only when it is 0.5, so it does reach this
+        reader. Neither route is bound in this config -- both need
+        `kitty @ action` -- so this is a correctness guard, not a path
+        the keybinding exercises.
         """
         out = []
+        seq = 0
         # (node, top, left, height, width). Explicit stack rather than
         # recursion: a deeply nested split chain is user-reachable (every
         # ctrl+< adds a level) and this cannot be allowed to hit the
-        # recursion limit mid-cycle.
+        # recursion limit mid-cycle. `two` is pushed before `one` so that
+        # `one` pops first and the sequence numbers run in tree order.
         stack = [(pairs, 0.0, 0.0, 1.0, 1.0)]
         while stack:
             node, top, left, height, width = stack.pop()
@@ -1763,18 +1787,19 @@ let
                 continue
             if isinstance(node, int):
                 out.append((round(top, EDGE_PRECISION),
-                            round(left, EDGE_PRECISION), node))
+                            round(left, EDGE_PRECISION), seq, node))
+                seq += 1
                 continue
             bias = node.get("bias", 0.5)
             one, two = node.get("one"), node.get("two")
             if node.get("horizontal", True):
                 cut = width * bias
-                stack.append((one, top, left, height, cut))
                 stack.append((two, top, left + cut, height, width - cut))
+                stack.append((one, top, left, height, cut))
             else:
                 cut = height * bias
-                stack.append((one, top, left, cut, width))
                 stack.append((two, top + cut, left, height - cut, width))
+                stack.append((one, top, left, cut, width))
         return out
 
 
@@ -1810,7 +1835,10 @@ let
 
         allowed = set(real)
         ordered = [
-            gid for _, _, gid in sorted(leaf_rects(pairs))
+            # (top, left, tree-order seq, group id) -- seq only ever
+            # breaks a tie between two siblings a bias collapsed onto the
+            # same edge; see leaf_rects.
+            gid for _, _, _, gid in sorted(leaf_rects(pairs))
             if gid in allowed
         ]
         # A group the tree does not mention cannot be placed, so append it
@@ -1852,6 +1880,19 @@ let
         KITTY_LISTEN_ON may fall through to the glob. Reflow refuses that
         fallback because rearranging the wrong kitty is destructive;
         focusing a pane in it is not.
+
+        On the keybinding path the env branch is in practice inert, and
+        that is fine. `launch --type=background` without
+        --allow-remote-control gives the child kitty's OWN environ
+        (boss.py:3208-3241), which carries no KITTY_LISTEN_ON unless
+        kitty itself was started from inside another kitty -- in which
+        case it names the OUTER kitty. The glob then normally finds the
+        right instance, and picking a wrong one is still safe rather than
+        merely tolerable: plan() requires an OS window with
+        is_focused set, which only the kitty the user is actually looking
+        at reports, so a wrong instance yields "no focused OS window" and
+        a silent rc 0. The cost of that case is a keypress that does
+        nothing, never a pane focused in a window the user cannot see.
         """
         env_sock = os.environ.get("KITTY_LISTEN_ON")
         if env_sock and _answers(env_sock):
@@ -1862,69 +1903,91 @@ let
         return None
 
 
-    def plan(data):
+    def plan(data, step):
         """(window_id_to_focus, description), or (None, why not).
+
+        `step` is +1 to advance and -1 to go back, and that sign is the
+        ONLY difference between the two directions -- which is the point
+        of flattening below.
+
+        The whole OS window becomes one ordered list of panes: the tabs
+        in kitty's tab order, and within each tab its panes in reading
+        order. Every case that would otherwise be a branch then falls out
+        of one modulo:
+
+          * advancing inside a tab, and crossing into the next tab, are
+            the same step;
+          * the ends wrap, in both directions, because Python's % is
+            already non-negative for a negative left operand;
+          * a tab holding nothing but kitty's own chrome contributes no
+            entries, so it is stepped over without being special-cased;
+          * one tab, or one pane, wraps onto itself.
+
+        An earlier version special-cased each of those and needed a
+        bounded search loop to skip chrome-only tabs. The flat sequence
+        is not a tidier spelling of that -- it removes the cases.
 
         Pure given `kitty @ ls` output, so the whole ordering decision is
         testable without a kitty.
         """
-        osw = next(
-            (o for o in data if o.get("is_focused")),
-            None,
-        )
+        osw = next((o for o in data if o.get("is_focused")), None)
         if osw is None:
+            # Only the kitty the user is looking at reports this, which
+            # is what makes a wrong socket harmless rather than merely
+            # tolerable -- see find_socket.
             return None, "no focused OS window"
         tabs = osw.get("tabs") or []
-        tab_idx = next(
-            (i for i, t in enumerate(tabs) if t.get("is_focused")),
-            None,
-        )
-        if tab_idx is None:
-            return None, "no focused tab"
-        tab = tabs[tab_idx]
 
-        focused_wid = next(
-            (w["id"] for w in tab.get("windows") or [] if w.get("is_focused")),
-            None,
-        )
-        groups = pane_groups(tab)
-        if not groups:
+        seq = []  # [(tab, group_id)], the whole OS window in order
+        for t in tabs:
+            for gid in pane_groups(t):
+                seq.append((t, gid))
+        if not seq:
             return None, "no panes"
 
-        # Which pane holds focus. Resolved through the group rather than
-        # the window, so an overlay covering a pane still counts as that
-        # pane.
-        cur = None
-        for g in tab.get("groups") or []:
-            if focused_wid in (g.get("windows") or []):
-                cur = g["id"]
+        # Where focus is now, as an index into that sequence. Resolved
+        # through the GROUP, not the window, so an overlay covering a
+        # pane still counts as being on that pane.
+        pos = None
+        for i, (t, gid) in enumerate(seq):
+            if not t.get("is_focused"):
+                continue
+            focused_wid = next(
+                (w["id"] for w in t.get("windows") or [] if w.get("is_focused")),
+                None,
+            )
+            for g in t.get("groups") or []:
+                if g["id"] == gid and focused_wid in (g.get("windows") or []):
+                    pos = i
+                    break
+            if pos is not None:
                 break
-        try:
-            pos = groups.index(cur)
-        except ValueError:
-            # Focus sits in a group that is not a pane (kitty's own
-            # chrome). Start the cycle at the first real pane.
-            pos = -1
 
-        if pos + 1 < len(groups):
-            wid = group_base_window(tab, groups[pos + 1])
-            return wid, f"pane {pos + 2}/{len(groups)} of this tab"
+        if pos is None:
+            # Focus is nowhere in the sequence: no focused tab, or it
+            # sits in a group that is not a pane (kitty's own chrome).
+            # Enter at the end the direction comes from, so the first
+            # keypress still lands on a real pane.
+            nxt_tab, nxt_gid = seq[0] if step > 0 else seq[-1]
+            where = "first" if step > 0 else "last"
+            return (
+                group_base_window(nxt_tab, nxt_gid),
+                f"{where} pane (focus was not on one)",
+            )
 
-        # Past the last pane: the next tab, at ITS first pane.
-        if len(tabs) < 2:
-            wid = group_base_window(tab, groups[0])
-            return wid, "wrapped to the first pane (only one tab)"
-        nxt = tabs[(tab_idx + 1) % len(tabs)]
-        nxt_groups = pane_groups(nxt)
-        if not nxt_groups:
-            return None, "next tab has no panes"
-        wid = group_base_window(nxt, nxt_groups[0])
-        return wid, f"first pane of tab {nxt.get('title')!r}"
+        nxt_tab, nxt_gid = seq[(pos + step) % len(seq)]
+        return (
+            group_base_window(nxt_tab, nxt_gid),
+            "pane %d/%d of the cycle, in tab %r"
+            % ((pos + step) % len(seq) + 1, len(seq), nxt_tab.get("title")),
+        )
 
 
     def main():
         argv = sys.argv[1:]
         dry = "--plan" in argv
+        # The entire reverse direction. Everything downstream is shared.
+        step = -1 if "--reverse" in argv else 1
 
         sock = find_socket()
         if sock is None:
@@ -1935,7 +1998,7 @@ let
         data = json.loads(subprocess.check_output(
             ["kitty", "@", "--to", sock, "ls"], text=True,
         ))
-        wid, why = plan(data)
+        wid, why = plan(data, step)
         if wid is None:
             print(f"kitty-pane-cycle: nothing to do ({why})", file=sys.stderr)
             # Not a failure: pressing the key in a single-pane kitty is a
@@ -5385,8 +5448,14 @@ in
     inactive_tab_font_style bold
 
     # Keybinds — largely mirror Ghostty config (home/ghostty.nix); pane
-    # focus deliberately diverges from it, see the note below. These
-    # override kitty defaults like ctrl+minus = decrease_font_size.
+    # focus deliberately diverges from it, see the note below. Several of
+    # these displace a kitty default; each such case names the default it
+    # takes and where the displaced action remains reachable.
+    #
+    # (An earlier version of this comment claimed ctrl+minus was kitty's
+    # decrease_font_size. It is not, and never was: that default is
+    # kitty_mod+minus, i.e. ctrl+shift+minus — definition.py:4378. Plain
+    # ctrl+minus is unbound by kitty and free for the hsplit below.)
     map ctrl+minus launch --location=hsplit --cwd=current
     map ctrl+w close_window
     # Pane focus movement, all four directions on kitty_mod (= ctrl+shift,
@@ -5449,17 +5518,26 @@ in
     # pane. On the 2x2 grid that is lt, rt, lb, rb, then the next tab's
     # lt. kitty has no primitive for this: `next_window` follows the
     # window-GROUP order, which on that grid is lt, lb, rt, rb (down each
-    # column, measured on a live session), and nothing in kitty crosses
-    # from a tab's last pane into the next tab. See kitty-pane-cycle.
+    # column, measured on a live session), `neighboring_window right`
+    # stops at the right edge instead of descending, and nothing in kitty
+    # crosses from a tab's last pane into the next tab. See
+    # kitty-pane-cycle.
     #
-    # This REPLACES kitty's `previous_tab` default on ctrl+shift+tab, and
-    # with ctrl+shift+left now holding pane focus that was previous_tab's
-    # last binding -- so backwards tab navigation is left unbound. Chosen
-    # deliberately: the cycler reaches every pane of every tab going
-    # forward, which is the traversal actually used, and `ctrl+tab`
-    # (next_tab) still jumps whole tabs. Add `map <key> previous_tab` if
-    # the backwards jump is ever wanted again.
-    map ctrl+shift+tab launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-cycle
+    # Forward on ctrl+tab, backward on ctrl+shift+tab. The second line is
+    # the first plus `--reverse`, and inside the script that flag only
+    # flips the sign of one step over a sequence built once, so the two
+    # directions cannot disagree about the order.
+    #
+    # Both keys were kitty tab-navigation defaults -- ctrl+tab next_tab,
+    # ctrl+shift+tab previous_tab (definition.py:4232, 4246) -- and both
+    # are displaced here, which also spends their only remaining
+    # bindings now that ctrl+shift+left/right hold pane focus. That is
+    # the intended trade rather than a cost: the cycle already runs
+    # through every pane of every tab in both directions, so it subsumes
+    # per-tab jumping instead of merely replacing it. Rebind next_tab /
+    # previous_tab on a free key if whole-tab jumps are ever wanted back.
+    map ctrl+tab launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-cycle
+    map ctrl+shift+tab launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-cycle --reverse
 
     # Font zoom disabled. `ctrl+shift+minus` (what a Swedish layout types
     # as `ctrl+_`) is kitty's decrease_font_size and was hit by accident,

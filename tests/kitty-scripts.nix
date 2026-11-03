@@ -728,6 +728,19 @@ let
   # assertion by luck. Swapped, ascending-id and kitty's group order
   # both give the wrong next pane and only the split tree gives the
   # right one.
+  # argv[4] selects a chrome shape, since kitty's own windows are what
+  # this repo has historically miscounted (the 2026-09-04 incident):
+  #
+  #   overlay      an INTERNAL overlay joins the lb pane's group, so that
+  #                group is mixed -- one real window, one chrome. A pane
+  #                with an overlay is still a pane, so a predicate that
+  #                skips a group when ANY of its windows is chrome (as
+  #                opposed to ALL) makes the pane vanish.
+  #   chrome-group an extra group holding nothing but chrome, absent from
+  #                the split tree. It is not a pane and must not get a
+  #                slot in the cycle.
+  #   chrome-tab   the SECOND tab is entirely chrome, so the wrap has to
+  #                step over it to the third.
   mkCycleFixture = pkgs.writeText "kitty-scripts-cycle-fixture.py" ''
     import json
     import sys
@@ -735,36 +748,80 @@ let
     focused = int(sys.argv[1])
     ntabs = int(sys.argv[2])
     swap_top = len(sys.argv) > 3 and sys.argv[3] == "1"
+    mode = sys.argv[4] if len(sys.argv) > 4 else "plain"
+
+    # Marks a window as kitty's own chrome. OWN_UI_ENV in the shared
+    # kittyInternalWindowPy predicate (home/kitty.nix); spelled out here
+    # so the fixture exercises the real env marker rather than a cmdline
+    # shape that might drift.
+    CHROME_ENV = {"KITTY_SESSION_UI": "1"}
+
+
+    def win(wid, chrome=False):
+        return {
+            "id": wid,
+            "is_focused": wid == focused,
+            "is_active": wid == focused,
+            "cmdline": ["/bin/zsh"],
+            "env": dict(CHROME_ENV) if chrome else {},
+            "foreground_processes": [],
+            "cwd": "/tmp",
+            "title": ("chrome" if chrome else "pane") + str(wid),
+        }
 
 
     def tab(idx, base):
         lt, rt, lb, rb = base + 1, base + 2, base + 3, base + 4
         if swap_top:
             lt, rt = rt, lt
-        wins = []
-        for wid in (lt, rt, lb, rb):
-            wins.append({
-                "id": wid,
-                "is_focused": wid == focused,
-                "is_active": wid == focused,
-                "cmdline": ["/bin/zsh"],
-                "env": {},
-                "foreground_processes": [],
-                "cwd": "/tmp",
-                "title": f"pane{wid}",
-            })
+
+        # A whole tab of nothing but chrome.
+        if mode == "chrome-tab" and idx == 1:
+            only = base + 31
+            return {
+                "id": idx + 1,
+                "title": f"tab{idx + 1}-chrome",
+                "layout": "splits",
+                "is_focused": only == focused,
+                "is_active": only == focused,
+                "groups": [{"id": only, "windows": [only]}],
+                "windows": [win(only, chrome=True)],
+                "layout_state": {"class": "Splits", "pairs": only},
+            }
+
+        wins = [win(w) for w in (lt, rt, lb, rb)]
+        # Column order (lt, lb, rt, rb), as kitty really reports it --
+        # NOT reading order. See the header note.
+        groups = [{"id": g, "windows": [g]} for g in (lt, lb, rt, rb)]
+
+        if mode == "overlay":
+            # Overlay lands in the SAME group as the window it covers,
+            # which is how kitty does it: the group keeps its id and
+            # gains a window.
+            ov = base + 13
+            wins.append(win(ov, chrome=True))
+            for g in groups:
+                if g["id"] == lb:
+                    g["windows"] = [lb, ov]
+
+        if mode == "chrome-group":
+            cg = base + 21
+            wins.append(win(cg, chrome=True))
+            groups.append({"id": cg, "windows": [cg]})
+
         return {
             "id": idx + 1,
             "title": f"tab{idx + 1}",
             "layout": "splits",
             "is_focused": any(w["is_focused"] for w in wins),
             "is_active": any(w["is_focused"] for w in wins),
-            # Column order, as kitty really reports it.
-            "groups": [{"id": g, "windows": [g]} for g in (lt, lb, rt, rb)],
+            "groups": groups,
             "windows": wins,
             "layout_state": {
                 "class": "Splits",
                 # Root pair: `horizontal` absent === True (side by side).
+                # The chrome-only group is deliberately NOT here; kitty
+                # keys the tree by pane, and an extra group has no slot.
                 "pairs": {
                     "one": {"horizontal": False, "one": lt, "two": lb},
                     "two": {"horizontal": False, "one": rt, "two": rb},
@@ -4409,19 +4466,32 @@ pkgs.runCommand "kitty-scripts-harness"
     export KITTY_LISTEN_ON="unix:$PWD/state/cycle-fake.sock"
 
     cycle_expect() {
-      # cycle_expect <focused-window> <n-tabs> <expected-focus> <what> [swap]
+      # cycle_expect <focused-win> <n-tabs> <expected> <what> \
+      #              [swap] [mode] [direction-flag]
       export LS_FIXTURE="$PWD/state/cycle-ls.json"
       export FOCUS_OUT="$PWD/state/cycle-focus"
-      python3 ${mkCycleFixture} "$1" "$2" "''${5:-0}" > "$LS_FIXTURE"
+      python3 ${mkCycleFixture} "$1" "$2" "''${5:-0}" "''${6:-plain}" \
+        > "$LS_FIXTURE"
       : > "$FOCUS_OUT"
-      kitty-pane-cycle
+      # Unquoted on purpose: empty means "no flag", not an empty argv
+      # entry, which the script would see as an unknown argument.
+      kitty-pane-cycle ''${7:-}
       got=$(cat "$FOCUS_OUT")
       [ "$got" = "id:$3" ] || {
         echo "FAIL(Q/$4): focused from window $1 went to '$got',"
-        echo "  expected 'id:$3'. Reading order across the 2x2 grid is"
-        echo "  lt rt lb rb; kitty's own group order is lt lb rt rb, so"
-        echo "  landing on the pane BELOW instead of the one to the right"
-        echo "  means the cycler fell back to next_window's column walk."
+        echo "  expected 'id:$3'  (tabs=$2 swap=''${5:-0} mode=''${6:-plain}"
+        echo "  direction=''${7:-forward})."
+        echo "  Reading order across the 2x2 grid is lt rt lb rb, and"
+        echo "  kitty's own group order is lt lb rt rb."
+        if [ -n "''${7:-}" ]; then
+          echo "  This is a REVERSE case. Landing where the forward step"
+          echo "  would have landed means --reverse is not flipping the"
+          echo "  sign of the step; a wrapped-around answer instead means"
+          echo "  the modulo is wrong for a negative index."
+        else
+          echo "  Landing on the pane BELOW instead of the one to the"
+          echo "  right means the cycler fell back to a column walk."
+        fi
         exit 1; }
     }
 
@@ -4450,21 +4520,99 @@ pkgs.runCommand "kitty-scripts-harness"
     # swap is id 6 rather than 5.
     cycle_expect 4 2 6 swapped-rb-to-next-tab 1
 
+    # --- Chrome: kitty's own windows are not panes, but a pane with an
+    # overlay over it is still that pane. This repo has miscounted
+    # exactly this before (2026-09-04), and the three cases below are
+    # each sharp enough to kill a specific plausible wrong predicate.
+
+    # An INTERNAL overlay joins the lb group, making that group mixed.
+    # Focus is ON the overlay (id 13), so the answer is only right if
+    # focus is resolved through the GROUP: lb is pane 3 of 4, so next is
+    # rb (id 4).
+    #   - skip-group-if-ANY-window-is-chrome would drop lb entirely,
+    #     leaving order [1,2,4]; the overlay's group is then unknown and
+    #     the cycle restarts at id 1.
+    #   - comparing the focused WINDOW id against group ids, instead of
+    #     resolving window -> group, also finds nothing and gives id 1.
+    # So id:4 distinguishes the correct predicate from both.
+    cycle_expect 13 2 4 overlay-focus-resolves-via-group 0 overlay
+    # Focusing the overlay's base window must agree with focusing the
+    # overlay: same pane, same successor.
+    cycle_expect 3 2 4 overlay-base-agrees 0 overlay
+
+    # A group of nothing but chrome is not a pane and gets no slot. From
+    # the last real pane (rb, id 4) the cycle must leave the tab for the
+    # next one, NOT stop on the chrome group (id 21).
+    cycle_expect 4 2 5 chrome-group-is-not-a-pane 0 chrome-group
+
+    # The wrap steps OVER a tab that holds nothing but chrome rather than
+    # dead-ending on it: tab 2 is all chrome, so from tab 1's rb the
+    # answer is tab 3's lt (id 9).
+    cycle_expect 4 3 9 wrap-skips-chrome-only-tab 0 chrome-tab
+
+    # --- Reverse. `--reverse` only flips the sign of the step over a
+    # sequence built once, so these assert that the backward walk is the
+    # exact inverse of the forward one rather than a second, separately
+    # maintained order.
+
+    # Straight inverses of the forward hops asserted above.
+    cycle_expect 2 2 1 rev-rt-to-lt 0 plain --reverse
+    cycle_expect 4 2 3 rev-rb-to-lb 0 plain --reverse
+    # Round trip: forward took 2 -> 3 (rt-to-lb, above); reverse must
+    # take 3 -> 2 and not, say, 3 -> 1.
+    cycle_expect 3 2 2 rev-round-trips-the-forward-hop 0 plain --reverse
+    # Crossing a tab boundary backwards: tab 2's lt goes back to tab 1's
+    # rb, the mirror of the rb-to-next-tab hop.
+    cycle_expect 5 2 4 rev-crosses-into-previous-tab 0 plain --reverse
+    # The first pane of the cycle wraps to the very LAST pane of the last
+    # tab. This is the case a hand-written backward walk gets wrong, and
+    # it works here only because Python's % is non-negative for a
+    # negative left operand.
+    cycle_expect 1 2 8 rev-wraps-to-last-pane-of-last-tab 0 plain --reverse
+    # Reverse steps over a chrome-only tab too, from tab 3 back to tab 1.
+    cycle_expect 9 3 4 rev-skips-chrome-only-tab 0 chrome-tab --reverse
+
+    # Focus sitting on kitty's own chrome is not in the cycle at all, so
+    # each direction enters from its own end: forward at the first pane,
+    # reverse at the last.
+    cycle_expect 21 2 1 chrome-focus-enters-at-first 0 chrome-group
+    cycle_expect 21 2 8 chrome-focus-enters-at-last 0 chrome-group --reverse
+
     # --plan reports the same decision WITHOUT touching focus, so the
     # ordering can be inspected by hand against a live session.
+    #
+    # Deliberately LAST. These compare a whole human-readable sentence,
+    # so any ordering bug trips them too -- and because the harness exits
+    # on first failure, having them earlier meant a broken `--reverse`
+    # surfaced as a string mismatch here and the reverse assertions above
+    # never ran at all. Observed while mutation-testing the step sign.
     export LS_FIXTURE="$PWD/state/cycle-ls.json"
     export FOCUS_OUT="$PWD/state/cycle-focus-plan"
     python3 ${mkCycleFixture} 1 2 0 > "$LS_FIXTURE"
     : > "$FOCUS_OUT"
     plan_out=$(kitty-pane-cycle --plan)
-    [ "$plan_out" = "would focus window 2 -- pane 2/4 of this tab" ] || {
+    # Position is reported over the WHOLE cycle -- 8 panes across 2 tabs
+    # -- not per tab, because that flat sequence is what the step walks.
+    [ "$plan_out" = "would focus window 2 -- pane 2/8 of the cycle, in tab 'tab1'" ] || {
       echo "FAIL(Q/plan): got '$plan_out', expected the lt->rt hop"
       exit 1; }
     [ ! -s "$FOCUS_OUT" ] || {
       echo "FAIL(Q/plan): --plan moved focus; it must only describe"
       exit 1; }
+    # Same fixture, reverse: from the FIRST pane of the cycle the step
+    # wraps to the last pane of the last tab, reported as 8/8.
+    plan_rev=$(kitty-pane-cycle --plan --reverse)
+    [ "$plan_rev" = "would focus window 8 -- pane 8/8 of the cycle, in tab 'tab2'" ] || {
+      echo "FAIL(Q/plan-rev): got '$plan_rev', expected the wrap back to"
+      echo "  the last pane of the last tab"
+      exit 1; }
+    [ ! -s "$FOCUS_OUT" ] || {
+      echo "FAIL(Q/plan-rev): --plan --reverse moved focus"
+      exit 1; }
 
-    echo "ok(Q): panes cycle lt rt lb rb, then into the next tab"
+    echo "ok(Q): panes cycle lt rt lb rb, then into the next tab;"
+    echo "       --reverse is the exact inverse; overlays stay with"
+    echo "       their pane, chrome gets no slot and no tab of its own"
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"

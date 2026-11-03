@@ -177,15 +177,16 @@ let
     # by a route ZOOM_STEPS misses, e.g. `kitty @ set-font-size` or a
     # font-size default kitty adds in a later release.
     ZOOM_RESET = "ctrl+shift+backspace"
-    # Reading-order pane cycler. Must displace kitty's `previous_tab`
-    # default here -- if that default survives, the key still switches
-    # tabs and never reaches a pane.
-    CYCLER = "ctrl+shift+tab"
+    # Reading-order pane cycler, both directions. These displace kitty's
+    # next_tab and previous_tab defaults; if either default survives, the
+    # key jumps a whole tab instead of reaching the next pane.
+    CYCLER = "ctrl+tab"
+    CYCLER_REVERSE = "ctrl+shift+tab"
 
     eff = {}
     for spec in (
         list(PANE_FOCUS) + list(MUST_FALL_THROUGH) + list(ZOOM_STEPS)
-        + [ZOOM_RESET, CYCLER]
+        + [ZOOM_RESET, CYCLER, CYCLER_REVERSE]
     ):
         defs = keymap.get(parse_shortcut(spec))
         eff[spec] = defs[-1].definition if defs else None
@@ -228,8 +229,31 @@ let
     if eff[CYCLER] is None or "kitty-pane-cycle" not in eff[CYCLER]:
         errors.append(
             f"{CYCLER}: resolves to {eff[CYCLER]!r}, want a launch of "
-            "kitty-pane-cycle -- kitty's previous_tab default must be "
+            "kitty-pane-cycle -- kitty's next_tab default must be "
             "displaced or the key never reaches a pane"
+        )
+    elif "--reverse" in eff[CYCLER]:
+        errors.append(
+            f"{CYCLER}: resolves to {eff[CYCLER]!r}; the FORWARD "
+            "direction must not carry --reverse"
+        )
+
+    # The reverse bind must be the same command plus --reverse. Asserting
+    # the flag specifically, because the two lines differ by exactly that
+    # and a copy-paste that dropped it would leave both keys cycling
+    # forward -- two keys, one direction, and no way back.
+    if eff[CYCLER_REVERSE] is None or (
+        "kitty-pane-cycle" not in eff[CYCLER_REVERSE]
+    ):
+        errors.append(
+            f"{CYCLER_REVERSE}: resolves to {eff[CYCLER_REVERSE]!r}, want "
+            "a launch of kitty-pane-cycle --reverse"
+        )
+    elif "--reverse" not in eff[CYCLER_REVERSE]:
+        errors.append(
+            f"{CYCLER_REVERSE}: resolves to {eff[CYCLER_REVERSE]!r}, which "
+            "launches the cycler WITHOUT --reverse -- both keys would "
+            "then cycle forward and nothing would go back"
         )
 
     if errors:
