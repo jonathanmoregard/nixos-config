@@ -13,6 +13,7 @@ Subcommands:
 Spool entries are files holding one line `owner/repo <40-hex sha>`. They are
 data only: the publisher re-derives everything from GitHub.
 """
+import collections
 import json
 import os
 import re
@@ -39,6 +40,20 @@ class Retry(Exception):
 
 class Skip(Exception):
     """Final decision for this entry: do not push."""
+
+
+class RateLimited(Retry):
+    """A Retry that also knows nothing else will get through this run."""
+
+
+# What the publisher decided about one entry; the queue reads these fields
+# and nothing else. FINISHED retires; RETRY and INCOMPLETE take the same
+# transition and differ only in wording and whether paths were uploaded.
+# `not_before` overrides the backoff, `halt` ends the run. See the Queue
+# mechanics section of modules/nixos/cache-publisher.nix.
+FINISHED, RETRY, INCOMPLETE = "finished", "retry", "incomplete"
+Outcome = collections.namedtuple("Outcome", "kind pushed reason not_before halt")
+Outcome.__new__.__defaults__ = (None, False)
 
 
 # No credential of any kind may reach nix: with one it could fetch private
@@ -77,23 +92,18 @@ TRANSIENT = ("unable to download", "http error 404", "could not resolve host", "
              "http error 5", "http error 429", "temporary failure")
 
 
-# A candidate's drvPath is whatever the flake says, and it is passed to nix as
-# a positional argument. Deliberately loose — it must reject argv payloads
-# without ever rejecting a real derivation, because a false negative here
-# stops publication silently. `--version` is the motivating case: nix accepts
-# the flag, exits 0 and prints non-JSON, which used to crash the run.
+# A flake-stated drvPath reaches nix as a positional argument, so it must not
+# be able to act as a flag (`--version` exits 0 with non-JSON). Deliberately
+# loose: a false negative here stops publication silently.
 DRV_PATH_RE = re.compile(r"^/nix/store/[^/\s]+\.drv$")
 
 
 def store_path(p):
     """Absolute store path for a name `nix derivation show` may give either way.
 
-    The pinned Nix (json version 4) keys its graph by BASENAME and reports
-    `outputs.<name>.path` as a basename too; other versions use absolute
-    paths. Everything else here — path-info, the upstream query, cachix —
-    works in absolute paths, and the chroot eval store keeps the same virtual
-    /nix/store prefix, which is the whole basis for comparing an anonymous
-    path to a local one. Normalise once, at every edge that reads that JSON."""
+    The pinned Nix (json v4) keys its graph and its output paths by basename;
+    other versions use absolute paths. Everything else here works in absolute
+    paths. Apply at every edge that reads that JSON."""
     return p if p.startswith("/") else f"/nix/store/{p}"
 
 
@@ -169,11 +179,8 @@ class Publisher:
         self.w = world
         self.log = log
         # "o/r" and "o/r@rev" -> time of a POSITIVE preliminary answer, lock
-        # inputs only. Passed in by run() so it survives across runs: a flake
-        # with many distinct input repos costs 4+4n anonymous API requests
-        # against a 60/h budget, and rebuilding this map every run meant such
-        # an entry rate-limited at the same place forever. Never consulted by
-        # the pre-upload recheck, which is the gate that matters.
+        # inputs only. run() passes it in so it survives across runs. Gate (f)
+        # never consults it.
         self.input_cache = {} if input_cache is None else input_cache
 
     def gh(self, path):
@@ -249,6 +256,32 @@ class Publisher:
         m = GH_PATH_RE.match(u.path)
         return (m.group(1), m.group(2)) if m else None
 
+    def locked_github_repo(self, name, locked):
+        """One lock node as (owner, repo, rev), or None when it names no
+        GitHub repo but is an allowlisted source. Every unsupported shape is
+        rejected here and named; nothing falls through silently."""
+        t = locked.get("type")
+        if t == "github":
+            if locked.get("host") not in (None, "github.com"):
+                raise Skip(f"lock node {name}: github host {locked.get('host')} not allowed")
+            return locked.get("owner", ""), locked.get("repo", ""), locked.get("rev", "")
+        if t == "git":
+            url = locked.get("url", "")
+            gr = self.github_repo_of(url) if url.startswith("https://") else None
+            if not gr:
+                raise Skip(f"lock node {name}: git input {url!r} is not an https GitHub URL")
+            return gr[0], gr[1], locked.get("rev", "")
+        if t in ("tarball", "file"):
+            url = locked.get("url", "")
+            # GitHub content only as a typed github/git input: those carry a
+            # rev the pre-upload recheck can re-ask about; a tarball URL cannot.
+            if self.github_repo_of(url):
+                raise Skip(f"lock node {name}: GitHub {t} input {url!r}; use a github: input")
+            if not self.url_allowed(url):
+                raise Skip(f"lock node {name}: {t} url {url!r} not allowlisted")
+            return None
+        raise Skip(f"lock node {name}: input type {t!r} not allowed")
+
     def audit_lock(self, ref):
         meta = json.loads(self.w.nix(["flake", "metadata", *self.fresh(), "--json", "--no-update-lock-file", ref]))
         if meta.get("dirtyRevision") or not meta.get("revision"):
@@ -262,38 +295,19 @@ class Publisher:
             locked = node.get("locked")
             if not locked:
                 raise Skip(f"lock node {name} is unlocked")
-            t = locked.get("type")
-            if t == "github":
-                if locked.get("host") not in (None, "github.com"):
-                    raise Skip(f"lock node {name}: github host {locked.get('host')} not allowed")
-                if not self.input_public(locked["owner"], locked["repo"]):
-                    raise Skip(f"lock node {name}: {locked['owner']}/{locked['repo']} is not public")
-                # The narHash pins content, and Nix reuses a valid local store path
-                # without downloading it. Proving the locked rev itself is public
-                # keeps a lock entry from smuggling private content under a
-                # public repo's name.
-                self.input_rev_public(locked["owner"], locked["repo"], locked.get("rev", ""))
-                inputs.append((locked["owner"], locked["repo"], locked["rev"]))
-            elif t == "git":
-                url = locked.get("url", "")
-                gr = self.github_repo_of(url) if url.startswith("https://") else None
-                if not gr:
-                    raise Skip(f"lock node {name}: git input {url!r} is not an https GitHub URL")
-                if not self.input_public(*gr):
-                    raise Skip(f"lock node {name}: {gr[0]}/{gr[1]} is not public")
-                self.input_rev_public(*gr, locked.get("rev", ""))
-                inputs.append((*gr, locked["rev"]))
-            elif t in ("tarball", "file"):
-                url = locked.get("url", "")
-                # GitHub content only as a typed github/git input: those carry
-                # a rev that is re-checked right before upload; a tarball URL
-                # would slip past that re-check.
-                if self.github_repo_of(url):
-                    raise Skip(f"lock node {name}: GitHub {t} input {url!r}; use a github: input")
-                if not self.url_allowed(url):
-                    raise Skip(f"lock node {name}: {t} url {url!r} not allowlisted")
-            else:
-                raise Skip(f"lock node {name}: input type {t!r} not allowed")
+            gh = self.locked_github_repo(name, locked)
+            if gh is None:
+                continue  # allowlisted non-GitHub source, nothing to re-ask
+            owner, repo, rev = gh
+            # Invariant: every GitHub input is public AND its locked rev is
+            # anonymously fetchable. The narHash pins content and Nix reuses a
+            # valid local path without downloading, so proving the rev public
+            # is what stops a lock entry smuggling private content under a
+            # public repo's name.
+            if not self.input_public(owner, repo):
+                raise Skip(f"lock node {name}: {owner}/{repo} is not public")
+            self.input_rev_public(owner, repo, rev)
+            inputs.append((owner, repo, rev))
         return inputs
 
     def url_allowed(self, url):
@@ -372,17 +386,11 @@ class Publisher:
                 if isinstance(v, dict) and isinstance(v.get("outs"), list) and v.get("drv")}
 
     def drv_outputs(self, drv):
-        """The output paths `drv` itself declares, read from the anonymous
-        store the evaluation instantiated it into.
+        """Output paths `drv` itself declares, from the anonymous store.
 
-        `candidates` takes drvPath and outPath from the flake, and a flake
-        states them independently: a hand-written attrset can pair a harmless
-        derivation's drvPath with any string as its outPath, and pure
-        evaluation does not object — a literal instantiates nothing, so there
-        is no derivation tying the two together. Auditing that harmless graph
-        would then say nothing about the path being uploaded. Taking the paths
-        from the derivation is what binds the upload to the recipe the audit
-        cleared."""
+        Invariant (gate d): an uploaded path is one the audited derivation
+        declares. The flake states drvPath and outPath independently, so
+        `c["outs"]` carries no provenance and never decides an upload."""
         if not DRV_PATH_RE.match(drv):
             raise Skip(f"drvPath {drv!r} is not a store derivation path")
         try:
@@ -410,19 +418,13 @@ class Publisher:
         a text-only repo's outputs are tiny, a wrapper around locally built
         libraries is not).
 
-        Returns (keep, incomplete). `incomplete` marks an empty result that
-        local state can still change: an output not built yet, or a closure
-        only partly present. The caller must not retire the commit on one of
-        those — the pre-push hook enqueues on push, which routinely beats the
-        build, and `done` is consulted before a spool entry becomes pending,
-        so retiring early discards every later entry for that sha."""
+        Returns (keep, incomplete). Invariant: availability is not a verdict —
+        `incomplete` means local state can still change this answer, so the
+        caller must not retire the commit."""
         info = self.path_info(outs)
         upstream = self.upstream_set([p for p in outs if info.get(p)])
-        # Decided ONCE, with a single exit below. This flag had three separate
-        # return statements and the same defect appeared in each of them in
-        # turn: whatever filtering happens afterwards, an output that is not
-        # in the local store yet means this verdict can still change, so the
-        # commit must not be retired on it.
+        # Decided once, single exit below: this flag previously had a return
+        # of its own per filter, and the same defect appeared in each in turn.
         incomplete = any(not info.get(p) for p in outs)
         keep = []
         for p in outs:
@@ -493,8 +495,30 @@ class Publisher:
             # the local store or the target cache.
             self.w.nix(["build", *self.fresh(), "--no-link", *missing])
 
-    def process(self, owner, repo, sha):
-        """Returns list of pushed paths. Raises Skip/Retry."""
+    def decide(self, owner, repo, sha):
+        """The only boundary between policy and queue mechanics.
+
+        Skip / Retry / RateLimited are how the gates abort from depth; they
+        all end here and become one explicit Outcome, so the queue never has
+        to infer state from an exception type or a log line."""
+        try:
+            pushed, incomplete = self.publish(owner, repo, sha)
+        except RateLimited as e:
+            return Outcome(RETRY, [], str(e), e.not_before, halt=True)
+        except Retry as e:
+            return Outcome(RETRY, [], str(e))
+        except Skip as e:
+            return Outcome(FINISHED, [], str(e))
+        except Exception as e:
+            # Entries are processed in sorted order, so anything unexpected
+            # would be met again every run and starve everything behind it.
+            return Outcome(RETRY, [], f"unexpected {type(e).__name__}: {e}")
+        if incomplete:
+            return Outcome(INCOMPLETE, pushed, "outputs of this commit are not built yet")
+        return Outcome(FINISHED, pushed, "")
+
+    def publish(self, owner, repo, sha):
+        """(pushed paths, incomplete). Raises Skip/Retry; `decide` converts."""
         if not self.repo_public(owner, repo):
             raise Skip(f"{owner}/{repo} is not public")
         self.commit_public(owner, repo, sha)
@@ -503,12 +527,8 @@ class Publisher:
         pushed = []
         incomplete = False
         for attr, c in sorted(self.candidates(ref).items()):
-            # The paths that decide the upload come from the derivation in the
-            # anonymous store, never from what the flake's attrset claimed:
-            # the two are independent (see drv_outputs), and only the
-            # derivation's own outputs are covered by audit_build_graph below.
-            # Input-addressed paths hash the whole build graph, so a local path
-            # equal to one of those was built from exactly that public recipe.
+            # Gate (d): decide on the derivation's own outputs, not the
+            # flake's claim, so gate (e) audits the recipe that produced them.
             try:
                 outs = self.drv_outputs(c["drv"])
             except Skip as e:
@@ -532,10 +552,7 @@ class Publisher:
                 continue
             pushed += keep
         if not pushed:
-            if incomplete:
-                # Not a verdict: a build finishing later changes the answer.
-                raise Retry("nothing built locally yet")
-            return []
+            return [], incomplete
         # The last word belongs to GitHub, right before upload: the repo, the
         # commit and every GitHub lock input, uncached.
         if not self.repo_public(owner, repo):
@@ -547,17 +564,9 @@ class Publisher:
             if self.commit_status(o, r, rev) != 200:
                 raise Skip(f"lock input {o}/{r}@{rev[:12]} stopped being fetchable before upload")
         self.w.cachix_push(pushed)
-        if incomplete:
-            # Pushed what exists; the commit must stay queued for the rest.
-            # A later attempt re-offers these paths, which cachix deduplicates.
-            self.log(f"pushed {len(pushed)} path(s) for {owner}/{repo}@{sha[:12]}"
-                     + "".join(f"\n  {p}" for p in pushed))
-            raise Retry("other outputs of this commit are not built yet")
-        return pushed
+        return pushed, incomplete
 
 
-class RateLimited(Retry):
-    pass
 
 
 # ── spool driver ────────────────────────────────────────────────────────────
@@ -645,53 +654,32 @@ def run(cfg, world, log=print):
         if st["next"] > world.now():
             continue
         owner, repo, sha = ENTRY_RE.match(st["entry"]).groups()
-        try:
-            try:
-                pushed = pub.process(owner, repo, sha)
-            except (RateLimited, Retry, Skip):
-                raise
-            except Exception as e:
-                # Entries are processed in sorted order, so an entry that
-                # raises anything unexpected would be met again on every run
-                # and starve every entry sorting after it — and a repo owner
-                # whose name begins with a digit sorts before all letters.
-                # Degrade to the retry path: bounded, and it keeps the queue
-                # moving. Nothing here is a reason to publish.
-                raise Retry(f"unexpected {type(e).__name__}: {e}") from e
-            log(f"done {owner}/{repo}@{sha[:12]}: pushed {len(pushed)} path(s)" + "".join(f"\n  {p}" for p in pushed))
-            final = True
-        except RateLimited as e:
-            # Bounded like every other retry. Without the expiry check this
-            # branch never incremented `tries` and never retired, so an entry
-            # that rate-limits every run stayed at the head of a sorted queue
-            # indefinitely — and the `break` below meant nothing behind it was
-            # ever processed.
+        at = f"{owner}/{repo}@{sha[:12]}"
+        o = pub.decide(owner, repo, sha)
+        if o.pushed:
+            log(f"pushed {len(o.pushed)} path(s) for {at}" + "".join(f"\n  {p}" for p in o.pushed))
+        # One state transition for everything that is not finished. Rate
+        # limiting differs only in supplying its own next-attempt time and
+        # halting the run; keeping it on a branch of its own is what let it
+        # skip the attempt count and the expiry.
+        if o.kind == FINISHED:
+            log(f"done {at}: {o.reason or f'pushed {len(o.pushed)} path(s)'}")
+            retire = True
+        else:
             st["tries"] += 1
-            if world.now() - st["first"] > cfg["expire"]:
-                log(f"expire {owner}/{repo}@{sha[:12]}: {e}")
-                open(os.path.join(state, "done", k), "w").close()
-                os.unlink(pf)
+            retire = world.now() - st["first"] > cfg["expire"]
+            if retire:
+                log(f"expire {at}: {o.reason}")
             else:
-                log(f"retry later {owner}/{repo}@{sha[:12]}: {e}")
-                st["next"] = e.not_before
+                st["next"] = (o.not_before if o.not_before is not None
+                              else world.now() + min(3600, 120 * 2 ** min(st["tries"], 5)))
                 write_json(pf, st)
-            break  # every further call would be rate limited too
-        except Retry as e:
-            st["tries"] += 1
-            if world.now() - st["first"] > cfg["expire"]:
-                log(f"expire {owner}/{repo}@{sha[:12]}: {e}")
-                final = True
-            else:
-                st["next"] = world.now() + min(3600, 120 * 2 ** min(st["tries"], 5))
-                write_json(pf, st)
-                log(f"retry {owner}/{repo}@{sha[:12]}: {e}")
-                continue
-        except Skip as e:
-            log(f"skip {owner}/{repo}@{sha[:12]}: {e}")
-            final = True
-        if final:
+                log(f"retry {at}: {o.reason}")
+        if retire:
             open(os.path.join(state, "done", k), "w").close()
             os.unlink(pf)
+        if o.halt:
+            break
     # Persist the preliminary answers, pruned, so the next run does not spend
     # the anonymous budget re-asking what it already asked.
     try:
@@ -754,12 +742,8 @@ def config_from_env():
         "eval_store": e.get("CP_EVAL_STORE", "/var/lib/cache-publisher/evalstore"),
         "local_store": e.get("CP_LOCAL_STORE", "daemon"),
         "min_nar": int(e.get("CP_MIN_NAR_BYTES", str(1024 * 1024))),
-        # Preliminary lock-input answers only, and only positive ones. Longer
-        # than the 15 min timer interval on purpose: at 600 s a persisted
-        # cache was always stale by the next run, which is what let a
-        # many-input flake rate-limit at the same point forever. Safe because
-        # the pre-upload recheck never consults this cache and re-asks GitHub
-        # about the repo, the commit and every lock input.
+        # Must exceed the 15 min timer interval or a persisted cache is always
+        # stale by the next run, which defeats its purpose.
         "input_ttl": int(e.get("CP_INPUT_TTL", str(6 * 3600))),
         "expire": int(e.get("CP_EXPIRE", str(48 * 3600))),
         "url_allow": e.get("CP_URL_ALLOW", "nixos.org").split(),

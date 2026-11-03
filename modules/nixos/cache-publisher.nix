@@ -55,7 +55,42 @@
 #   - the Cachix token is readable only by cache-publisher (not jonathan,
 #     not any agent running as jonathan).
 #
+# Queue mechanics (scripts/cache-publisher.py; the code names these
+# invariants rather than restating the arguments):
+#   - One boundary. The gates abort from depth with Skip/Retry/RateLimited;
+#     `decide` converts every one of them into a single explicit Outcome
+#     (finished / retry / published-but-incomplete) and the queue reads only
+#     that. Nothing infers state from an exception type or a log line.
+#   - One transition. Everything not finished counts an attempt, then either
+#     expires or reschedules. Rate limiting is the same transition with its
+#     own next-attempt time, plus a halt for the rest of the run; it had its
+#     own branch once, which is how it came to skip the count and the expiry
+#     and park an entry at the head of a sorted queue forever.
+#   - Anything unexpected degrades to retry, never to publish: entries are
+#     processed in sorted order, so one entry that always raises would starve
+#     every entry behind it, and a repo owner may begin with a digit.
+#   - Availability is not a verdict. "Not built locally yet" keeps an entry
+#     queued; only a built-and-rejected answer retires it. `done` is consulted
+#     before a spool entry becomes pending, so retiring early would discard
+#     every later entry for that sha.
+#   - The preliminary lock-input answers are cached (positives only) and
+#     persist across runs, because 4+4n anonymous API requests per entry
+#     against GitHub's 60/h cannot finish a many-input flake in one window.
+#     Gate (f) never consults that cache.
+#
 # Residual risks (by design, documented rather than gated):
+#   - a candidate drvPath naming a derivation left in the day-lived eval
+#     store by an EARLIER entry is audited as that entry's repo, without
+#     re-running its own gate (a)/(b)/(f). Bounded to bytes that were public
+#     when evaluated — the same class as the flip-after-push item below. A
+#     per-entry eval store would close it, at the cost of every eval and
+#     fixed-output download being repeated;
+#   - `allowed-uris` matches the `github:` input TYPE, so builtins.fetchTree
+#     with a `host` attribute can issue one unauthenticated HTTPS GET from
+#     this machine's IP. audit_lock rejects host != github.com for lock
+#     inputs; the builtin path is not gated;
+#   - "http error 403" is absent from the transient list, so a rate-limited
+#     fetch inside nix retires a sha permanently;
 #   - a bug in the audit code itself (tests/cache-publisher/*);
 #   - secrets committed to a public repo end up in its outputs — repo
 #     hygiene, not a cache problem;
