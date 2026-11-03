@@ -49,6 +49,7 @@ let
       "kitty-session-commit"
       "kitty-session-save"
       "kitty-panes-reflow"
+      "kitty-pane-cycle"
       "claude-kitty-pane-record"
       # The session-restoring `kitty` wrapper itself, so the stub path
       # it READS can be checked against the one the writer emits.
@@ -701,6 +702,84 @@ let
     for name, data in cases.items():
         with open(os.path.join(out, name + ".json"), "w") as fh:
             json.dump(data, fh)
+  '';
+
+  # `kitty @ ls` output for Phase Q, shaped like the REAL thing.
+  #
+  # Transcribed from a live 4-pane session (kitty 0.49.2), because the
+  # two properties under test are both properties of kitty's actual
+  # serialization and neither is guessable:
+  #
+  #   * The root pair carries NO `horizontal` key. kitty's Pair.serialize
+  #     emits it only when it is False (layout/splits.py:43-44) and
+  #     unserialize defaults it to True (splits.py:55). A reader that
+  #     defaults it to False transposes every grid.
+  #   * `groups` order is NOT reading order. Live, the 2x2 came back
+  #     [1, 3, 2, 4] -- lt, lb, rt, rb, down each column -- which is
+  #     exactly what `next_window` would follow and what the cycler must
+  #     not.
+  #
+  # So a fixture that merely looked plausible would pass while the real
+  # thing failed. Per tab the ids are lt, rt, lb, rb = n+1, n+2, n+3, n+4.
+  #
+  # argv[3]=1 swaps the two TOP ids to lt=n+2, rt=n+1. Without it,
+  # reading order happens to coincide with ascending window id, so an
+  # implementation that just sorted ids would pass every ordering
+  # assertion by luck. Swapped, ascending-id and kitty's group order
+  # both give the wrong next pane and only the split tree gives the
+  # right one.
+  mkCycleFixture = pkgs.writeText "kitty-scripts-cycle-fixture.py" ''
+    import json
+    import sys
+
+    focused = int(sys.argv[1])
+    ntabs = int(sys.argv[2])
+    swap_top = len(sys.argv) > 3 and sys.argv[3] == "1"
+
+
+    def tab(idx, base):
+        lt, rt, lb, rb = base + 1, base + 2, base + 3, base + 4
+        if swap_top:
+            lt, rt = rt, lt
+        wins = []
+        for wid in (lt, rt, lb, rb):
+            wins.append({
+                "id": wid,
+                "is_focused": wid == focused,
+                "is_active": wid == focused,
+                "cmdline": ["/bin/zsh"],
+                "env": {},
+                "foreground_processes": [],
+                "cwd": "/tmp",
+                "title": f"pane{wid}",
+            })
+        return {
+            "id": idx + 1,
+            "title": f"tab{idx + 1}",
+            "layout": "splits",
+            "is_focused": any(w["is_focused"] for w in wins),
+            "is_active": any(w["is_focused"] for w in wins),
+            # Column order, as kitty really reports it.
+            "groups": [{"id": g, "windows": [g]} for g in (lt, lb, rt, rb)],
+            "windows": wins,
+            "layout_state": {
+                "class": "Splits",
+                # Root pair: `horizontal` absent === True (side by side).
+                "pairs": {
+                    "one": {"horizontal": False, "one": lt, "two": lb},
+                    "two": {"horizontal": False, "one": rt, "two": rb},
+                },
+            },
+        }
+
+
+    tabs = [tab(i, i * 4) for i in range(ntabs)]
+    json.dump([{
+        "id": 1,
+        "is_focused": True,
+        "is_active": True,
+        "tabs": tabs,
+    }], sys.stdout)
   '';
 in
 pkgs.runCommand "kitty-scripts-harness"
@@ -4296,6 +4375,96 @@ pkgs.runCommand "kitty-scripts-harness"
       echo "FAIL(correction): $total_failures deadline/durability seam(s) failed"
       exit 1
     }
+
+    # --- Phase Q: panes cycle in reading order, wrapping into the next tab ---
+    #
+    # Drives the REAL kitty-pane-cycle derivation against a stub `kitty`
+    # on PATH, the same way Phase A drives the restore scripts against a
+    # stub `claude`. No test-only flag and no test-only code path in the
+    # script: it discovers a socket, runs `kitty @ ls`, and issues
+    # `kitty @ focus-window` exactly as it does in production, and the
+    # stub answers all three.
+    cat > fakebin/kitty <<'KSTUB'
+    #!/bin/sh
+    # Scan for the remote-control subcommand and the --match value.
+    # `--to unix:...` cannot collide: the socket is never a bare verb.
+    cmd=""; match=""; prev=""
+    for a in "$@"; do
+      case "$a" in
+        ls|focus-window|focus-tab) [ -z "$cmd" ] && cmd="$a" ;;
+      esac
+      [ "$prev" = "--match" ] && match="$a"
+      prev="$a"
+    done
+    case "$cmd" in
+      ls) cat "$LS_FIXTURE" ;;
+      focus-window) printf '%s\n' "$match" >> "$FOCUS_OUT" ;;
+    esac
+    exit 0
+    KSTUB
+    chmod +x fakebin/kitty
+
+    # Any value is fine: the stub answers `ls` on it, which is precisely
+    # the liveness probe find_socket() uses. Never a real socket path.
+    export KITTY_LISTEN_ON="unix:$PWD/state/cycle-fake.sock"
+
+    cycle_expect() {
+      # cycle_expect <focused-window> <n-tabs> <expected-focus> <what> [swap]
+      export LS_FIXTURE="$PWD/state/cycle-ls.json"
+      export FOCUS_OUT="$PWD/state/cycle-focus"
+      python3 ${mkCycleFixture} "$1" "$2" "''${5:-0}" > "$LS_FIXTURE"
+      : > "$FOCUS_OUT"
+      kitty-pane-cycle
+      got=$(cat "$FOCUS_OUT")
+      [ "$got" = "id:$3" ] || {
+        echo "FAIL(Q/$4): focused from window $1 went to '$got',"
+        echo "  expected 'id:$3'. Reading order across the 2x2 grid is"
+        echo "  lt rt lb rb; kitty's own group order is lt lb rt rb, so"
+        echo "  landing on the pane BELOW instead of the one to the right"
+        echo "  means the cycler fell back to next_window's column walk."
+        exit 1; }
+    }
+
+    # Within one tab: lt -> rt -> lb -> rb. Window ids are lt=1 rt=2
+    # lb=3 rb=4, so each step must advance by exactly one id here, which
+    # the column-order fallback cannot produce.
+    cycle_expect 1 2 2 lt-to-rt
+    cycle_expect 2 2 3 rt-to-lb
+    cycle_expect 3 2 4 lb-to-rb
+    # Past the last pane: the NEXT tab, at its first pane (lt = id 5).
+    cycle_expect 4 2 5 rb-to-next-tab
+    # Last pane of the last tab wraps around to the very first pane.
+    cycle_expect 8 2 1 last-tab-wraps-to-first
+    # One tab only: the last pane wraps to that tab's own first pane,
+    # rather than doing nothing.
+    cycle_expect 4 1 1 single-tab-wraps
+
+    # The order must come from the split TREE, not from ascending window
+    # id. With the two top ids swapped (lt=2, rt=1), reading order is
+    # 2, 1, 3, 4 -- so from lt the right answer is the LOWER id, which
+    # neither an id sort nor kitty's group order ([2,3,1,4] here) can
+    # produce.
+    cycle_expect 2 2 1 swapped-lt-to-rt 1
+    cycle_expect 1 2 3 swapped-rt-to-lb 1
+    # The tab hop still lands on the next tab's top-LEFT, which under the
+    # swap is id 6 rather than 5.
+    cycle_expect 4 2 6 swapped-rb-to-next-tab 1
+
+    # --plan reports the same decision WITHOUT touching focus, so the
+    # ordering can be inspected by hand against a live session.
+    export LS_FIXTURE="$PWD/state/cycle-ls.json"
+    export FOCUS_OUT="$PWD/state/cycle-focus-plan"
+    python3 ${mkCycleFixture} 1 2 0 > "$LS_FIXTURE"
+    : > "$FOCUS_OUT"
+    plan_out=$(kitty-pane-cycle --plan)
+    [ "$plan_out" = "would focus window 2 -- pane 2/4 of this tab" ] || {
+      echo "FAIL(Q/plan): got '$plan_out', expected the lt->rt hop"
+      exit 1; }
+    [ ! -s "$FOCUS_OUT" ] || {
+      echo "FAIL(Q/plan): --plan moved focus; it must only describe"
+      exit 1; }
+
+    echo "ok(Q): panes cycle lt rt lb rb, then into the next tab"
 
     echo "ok: single-line stub, pane-0 notice intact, grid dispatch and"
     echo "    session convert count real panes only, snapshot rotation"

@@ -177,10 +177,15 @@ let
     # by a route ZOOM_STEPS misses, e.g. `kitty @ set-font-size` or a
     # font-size default kitty adds in a later release.
     ZOOM_RESET = "ctrl+shift+backspace"
+    # Reading-order pane cycler. Must displace kitty's `previous_tab`
+    # default here -- if that default survives, the key still switches
+    # tabs and never reaches a pane.
+    CYCLER = "ctrl+shift+tab"
 
     eff = {}
     for spec in (
-        list(PANE_FOCUS) + list(MUST_FALL_THROUGH) + list(ZOOM_STEPS) + [ZOOM_RESET]
+        list(PANE_FOCUS) + list(MUST_FALL_THROUGH) + list(ZOOM_STEPS)
+        + [ZOOM_RESET, CYCLER]
     ):
         defs = keymap.get(parse_shortcut(spec))
         eff[spec] = defs[-1].definition if defs else None
@@ -218,6 +223,13 @@ let
             f"{ZOOM_RESET}: resolves to {eff[ZOOM_RESET]!r}, want "
             "'change_font_size all 0' -- reset must stay bound as the "
             "font-size recovery path"
+        )
+
+    if eff[CYCLER] is None or "kitty-pane-cycle" not in eff[CYCLER]:
+        errors.append(
+            f"{CYCLER}: resolves to {eff[CYCLER]!r}, want a launch of "
+            "kitty-pane-cycle -- kitty's previous_tab default must be "
+            "displaced or the key never reaches a pane"
         )
 
     if errors:
