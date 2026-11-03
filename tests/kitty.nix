@@ -107,9 +107,10 @@ let
     import sys
 
     from kitty.config import load_config
+    from kitty.options.utils import parse_shortcut
 
     bad = []
-    load_config(os.environ["KITTY_CONF"], accumulate_bad_lines=bad)
+    opts = load_config(os.environ["KITTY_CONF"], accumulate_bad_lines=bad)
     for b in bad:
         print(
             f"kitty.conf line {b.number}: {b.line!r} -> {b.exception}",
@@ -124,6 +125,110 @@ let
         )
         sys.exit(1)
     print("config parses clean under the deployed kitty")
+
+    # --- Resolved-keymap assertions ---
+    #
+    # Deliberately NOT a grep over kitty.conf. A `map` line can be
+    # present, spelled plausibly, and still never fire: `ctrl+less`
+    # parse-errored to "unknown key, ignoring" on this build because
+    # kitty's dlopen of libxkbcommon fails (see home/kitty.nix). Reading
+    # the keymap kitty ACTUALLY built, keyed by kitty's own
+    # parse_shortcut, is the only way to tell a live bind from a line
+    # that merely looks like one.
+    #
+    # `keyboard_modes[""]` is the default (no-leader) mode; its keymap
+    # maps SingleKey -> [KeyDefinition], defaults first and user binds
+    # appended, so the LAST entry is what the keypress actually does.
+    keymap = opts.keyboard_modes[""].keymap
+
+    # Resolved once into a plain dict, with NO helper function, and that
+    # is deliberate. `kitty +runpy` runs this script via `exec(<string>)`
+    # inside a FUNCTION frame (entry_points.py:25), so every name bound
+    # here -- including the `from ... import` above -- lands in that
+    # frame's locals, and exec creates no closure cells for them. A
+    # nested `def` referencing `keymap` or `parse_shortcut` therefore
+    # dies with NameError at call time, not at def time. Both NameErrors
+    # were observed while writing this assertion. Straight-line code at
+    # one level reads those locals fine.
+    PANE_FOCUS = {
+        "ctrl+shift+up": "neighboring_window up",
+        "ctrl+shift+down": "neighboring_window down",
+        "ctrl+shift+left": "neighboring_window left",
+        "ctrl+shift+right": "neighboring_window right",
+    }
+    # zsh binds the ctrl-arrow CSI sequences to word movement (^[[1;5C
+    # forward-word, ^[[1;5D backward-word) and kitty swallows whatever it
+    # binds, so a bind on these silently removes word movement from every
+    # shell, vim and TUI running in a pane. That is the whole reason pane
+    # focus lives on kitty_mod rather than on plain ctrl.
+    MUST_FALL_THROUGH = ("ctrl+left", "ctrl+right", "ctrl+up", "ctrl+down")
+    # Every Linux-reachable font-size step in kitty 0.49.2. `no_op`
+    # resolves to an empty definition; an ABSENT entry instead means the
+    # no_op line never parsed, which is the libxkbcommon failure mode
+    # that silently killed `ctrl+less`.
+    ZOOM_STEPS = (
+        "ctrl+shift+equal",
+        "ctrl+shift+plus",
+        "ctrl+shift+kp_add",
+        "ctrl+shift+minus",
+        "ctrl+shift+kp_subtract",
+    )
+    # Reset stays reachable: the recovery path if the size is ever changed
+    # by a route ZOOM_STEPS misses, e.g. `kitty @ set-font-size` or a
+    # font-size default kitty adds in a later release.
+    ZOOM_RESET = "ctrl+shift+backspace"
+
+    eff = {}
+    for spec in (
+        list(PANE_FOCUS) + list(MUST_FALL_THROUGH) + list(ZOOM_STEPS) + [ZOOM_RESET]
+    ):
+        defs = keymap.get(parse_shortcut(spec))
+        eff[spec] = defs[-1].definition if defs else None
+
+    errors = []
+
+    for spec, want in PANE_FOCUS.items():
+        got = eff[spec]
+        if got is None:
+            errors.append(f"{spec}: NOT BOUND (want {want!r})")
+        elif got != want:
+            errors.append(f"{spec}: resolves to {got!r}, want {want!r}")
+
+    for spec in MUST_FALL_THROUGH:
+        got = eff[spec]
+        if got is not None:
+            errors.append(
+                f"{spec}: bound to {got!r}; must stay UNBOUND so the "
+                "ctrl-arrow CSI sequence reaches the shell (zsh word movement)"
+            )
+
+    for spec in ZOOM_STEPS:
+        got = eff[spec]
+        if got is None:
+            errors.append(
+                f"{spec}: absent from keymap -- its `no_op` line did not parse"
+            )
+        elif got != "":
+            errors.append(
+                f"{spec}: resolves to {got!r}, want no_op (font zoom disabled)"
+            )
+
+    if eff[ZOOM_RESET] != "change_font_size all 0":
+        errors.append(
+            f"{ZOOM_RESET}: resolves to {eff[ZOOM_RESET]!r}, want "
+            "'change_font_size all 0' -- reset must stay bound as the "
+            "font-size recovery path"
+        )
+
+    if errors:
+        for e in errors:
+            print("FAIL: " + e, file=sys.stderr)
+        sys.exit(1)
+    print(
+        "keymap correct: kitty_mod+arrows move pane focus, plain "
+        "ctrl+arrows free for the shell, font-zoom steps disabled, "
+        "reset still reachable"
+    )
   '';
 
   # A real long-lived foreground process named `codex`. A shell wrapper

@@ -5119,12 +5119,39 @@ in
     active_tab_font_style   bold
     inactive_tab_font_style bold
 
-    # Keybinds — mirror Ghostty config (home/ghostty.nix). These override
-    # kitty defaults like ctrl+minus = decrease_font_size.
+    # Keybinds — largely mirror Ghostty config (home/ghostty.nix); pane
+    # focus deliberately diverges from it, see the note below. These
+    # override kitty defaults like ctrl+minus = decrease_font_size.
     map ctrl+minus launch --location=hsplit --cwd=current
     map ctrl+w close_window
-    map ctrl+up neighboring_window up
-    map ctrl+down neighboring_window down
+    # Pane focus movement, all four directions on kitty_mod (= ctrl+shift,
+    # left at its default since this config never sets `kitty_mod`).
+    #
+    # NOT plain ctrl+arrows. zsh binds the ctrl-arrow CSI sequences to
+    # word movement — `^[[1;5C` forward-word, `^[[1;5D` backward-word
+    # (verify: `bindkey | grep '1;5'`). kitty matches the exact modifier
+    # set and swallows what it binds, so `map ctrl+left` would take
+    # word-jump away from every shell, vim and TUI running in a pane.
+    # Horizontal is the direction that collides, and binding only left/
+    # right on kitty_mod while up/down stayed on plain ctrl would be an
+    # asymmetry the fingers have to remember, so all four moved together.
+    #
+    # Each kitty 0.49.2 default this shadows keeps a second binding, so
+    # nothing becomes unreachable:
+    #   ctrl+shift+up    scroll_line_up   -> also ctrl+shift+k
+    #   ctrl+shift+down  scroll_line_down -> also ctrl+shift+j
+    #   ctrl+shift+left  previous_tab     -> also ctrl+shift+tab
+    #   ctrl+shift+right next_tab         -> also ctrl+tab
+    # (source: kitty/options/definition.py, lines 3853-4246.)
+    #
+    # Arrows are named keysyms, but unlike the `ctrl+less` case noted
+    # below they resolve without libxkbcommon: kitty's own key tables
+    # carry `up`/`down`/`left`/`right`, and the four binds are asserted
+    # live in tests/kitty.nix rather than trusted to parse.
+    map ctrl+shift+up neighboring_window up
+    map ctrl+shift+down neighboring_window down
+    map ctrl+shift+left neighboring_window left
+    map ctrl+shift+right neighboring_window right
     # Plain vsplit of the focused pane — no grid logic, just side-by-side.
     # Use literal `<` (ASCII 0x3C, matches X11 keysym at runtime) rather
     # than `less`: kitty's `dlopen("libxkbcommon.so")` fails on this
@@ -5151,6 +5178,29 @@ in
     map ctrl+shift+r launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-panes-reflow
     # New tab inheriting cwd of current window.
     map ctrl+t new_tab_with_cwd
+
+    # Font zoom disabled. `ctrl+shift+minus` (what a Swedish layout types
+    # as `ctrl+_`) is kitty's decrease_font_size and was hit by accident,
+    # shrinking every window at once with no visible indicator of the
+    # current size — `change_font_size all` applies instance-wide, and
+    # the step bindings can only ever drift away from the `font_size`
+    # set above, which is meant to be the single source of truth.
+    #
+    # These are every Linux-reachable font-size step in kitty 0.49.2
+    # (kitty/options/definition.py:4350-4391). The `cmd+*` variants in
+    # that same range bind the macOS Command key and are unreachable
+    # here, so they are deliberately not listed.
+    map kitty_mod+equal no_op
+    map kitty_mod+plus no_op
+    map kitty_mod+kp_add no_op
+    map kitty_mod+minus no_op
+    map kitty_mod+kp_subtract no_op
+    # kitty_mod+backspace (reset_font_size) is deliberately LEFT BOUND.
+    # It is the recovery path if the size is ever changed by a route this
+    # list misses — `kitty @ set-font-size`, a future kitty default — and
+    # it cannot itself cause drift, because it only ever restores
+    # `font_size`. Removing it would make such a change unrecoverable
+    # without restarting kitty.
 
     # Copy: pipe selection through kitty-copy-unwrap (see let-binding
     # above) to undo TUI hanging-indent line wraps before xclip.
