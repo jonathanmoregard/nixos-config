@@ -41,8 +41,14 @@ SKILLS_EDIT = "Edit(//home/jonathan/.claude/skills/**)"
 BASE = {
     "model": "opus[1m]",
     "hooks": {"PreToolUse": [PUSH, GUARD]},
+    # Fixture data for a unittest module, not a permissions table anything
+    # loads. The gate's JSON-path exemption cannot reach it because this file
+    # is Python, so it is waived here instead.
+    # arftl-allow: permission-widened
     "permissions": {
         "allow": ["Read(//a/**)", SKILLS_EDIT],
+        # A deny rule names a command in order to forbid it.
+        # arftl-allow: destructive-rm
         "deny": ["Bash(rm -rf *)"],
     },
     "sandbox": {"enabled": False},
@@ -142,6 +148,9 @@ class TestProjection(ProjectionCase):
         self.run_script()
         doc = json.loads(self.read(self.live))
         self.assertIn(GUARD, doc["hooks"]["PreToolUse"])
+        # Asserts a deny rule SURVIVES the projection; the string is the
+        # protection, not a hazard.
+        # arftl-allow: destructive-rm
         self.assertIn("Bash(rm -rf *)", doc["permissions"]["deny"])
 
     def test_a_missing_live_file_is_created(self):
@@ -194,6 +203,61 @@ class TestRefusals(ProjectionCase):
         done = self.run_script("--dry-run")
         self.assert_live_untouched(before, inode)
         self.assertIn("model", done.stdout)
+
+
+class TestJsonParseParity(ProjectionCase):
+    """Claude Code reads this file with JSON.parse, which is stricter than
+    json.loads. A served file the harness cannot load must not be projected.
+    Each payload below was confirmed to project with rc=0 before the fix."""
+
+    def assert_refused(self, payload):
+        before, inode = self.read(self.live), os.stat(self.live).st_ino
+        with open(self.served, "wb") as f:
+            f.write(payload)
+        self.run_script(expect=75)
+        self.assertEqual(self.read(self.live), before)
+        self.assertEqual(os.stat(self.live).st_ino, inode)
+
+    def test_nan_is_refused(self):
+        self.assert_refused(b'{"a": NaN}\n')
+
+    def test_infinity_is_refused(self):
+        self.assert_refused(b'{"a": Infinity}\n')
+
+    def test_negative_infinity_is_refused(self):
+        self.assert_refused(b'{"a": -Infinity}\n')
+
+    def test_a_utf8_bom_is_refused(self):
+        self.assert_refused(b'\xef\xbb\xbf{"a": 1}\n')
+
+    def test_utf16_is_refused(self):
+        """json.loads sniffs this from bytes; JSON.parse cannot read it."""
+        self.assert_refused('{"a": 1}\n'.encode("utf-16-le"))
+
+
+class TestLiveModeLookup(unittest.TestCase):
+    """The mode is the one thing still read from the live file, so its lookup
+    must survive the file being unlinked between the read and the stat."""
+
+    def test_a_vanished_live_file_falls_back_to_0644(self):
+        import importlib.machinery
+        import importlib.util
+        spec = importlib.util.spec_from_loader(
+            "project", importlib.machinery.SourceFileLoader("project", SRC))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(mod._live_mode("/nonexistent/settings.json"), 0o644)
+
+    def test_an_existing_live_file_reports_its_own_mode(self):
+        import importlib.machinery
+        import importlib.util
+        spec = importlib.util.spec_from_loader(
+            "project", importlib.machinery.SourceFileLoader("project", SRC))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.NamedTemporaryFile(suffix=".json") as f:
+            os.chmod(f.name, 0o600)
+            self.assertEqual(mod._live_mode(f.name), 0o600)
 
 
 class TestWriteDiscipline(ProjectionCase):

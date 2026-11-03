@@ -62,13 +62,53 @@ def _read(path):
 
 
 def _check_object(raw, path):
-    """Validate without keeping the parse: the bytes are what gets written."""
+    """Validate without keeping the parse: the bytes are what gets written.
+
+    Stricter than `json.loads(raw)` on purpose. Claude Code is a JavaScript
+    program and reads this file with `JSON.parse`, which rejects things
+    Python's parser accepts from BYTES: `NaN`, `Infinity`, `-Infinity`, and a
+    UTF-16 encoding it sniffs from a byte string. Accepting any of them would
+    project a file the harness then cannot load -- the exact outcome this
+    check exists to prevent.
+
+    Decoding first, and passing a `str`, is what closes the encoding half:
+    `json.loads` only sniffs UTF-16/UTF-32 when handed bytes, and on a `str`
+    it rejects a leading BOM itself. An explicit BOM check here was tried and
+    removed -- a mutation proved it unreachable as the sole guard, and a
+    guard that looks load-bearing while nothing depends on it is a trap. The
+    BOM case stays asserted in the suite, so a change in that behaviour fails
+    the tests rather than slipping through.
+    """
     try:
-        doc = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Unusable(f"{path} is not UTF-8 ({exc})")
+
+    def _reject_constant(token):
+        raise Unusable(f"{path} contains {token}, which JSON.parse rejects")
+
+    try:
+        doc = json.loads(text, parse_constant=_reject_constant)
+    except json.JSONDecodeError as exc:
         raise Unusable(f"{path} is not valid JSON ({exc})")
     if not isinstance(doc, dict):
         raise Unusable(f"{path} is not a JSON object")
+
+
+def _live_mode(path):
+    """The live file's mode, or 0644 when it is not there to be asked.
+
+    Read separately from the content, so a writer that unlinks and recreates
+    the file between the two can make this lookup fail on a path that existed
+    moments earlier. That must not become an unhandled traceback: the unit
+    would exit 1 -- not a code this script defines -- and the OnFailure
+    notifier would record that merged settings are not arriving when the only
+    thing that happened was a concurrent write.
+    """
+    try:
+        return os.stat(path).st_mode & 0o7777
+    except FileNotFoundError:
+        return 0o644
 
 
 def _die(message, code=75):
@@ -139,10 +179,11 @@ def _project(args):
         print(f"claude-settings-project: installed {args.live} from {args.served}")
         return 0
 
-    # The harness may rewrite the file while this runs. That is harmless: the
-    # bytes written do not depend on what was there, so the last writer wins
-    # and the next tick converges either way.
-    _replace(args.live, served_raw, os.stat(args.live).st_mode & 0o7777)
+    # The harness may rewrite the file while this runs. That is harmless for
+    # the content -- the bytes written do not depend on what was there, so the
+    # last writer wins and the next tick converges either way. The mode is the
+    # one thing still read from the live file, hence _live_mode's fallback.
+    _replace(args.live, served_raw, _live_mode(args.live))
     print(f"claude-settings-project: updated {args.live} from {args.served}")
     return 0
 

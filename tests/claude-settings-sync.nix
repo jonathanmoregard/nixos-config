@@ -55,6 +55,8 @@ in
              "hooks": [{"type": "command", "command": "python3 bash-guard.py"}]}
     BASE = {"model": "opus[1m]", "env": {},
             "hooks": {"PreToolUse": [GUARD]},
+            # Fixture settings for the VM's throwaway home, not a real grant.
+            # arftl-allow: permission-widened
             "permissions": {"allow": ["Read(//a/**)"]}}
 
     def as_deploy(cmd):
@@ -77,8 +79,18 @@ in
             "systemctl show -P InvocationID claude-settings-sync.service").strip()
 
     def tick():
-        """One deploy tick; returns the sync unit's Result once it has run."""
+        """One deploy tick; returns the sync unit's Result once it has run.
+
+        The reset clears claude-runtime-deploy's START LIMIT, not a failure of
+        it. This lane fires every tick back to back, and systemd's default
+        burst (5 starts) is reached part-way through, after which `systemctl
+        start` refuses with "attempted too often" and the scenario fails for a
+        reason that has nothing to do with what it tests. Production ticks are
+        a merge or a timer apart, so the limit is never approached there; the
+        reset models that spacing rather than removing the protection.
+        """
         before = sync_invocation()
+        workstation.execute("systemctl reset-failed claude-runtime-deploy.service")
         workstation.succeed("systemctl start claude-runtime-deploy.service")
         workstation.wait_until_succeeds(
             f"[ \"$(systemctl show -P InvocationID claude-settings-sync.service)\" != {shlex.quote(before)} ] && "
@@ -166,6 +178,13 @@ in
     publish("{ truncated", "unparseable")
     assert tick() == "exit-code"
     assert workstation.succeed(f"sha256sum {live}").split()[0] == before
+    # The sync unit reaching "failed" does not mean OnFailure has finished:
+    # the notifier is a separate unit, started as the sync unit exits. Reading
+    # the record without waiting races it, and loses under load.
+    # Waiting on the unit is wrong here: it is a oneshot without
+    # RemainAfterExit, so it is never observably "active". Wait for the
+    # artifact, which also fails the lane if the notifier never writes it.
+    workstation.wait_for_file(record)
     rec = json.loads(workstation.succeed(f"cat {record}"))
     assert rec["unit"] == "claude-settings-sync.service", rec
     log = workstation.succeed("journalctl -u claude-settings-sync.service --no-pager")
