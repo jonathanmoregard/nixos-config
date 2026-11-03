@@ -674,6 +674,7 @@ in
     ./kitty.nix
     ./vscodium.nix
     ./git-hooks.nix
+    ./cache-publisher-enqueue.nix
     ./autodoro.nix
     ./claude-mcp-sync.nix
     ./dcg.nix

@@ -137,6 +137,7 @@
     # recipient yet).
     ../../modules/nixos/klaffat-infra.nix
     ../../modules/nixos/klaffat-local-google.nix
+    ../../modules/nixos/cache-publisher.nix
   ];
 
   services.claudeEgressObserve.enable = true;
@@ -314,6 +315,15 @@
     rekeyFile = ../../secrets/gcal-ical-url.age;
     owner = "jonathan";
     group = "users";
+    mode = "0400";
+  };
+  # Write token for the public jonathanmoregard cachix cache. Readable only
+  # by the cache-publisher service user (modules/nixos/cache-publisher.nix),
+  # never by jonathan or the agents running as jonathan.
+  age.secrets.cachix-push-token = {
+    rekeyFile = ../../secrets/cachix-push-token.age;
+    owner = "cache-publisher";
+    group = "cache-publisher";
     mode = "0400";
   };
 

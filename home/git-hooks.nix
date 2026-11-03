@@ -24,12 +24,21 @@ let
     fi
   '';
 
+  allBlock = e: ''
+    # ${e.name} (every repo)
+    ${e.body}
+  '';
+
   hookText = ''
     #!/usr/bin/env bash
     # Global pre-push hook. Dispatches on repo toplevel. Never blocks
     # the push — every body runs || true and the hook exits 0.
+    # $1 = remote name, $2 = remote URL; the ref list git sends on stdin
+    # is kept in $refs for the bodies.
+    refs="$(cat)"
     toplevel="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null)"
     ${lib.concatMapStringsSep "\n" entryBlock cfg.prePush}
+    ${lib.concatMapStringsSep "\n" allBlock cfg.prePushAll}
     exit 0
   '';
 in
@@ -67,7 +76,22 @@ in
     });
   };
 
-  config = lib.mkIf (cfg.prePush != [ ]) {
+  options.homeGitHooks.prePushAll = lib.mkOption {
+    description = ''
+      Bodies that run on every push from any repo, after the per-repo
+      dispatches. "$1"/"$2" are the remote name/URL and $refs holds the
+      `<local ref> <local sha> <remote ref> <remote sha>` lines.
+    '';
+    default = [ ];
+    type = lib.types.listOf (lib.types.submodule {
+      options = {
+        name = lib.mkOption { type = lib.types.str; };
+        body = lib.mkOption { type = lib.types.lines; };
+      };
+    });
+  };
+
+  config = lib.mkIf (cfg.prePush != [ ] || cfg.prePushAll != [ ]) {
     home.file.".config/git/hooks/pre-push" = {
       executable = true;
       text = hookText;
