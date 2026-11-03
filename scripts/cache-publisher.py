@@ -164,11 +164,17 @@ class World:
 # ── gates ───────────────────────────────────────────────────────────────────
 
 class Publisher:
-    def __init__(self, cfg, world, log=print):
+    def __init__(self, cfg, world, log=print, input_cache=None):
         self.cfg = cfg
         self.w = world
         self.log = log
-        self.input_cache = {}  # "o/r" -> (time, True); lock inputs only
+        # "o/r" and "o/r@rev" -> time of a POSITIVE preliminary answer, lock
+        # inputs only. Passed in by run() so it survives across runs: a flake
+        # with many distinct input repos costs 4+4n anonymous API requests
+        # against a 60/h budget, and rebuilding this map every run meant such
+        # an entry rate-limited at the same place forever. Never consulted by
+        # the pre-upload recheck, which is the gate that matters.
+        self.input_cache = {} if input_cache is None else input_cache
 
     def gh(self, path):
         st, hdrs, body = self.w.http_get(self.cfg["github_api"] + path)
@@ -412,13 +418,17 @@ class Publisher:
         so retiring early discards every later entry for that sha."""
         info = self.path_info(outs)
         upstream = self.upstream_set([p for p in outs if info.get(p)])
+        # Decided ONCE, with a single exit below. This flag had three separate
+        # return statements and the same defect appeared in each of them in
+        # turn: whatever filtering happens afterwards, an output that is not
+        # in the local store yet means this verdict can still change, so the
+        # commit must not be retired on it.
+        incomplete = any(not info.get(p) for p in outs)
         keep = []
-        unbuilt = False
         for p in outs:
             v = info.get(p)
             if not v:
-                unbuilt = True  # not built locally YET: a build may follow
-                continue
+                continue  # not built locally YET: a build may follow
             if not v.get("ultimate"):
                 continue
             if (v.get("ca") or "").startswith("fixed:"):
@@ -426,20 +436,22 @@ class Publisher:
             if p in upstream:
                 continue
             keep.append(p)
-        if not keep:
-            return [], unbuilt
-        closure = json.loads(self.w.nix(["path-info", "--json", "--json-format", "1", *self.local(),
-                                         "--recursive", *keep]))
-        if any(v is None for v in closure.values()):
-            return [], True  # incomplete locally: cachix could not push it anyway
-        up = self.upstream_set(closure)
-        size = sum(v.get("narSize", 0) for p, v in closure.items() if p not in up)
-        if size < self.cfg["min_nar"]:
-            return [], False  # built, and simply not worth pushing: conclusive
-        # `unbuilt` still matters when keep is non-empty: a multi-output
-        # package can have one output built and another not, and retiring the
-        # commit on the strength of the first would lose the rest for good.
-        return keep, unbuilt
+        if keep:
+            closure = json.loads(self.w.nix(["path-info", "--json", "--json-format", "1", *self.local(),
+                                             "--recursive", *keep]))
+            if any(v is None for v in closure.values()):
+                # Only partly present locally: cachix could not push it anyway,
+                # and the rest of the closure may yet be built.
+                keep, incomplete = [], True
+            else:
+                up = self.upstream_set(closure)
+                size = sum(v.get("narSize", 0) for p, v in closure.items() if p not in up)
+                if size < self.cfg["min_nar"]:
+                    # Too small to be worth pushing. Conclusive only if every
+                    # output is actually built: an unbuilt sibling can take the
+                    # total over the threshold later.
+                    keep = []
+        return keep, incomplete
 
     def audit_build_graph(self, drv):
         """Prove every byte the build consumed is public.
@@ -615,7 +627,18 @@ def run(cfg, world, log=print):
         with open(marker, "w"):
             pass
     # 3. process due pending entries
-    pub = Publisher(cfg, world, log)
+    icache_path = os.path.join(state, "input-cache.json")
+    try:
+        icache = read_json(icache_path)
+        if not isinstance(icache, dict):
+            raise ValueError("not an object")
+        icache = {k: v for k, v in icache.items() if isinstance(v, (int, float))}
+    except (OSError, ValueError) as e:
+        # A missing or damaged cache costs API requests, never correctness.
+        if os.path.exists(icache_path):
+            log(f"ignoring unreadable input cache: {e}")
+        icache = {}
+    pub = Publisher(cfg, world, log, input_cache=icache)
     for k in sorted(os.listdir(os.path.join(state, "pending"))):
         pf = os.path.join(state, "pending", k)
         st = read_json(pf)
@@ -638,9 +661,20 @@ def run(cfg, world, log=print):
             log(f"done {owner}/{repo}@{sha[:12]}: pushed {len(pushed)} path(s)" + "".join(f"\n  {p}" for p in pushed))
             final = True
         except RateLimited as e:
-            log(f"retry later {owner}/{repo}@{sha[:12]}: {e}")
-            st["next"] = e.not_before
-            write_json(pf, st)
+            # Bounded like every other retry. Without the expiry check this
+            # branch never incremented `tries` and never retired, so an entry
+            # that rate-limits every run stayed at the head of a sorted queue
+            # indefinitely — and the `break` below meant nothing behind it was
+            # ever processed.
+            st["tries"] += 1
+            if world.now() - st["first"] > cfg["expire"]:
+                log(f"expire {owner}/{repo}@{sha[:12]}: {e}")
+                open(os.path.join(state, "done", k), "w").close()
+                os.unlink(pf)
+            else:
+                log(f"retry later {owner}/{repo}@{sha[:12]}: {e}")
+                st["next"] = e.not_before
+                write_json(pf, st)
             break  # every further call would be rate limited too
         except Retry as e:
             st["tries"] += 1
@@ -658,6 +692,13 @@ def run(cfg, world, log=print):
         if final:
             open(os.path.join(state, "done", k), "w").close()
             os.unlink(pf)
+    # Persist the preliminary answers, pruned, so the next run does not spend
+    # the anonymous budget re-asking what it already asked.
+    try:
+        write_json(icache_path, {k: v for k, v in pub.input_cache.items()
+                                 if world.now() - v < cfg["input_ttl"]})
+    except OSError as e:
+        log(f"could not write input cache: {e}")
 
 
 def scan(cfg, log=print):
@@ -713,7 +754,13 @@ def config_from_env():
         "eval_store": e.get("CP_EVAL_STORE", "/var/lib/cache-publisher/evalstore"),
         "local_store": e.get("CP_LOCAL_STORE", "daemon"),
         "min_nar": int(e.get("CP_MIN_NAR_BYTES", str(1024 * 1024))),
-        "input_ttl": int(e.get("CP_INPUT_TTL", "600")),
+        # Preliminary lock-input answers only, and only positive ones. Longer
+        # than the 15 min timer interval on purpose: at 600 s a persisted
+        # cache was always stale by the next run, which is what let a
+        # many-input flake rate-limit at the same point forever. Safe because
+        # the pre-upload recheck never consults this cache and re-asks GitHub
+        # about the repo, the commit and every lock input.
+        "input_ttl": int(e.get("CP_INPUT_TTL", str(6 * 3600))),
         "expire": int(e.get("CP_EXPIRE", str(48 * 3600))),
         "url_allow": e.get("CP_URL_ALLOW", "nixos.org").split(),
         "scan_roots": [os.path.expanduser(p) for p in e.get("CP_SCAN_ROOTS", "~/Repos ~/worktrees").split()],

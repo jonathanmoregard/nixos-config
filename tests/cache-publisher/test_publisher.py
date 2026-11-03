@@ -32,6 +32,11 @@ PRIV = "/nix/store/0000000000000000000000000000000f-klaffat-secret-1.0"
 MiB = 1024 * 1024
 
 
+def read_state(path):
+    with open(path) as f:
+        return json.load(f)
+
+
 def lock(**inputs):
     nodes = {"root": {"inputs": {k: k for k in inputs}}}
     nodes.update({k: {"locked": v} for k, v in inputs.items()})
@@ -534,6 +539,66 @@ class Case(unittest.TestCase):
         self.assertEqual(self.w.pushed, [[OUT]])  # me/tool still published
         self.assertIn("unexpected TimeoutExpired", self.log())
 
+    def test_small_built_output_with_unbuilt_sibling_stays_queued(self):
+        # One output built but below the threshold, one not built at all. The
+        # sibling can take the total over the threshold once it exists, so
+        # this is not a verdict — `size < min_nar` must not retire it.
+        self.w.packages = {"default": [OUT, DEP]}
+        self.w.closure = {OUT: {"narSize": 4096}, GLIBC: {"narSize": 30 * MiB}}
+        self.run_once()
+        self.assertEqual(self.w.pushed, [])
+        self.assertEqual(len(self.pending()), 1)
+        self.assertEqual(self.done(), [])
+        # the sibling is built, and now the pair is worth pushing
+        self.w.local[DEP] = {"ultimate": True, "ca": None, "narSize": 40 * MiB,
+                             "deriver": OUT + ".drv"}
+        self.w.closure = {OUT: {"narSize": 4096}, DEP: {"narSize": 40 * MiB}}
+        self.w.t += 4000
+        self.run_once(None)
+        self.assertEqual(self.w.pushed, [[OUT, DEP]])
+        self.assertEqual(self.pending(), [])
+
+    # ── rate limiting is bounded like every other retry ─────────────────────
+    def test_rate_limited_entry_expires_instead_of_blocking_forever(self):
+        self.w.rate_limited = True
+        self.run_once()
+        self.assertEqual(len(self.pending()), 1)
+        self.w.t += 49 * 3600
+        self.run_once(None)
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(len(self.done()), 1)
+        self.assertIn("expire", self.log())
+        self.assertEqual(self.w.pushed, [])
+
+    def test_rate_limited_entry_counts_tries(self):
+        self.w.rate_limited = True
+        self.run_once()
+        st = read_state(os.path.join(self.cfg["state"], "pending", self.pending()[0]))
+        self.assertEqual(st["tries"], 1)
+
+    # ── the preliminary input answers survive a run ─────────────────────────
+    def test_input_answers_are_reused_by_the_next_run(self):
+        self.w.commits.add(f"me/tool@{SHA2}")
+        self.run_once()
+        first = len(self.w.gh_calls)
+        self.w.t += 60
+        self.run_once(f"me/tool {SHA2}")
+        # the second entry re-asks about itself, but not about nixpkgs, whose
+        # preliminary answer was persisted by the previous run
+        second = len(self.w.gh_calls) - first
+        self.assertLess(second, first, (first, second))
+        self.assertTrue(any("input-cache" in f for f in os.listdir(self.cfg["state"])))
+
+    def test_unreadable_input_cache_is_ignored(self):
+        self.w.commits.add(f"me/tool@{SHA2}")
+        self.run_once()
+        with open(os.path.join(self.cfg["state"], "input-cache.json"), "w") as f:
+            f.write("{not json")
+        self.w.t += 60
+        self.run_once(f"me/tool {SHA2}")
+        self.assertIn("unreadable input cache", self.log())
+        self.assertEqual(len(self.w.pushed), 2)  # still publishes
+
     def test_built_but_nothing_worth_pushing_is_retired(self):
         # Built locally and simply too small: a conclusive answer. It must be
         # retired, not left re-evaluating every hour for 48 h.
@@ -626,12 +691,21 @@ class Case(unittest.TestCase):
         self.assertIn("stopped being public before upload", self.log())
 
     def test_input_cache_not_used_for_final_recheck(self):
-        # first entry warms the input cache; second must still re-ask GitHub
+        # The first entry warms the preliminary cache, which now persists
+        # across runs. The pre-upload recheck must still ask GitHub, so a lock
+        # input that has since gone private stops the upload.
+        #
+        # Stated as a flat visibility rather than a ["public", "private"]
+        # sequence on purpose: the sequence form consumes one element per
+        # repo_public call, so it silently re-aimed at a different call when
+        # the number of preliminary calls changed, and the test passed while
+        # asserting nothing. A flat value holds however many calls are made.
         self.run_once()
         self.w.commits.add(f"me/tool@{SHA2}")
-        self.w.repos["NixOS/nixpkgs"] = ["public", "private"]
+        self.w.repos["NixOS/nixpkgs"] = "private"
         self.run_once(f"me/tool {SHA2}")
         self.assertEqual(len(self.w.pushed), 1)
+        self.assertIn("stopped being public before upload", self.log())
 
     def test_eval_failure_in_fresh_store_never_pushes(self):
         # e.g. an eval-time fetch of private content: the anonymous store can't get it
