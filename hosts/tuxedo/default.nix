@@ -24,6 +24,9 @@
     # jonathan cannot write. Pairs with the module above and must be imported
     # with it: the mounts name that clone as their source.
     ../../modules/nixos/claude-runtime-deploy.nix
+    # Merges that clone's settings.json into the live ~/.claude/settings.json,
+    # the one entry the mounts cannot serve as a link.
+    ../../modules/nixos/claude-settings-sync.nix
   ];
 
   networking.hostName = "tuxedo";
