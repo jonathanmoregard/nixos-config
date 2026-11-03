@@ -91,6 +91,18 @@ let
     "chatgpt.com"
     "auth.openai.com"
     "api.openai.com"
+    # Bolagsverket open-data bulk file (CC-BY, weekly refresh):
+    "vardefulla-datamangder.bolagsverket.se"
+    # PRV open-data FTP (Swedish national trademark register;
+    # sanctioned bulk channel used by prv_shim).
+    "opendata.prv.se"
+  ]
+  # The keyed APIs. The host's research-broker calls them for new code
+  # (the guest reaches it at 10.0.2.2:8124); during the switchover's
+  # expand step (legacyPaths) MCP processes still running old code call
+  # them from the guest directly, so they stay until the contract step.
+  # research-agent docs/egress-broker.md §12.1.
+  ++ lib.optionals cfg.legacyPaths [
     "api.exa.ai"
     "mcp.exa.ai"
     # api.tavily.com is AWS ELB-backed and its A records rotate on a
@@ -112,11 +124,6 @@ let
     # shim-env change, not another firewall PR):
     "euipo.europa.eu"
     "api.euipo.europa.eu"
-    # Bolagsverket open-data bulk file (CC-BY, weekly refresh):
-    "vardefulla-datamangder.bolagsverket.se"
-    # PRV open-data FTP (Swedish national trademark register;
-    # sanctioned bulk channel used by prv_shim).
-    "opendata.prv.se"
     # Shopping-search shims (agent/shims/{ebay,tradera}_shim.py in
     # the research-agent repo): the marketplaces' own read-only
     # search APIs. eBay's token endpoint and Browse API share
@@ -128,6 +135,17 @@ let
   ];
 in
 {
+  options.researchAgent.egress.legacyPaths = lib.mkOption {
+    type = lib.types.bool;
+    default = true;
+    description = ''
+      Egress-broker switchover transition switch (set from the host's
+      researchAgent.legacyPaths). true: the keyed API hosts and the
+      scraper's 10.0.2.2:8123 stay reachable next to the broker's :8124,
+      for MCP processes still running the old code. false: broker only.
+    '';
+  };
+
   options.researchAgent.egress.upstreamDns = lib.mkOption {
     type = lib.types.str;
     # qemu user-mode (SLIRP) networking's built-in resolver.
@@ -169,6 +187,11 @@ in
             ip daddr ${cfg.upstreamDns} udp dport 53 meta skuid "dnsmasq" accept
             ip daddr ${cfg.upstreamDns} tcp dport 53 meta skuid "dnsmasq" accept
             ip daddr @research_allowed tcp dport 443 accept
+            # research-broker (modules/nixos/research-broker.nix): the
+            # host's credential-injecting egress broker, listening on host
+            # 127.0.0.1:8124, which SLIRP's gateway 10.0.2.2 maps to.
+            ip daddr 10.0.2.2 tcp dport 8124 accept
+          '' + lib.optionalString cfg.legacyPaths ''
             # Scraper microvm HTTP API. 10.0.2.2 is the SLIRP host
             # gateway from inside this VM (qemu user-mode default).
             # The host's forwardPorts rule on the scraper VM exposes
@@ -176,6 +199,7 @@ in
             # so this rule lets the agent's render_shim reach the
             # scraper without widening the broader egress allowlist.
             ip daddr 10.0.2.2 tcp dport 8123 accept
+          '' + ''
           }
         }
       '';

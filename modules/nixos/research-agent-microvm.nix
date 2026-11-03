@@ -22,6 +22,9 @@
 let
   # Captured here: inside the guest module below, `config` is the guest's.
   hostJonathanUid = config.users.users.jonathan.uid;
+  # Egress-broker switchover (research-vm-roll.nix): while true, the old
+  # direct paths stay open next to the broker.
+  legacyPaths = config.researchAgent.legacyPaths;
 in
 {
   microvm.vms.research-agent = {
@@ -36,6 +39,7 @@ in
       # Egress allowlist + the resolver that fills it (dnsmasq nftset).
       # The allowlist itself lives there.
       imports = [ ./research-agent-egress.nix ];
+      researchAgent.egress.legacyPaths = legacyPaths;
 
       microvm = {
         hypervisor = "qemu";
@@ -126,6 +130,7 @@ in
             tag = "tool-cache";
             proto = "virtiofs";
           }
+        ] ++ lib.optionals legacyPaths [
           {
             # Bearer token for the scraper microvm's HTTP API. The file
             # lives on the host at /var/lib/scraper-bearer/token

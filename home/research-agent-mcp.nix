@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ pkgs, osConfig ? { }, ... }:
 # research-agent-mcp wrapper.
 #
 # Claude Code spawns `research-agent-mcp` as a stdio MCP subprocess
@@ -232,6 +232,16 @@ in
         # jonathan-owned by a tmpfiles rule in the healthcheck module;
         # writer (here) and reader (watchdog) agree on this exact path.
         export RESEARCH_ACTIVITY_FILE="''${RESEARCH_ACTIVITY_FILE:-/run/research-agent/active}"
+
+        # research-broker admin socket (0600 jonathan): the dual-mode MCP
+        # server registers each broker-mode dial here (research-agent
+        # docs/egress-broker.md §2.4). Override-friendly like the others.
+        export RESEARCH_BROKER_ADMIN="''${RESEARCH_BROKER_ADMIN:-/run/research-broker/admin.sock}"
+
+        # Research VM slot count, from the same NixOS option that sizes the
+        # slot files and the drained roll's locking (research-vm-roll.nix):
+        # not overridable, so the roll always locks every slot the MCP uses.
+        export RESEARCH_SLOTS=${toString (osConfig.researchAgent.slots or 2)}
 
         # The bootstrap is the final process. It disables dumpability before
         # reading agenix, then runs mcp_server.server in-process; neither this

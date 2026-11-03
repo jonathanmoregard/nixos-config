@@ -175,6 +175,21 @@ in
 
       count=$(read_int "$COUNT_FILE")
 
+      # Drained roll in progress (research-vm-roll.nix): the scraper is being
+      # restarted on purpose, every research slot is held, nothing is
+      # dialling it. Like a fresh heartbeat: skip the probe, no strike.
+      # Only while that roll unit is actually running: the marker lives in
+      # a jonathan-owned dir, so a stale or planted one must not silence
+      # the watchdog.
+      if [ -e /run/research-agent/rolling ]; then
+        roll_state=$(systemctl show -P ActiveState research-vm-roll@scraper.service 2>/dev/null || true)
+        if [ "$roll_state" = active ] || [ "$roll_state" = activating ]; then
+          echo "healthcheck: drained roll in progress (research-vm-roll@scraper); not probing"
+          echo 0 > "$COUNT_FILE"
+          exit 0
+        fi
+      fi
+
       # ssh-keyscan does the protocol banner exchange only — no auth,
       # no known_hosts mutation. -T sets the connect timeout. Piping to
       # grep ensures we got a real key line, not just an empty response.

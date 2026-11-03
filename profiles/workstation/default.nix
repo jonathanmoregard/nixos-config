@@ -59,6 +59,13 @@
     # crawls. See module header for the trust-boundary rationale.
     ../../modules/nixos/scraper-microvm.nix
     ../../modules/nixos/scraper-microvm-healthcheck.nix
+    # Host-side egress broker: holds the research agent's third-party API
+    # keys and becomes the research VM's path to them and to the scraper.
+    ../../modules/nixos/research-broker.nix
+    # Its zero-downtime switchover: drained VM rolls, slot files, the
+    # egress-era file, the G3 gate script (research-agent
+    # docs/egress-broker.md §12).
+    ../../modules/nixos/research-vm-roll.nix
     # Weekly CVE + sandbox-score sweep of both microVMs; results reach
     # Claude via /var/lib/unit-failures (modules/nixos/security-batch.nix).
     ../../modules/nixos/security-batch/research-agent.nix
@@ -410,6 +417,8 @@
     "d /home/jonathan/Repos 0755 jonathan users -"
     "d /home/jonathan/Repos/research-agent 0755 jonathan users -"
     "d /home/jonathan/Repos/research-agent/reports 0755 jonathan users -"
+    # The scraper VM's only workspace share (scraper-microvm.nix).
+    "d /home/jonathan/Repos/research-agent/scraper 0755 jonathan users -"
   ];
 
   # ---------------------------------------------------------------------
