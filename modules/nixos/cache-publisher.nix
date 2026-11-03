@@ -88,9 +88,12 @@
 #   - `allowed-uris` matches the `github:` input TYPE, so builtins.fetchTree
 #     with a `host` attribute can issue one unauthenticated HTTPS GET from
 #     this machine's IP. audit_lock rejects host != github.com for lock
-#     inputs; the builtin path is not gated;
-#   - "http error 403" is absent from the transient list, so a rate-limited
-#     fetch inside nix retires a sha permanently;
+#     inputs; the builtin path is not gated. CONFIRMED, not inferred: under
+#     this module's own NIX_CONFIG_FRESH, `fetchTree { type = "github";
+#     host = "gitlab.example.com"; }` reached DNS resolution of that host
+#     rather than being refused by policy. A bare IP or host:port is rejected
+#     by nix itself ("invalid instance host"), and IPAddressDeny still blocks
+#     loopback/LAN/tailnet, so the reachable set is public hosts only;
 #   - a bug in the audit code itself (tests/cache-publisher/*);
 #   - secrets committed to a public repo end up in its outputs — repo
 #     hygiene, not a cache problem;
@@ -104,6 +107,18 @@
 #     NIX_CONFIG_FRESH pins are inherited from this host's nix.conf;
 #   - an output pushed while the repo was public stays fetchable after a
 #     later public→private flip (clients also cache narinfos).
+#
+# Withdrawn from that list, because it was measured and found false: "'http
+# error 403' is absent from TRANSIENT, so a rate-limited fetch inside nix
+# retires a sha permanently". On nix 2.34.9 a `github:` archive fetch reports
+# its status inside "Failed to open archive (Source threw exception: error:
+# unable to download ...: HTTP error 403)", and the "unable to download"
+# prefix already classifies that as transient — so the dominant 403 path, the
+# one anonymous rate limiting actually takes, always retried. The shape that
+# genuinely escaped carried no status at all ("Failed to fetch git
+# repository") and is now in TRANSIENT. Both are pinned by tests. Recorded
+# here because a plausible-sounding risk that prose alone would keep
+# re-proposing is worth refuting once, in writing.
 let
   cfg = config.services.cache-publisher;
   base = "/var/lib/cache-publisher";

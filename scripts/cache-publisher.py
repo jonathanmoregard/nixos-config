@@ -87,9 +87,20 @@ NIX_CONFIG_FRESH = NIX_CONFIG + (
 CANDIDATES_APPLY = ('ps: builtins.mapAttrs (n: p: { drv = p.drvPath; '
                     'outs = map (o: (builtins.getAttr o p).outPath) (p.outputs or ["out"]); }) ps')
 
+# A network-shaped nix failure is a "not now", never a verdict about the repo:
+# Skip writes `done` and the sha is never reconsidered, so a needle missing
+# here loses a repo permanently and silently. Erring towards retry costs only
+# bounded attempts until the 48 h expiry, and no gate is weakened either way.
+# "unable to download" is the load-bearing one: nix wraps the HTTP status of a
+# `github:` archive fetch inside "Failed to open archive (Source threw
+# exception: error: unable to download ...: HTTP error 403)", so anonymous rate
+# limiting (GitHub answers 403, not 429) is already caught by the prefix rather
+# than by a status needle. "failed to fetch git repository" is the shape that
+# carries no status at all — measured on nix 2.34.9; both are pinned by tests.
 TRANSIENT = ("unable to download", "http error 404", "could not resolve host", "couldn't resolve host",
              "timeout", "timed out", "connection refused", "network is unreachable",
-             "http error 5", "http error 429", "temporary failure")
+             "http error 5", "http error 429", "temporary failure",
+             "failed to fetch git repository")
 
 
 # A flake-stated drvPath reaches nix as a positional argument, so it must not
