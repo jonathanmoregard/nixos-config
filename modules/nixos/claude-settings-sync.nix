@@ -6,22 +6,24 @@
 # clone, so a merged PR reaches it on the next deploy tick. settings.json
 # cannot be one: Claude Code writes it at runtime (`/model`, rules saved from
 # a permission prompt, `/config`), and through a symlink into the read-only
-# projection those writes fail with EROFS. So it stays a real file that
-# jonathan — and therefore the harness — can write, and this unit merges the
-# repository's copy into it.
+# projection those writes fail with EROFS. Worse, Claude Code REPLACES the
+# file rather than writing through it, so a link would be swapped back for a
+# regular file on the first write — silently restoring the problem this unit
+# exists to fix. So it stays a real file, and this unit projects the
+# repository's copy onto it.
 #
-# The merge is three-way (scripts/claude-settings-merge.py): a value only the
-# repository changed arrives, a value only the live file changed is kept, and
-# list entries either side added are kept. That last part is why this is not a
-# copy. The live file carries entries nothing in the repository knows about —
-# today a PreToolUse group that dcg wrote into it — and a copy, or jq's `*`
-# (which replaces arrays), deletes them without a word. The script refuses any
-# merge that would drop such an entry and leaves the file alone.
+# The repository wins (scripts/claude-settings-project.py): after a run the
+# live file IS the served file, byte for byte, and a live-only edit does not
+# survive. That is the point. Every live-only entry measured on tuxedo on
+# 2026-11-03 was drift nobody wanted — a PreToolUse group dcg's own
+# `self_heal_hook` wrote into the file pinned to a /nix/store path that stops
+# resolving after the next dcg upgrade and GC, an allow rule a merged PR had
+# deliberately removed, and a `model` value `/model` wrote over the
+# checked-in one. There is no merge base and nothing to reconcile.
 #
-# The merge base — the served copy as of the last successful run — lives in
-# ~/.local/state/claude-settings-sync/base.json. Without it the script refuses
-# to merge a live file that differs from the served one, because nothing can
-# then tell "added live" from "removed upstream".
+# The cost is the other side of the same coin: a `/model` or `/config` change
+# made in a session is reverted at the next tick. Values meant to persist
+# belong in the repository, which is where this unit reads them from.
 #
 # Triggered by claude-runtime-deploy.service succeeding rather than by a watch
 # on the file: git replaces a file by unlinking and recreating it, so a path
@@ -41,21 +43,20 @@ let
   served = "/var/lib/claude-runtime/checkout/runtime/settings.json";
   live = "${home}/.claude/settings.json";
   marker = "${home}/.claude/.projection-enabled";
-  base = "${home}/.local/state/claude-settings-sync/base.json";
 
   failuresDir = "/var/lib/unit-failures";
   record = "${failuresDir}/claude-settings-sync.json";
 
   # The suite runs against the installed file, so the store path the unit
   # executes is the one that passed it, and a red suite fails the host build.
-  merge = pkgs.runCommand "claude-settings-merge" {
+  project = pkgs.runCommand "claude-settings-project" {
     nativeBuildInputs = [ pkgs.python3 pkgs.jq ];
   } ''
-    install -Dm755 ${../../scripts/claude-settings-merge.py} $out/bin/claude-settings-merge
-    substituteInPlace $out/bin/claude-settings-merge \
+    install -Dm755 ${../../scripts/claude-settings-project.py} $out/bin/claude-settings-project
+    substituteInPlace $out/bin/claude-settings-project \
       --replace-fail '#!/usr/bin/env python3' '#!${pkgs.python3}/bin/python3'
-    PYTHONDONTWRITEBYTECODE=1 CLAUDE_SETTINGS_MERGE_SRC=$out/bin/claude-settings-merge \
-      python3 -W error::ResourceWarning ${../../tests/claude-settings-sync/test_merge.py} -v
+    PYTHONDONTWRITEBYTECODE=1 CLAUDE_SETTINGS_PROJECT_SRC=$out/bin/claude-settings-project \
+      python3 -W error::ResourceWarning ${../../tests/claude-settings-sync/test_project.py} -v
   '';
 
   failureNotify = pkgs.writeShellApplication {
@@ -93,7 +94,7 @@ let
 in
 {
   systemd.services.claude-settings-sync = {
-    description = "Merge the served claude-config settings.json into ~/.claude/settings.json";
+    description = "Project the served claude-config settings.json onto ~/.claude/settings.json";
     after = [ "claude-runtime-deploy.service" ];
     unitConfig = {
       OnFailure = "claude-settings-sync-failure-notify.service";
@@ -106,10 +107,9 @@ in
       User = user;
       Group = group;
       ExecStart = lib.escapeShellArgs [
-        "${merge}/bin/claude-settings-merge"
+        "${project}/bin/claude-settings-project"
         "--served" served
         "--live" live
-        "--base" base
         "--marker" marker
       ];
       ExecStopPost = "+${clearRecord}";

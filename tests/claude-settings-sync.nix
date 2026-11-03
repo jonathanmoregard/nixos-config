@@ -1,5 +1,6 @@
-# vm-claude-settings-sync: a merged settings.json change reaches the live
-# ~/.claude/settings.json, and nothing written there at runtime is lost.
+# vm-claude-settings-sync: the checked-in settings.json wins. After a deploy
+# tick the live ~/.claude/settings.json IS the served one, byte for byte, and
+# whatever was written there at runtime is gone.
 #
 # Drives the real chain, offline: a commit lands in a local remote, the real
 # claude-runtime-deploy.service fast-forwards its clone (through a minimal
@@ -9,12 +10,15 @@
 #
 # Invariants:
 #   no cutover marker                 → live file not created
-#   upstream adds a probe key         → it arrives; the live-only hook group,
-#                                       the /model pin and file ownership stay
-#   live gains an "always allow" rule,
-#   upstream removes the probe        → the probe goes, the rule stays
-#   upstream deletes the key holding
-#   a live-only entry                 → unit fails, live bytes unchanged,
+#   live has a dcg hook group and a
+#   /model pin, upstream does not     → both are gone after the tick; the
+#                                       live file is byte-identical to served
+#                                       and still jonathan:users 0644
+#   upstream adds a key               → it arrives
+#   live gains an "always allow" rule → the next tick drops it
+#   upstream deletes a key            → it goes, and this is a SUCCESS: there
+#                                       is no live-only entry to protect
+#   served file is unparseable        → unit fails, live bytes unchanged,
 #                                       failure record written for Claude
 #   upstream repaired                 → unit succeeds, record cleared
 #
@@ -41,6 +45,7 @@ in
 
     seed = "/var/lib/claude-runtime-seed"
     served = f"{seed}/runtime/settings.json"
+    clone = "/var/lib/claude-runtime/checkout/runtime/settings.json"
     live = "/home/jonathan/.claude/settings.json"
     record = "/var/lib/unit-failures/claude-settings-sync.json"
 
@@ -58,11 +63,14 @@ in
     def as_jonathan(cmd):
         return workstation.succeed(f"su jonathan -c {shlex.quote(cmd)}")
 
-    def publish(doc, message):
-        """Commit DOC as the served settings.json in the remote."""
-        as_deploy(f"cat > {served} <<'EOF'\n{json.dumps(doc, indent=2)}\nEOF")
+    def publish(text, message):
+        """Commit TEXT as the served settings.json in the remote."""
+        as_deploy(f"cat > {served} <<'EOF'\n{text}\nEOF")
         as_deploy(f"cd {seed} && ${git} -c user.name=t -c user.email=t@t.invalid "
                   f"-c commit.gpgsign=false commit -qam {shlex.quote(message)}")
+
+    def publish_doc(doc, message):
+        publish(json.dumps(doc, indent=2), message)
 
     def sync_invocation():
         return workstation.succeed(
@@ -81,6 +89,10 @@ in
 
     def read_live():
         return json.loads(workstation.succeed(f"cat {live}"))
+
+    def assert_live_is_served():
+        """The whole contract. cmp exits non-zero on any difference."""
+        workstation.succeed(f"cmp {live} {clone}")
 
     workstation.wait_for_unit("multi-user.target")
     workstation.succeed("systemctl stop claude-runtime-deploy.timer")
@@ -105,60 +117,64 @@ in
     assert tick() == "success"
     workstation.fail(f"test -e {live}")
 
-    # ── The live file as tuxedo has it: a live-only dcg group and a model pin ──
+    # ── The live file as tuxedo had it: a live-only dcg group and a model pin ──
     live_doc = json.loads(json.dumps(BASE))
     live_doc["model"] = "claude-opus-5"
     live_doc["hooks"]["PreToolUse"].insert(0, DCG)
-    as_jonathan("mkdir -p ~/.claude ~/.local/state/claude-settings-sync && "
-                "touch ~/.claude/.projection-enabled")
+    as_jonathan("mkdir -p ~/.claude && touch ~/.claude/.projection-enabled")
     as_jonathan(f"cat > {live} <<'EOF'\n{json.dumps(live_doc, indent=2)}\nEOF")
-    as_jonathan("cat > ~/.local/state/claude-settings-sync/base.json <<'EOF'\n"
-                f"{json.dumps(BASE, indent=2)}\nEOF")
 
-    # ── A merged change arrives; the live-only entries survive ──
+    # ── One tick and the checked-in file wins outright ──
     probe = json.loads(json.dumps(BASE))
     probe["env"]["SETTINGS_SYNC_PROBE"] = "arrived"
     assert "SETTINGS_SYNC_PROBE" not in read_live()["env"]
-    publish(probe, "probe")
+    publish_doc(probe, "probe")
     assert tick() == "success", workstation.succeed(
         "journalctl -u claude-settings-sync.service --no-pager | tail -20")
+    assert_live_is_served()
     got = read_live()
     assert got["env"].get("SETTINGS_SYNC_PROBE") == "arrived", got
-    assert DCG in got["hooks"]["PreToolUse"], got
+    assert DCG not in got["hooks"]["PreToolUse"], got
     assert GUARD in got["hooks"]["PreToolUse"], got
-    assert got["model"] == "claude-opus-5", got
+    assert got["model"] == "opus[1m]", got
     owner = workstation.succeed(f"stat -c '%U:%G %a' {live}").strip()
     assert owner == "jonathan:users 644", owner
     workstation.fail(f"test -e {record}")
 
-    # ── A runtime write survives the next upstream change ──
+    # ── A runtime write does not survive the next tick ──
     as_jonathan(
         "${pkgs.python3}/bin/python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); "
         "d[\"permissions\"][\"allow\"].append(\"Bash(ls:*)\"); "
         "json.dump(d, open(p, \"w\"), indent=2)' " + live)
-    publish(BASE, "drop probe")
+    publish_doc(BASE, "drop probe")
     assert tick() == "success"
+    assert_live_is_served()
     got = read_live()
     assert "SETTINGS_SYNC_PROBE" not in got["env"], got
-    assert "Bash(ls:*)" in got["permissions"]["allow"], got
-    assert DCG in got["hooks"]["PreToolUse"], got
+    assert "Bash(ls:*)" not in got["permissions"]["allow"], got
 
-    # ── A merge that would drop a live-only entry is refused, loudly ──
-    lossy = json.loads(json.dumps(BASE))
-    del lossy["hooks"]["PreToolUse"]
-    before = workstation.succeed(f"sha256sum {live}")
-    publish(lossy, "lossy")
+    # ── Upstream deleting a key is a success, not a refusal ──
+    pruned = json.loads(json.dumps(BASE))
+    del pruned["hooks"]["PreToolUse"]
+    publish_doc(pruned, "prune the hook key")
+    assert tick() == "success"
+    assert_live_is_served()
+    assert "PreToolUse" not in read_live()["hooks"], read_live()
+
+    # ── An unusable served file fails loudly and leaves the live one alone ──
+    before = workstation.succeed(f"sha256sum {live}").split()[0]
+    publish("{ truncated", "unparseable")
     assert tick() == "exit-code"
-    assert workstation.succeed(f"sha256sum {live}") == before
+    assert workstation.succeed(f"sha256sum {live}").split()[0] == before
     rec = json.loads(workstation.succeed(f"cat {record}"))
     assert rec["unit"] == "claude-settings-sync.service", rec
     log = workstation.succeed("journalctl -u claude-settings-sync.service --no-pager")
-    assert "would lose: live added" in log, log
+    assert "is not valid JSON" in log, log
 
     # ── Repaired upstream: the next tick succeeds and clears the record ──
-    publish(BASE, "repair")
+    publish_doc(BASE, "repair")
     assert tick() == "success"
     workstation.fail(f"test -e {record}")
-    assert DCG in read_live()["hooks"]["PreToolUse"]
+    assert_live_is_served()
   '';
 }
