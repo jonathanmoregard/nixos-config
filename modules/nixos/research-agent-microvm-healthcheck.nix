@@ -287,6 +287,24 @@ in
       #   activating  → boot in progress; systemd's own
       #                 TimeoutStartSec handles a stuck activation.
       #   deactivating→ stop in progress; ditto.
+      # Drained roll in progress (research-vm-roll.nix): the research-agent is being
+      # restarted on purpose, every research slot is held, nothing is
+      # dialling it. Like a fresh heartbeat: skip the probe, no strike.
+      # Only while that roll unit is actually running: the marker lives in
+      # a jonathan-owned dir, so a stale or planted one must not silence
+      # the watchdog. BEFORE the state switch: a roll whose restart left
+      # the unit `failed` is the roll's to finish, and the `failed` arm
+      # below would otherwise issue a competing restart and spend the
+      # give-up budget while the roll still holds every slot.
+      if [ -e /run/research-agent/rolling ]; then
+        roll_state=$(systemctl show -P ActiveState research-vm-roll@research-agent.service 2>/dev/null || true)
+        if [ "$roll_state" = active ] || [ "$roll_state" = activating ]; then
+          echo "healthcheck: drained roll in progress (research-vm-roll@research-agent); not probing"
+          echo 0 > "$COUNT_FILE"
+          exit 0
+        fi
+      fi
+
       state=$(systemctl is-active microvm@research-agent.service 2>/dev/null || true)
       case "$state" in
         active) ;;
@@ -306,21 +324,6 @@ in
       esac
 
       count=$(read_int "$COUNT_FILE")
-
-      # Drained roll in progress (research-vm-roll.nix): the research-agent is being
-      # restarted on purpose, every research slot is held, nothing is
-      # dialling it. Like a fresh heartbeat: skip the probe, no strike.
-      # Only while that roll unit is actually running: the marker lives in
-      # a jonathan-owned dir, so a stale or planted one must not silence
-      # the watchdog.
-      if [ -e /run/research-agent/rolling ]; then
-        roll_state=$(systemctl show -P ActiveState research-vm-roll@research-agent.service 2>/dev/null || true)
-        if [ "$roll_state" = active ] || [ "$roll_state" = activating ]; then
-          echo "healthcheck: drained roll in progress (research-vm-roll@research-agent); not probing"
-          echo 0 > "$COUNT_FILE"
-          exit 0
-        fi
-      fi
 
       # ssh-keyscan does the protocol banner exchange only — no auth,
       # no known_hosts mutation (-T sets the connect timeout). Piping

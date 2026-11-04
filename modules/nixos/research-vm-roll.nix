@@ -356,6 +356,7 @@ let
     """
     import argparse
     import os
+    import pwd
     import re
     import sys
     import time
@@ -364,13 +365,25 @@ let
     ap.add_argument("--window-hours", type=float, default=24.0)
     args = ap.parse_args()
 
-    uid = os.getuid()
+    # As jonathan or not at all: any other user scans its own processes and
+    # an empty marker dir, and with RESEARCH_AGENT_LOG at the real log would
+    # print PASS having examined nothing.
+    try:
+        want_uid = pwd.getpwnam("jonathan").pw_uid
+    except KeyError:
+        print("G3 FAIL: no user jonathan on this host")
+        sys.exit(1)
+    if os.geteuid() != want_uid:
+        print(f"G3 FAIL: must run as jonathan (uid {want_uid}), not euid {os.geteuid()}")
+        sys.exit(1)
+    uid = want_uid
     rundir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
     markers = os.path.join(rundir, "research-agent-mcp")
     log = os.environ.get("RESEARCH_AGENT_LOG") or os.path.expanduser(
         "~/.cache/research-agent/server.log")
     failures = []
     passed = []
+    examined = 0  # MCP processes of this user found, whatever their verdict
 
 
     def is_mcp(argv):
@@ -397,6 +410,7 @@ let
                 argv = f.read().split(b"\0")
             if not is_mcp([a for a in argv if a]):
                 continue
+            examined += 1
             ticks = start_ticks(pid)
         except (FileNotFoundError, ProcessLookupError):
             continue  # gone: not live
@@ -452,6 +466,9 @@ let
         print(f"ok   pid {p}: protocol marker present")
     for msg in failures:
         print(f"FAIL {msg}")
+    # The count in both outcomes: 0 is legitimate, but a run that inspected
+    # nothing must not read like one that inspected everything.
+    print(f"examined {examined} MCP process(es) of uid {uid}")
     print("G3 PASS" if not failures else "G3 FAIL")
     sys.exit(1 if failures else 0)
   '';

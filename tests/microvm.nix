@@ -32,7 +32,8 @@
 let
   lib = pkgs.lib;
 
-  # The real scraper's /health idle counters (research-agent
+  # The real scraper's /health fields that the roll reads: `status`,
+  # `stale` and the two idle counters (research-agent
   # scraper/server.py, read from the pinned source at eval time). The fake
   # scraper below reports exactly these names, so the drained-roll subtests
   # hold the roll to the real contract. Root cause this pins: the fake once
@@ -40,9 +41,24 @@ let
   # real scraper says `open_sessions` — vm-microvm stayed green while the
   # real scraper could never be rolled.
   scraperHealthSrc = builtins.readFile "${inputs.researchAgentNew}/scraper/server.py";
+  # EVERY /health field the roll reads (research-vm-roll.nix: need() reads
+  # `stale`, the idle verdict the two counters, ready() `.status == "ok"`),
+  # searched in the /health handler's own block only: `"status": ` occurs
+  # in every handler, so a whole-file search would pin nothing for it.
+  healthBlock =
+    let parts = lib.splitString "self.path == \"/health\":" scraperHealthSrc;
+    in if lib.length parts < 2 then "" else lib.head (lib.splitString "return" (lib.elemAt parts 1));
+  statusKey = "status";
+  staleKey = "stale";
   openSessionsKey = "open_sessions";
   pendingArtifactsKey = "pending_artifacts";
-  idleKeysPinned = lib.all (k: lib.hasInfix "\"${k}\": " scraperHealthSrc) [ openSessionsKey pendingArtifactsKey ];
+  healthPins = [
+    "\"${statusKey}\": \"ok\""
+    "\"${staleKey}\": "
+    "\"${openSessionsKey}\": "
+    "\"${pendingArtifactsKey}\": "
+  ];
+  healthMissing = lib.filter (p: !lib.hasInfix p healthBlock) healthPins;
 
   # The fakes' own code digest. Internal to the stand-ins below, the way
   # research-agent's broker/scraper compute theirs: the nixos side never
@@ -228,10 +244,10 @@ let
                 self.send_error(503)
                 return
             if os.path.exists(f"{D}/legacy"):
-                body = {"status": "ok"}
+                body = {"${statusKey}": "ok"}
             else:
                 disk = digest()
-                body = {"status": "ok", "code": CODE, "disk_code": disk, "stale": disk != CODE,
+                body = {"${statusKey}": "ok", "code": CODE, "disk_code": disk, "${staleKey}": disk != CODE,
                         **json.load(open(f"{D}/counters.json"))}
             raw = json.dumps(body).encode()
             self.send_response(200)
@@ -284,8 +300,8 @@ let
     ExecStopPost=
   '';
 in
-assert lib.assertMsg idleKeysPinned
-  "vm-microvm: research-agent scraper/server.py /health no longer reports ${openSessionsKey} and ${pendingArtifactsKey}; the fake scraper and the roll must follow the real field names";
+assert lib.assertMsg (healthBlock != "" && healthMissing == [ ])
+  "vm-microvm: research-agent scraper/server.py's /health handler no longer emits ${lib.concatStringsSep ", " (if healthBlock == "" then [ "(no /health handler found)" ] else healthMissing)}; the fake scraper and the roll must follow the real field names";
 pkgs.testers.runNixOSTest {
   name = "vm-microvm";
   skipTypeCheck = true;
@@ -1143,6 +1159,37 @@ pkgs.testers.runNixOSTest {
     workstation.succeed(
         "journalctl -u scraper-healthcheck.service -o cat | grep -q 'drained roll in progress'"
     )
+    # The same roll with the scraper it restarted now `failed` (Restart=no
+    # drop-in, SIGKILL): the watchdog's `failed` arm must not issue a
+    # competing restart while the roll holds the slots. Cooldown and burst
+    # zeroed, so only the roll guard can stop it.
+    workstation.succeed(
+        "mkdir -p /run/systemd/system/microvm@scraper.service.d",
+        "printf '[Service]\\nRestart=no\\n' > /run/systemd/system/microvm@scraper.service.d/zz-norestart.conf",
+        "systemctl daemon-reload",
+        "systemctl kill -s KILL microvm@scraper.service",
+    )
+    wait_state("microvm@scraper.service", "failed", 30)
+    roll_st = unit_state("research-vm-roll@scraper.service")
+    assert roll_st in ("active", "activating"), f"precondition: the scraper roll must still run, got {roll_st}"
+    n_boots = boots("scraper")
+    workstation.succeed(
+        "echo 0 > /run/scraper-healthcheck/last-restart-epoch",
+        "echo 0 > /run/scraper-healthcheck/restart-burst-count",
+    )
+    workstation.succeed("systemctl start scraper-healthcheck.service")
+    inv = workstation.succeed("systemctl show -P InvocationID scraper-healthcheck.service").strip()
+    hj = workstation.succeed(f"journalctl _SYSTEMD_INVOCATION_ID={inv} -o cat")
+    assert "drained roll in progress" in hj and "restarting" not in hj, \
+        f"scraper watchdog fought its drained roll over a failed VM: {hj!r}"
+    workstation.sleep(3)
+    assert boots("scraper") == n_boots, "scraper watchdog restarted the VM during its drained roll"
+    assert unit_state("microvm@scraper.service") == "failed"
+    workstation.succeed(
+        "rm /run/systemd/system/microvm@scraper.service.d/zz-norestart.conf",
+        "systemctl daemon-reload",
+        "systemctl reset-failed microvm@scraper.service",
+    )
     workstation.succeed("rm /run/fake-scraper/broken", "systemctl restart microvm@scraper.service")
     wait_state("research-vm-roll@scraper.service", "inactive", 60)
     workstation.succeed("test ! -e /run/research-agent/rolling")
@@ -1215,6 +1262,38 @@ pkgs.testers.runNixOSTest {
     )
     cnt = workstation.succeed("cat /run/research-agent-healthcheck/fail-count").strip()
     assert cnt == "0", f"research watchdog struck during its drained roll: {cnt}"
+
+    # The same roll, with the VM it restarted now `failed` (Restart=no
+    # through a runtime drop-in, then SIGKILL): the watchdog's `failed` arm
+    # must not issue a competing restart while the roll holds the slots.
+    # Cooldown and burst zeroed, so only the roll guard can stop it.
+    workstation.succeed(
+        "mkdir -p /run/systemd/system/microvm@research-agent.service.d",
+        "printf '[Service]\\nRestart=no\\n' > /run/systemd/system/microvm@research-agent.service.d/zz-norestart.conf",
+        "systemctl daemon-reload",
+        "systemctl kill -s KILL microvm@research-agent.service",
+    )
+    wait_state("microvm@research-agent.service", "failed", 30)
+    roll_st = unit_state("research-vm-roll@research-agent.service")
+    assert roll_st in ("active", "activating"), f"precondition: the roll must still run, got {roll_st}"
+    n_boots = boots("research-agent")
+    workstation.succeed(
+        "echo 0 > /run/research-agent-healthcheck/last-restart-epoch",
+        "echo 0 > /run/research-agent-healthcheck/restart-burst-count",
+    )
+    workstation.succeed("systemctl start research-agent-healthcheck.service")
+    inv = workstation.succeed("systemctl show -P InvocationID research-agent-healthcheck.service").strip()
+    hj = workstation.succeed(f"journalctl _SYSTEMD_INVOCATION_ID={inv} -o cat")
+    assert "drained roll in progress" in hj and "restarting" not in hj, \
+        f"research watchdog fought its drained roll over a failed VM: {hj!r}"
+    workstation.sleep(3)
+    assert boots("research-agent") == n_boots, "research watchdog restarted the VM during its drained roll"
+    assert unit_state("microvm@research-agent.service") == "failed"
+    workstation.succeed(
+        "rm /run/systemd/system/microvm@research-agent.service.d/zz-norestart.conf",
+        "systemctl daemon-reload",
+        "systemctl reset-failed microvm@research-agent.service",
+    )
     workstation.succeed("rm /run/fake-vm/broken", "systemctl restart microvm@research-agent.service")
     wait_state("research-vm-roll@research-agent.service", "inactive", 120)
     workstation.succeed("test ! -e /run/research-agent/rolling")
@@ -1405,6 +1484,16 @@ pkgs.testers.runNixOSTest {
     workstation.wait_until_succeeds(f"test -d {RUN}")
     rc, out = protocheck()
     assert rc == 0, f"no MCP process, clean log: gate must pass: {out}"
+    # Zero is a legitimate count, but it must be VISIBLE: a run that
+    # inspected nothing must not read like one that inspected everything.
+    assert "examined 0 MCP process(es)" in out, f"the gate must state how many MCP processes it examined: {out}"
+    # Any other user (here root, pointed at the real log) scans an empty
+    # marker dir and its own processes only: refused, never a PASS.
+    rc, out = workstation.execute(
+        f"env XDG_RUNTIME_DIR={RUN} RESEARCH_AGENT_LOG={LOG} research-mcp-protocheck"
+    )
+    assert rc != 0 and "G3 PASS" not in out and "must run as jonathan" in out, \
+        f"G3 run as root must refuse, not pass over nothing: rc={rc} {out}"
     # A pre-pull MCP process (no marker) holds the gate shut.
     workstation.succeed(
         "systemd-run --uid=jonathan --unit=old-mcp ${pkgs.python3}/bin/python3 -c "
@@ -1414,6 +1503,7 @@ pkgs.testers.runNixOSTest {
     pid = workstation.succeed("systemctl show -P MainPID old-mcp.service").strip()
     rc, out = protocheck()
     assert rc != 0 and pid in out, f"unmarked MCP pid {pid} must fail the gate: rc={rc} {out}"
+    assert "examined 1 MCP process(es)" in out, f"the gate must count the process it failed: {out}"
     # The marker holds its writer's own start tick (field 22 of
     # /proc/<pid>/stat, research-agent mcp_marker.py). Live only on an
     # exact match; everything else fails closed, and a fresh mtime proves
