@@ -59,35 +59,27 @@ let
 
   # One JSON record per failed system unit, <unit>.json. Read by
   # ~/.claude/hooks/unit-failure-health.py at SessionStart; another
-  # system unit opts in by writing the same shape here.
-  failuresDir = "/var/lib/unit-failures";
-  record = "${failuresDir}/nix-gc.json";
+  # system unit opts in by writing the same shape here. The shape itself, and
+  # the atomic write, live in lib/unit-failure-record.nix so that the units
+  # using it cannot drift apart on the format their one consumer parses.
+  ufr = import ./lib/unit-failure-record.nix { inherit pkgs; };
+  record = ufr.recordPath "nix-gc";
 
   # Activated only via OnFailure (no wantedBy). Journal first, then the
   # record, written atomically so the hook never reads half a file.
   failureNotify = pkgs.writeShellApplication {
     name = "nix-gc-failure-notify";
-    runtimeInputs = [ pkgs.jq pkgs.coreutils ];
+    runtimeInputs = ufr.runtimeInputs;
     text = ''
+      ${ufr.writerFunction}
+
       result="''${MONITOR_SERVICE_RESULT:-unknown}"
       status="''${MONITOR_EXIT_STATUS:-unknown}"
       echo "nix-gc FAILED (result=$result status=$status): scheduled GC did not run; inspect: journalctl -u nix-gc.service -n 100"
 
-      mkdir -p -- ${failuresDir}
-      chmod 0755 -- ${failuresDir}
-      tmp=$(mktemp ${failuresDir}/.nix-gc.XXXXXX)
-      jq -n \
-        --arg unit nix-gc.service \
-        --arg result "$result" \
-        --arg status "$status" \
-        --arg invocation "''${MONITOR_INVOCATION_ID:-}" \
-        --arg failed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --arg summary "Scheduled Nix garbage collection failed; no scheduled GC runs until this is fixed (the keep-recent pin step fails closed)." \
-        --arg inspect "journalctl -u nix-gc.service -n 100" \
-        '{unit: $unit, result: $result, exit_status: $status, invocation_id: $invocation, failed_at: $failed_at, summary: $summary, inspect: $inspect}' \
-        > "$tmp"
-      chmod 0644 -- "$tmp"
-      mv -f -- "$tmp" ${record}
+      write_unit_failure_record ${record} nix-gc.service "$result" "$status" \
+        "Scheduled Nix garbage collection failed; no scheduled GC runs until this is fixed (the keep-recent pin step fails closed)." \
+        "journalctl -u nix-gc.service -n 100"
       echo "nix-gc-failure-notify: recorded ${record}"
     '';
   };
@@ -96,9 +88,7 @@ let
   # failure record.
   postStop = pkgs.writeShellScript "nix-gc-post-stop" ''
     ${pkgs.coreutils}/bin/rm -rf -- ${rootsDir}
-    if [ "''${SERVICE_RESULT:-}" = success ]; then
-      ${pkgs.coreutils}/bin/rm -f -- ${record}
-    fi
+    ${ufr.clearOnSuccess "nix-gc"}
   '';
 
   pinRecent = pkgs.writeShellApplication {
