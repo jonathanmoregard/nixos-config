@@ -596,17 +596,34 @@
     "research-agent-new": {
       "flake": false,
       "locked": {
-        "lastModified": 1793738144,
-        "narHash": "sha256-FAJSERqdhky2NyYJUCJjpIgpU54Jv3AQi/wj0mIK4jE=",
+        "lastModified": 1793751518,
+        "narHash": "sha256-K2PyenhW4MA3G5eXrgf6Zyz/Xb/3lHkVYa4/J4+UOxQ=",
         "owner": "jonathanmoregard",
         "repo": "research-agent",
-        "rev": "43cdf2bd5810a5a7e7489b39a59ff5523431c04d",
+        "rev": "6afe86f2dd2489b24951d986454add63ef391c0d",
         "type": "github"
       },
       "original": {
         "owner": "jonathanmoregard",
         "repo": "research-agent",
-        "rev": "43cdf2bd5810a5a7e7489b39a59ff5523431c04d",
+        "rev": "6afe86f2dd2489b24951d986454add63ef391c0d",
+        "type": "github"
+      }
+    },
+    "research-agent-old": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791098200,
+        "narHash": "sha256-QHTVjHws3iD5a//jCYN3NpXkiEaNmbw9vqAJC8v/2wU=",
+        "owner": "jonathanmoregard",
+        "repo": "research-agent",
+        "rev": "e92646e6687db5cda547e6ee99a95d2066c1e421",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jonathanmoregard",
+        "repo": "research-agent",
+        "rev": "e92646e6687db5cda547e6ee99a95d2066c1e421",
         "type": "github"
       }
     },
@@ -624,6 +641,7 @@
         "pyproject-build-systems": "pyproject-build-systems_2",
         "pyproject-nix": "pyproject-nix_2",
         "research-agent-new": "research-agent-new",
+        "research-agent-old": "research-agent-old",
         "substack-url-tool": "substack-url-tool",
         "tts-tool": "tts-tool",
         "uv2nix": "uv2nix_4"

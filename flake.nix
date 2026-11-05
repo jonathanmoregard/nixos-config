@@ -162,17 +162,26 @@
     microvm.url = "github:astro/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
 
-    # research-agent code read by checks ONLY. The hosts run whatever
-    # ~/Repos/research-agent holds (pulled every 30 min); this pin lets a
-    # lane hold its fakes to the real contract. Referencing it from
-    # nixosConfigurations would make the host depend on a test pin. Verify
-    # with: the tuxedo toplevel drvPath is identical with and without
-    # `--override-input research-agent-new`.
+    # research-agent code read by checks ONLY: the vm-egress-switchover
+    # lane (both pins) and vm-microvm's /health field pin (new). The hosts run
+    # whatever ~/Repos/research-agent holds (pulled every 30 min); these
+    # pins only let the lane replay the switchover from the old code to the
+    # new. Referencing either from nixosConfigurations would make the host
+    # depend on a test pin. Verify with: the tuxedo toplevel drvPath is
+    # identical with and without `--override-input research-agent-new`.
+    # old: research-agent main before the switch (#40 merged), immutable.
     # new: the egress-broker branch head (research-agent#41); bump to the
     # merge commit in nixos-B. Revs in the URL, like aggregator-src above:
     # `nix flake update` on a fully pinned ref changes nothing.
+    # Unmerged local run:
+    #   nix build "path:$PWD#checks.x86_64-linux.vm-egress-switchover" -L \
+    #     --override-input research-agent-new path:<research-agent checkout>
+    research-agent-old = {
+      url = "github:jonathanmoregard/research-agent/e92646e6687db5cda547e6ee99a95d2066c1e421";
+      flake = false;
+    };
     research-agent-new = {
-      url = "github:jonathanmoregard/research-agent/43cdf2bd5810a5a7e7489b39a59ff5523431c04d";
+      url = "github:jonathanmoregard/research-agent/6afe86f2dd2489b24951d986454add63ef391c0d";
       flake = false;
     };
   };
@@ -344,6 +353,17 @@
         # research-agent-new: read at eval time only, to pin the fake
         # scraper's /health field names to the real scraper's.
         vm-microvm      = mkLaneWith { researchAgentNew = flakeInputs.research-agent-new; } ./tests/microvm.nix;
+        # The egress-broker switchover replayed end to end (research-agent
+        # docs/egress-broker.md §12.5). The only consumer of
+        # research-agent-old.
+        vm-egress-switchover = import ./tests/egress-switchover.nix {
+          pkgs = pkgsLinux;
+          inputs = {
+            inherit microvm;
+            researchAgentOld = flakeInputs.research-agent-old;
+            researchAgentNew = flakeInputs.research-agent-new;
+          };
+        };
         vm-listen-tools = mkLane ./tests/listen-tools.nix;
         vm-android-dev  = mkLane ./tests/android-dev.nix;
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
