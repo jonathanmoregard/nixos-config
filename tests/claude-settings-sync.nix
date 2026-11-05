@@ -1,26 +1,10 @@
-# vm-claude-settings-sync: the checked-in settings.json wins. After a deploy
-# tick the live ~/.claude/settings.json IS the served one, byte for byte, and
-# whatever was written there at runtime is gone.
+# vm-claude-settings-sync: the checked-in settings.json wins after a deploy
+# tick. Each scenario is labelled in the test script below.
 #
-# Drives the real chain, offline: a commit lands in a local remote, the real
-# claude-runtime-deploy.service fast-forwards its clone (through a minimal
-# ff-only stand-in for claude-config's puller), and its OnSuccess= runs
-# claude-settings-sync.service as jonathan. The sync unit is never started by
-# hand, so a broken trigger fails the lane.
-#
-# Invariants:
-#   no cutover marker                 → live file not created
-#   live has a dcg hook group and a
-#   /model pin, upstream does not     → both are gone after the tick; the
-#                                       live file is byte-identical to served
-#                                       and still jonathan:users 0644
-#   upstream adds a key               → it arrives
-#   live gains an "always allow" rule → the next tick drops it
-#   upstream deletes a key            → it goes, and this is a SUCCESS: there
-#                                       is no live-only entry to protect
-#   served file is unparseable        → unit fails, live bytes unchanged,
-#                                       failure record written for Claude
-#   upstream repaired                 → unit succeeds, record cleared
+# Drives the real chain offline — a commit lands in a local remote, the real
+# claude-runtime-deploy.service fast-forwards its clone, and its OnSuccess=
+# runs the sync unit. The sync unit is never started by hand, so a broken
+# trigger fails the lane.
 #
 # Run: nix build .#checks.x86_64-linux.vm-claude-settings-sync -L
 { pkgs, inputs }:
@@ -81,13 +65,9 @@ in
     def tick():
         """One deploy tick; returns the sync unit's Result once it has run.
 
-        The reset clears claude-runtime-deploy's START LIMIT, not a failure of
-        it. This lane fires every tick back to back, and systemd's default
-        burst (5 starts) is reached part-way through, after which `systemctl
-        start` refuses with "attempted too often" and the scenario fails for a
-        reason that has nothing to do with what it tests. Production ticks are
-        a merge or a timer apart, so the limit is never approached there; the
-        reset models that spacing rather than removing the protection.
+        The reset clears the deploy unit's START LIMIT, not a failure of it:
+        this lane fires ticks back to back and exceeds systemd's default burst
+        of 5, which production spacing never approaches.
         """
         before = sync_invocation()
         workstation.execute("systemctl reset-failed claude-runtime-deploy.service")
@@ -178,12 +158,9 @@ in
     publish("{ truncated", "unparseable")
     assert tick() == "exit-code"
     assert workstation.succeed(f"sha256sum {live}").split()[0] == before
-    # The sync unit reaching "failed" does not mean OnFailure has finished:
-    # the notifier is a separate unit, started as the sync unit exits. Reading
-    # the record without waiting races it, and loses under load.
-    # Waiting on the unit is wrong here: it is a oneshot without
-    # RemainAfterExit, so it is never observably "active". Wait for the
-    # artifact, which also fails the lane if the notifier never writes it.
+    # OnFailure's notifier is a separate unit, so the record is not there the
+    # moment the sync unit is "failed". wait_for_unit cannot be used: the
+    # notifier is a oneshot without RemainAfterExit, never observably active.
     workstation.wait_for_file(record)
     rec = json.loads(workstation.succeed(f"cat {record}"))
     assert rec["unit"] == "claude-settings-sync.service", rec

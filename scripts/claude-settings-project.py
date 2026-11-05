@@ -1,42 +1,9 @@
 #!/usr/bin/env python3
-"""Project the served claude-config settings.json onto the live one.
+"""Overwrite ~/.claude/settings.json with the served claude-config copy.
 
-~/.claude/settings.json is the one projected entry that is a real file rather
-than a symlink into the read-only deploy clone, because Claude Code writes it
-at runtime: `/model`, rules saved from a permission prompt, `/config`. Through
-a link into the projection those writes fail with EROFS, and worse, Claude
-Code replaces the file rather than writing through it -- a link would simply
-be swapped back for a regular file on the first write, silently restoring the
-problem this unit exists to fix.
-
-So the file stays writable and this unit makes the checked-in copy win. The
-repository is authoritative: after a run the live file IS the served file,
-byte for byte. A live-only edit does not survive.
-
-That is deliberate. Every live-only entry measured on tuxedo on 2026-11-03
-was drift nobody wanted:
-
-  - a PreToolUse hook group dcg's own `self_heal_hook` wrote into the file,
-    pinned to a fixed /nix/store path that stops resolving after the next
-    dcg upgrade and GC -- a check that looks present and does nothing;
-  - `Edit(//home/jonathan/.claude/skills/**)`, an allow rule a merged PR
-    had deliberately removed;
-  - `model: claude-opus-5`, written by `/model` over the checked-in
-    `opus[1m]`.
-
-The cost is the other side of the same coin: a `/model` or `/config` change
-made in a session is reverted at the next deploy tick. Values meant to
-persist belong in the repository, which is where this unit reads them from.
-
-This delivers configuration; it does not enforce it. Between ticks the live
-file is still writable by the account the agents run as. Managed settings
-(/etc/claude-code/managed-settings.json) is the enforcement layer, and it is
-a separate decision -- it also overrides the user, not just the agent.
-
-Nothing is parsed out of the live file, so a corrupt live file cannot wedge
-the unit; it is simply replaced. The served file IS parsed, purely to refuse
-projecting something that is not a settings object: an unusable input leaves
-the live file exactly as it was.
+The repository wins: after a run the live file IS the served file, byte for
+byte, and a live-only edit does not survive. Why that is the wanted behaviour,
+and what it costs, is in nixos-config#402.
 
 Exit 0 projected or nothing to do, 75 the served file is unusable.
 """
@@ -62,22 +29,12 @@ def _read(path):
 
 
 def _check_object(raw, path):
-    """Validate without keeping the parse: the bytes are what gets written.
+    """Reject anything Claude Code's `JSON.parse` would reject.
 
-    Stricter than `json.loads(raw)` on purpose. Claude Code is a JavaScript
-    program and reads this file with `JSON.parse`, which rejects things
-    Python's parser accepts from BYTES: `NaN`, `Infinity`, `-Infinity`, and a
-    UTF-16 encoding it sniffs from a byte string. Accepting any of them would
-    project a file the harness then cannot load -- the exact outcome this
-    check exists to prevent.
-
-    Decoding first, and passing a `str`, is what closes the encoding half:
-    `json.loads` only sniffs UTF-16/UTF-32 when handed bytes, and on a `str`
-    it rejects a leading BOM itself. An explicit BOM check here was tried and
-    removed -- a mutation proved it unreachable as the sole guard, and a
-    guard that looks load-bearing while nothing depends on it is a trap. The
-    BOM case stays asserted in the suite, so a change in that behaviour fails
-    the tests rather than slipping through.
+    Deliberately stricter than `json.loads(raw)`: decoding to `str` first is
+    what rejects a BOM and stops the UTF-16 sniff that only happens for bytes,
+    and `parse_constant` rejects NaN/Infinity. All five would otherwise be
+    written out and leave the harness unable to load its own settings.
     """
     try:
         text = raw.decode("utf-8")
@@ -96,14 +53,10 @@ def _check_object(raw, path):
 
 
 def _live_mode(path):
-    """The live file's mode, or 0644 when it is not there to be asked.
+    """The live file's mode, or 0644 if it vanished since we read it.
 
-    Read separately from the content, so a writer that unlinks and recreates
-    the file between the two can make this lookup fail on a path that existed
-    moments earlier. That must not become an unhandled traceback: the unit
-    would exit 1 -- not a code this script defines -- and the OnFailure
-    notifier would record that merged settings are not arriving when the only
-    thing that happened was a concurrent write.
+    The harness rewrites this file by unlinking and recreating it, so a path
+    that existed moments ago can be gone by this call.
     """
     try:
         return os.stat(path).st_mode & 0o7777
@@ -179,10 +132,6 @@ def _project(args):
         print(f"claude-settings-project: installed {args.live} from {args.served}")
         return 0
 
-    # The harness may rewrite the file while this runs. That is harmless for
-    # the content -- the bytes written do not depend on what was there, so the
-    # last writer wins and the next tick converges either way. The mode is the
-    # one thing still read from the live file, hence _live_mode's fallback.
     _replace(args.live, served_raw, _live_mode(args.live))
     print(f"claude-settings-project: updated {args.live} from {args.served}")
     return 0

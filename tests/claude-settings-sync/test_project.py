@@ -1,15 +1,7 @@
 """Unit tests for scripts/claude-settings-project.py.
 
-The checked-in settings.json is authoritative: after a run the live file is
-the served file, byte for byte. A live-only edit does not survive, which is
-the point -- every live-only entry measured on tuxedo was drift nobody
-wanted: a store-pinned hook group dcg wrote into the file itself, an allow
-rule a merged PR had deleted, and a `model` value `/model` wrote over the
-checked-in one.
-
-The fixtures model that measured divergence. `live_of` is what the harness
-and dcg did to the file at runtime; `served_of` is what merged PRs did to
-the repository copy. Both must end as `served_of`.
+The fixtures are the divergence measured on tuxedo, not invented: keeping
+them that shape is what makes the suite worth having.
 
 Run: python3 -m unittest tests/claude-settings-sync/test_project.py
 """
@@ -41,13 +33,11 @@ SKILLS_EDIT = "Edit(//home/jonathan/.claude/skills/**)"
 BASE = {
     "model": "opus[1m]",
     "hooks": {"PreToolUse": [PUSH, GUARD]},
-    # Fixture data for a unittest module, not a permissions table anything
-    # loads. The gate's JSON-path exemption cannot reach it because this file
-    # is Python, so it is waived here instead.
+    # Fixture, not a permissions table anything loads; the gate's JSON-path
+    # exemption cannot reach a .py file.
     # arftl-allow: permission-widened
     "permissions": {
         "allow": ["Read(//a/**)", SKILLS_EDIT],
-        # A deny rule names a command in order to forbid it.
         # arftl-allow: destructive-rm
         "deny": ["Bash(rm -rf *)"],
     },
@@ -206,9 +196,7 @@ class TestRefusals(ProjectionCase):
 
 
 class TestJsonParseParity(ProjectionCase):
-    """Claude Code reads this file with JSON.parse, which is stricter than
-    json.loads. A served file the harness cannot load must not be projected.
-    Each payload below was confirmed to project with rc=0 before the fix."""
+    """Each payload below was confirmed to project with rc=0 before the fix."""
 
     def assert_refused(self, payload):
         before, inode = self.read(self.live), os.stat(self.live).st_ino
@@ -236,8 +224,7 @@ class TestJsonParseParity(ProjectionCase):
 
 
 class TestLiveModeLookup(unittest.TestCase):
-    """The mode is the one thing still read from the live file, so its lookup
-    must survive the file being unlinked between the read and the stat."""
+    """The mode is the one thing still read back from the live file."""
 
     def test_a_vanished_live_file_falls_back_to_0644(self):
         import importlib.machinery

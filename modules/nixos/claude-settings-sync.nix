@@ -1,39 +1,17 @@
-# modules/nixos/claude-settings-sync.nix
+# Overwrites ~/.claude/settings.json with the claude-config copy on each
+# deploy tick. The repository wins; a live-only edit does not survive. See
+# nixos-config#402 for why, and what it costs.
 #
-# Delivers the claude-config settings.json into ~/.claude/settings.json.
+# settings.json is the one projected entry that is not a symlink into the
+# deploy clone, because Claude Code REPLACES this file on `/model` — a link
+# would be swapped back for a regular file on the first write.
 #
-# Every other projected entry under ~/.claude is a symlink into the deploy
-# clone, so a merged PR reaches it on the next deploy tick. settings.json
-# cannot be one: Claude Code writes it at runtime (`/model`, rules saved from
-# a permission prompt, `/config`), and through a symlink into the read-only
-# projection those writes fail with EROFS. Worse, Claude Code REPLACES the
-# file rather than writing through it, so a link would be swapped back for a
-# regular file on the first write — silently restoring the problem this unit
-# exists to fix. So it stays a real file, and this unit projects the
-# repository's copy onto it.
+# Triggered by claude-runtime-deploy.service succeeding, not by a path unit on
+# the file: git unlinks and recreates, so a watch fires on a file that is
+# momentarily absent or half-written.
 #
-# The repository wins (scripts/claude-settings-project.py): after a run the
-# live file IS the served file, byte for byte, and a live-only edit does not
-# survive. That is the point. Every live-only entry measured on tuxedo on
-# 2026-11-03 was drift nobody wanted — a PreToolUse group dcg's own
-# `self_heal_hook` wrote into the file pinned to a /nix/store path that stops
-# resolving after the next dcg upgrade and GC, an allow rule a merged PR had
-# deliberately removed, and a `model` value `/model` wrote over the
-# checked-in one. There is no merge base and nothing to reconcile.
-#
-# The cost is the other side of the same coin: a `/model` or `/config` change
-# made in a session is reverted at the next tick. Values meant to persist
-# belong in the repository, which is where this unit reads them from.
-#
-# Triggered by claude-runtime-deploy.service succeeding rather than by a watch
-# on the file: git replaces a file by unlinking and recreating it, so a path
-# unit can fire on a file that is momentarily absent or half-written. After
-# the deploy tick, the checkout is settled.
-#
-# Runs as jonathan from a root-owned unit with a store-pinned script: no path
-# jonathan can write is in its exec chain, and it can write nothing jonathan
-# could not. This delivers configuration; it does not enforce it. The live
-# file stays writable by the user the agents run as, by necessity.
+# Delivers configuration, does not enforce it: the live file stays writable by
+# the account the agents run as, by necessity.
 { config, lib, pkgs, ... }:
 let
   user = "jonathan";
