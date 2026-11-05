@@ -5119,91 +5119,21 @@ in
     active_tab_font_style   bold
     inactive_tab_font_style bold
 
-    # Keybinds — largely mirror Ghostty config (home/ghostty.nix); pane
-    # focus deliberately diverges from it, see the note below. Several of
-    # these displace a kitty default; each such case names the default it
-    # takes and where the displaced action remains reachable.
-    #
-    # (An earlier version of this comment claimed ctrl+minus was kitty's
-    # decrease_font_size. It is not, and never was: that default is
-    # kitty_mod+minus, i.e. ctrl+shift+minus — definition.py:4378. Plain
-    # ctrl+minus is unbound by kitty and free for the hsplit below.)
+    # Keybinds — largely mirror Ghostty config (home/ghostty.nix).
     map ctrl+minus launch --location=hsplit --cwd=current
     map ctrl+w close_window
-    # Pane focus movement, all four directions on kitty_mod (= ctrl+shift,
-    # left at its default since this config never sets `kitty_mod`).
-    #
-    # NOT plain ctrl+arrows. zsh binds the ctrl-arrow CSI sequences to
-    # word movement — `^[[1;5C` forward-word, `^[[1;5D` backward-word
-    # (verify: `bindkey | grep '1;5'`). kitty matches the exact modifier
-    # set and swallows what it binds, so `map ctrl+left` would take
-    # word-jump away from every shell, vim and TUI running in a pane.
-    # Horizontal is the direction that collides, and binding only left/
-    # right on kitty_mod while up/down stayed on plain ctrl would be an
-    # asymmetry the fingers have to remember, so all four moved together.
-    #
-    # Each kitty 0.49.2 default this shadows keeps a second binding, so
-    # nothing becomes unreachable:
-    #   ctrl+shift+up    scroll_line_up   -> also ctrl+shift+k
-    #   ctrl+shift+down  scroll_line_down -> also ctrl+shift+j
-    #   ctrl+shift+left  previous_tab     -> also ctrl+shift+tab
-    #   ctrl+shift+right next_tab         -> also ctrl+tab
-    # (source: kitty/options/definition.py, lines 3853-4246.)
-    #
-    # The last two rows are the whole of tab navigation now: ctrl+tab and
-    # ctrl+shift+tab are the ONLY bindings left for next_tab and
-    # previous_tab. Nothing here re-declares them -- they are kitty's
-    # defaults and left alone -- so tests/kitty.nix asserts them, because
-    # a kitty release that moved those defaults would make tab switching
-    # unreachable with no change in this file to point at.
-    #
-    # Arrows are named keysyms, but unlike the `ctrl+less` case noted
-    # below they resolve without libxkbcommon: kitty's own key tables
-    # carry `up`/`down`/`left`/`right`, and the four binds are asserted
-    # live in tests/kitty.nix rather than trusted to parse.
+    # On kitty_mod, not plain ctrl+arrows: zsh binds the ctrl-arrow CSI
+    # sequences to word movement, and kitty swallows what it binds.
     map ctrl+shift+up neighboring_window up
     map ctrl+shift+down neighboring_window down
     map ctrl+shift+left neighboring_window left
     map ctrl+shift+right neighboring_window right
-    # Plain vsplit of the focused pane — no grid logic, just side-by-side.
-    # Use literal `<` (ASCII 0x3C, matches X11 keysym at runtime) rather
-    # than `less`: kitty's `dlopen("libxkbcommon.so")` fails on this
-    # NixOS build, so named-keysym binds like `ctrl+less` parse-error
-    # ("unknown key, ignoring") at config-load and never fire.
+    # Literal `<`, not `less`: libxkbcommon fails to dlopen on this
+    # build, so named-keysym binds parse-error and never fire.
     map ctrl+< launch --location=vsplit --cwd=current
-    # Second key for the same vsplit, on request. `*` is NOT a level-1
-    # symbol on either layout in use (`setxkbmap -query` reports
-    # `se,us`): on se it is shift+BKSL, the key left of Enter
-    # (`key <BKSL> {[apostrophe, asterisk, ...]}`, xkeyboard-config
-    # symbols/se:28), and on us it is shift+8. So no key event ever
-    # reports `*` as its key, and this bind fires only through kitty's
-    # SHIFTED FALLBACK: get_shortcut tries SingleKey(mods, key) first,
-    # and on a miss, when shift is held and the event carries a
-    # shifted_key, retries with shift REMOVED from the mods and
-    # shifted_key as the key (keys.py:43-47, 64-65). Pressing
-    # ctrl+shift+' yields key=`'` shifted_key=`*` mods=ctrl|shift, which
-    # misses `ctrl+shift+'` and lands on `ctrl+*`. Two conditions make
-    # that reachable, both verified rather than assumed:
-    #   * the fallback is opt-in per definition and a plain `map` gets
-    #     allow_fallback=(shifted,) by default (options/utils.py:1437);
-    #   * the fallback runs ONLY when the exact lookup missed, so
-    #     anything bound to ctrl+shift+' would starve this bind. Nothing
-    #     is: kitty 0.49.2's default keymap has no entry whose key is
-    #     `'` or `*` at any modifier combination.
-    # That makes this bind LAYOUT-DEPENDENT, and it works on se only.
-    # Dispatching both synthesized keypresses through kitty's own
-    # get_shortcut says so:
-    #   se, shift+BKSL -> key=`'`  -> exact miss -> fallback -> vsplit
-    #   us, shift+8    -> key=`8`  -> exact HIT on ctrl+shift+8, which
-    #                                 is kitty's `eighth_window` default
-    # So on us this key jumps to the 8th window instead of splitting, and
-    # no spelling fixes both: the two layouts put `*` on different
-    # physical keys, so there is no shared exact match to bind. Left as
-    # is rather than also binding ctrl+shift+8, which would take
-    # eighth_window away on BOTH layouts to buy the secondary one.
-    # se is primary, so the key does what it says where it is typed.
-    # `*` is a literal ASCII character, so the libxkbcommon problem
-    # noted on ctrl+< does not apply here.
+    # se only. `*` needs shift on every layout, so this matches via
+    # kitty's shifted fallback (keys.py:64) — which on us loses to the
+    # exact ctrl+shift+8, kitty's eighth_window.
     map ctrl+* launch --location=vsplit --cwd=current
     # Add new pane via the 2x2-grid pattern (kitty-pane-add).
     map ctrl+n launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
@@ -5227,28 +5157,16 @@ in
     map ctrl+t new_tab_with_cwd
 
 
-    # Font zoom disabled. `ctrl+shift+minus` (what a Swedish layout types
-    # as `ctrl+_`) is kitty's decrease_font_size and was hit by accident,
-    # shrinking every window at once with no visible indicator of the
-    # current size — `change_font_size all` applies instance-wide, and
-    # the step bindings can only ever drift away from the `font_size`
-    # set above, which is meant to be the single source of truth.
-    #
-    # These are every Linux-reachable font-size step in kitty 0.49.2
-    # (kitty/options/definition.py:4350-4391). The `cmd+*` variants in
-    # that same range bind the macOS Command key and are unreachable
-    # here, so they are deliberately not listed.
+    # Font zoom disabled: it applies instance-wide with no size
+    # indicator, so an accidental press is hard to notice and undo.
+    # Every Linux-reachable step, hence five lines for one intent.
     map kitty_mod+equal no_op
     map kitty_mod+plus no_op
     map kitty_mod+kp_add no_op
     map kitty_mod+minus no_op
     map kitty_mod+kp_subtract no_op
-    # kitty_mod+backspace (reset_font_size) is deliberately LEFT BOUND.
-    # It is the recovery path if the size is ever changed by a route this
-    # list misses — `kitty @ set-font-size`, a future kitty default — and
-    # it cannot itself cause drift, because it only ever restores
-    # `font_size`. Removing it would make such a change unrecoverable
-    # without restarting kitty.
+    # reset_font_size (kitty_mod+backspace) is left bound on purpose: the
+    # recovery path for routes this list misses, e.g. kitty @ set-font-size.
 
     # Copy: pipe selection through kitty-copy-unwrap (see let-binding
     # above) to undo TUI hanging-indent line wraps before xclip.

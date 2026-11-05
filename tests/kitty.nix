@@ -132,46 +132,23 @@ let
         sys.exit(1)
     print("config parses clean under the deployed kitty")
 
-    # --- Resolved-keymap assertions ---
-    #
-    # Deliberately NOT a grep over kitty.conf. A `map` line can be
-    # present, spelled plausibly, and still never fire: `ctrl+less`
-    # parse-errored to "unknown key, ignoring" on this build because
-    # kitty's dlopen of libxkbcommon fails (see home/kitty.nix). Reading
-    # the keymap kitty ACTUALLY built, keyed by kitty's own
-    # parse_shortcut, is the only way to tell a live bind from a line
-    # that merely looks like one.
-    #
-    # `keyboard_modes[""]` is the default (no-leader) mode; its keymap
-    # maps SingleKey -> [KeyDefinition], defaults first and user binds
-    # appended, so the LAST entry is what the keypress actually does.
+    # Asserted against the keymap kitty builds, not by grepping
+    # kitty.conf: a `map` line can parse to "unknown key, ignoring" and
+    # never fire, which is how `ctrl+less` died on this build. Last entry
+    # per key wins, since user binds append to kitty's defaults.
     keymap = opts.keyboard_modes[""].keymap
 
-    # Resolved once into a plain dict, with NO helper function, and that
-    # is deliberate. `kitty +runpy` runs this script via `exec(<string>)`
-    # inside a FUNCTION frame (entry_points.py:25), so every name bound
-    # here -- including the `from ... import` above -- lands in that
-    # frame's locals, and exec creates no closure cells for them. A
-    # nested `def` referencing `keymap` or `parse_shortcut` therefore
-    # dies with NameError at call time, not at def time. Both NameErrors
-    # were observed while writing this assertion. Straight-line code at
-    # one level reads those locals fine.
+    # No helper function anywhere below: `kitty +runpy` exec()s this
+    # inside a function frame, so these names are frame locals with no
+    # closure cells and a nested def would NameError at call time.
     PANE_FOCUS = {
         "ctrl+shift+up": "neighboring_window up",
         "ctrl+shift+down": "neighboring_window down",
         "ctrl+shift+left": "neighboring_window left",
         "ctrl+shift+right": "neighboring_window right",
     }
-    # zsh binds the ctrl-arrow CSI sequences to word movement (^[[1;5C
-    # forward-word, ^[[1;5D backward-word) and kitty swallows whatever it
-    # binds, so a bind on these silently removes word movement from every
-    # shell, vim and TUI running in a pane. That is the whole reason pane
-    # focus lives on kitty_mod rather than on plain ctrl.
+    # Must reach the shell: zsh binds these to word movement.
     MUST_FALL_THROUGH = ("ctrl+left", "ctrl+right", "ctrl+up", "ctrl+down")
-    # Every Linux-reachable font-size step in kitty 0.49.2. `no_op`
-    # resolves to an empty definition; an ABSENT entry instead means the
-    # no_op line never parsed, which is the libxkbcommon failure mode
-    # that silently killed `ctrl+less`.
     ZOOM_STEPS = (
         "ctrl+shift+equal",
         "ctrl+shift+plus",
@@ -179,42 +156,20 @@ let
         "ctrl+shift+minus",
         "ctrl+shift+kp_subtract",
     )
-    # Reset stays reachable: the recovery path if the size is ever changed
-    # by a route ZOOM_STEPS misses, e.g. `kitty @ set-font-size` or a
-    # font-size default kitty adds in a later release.
     ZOOM_RESET = "ctrl+shift+backspace"
-    # Whole-tab navigation, left on kitty's own defaults (definition.py:
-    # 4232, 4246) rather than re-declared. Asserted anyway, and for a
-    # reason the rest of this config makes concrete: ctrl+shift+left and
-    # ctrl+shift+right took pane focus, and those were next_tab's and
-    # previous_tab's OTHER bindings. These two keys are now the only way
-    # to reach either action, so a kitty release that moved or dropped
-    # these defaults would leave tab switching unreachable with nothing
-    # in this file changed to explain it.
+    # Kitty's own defaults, not declared anywhere in home/kitty.nix.
+    # Asserted because ctrl+shift+left/right took pane focus, leaving
+    # these the only route to either action.
     TAB_NAV = {
         "ctrl+tab": "next_tab",
         "ctrl+shift+tab": "previous_tab",
     }
-    # Both keys that vsplit the focused pane. Same action, two keys.
     VSPLIT = "launch --location=vsplit --cwd=current"
     VSPLIT_KEYS = ("ctrl+<", "ctrl+*")
-    # ctrl+* can never be matched exactly: `*` is not a level-1 symbol on
-    # either layout in `se,us` (se puts it at shift+BKSL, us at shift+8),
-    # so no key event reports it as `key`. It is reachable only through
-    # kitty's shifted fallback, and ONLY while nothing is bound to the
-    # exact ctrl+shift+' that the fallback runs after missing
-    # (keys.py:43-47, 64-65). Asserting the bind exists would not catch
-    # that starvation, so this synthesizes the real keypress instead --
-    # key=`'`, shifted_key=`*`, mods=ctrl|shift -- and pushes it through
-    # kitty's own get_shortcut. Verified to discriminate: with nothing
-    # bound it returns None, and with `map ctrl+shift+' no_op` added
-    # alongside the vsplit it returns the no_op.
-    #
-    # se only, deliberately. On us, `*` is shift+8, so the exact lookup
-    # hits ctrl+shift+8 -- kitty's `eighth_window` default -- and the
-    # fallback never runs. The two layouts put `*` on different physical
-    # keys, so no spelling serves both; see home/kitty.nix. se is the
-    # primary layout and the only one this asserts.
+    # The se keypress that produces `*`. Dispatched for real further
+    # down, because ctrl+* matches only via kitty's shifted fallback and
+    # a bind on the exact ctrl+shift+' would starve it while the bind
+    # itself still looked correct.
     STAR_EVENT_KEY = ord("'")
     STAR_EVENT_SHIFTED = ord("*")
 
