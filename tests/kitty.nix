@@ -108,6 +108,12 @@ let
 
     from kitty.config import load_config
     from kitty.options.utils import parse_shortcut
+    from kitty.keys import get_shortcut
+    from kitty.fast_data_types import (
+        KeyEvent,
+        GLFW_MOD_CONTROL,
+        GLFW_MOD_SHIFT,
+    )
 
     bad = []
     opts = load_config(os.environ["KITTY_CONF"], accumulate_bad_lines=bad)
@@ -182,11 +188,33 @@ let
     # key jumps a whole tab instead of reaching the next pane.
     CYCLER = "ctrl+tab"
     CYCLER_REVERSE = "ctrl+shift+tab"
+    # Both keys that vsplit the focused pane. Same action, two keys.
+    VSPLIT = "launch --location=vsplit --cwd=current"
+    VSPLIT_KEYS = ("ctrl+<", "ctrl+*")
+    # ctrl+* can never be matched exactly: `*` is not a level-1 symbol on
+    # either layout in `se,us` (se puts it at shift+BKSL, us at shift+8),
+    # so no key event reports it as `key`. It is reachable only through
+    # kitty's shifted fallback, and ONLY while nothing is bound to the
+    # exact ctrl+shift+' that the fallback runs after missing
+    # (keys.py:43-47, 64-65). Asserting the bind exists would not catch
+    # that starvation, so this synthesizes the real keypress instead --
+    # key=`'`, shifted_key=`*`, mods=ctrl|shift -- and pushes it through
+    # kitty's own get_shortcut. Verified to discriminate: with nothing
+    # bound it returns None, and with `map ctrl+shift+' no_op` added
+    # alongside the vsplit it returns the no_op.
+    #
+    # se only, deliberately. On us, `*` is shift+8, so the exact lookup
+    # hits ctrl+shift+8 -- kitty's `eighth_window` default -- and the
+    # fallback never runs. The two layouts put `*` on different physical
+    # keys, so no spelling serves both; see home/kitty.nix. se is the
+    # primary layout and the only one this asserts.
+    STAR_EVENT_KEY = ord("'")
+    STAR_EVENT_SHIFTED = ord("*")
 
     eff = {}
     for spec in (
         list(PANE_FOCUS) + list(MUST_FALL_THROUGH) + list(ZOOM_STEPS)
-        + [ZOOM_RESET, CYCLER, CYCLER_REVERSE]
+        + list(VSPLIT_KEYS) + [ZOOM_RESET, CYCLER, CYCLER_REVERSE]
     ):
         defs = keymap.get(parse_shortcut(spec))
         eff[spec] = defs[-1].definition if defs else None
@@ -256,6 +284,30 @@ let
             "then cycle forward and nothing would go back"
         )
 
+    for spec in VSPLIT_KEYS:
+        got = eff[spec]
+        if got is None:
+            errors.append(f"{spec}: NOT BOUND (want {VSPLIT!r})")
+        elif got != VSPLIT:
+            errors.append(f"{spec}: resolves to {got!r}, want {VSPLIT!r}")
+
+    # The keypress, not the bind: see STAR_EVENT_* above.
+    star_ev = KeyEvent(
+        key=STAR_EVENT_KEY,
+        shifted_key=STAR_EVENT_SHIFTED,
+        mods=GLFW_MOD_CONTROL | GLFW_MOD_SHIFT,
+    )
+    star_hit = get_shortcut(keymap, star_ev)
+    star_got = star_hit[-1].definition if star_hit else None
+    if star_got != VSPLIT:
+        errors.append(
+            "pressing ctrl+shift+' (what types ctrl+* on the se layout) "
+            f"dispatches to {star_got!r}, want {VSPLIT!r}. The bind can be "
+            "present and still never fire: it matches only via kitty's "
+            "shifted fallback, which is skipped when anything claims the "
+            "exact ctrl+shift+' first"
+        )
+
     if errors:
         for e in errors:
             print("FAIL: " + e, file=sys.stderr)
@@ -263,7 +315,8 @@ let
     print(
         "keymap correct: kitty_mod+arrows move pane focus, plain "
         "ctrl+arrows free for the shell, font-zoom steps disabled, "
-        "reset still reachable"
+        "reset still reachable, and both ctrl+< and ctrl+* vsplit -- the "
+        "latter checked by dispatching a real ctrl+shift+' keypress"
     )
   '';
 

@@ -5492,6 +5492,40 @@ in
     # NixOS build, so named-keysym binds like `ctrl+less` parse-error
     # ("unknown key, ignoring") at config-load and never fire.
     map ctrl+< launch --location=vsplit --cwd=current
+    # Second key for the same vsplit, on request. `*` is NOT a level-1
+    # symbol on either layout in use (`setxkbmap -query` reports
+    # `se,us`): on se it is shift+BKSL, the key left of Enter
+    # (`key <BKSL> {[apostrophe, asterisk, ...]}`, xkeyboard-config
+    # symbols/se:28), and on us it is shift+8. So no key event ever
+    # reports `*` as its key, and this bind fires only through kitty's
+    # SHIFTED FALLBACK: get_shortcut tries SingleKey(mods, key) first,
+    # and on a miss, when shift is held and the event carries a
+    # shifted_key, retries with shift REMOVED from the mods and
+    # shifted_key as the key (keys.py:43-47, 64-65). Pressing
+    # ctrl+shift+' yields key=`'` shifted_key=`*` mods=ctrl|shift, which
+    # misses `ctrl+shift+'` and lands on `ctrl+*`. Two conditions make
+    # that reachable, both verified rather than assumed:
+    #   * the fallback is opt-in per definition and a plain `map` gets
+    #     allow_fallback=(shifted,) by default (options/utils.py:1437);
+    #   * the fallback runs ONLY when the exact lookup missed, so
+    #     anything bound to ctrl+shift+' would starve this bind. Nothing
+    #     is: kitty 0.49.2's default keymap has no entry whose key is
+    #     `'` or `*` at any modifier combination.
+    # That makes this bind LAYOUT-DEPENDENT, and it works on se only.
+    # Dispatching both synthesized keypresses through kitty's own
+    # get_shortcut says so:
+    #   se, shift+BKSL -> key=`'`  -> exact miss -> fallback -> vsplit
+    #   us, shift+8    -> key=`8`  -> exact HIT on ctrl+shift+8, which
+    #                                 is kitty's `eighth_window` default
+    # So on us this key jumps to the 8th window instead of splitting, and
+    # no spelling fixes both: the two layouts put `*` on different
+    # physical keys, so there is no shared exact match to bind. Left as
+    # is rather than also binding ctrl+shift+8, which would take
+    # eighth_window away on BOTH layouts to buy the secondary one.
+    # se is primary, so the key does what it says where it is typed.
+    # `*` is a literal ASCII character, so the libxkbcommon problem
+    # noted on ctrl+< does not apply here.
+    map ctrl+* launch --location=vsplit --cwd=current
     # Add new pane via the 2x2-grid pattern (kitty-pane-add).
     map ctrl+n launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
     # Rearrange the panes this kitty ALREADY has into that same grid,
