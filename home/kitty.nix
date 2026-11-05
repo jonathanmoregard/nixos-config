@@ -5181,6 +5181,12 @@ in
     # OSC 52 fails under pass_selection_to_program — see comment near
     # `pkgs.xclip` above).
     map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | kitty-copy-unwrap | xclip -selection clipboard -in'
+    # Same copy on ctrl+c. With nothing selected copy_or_noop reports the
+    # key unhandled, so the real keypress goes to the application and ctrl+c
+    # still interrupts. With a selection it copies the raw text and the
+    # unwrap pipeline runs second, overwriting it; clear_selection then
+    # stops a stale selection from swallowing the next interrupt.
+    map ctrl+c combine : copy_or_noop : pass_selection_to_program sh -c 'printf %s "$0" | kitty-copy-unwrap | xclip -selection clipboard -in' : clear_selection
     # Escape hatch: kitty's built-in copy_to_clipboard, no transform.
     # Use for uniformly-indented multi-line shell bodies (for/do/done,
     # if/then/fi) that the unwrap heuristic would collapse — kitty has
@@ -5199,6 +5205,10 @@ in
     # the payload in the buffer without auto-executing, so the
     # safety story is already covered by the shell side.
     paste_actions quote-urls-at-prompt,confirm
+    # Shadows claude-code's own ctrl+v (chat:imagePaste) — kitty claims the
+    # chord before the TUI sees it. Rebind that action in
+    # ~/.claude/keybindings.json to keep image paste reachable.
+    map ctrl+v paste_from_clipboard
   '';
 
   # Periodic snapshot — survives crashes, kernel panics, power loss.

@@ -109,6 +109,9 @@ let
     from kitty.config import load_config
     from kitty.options.utils import parse_shortcut
     from kitty.keys import get_shortcut
+    from kitty.boss import Boss
+    from kitty.tabs import Tab
+    from kitty.window import Window
     from kitty.fast_data_types import (
         KeyEvent,
         GLFW_MOD_CONTROL,
@@ -251,6 +254,84 @@ let
             "exact ctrl+shift+' first"
         )
 
+    # Resolved into actions, not compared as a definition string: kitty
+    # accepts an unknown action name without complaining. The line parses,
+    # `bad` stays empty, and only at dispatch does getattr come up empty
+    # and the key get swallowed -- a typo inside the ctrl+c chain would
+    # cost the interrupt with nothing anywhere reporting it.
+    CTRL_C_CHAIN = (
+        "copy_or_noop",
+        "pass_selection_to_program",
+        "clear_selection",
+    )
+    CTRL_V_CHAIN = ("paste_from_clipboard",)
+
+    resolved = {}
+    for spec in ("ctrl+c", "ctrl+shift+c", "ctrl+v"):
+        defs = keymap.get(parse_shortcut(spec))
+        if not defs:
+            errors.append(f"{spec}: NOT BOUND")
+            continue
+        acts = opts.alias_map.resolve_aliases(defs[-1].definition, "map")
+        resolved[spec] = acts
+        for a in acts:
+            live = False
+            if hasattr(Boss, a.func):
+                live = True
+            if hasattr(Tab, a.func):
+                live = True
+            if hasattr(Window, a.func):
+                live = True
+            if not live:
+                errors.append(
+                    f"{spec}: no such action as {a.func!r}, so the key is "
+                    "silently swallowed -- the config parses clean and "
+                    "kitty reports nothing"
+                )
+
+    funcs = {}
+    for spec in resolved:
+        chain = []
+        for a in resolved[spec]:
+            chain.append(a.func)
+        funcs[spec] = tuple(chain)
+
+    if "ctrl+c" in funcs and funcs["ctrl+c"] != CTRL_C_CHAIN:
+        errors.append(
+            f"ctrl+c resolves to {funcs['ctrl+c']}, want {CTRL_C_CHAIN} -- "
+            "without copy_or_noop first the key never reaches the "
+            "application and nothing interrupts, and without "
+            "clear_selection a stale selection swallows every further "
+            "interrupt"
+        )
+    if "ctrl+v" in funcs and funcs["ctrl+v"] != CTRL_V_CHAIN:
+        errors.append(
+            f"ctrl+v resolves to {funcs['ctrl+v']}, want {CTRL_V_CHAIN}"
+        )
+
+    # Same pipeline on both keys, asserted by comparing them rather than
+    # by restating it: ctrl+c must put the unwrapped text on the clipboard,
+    # not the raw selection copy_or_interrupt leaves there first.
+    cc_args = None
+    for a in resolved.get("ctrl+c") or ():
+        if a.func == "pass_selection_to_program":
+            cc_args = a.args
+    cs_args = None
+    for a in resolved.get("ctrl+shift+c") or ():
+        if a.func == "pass_selection_to_program":
+            cs_args = a.args
+    if cs_args is None:
+        errors.append(
+            "ctrl+shift+c no longer runs pass_selection_to_program, so the "
+            "unwrap filter is gone"
+        )
+    elif cc_args != cs_args:
+        errors.append(
+            f"ctrl+c pipes the selection through {cc_args!r} but "
+            f"ctrl+shift+c uses {cs_args!r} -- the two copy keys would put "
+            "different text on the clipboard"
+        )
+
     if errors:
         for e in errors:
             print("FAIL: " + e, file=sys.stderr)
@@ -258,9 +339,10 @@ let
     print(
         "keymap correct: kitty_mod+arrows move pane focus, ctrl+tab and "
         "ctrl+shift+tab still switch tabs, plain ctrl+arrows free for the "
-        "shell, font-zoom steps disabled, reset still reachable, and both "
+        "shell, font-zoom steps disabled, reset still reachable, both "
         "ctrl+< and ctrl+* vsplit -- the latter checked by dispatching a "
-        "real ctrl+shift+' keypress"
+        "real ctrl+shift+' keypress -- and ctrl+c / ctrl+v copy and paste "
+        "through dispatchable actions, ctrl+c keeping its interrupt"
     )
   '';
 
