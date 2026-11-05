@@ -183,11 +183,18 @@ let
     # by a route ZOOM_STEPS misses, e.g. `kitty @ set-font-size` or a
     # font-size default kitty adds in a later release.
     ZOOM_RESET = "ctrl+shift+backspace"
-    # Reading-order pane cycler, both directions. These displace kitty's
-    # next_tab and previous_tab defaults; if either default survives, the
-    # key jumps a whole tab instead of reaching the next pane.
-    CYCLER = "ctrl+tab"
-    CYCLER_REVERSE = "ctrl+shift+tab"
+    # Whole-tab navigation, left on kitty's own defaults (definition.py:
+    # 4232, 4246) rather than re-declared. Asserted anyway, and for a
+    # reason the rest of this config makes concrete: ctrl+shift+left and
+    # ctrl+shift+right took pane focus, and those were next_tab's and
+    # previous_tab's OTHER bindings. These two keys are now the only way
+    # to reach either action, so a kitty release that moved or dropped
+    # these defaults would leave tab switching unreachable with nothing
+    # in this file changed to explain it.
+    TAB_NAV = {
+        "ctrl+tab": "next_tab",
+        "ctrl+shift+tab": "previous_tab",
+    }
     # Both keys that vsplit the focused pane. Same action, two keys.
     VSPLIT = "launch --location=vsplit --cwd=current"
     VSPLIT_KEYS = ("ctrl+<", "ctrl+*")
@@ -214,7 +221,7 @@ let
     eff = {}
     for spec in (
         list(PANE_FOCUS) + list(MUST_FALL_THROUGH) + list(ZOOM_STEPS)
-        + list(VSPLIT_KEYS) + [ZOOM_RESET, CYCLER, CYCLER_REVERSE]
+        + list(VSPLIT_KEYS) + list(TAB_NAV) + [ZOOM_RESET]
     ):
         defs = keymap.get(parse_shortcut(spec))
         eff[spec] = defs[-1].definition if defs else None
@@ -254,35 +261,16 @@ let
             "font-size recovery path"
         )
 
-    if eff[CYCLER] is None or "kitty-pane-cycle" not in eff[CYCLER]:
-        errors.append(
-            f"{CYCLER}: resolves to {eff[CYCLER]!r}, want a launch of "
-            "kitty-pane-cycle -- kitty's next_tab default must be "
-            "displaced or the key never reaches a pane"
-        )
-    elif "--reverse" in eff[CYCLER]:
-        errors.append(
-            f"{CYCLER}: resolves to {eff[CYCLER]!r}; the FORWARD "
-            "direction must not carry --reverse"
-        )
-
-    # The reverse bind must be the same command plus --reverse. Asserting
-    # the flag specifically, because the two lines differ by exactly that
-    # and a copy-paste that dropped it would leave both keys cycling
-    # forward -- two keys, one direction, and no way back.
-    if eff[CYCLER_REVERSE] is None or (
-        "kitty-pane-cycle" not in eff[CYCLER_REVERSE]
-    ):
-        errors.append(
-            f"{CYCLER_REVERSE}: resolves to {eff[CYCLER_REVERSE]!r}, want "
-            "a launch of kitty-pane-cycle --reverse"
-        )
-    elif "--reverse" not in eff[CYCLER_REVERSE]:
-        errors.append(
-            f"{CYCLER_REVERSE}: resolves to {eff[CYCLER_REVERSE]!r}, which "
-            "launches the cycler WITHOUT --reverse -- both keys would "
-            "then cycle forward and nothing would go back"
-        )
+    for spec, want in TAB_NAV.items():
+        got = eff[spec]
+        if got is None:
+            errors.append(
+                f"{spec}: NOT BOUND (want {want!r}) -- this is kitty's own "
+                "default, and since ctrl+shift+left/right took pane focus "
+                f"it is the ONLY remaining way to reach {want}"
+            )
+        elif got != want:
+            errors.append(f"{spec}: resolves to {got!r}, want {want!r}")
 
     for spec in VSPLIT_KEYS:
         got = eff[spec]
@@ -313,10 +301,11 @@ let
             print("FAIL: " + e, file=sys.stderr)
         sys.exit(1)
     print(
-        "keymap correct: kitty_mod+arrows move pane focus, plain "
-        "ctrl+arrows free for the shell, font-zoom steps disabled, "
-        "reset still reachable, and both ctrl+< and ctrl+* vsplit -- the "
-        "latter checked by dispatching a real ctrl+shift+' keypress"
+        "keymap correct: kitty_mod+arrows move pane focus, ctrl+tab and "
+        "ctrl+shift+tab still switch tabs, plain ctrl+arrows free for the "
+        "shell, font-zoom steps disabled, reset still reachable, and both "
+        "ctrl+< and ctrl+* vsplit -- the latter checked by dispatching a "
+        "real ctrl+shift+' keypress"
     )
   '';
 
