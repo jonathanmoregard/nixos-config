@@ -107,9 +107,16 @@ let
     import sys
 
     from kitty.config import load_config
+    from kitty.options.utils import parse_shortcut
+    from kitty.keys import get_shortcut
+    from kitty.fast_data_types import (
+        KeyEvent,
+        GLFW_MOD_CONTROL,
+        GLFW_MOD_SHIFT,
+    )
 
     bad = []
-    load_config(os.environ["KITTY_CONF"], accumulate_bad_lines=bad)
+    opts = load_config(os.environ["KITTY_CONF"], accumulate_bad_lines=bad)
     for b in bad:
         print(
             f"kitty.conf line {b.number}: {b.line!r} -> {b.exception}",
@@ -124,6 +131,137 @@ let
         )
         sys.exit(1)
     print("config parses clean under the deployed kitty")
+
+    # Asserted against the keymap kitty builds, not by grepping
+    # kitty.conf: a `map` line can parse to "unknown key, ignoring" and
+    # never fire, which is how `ctrl+less` died on this build. Last entry
+    # per key wins, since user binds append to kitty's defaults.
+    keymap = opts.keyboard_modes[""].keymap
+
+    # No helper function anywhere below: `kitty +runpy` exec()s this
+    # inside a function frame, so these names are frame locals with no
+    # closure cells and a nested def would NameError at call time.
+    PANE_FOCUS = {
+        "ctrl+shift+up": "neighboring_window up",
+        "ctrl+shift+down": "neighboring_window down",
+        "ctrl+shift+left": "neighboring_window left",
+        "ctrl+shift+right": "neighboring_window right",
+    }
+    # Must reach the shell: zsh binds these to word movement.
+    MUST_FALL_THROUGH = ("ctrl+left", "ctrl+right", "ctrl+up", "ctrl+down")
+    ZOOM_STEPS = (
+        "ctrl+shift+equal",
+        "ctrl+shift+plus",
+        "ctrl+shift+kp_add",
+        "ctrl+shift+minus",
+        "ctrl+shift+kp_subtract",
+    )
+    ZOOM_RESET = "ctrl+shift+backspace"
+    # Kitty's own defaults, not declared anywhere in home/kitty.nix.
+    # Asserted because ctrl+shift+left/right took pane focus, leaving
+    # these the only route to either action.
+    TAB_NAV = {
+        "ctrl+tab": "next_tab",
+        "ctrl+shift+tab": "previous_tab",
+    }
+    VSPLIT = "launch --location=vsplit --cwd=current"
+    VSPLIT_KEYS = ("ctrl+<", "ctrl+*")
+    # The se keypress that produces `*`. Dispatched for real further
+    # down, because ctrl+* matches only via kitty's shifted fallback and
+    # a bind on the exact ctrl+shift+' would starve it while the bind
+    # itself still looked correct.
+    STAR_EVENT_KEY = ord("'")
+    STAR_EVENT_SHIFTED = ord("*")
+
+    eff = {}
+    for spec in (
+        list(PANE_FOCUS) + list(MUST_FALL_THROUGH) + list(ZOOM_STEPS)
+        + list(VSPLIT_KEYS) + list(TAB_NAV) + [ZOOM_RESET]
+    ):
+        defs = keymap.get(parse_shortcut(spec))
+        eff[spec] = defs[-1].definition if defs else None
+
+    errors = []
+
+    for spec, want in PANE_FOCUS.items():
+        got = eff[spec]
+        if got is None:
+            errors.append(f"{spec}: NOT BOUND (want {want!r})")
+        elif got != want:
+            errors.append(f"{spec}: resolves to {got!r}, want {want!r}")
+
+    for spec in MUST_FALL_THROUGH:
+        got = eff[spec]
+        if got is not None:
+            errors.append(
+                f"{spec}: bound to {got!r}; must stay UNBOUND so the "
+                "ctrl-arrow CSI sequence reaches the shell (zsh word movement)"
+            )
+
+    for spec in ZOOM_STEPS:
+        got = eff[spec]
+        if got is None:
+            errors.append(
+                f"{spec}: absent from keymap -- its `no_op` line did not parse"
+            )
+        elif got != "":
+            errors.append(
+                f"{spec}: resolves to {got!r}, want no_op (font zoom disabled)"
+            )
+
+    if eff[ZOOM_RESET] != "change_font_size all 0":
+        errors.append(
+            f"{ZOOM_RESET}: resolves to {eff[ZOOM_RESET]!r}, want "
+            "'change_font_size all 0' -- reset must stay bound as the "
+            "font-size recovery path"
+        )
+
+    for spec, want in TAB_NAV.items():
+        got = eff[spec]
+        if got is None:
+            errors.append(
+                f"{spec}: NOT BOUND (want {want!r}) -- this is kitty's own "
+                "default, and since ctrl+shift+left/right took pane focus "
+                f"it is the ONLY remaining way to reach {want}"
+            )
+        elif got != want:
+            errors.append(f"{spec}: resolves to {got!r}, want {want!r}")
+
+    for spec in VSPLIT_KEYS:
+        got = eff[spec]
+        if got is None:
+            errors.append(f"{spec}: NOT BOUND (want {VSPLIT!r})")
+        elif got != VSPLIT:
+            errors.append(f"{spec}: resolves to {got!r}, want {VSPLIT!r}")
+
+    # The keypress, not the bind: see STAR_EVENT_* above.
+    star_ev = KeyEvent(
+        key=STAR_EVENT_KEY,
+        shifted_key=STAR_EVENT_SHIFTED,
+        mods=GLFW_MOD_CONTROL | GLFW_MOD_SHIFT,
+    )
+    star_hit = get_shortcut(keymap, star_ev)
+    star_got = star_hit[-1].definition if star_hit else None
+    if star_got != VSPLIT:
+        errors.append(
+            "pressing ctrl+shift+' (what types ctrl+* on the se layout) "
+            f"dispatches to {star_got!r}, want {VSPLIT!r}. The bind can be "
+            "present and still never fire: it matches only via kitty's "
+            "shifted fallback, which is skipped when anything claims the "
+            "exact ctrl+shift+' first"
+        )
+
+    if errors:
+        for e in errors:
+            print("FAIL: " + e, file=sys.stderr)
+        sys.exit(1)
+    print(
+        "keymap correct: kitty_mod+arrows move pane focus, ctrl+tab and "
+        "ctrl+shift+tab still switch tabs, plain ctrl+arrows free for the "
+        "shell, font-zoom steps disabled, reset still reachable, and both "
+        "ctrl+< and ctrl+* vsplit -- the latter checked by dispatching a "
+        "real ctrl+shift+' keypress"
+    )
   '';
 
   # A real long-lived foreground process named `codex`. A shell wrapper
