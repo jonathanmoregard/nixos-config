@@ -5119,18 +5119,22 @@ in
     active_tab_font_style   bold
     inactive_tab_font_style bold
 
-    # Keybinds — mirror Ghostty config (home/ghostty.nix). These override
-    # kitty defaults like ctrl+minus = decrease_font_size.
+    # Keybinds — largely mirror Ghostty config (home/ghostty.nix).
     map ctrl+minus launch --location=hsplit --cwd=current
     map ctrl+w close_window
-    map ctrl+up neighboring_window up
-    map ctrl+down neighboring_window down
-    # Plain vsplit of the focused pane — no grid logic, just side-by-side.
-    # Use literal `<` (ASCII 0x3C, matches X11 keysym at runtime) rather
-    # than `less`: kitty's `dlopen("libxkbcommon.so")` fails on this
-    # NixOS build, so named-keysym binds like `ctrl+less` parse-error
-    # ("unknown key, ignoring") at config-load and never fire.
+    # On kitty_mod, not plain ctrl+arrows: zsh binds the ctrl-arrow CSI
+    # sequences to word movement, and kitty swallows what it binds.
+    map ctrl+shift+up neighboring_window up
+    map ctrl+shift+down neighboring_window down
+    map ctrl+shift+left neighboring_window left
+    map ctrl+shift+right neighboring_window right
+    # Literal `<`, not `less`: libxkbcommon fails to dlopen on this
+    # build, so named-keysym binds parse-error and never fire.
     map ctrl+< launch --location=vsplit --cwd=current
+    # se only. `*` needs shift on every layout, so this matches via
+    # kitty's shifted fallback (keys.py:64) — which on us loses to the
+    # exact ctrl+shift+8, kitty's eighth_window.
+    map ctrl+* launch --location=vsplit --cwd=current
     # Add new pane via the 2x2-grid pattern (kitty-pane-add).
     map ctrl+n launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-pane-add
     # Rearrange the panes this kitty ALREADY has into that same grid,
@@ -5151,6 +5155,18 @@ in
     map ctrl+shift+r launch --type=background --cwd=current /etc/profiles/per-user/jonathan/bin/kitty-panes-reflow
     # New tab inheriting cwd of current window.
     map ctrl+t new_tab_with_cwd
+
+
+    # Font zoom disabled: it applies instance-wide with no size
+    # indicator, so an accidental press is hard to notice and undo.
+    # Every Linux-reachable step, hence five lines for one intent.
+    map kitty_mod+equal no_op
+    map kitty_mod+plus no_op
+    map kitty_mod+kp_add no_op
+    map kitty_mod+minus no_op
+    map kitty_mod+kp_subtract no_op
+    # reset_font_size (kitty_mod+backspace) is left bound on purpose: the
+    # recovery path for routes this list misses, e.g. kitty @ set-font-size.
 
     # Copy: pipe selection through kitty-copy-unwrap (see let-binding
     # above) to undo TUI hanging-indent line wraps before xclip.
