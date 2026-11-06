@@ -28,6 +28,20 @@
     prose-decorate.url = "github:jonathanmoregard/prose-decorate";
     prose-decorate.inputs.nixpkgs.follows = "nixpkgs";
 
+    # Voquill voice-typing, built by its own flake.
+    #
+    # Deliberately NOT `inputs.nixpkgs.follows = "nixpkgs"`. Voquill's binary
+    # and the libraries it loads must come from ONE nixpkgs. The previous setup
+    # built it in Voquill's devShell (its own, older pin) and then injected this
+    # flake's newer libs via LD_LIBRARY_PATH; when the two pins drifted apart
+    # the app died with `GLIBC_2.43 not found` against its pinned glibc, and a
+    # nix GC then removed that glibc entirely (exit 127, ~19k restart loop).
+    # Letting Voquill keep its own pin makes the package self-consistent: its
+    # RPATHs resolve inside its own closure and no ambient library path is
+    # involved. The cost is a second nixpkgs in the closure, so Voquill's
+    # webkitgtk only advances when its flake.lock is bumped.
+    voquill.url = "github:jonathanmoregard/voquill";
+
     # Anthropic ships an official Linux app since 2026-06-30, but not
     # via nixpkgs. `aaddrick/claude-desktop-debian` repackages the
     # upstream Linux app as `.deb`/`.rpm`/AppImage plus a Nix flake
@@ -164,7 +178,7 @@
   };
 
   outputs = flakeInputs@{ self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
-              tts-tool, substack-url-tool, prose-decorate, claude-desktop,
+              tts-tool, substack-url-tool, prose-decorate, claude-desktop, voquill,
               codex-cli-nix,
               aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
               ... }:
@@ -232,6 +246,7 @@
         })
         claude-desktop.overlays.default
         (final: prev: {
+          voquill = voquill.packages.${linuxSystem}.default;
           tts-tool = tts-tool.packages.${linuxSystem}.default;
           substack-url-tool = substack-url-tool.packages.${linuxSystem}.default;
           prose-decorate = prose-decorate.packages.${linuxSystem}.default;
