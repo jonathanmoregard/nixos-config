@@ -51,6 +51,51 @@ let
     done > "''${CLAUDE_PULL_STATE_ROOT:-/tmp}/tools"
   '';
 
+  # VSCodium settings fixtures. Kept as store files rather than printf'd
+  # into the guest: JSONC inside a python string inside a shell string
+  # inside Nix needs four layers of escaping, and the quoting is where that
+  # goes wrong silently.
+  #
+  # Both "live" fixtures carry a comment, because the merge home/vscodium.nix
+  # relies on parses JSON5 — a plain-JSON fixture would pass while proving
+  # nothing about the file VSCodium actually leaves behind once a hand-edit
+  # has introduced one.
+  vscodiumLiveEdited = pkgs.writeText "vm-base-vscodium-live-edited.json" ''
+    {
+      // a comment the Settings UI preserved
+      "zz.driftProbe": "survives",
+      "git.autofetch": false
+    }
+  '';
+  vscodiumLiveMalformed = pkgs.writeText "vm-base-vscodium-live-malformed.json" ''
+    {{{ this is not json and never will be
+  '';
+  vscodiumDeclaredFixture =
+    pkgs.writeText "vm-base-vscodium-declared-fixture.json" (builtins.toJSON {
+      "editor.formatOnSave" = true;
+      "git.autofetch" = true;
+    });
+  vscodiumLiveFixture = pkgs.writeText "vm-base-vscodium-live-fixture.json" ''
+    {
+      // a comment the Settings UI preserved
+      "editor.fontSize": 15,
+      "git.autofetch": false
+    }
+  '';
+  # `report` only reads this record; computing it is `record`'s job, which
+  # the activation assertions above exercise for real. Planted here so the
+  # fixture covers the reporting path on its own.
+  vscodiumOverriddenFixture =
+    pkgs.writeText "vm-base-vscodium-overridden-fixture.json" (builtins.toJSON {
+      "git.autofetch" = {
+        first_seen = "2026-11-06T00:00:00+00:00";
+        last_seen = "2026-11-06T00:00:00+00:00";
+        count = 2;
+        kind = "overridden";
+        discarded = false;
+      };
+    });
+
   mcpInitializeJson = pkgs.writeText "vm-base-mcp-initialize.json" ''
     {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vm-base","version":"1"}}}
   '';
@@ -1380,6 +1425,93 @@ in
             f"{forbidden!r}:\n{drift_runner_src}"
         )
 
+    # ── VSCodium settings: declared, but extensible ───────────────────
+    #
+    # home/vscodium.nix replaced `home.file … force = true` with
+    # home-manager's `mutableUserSettings`, so settings.json is a REAL file
+    # that every activation re-merges as declared-over-live. Three
+    # properties, none of them provable by presence alone:
+    #
+    #   (a) the file is no longer a store symlink — the one step of this
+    #       migration CI cannot otherwise model, since the old generation's
+    #       symlink is removed by linkGeneration on the FIRST deploy only
+    #   (b) a key not declared in Nix survives a full activation, and a
+    #       declared key the user changed does not — and the loss is
+    #       recorded pre-merge rather than vanishing
+    #   (c) a settings file home-manager cannot parse does NOT fail
+    #       activation. This is what the mkForce override of
+    #       `vscodiumMutableUserSettings` exists for: upstream's entry ends
+    #       `|| exit 1`, and on this host a failed activation poisons the
+    #       deploy SHA and refuses to re-attempt it. If a future
+    #       home-manager renames that entry, our override silently stops
+    #       applying and THIS assertion is what catches it.
+    codium_settings = "/home/jonathan/.config/VSCodium/User/settings.json"
+    codium_drift = "/home/jonathan/.local/state/vscodium-drift"
+
+    def hm_reactivate():
+        workstation.succeed("systemctl restart home-manager-jonathan.service")
+        workstation.wait_until_succeeds(
+            "systemctl is-active home-manager-jonathan.service", timeout=120
+        )
+
+    # (a)
+    workstation.succeed(f"test -f {codium_settings}")
+    workstation.succeed(f"test ! -L {codium_settings}")
+    settled = workstation.succeed(f"cat {codium_settings}")
+    assert '"editor.formatOnSave": true' in settled, settled
+    assert '"security.workspace.trust.untrustedFiles": "prompt"' in settled, settled
+
+    # (b)
+    workstation.succeed(
+        f"install -o jonathan -g users -m 0644 ${vscodiumLiveEdited} "
+        f"{codium_settings}"
+    )
+    hm_reactivate()
+    merged = workstation.succeed(f"cat {codium_settings}")
+    assert '"zz.driftProbe": "survives"' in merged, (
+        f"undeclared key did not survive activation:\n{merged}"
+    )
+    assert '"git.autofetch": true' in merged, (
+        f"declared key was not re-asserted over the live edit:\n{merged}"
+    )
+    overridden = workstation.succeed(f"cat {codium_drift}/overridden.json")
+    assert "git.autofetch" in overridden, (
+        f"override of a declared key was not recorded pre-merge:\n{overridden}"
+    )
+    assert "zz.driftProbe" not in overridden, (
+        f"an undeclared key must not be recorded as overridden:\n{overridden}"
+    )
+
+    # (c) The file must be left exactly where it is — an earlier draft moved
+    #     it aside, which is silent loss during an unattended deploy.
+    workstation.succeed(
+        f"install -o jonathan -g users -m 0644 ${vscodiumLiveMalformed} "
+        f"{codium_settings}"
+    )
+    hm_reactivate()
+    workstation.succeed(f"cmp ${vscodiumLiveMalformed} {codium_settings}")
+    workstation.succeed(f"test ! -e {codium_drift}/holding-pen")
+    workstation.succeed(f"test -s {codium_drift}/unparseable.json")
+    # The `else` arm of the mkForce'd entry is the whole reason it exists:
+    # upstream's merge DID fail here, and the proof that its failure was
+    # caught and recorded rather than aborting activation is this marker,
+    # which the hourly report turns into a finding. Asserting only that the
+    # unit stayed active would leave the recording path unexercised.
+    workstation.succeed(f"test -s {codium_drift}/merge-failed.json")
+
+    # Recovery: a parseable file clears the marker and the merge resumes, so
+    # the finding cannot outlive the fault.
+    workstation.succeed(
+        f"install -o jonathan -g users -m 0644 ${vscodiumLiveEdited} "
+        f"{codium_settings}"
+    )
+    hm_reactivate()
+    workstation.succeed(f"test ! -e {codium_drift}/unparseable.json")
+    workstation.succeed(f"test ! -e {codium_drift}/merge-failed.json")
+    assert '"git.autofetch": true' in workstation.succeed(
+        f"cat {codium_settings}"
+    )
+
     drift_fixture = "/tmp/nixos-drift-fixture"
     workstation.succeed(
         f"install -d -o jonathan -g users {drift_fixture} && "
@@ -1423,6 +1555,22 @@ in
         "printf \"#!/bin/sh\\n\" > $root/home/.local/share/claude/versions/9.9.9; "
         "ln -s $root/home/.local/share/claude/versions/9.9.9 $root/home/.local/bin/claude'"
     )
+    # The analyzer's VSCodium probe, driven through the same fixture as every
+    # other probe. The override record is planted rather than produced: the
+    # real one is written pre-merge by the activation entry, which this
+    # fixture deliberately does not run — (b) above covers that path.
+    workstation.succeed(
+        "su - jonathan -c 'set -eu; "
+        f"root={drift_fixture}; "
+        "mkdir -p $root/home/.config/VSCodium/User $root/state/vscodium-drift; "
+        "install -m 0644 ${vscodiumDeclaredFixture} "
+        "$root/state/vscodium-drift/declared.json; "
+        "install -m 0644 ${vscodiumLiveFixture} "
+        "$root/home/.config/VSCodium/User/settings.json; "
+        "install -m 0644 ${vscodiumOverriddenFixture} "
+        "$root/state/vscodium-drift/overridden.json'"
+    )
+
     drift_env = (
         f"HOME={drift_fixture}/home "
         f"XDG_DATA_HOME={drift_fixture}/data "
@@ -1448,6 +1596,11 @@ in
         "config.nix",
         "Installed crontab differs from declaration",
         "Multiple worktrees share refs/heads/main",
+        # Both sides of the one deliberately-writable declared file: the
+        # promotion queue, and the silent revert.
+        "VSCodium settings live but not declared",
+        "editor.fontSize",
+        "VSCodium settings overwritten by the declared config",
     ]:
         assert marker in drift_report, (
             f"drift fixture finding {marker!r} missing:\n{drift_report}"
