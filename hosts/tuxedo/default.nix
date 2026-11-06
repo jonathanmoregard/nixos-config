@@ -27,6 +27,12 @@
   ];
 
   networking.hostName = "tuxedo";
+
+  # Flash the Corne (QMK, ATmega32U4) without sudo. The rules tag the
+  # bootloader devices `uaccess`, so the seat's logged-in user gets an ACL;
+  # no group membership is involved. The flashing toolchain is not installed
+  # here on purpose: it comes from qmk_firmware's own shell.nix.
+  hardware.keyboard.qmk.enable = true;
   # secrets/github-app-key.age is encrypted to this host's key only.
   services.githubAppBroker.enable = true;
   # claude-code-dev-box (public: `gh api /apps/claude-code-dev-box`).

@@ -17,19 +17,54 @@ if mountpoint -q /nix 2>/dev/null; then
   exit 0
 fi
 
-# Sparse file via truncate, not fallocate. `fallocate -l 60G` reserves
-# the full 60GB on /mnt's underlying filesystem upfront — fine on
-# ubuntu-latest images where /mnt = /dev/sdb1 with ~70GB free, but
-# some image rollouts have collapsed /mnt onto /dev/root, leaving
-# only ~47GB free after free-root-disk.sh. fallocate then ENOSPCs
-# and the job dies in step 6 (observed on runs 26387387551 attempt 3
-# and 26397985441 attempt 1 during the PR #101 stability loop).
-# truncate creates a sparse image: only filesystem metadata is
-# materialised, actual disk consumed grows as paths are written. The
-# 60G cap is enforced by underlying /mnt free space at runtime —
-# graceful ENOSPC mid-build instead of cold ENOSPC at job start.
-# Works identically on both image variants.
-sudo truncate -s 60G /mnt/nix.img
+# Sparse file via truncate, not fallocate: `fallocate -l 60G` reserves
+# the whole 60GB upfront and cold-ENOSPCs at job start on images with a
+# smaller /mnt. truncate materialises only metadata and grows as paths
+# are written.
+#
+# But a sparse image larger than its backing filesystem does not fail
+# gracefully when /mnt IS the root filesystem (some runner image
+# rollouts collapse it onto /dev/root). The image grows until ROOT is
+# exhausted, and the first casualty is the runner's own worker process
+# writing _diag: it dies without logging, so the build step's retry loop
+# never reaches attempt 2 and even the `always()` disk report never runs.
+# The job then reports a failure with no error message anywhere in it.
+#
+# So cap the image at what the backing filesystem can actually spare.
+# Overrunning a correctly-sized image gives ENOSPC *inside* the loopback,
+# which surfaces as an ordinary nix build error with the runner intact.
+# Over-committing is only dangerous on the collapsed-/mnt shape, so the
+# cap applies there and nowhere else: on a real /mnt disk the sparse image
+# may exceed it freely, because ENOSPC then lands inside the loopback and
+# nix reports it like any other build failure.
+MARGIN_GIB=12
+FLOOR_GIB=20
+MAX_GIB=60
+
+sudo mkdir -p /mnt
+if [ "$(stat -c %d /mnt)" = "$(stat -c %d /)" ]; then
+  avail_gib=$(df -BG --output=avail /mnt | tail -1 | tr -dc '0-9')
+  if [ -z "$avail_gib" ]; then
+    echo "::error::could not read available space on the filesystem backing /mnt"
+    df -h / /mnt
+    exit 1
+  fi
+  img_gib=$(( avail_gib - MARGIN_GIB ))
+  if [ "$img_gib" -gt "$MAX_GIB" ]; then
+    img_gib=$MAX_GIB
+  fi
+  if [ "$img_gib" -lt "$FLOOR_GIB" ]; then
+    echo "::error::/mnt shares the root filesystem and only ${img_gib}G can be spared for /nix (${avail_gib}G avail, ${MARGIN_GIB}G reserved for the runner); refusing to create an image that would exhaust root mid-build and kill the runner"
+    df -h / /mnt
+    exit 1
+  fi
+  echo "::warning::/mnt shares the root filesystem on this runner; /nix image capped at ${img_gib}G (${avail_gib}G avail, ${MARGIN_GIB}G reserved for the runner itself)"
+else
+  img_gib=$MAX_GIB
+fi
+
+echo "sizing /nix image at ${img_gib}G"
+sudo truncate -s "${img_gib}G" /mnt/nix.img
 sudo mkfs.ext4 -F -E lazy_itable_init=1,lazy_journal_init=1 /mnt/nix.img
 sudo mkdir -p /nix
 sudo mount -o loop,noatime /mnt/nix.img /nix

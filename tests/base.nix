@@ -11,6 +11,8 @@
 #     primary host config via mkTest, and we only need to verify the
 #     payload once per build — mkMinimalTest / mkFeatureTest lanes
 #     don't include kindle.nix)
+#   - a QMK bootloader (Corne) is openable read-write by the seat user,
+#     and an unrelated USB device is not
 #
 # Run: nix build .#checks.x86_64-linux.vm-base -L
 { pkgs, inputs }:
@@ -378,6 +380,23 @@ let
         ]
       }
     }
+  '';
+
+  # Opens a device node read-write, as avrdude (tty) and libusb (usbfs) do
+  # when flashing. Prints the errno name on failure so the caller can tell a
+  # refused open (EACCES) from a node that is not there (ENOENT). O_NONBLOCK
+  # because a CDC-ACM tty open otherwise waits for carrier.
+  devOpenProbe = pkgs.writers.writePython3 "dev-open-probe" { } ''
+    import errno
+    import os
+    import sys
+
+    try:
+        os.close(os.open(sys.argv[1], os.O_RDWR | os.O_NONBLOCK))
+    except OSError as e:
+        print(errno.errorcode[e.errno])
+        sys.exit(1)
+    print("OK")
   '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkTest {
@@ -2156,6 +2175,58 @@ in
     # writeTextFile body, tighten this to a regex/word-boundary check.
     assert 'ENV{ID_MEDIA_PLAYER}=""' not in kindle_rule, \
         f"kindle rule clears ID_MEDIA_PLAYER — breaks uaccess; see PR #108 regression:\n{kindle_rule}"
+
+    # QMK keyboards (hardware.keyboard.qmk) must be flashable by the seat
+    # user without sudo. dummy_hcd + g_serial enumerate a real CDC-ACM USB
+    # device with any VID:PID, which is what a Caterina bootloader is, so
+    # udev, the uaccess ACL and the open all run as they do for a real
+    # keyboard. The Linux-gadget id is the control: same device, an id no
+    # QMK rule matches, so it must be refused, and refused with EACCES
+    # rather than ENOENT.
+    workstation.succeed("modprobe dummy_hcd")
+
+    def usb_gadget_access(vid, pid):
+        workstation.succeed(
+            f"modprobe g_serial use_acm=1 idVendor=0x{vid} idProduct=0x{pid}"
+        )
+        try:
+            # `if`, not `&&`: the driver runs commands under pipefail, and a
+            # trailing false `[ ]` would fail the loop even after a match.
+            dev = workstation.wait_until_succeeds(
+                "for d in /sys/bus/usb/devices/*; do"
+                f" if [ \"$(cat $d/idVendor 2>/dev/null):$(cat $d/idProduct 2>/dev/null)\" = {vid}:{pid} ];"
+                " then echo $d; fi; done | grep .",
+                timeout=60,
+            ).strip()
+            tty = workstation.wait_until_succeeds(
+                f"ls -1 {dev}/*/tty/ | grep '^ttyACM'", timeout=60
+            ).strip()
+            workstation.succeed("udevadm settle")
+            usbfs = workstation.succeed(
+                f"udevadm info -q property --property=DEVNAME --value -p {dev}"
+            ).strip()
+            nodes = [usbfs, f"/dev/{tty}"]
+            print(f"[diag] {vid}:{pid}\n" + workstation.succeed(
+                "${pkgs.acl}/bin/getfacl -p " + " ".join(nodes)
+            ))
+            return {
+                n: workstation.execute(f"su jonathan -c '${devOpenProbe} {n}'")[1].strip()
+                for n in nodes
+            }
+        finally:
+            workstation.succeed("modprobe -r g_serial")
+
+    # Caterina as on SparkFun and Arduino-id Pro Micros, and ATmega32U4 DFU.
+    for vid, pid in [("1b4f", "9205"), ("2341", "0036"), ("03eb", "2ff4")]:
+        got = usb_gadget_access(vid, pid)
+        assert set(got.values()) == {"OK"}, \
+            f"jonathan cannot open QMK bootloader {vid}:{pid} read-write: {got}"
+
+    got = usb_gadget_access("0525", "a4a7")
+    assert set(got.values()) == {"EACCES"}, \
+        f"non-QMK device 0525:a4a7 must be refused with EACCES: {got}"
+
+    workstation.succeed("modprobe -r dummy_hcd")
 
     # claude-agent-N users (modules/nixos/claude-agent-users.nix) must be
     # hidden from the LightDM greeter. slick-greeter builds its user list
