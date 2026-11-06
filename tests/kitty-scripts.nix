@@ -702,6 +702,7 @@ let
         with open(os.path.join(out, name + ".json"), "w") as fh:
             json.dump(data, fh)
   '';
+
 in
 pkgs.runCommand "kitty-scripts-harness"
   {
