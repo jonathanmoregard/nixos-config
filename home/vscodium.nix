@@ -138,15 +138,84 @@ let
     "gitlens.codeLens.authors.enabled" = false;
     "gitlens.codeLens.recentChange.enabled" = false;
 
-    # ── Workspace trust ─────────────────────────────────────────────────
-    # "prompt" IS VSCodium's default, and this line exists anyway. Until
-    # settings.json became mutable, an unlisted key was pinned to its
-    # default by the force-written file; now the UI can set one and it
-    # sticks across deploys — including from the "Don't ask again" checkbox
-    # on the trust dialog itself. The trust prompt is a real guard now that
-    # agents write into these repos, so it is declared rather than left to
-    # whatever the last click chose.
+    # ── Security ────────────────────────────────────────────────────────
+    # Keys whose wrong value silently removes a guard, declared so the merge
+    # re-asserts them. Until settings.json became mutable an unlisted key was
+    # pinned to its default by the force-written file; now the UI can set one
+    # and it STICKS across deploys, because the merge preserves undeclared
+    # keys — including from a "Don't ask again" checkbox on the very dialog
+    # whose guard it disarms. So the drift layer is scoped deliberately:
+    # cosmetic keys stay mutable, which is what it is for, and these are
+    # pinned, where declared wins on every deploy and a live edit is reverted
+    # and reported rather than becoming the new configuration.
+    #
+    # Values were read out of the DEPLOYED editor build rather than from
+    # memory or docs (workbench.desktop.main.js and the built-in git
+    # extension's package.json in
+    # /nix/store/…-vscodium-1.143.17183). All but the two marked below are
+    # that build's own default, so pinning them changes nothing today and
+    # only refuses a later change.
+    #
+    # Workspace trust is the guard that stops a cloned repo's tasks, debug
+    # configs and extension code from running on open — worth more here than
+    # on a normal desktop, because agents clone and write into these repos.
+    # `startupPrompt` is deliberately NOT declared: its default is "never"
+    # and the other values only prompt MORE, so there is nothing to weaken,
+    # and declaring a non-default would quietly add a dialog nobody asked
+    # for. `security.` is in the drift tool's sensitive prefixes, so a live
+    # change to it is still reported.
+    "security.workspace.trust.enabled" = true;
     "security.workspace.trust.untrustedFiles" = "prompt";
+    "security.workspace.trust.emptyWindow" = true;
+    # Opening a file:// or a remote-protocol URL is a code path, not a
+    # navigation; keep the confirmation.
+    "security.promptForLocalFileProtocolHandling" = true;
+    "security.promptForRemoteFileProtocolHandling" = true;
+    # A folder that auto-runs a task on open is arbitrary code execution from
+    # a `git clone`. "off" is the build's default, and `restricted: true` in
+    # its schema, so a workspace cannot set it either.
+    "task.allowAutomaticTasks" = "off";
+    # The two deliberate NON-defaults ("on" and true upstream). Extensions
+    # come from the read-only nix store — mutableExtensionsDir is false — so
+    # an update check cannot succeed: at best it is noise, at worst a prompt
+    # that invites installing a second, unmanaged copy outside the store.
+    # `autoUpdate` is a string enum, not a boolean.
+    "extensions.autoUpdate" = "off";
+    "extensions.autoCheckUpdates" = false;
+    # Spelled here rather than via the module's `enableUpdateCheck` /
+    # `enableExtensionUpdateCheck` options, which inject these same two keys
+    # (mkVscodeModule.nix `mergedUserSettings`, and only when explicitly
+    # false). Setting those options would be silently INERT, not merely
+    # redundant: the mkForce'd activation entry below merges
+    # ${declaredSettings} — generated from this attrset — so the module's
+    # own effectiveUserSettings path never reaches the live file. That is
+    # also what keeps declared.json and the merged result identical by
+    # construction rather than by coincidence.
+    #
+    # Nothing should get past the pre-commit hooks from a GUI button: the
+    # gitleaks hook is what stands between a secret and this public repo's
+    # history, and --no-verify from a checkbox would skip it.
+    "git.allowNoVerifyCommit" = false;
+    "git.confirmNoVerifyCommit" = true;
+    "git.allowForcePush" = false;
+    "git.confirmForcePush" = true;
+    # Never let the editor be the thing that stops verifying TLS.
+    "http.proxyStrictSSL" = true;
+    # "off" is already VSCodium's default, unlike upstream VS Code's "all".
+    "telemetry.telemetryLevel" = "off";
+    # The Claude Code extension's own permission switch. `bypassPermissions`
+    # is one of claudeCode.initialPermissionMode's enum values and this is
+    # the setting that admits it, so a live `true` would hand an
+    # editor-started session blanket tool approval and survive every deploy.
+    # environmentVariables sets the env of the spawned claude process, which
+    # is how the egress wrapper below could be worked around.
+    #
+    # initialPermissionMode itself is left undeclared on purpose: unset means
+    # "defer to the CLI's resolved default for the session", and pinning a
+    # value here would override that. It is in the drift tool's sensitive
+    # prefixes instead, so a live value is reported within the hour.
+    "claudeCode.allowDangerouslySkipPermissions" = false;
+    "claudeCode.environmentVariables" = [ ];
 
     # ── Claude Code ─────────────────────────────────────────────────────
     # Launch through the egress wrapper, so an editor-spawned session

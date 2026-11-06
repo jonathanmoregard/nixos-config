@@ -57,9 +57,61 @@ MAX_RECORDED_OVERRIDES = 200
 # extension rewrites on its own schedule. Reporting these would fire on
 # every rebuild without anything having drifted.
 IGNORED_PREFIXES = (
-    "claudeCode.",
+    # Only the one claudeCode key whose declared value is a store path, NOT
+    # the subtree. `claudeCode.` used to be ignored wholesale, which hid the
+    # extension's own permission settings -- a live
+    # `claudeCode.allowDangerouslySkipPermissions: true` or
+    # `claudeCode.initialPermissionMode: "bypassPermissions"` is undeclared,
+    # so the merge PRESERVES it, so it would have outlasted every deploy
+    # while never appearing in a report. Found in review.
+    "claudeCode.claudeProcessWrapper",
     "rust-analyzer.server.path",
     "nix.serverPath",
+)
+
+# Leaf paths where a wrong value silently removes a guard instead of
+# changing an appearance: what is allowed to run, and what gets verified.
+#
+# Every one of these is declared in home/vscodium.nix, so the merge reverts
+# a live edit to it. This list is for the keys that are NOT -- a sibling
+# setting, a new one from an editor upgrade, one an extension introduces.
+# Those are preserved by the merge and outlast reboot and deploy, exactly
+# like a cosmetic key, which is why they are reported apart from it:
+# "undeclared colour theme" and "undeclared workspace-trust switch" are
+# the same shape on disk and nothing like the same finding.
+#
+# Prefix-matched, so `security.` covers a key that does not exist yet. Erring
+# wide is the right error: `security.` and `telemetry.` also sweep in a few
+# cosmetic toggles (`security.workspace.trust.banner`,
+# `telemetry.feedback.enabled`), which costs one over-escalated line in a
+# report, while a missed prefix costs a guard nobody is told about.
+SENSITIVE_PREFIXES = (
+    "security.",
+    "task.allowAutomaticTasks",
+    "extensions.autoUpdate",
+    "extensions.autoCheckUpdates",
+    "extensions.supportUntrustedWorkspaces",
+    "git.allowNoVerifyCommit",
+    "git.confirmNoVerifyCommit",
+    "git.allowForcePush",
+    "git.confirmForcePush",
+    "http.proxy",
+    "telemetry.",
+    # Auto-approving an agent's tool calls from the editor's own settings.
+    # The whole `chat.tools.` subtree, not a single key: the editor spells
+    # these `chat.tools.global.autoApprove`,
+    # `chat.tools.terminal.autoApprove`, `chat.tools.edits.autoApprove` and
+    # `chat.tools.terminal.enableAutoApprove` (verified against the deployed
+    # 1.143 build), and the set has been renamed at least once already.
+    "chat.tools.",
+    # The Claude Code extension's own permission settings. `bypassPermissions`
+    # is one of initialPermissionMode's enum values, and
+    # allowDangerouslySkipPermissions is the switch that admits it.
+    # environmentVariables is listed because it sets the env of the spawned
+    # claude process.
+    "claudeCode.allowDangerouslySkipPermissions",
+    "claudeCode.initialPermissionMode",
+    "claudeCode.environmentVariables",
 )
 
 
@@ -85,8 +137,32 @@ def render_path(parts: list[str]) -> str:
     return " -> ".join(parts)
 
 
+def canonical(path: str) -> str:
+    """A rendered path as VS Code's own dotted key.
+
+    `render_path` arrow-joins components so a nested key stays unambiguous
+    for a human reader, but every prefix in the two lists below is spelled
+    the way VS Code spells a setting — with dots. Matching the rendered form
+    against them silently fails for anything nested: VS Code's config parser
+    honours `{"security": {"workspace.trust.enabled": false}}`, which renders
+    as `security -> workspace.trust.enabled`, and that does not start with
+    `security.`. Both prefix checks therefore match on this form instead.
+    """
+    return path.replace(" -> ", ".")
+
+
 def is_ignored(parts: list[str]) -> bool:
-    return render_path(parts).startswith(IGNORED_PREFIXES)
+    return canonical(render_path(parts)).startswith(IGNORED_PREFIXES)
+
+
+def is_ignored_path(path: str) -> bool:
+    """is_ignored for an already-rendered leaf path."""
+    return canonical(path).startswith(IGNORED_PREFIXES)
+
+
+def is_sensitive(path: str) -> bool:
+    """Whether a rendered leaf path names a guard rather than an appearance."""
+    return canonical(path).startswith(SENSITIVE_PREFIXES)
 
 
 def flatten_leaves(value, parts: list[str] | None = None) -> dict:
@@ -136,7 +212,7 @@ def diff(live: dict, declared: dict, parts: list[str] | None = None) -> list[dic
             continue
         if key not in declared:
             out.append({"path": render_path(here), "kind": "undeclared",
-                        "value": live_value})
+                        "value": live_value, "parts": here})
             continue
         declared_value = declared[key]
         if isinstance(live_value, dict) and isinstance(declared_value, dict):
@@ -356,12 +432,43 @@ def cmd_report(args) -> int:
                 f"{args.live}: {type(exc).__name__}: {exc}",
             ))
         else:
-            undeclared = [e["path"] for e in diff(live, declared)
-                          if e["kind"] == "undeclared"]
-            if undeclared:
+            # A whole undeclared SUBTREE arrives as one entry holding a dict
+            # (diff only recurses where both sides have the key), so it is
+            # expanded to leaves here before anything classifies it. VS Code's
+            # config parser honours the nested spelling, and `security` does
+            # not start with `security.` -- so a live file written as
+            # {"security": {"workspace.trust.enabled": false}} would otherwise
+            # be filed as one cosmetic promotion candidate named `security`.
+            # Found in review.
+            undeclared: list[str] = []
+            for entry in diff(live, declared):
+                if entry["kind"] != "undeclared":
+                    continue
+                value = entry["value"]
+                if isinstance(value, dict) and value:
+                    undeclared.extend(
+                        leaf for leaf in flatten_leaves(value, entry["parts"])
+                        if not is_ignored_path(leaf)
+                    )
+                else:
+                    undeclared.append(entry["path"])
+            sensitive = sorted(p for p in undeclared if is_sensitive(p))
+            ordinary = sorted(p for p in undeclared if not is_sensitive(p))
+            if sensitive:
+                findings.append(finding(
+                    "VSCodium security settings live but not declared",
+                    "\n".join(sensitive)
+                    + "\n\nSet live, and the merge PRESERVES them, so they "
+                    "outlast reboot and deploy. Keys under these prefixes "
+                    "decide what is allowed to run or what gets verified, not "
+                    "how the editor looks. Declare them in home/vscodium.nix "
+                    "so the declared value wins every deploy, or clear them "
+                    "in the UI.",
+                ))
+            if ordinary:
                 findings.append(finding(
                     "VSCodium settings live but not declared",
-                    "\n".join(sorted(undeclared))
+                    "\n".join(ordinary)
                     + "\n\nThese survive reboot and deploy but not a fresh "
                     "install. Promote by adding to home/vscodium.nix in "
                     "nixos-config; the finding clears once declared.",

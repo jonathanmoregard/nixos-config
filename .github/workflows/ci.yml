@@ -241,6 +241,20 @@ jobs:
       # Stubs nix, boots nothing, runs in seconds.
       - if: needs.preflight.outputs.risk != 'TRIVIAL'
         run: nix build .#checks.x86_64-linux.rust-analyzer-devshell -L
+      # VSCodium settings drift recorder/reporter contracts
+      # (tests/vscodium-drift-tool.nix): which keys the declared-over-live
+      # merge preserves and which it reverts, that no failure path moves,
+      # rewrites or deletes the user's settings.json, that an unparseable
+      # file is reported as theirs to fix while an internal error is
+      # reported as ours, and that a live-only key under a sensitive prefix
+      # escalates apart from the cosmetic promotion queue. Drives the same
+      # derivation both call sites import, so `python3 -I` and the json5 in
+      # its closure are under test too — a missing json5 is what made the
+      # first draft quarantine a perfectly valid settings.json. The vm-base
+      # lane drives this tool through a real activation; this covers the
+      # cases that lane cannot reach cheaply. Boots nothing, seconds.
+      - if: needs.preflight.outputs.risk != 'TRIVIAL'
+        run: nix build .#checks.x86_64-linux.vscodium-drift-tool -L
       # research-agent security sweep verdict logic
       # (tests/security-batch-research-agent.nix): seed, new CVE,
       # accepted, score regression, tool errors, against fake vulnix /

@@ -472,6 +472,20 @@
                   .programs.vscodium.profiles.default.userSettings
               ));
         };
+        # Not a VM lane: behavioural harness for the VSCodium settings drift
+        # recorder/reporter (home/vscodium-drift-tool.nix) — what the merge
+        # preserves, what it reverts, that the live file is never moved or
+        # rewritten, and that a live-only security key escalates apart from
+        # the cosmetic promotion queue. Boots nothing; seconds.
+        #
+        # The vm-base lane drives the same tool through a real home-manager
+        # activation; this drives the cases that lane cannot reach cheaply.
+        vscodium-drift-tool = import ./tests/vscodium-drift-tool.nix {
+          pkgs = pkgsLinux;
+          # The derivation both call sites import, so the `python3 -I`
+          # wrapper and the json5 in its closure are under test too.
+          driftTool = import ./home/vscodium-drift-tool.nix { pkgs = pkgsLinux; };
+        };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
         # credential whose real home is elsewhere (see the test's header for
         # why this is not a VM assertion). Pure eval; instant.

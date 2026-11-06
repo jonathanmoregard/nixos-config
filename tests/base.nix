@@ -75,10 +75,16 @@ let
       "editor.formatOnSave" = true;
       "git.autofetch" = true;
     });
+  # Two undeclared keys, one cosmetic and one under a sensitive prefix, so
+  # the report has to SPLIT them rather than file both as promotion
+  # candidates. `security.workspace.trust.enabled` is the sharpest case: the
+  # merge preserves an undeclared key, so a false here would outlast every
+  # deploy and silently disarm workspace trust.
   vscodiumLiveFixture = pkgs.writeText "vm-base-vscodium-live-fixture.json" ''
     {
       // a comment the Settings UI preserved
       "editor.fontSize": 15,
+      "security.workspace.trust.enabled": false,
       "git.autofetch": false
     }
   '';
@@ -1601,6 +1607,11 @@ in
         "VSCodium settings live but not declared",
         "editor.fontSize",
         "VSCodium settings overwritten by the declared config",
+        # And the escalation: an undeclared key that disarms a guard is not
+        # the same finding as an undeclared font size, even though the two
+        # are indistinguishable on disk.
+        "VSCodium security settings live but not declared",
+        "security.workspace.trust.enabled",
     ]:
         assert marker in drift_report, (
             f"drift fixture finding {marker!r} missing:\n{drift_report}"
