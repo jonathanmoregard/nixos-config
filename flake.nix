@@ -454,11 +454,23 @@
         rust-analyzer-devshell = import ./tests/rust-analyzer-devshell.nix {
           pkgs = pkgsLinux;
           raDevshell = import ./home/rust-analyzer-devshell.nix { pkgs = pkgsLinux; };
-          # Drift gate: the settings.json the primary host really deploys,
+          # Drift gate: the server path the primary host really declares,
           # read for the server path the editor will spawn.
-          deployedSettings = primaryConfig
-            .home-manager.users.jonathan
-            .home.file.".config/VSCodium/User/settings.json".source;
+          #
+          # Read from the OPTION, not from a deployed settings.json in the
+          # store. Since home/vscodium.nix moved to `mutableUserSettings`
+          # there is no single deployed settings.json to read: the live file
+          # is assembled at activation from this declared set plus whatever
+          # the user has added through the Settings UI. The declared set is
+          # the half this check is about, and reading the option keeps the
+          # gate independent of how that set happens to be exported to disk.
+          deployedSettings =
+            pkgsLinux.writeText "deployed-vscodium-settings.json"
+              (builtins.toJSON (
+                primaryConfig
+                  .home-manager.users.jonathan
+                  .programs.vscodium.profiles.default.userSettings
+              ));
         };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
         # credential whose real home is elsewhere (see the test's header for
