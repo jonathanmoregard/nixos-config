@@ -70,6 +70,14 @@ NIX_CONFIG_FRESH = NIX_CONFIG + (
     # Pinned, not inherited: untrusted builders run as cache-publisher.
     "sandbox = true\n"
     "sandbox-fallback = false\n"
+    # Off, and pinned so the host's `use-cgroups = true` cannot leak in: this
+    # unit has no Delegate=yes, so systemd owns its cgroup and every build died
+    # with `creating cgroup ...: Permission denied`, reported only as
+    # `skip <repo>#<attr>: nix build failed`. Gate (e) could then never run and
+    # the publisher pushed 0 paths for any repo needing a download (observed
+    # 2026-11-06 on voquill). Isolation here is `sandbox = true` above, not
+    # cgroups, which only do accounting and cleanup.
+    "use-cgroups = false\n"
     "extra-sandbox-paths =\n"
     "builders =\n"
     "accept-flake-config = false\n"
