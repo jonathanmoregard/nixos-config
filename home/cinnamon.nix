@@ -94,10 +94,10 @@ in
   '';
 
   # Voquill autostart intentionally NOT declared here: it is launched by
-  # systemd.user.services.voquill (home/router-services.nix) via voquillWrapper,
-  # which injects LD_LIBRARY_PATH and execs the release binary. A previous
-  # cinnamon autostart entry here pointed at the stale debug binary and raced
-  # with the systemd unit on every login (proposals/2026-05-05-voquill-autostart-race.md).
+  # systemd.user.services.voquill (home/router-services.nix), which execs
+  # `pkgs.voquill` directly. A previous cinnamon autostart entry here pointed at
+  # a stale locally-built binary and raced with the systemd unit on every login
+  # (proposals/2026-05-05-voquill-autostart-race.md).
 
   # Cinnamon applet configs — written as real files (not symlinks) so applets can read/write them
   home.activation.cinnamonAppletConfigs = lib.hm.dag.entryAfter ["writeBoundary"] ''

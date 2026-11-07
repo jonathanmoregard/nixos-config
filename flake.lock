@@ -351,6 +351,22 @@
         "type": "github"
       }
     },
+    "nixpkgs_3": {
+      "locked": {
+        "lastModified": 1777578337,
+        "narHash": "sha256-Ad49moKWeXtKBJNy2ebiTQUEgdLyvGmTeykAQ9xM+Z4=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "15f4ee454b1dce334612fa6843b3e05cf546efab",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "pre-commit-hooks": {
       "inputs": {
         "flake-compat": "flake-compat",
@@ -608,7 +624,8 @@
         "pyproject-nix": "pyproject-nix_2",
         "substack-url-tool": "substack-url-tool",
         "tts-tool": "tts-tool",
-        "uv2nix": "uv2nix_4"
+        "uv2nix": "uv2nix_4",
+        "voquill": "voquill"
       }
     },
     "spectrum": {
@@ -819,6 +836,24 @@
       "original": {
         "owner": "pyproject-nix",
         "repo": "uv2nix",
+        "type": "github"
+      }
+    },
+    "voquill": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_3"
+      },
+      "locked": {
+        "lastModified": 1794052359,
+        "narHash": "sha256-SZwvnKlAAKJDxhUTwqhpnFRk9AKoCat8d9e5H3hK5TE=",
+        "owner": "jonathanmoregard",
+        "repo": "voquill",
+        "rev": "8f16d7e6be5d022c9aa935387966c6e064e14b5a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jonathanmoregard",
+        "repo": "voquill",
         "type": "github"
       }
     }
