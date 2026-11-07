@@ -21,7 +21,7 @@
 # (their extensions are not in the nixpkgs set), and
 # security.workspace.trust.untrustedFiles = "open" (the trust prompt is a real
 # guard now that agents write into these repos).
-{ pkgs, ... }:
+{ pkgs, config, ... }:
 let
   jsonFormat = pkgs.formats.json { };
 
@@ -109,6 +109,30 @@ let
     # this the extension spawns the CLI directly and its traffic is
     # invisible to the nftables rule bound to that cgroup.
     "claudeCode.claudeProcessWrapper" = "${claudeEgressLaunch}/bin/claude-egress-launch";
+    # Point editor-started sessions at their own config directory, which is
+    # what gives Codium its own CLAUDE.md and its own skills/ — see
+    # home/claude-codium-config.nix for what that directory contains and what
+    # had to be linked back into it.
+    #
+    # CLAUDE_CONFIG_DIR is special inside this list: the extension copies
+    # every OTHER entry into the spawned process's environment, but pulls this
+    # one out, requires an absolute path, and applies it on its own
+    # (extension.js 2.1.311). An entry here with a relative path is silently
+    # ignored, so the path is built from homeDirectory rather than written
+    # with a `~`.
+    #
+    # Declared here, which is what makes it safe to depend on: this whole
+    # file is written with `force = true`, so a value edited into
+    # settings.json through the Settings UI is replaced on the next deploy.
+    # That matters more for this key than for the rest of them — it is where
+    # an edit could point the editor's Claude at an attacker-chosen config
+    # directory, or inject environment into the process it spawns.
+    "claudeCode.environmentVariables" = [
+      {
+        name = "CLAUDE_CONFIG_DIR";
+        value = "${config.home.homeDirectory}/.local/state/claude-codium";
+      }
+    ];
 
     # ── Rust ────────────────────────────────────────────────────────────
     # Same desktop-menu PATH problem as nix.serverPath below, one layer

@@ -1421,7 +1421,34 @@ in
         # (home/claude-egress-slice.nix), not drift.
         "mkdir -p $root/home/.local/share/claude/versions; "
         "printf \"#!/bin/sh\\n\" > $root/home/.local/share/claude/versions/9.9.9; "
-        "ln -s $root/home/.local/share/claude/versions/9.9.9 $root/home/.local/bin/claude'"
+        "ln -s $root/home/.local/share/claude/versions/9.9.9 $root/home/.local/bin/claude; "
+        # Codium Claude config directory (home/claude-codium-config.nix): the
+        # writable declared surface whose live layer nothing else reports on.
+        # Deliberately built at the probe's DEFAULT paths — $XDG_STATE_HOME/
+        # claude-codium and $HOME/.claude/skills, both of which already point
+        # into this fixture — rather than behind NIXOS_DRIFT_CODIUM_* env
+        # overrides, so the path construction is exercised too and not just
+        # the override plumbing.
+        "c=$root/state/claude-codium; mkdir -p $c/skills; "
+        "mkdir -p $root/home/.claude/skills/inherited-demo; "
+        "mkdir -p $root/home/.claude/skills/shadowed-demo; "
+        "mkdir -p $root/own-repo/my-skill; "
+        # MANAGED, must stay silent: a declared Codium skill is a store
+        # symlink, and an inherited one points into ~/.claude/skills.
+        "ln -s ${../home/claude-codium/skills}/declared-demo $c/skills/declared-link; "
+        "ln -s $root/home/.claude/skills/inherited-demo $c/skills/inherited-link; "
+        # DRIFT: written in place, and the promotion queue this probe exists
+        # to surface.
+        "mkdir -p $c/skills/handwritten; "
+        # DRIFT: a symlink into one of the user's own repos — route 2 from the
+        # skills README, managed by nobody.
+        "ln -s $root/own-repo/my-skill $c/skills/own-repo-link; "
+        # DRIFT *and* SHADOWING: a real directory beats the shared skill of
+        # the same name, silently, because activation leaves it alone.
+        "mkdir -p $c/skills/shadowed-demo; "
+        # Prose layer starts byte-identical to the seed, which IS the empty
+        # state and must not be reported.
+        "install -m 0644 ${../home/claude-codium/local-seed.md} $c/local.md'"
     )
     drift_env = (
         f"HOME={drift_fixture}/home "
@@ -1468,6 +1495,75 @@ in
     local_bin = drift_section("Entries outside /nix/store in ~/.local/bin")
     assert "claude" not in local_bin, (
         f"Claude Code native installer reported as drift:\n{drift_report}"
+    )
+
+    # Codium skills live layer. The promotion queue is the point: a skill
+    # written straight into that directory works immediately and survives
+    # every deploy, so nothing distinguishes it from reviewed config until a
+    # fresh install drops it.
+    codium_live = drift_section("Codium-only skills live but not declared")
+    for entry in ["handwritten", "own-repo-link", "shadowed-demo"]:
+        assert entry in codium_live, (
+            f"undeclared Codium skill {entry!r} not reported. A skill in that "
+            "directory is permanent in practice and unreviewed, and this "
+            f"probe is the only thing that says so:\n{drift_report}"
+        )
+    # The managed shapes must stay silent, or the report is noise every hour
+    # and gets ignored — which costs the findings above, not just these.
+    for managed in ["declared-link", "inherited-link"]:
+        assert managed not in codium_live, (
+            f"managed Codium skill link {managed!r} reported as drift. A "
+            "store symlink is a declared skill and a link into "
+            f"~/.claude/skills is an inherited one:\n{drift_report}"
+        )
+    # Shadowing is the skills-side equivalent of a declared settings key
+    # being overridden, and it is reported separately because the fix is
+    # different: rename or drop the live copy, not promote it.
+    codium_shadow = drift_section(
+        "Codium skills shadowing a shared skill of the same name"
+    )
+    assert "shadowed-demo" in codium_shadow, (
+        "a live Codium skill silently shadowing a shared skill of the same "
+        f"name was not reported:\n{drift_report}"
+    )
+    for unshadowed in ["handwritten", "own-repo-link"]:
+        assert unshadowed not in codium_shadow, (
+            f"{unshadowed!r} reported as shadowing, but no shared skill of "
+            f"that name exists:\n{drift_report}"
+        )
+    # A local.md still byte-identical to the seed is the EMPTY state. This is
+    # the no-false-positive arm: it would otherwise fire on every host from
+    # the first deploy onwards, which is how an hourly report gets muted.
+    assert "Codium session notes live but not declared" not in drift_report, (
+        "local.md matching the seed byte-for-byte was reported as drift. "
+        "That fires on every freshly deployed host and trains the reader to "
+        f"ignore the whole report:\n{drift_report}"
+    )
+    # …and the other arm, which is what makes the one above mean something:
+    # write a note into local.md and it IS reported. Without this pair, a
+    # probe that never fires and a probe that always fires both look green.
+    workstation.succeed(
+        "su - jonathan -c 'printf \"\\nSomething learned mid-session.\\n\" "
+        f">> {drift_fixture}/state/claude-codium/local.md'"
+    )
+    workstation.succeed(
+        "su - jonathan -c '" + drift_env + drift_runner + "'"
+    )
+    codium_notes_report = workstation.succeed(
+        f"cat {drift_fixture}/data/nixos-drift-analyzer/latest.md"
+    )
+    assert "Codium session notes live but not declared" in codium_notes_report, (
+        "a note written into local.md was not reported. That file is the "
+        "prose half of the same layer — writable, needing no PR — so without "
+        "this the notes accumulate unreviewed and are lost on a reinstall:\n"
+        + codium_notes_report
+    )
+    # Restore the empty state, so the blocks below start from a fixture whose
+    # Codium layer differs from the seed in no way they did not ask for.
+    workstation.succeed(
+        "install -o jonathan -g users -m 0644 "
+        f"${../home/claude-codium/local-seed.md} "
+        f"{drift_fixture}/state/claude-codium/local.md"
     )
     drift_success = f"{drift_fixture}/state/nixos-drift-analyzer/last-success"
     workstation.succeed(f"test -s {drift_success}")
@@ -6074,6 +6170,279 @@ in
     workstation.succeed("systemctl reset-failed home-manager-jonathan.service")
     workstation.succeed("systemctl start home-manager-jonathan.service")
     workstation.succeed("test -f /home/jonathan/.claude/dcg.toml")
+
+    # home/claude-codium-config.nix — the Claude config directory that only
+    # editor-started sessions use, which is what gives Codium its own
+    # CLAUDE.md and its own skills/ without forking the shared ~/.claude.
+    #
+    # Claude reads EVERYTHING from its config directory, so relocating it
+    # drops whatever is not re-provided, silently and at session start. Both
+    # halves of that are behaviour worth pinning: what is linked back at
+    # ~/.claude (without it an editor session comes up with no permissions,
+    # no hooks and no credentials while looking perfectly healthy), and what
+    # activation must NOT touch on a re-run (without that the mutable layer
+    # this directory exists for is a lie, and a skill written mid-session is
+    # gone at the next deploy).
+    #
+    # This block sits here rather than at the end of the lane because by then
+    # ~/.claude/skills is a symlink into the read-only projection mount, and
+    # the planted-skill arms below need to write there.
+    codium = "/home/jonathan/.local/state/claude-codium"
+
+    # A real directory, not a store symlink. Claude writes .claude.json,
+    # projects/, sessions/, session-env/ and backups/ in here, so a store
+    # symlink farm would be read-only at exactly the paths it needs to write
+    # — which is the whole reason this is an activation script and not
+    # home.file.
+    workstation.succeed(f"test -d {codium} -a ! -L {codium}")
+
+    # The entries linked straight back at the shared ~/.claude. readlink
+    # rather than `test -e`, deliberately: it asserts the link AND its target
+    # path, and it still holds when the target does not exist yet (this VM
+    # has no .credentials.json), where `test -e` would follow the link and
+    # fail for the wrong reason.
+    #
+    # settings.json is the one that carries the security requirement. Every
+    # permission rule and every hook comes from it, and the hook commands are
+    # $HOME-anchored absolute paths, so they do not move with the config
+    # directory — linking this one file is what makes the global security
+    # configuration apply to an editor session too.
+    for codium_entry in ["settings.json", ".credentials.json", "agents", "commands"]:
+        codium_target = workstation.succeed(
+            f"readlink {codium}/{codium_entry}"
+        ).strip()
+        assert codium_target == f"/home/jonathan/.claude/{codium_entry}", (
+            f"{codium}/{codium_entry} points at {codium_target!r} instead of "
+            f"the shared /home/jonathan/.claude/{codium_entry}. An editor "
+            "session reads this directory and nothing else, so whatever that "
+            "entry was carrying is simply absent from it — for "
+            "settings.json that is every permission rule and every hook, "
+            "i.e. an editor Claude running with no security configuration "
+            "at all, and nothing in the session would say so."
+        )
+
+    # .claude.json is NOT under ~/.claude, and the distinction is load-
+    # bearing: the file Claude actually uses is $HOME/.claude.json, which is
+    # where the local MCP servers are registered. A relocated config
+    # directory without this link starts with none of them. Pinned to the
+    # exact path because ~/.claude/.claude.json also exists on this host and
+    # is the empty one — linking that instead looks right and silently costs
+    # every local server.
+    codium_json = workstation.succeed(f"readlink {codium}/.claude.json").strip()
+    assert codium_json == "/home/jonathan/.claude.json", (
+        f"{codium}/.claude.json points at {codium_json!r}. It has to be "
+        "/home/jonathan/.claude.json, the file that holds the local MCP "
+        "server registrations; ~/.claude/.claude.json is a different and "
+        "empty file, so an editor session would come up with no local MCP "
+        "servers and no project history."
+    )
+
+    # CLAUDE.md comes from the store, so it cannot be edited into something
+    # else between deploys, and it EXTENDS the global rules rather than
+    # replacing them — the `@`-import is the only reason a Codium-scoped file
+    # does not mean giving up everything in ~/.claude/CLAUDE.md.
+    codium_md = workstation.succeed(f"readlink {codium}/CLAUDE.md").strip()
+    assert codium_md.startswith("/nix/store/"), (
+        f"{codium}/CLAUDE.md resolves to {codium_md!r}, outside the store. "
+        "The declared file is the point: a writable CLAUDE.md here is one a "
+        "session can rewrite, and the mutable prose layer is local.md."
+    )
+    codium_md_text = workstation.succeed(f"cat {codium}/CLAUDE.md")
+    for codium_import in [
+        "@/home/jonathan/.claude/CLAUDE.md",
+        "@/home/jonathan/.local/state/claude-codium/local.md",
+    ]:
+        assert codium_import in codium_md_text, (
+            f"the Codium CLAUDE.md no longer imports {codium_import!r}. "
+            "Without the first one an editor session loses every global "
+            "rule, including the security ones, and gets only the handful "
+            "of editor notes in this file; without the second the mutable "
+            "prose layer is written but never read."
+        )
+
+    # local.md is seeded once and is the user's from then on. Writable by its
+    # owner, because a session writing to it is the entire point.
+    workstation.succeed(f"su jonathan -c 'test -w {codium}/local.md'")
+
+    # ---- what a re-activation must leave alone ---------------------------
+    #
+    # Everything above is composition. This is the durability claim, and it
+    # is the one a future edit is most likely to break by reaching for the
+    # obvious implementation: build the directory from scratch each run.
+    #
+    # Four plants, then one real activation over the top of them.
+    workstation.succeed(
+        "install -d -o jonathan -g users "
+        "/home/jonathan/.claude/skills/vm-global-skill && "
+        "printf 'inherited from the shared config\\n' > "
+        "/home/jonathan/.claude/skills/vm-global-skill/SKILL.md"
+    )
+    # (1) a skill written straight into the live layer, as a REAL directory —
+    #     the thing someone does mid-session when a skill is worth having
+    #     before it is worth a PR.
+    workstation.succeed(
+        f"install -d -o jonathan -g users {codium}/skills/vm-live-skill && "
+        f"printf 'written-live\\n' > {codium}/skills/vm-live-skill/SKILL.md"
+    )
+    # (2) a real directory whose name COLLIDES with an inherited skill. The
+    #     live one has to win: it is the version being iterated on, and
+    #     clobbering it would throw away exactly the work this layer holds.
+    workstation.succeed(
+        "install -d -o jonathan -g users "
+        "/home/jonathan/.claude/skills/vm-collide && "
+        "printf 'the shared copy\\n' > "
+        "/home/jonathan/.claude/skills/vm-collide/SKILL.md"
+    )
+    workstation.succeed(
+        f"install -d -o jonathan -g users {codium}/skills/vm-collide && "
+        f"printf 'local-wins\\n' > {codium}/skills/vm-collide/SKILL.md"
+    )
+    # (3) a DANGLING link, standing in for a skill that has since been
+    #     removed upstream. This one must go, or a removed skill keeps
+    #     resolving forever.
+    workstation.succeed(f"ln -sfn /nonexistent {codium}/skills/vm-stale-link")
+    # (4) a WORKING symlink the user made by hand into one of their own
+    #     directories — the natural way to do route 2 from the skills
+    #     README. It has to survive, and it is what pins the sweep to
+    #     dangling links only: a sweep of every symlink would delete this
+    #     silently on the next deploy, and the same blanket sweep is what
+    #     would wipe every inherited skill on a run where
+    #     claude-runtime-links.service had not populated ~/.claude/skills
+    #     yet.
+    workstation.succeed(
+        "install -d -o jonathan -g users /home/jonathan/vm-own-skill && "
+        "printf 'my own\\n' > /home/jonathan/vm-own-skill/SKILL.md && "
+        f"ln -sfn /home/jonathan/vm-own-skill {codium}/skills/vm-own-link"
+    )
+    # (5) an edit to the prose layer.
+    workstation.succeed(f"printf 'vm-local-marker\\n' >> {codium}/local.md")
+    # (6) a REAL FILE where an inherited link belongs. This is what a future
+    #     Claude version that wrote .claude.json to a temp file and renamed
+    #     it would leave behind, and that file would hold its own MCP set
+    #     and project state. 2.1.311 writes through the symlink instead
+    #     (measured on the host, not in here), so this is a guard against a
+    #     version change rather than current behaviour — and the thing it
+    #     guards against is `ln -sfn` DELETING the file on the next deploy.
+    workstation.succeed(f"rm {codium}/.claude.json")
+    workstation.succeed(
+        f"printf 'forked by a future version\\n' > {codium}/.claude.json"
+    )
+    # (7) a REAL DIRECTORY where an inherited link belongs. `ln -sfn X dir`
+    #     creates dir/X and exits 0 rather than replacing it, so without a
+    #     guard this entry stops being inherited and the only trace is a
+    #     nested link nobody reads.
+    workstation.succeed(f"rm {codium}/commands")
+    workstation.succeed(
+        f"install -d -o jonathan -g users {codium}/commands && "
+        f"printf 'planted\\n' > {codium}/commands/planted.md"
+    )
+
+    workstation.succeed("systemctl restart home-manager-jonathan.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus home-manager-jonathan.service"
+    ).strip() == "0"
+
+    # (1) survived, as a real directory with its content intact.
+    workstation.succeed(
+        f"test -d {codium}/skills/vm-live-skill -a "
+        f"! -L {codium}/skills/vm-live-skill"
+    )
+    assert workstation.succeed(
+        f"cat {codium}/skills/vm-live-skill/SKILL.md"
+    ).strip() == "written-live", (
+        "activation rewrote a skill that was written straight into "
+        f"{codium}/skills. That directory is the mutable half of this layer "
+        "— the reason it is a writable path and not a store symlink farm — "
+        "so a skill written mid-session has to outlive every deploy. It now "
+        "does not, and the only warning anyone gets is the skill going "
+        "missing."
+    )
+    # (2) the collision resolved towards the live copy.
+    #
+    # The nesting assertion first, and it is the one that gives this arm
+    # teeth. `ln -sfn X some-real-dir` creates some-real-dir/X and exits 0
+    # rather than replacing the directory, so with the real-directory-wins
+    # guard DELETED the content check below still reads "local-wins" and
+    # still passes. Without this line the arm proves nothing about the
+    # guard.
+    workstation.succeed(f"test ! -e {codium}/skills/vm-collide/vm-collide")
+    assert workstation.succeed(
+        f"cat {codium}/skills/vm-collide/SKILL.md"
+    ).strip() == "local-wins", (
+        "a real directory in the Codium skills/ was replaced by the "
+        "same-named skill from ~/.claude/skills. That is the live-authored "
+        "version of a skill being iterated on, and the inherited copy is "
+        "the one it was forked from, so this deletes the newer work and "
+        "restores the older silently."
+    )
+    # (3) the dangling link is gone. `! -L` and not `! -e`: -e follows the
+    #     link, so it is already true for a dangling one and the assertion
+    #     would pass without any sweep existing.
+    workstation.succeed(f"test ! -L {codium}/skills/vm-stale-link")
+    # (4) …while the user's own WORKING symlink is still there, still a
+    #     symlink, still pointing where they put it. This and the line above
+    #     are a pair: together they say the sweep discriminates on whether
+    #     the target resolves, rather than deleting every symlink it finds.
+    codium_own = workstation.succeed(
+        f"readlink {codium}/skills/vm-own-link"
+    ).strip()
+    assert codium_own == "/home/jonathan/vm-own-skill", (
+        f"a hand-made symlink in the Codium skills/ now reads {codium_own!r}. "
+        "Sweeping every symlink and relinking from scratch is the shape that "
+        "does this, and it has a worse consequence than losing one link: on "
+        "any activation where claude-runtime-links.service has not populated "
+        "~/.claude/skills yet, it deletes every inherited skill and recreates "
+        "none, and nothing re-runs activation until the next deploy."
+    )
+    # A loose file in the declared-skills source must not become a skill:
+    # only directories are linked, which is what keeps that directory's own
+    # README out of the set.
+    workstation.succeed(f"test ! -e {codium}/skills/README.md")
+    # …while a live skill inherited from the shared config IS linked, which
+    # is what keeps the ~110 user-scope skills reachable from an editor
+    # session at all.
+    codium_skill = workstation.succeed(
+        f"readlink {codium}/skills/vm-global-skill"
+    ).strip()
+    assert codium_skill == "/home/jonathan/.claude/skills/vm-global-skill", (
+        f"a skill in ~/.claude/skills is linked as {codium_skill!r}. "
+        "Nothing inherits into a relocated config directory by itself, so "
+        "an editor session sees only the skills this loop links plus the "
+        "built-in ones."
+    )
+    # (5) the prose edit survived. Seeded once, never flattened.
+    assert "vm-local-marker" in workstation.succeed(f"cat {codium}/local.md"), (
+        "activation overwrote local.md, which is the writable prose layer "
+        "the declared CLAUDE.md imports. It is seeded when absent and is "
+        "the user's from then on; re-seeding it on every deploy throws away "
+        "whatever a session recorded there."
+    )
+    # (6) the real file was NOT deleted. Losing the inherited link is the
+    #     acceptable outcome here; deleting a file that holds the only copy
+    #     of a session's MCP set and project state is not.
+    assert workstation.succeed(
+        f"cat {codium}/.claude.json"
+    ).strip() == "forked by a future version", (
+        "activation replaced a REAL .claude.json with a symlink, destroying "
+        "it. That file is what a Claude version writing via temp-file-and-"
+        "rename would leave behind, and it would be the only copy of that "
+        "session's MCP registrations and project state. The entry is "
+        "allowed to stop being inherited; the data is not allowed to go."
+    )
+    # (7) the real directory survived AND the link did not nest inside it.
+    workstation.succeed(f"test ! -e {codium}/commands/commands")
+    workstation.succeed(f"test -f {codium}/commands/planted.md")
+
+    # Hygiene, same reason as the session-reflect block far above: the
+    # claude-runtime-mounts section below asserts the projection takes
+    # ~/.claude/skills over, and an empty directory left here blocks it
+    # exactly as a full one would. `rmdir` so anything unexpected under
+    # there fails loudly rather than being deleted silently.
+    workstation.succeed(
+        "rm -r /home/jonathan/.claude/skills/vm-global-skill "
+        "/home/jonathan/.claude/skills/vm-collide"
+    )
+    workstation.succeed("rmdir /home/jonathan/.claude/skills")
 
     # claude-runtime-mounts — project claude-config's runtime subset into
     # ~/.claude read-only, and leave the dev trees unreachable by that route.
