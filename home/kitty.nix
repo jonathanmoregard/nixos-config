@@ -4324,6 +4324,73 @@ finally:
         main()
   '';
 
+  # ctrl+v chooses between pasting text itself and handing the key to the
+  # application, because only the application can paste an image.
+  # claude-code binds ctrl+v to `chat:imagePaste`, which reads the clipboard
+  # ITSELF and acts only if an image comes back (`if (ct) C(ct.base64, ...)`
+  # in the 2.1.319 binary) — the keypress is only a trigger, no image bytes
+  # travel through the terminal. kitty's own paste reads text/plain only, so
+  # claiming the chord unconditionally makes an image-only clipboard paste
+  # nothing at all, with no error anywhere.
+  #
+  # The channel back to kitty is the per-launch socket pair that
+  # `launch --allow-remote-control` creates (KITTY_LISTEN_ON=fd:N, set by
+  # kitty's own Boss.run_background_process), NOT a /tmp/kitty.sock-* glob —
+  # see find_socket() above on why that glob is exactly how a process reaches
+  # the user's live session instead of its own. An fd can only reach the
+  # instance that launched this script, and `send-key` with no --match goes
+  # to that instance's active window, i.e. the window the key was pressed in.
+  # Measured: a background launch inherits NO KITTY_* variables, so there is
+  # nothing else to address the window with.
+  kittyPasteSmart = pkgs.writeShellApplication {
+    name = "kitty-paste-smart";
+    # gnugrep is NOT optional padding. writeShellApplication only prepends
+    # the inputs listed here, so an unlisted grep resolves from whatever
+    # PATH kitty inherited from the desktop session. Were it ever missing,
+    # `if ... | grep -q ...` would exit 127, which inside an `if` condition
+    # is merely false and NOT fatal even under `set -e` -- so the script
+    # would take the text branch and an image clipboard would silently get a
+    # text paste. That is precisely the failure this whole file exists to
+    # remove, reintroduced by a missing dependency. Measured, not reasoned:
+    # with grep off PATH the condition evaluates to the text branch.
+    runtimeInputs = [ pkgs.xclip pkgs.coreutils pkgs.gnugrep ];
+    text = ''
+      # `|| true` because xclip exits non-zero on an empty clipboard, which
+      # is not an error here: no targets means no image, means paste.
+      targets=$(timeout 2 xclip -selection clipboard -t TARGETS -o 2>/dev/null || true)
+
+      # An image wins only when the clipboard offers no text alternative.
+      # A screenshot carries image/* alone, so the case this exists for is
+      # covered; so is Chrome's "Copy image", which offers image/png and
+      # text/html but no text/plain and therefore still counts as an image.
+      # A clipboard genuinely offering both (measured with CopyQ: image/png
+      # AND text/plain at once) pastes the text.
+      #
+      # The tie-break costs something either way, so neither side gets
+      # called free: text-first loses the image in a claude pane, and
+      # image-first sends a real ctrl+v to zsh in a shell pane, where
+      # quoted-insert then takes the NEXT keystroke literally (a following
+      # ctrl+c inserts a literal ^C instead of interrupting). Text-first
+      # because a clipboard offering both is rare while a shell pane is
+      # where most ctrl+v presses land. Deciding per pane is possible --
+      # `kitty @ ls --match state:focused` over this same fd channel reports
+      # foreground_processes -- and is deliberately not done for one rare
+      # case. That quoted-insert cost is unavoidable for the image-ONLY
+      # case, which is the case this binding exists for; previously the key
+      # was swallowed there instead, and the shell's own binding is not
+      # kitty's to suppress.
+      #
+      # The text alternatives are matched with no end anchor on purpose:
+      # `text/plain;charset=utf-8` is a text alternative too.
+      if printf '%s\n' "$targets" | grep -q '^image/' \
+         && ! printf '%s\n' "$targets" | grep -qE '^(text/plain|UTF8_STRING|STRING|TEXT)'; then
+        exec ${pkgs.kitty}/bin/kitty @ send-key ctrl+v
+      fi
+
+      exec ${pkgs.kitty}/bin/kitty @ action paste_from_clipboard
+    '';
+  };
+
   # ctrl+shift+c copy filter: unwrap TUI hanging-indent line wraps so a
   # single shell command that the source app (claude-code, less, man,
   # any wide-text TUI) hard-wrapped for display copies back to its
@@ -4982,6 +5049,7 @@ in
     kittySessionCommit
     kittySessionSave
     kittyCopyUnwrap
+    kittyPasteSmart
     claudeKittyPaneRecord
     kittyPaneRegistryWrite
     kittyPanesReflow
@@ -5181,6 +5249,25 @@ in
     # OSC 52 fails under pass_selection_to_program — see comment near
     # `pkgs.xclip` above).
     map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | kitty-copy-unwrap | xclip -selection clipboard -in'
+    # Same copy on ctrl+c. With nothing selected copy_or_noop returns True,
+    # which kitty's dispatch protocol reads as "unhandled" (dispatch_action:
+    # `if passthrough is not True: return True`), so the rest of the combine
+    # chain does not run, the real keypress goes to the application, and
+    # ctrl+c still interrupts. With a selection it copies the raw text and
+    # returns False, which drains the chain: the unwrap pipeline runs second
+    # and overwrites it, then clear_selection stops a stale selection from
+    # swallowing the next interrupt.
+    #
+    # So a copy that the filter rewrites performs TWO clipboard ownership
+    # changes, raw then unwrapped, and the raw text is briefly what a paste
+    # would get. A clipboard manager sees both: no dedup option is declared
+    # for CopyQ (nothing in ~/.config/copyq/copyq.conf), so expect a raw
+    # entry in its history beside the unwrapped one whenever the two differ.
+    # When the filter changes nothing the two writes are byte-identical.
+    # copy_or_noop is nonetheless the right action here -- it is the only one
+    # whose return value lets the interrupt through -- and the raw write is
+    # its side effect, not something this binding can suppress.
+    map ctrl+c combine : copy_or_noop : pass_selection_to_program sh -c 'printf %s "$0" | kitty-copy-unwrap | xclip -selection clipboard -in' : clear_selection
     # Escape hatch: kitty's built-in copy_to_clipboard, no transform.
     # Use for uniformly-indented multi-line shell bodies (for/do/done,
     # if/then/fi) that the unwrap heuristic would collapse — kitty has
@@ -5199,6 +5286,20 @@ in
     # the payload in the buffer without auto-executing, so the
     # safety story is already covered by the shell side.
     paste_actions quote-urls-at-prompt,confirm
+    # Not `paste_from_clipboard` directly: that claims the chord for text
+    # and an image-only clipboard then pastes nothing, silently, because
+    # kitty's paste reads text/plain only. kitty-paste-smart pastes text
+    # when there is text and otherwise hands the real keypress to the
+    # application, which is the only thing that can paste an image —
+    # claude-code's chat:imagePaste reads the clipboard itself. See the
+    # script for why its channel is a per-launch fd and not a socket glob.
+    #
+    # --allow-remote-control is what creates that channel; without it the
+    # script has no way to reach the kitty that launched it. A launch whose
+    # target is missing or non-executable swallows the key with no error at
+    # all (measured) — tests/kitty.nix asserts the target is executable for
+    # exactly that reason.
+    map ctrl+v launch --type=background --allow-remote-control ${kittyPasteSmart}/bin/kitty-paste-smart
   '';
 
   # Periodic snapshot — survives crashes, kernel panics, power loss.
