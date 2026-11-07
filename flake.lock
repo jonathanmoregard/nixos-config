@@ -844,11 +844,11 @@
         "nixpkgs": "nixpkgs_3"
       },
       "locked": {
-        "lastModified": 1794002485,
-        "narHash": "sha256-AMJD1befY3NDoWdr3PEB2+jTYl2Lp8InkOdpGMijHp0=",
+        "lastModified": 1794052359,
+        "narHash": "sha256-SZwvnKlAAKJDxhUTwqhpnFRk9AKoCat8d9e5H3hK5TE=",
         "owner": "jonathanmoregard",
         "repo": "voquill",
-        "rev": "c61abe12c496cadee3b16ada2feed76da28f70a3",
+        "rev": "8f16d7e6be5d022c9aa935387966c6e064e14b5a",
         "type": "github"
       },
       "original": {
