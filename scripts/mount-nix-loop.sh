@@ -26,10 +26,34 @@ fi
 # and 26397985441 attempt 1 during the PR #101 stability loop).
 # truncate creates a sparse image: only filesystem metadata is
 # materialised, actual disk consumed grows as paths are written. The
-# 60G cap is enforced by underlying /mnt free space at runtime —
+# cap is enforced by underlying /mnt free space at runtime —
 # graceful ENOSPC mid-build instead of cold ENOSPC at job start.
 # Works identically on both image variants.
-sudo truncate -s 60G /mnt/nix.img
+#
+# Size the cap from actual free space rather than hardcoding it. A flat
+# 60G was the binding limit, not the disk: on PR #407 (voquill joins the
+# host closure, so CI compiles a Tauri app plus whisper.cpp twice) the
+# image grew to its full 60G and 288 `No space left on device` lines
+# killed `build tuxedo toplevel` and four VM lanes — while the runner
+# still had 29G free (root went 57G -> 116G of 145G, i.e. 57G baseline
+# + the 59G image). Spending that idle headroom costs nothing, because
+# the file is sparse.
+#
+# `max(60G, avail - reserve)` so this can only ever help: the runner
+# image whose /mnt collapsed onto /dev/root with ~47G free keeps the
+# historical 60G ceiling (unreachable there anyway — the disk binds
+# first), while a 145G root variant gets ~78G of real room. The reserve
+# is for build temp dirs, which land outside the image on the same
+# filesystem: ci.yml sets TMPDIR=/mnt/tmp, and /tmp is bind-mounted onto
+# /mnt, so an unreserved cap would just move the ENOSPC into cargo's
+# and cmake's scratch space instead.
+reserve_k=$((10 * 1024 * 1024))                 # 10 GiB for /mnt/tmp
+floor_k=$((60 * 1024 * 1024))                   # never below the old cap
+avail_k=$(df --output=avail -k /mnt | tail -1 | tr -d ' ')
+size_k=$((avail_k - reserve_k))
+[ "$size_k" -lt "$floor_k" ] && size_k="$floor_k"
+echo "/mnt avail ${avail_k}K; sizing /nix image at ${size_k}K"
+sudo truncate -s "${size_k}K" /mnt/nix.img
 sudo mkfs.ext4 -F -E lazy_itable_init=1,lazy_journal_init=1 /mnt/nix.img
 sudo mkdir -p /nix
 sudo mount -o loop,noatime /mnt/nix.img /nix

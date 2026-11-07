@@ -43,6 +43,37 @@ in
   # builds.
   hardware.tuxedo-drivers.enable = lib.mkForce false;
 
+  # Do not autostart the dictation app in a guest. autoLogin reaches
+  # graphical-session.target, which pulls in voquill.service, and no guest has
+  # a usable audio sink — so voquill's output-stream error path spins with no
+  # backoff and no cap.
+  #
+  # Measured 2026-11-06, in the first vm-base run that ever EXECUTED it: the
+  # old ExecStart was a wrapper around a binary under ~/Repos that does not
+  # exist in a guest, so every earlier run died instantly and logged nothing.
+  # Pointed at `pkgs.voquill` it starts, and then emits 67,770
+  # `alsa::poll() returned POLLERR` lines in 113s — a sustained 598/s, and 93%
+  # of that lane's entire output. journald never throttled it: it scales
+  # RateLimitBurst by free disk space, and these guests have 12 GiB (17.6k-18.6k
+  # messages per 30s window against a nominal 10000 burst, zero "Suppressed"
+  # lines). voquill and aggregator-ingest-failure-notify are both uid-1003 user
+  # units sharing one user journal, so the flood made that notifier's marker
+  # unreadable and failed a tests/base.nix assertion that has nothing to do
+  # with voquill. The notifier HAD fired; only the read-back was drowned.
+  #
+  # This lives here rather than in tests/lib/common.nix's `node` because
+  # tests/microvm.nix imports THIS file directly and would otherwise keep the
+  # autostart. Every lane on this file is covered: vm-base, vm-android-dev,
+  # vm-autodoro, vm-listen-tools (all mkTest) and vm-microvm.
+  #
+  # It removes no coverage a guest could give — voquill needs an audio device,
+  # a GPU and a real X session. The unit itself is still built and installed
+  # here; only its autostart is dropped. The real host keeps
+  # WantedBy=graphical-session.target. The unbounded error loop is an upstream
+  # voquill bug, reported separately; the guest only made it visible.
+  home-manager.users.jonathan.systemd.user.services.voquill.Install.WantedBy =
+    lib.mkForce [ ];
+
   # The NixOS test framework turns the manual off for every node
   # (nixos/lib/testing/nixos-test-base.nix, "no-manual"), so
   # system.build.manual does not exist, and modules/nixos/offline-ai.nix
