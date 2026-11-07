@@ -395,6 +395,36 @@ in
   # in it worth preserving that is not already above.
   home.file.${keybindingsPath}.force = true;
 
+  # Exempts the path from the collision check, which covers a stray file or
+  # foreign symlink there. It does not cover a directory: linkGeneration
+  # places the link with `ln -Tsf`, which refuses one.
+  #
+  # Keyed relative, unlike the paths above: the module derives this entry
+  # from its own dataFolderName, and the absolute spelling would be a second,
+  # sourceless entry rather than an override of that one.
+  home.file.".vscode-oss/extensions".force = true;
+
+  # VSCodium creates ~/.vscode-oss/extensions itself on first run, and
+  # mutableExtensionsDir = false puts that path under home-manager, where a
+  # real directory stops the linker. A failed activation on this host latches
+  # the deploy SHA as poisoned and never re-attempts it.
+  #
+  # Moved aside rather than deleted: the declared set is the whole set, so
+  # nothing there is needed, but a sideloaded extension is the user's. Placed
+  # after the write boundary so the rename happens only once activation is
+  # past the checks that can still abort it, and before linkGeneration
+  # because that is what needs the path free.
+  home.activation.vscodiumExtensionsDirMigration =
+    lib.hm.dag.entryBetween [ "linkGeneration" ] [ "writeBoundary" ] ''
+      extDir="$HOME/.vscode-oss/extensions"
+      if [ -d "$extDir" ] && [ ! -L "$extDir" ]; then
+        moved="$extDir.pre-nix-$(date -u +%Y%m%dT%H%M%SZ)"
+        echo "vscodium: $extDir is an unmanaged directory and the declared" \
+             "extension set belongs at that path; moving it to $moved" >&2
+        run mv "$extDir" "$moved"
+      fi
+    '';
+
   # What the hourly probe diffs the live file against. A store symlink, so it
   # is exactly what this file declares and cannot be edited into agreement.
   home.file."${driftDir}/declared.json".source = declaredSettings;
