@@ -10,6 +10,10 @@
 #   - lid-guard: lid-close action is suspend by default, "nothing" while
 #     agent hooks report work in flight (turn, subagent, young background
 #     Bash), back to suspend on Stop / dead agent / SessionEnd.
+#   - cinnamon-rescue: a wedged main loop reads as hung and is recovered
+#     after three consecutive failures; an unowned bus name never is; the
+#     cooldown both holds and expires; the failure count does not outlive
+#     the boot; `now` recovers on demand.
 #
 # Uses mkFeatureTest with home/_test-desktop.nix — HM closure is
 # jonathan.nix + cinnamon.nix + desktop-apps.nix (no kitty / claude
@@ -34,33 +38,55 @@ let
 
   # Stands in for gdbus so cinnamon-rescue's branching can be driven without
   # wedging a real Cinnamon. $FAKE_GDBUS_MODE picks the shape:
-  #   alive   — name owned, Peer.Ping replies
-  #   hung    — name owned, Ping exits non-zero (what a blocked main loop
-  #             looks like to gdbus once --timeout expires)
+  #   alive   — name owned, the property read answers
+  #   hung    — name owned, the property read times out
   #   unowned — org.Cinnamon has no owner at all (Cinnamon not running)
+  #
+  # It rejects anything other than the exact call cinnamon-rescue is supposed
+  # to make, so aiming the probe at the wrong name or path fails the lane
+  # rather than passing it. Peer.Ping and Introspect are rejected outright:
+  # GDBus answers both from its worker thread, so a Cinnamon whose main loop
+  # has stopped dispatching still replies to them, and a probe built on them
+  # can never detect the hang this exists to recover from.
   fakeGdbus = pkgs.writeScriptBin "fake-gdbus" ''
     #!${pkgs.bash}/bin/bash
     mode="''${FAKE_GDBUS_MODE:-alive}"
-    case "$*" in
-      *GetNameOwner*|*GetConnectionUnixProcessID*)
+    args="$*"
+    case "$args" in
+      *"org.freedesktop.DBus.GetNameOwner org.Cinnamon"*)
         if [ "$mode" = unowned ]; then
           echo "Error: org.Cinnamon has no owner" >&2
           exit 1
         fi
-        case "$*" in
-          *GetNameOwner*) echo "(':1.42',)" ;;
-          # PID 1 always exists, so the /proc capture has a real target to
-          # read (and to fall back on where a field is unreadable).
-          *)              echo "(uint32 1,)" ;;
-        esac ;;
-      *Peer.Ping*)
+        echo "(':1.42',)" ;;
+      *"org.freedesktop.DBus.GetConnectionUnixProcessID org.Cinnamon"*)
+        if [ "$mode" = unowned ]; then
+          echo "Error: org.Cinnamon has no owner" >&2
+          exit 1
+        fi
+        # PID 1 always exists, so the /proc capture has a real target.
+        echo "(uint32 ''${FAKE_PID:-1},)" ;;
+      *"org.freedesktop.DBus.Properties.Get org.Cinnamon CinnamonVersion"*)
+        case "$args" in
+          *"--dest org.Cinnamon "*) : ;;
+          *) echo "FAKE: property read not aimed at org.Cinnamon: $args" >&2; exit 64 ;;
+        esac
+        case "$args" in
+          *"--object-path /org/Cinnamon "*) : ;;
+          *) echo "FAKE: property read on wrong object path: $args" >&2; exit 64 ;;
+        esac
         if [ "$mode" = alive ]; then
-          echo "()"
+          echo "(<'6.6.9'>,)"
         else
           echo "Error: Timeout was reached" >&2
           exit 1
         fi ;;
-      *) exit 1 ;;
+      *Peer.Ping*|*Introspect*)
+        echo "FAKE: probed with a call GDBus answers off the main loop: $args" >&2
+        exit 64 ;;
+      *)
+        echo "FAKE: unexpected call: $args" >&2
+        exit 64 ;;
     esac
   '';
 
@@ -166,29 +192,42 @@ in
         timeout=120,
     )
 
-    # cinnamon-rescue (home/cinnamon-watchdog.nix): recovers a hung Cinnamon
-    # without the hard reboot a wedged window manager otherwise forces.
-    # Cinnamon's main loop is what dispatches clicks, so when it blocks the
-    # cursor still tracks the mouse (X is fine) but nothing is clickable.
-    # That cost two hard power-offs (2026-10-29, 2026-11-07), each leaving an
-    # unclean btrfs. Liveness is a D-Bus Peer.Ping to org.Cinnamon: it is
-    # answered from the main loop, so a blocked loop fails the ping while the
-    # bus name stays owned — which is exactly the state worth acting on.
-    rstate = "/tmp/rescue-state"
+    # cinnamon-rescue (home/cinnamon-watchdog.nix): recover a wedged Cinnamon
+    # main loop without a reboot.
+    #
+    # The probe reads a property off Cinnamon's own interface instead of
+    # calling Peer.Ping, because GDBus answers Peer.Ping from its worker
+    # thread — a Cinnamon that has stopped dispatching still replies to it.
+    # fake-gdbus rejects Peer.Ping outright so that regression fails here.
+    rstate = "/tmp/rescue-reports"
+    rcount = "/tmp/rescue-counters"
     rlog = "/tmp/rescue-restarts"
+    fake_pid = 1
 
-    def rescue(cmd, mode="alive"):
+    def rescue_run(cmd, mode="alive", threshold=3, cooldown=300):
         return workstation.execute(
             "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u) "
             "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus "
-            f"FAKE_GDBUS_MODE={mode} "
+            f"FAKE_GDBUS_MODE={mode} FAKE_PID={fake_pid} "
             f"CINNAMON_RESCUE_GDBUS=${fakeGdbus}/bin/fake-gdbus "
             f"CINNAMON_RESCUE_STATE_DIR={rstate} "
+            f"CINNAMON_RESCUE_COUNTER_DIR={rcount} "
             f"CINNAMON_RESCUE_RESTART_LOG={rlog} "
             f"CINNAMON_RESCUE_RESTART_CMD=${fakeRestart}/bin/fake-cinnamon-restart "
-            "CINNAMON_RESCUE_THRESHOLD=3 CINNAMON_RESCUE_COOLDOWN_SECS=300; "
+            f"CINNAMON_RESCUE_THRESHOLD={threshold} "
+            f"CINNAMON_RESCUE_COOLDOWN_SECS={cooldown}; "
             f"cinnamon-rescue {cmd}'"
-        )[0]
+        )
+
+    def rescue(cmd, mode="alive", **kw):
+        return rescue_run(cmd, mode, **kw)[0]
+
+    # Asserts the exit code too: a traceback in a branch that happens not to
+    # restart would otherwise read as correct "did not restart" behaviour.
+    def rescue_ok(cmd, mode="alive", **kw):
+        rc, out = rescue_run(cmd, mode, **kw)
+        assert rc == 0, f"cinnamon-rescue {cmd} (mode={mode}) exited {rc}:\n{out}"
+        return out
 
     def restarts():
         return int(
@@ -197,7 +236,8 @@ in
 
     def reset_rescue():
         workstation.succeed(
-            f"rm -rf {rstate} {rlog}; install -o jonathan -m 644 /dev/null {rlog}"
+            f"rm -rf {rstate} {rcount} {rlog}; "
+            f"install -o jonathan -m 644 /dev/null {rlog}"
         )
 
     # The real probe, against the live Cinnamon in this session. The fakes
@@ -207,13 +247,10 @@ in
         "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
         "systemctl --user is-active cinnamon-watchdog.timer'"
     )
-    # Cinnamon's shell does not reliably claim org.Cinnamon in a headless
-    # VM (no GL), so asserting ALIVE here would be flaky. Assert the
-    # discriminating property instead: in a session that is NOT wedged,
-    # probe must never report "hung" — which is the misreport that would
-    # make the watchdog replace a healthy window manager. The live ALIVE
-    # case is covered by the host smoke, where Cinnamon demonstrably
-    # answers the ping.
+    # Cinnamon's shell may take a while to claim org.Cinnamon here, so wait
+    # for it, then assert the discriminating property: a session that is NOT
+    # wedged must never read as hung, which is the misreport that would make
+    # the watchdog replace a healthy window manager.
     def live_probe():
         return workstation.execute(
             "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u) "
@@ -234,42 +271,75 @@ in
     # Fail-safe: an unowned org.Cinnamon means Cinnamon is not running at all
     # (greeter, non-Cinnamon session). Never "recover" it there.
     reset_rescue()
-    rc = rescue("probe", mode="unowned")
-    assert rc == 2, f"probe on an unowned bus name: rc={rc}, want 2 (not running)"
+    assert rescue("probe", mode="unowned") == 2, \
+        "an unowned bus name must read as absent, not hung"
     for _ in range(5):
-        rescue("check", mode="unowned")
+        rescue_ok("check", mode="unowned")
     assert restarts() == 0, \
         "watchdog restarted Cinnamon while its bus name was unowned"
 
     # Hung: name owned, main loop silent. Must not fire below the threshold.
     reset_rescue()
-    rc = rescue("probe", mode="hung")
-    assert rc == 1, f"probe on a blocked main loop: rc={rc}, want 1 (hung)"
-    rescue("check", mode="hung")
-    rescue("check", mode="hung")
-    assert restarts() == 0, "watchdog fired before 3 consecutive failed pings"
+    assert rescue("probe", mode="hung") == 1, \
+        "a silent main loop must read as hung"
+    rescue_ok("check", mode="hung")
+    rescue_ok("check", mode="hung")
+    assert restarts() == 0, "watchdog fired before 3 consecutive failed probes"
 
-    # Third consecutive failure: recover, and leave the diagnostics behind —
-    # the hang left no trace either time, which is why it was never explained.
-    rescue("check", mode="hung")
+    # Threshold reached: recover, and leave a report carrying the real pid,
+    # the probe actually used, and a real thread state — so a capture that
+    # quietly stopped reading /proc fails here instead of passing on labels.
+    rescue_ok("check", mode="hung")
     assert restarts() == 1, "watchdog did not restart Cinnamon at the threshold"
     diag = workstation.succeed(f"cat {rstate}/hang-*.txt")
-    for want in ("cinnamon-rescue", "pid=", "wchan", "threads"):
-        assert want in diag, f"diagnostics file missing {want!r}:\n{diag}"
+    assert f"pid={fake_pid}" in diag, f"report does not name the pid:\n{diag}"
+    assert "Properties.Get" in diag, \
+        f"report does not name the probe actually used:\n{diag}"
+    assert f"tid={fake_pid} state=S" in diag, \
+        f"report carries no real thread state for pid {fake_pid}:\n{diag}"
 
-    # Cooldown: a Cinnamon that keeps wedging must not become a restart loop.
+    # Cooldown holds inside the window...
     for _ in range(3):
-        rescue("check", mode="hung")
+        rescue_ok("check", mode="hung")
     assert restarts() == 1, "cooldown did not suppress a second restart"
+
+    # ...and expires. Backdating last-restart is what makes the assertion
+    # above falsifiable: a cooldown that never ended would satisfy it too.
+    workstation.succeed(
+        f"echo 1 > {rcount}/last-restart; chown jonathan {rcount}/last-restart"
+    )
+    for _ in range(3):
+        rescue_ok("check", mode="hung")
+    assert restarts() == 2, \
+        "an expired cooldown still refused to restart, so it never ends"
 
     # A reply resets the count, so isolated blips never add up to a restart.
     reset_rescue()
-    rescue("check", mode="hung")
-    rescue("check", mode="hung")
-    rescue("check", mode="alive")
-    rescue("check", mode="hung")
-    rescue("check", mode="hung")
-    assert restarts() == 0, "a successful ping did not reset the failure counter"
+    rescue_ok("check", mode="hung")
+    rescue_ok("check", mode="hung")
+    rescue_ok("check", mode="alive")
+    rescue_ok("check", mode="hung")
+    rescue_ok("check", mode="hung")
+    assert restarts() == 0, "a successful probe did not reset the failure counter"
+
+    # The count belongs to the boot. Clearing the counter dir is what a reboot
+    # does to XDG_RUNTIME_DIR; a count that survived it would let the next
+    # session's first failure skip the threshold entirely.
+    reset_rescue()
+    rescue_ok("check", mode="hung")
+    rescue_ok("check", mode="hung")
+    workstation.succeed(f"rm -rf {rcount}")
+    rescue_ok("check", mode="hung")
+    assert restarts() == 0, \
+        "a failure count outlived the boot and skipped the threshold"
+
+    # `now` is the manual escape hatch over SSH or Ctrl+Alt+F2: it recovers on
+    # demand, with no accumulated failures and no regard for the cooldown.
+    reset_rescue()
+    rescue_ok("now", mode="hung")
+    assert restarts() == 1, "`cinnamon-rescue now` did not recover on demand"
+    status = rescue_ok("status", mode="alive")
+    assert "failures=0/3" in status, f"status does not report the counter:\n{status}"
 
     # Runs last: it takes ~40 s, and the X-bell check above samples server
     # state at one instant, so running this first shifted that sample past
