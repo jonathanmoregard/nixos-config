@@ -51,6 +51,17 @@ let
                  tip._tooltip.clutter_text.get_text().split(NL).join("~"));
         tip.set_markup("<b>bold</b>");
         log.push("valid_text=" + tip._tooltip.clutter_text.get_text());
+        // Positive control, and it runs LAST on purpose. These two lines are
+        // the unpatched set_markup body verbatim, so they reach Pango without
+        // the validation and must produce exactly one warning. Without it,
+        // "no new warnings" would also pass when the warning never reaches
+        // the journal at all -- and the rendered text cannot tell the two
+        // apart, because Clutter keeps the literal string either way.
+        // Being last means journald has necessarily flushed the lines above
+        // it by the time this one is visible.
+        tip._tooltip.set_text("CopyQ" + NL + "<EMPTY>");
+        tip._tooltip.clutter_text.set_use_markup(true);
+        log.push("control=fired");
         tip._tooltip.destroy();
         button.destroy();
     } catch (e) {
@@ -307,11 +318,24 @@ in
         f"CopyQ's tooltip text was not preserved verbatim:\n{rendered}"
     assert "valid_text=bold" in rendered, \
         f"valid markup no longer renders (over-escaped?):\n{rendered}"
+    assert "control=fired" in rendered, \
+        f"the positive control did not run, so the count below proves nothing:\n{rendered}"
+
+    # Wait for the control's warning rather than reading the count straight
+    # away: this is what distinguishes "the fix worked" from "the warning had
+    # not been flushed yet", and it waits out the flush in the same step.
+    workstation.wait_until_succeeds(
+        f"test $(journalctl -b 0 --no-pager | grep -c 'Failed to set the markup') "
+        f"-ge {before + 1}",
+        timeout=60,
+    )
     after = markup_failures()
-    assert after == before, (
-        "Pango rejected CopyQ's tooltip text: "
-        f"{after - before} new 'Failed to set the markup' line(s) "
-        f"(before={before} after={after})"
+    # Exactly one: the control's. The two set_markup calls above it must have
+    # added none.
+    assert after == before + 1, (
+        "Pango rejected CopyQ's tooltip text through the patched path: "
+        f"{after - before - 1} warning(s) beyond the positive control's "
+        f"(before={before} after={after}, expected {before + 1})"
     )
   '';
 }
