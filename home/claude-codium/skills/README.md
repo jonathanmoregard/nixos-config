@@ -10,9 +10,9 @@ the same name — declaring it here is deliberate, so it is the one that wins.
 
 Only subdirectories are picked up, so this file is ignored.
 
-Empty is the intended starting state. The mechanism is what was missing —
-there was no way to scope a skill to the editor at all — and a skill nobody
-asked for is worse than none.
+Keep this directory small: a skill nobody asked for is worse than none. What
+is here documents the two mutable layers of this setup itself — the editor's
+settings, and this Claude config directory.
 
 ## Adding one
 
