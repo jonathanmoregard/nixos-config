@@ -6337,17 +6337,13 @@ in
         "printf 'my own\\n' > /home/jonathan/vm-own-skill/SKILL.md && "
         f"ln -sfn /home/jonathan/vm-own-skill {codium}/skills/vm-own-link"
     )
-    # (4b) an OBSOLETE link into a previous generation's declared source —
-    #      a skill that was deleted from home/claude-codium/skills. The
-    #      target is a store path, so it stays valid for as long as any
-    #      generation retains it: the link is NOT dangling, arm (3) never
-    #      sees it, and the removed skill went on loading in every editor
-    #      session. The drift analyzer excludes store links, so nothing
-    #      reported it either. Found in review.
-    #
-    #      Any store path that is not a child of the CURRENT declared source
-    #      models this, and one from the closure is used so the fixture
-    #      resolves in the VM exactly as a retained old generation would.
+    # (4b) an OBSOLETE link into a previous generation's declared source — a
+    #      skill since deleted from home/claude-codium/skills. Its store
+    #      target stays valid for as long as any generation retains it, so
+    #      the link never dangles, a target-blind sweep keeps it, and the
+    #      deleted skill goes on being discovered. The fixture target is a
+    #      store path from the closure precisely so that it RESOLVES in the
+    #      VM, exactly as a retained old generation's would.
     workstation.succeed(
         f"ln -sfn ${../home/claude-codium} {codium}/skills/vm-obsolete-declared"
     )
@@ -6442,11 +6438,10 @@ in
         "~/.claude/skills yet, it deletes every inherited skill and recreates "
         "none, and nothing re-runs activation until the next deploy."
     )
-    # (4b) the obsolete declared link is gone. `! -L`, and the target is
-    #      deliberately one that still RESOLVES, so this cannot pass by way
-    #      of the dangling sweep: only a sweep that reads the link's target
-    #      and compares it against the current declared store path removes
-    #      it. Without that, removing a skill from
+    # (4b) the obsolete declared link is gone. The target still RESOLVES, so
+    #      this cannot pass by way of the dangling sweep: only a sweep that
+    #      reads the target and compares it against the current declared
+    #      store path removes it. Without one, removing a skill from
     #      home/claude-codium/skills does not remove it from editor
     #      sessions — it keeps being discovered, from a store path no
     #      declaration mentions any more.

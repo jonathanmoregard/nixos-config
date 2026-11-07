@@ -73,11 +73,9 @@ let
   # names it found — and since no Codium-only skill is declared yet, that
   # second loop was unreachable, so the first skill ever added here would have
   # been the first thing to run it.
-  # Named rather than inlined into skillSources because the sweep needs to
-  # tell THIS generation's declared source from an older one's. The store
-  # path changes whenever the directory's contents change, so "a child of
-  # this path" is exactly "declared now", and a link into any other store
-  # path is one this module made before a skill was deleted or renamed.
+  # Named separately because the sweep needs to tell THIS generation's
+  # declared source from an older one's: the store path changes whenever the
+  # directory's contents do, so "a child of this path" means "declared now".
   declaredSkills = ./claude-codium/skills;
 
   skillSources = [ "${live}/skills" declaredSkills ];
@@ -104,12 +102,11 @@ in
   #
   # The skills loop reads ~/.claude/skills, which on this host is populated
   # by claude-runtime-links.service — a separate unit, so the DAG does not
-  # order against it. That is tolerable rather than ignored, but only because
-  # the loop is additive: it links what is there, and the only links it
-  # sweeps are ones whose own target says they are finished — gone, or in a
-  # store path this generation does not declare. A run that reads an empty
-  # ~/.claude/skills therefore adds nothing instead of removing everything.
-  # See the sweep below.
+  # order against it. A run where that mount is absent loses the inherited
+  # links, whose targets went with it, and the next activation re-links them;
+  # what such a run cannot lose is the live or the declared half, because a
+  # link is only ever swept on the evidence of its own target. See the sweep
+  # below.
   home.activation.claudeCodiumConfig =
     lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       codium=${lib.escapeShellArg codiumDir}
@@ -183,46 +180,29 @@ in
         $DRY_RUN_CMD install -m 0644 ${codiumLocalSeed} "$codium/local.md"
       fi
 
-      # skills/ is assembled, not replaced. Two kinds of link are swept, and
-      # between them they cover both ways a skill stops being declared:
+      # skills/ is assembled, not replaced. A link is swept when its own
+      # target says it is finished: either the target is gone, or it sits in
+      # a store path this generation does not declare. The second case is
+      # the one that is easy to miss — a skill deleted from
+      # home/claude-codium/skills leaves a link whose store target stays
+      # valid for as long as any generation retains it, so it never dangles,
+      # and home/drift-analyzer.nix excludes store links from the report.
       #
-      #   - DANGLING: the target has gone, so the skill was removed or
-      #     renamed in ~/.claude/skills. Leaving it would keep a dead skill
-      #     resolving.
-      #   - OBSOLETE DECLARED: the target is a store path that is not a
-      #     child of this generation's declared source. That link is one WE
-      #     made from an earlier generation, and its target stays valid for
-      #     as long as any generation retains that store path -- so it is
-      #     not dangling, the sweep above never sees it, and a skill deleted
-      #     from home/claude-codium/skills went on being discovered by
-      #     every editor session. home/drift-analyzer.nix excludes store
-      #     links (they are the declared half, normally not news), so
-      #     nothing reported it either. Found in review.
+      # Judging the target, rather than recording what we linked, leaves no
+      # manifest that can fall out of step with the directory; and the store
+      # source is in this script's own closure, so unlike the bind mount
+      # below it cannot go missing and take the whole declared set with it.
       #
-      # Discriminating on the target, rather than tracking what we linked in
-      # a state file beside the directory, is what keeps this a pure
-      # function of the declaration: there is no manifest to get out of step
-      # with the links themselves, and no run can prune on the strength of a
-      # stale record. The store source also cannot go missing the way the
-      # bind mount below can -- it is in this script's own closure -- so
-      # this sweep has no empty-source failure mode of the kind the next
-      # paragraph is about.
+      # Judging each link rather than relinking from scratch is what spares a
+      # symlink the user made by hand into one of their own repos — route 2
+      # from the skills README — which a blanket sweep would remove silently
+      # on the next deploy.
       #
-      # Deliberately NOT "delete every symlink and relink from scratch",
-      # which is the obvious shape and is destructive in two ordinary
-      # situations:
-      #
-      #   - ~/.claude/skills is populated by claude-runtime-links.service, a
-      #     separate unit this DAG is not ordered against. On a run where it
-      #     has not populated yet — first boot after a cutover, or a skipped
-      #     mount — relinking from scratch would delete every link and
-      #     recreate none, leaving editor sessions with no skills at all
-      #     until the next deploy, because nothing re-runs activation on a
-      #     timer. Sweeping only dangling links degrades that to "the
-      #     previous set stays", which is both safe and self-correcting.
-      #   - a symlink the user made by hand into one of their own repos is
-      #     the natural way to do route 2 from the skills README, and a
-      #     blanket sweep would delete it silently on the next deploy.
+      # It does NOT spare an inherited link while ~/.claude/skills is
+      # unpopulated: that target went with the mount, so the link dangles and
+      # is swept, leaving an editor session the live and declared skills only
+      # until a later activation re-links the rest. Nothing re-runs
+      # activation on a timer, so that window is a deploy long.
       #
       # Anything that is not a symlink at all — a real directory — is a skill
       # written in place and is never touched. That is the mutable half of
@@ -231,27 +211,25 @@ in
 
       for link in "$codium/skills"/*; do
         [ -L "$link" ] || continue
-        # readlink, not realpath: the literal target is what the link loop
-        # wrote, so it is either "$live/skills/<name>" or a child of a
-        # declared store path. Resolving it would turn the first of those
-        # into a store path too (~/.claude/skills entries are themselves
-        # links into the store) and this would start deleting inherited
-        # skills.
-        target=$(readlink "$link")
+        # readlink, not realpath: ~/.claude/skills entries are themselves
+        # links into the store, so resolving would make every inherited
+        # skill look like one of ours and sweep it.
+        #
+        # `|| true` because this runs under set -e and a failed read would
+        # abort activation, which on this host poisons the deploy SHA. An
+        # empty target falls through to the resolves-or-sweep rule below,
+        # which keeps the link.
+        target=$(readlink "$link" || true)
         case "$target" in
-          "$declaredStore"/*)
-            # Declared right now. Nothing to do: the link loop below
-            # re-points it, and an unchanged declaration keeps the same
-            # store path.
-            continue
-            ;;
+          # Declared now: an unchanged declaration keeps the same store path.
+          "$declaredStore"/*) continue ;;
+          # Ours, from a generation whose declared set still had it.
           /nix/store/*)
-            # Ours, from a generation whose declared set still had it.
             $DRY_RUN_CMD rm -f "$link"
             continue
             ;;
         esac
-        # Everything else is judged on whether it resolves, which is what
+        # Anything else is judged on whether it resolves, which is what
         # spares a hand-made link into one of the user's own repos.
         if [ -e "$link" ]; then continue; fi
         $DRY_RUN_CMD rm -f "$link"
