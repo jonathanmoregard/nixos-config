@@ -6314,6 +6314,31 @@ in
         "printf 'my own\\n' > /home/jonathan/vm-own-skill/SKILL.md && "
         f"ln -sfn /home/jonathan/vm-own-skill {codium}/skills/vm-own-link"
     )
+    # (4b) an OBSOLETE link into a previous generation's declared source —
+    #      a skill that was deleted from home/claude-codium/skills. The
+    #      target is a store path, so it stays valid for as long as any
+    #      generation retains it: the link is NOT dangling, arm (3) never
+    #      sees it, and the removed skill went on loading in every editor
+    #      session. The drift analyzer excludes store links, so nothing
+    #      reported it either. Found in review.
+    #
+    #      Any store path that is not a child of the CURRENT declared source
+    #      models this, and one from the closure is used so the fixture
+    #      resolves in the VM exactly as a retained old generation would.
+    workstation.succeed(
+        f"ln -sfn ${../home/claude-codium} {codium}/skills/vm-obsolete-declared"
+    )
+    # (4c) …and its counterpart: a link into THIS generation's declared
+    #      source must survive. The pair is what pins the sweep to "a store
+    #      path other than the current one" rather than "every store path",
+    #      which would delete the Codium-only skills on the very deploy that
+    #      declared them. No Codium-only skill is declared yet, so without
+    #      this arm the keep-branch would first run for real on whoever adds
+    #      the first one.
+    workstation.succeed(
+        f"ln -sfn ${../home/claude-codium/skills}/README.md "
+        f"{codium}/skills/vm-declared-current"
+    )
     # (5) an edit to the prose layer.
     workstation.succeed(f"printf 'vm-local-marker\\n' >> {codium}/local.md")
     # (6) a REAL FILE where an inherited link belongs. This is what a future
@@ -6393,6 +6418,27 @@ in
         "any activation where claude-runtime-links.service has not populated "
         "~/.claude/skills yet, it deletes every inherited skill and recreates "
         "none, and nothing re-runs activation until the next deploy."
+    )
+    # (4b) the obsolete declared link is gone. `! -L`, and the target is
+    #      deliberately one that still RESOLVES, so this cannot pass by way
+    #      of the dangling sweep: only a sweep that reads the link's target
+    #      and compares it against the current declared store path removes
+    #      it. Without that, removing a skill from
+    #      home/claude-codium/skills does not remove it from editor
+    #      sessions — it keeps being discovered, from a store path no
+    #      declaration mentions any more.
+    workstation.succeed(f"test ! -L {codium}/skills/vm-obsolete-declared")
+    # (4c) while the current generation's declared link is untouched.
+    codium_declared = workstation.succeed(
+        f"readlink {codium}/skills/vm-declared-current"
+    ).strip()
+    assert codium_declared.startswith("/nix/store/"), (
+        f"the link into the current declared source now reads "
+        f"{codium_declared!r}. Sweeping every store-targeted link is the "
+        "shape that does this, and it deletes every Codium-only skill on "
+        "the same deploy that declares them: the link loop recreates them, "
+        "but a sweep ordered after it would leave none, and nothing re-runs "
+        "activation until the next deploy."
     )
     # A loose file in the declared-skills source must not become a skill:
     # only directories are linked, which is what keeps that directory's own

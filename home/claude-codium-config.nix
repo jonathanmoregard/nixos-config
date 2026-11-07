@@ -73,7 +73,14 @@ let
   # names it found — and since no Codium-only skill is declared yet, that
   # second loop was unreachable, so the first skill ever added here would have
   # been the first thing to run it.
-  skillSources = [ "${live}/skills" ./claude-codium/skills ];
+  # Named rather than inlined into skillSources because the sweep needs to
+  # tell THIS generation's declared source from an older one's. The store
+  # path changes whenever the directory's contents change, so "a child of
+  # this path" is exactly "declared now", and a link into any other store
+  # path is one this module made before a skill was deleted or renamed.
+  declaredSkills = ./claude-codium/skills;
+
+  skillSources = [ "${live}/skills" declaredSkills ];
 
   codiumClaudeMd = ./claude-codium/CLAUDE.md;
 
@@ -98,9 +105,11 @@ in
   # The skills loop reads ~/.claude/skills, which on this host is populated
   # by claude-runtime-links.service — a separate unit, so the DAG does not
   # order against it. That is tolerable rather than ignored, but only because
-  # the loop is additive: it links what is there and sweeps just the links
-  # that have gone dangling, so a run that reads an empty source adds nothing
-  # instead of removing everything. See the sweep below.
+  # the loop is additive: it links what is there, and the only links it
+  # sweeps are ones whose own target says they are finished — gone, or in a
+  # store path this generation does not declare. A run that reads an empty
+  # ~/.claude/skills therefore adds nothing instead of removing everything.
+  # See the sweep below.
   home.activation.claudeCodiumConfig =
     lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       codium=${lib.escapeShellArg codiumDir}
@@ -174,9 +183,30 @@ in
         $DRY_RUN_CMD install -m 0644 ${codiumLocalSeed} "$codium/local.md"
       fi
 
-      # skills/ is assembled, not replaced. Only DANGLING symlinks are swept:
-      # a link whose target has gone is a skill that was removed or renamed
-      # upstream, and leaving it would keep a dead skill resolving.
+      # skills/ is assembled, not replaced. Two kinds of link are swept, and
+      # between them they cover both ways a skill stops being declared:
+      #
+      #   - DANGLING: the target has gone, so the skill was removed or
+      #     renamed in ~/.claude/skills. Leaving it would keep a dead skill
+      #     resolving.
+      #   - OBSOLETE DECLARED: the target is a store path that is not a
+      #     child of this generation's declared source. That link is one WE
+      #     made from an earlier generation, and its target stays valid for
+      #     as long as any generation retains that store path -- so it is
+      #     not dangling, the sweep above never sees it, and a skill deleted
+      #     from home/claude-codium/skills went on being discovered by
+      #     every editor session. home/drift-analyzer.nix excludes store
+      #     links (they are the declared half, normally not news), so
+      #     nothing reported it either. Found in review.
+      #
+      # Discriminating on the target, rather than tracking what we linked in
+      # a state file beside the directory, is what keeps this a pure
+      # function of the declaration: there is no manifest to get out of step
+      # with the links themselves, and no run can prune on the strength of a
+      # stale record. The store source also cannot go missing the way the
+      # bind mount below can -- it is in this script's own closure -- so
+      # this sweep has no empty-source failure mode of the kind the next
+      # paragraph is about.
       #
       # Deliberately NOT "delete every symlink and relink from scratch",
       # which is the obvious shape and is destructive in two ordinary
@@ -197,8 +227,32 @@ in
       # Anything that is not a symlink at all — a real directory — is a skill
       # written in place and is never touched. That is the mutable half of
       # this directory and the reason it is not a store path.
+      declaredStore=${lib.escapeShellArg "${declaredSkills}"}
+
       for link in "$codium/skills"/*; do
         [ -L "$link" ] || continue
+        # readlink, not realpath: the literal target is what the link loop
+        # wrote, so it is either "$live/skills/<name>" or a child of a
+        # declared store path. Resolving it would turn the first of those
+        # into a store path too (~/.claude/skills entries are themselves
+        # links into the store) and this would start deleting inherited
+        # skills.
+        target=$(readlink "$link")
+        case "$target" in
+          "$declaredStore"/*)
+            # Declared right now. Nothing to do: the link loop below
+            # re-points it, and an unchanged declaration keeps the same
+            # store path.
+            continue
+            ;;
+          /nix/store/*)
+            # Ours, from a generation whose declared set still had it.
+            $DRY_RUN_CMD rm -f "$link"
+            continue
+            ;;
+        esac
+        # Everything else is judged on whether it resolves, which is what
+        # spares a hand-made link into one of the user's own repos.
         if [ -e "$link" ]; then continue; fi
         $DRY_RUN_CMD rm -f "$link"
       done
