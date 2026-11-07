@@ -101,6 +101,54 @@ let
     }
   '';
 
+  # Shared by Phase A3 and A4, which both press a real key at a pane. XTEST
+  # delivers to the FOCUSED window, so focus has to be established and then
+  # CHECKED rather than assumed: a keypress sent to the wrong window would
+  # read as a missing interrupt, i.e. as the exact regression these phases
+  # exist to catch.
+  #
+  # The window count is POLLED rather than asserted once, because a phase that
+  # just finished may still be tearing its own kitty down. A window that has
+  # not appeared yet and one that has not gone yet are both transient, and
+  # demanding "exactly one, right now" turns either into a flake.
+  #
+  # A plain loop, not wait_for: the predicate needs a command substitution
+  # evaluated per attempt, and deferring one through `eval` costs more
+  # legibility than the four lines it saves.
+  focusKittySh = ''
+    focus_one_kitty() {
+      n=0
+      wid=""
+      while [ "$n" -lt 300 ]; do
+        wid=$($XDOTOOL search --onlyvisible --class kitty || true)
+        if [ "$(printf '%s\n' "$wid" | grep -c . || true)" = 1 ]; then
+          break
+        fi
+        sleep 0.1
+        n=$((n + 1))
+      done
+      count=$(printf '%s\n' "$wid" | grep -c . || true)
+      if [ "$count" -ne 1 ]; then
+        echo "FAIL: expected exactly 1 kitty window to focus, found $count" >&2
+        return 1
+      fi
+      # windowactivate needs a window manager advertising _NET_ACTIVE_WINDOW.
+      # Measured on a bare X server it prints "claims not to support
+      # _NET_ACTIVE_WINDOW" and exits 1, which under `set -e` would abort the
+      # calling phase with no message of its own. windowfocus
+      # (XSetInputFocus) needs no WM, so fall back to it.
+      $XDOTOOL windowactivate --sync "$wid" 2>/dev/null \
+        || $XDOTOOL windowfocus --sync "$wid" 2>/dev/null \
+        || true
+      focused=$($XDOTOOL getwindowfocus 2>/dev/null || echo none)
+      if [ "$focused" != "$wid" ]; then
+        echo "FAIL: could not focus the test window ($focused != $wid), so" \
+             "the keypress would have gone somewhere other than the pane" >&2
+        return 1
+      fi
+    }
+  '';
+
   # Phase A3 — the ctrl+c INTERRUPT, behaviourally. The config probe compares
   # the resolved chain, which catches a reordering or a dropped action but not
   # a kitty release that changes what a chain MEANS: whether the interrupt
@@ -164,6 +212,7 @@ let
     log=/tmp/kitty-interrupt.log
 
     ${waitForSh}
+    ${focusKittySh}
 
     rm -f "$res" "$ready"
 
@@ -171,7 +220,9 @@ let
       ${pkgs.python3}/bin/python3 ${interruptObserverPy} "$res" "$ready" \
       >"$log" 2>&1 &
     kpid=$!
-    trap 'kill $kpid 2>/dev/null || true' EXIT
+    # `wait` as well as `kill`: this script returning before kitty is
+    # reaped would leave its window alive for the next phase to count.
+    trap 'kill $kpid 2>/dev/null || true; wait $kpid 2>/dev/null || true' EXIT
 
     if ! wait_for 600 "$KITTY @ --to $sock ls"; then
       echo "FAIL: test kitty never opened its socket" >&2
@@ -184,33 +235,7 @@ let
       exit 1
     fi
 
-    # XTEST delivers to the FOCUSED window, so focus has to be established
-    # and then CHECKED rather than assumed. Only this one kitty is running at
-    # this point in the lane -- Phase A2 waits for its own instances to exit
-    # and the session phases start later -- so one match is expected, and more
-    # than one would make the keypress ambiguous.
-    wid=$($XDOTOOL search --onlyvisible --class kitty || true)
-    matches=$(printf '%s\n' "$wid" | grep -c . || true)
-    if [ "$matches" -ne 1 ]; then
-      echo "FAIL: expected exactly 1 kitty window to focus, found $matches" >&2
-      exit 1
-    fi
-    # windowactivate needs a window manager advertising _NET_ACTIVE_WINDOW.
-    # Measured on a bare X server it prints "claims not to support
-    # _NET_ACTIVE_WINDOW" and exits 1, which under `set -e` would abort this
-    # phase with no message of its own. windowfocus (XSetInputFocus) needs no
-    # WM, so fall back to it, and then confirm focus instead of trusting
-    # either call -- a keypress sent to the wrong window would read as a
-    # missing interrupt.
-    $XDOTOOL windowactivate --sync "$wid" 2>/dev/null \
-      || $XDOTOOL windowfocus --sync "$wid" 2>/dev/null \
-      || true
-    focused=$($XDOTOOL getwindowfocus 2>/dev/null || echo none)
-    if [ "$focused" != "$wid" ]; then
-      echo "FAIL: could not focus the test window ($focused != $wid), so the" \
-           "keypress would have gone somewhere other than the pane" >&2
-      exit 1
-    fi
+    focus_one_kitty
     $XDOTOOL key ctrl+c
 
     if ! wait_for 100 "grep -qx INTERRUPTED $res"; then
@@ -221,6 +246,143 @@ let
       exit 1
     fi
     echo "PASS ctrl+c with nothing selected still interrupts the program"
+  '';
+
+  # Phase A4 — the OTHER half of the interrupt guarantee: that
+  # `clear_selection` stops a stale selection from swallowing the next ctrl+c.
+  # Phase A3 covers the no-selection case; this covers the sequence a user
+  # actually performs, copy then interrupt:
+  #
+  #   press 1, with a selection -> consumed by the copy, must NOT interrupt
+  #   press 2, selection cleared -> must interrupt
+  #
+  # Without the clear_selection clause the second press is swallowed too, and
+  # stays swallowed until something else clears the selection. Measured on the
+  # host with the clause removed as the control: press1=0 press2=0, against
+  # press1=0 press2=1 for the real chain. That is a reachable bug, not a
+  # theoretical one, which is why this is worth a phase rather than only the
+  # chain comparison in the config probe.
+  #
+  # This lane twice declined drag automation as brittle, and the reason it is
+  # not brittle here is that the selection is CONFIRMED through `kitty @
+  # get-text --extent selection` before any key is pressed. A drag that
+  # selects nothing is then reported as a failed drag rather than as a broken
+  # binding, so the phase cannot produce a false verdict about the keymap --
+  # only a clearly-labelled instrument failure. The drag is also
+  # window-relative (`mousemove --window`), because absolute screen
+  # coordinates only work on a bare X server that happens to place the window
+  # at 0,0; the VM session has a window manager.
+  selectObserverPy = pkgs.writeText "vm-kitty-select-observer.py" ''
+    """Prints selectable text, then counts the SIGINTs that arrive.
+
+    A count rather than a flag, because the assertion is about WHICH press
+    interrupts: press 1 must not and press 2 must. Stays in canonical mode for
+    the reason given in the Phase A3 observer.
+    """
+    import signal
+    import sys
+    import time
+
+    out = sys.argv[1]
+    ready_path = sys.argv[2]
+    count = 0
+
+
+    def record(signum, frame):
+        global count
+        count += 1
+        with open(out, "w") as f:
+            f.write("INTERRUPTS=%d" % count)
+
+
+    signal.signal(signal.SIGINT, record)
+    # Several rows, so a coarse drag cannot miss the text.
+    for i in range(5):
+        print("SELECTME-%d-SELECTME-SELECTME-SELECTME" % i, flush=True)
+    with open(out, "w") as f:
+        f.write("INTERRUPTS=0")
+    with open(ready_path, "w") as f:
+        f.write("READY")
+    deadline = time.time() + 40.0
+    while time.time() < deadline:
+        time.sleep(0.05)
+  '';
+
+  selectionTest = pkgs.writeShellScript "vm-kitty-selection-interrupt" ''
+    set -eu
+    PATH=/run/current-system/sw/bin:$PATH
+    KITTY=${pkgs.kitty}/bin/kitty
+    XDOTOOL=${pkgs.xdotool}/bin/xdotool
+    sock=unix:/tmp/kitty-selection.sock
+    res=/tmp/kitty-selection.txt
+    ready=/tmp/kitty-selection.ready
+    log=/tmp/kitty-selection.log
+
+    ${waitForSh}
+    ${focusKittySh}
+
+    rm -f "$res" "$ready"
+
+    # No --config: this must exercise the DEPLOYED chain, xclip pipeline and
+    # all. Press 1 therefore leaves a real xclip clipboard owner behind, which
+    # is exactly what the desktop does and is harmless here -- Phase A2 has
+    # finished with the clipboard and the session phases that follow do not
+    # touch it.
+    $KITTY -o allow_remote_control=yes --listen-on "$sock" \
+      ${pkgs.python3}/bin/python3 ${selectObserverPy} "$res" "$ready" \
+      >"$log" 2>&1 &
+    kpid=$!
+    # `wait` as well as `kill`: this script returning before kitty is
+    # reaped would leave its window alive for the next phase to count.
+    trap 'kill $kpid 2>/dev/null || true; wait $kpid 2>/dev/null || true' EXIT
+
+    if ! wait_for 600 "$KITTY @ --to $sock ls"; then
+      echo "FAIL: test kitty never opened its socket" >&2
+      cat "$log" >&2 || true
+      exit 1
+    fi
+    if ! wait_for 300 "grep -qx READY $ready"; then
+      echo "FAIL: the selection observer never started in the pane" >&2
+      cat "$log" >&2 || true
+      exit 1
+    fi
+
+    focus_one_kitty
+
+    $XDOTOOL mousemove --window "$wid" 20 20 mousedown 1 \
+             mousemove --window "$wid" 60 30 \
+             mousemove --window "$wid" 480 70 mouseup 1
+
+    # Instrument check, deliberately distinct from a verdict about the keymap.
+    if ! wait_for 50 "$KITTY @ --to $sock get-text --extent selection \
+        | tr -d '[:space:]' | grep -q SELECTME"; then
+      echo "FAIL: the drag selected nothing, so this run measured the drag" \
+           "and not the binding -- the keymap verdict is UNKNOWN, not bad" >&2
+      exit 1
+    fi
+    echo "selection confirmed in the pane"
+
+    $XDOTOOL key ctrl+c
+    # A consumed key produces no observable event, so there is nothing to poll
+    # for here; this waits long enough that a SIGINT would have landed. The
+    # press-2 assertion below is the one that polls.
+    wait_for 10 false || true
+    after1=$(cat "$res")
+    if [ "$after1" != "INTERRUPTS=0" ]; then
+      echo "FAIL: ctrl+c WITH a selection interrupted ($after1); the copy" \
+           "half of the chain is not consuming the key" >&2
+      exit 1
+    fi
+
+    $XDOTOOL key ctrl+c
+    if ! wait_for 100 "grep -qx INTERRUPTS=1 $res"; then
+      echo "FAIL: the second ctrl+c did not interrupt (observed" \
+           "$(cat "$res" 2>/dev/null || echo '<none>')), so a stale selection" \
+           "is swallowing interrupts -- clear_selection is not doing its job" >&2
+      cat "$log" >&2 || true
+      exit 1
+    fi
+    echo "PASS copy consumes ctrl+c, and the next ctrl+c interrupts again"
   '';
 
   # Phase A2 — the ctrl+v DECISION, behaviourally. The config assertions in
@@ -260,6 +422,23 @@ let
     mode is essential and not incidental: in canonical mode the tty line
     discipline claims ctrl+V as VLNEXT and the keypress never reaches the
     program at all.
+
+    Writes a READY file once negotiation is CONFIRMED, which the harness waits
+    for before asking for a decision. The socket being open says only that
+    kitty is up, not that this program has started, left canonical mode and
+    had its push processed -- and `send-key` encodes for the window's LIVE
+    keyboard mode, so a push that has not landed yet means kitty emits legacy
+    0x16 and the still-canonical tty eats it as VLNEXT. Measured with a 1.5s
+    startup delay standing in for a loaded runner: waiting only for the socket
+    loses the keypress entirely (observed NOTHING), waiting for READY observes
+    b'\x1b[118;5u'.
+
+    Confirmed, not assumed: after pushing the flag this queries it back with
+    CSI ?u and waits for kitty's reply (measured on 0.49.2: b'\x1b[?1u'), so
+    READY means kitty has processed the push rather than that the write was
+    flushed. The reply is consumed here so it cannot be mistaken for the
+    keypress under test, and if it never arrives READY is never written and
+    the harness fails loudly instead of racing.
     """
     import os
     import select
@@ -269,15 +448,33 @@ let
     import tty
 
     out = sys.argv[1]
+    ready_path = sys.argv[2]
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     buf = b""
+    # Before READY, so that READY implies the result file exists.
     with open(out, "w") as f:
         f.write("NOTHING")
     try:
         tty.setraw(fd)
         sys.stdout.write("\x1b[>1u")
+        sys.stdout.write("\x1b[?u")
         sys.stdout.flush()
+        reply = b""
+        hs_deadline = time.time() + 10.0
+        while time.time() < hs_deadline:
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if not r:
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            reply += chunk
+            if reply.endswith(b"u"):
+                break
+        if reply.endswith(b"u"):
+            with open(ready_path, "w") as f:
+                f.write("READY")
         deadline = time.time() + 20.0
         while time.time() < deadline:
             ready, _, _ = select.select([fd], [], [], 0.2)
@@ -354,7 +551,11 @@ let
       ready=$3
       sock=unix:/tmp/paste-decision-$name.sock
       res=/tmp/paste-decision-$name.txt
+      rdy=/tmp/paste-decision-$name.ready
       log=/tmp/paste-decision-$name.log
+
+      # So a re-run in the same VM cannot read a previous case's result.
+      rm -f "$res" "$rdy"
 
       stop_owner
       # Both halves of this line are load-bearing, and neither is obvious.
@@ -380,11 +581,23 @@ let
       fi
 
       $KITTY -o allow_remote_control=yes --listen-on "$sock" \
-        ${pkgs.python3}/bin/python3 ${pasteObserverPy} "$res" \
+        ${pkgs.python3}/bin/python3 ${pasteObserverPy} "$res" "$rdy" \
         >"$log" 2>&1 &
       kpid=$!
       if ! wait_for 600 "$KITTY @ --to $sock ls"; then
         echo "FAIL: $name: test kitty never opened its socket" >&2
+        cat "$log" >&2 || true
+        kill $kpid 2>/dev/null || true
+        return 1
+      fi
+      # The socket says kitty is up, NOT that the observer has started, left
+      # canonical mode and had its keyboard-protocol push processed. Asking
+      # for a decision before that loses an image case's keypress to VLNEXT
+      # (measured; see the observer's docstring). This is the handshake
+      # Phase A3 already had and this phase did not.
+      if ! wait_for 300 "grep -qx READY $rdy"; then
+        echo "FAIL: $name: the observer never confirmed the kitty keyboard" \
+             "protocol, so a keypress could not have been observed reliably" >&2
         cat "$log" >&2 || true
         kill $kpid 2>/dev/null || true
         return 1
@@ -400,7 +613,13 @@ let
       # exactly "something arrived". A timeout here is NOT failed on: the
       # per-case assertion below can tell "nothing arrived" from "the wrong
       # thing arrived" and says which, which is the more useful message.
-      wait_for 100 "! grep -qx NOTHING $res" || true
+      #
+      # The `-f` test is not redundant. grep exits 2 on a missing file, and
+      # `!` turns that into success, so without it this wait returns
+      # immediately on the first attempt whenever the file is not there yet
+      # and the case kills kitty before anything could arrive. READY already
+      # implies the file exists; this keeps the predicate true on its own.
+      wait_for 100 "[ -f $res ] && ! grep -qx NOTHING $res" || true
 
       kill $kpid 2>/dev/null || true
       wait $kpid 2>/dev/null || true
@@ -933,6 +1152,15 @@ in
     # return value and kitty's passthrough protocol, not on the config.
     print("[interrupt]\n" + workstation.succeed(
         "su jonathan -c 'DISPLAY=:0 ${interruptTest}'"
+    ))
+
+    # === ctrl+c after a copy (Phase A4 — clear_selection earns its place) ===
+    # The other half of the same guarantee: a selection makes ctrl+c copy, and
+    # the NEXT ctrl+c must interrupt again. Without clear_selection the second
+    # press is swallowed too (measured on the host as the control), and stays
+    # swallowed until something else clears the selection.
+    print("[selection-interrupt]\n" + workstation.succeed(
+        "su jonathan -c 'DISPLAY=:0 ${selectionTest}'"
     ))
 
     # Helper: glob discovers the live socket regardless of kitty's PID.
