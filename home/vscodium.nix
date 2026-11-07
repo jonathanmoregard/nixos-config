@@ -210,7 +210,8 @@ let
     # the setting that admits it, so a live `true` would hand an
     # editor-started session blanket tool approval and survive every deploy.
     # environmentVariables sets the env of the spawned claude process, which
-    # is how the egress wrapper below could be worked around.
+    # is how the egress wrapper below could be worked around; it is declared
+    # under Claude Code below, where its own value needs explaining.
     #
     # initialPermissionMode itself is left undeclared on purpose: unset means
     # "defer to the CLI's resolved default for the session", and pinning a
@@ -236,9 +237,11 @@ let
     # ignored, so the path is built from homeDirectory rather than written
     # with a `~`.
     #
-    # Declared here, which is what makes it safe to depend on: this whole
-    # file is written with `force = true`, so a value edited into
-    # settings.json through the Settings UI is replaced on the next deploy.
+    # Declared, which is what makes it safe to depend on: the activation
+    # merge is `$dynamic * $static`, so a declared key's value wins over
+    # whatever the Settings UI wrote, and the recorder files the discarded
+    # value as an override before the merge runs. jq's `*` replaces an array
+    # wholesale rather than unioning it, so an appended entry goes too.
     # That matters more for this key than for the rest of them — it is where
     # an edit could point the editor's Claude at an attacker-chosen config
     # directory, or inject environment into the process it spawns.

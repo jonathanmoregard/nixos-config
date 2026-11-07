@@ -2254,18 +2254,39 @@ in
     fill_inventory(1400)
     rc_big, out_big = run_stubbed()
     assert rc_big == 0, f"a >128 KiB prompt must still run (rc={rc_big}):\n{out_big}"
-    fed = workstation.succeed(f"cat {stub}/stdin")
-    assert len(fed.encode()) > 131072, (
-        f"fixture must push the prompt past MAX_ARG_STRLEN, got {len(fed.encode())} B"
+    # Sized and matched in the guest rather than read back here: a read-back
+    # of a payload this size came back short (130560 B of the 140 KiB+ on
+    # disk), and a short read is indistinguishable from the truncation this
+    # arm exists to detect. Small answers cross the channel reliably.
+    fed_bytes = int(workstation.succeed(f"stat -c %s {stub}/stdin").strip())
+    assert fed_bytes > 131072, (
+        f"fixture must push the prompt past MAX_ARG_STRLEN, got {fed_bytes} B"
     )
-    assert fed.startswith("PROMPT-MD-MARKER") and f"{probe_sess}/final.json" in fed, (
-        "the model must receive prompt.md plus the precomputed window"
+    fed_head = workstation.succeed(f"head -c 16 {stub}/stdin").strip()
+    assert fed_head == "PROMPT-MD-MARKER", (
+        f"the model must receive prompt.md first, got {fed_head!r}"
     )
-    assert "synthetic-proposal-with-a-realistic-slug-length-1400.md" in fed, (
-        "the whole inventory must reach the model, not a truncation"
+    assert workstation.execute(
+        f"grep -qF '{probe_sess}/final.json' {stub}/stdin"
+    )[0] == 0, "the model must receive the precomputed window"
+    # Counted, not sampled: the inventory is sorted LC_ALL=C, so the
+    # highest-numbered slug sits mid-list and finding it proves nothing about
+    # the tail.
+    fed_listed = int(workstation.succeed(
+        f"grep -c synthetic-proposal-with-a-realistic-slug-length {stub}/stdin"
+    ).strip())
+    assert fed_listed == 1400, (
+        f"the whole inventory must reach the model, got {fed_listed} of 1400"
+    )
+    # Sized in the guest first, for the same reason: a prompt that DID travel
+    # in argv would be too big to read back whole, and a short read could
+    # pass both of these.
+    argv_bytes = int(workstation.succeed(f"stat -c %s {stub}/argv").strip())
+    assert argv_bytes < 4096, (
+        f"the prompt must not travel in argv ({argv_bytes} B of argv)"
     )
     argv_big = workstation.succeed(f"cat {stub}/argv")
-    assert "PROMPT-MD-MARKER" not in argv_big and len(argv_big) < 4096, (
+    assert "PROMPT-MD-MARKER" not in argv_big, (
         f"the prompt must not travel in argv:\n{argv_big[:2000]}"
     )
     # The prompt is untrusted transcript content: the tool SURFACE must be
