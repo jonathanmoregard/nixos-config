@@ -674,6 +674,7 @@ in
     ./ghostty.nix
     ./kitty.nix
     ./vscodium.nix
+    ./claude-codium-config.nix
     ./git-hooks.nix
     ./cache-publisher-enqueue.nix
     ./autodoro.nix
