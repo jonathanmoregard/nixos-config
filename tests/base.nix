@@ -1518,6 +1518,61 @@ in
         f"cat {codium_settings}"
     )
 
+    # (d) an UNMANAGED real directory where the extension set belongs does
+    #     not stop the deploy. VSCodium creates ~/.vscode-oss/extensions on
+    #     first run and mutableExtensionsDir = false puts that path under
+    #     home-manager, so a real directory there fails both the collision
+    #     check and the linker, and a failed activation on this host latches
+    #     the deploy SHA as poisoned.
+    #
+    #     The plant is what VSCodium actually leaves there, an
+    #     extensions.json, and the arm turns on where it ends up: the
+    #     declared set has an extensions.json of its own, so the live path
+    #     cannot say whether the old directory was moved or destroyed.
+    codium_ext = "/home/jonathan/.vscode-oss/extensions"
+    workstation.succeed(
+        "install -d -o jonathan -g users /home/jonathan/.vscode-oss && "
+        f"rm -rf {codium_ext} && "
+        f"install -d -o jonathan -g users {codium_ext} && "
+        f"printf '[]' > {codium_ext}/extensions.json && "
+        f"chown jonathan:users {codium_ext}/extensions.json"
+    )
+    workstation.succeed(f"test -d {codium_ext} -a ! -L {codium_ext}")
+    # execute, not succeed: a refusal to clobber shows up as this unit
+    # failing, and the point of the arm is to observe that outcome rather
+    # than abort on it with the reason buried in a traceback.
+    workstation.execute("systemctl restart home-manager-jonathan.service")
+    assert workstation.succeed(
+        "systemctl show -P ExecMainStatus home-manager-jonathan.service"
+    ).strip() == "0", (
+        "home-manager activation failed with an unmanaged real directory at "
+        f"{codium_ext}. VSCodium creates it on first run, so every machine "
+        "that has opened the editor fails its next deploy, and this host "
+        "latches the failed SHA as poisoned. `force` alone does not settle "
+        "it: it exempts the path from the collision check, and the linker's "
+        "`ln -Tsf` then refuses the directory, so the directory has to be "
+        "moved aside before linkGeneration runs."
+    )
+    codium_ext_target = workstation.succeed(f"readlink {codium_ext}").strip()
+    assert codium_ext_target.startswith("/nix/store/"), (
+        f"{codium_ext} is {codium_ext_target!r} rather than a store path, so "
+        "the declared extension set is not what the editor loads."
+    )
+    # Moved, not deleted — a sideloaded extension is the user's, and the
+    # planted manifest is what proves which of the two happened.
+    codium_ext_moved = workstation.succeed(
+        f"ls -d {codium_ext}.pre-nix-* | head -1"
+    ).strip()
+    assert workstation.succeed(
+        f"cat {codium_ext_moved}/extensions.json"
+    ).strip() == "[]", (
+        f"{codium_ext} was replaced without preserving what was in it; the "
+        "migration moves the old directory aside precisely so that an "
+        "extension nobody declared is recoverable after the deploy."
+    )
+    # And the declared set is really what sits there now.
+    workstation.succeed(f"test -d {codium_ext}/rust-lang.rust-analyzer")
+
     drift_fixture = "/tmp/nixos-drift-fixture"
     workstation.succeed(
         f"install -d -o jonathan -g users {drift_fixture} && "
