@@ -89,6 +89,185 @@ let
   # bin/kitty` is the session-restoring bash wrapper from home/kitty.nix;
   # handed `+runpy` it does not pass the argument through — it proceeds to open a terminal and
   # blocks until the 3600s test timeout.
+  # Phase A2 — the ctrl+v DECISION, behaviourally. The config assertions in
+  # configParseProbe prove the binding points at a runnable decider; they say
+  # nothing about which way it decides. Without this, an edit to the script's
+  # TARGETS predicate could invert image and text and CI would stay green.
+  #
+  # Drives the decider exactly as kitty does -- `launch --type=background
+  # --allow-remote-control`, so it gets the same per-launch fd channel -- and
+  # observes the result in the pane with a raw-mode reader that has itself
+  # negotiated the kitty keyboard protocol, which is what claude-code does.
+  # A delivered keypress therefore arrives as the bytes \x1b[118;5u and a
+  # paste as the token: one channel, two unambiguous outcomes.
+  #
+  # The observer is NOT `cat -v`, which was the first attempt and failed for
+  # an instructive reason: `cat` leaves the tty in canonical mode, where the
+  # line discipline claims ctrl+V as VLNEXT (literal-next) and consumes it
+  # before any program can see it. The pane showed ^] and no ^V. Measuring a
+  # ctrl+v delivery requires a reader that has taken the terminal out of
+  # canonical mode, which is also the only configuration the real consumer
+  # ever runs in.
+  #
+  # Its own kitty instance on its own socket, started and stopped here, so it
+  # cannot disturb the session save/restore phases that follow (they glob
+  # /tmp/kitty.sock-* and count windows).
+  #
+  # On xclip: an earlier draft of this lane abandoned clipboard automation
+  # because "xclip daemonises waiting forever". That is true when xclip is a
+  # SINK being read back, which is why Phase A uses a file instead. As a
+  # clipboard OWNER the daemonising is the point -- it is what serves the
+  # selection to kitty -- so it is backgrounded here deliberately.
+  pasteObserverPy = pkgs.writeText "vm-kitty-paste-observer.py" ''
+    """Raw-mode reader that records what the pane actually receives.
+
+    Negotiates the kitty keyboard protocol with the disambiguate flag, the
+    way claude-code does, then records every byte for a bounded window. Raw
+    mode is essential and not incidental: in canonical mode the tty line
+    discipline claims ctrl+V as VLNEXT and the keypress never reaches the
+    program at all.
+    """
+    import os
+    import select
+    import sys
+    import termios
+    import time
+    import tty
+
+    out = sys.argv[1]
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    buf = b""
+    with open(out, "w") as f:
+        f.write("NOTHING")
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\x1b[>1u")
+        sys.stdout.flush()
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                continue
+            data = os.read(fd, 4096)
+            if not data:
+                break
+            buf += data
+            with open(out, "w") as f:
+                f.write(repr(buf))
+    finally:
+        sys.stdout.write("\x1b[<u")
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        with open(out, "w") as f:
+            f.write(repr(buf) if buf else "NOTHING")
+  '';
+
+  pasteDecisionTest = pkgs.writeShellScript "vm-kitty-paste-decision" ''
+    set -eu
+    PATH=/run/current-system/sw/bin:$PATH
+    PNG=/tmp/paste-decision.png
+    TOKEN=PASTEDECISIONTOKEN
+
+    decider=$(command -v kitty-paste-smart || true)
+    if [ -z "$decider" ]; then
+      echo "FAIL: kitty-paste-smart is not on the deployed PATH" >&2
+      exit 1
+    fi
+    echo "decider: $decider"
+
+    # A real 1x1 PNG, so an image clipboard is an image and not a guess.
+    printf '%s' \
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==' \
+      | base64 -d > "$PNG"
+
+    cleanup() {
+      pkill -f 'xclip -selection clipboard' 2>/dev/null || true
+    }
+    trap cleanup EXIT
+
+    # One kitty per case, each on its own socket with a fresh observer, so a
+    # case cannot read bytes left over from the previous one and none of them
+    # disturb the session phases that follow.
+    probe_case() {
+      # $1 = case name, $2 = clipboard setup command
+      name=$1
+      setup=$2
+      sock=unix:/tmp/paste-decision-$name.sock
+      res=/tmp/paste-decision-$name.txt
+      log=/tmp/paste-decision-$name.log
+
+      pkill -f 'xclip -selection clipboard' 2>/dev/null || true
+      sleep 1
+      # The redirect is load-bearing. xclip as a clipboard owner never exits,
+      # so if it inherits a pipe it holds that pipe open forever -- which is
+      # the hang Phase A's comment above describes, and which this function
+      # reproduced when its result was read through a command substitution.
+      # The result therefore travels by file, and the daemon gets no pipe.
+      eval "$setup" >/dev/null 2>&1
+      sleep 2
+
+      kitty -o allow_remote_control=yes --listen-on "$sock" \
+        ${pkgs.python3}/bin/python3 ${pasteObserverPy} "$res" \
+        >"$log" 2>&1 &
+      kpid=$!
+      i=0
+      while [ $i -lt 60 ]; do
+        if kitty @ --to "$sock" ls >/dev/null 2>&1; then break; fi
+        sleep 0.5
+        i=$((i + 1))
+      done
+      if ! kitty @ --to "$sock" ls >/dev/null 2>&1; then
+        echo "FAIL: $name: test kitty never opened its socket" >&2
+        cat "$log" >&2 || true
+        kill $kpid 2>/dev/null || true
+        return 1
+      fi
+
+      kitty @ --to "$sock" launch --type=background \
+        --allow-remote-control "$decider"
+      sleep 4
+      kill $kpid 2>/dev/null || true
+      wait $kpid 2>/dev/null || true
+    }
+
+    rc=0
+
+    echo "--- image case"
+    img_setup="xclip -selection clipboard -t image/png -i $PNG &"
+    probe_case image "$img_setup" || rc=1
+    got=$(cat /tmp/paste-decision-image.txt 2>/dev/null || true)
+    echo "    observed: $got"
+    case $got in
+      *'118;5u'*)
+        echo "PASS image clipboard -> real keypress handed to the application" ;;
+      *"$TOKEN"*)
+        echo "FAIL: image clipboard pasted text instead of handing over the key" >&2
+        rc=1 ;;
+      *)
+        echo "FAIL: image clipboard delivered neither the key nor a paste" >&2
+        rc=1 ;;
+    esac
+
+    echo "--- text case"
+    txt_setup="printf '%s' $TOKEN | xclip -selection clipboard -i &"
+    probe_case text "$txt_setup" || rc=1
+    got=$(cat /tmp/paste-decision-text.txt 2>/dev/null || true)
+    echo "    observed: $got"
+    case $got in
+      *"$TOKEN"*)
+        echo "PASS text clipboard -> pasted the text" ;;
+      *'118;5u'*)
+        echo "FAIL: text clipboard handed over the key instead of pasting" >&2
+        rc=1 ;;
+      *)
+        echo "FAIL: text clipboard delivered neither a paste nor the key" >&2
+        rc=1 ;;
+    esac
+
+    exit $rc
+  '';
+
   configParseProbe = pkgs.writeShellScript "vm-kitty-config-parse-probe" ''
     set -euo pipefail
     # Bounded so a future hang fails the lane in a minute with a clear
@@ -549,6 +728,16 @@ in
     workstation.succeed(
         "su jonathan -c 'DISPLAY=:0 ${testCopyPipeline}'"
     )
+
+    # === ctrl+v decision (Phase A2 — which way the decider decides) ===
+    # The config probe proves ctrl+v launches a runnable decider. This proves
+    # it decides correctly: an image clipboard must hand the real keypress to
+    # the application (only the application can paste an image — claude-code's
+    # chat:imagePaste reads the clipboard itself), and a text clipboard must
+    # paste the text. Inverting those two would leave the config probe green.
+    print("[paste-decision]\n" + workstation.succeed(
+        "su jonathan -c 'DISPLAY=:0 ${pasteDecisionTest}'"
+    ))
 
     # Helper: glob discovers the live socket regardless of kitty's PID.
     sock_cmd = (

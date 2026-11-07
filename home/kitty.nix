@@ -4362,7 +4362,16 @@ finally:
   # nothing else to address the window with.
   kittyPasteSmart = pkgs.writeShellApplication {
     name = "kitty-paste-smart";
-    runtimeInputs = [ pkgs.xclip pkgs.coreutils ];
+    # gnugrep is NOT optional padding. writeShellApplication only prepends
+    # the inputs listed here, so an unlisted grep resolves from whatever
+    # PATH kitty inherited from the desktop session. Were it ever missing,
+    # `if ... | grep -q ...` would exit 127, which inside an `if` condition
+    # is merely false and NOT fatal even under `set -e` -- so the script
+    # would take the text branch and an image clipboard would silently get a
+    # text paste. That is precisely the failure this whole file exists to
+    # remove, reintroduced by a missing dependency. Measured, not reasoned:
+    # with grep off PATH the condition evaluates to the text branch.
+    runtimeInputs = [ pkgs.xclip pkgs.coreutils pkgs.gnugrep ];
     text = ''
       # `|| true` because xclip exits non-zero on an empty clipboard, which
       # is not an error here: no targets means no image, means paste.
@@ -4370,9 +4379,19 @@ finally:
 
       # An image wins only when the clipboard offers no text alternative.
       # A screenshot carries image/* alone, so the case this exists for is
-      # covered. A clipboard carrying both (an image copied from a browser,
-      # which also offers its URL) pastes the text, deliberately: a wrong
+      # covered; so is Chrome's "Copy image", which offers image/png and
+      # text/html but no text/plain and therefore still counts as an image.
+      # A clipboard genuinely offering both (measured with CopyQ: image/png
+      # AND text/plain at once) pastes the text, deliberately -- a wrong
       # text paste is visible and undoable, a swallowed keypress is neither.
+      #
+      # Consequence worth knowing in a NON-claude pane: with an image on the
+      # clipboard this now delivers a real ctrl+v to the program, so zsh
+      # runs quoted-insert and takes the NEXT keystroke literally -- a
+      # following ctrl+c inserts a literal ^C instead of interrupting.
+      # Previously the key was swallowed there. Accepted: the alternative is
+      # keeping the swallow, and the shell's own binding is not kitty's to
+      # suppress.
       if printf '%s\n' "$targets" | grep -q '^image/' \
          && ! printf '%s\n' "$targets" | grep -qE '^(text/plain|UTF8_STRING|STRING|TEXT)'; then
         exec ${pkgs.kitty}/bin/kitty @ send-key ctrl+v
