@@ -1,5 +1,11 @@
 { pkgs, ... }:
 let
+  # Shared with home/vscodium.nix, which runs the same binary's `record`
+  # subcommand from its activation entry. One leaf-diff for both halves: a
+  # second copy would let this report call a key clean that the activation
+  # merge discarded an hour earlier.
+  vscodiumDriftTool = import ./vscodium-drift-tool.nix { inherit pkgs; };
+
   analyzerScript = pkgs.writeShellApplication {
     name = "nixos-drift-analyzer";
     runtimeInputs = with pkgs; [
@@ -20,8 +26,14 @@ let
       declared_crontab="''${NIXOS_DRIFT_DECLARED_CRONTAB:-$HOME/.config/crontab}"
       crontab_bin="''${NIXOS_DRIFT_CRONTAB_BIN:-/run/wrappers/bin/crontab}"
       anchor="''${NIXOS_DRIFT_ANCHOR:-$HOME/Repos/nixos-config-worktrees/main}"
+      xdg_state="''${XDG_STATE_HOME:-$HOME/.local/state}"
+      xdg_config="''${XDG_CONFIG_HOME:-$HOME/.config}"
+      vscodium_tool="''${NIXOS_DRIFT_VSCODIUM_TOOL:-${vscodiumDriftTool}/bin/vscodium-drift-tool}"
+      vscodium_settings="''${NIXOS_DRIFT_VSCODIUM_SETTINGS:-$xdg_config/VSCodium/User/settings.json}"
+      vscodium_state="''${NIXOS_DRIFT_VSCODIUM_STATE:-$xdg_state/vscodium-drift}"
+      vscodium_declared="''${NIXOS_DRIFT_VSCODIUM_DECLARED:-$vscodium_state/declared.json}"
       report_dir="''${XDG_DATA_HOME:-$HOME/.local/share}/nixos-drift-analyzer"
-      state_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/nixos-drift-analyzer"
+      state_dir="$xdg_state/nixos-drift-analyzer"
       latest="$report_dir/latest.md"
       last_success="$state_dir/last-success"
 
@@ -189,6 +201,29 @@ installed: crontab -l"
         fi
       else
         add_finding "NixOS config anchor is unavailable" "$anchor"
+      fi
+
+      # VSCodium's settings.json is the one declared file on this host that
+      # is deliberately WRITABLE (home/vscodium.nix: mutableUserSettings),
+      # so its drift is a two-sided question the other probes do not have:
+      # keys live but undeclared are the promotion queue, and keys the
+      # activation merge overrode are a silent loss recorded pre-merge.
+      # Both come back as ready-made findings; the tool owns the format so
+      # the comparison lives in exactly one place.
+      #
+      # Gated on the declared export existing: before this change first
+      # deploys, and inside any fixture that does not plant it, there is
+      # nothing to compare against and silence is the honest answer.
+      if [ -f "$vscodium_declared" ] || [ -d "$vscodium_state" ]; then
+        vscodium_count=$("$vscodium_tool" report \
+          --live "$vscodium_settings" \
+          --declared "$vscodium_declared" \
+          --state-dir "$vscodium_state" \
+          --out "$scratch/vscodium.md")
+        if [ "$vscodium_count" -gt 0 ]; then
+          cat "$scratch/vscodium.md" >> "$findings"
+          finding_count=$((finding_count + vscodium_count))
+        fi
       fi
 
       {
