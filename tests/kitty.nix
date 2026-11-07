@@ -81,14 +81,598 @@ let
     echo "Phase A OK: TUI-wrapped 5-row payload unwrapped to original single line"
   '';
 
+  # Shared by the two behavioural key phases below. Poll, never sleep for a
+  # fixed span: every wait in them is for a condition a loaded CI runner can
+  # reach late, and a fixed sleep turns late into a flake instead of into a
+  # slower pass. $1 = tenths of a second to keep trying; the rest is the
+  # condition, re-evaluated on each attempt, so it must arrive as a string
+  # `eval` can run and not as an already-expanded value.
+  waitForSh = ''
+    wait_for() {
+      tries=$1
+      shift
+      n=0
+      while [ "$n" -lt "$tries" ]; do
+        if eval "$*" >/dev/null 2>&1; then return 0; fi
+        sleep 0.1
+        n=$((n + 1))
+      done
+      return 1
+    }
+  '';
+
+  # Shared by Phase A3 and A4, which both press a real key at a pane. XTEST
+  # delivers to the FOCUSED window, so focus has to be established and then
+  # CHECKED rather than assumed: a keypress sent to the wrong window would
+  # read as a missing interrupt, i.e. as the exact regression these phases
+  # exist to catch.
+  #
+  # The window count is POLLED rather than asserted once, because a phase that
+  # just finished may still be tearing its own kitty down. A window that has
+  # not appeared yet and one that has not gone yet are both transient, and
+  # demanding "exactly one, right now" turns either into a flake.
+  #
+  # A plain loop, not wait_for: the predicate needs a command substitution
+  # evaluated per attempt, and deferring one through `eval` costs more
+  # legibility than the four lines it saves.
+  focusKittySh = ''
+    focus_one_kitty() {
+      n=0
+      wid=""
+      while [ "$n" -lt 300 ]; do
+        wid=$($XDOTOOL search --onlyvisible --class kitty || true)
+        if [ "$(printf '%s\n' "$wid" | grep -c . || true)" = 1 ]; then
+          break
+        fi
+        sleep 0.1
+        n=$((n + 1))
+      done
+      count=$(printf '%s\n' "$wid" | grep -c . || true)
+      if [ "$count" -ne 1 ]; then
+        echo "FAIL: expected exactly 1 kitty window to focus, found $count" >&2
+        return 1
+      fi
+      # windowactivate needs a window manager advertising _NET_ACTIVE_WINDOW.
+      # Measured on a bare X server it prints "claims not to support
+      # _NET_ACTIVE_WINDOW" and exits 1, which under `set -e` would abort the
+      # calling phase with no message of its own. windowfocus
+      # (XSetInputFocus) needs no WM, so fall back to it.
+      $XDOTOOL windowactivate --sync "$wid" 2>/dev/null \
+        || $XDOTOOL windowfocus --sync "$wid" 2>/dev/null \
+        || true
+      focused=$($XDOTOOL getwindowfocus 2>/dev/null || echo none)
+      if [ "$focused" != "$wid" ]; then
+        echo "FAIL: could not focus the test window ($focused != $wid), so" \
+             "the keypress would have gone somewhere other than the pane" >&2
+        return 1
+      fi
+    }
+  '';
+
+  # Phase A3 — the ctrl+c INTERRUPT, behaviourally. The config probe compares
+  # the resolved chain, which catches a reordering or a dropped action but not
+  # a kitty release that changes what a chain MEANS: whether the interrupt
+  # survives rests entirely on copy_or_noop's return value and on
+  # dispatch_action's `if passthrough is not True` protocol, neither of which
+  # is config. A terminal that quietly stops interrupting is a worse
+  # regression than a missed image paste, and this PR had a behavioural phase
+  # only for the cheaper of the two.
+  #
+  # Deliberately a real X keypress. `kitty @ send-key` does not re-enter the
+  # keymap (measured), so it would bypass the binding under test and assert
+  # nothing about it.
+  interruptObserverPy = pkgs.writeText "vm-kitty-interrupt-observer.py" ''
+    """Records whether a real SIGINT arrived, the way any ordinary program
+    would see one.
+
+    Deliberately does NOT negotiate the kitty keyboard protocol and does not
+    leave canonical mode. ctrl+c has to arrive as the legacy 0x03 byte that
+    the pty's line discipline turns into SIGINT for the foreground process
+    group, because that is the path every shell and every ordinary program is
+    on. Phase A2's observer is raw mode for the mirror-image reason: there the
+    keypress must be readable as bytes rather than kill the reader.
+    """
+    import signal
+    import sys
+    import time
+
+    out = sys.argv[1]
+    ready = sys.argv[2]
+
+
+    def record(signum, frame):
+        with open(out, "w") as f:
+            f.write("INTERRUPTED")
+        sys.exit(0)
+
+
+    signal.signal(signal.SIGINT, record)
+    with open(out, "w") as f:
+        f.write("NOTHING")
+    # Written last: the harness waits for this before pressing the key, so a
+    # slow interpreter start cannot be mistaken for a swallowed interrupt.
+    with open(ready, "w") as f:
+        f.write("READY")
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        time.sleep(0.1)
+  '';
+
+  interruptTest = pkgs.writeShellScript "vm-kitty-interrupt" ''
+    set -eu
+    PATH=/run/current-system/sw/bin:$PATH
+    # Raw binary, for the reason spelled out in pasteDecisionTest below.
+    KITTY=${pkgs.kitty}/bin/kitty
+    # xdotool is the instrument, not the thing under test, so pin it instead
+    # of resolving it from the session's PATH.
+    XDOTOOL=${pkgs.xdotool}/bin/xdotool
+    sock=unix:/tmp/kitty-interrupt.sock
+    res=/tmp/kitty-interrupt.txt
+    ready=/tmp/kitty-interrupt.ready
+    log=/tmp/kitty-interrupt.log
+
+    ${waitForSh}
+    ${focusKittySh}
+
+    rm -f "$res" "$ready"
+
+    $KITTY -o allow_remote_control=yes --listen-on "$sock" \
+      ${pkgs.python3}/bin/python3 ${interruptObserverPy} "$res" "$ready" \
+      >"$log" 2>&1 &
+    kpid=$!
+    # `wait` as well as `kill`: this script returning before kitty is
+    # reaped would leave its window alive for the next phase to count.
+    trap 'kill $kpid 2>/dev/null || true; wait $kpid 2>/dev/null || true' EXIT
+
+    if ! wait_for 600 "$KITTY @ --to $sock ls"; then
+      echo "FAIL: test kitty never opened its socket" >&2
+      cat "$log" >&2 || true
+      exit 1
+    fi
+    if ! wait_for 300 "grep -qx READY $ready"; then
+      echo "FAIL: the SIGINT observer never started in the pane" >&2
+      cat "$log" >&2 || true
+      exit 1
+    fi
+
+    focus_one_kitty
+    $XDOTOOL key ctrl+c
+
+    if ! wait_for 100 "grep -qx INTERRUPTED $res"; then
+      echo "FAIL: ctrl+c with nothing selected did not reach the program," \
+           "so the interrupt is gone" >&2
+      echo "  observed: $(cat "$res" 2>/dev/null || echo '<no result file>')" >&2
+      cat "$log" >&2 || true
+      exit 1
+    fi
+    echo "PASS ctrl+c with nothing selected still interrupts the program"
+  '';
+
+  # Phase A4 — the OTHER half of the interrupt guarantee: that
+  # `clear_selection` stops a stale selection from swallowing the next ctrl+c.
+  # Phase A3 covers the no-selection case; this covers the sequence a user
+  # actually performs, copy then interrupt:
+  #
+  #   press 1, with a selection -> consumed by the copy, must NOT interrupt
+  #   press 2, selection cleared -> must interrupt
+  #
+  # Without the clear_selection clause the second press is swallowed too, and
+  # stays swallowed until something else clears the selection. Measured on the
+  # host with the clause removed as the control: press1=0 press2=0, against
+  # press1=0 press2=1 for the real chain. That is a reachable bug, not a
+  # theoretical one, which is why this is worth a phase rather than only the
+  # chain comparison in the config probe.
+  #
+  # This lane twice declined drag automation as brittle, and the reason it is
+  # not brittle here is that the selection is CONFIRMED through `kitty @
+  # get-text --extent selection` before any key is pressed. A drag that
+  # selects nothing is then reported as a failed drag rather than as a broken
+  # binding, so the phase cannot produce a false verdict about the keymap --
+  # only a clearly-labelled instrument failure. The drag is also
+  # window-relative (`mousemove --window`), because absolute screen
+  # coordinates only work on a bare X server that happens to place the window
+  # at 0,0; the VM session has a window manager.
+  selectObserverPy = pkgs.writeText "vm-kitty-select-observer.py" ''
+    """Prints selectable text, then counts the SIGINTs that arrive.
+
+    A count rather than a flag, because the assertion is about WHICH press
+    interrupts: press 1 must not and press 2 must. Stays in canonical mode for
+    the reason given in the Phase A3 observer.
+    """
+    import signal
+    import sys
+    import time
+
+    out = sys.argv[1]
+    ready_path = sys.argv[2]
+    count = 0
+
+
+    def record(signum, frame):
+        global count
+        count += 1
+        with open(out, "w") as f:
+            f.write("INTERRUPTS=%d" % count)
+
+
+    signal.signal(signal.SIGINT, record)
+    # Several rows, so a coarse drag cannot miss the text.
+    for i in range(5):
+        print("SELECTME-%d-SELECTME-SELECTME-SELECTME" % i, flush=True)
+    with open(out, "w") as f:
+        f.write("INTERRUPTS=0")
+    with open(ready_path, "w") as f:
+        f.write("READY")
+    deadline = time.time() + 40.0
+    while time.time() < deadline:
+        time.sleep(0.05)
+  '';
+
+  selectionTest = pkgs.writeShellScript "vm-kitty-selection-interrupt" ''
+    set -eu
+    PATH=/run/current-system/sw/bin:$PATH
+    KITTY=${pkgs.kitty}/bin/kitty
+    XDOTOOL=${pkgs.xdotool}/bin/xdotool
+    sock=unix:/tmp/kitty-selection.sock
+    res=/tmp/kitty-selection.txt
+    ready=/tmp/kitty-selection.ready
+    log=/tmp/kitty-selection.log
+
+    ${waitForSh}
+    ${focusKittySh}
+
+    rm -f "$res" "$ready"
+
+    # No --config: this must exercise the DEPLOYED chain, xclip pipeline and
+    # all. Press 1 therefore leaves a real xclip clipboard owner behind, which
+    # is exactly what the desktop does and is harmless here -- Phase A2 has
+    # finished with the clipboard and the session phases that follow do not
+    # touch it.
+    $KITTY -o allow_remote_control=yes --listen-on "$sock" \
+      ${pkgs.python3}/bin/python3 ${selectObserverPy} "$res" "$ready" \
+      >"$log" 2>&1 &
+    kpid=$!
+    # `wait` as well as `kill`: this script returning before kitty is
+    # reaped would leave its window alive for the next phase to count.
+    trap 'kill $kpid 2>/dev/null || true; wait $kpid 2>/dev/null || true' EXIT
+
+    if ! wait_for 600 "$KITTY @ --to $sock ls"; then
+      echo "FAIL: test kitty never opened its socket" >&2
+      cat "$log" >&2 || true
+      exit 1
+    fi
+    if ! wait_for 300 "grep -qx READY $ready"; then
+      echo "FAIL: the selection observer never started in the pane" >&2
+      cat "$log" >&2 || true
+      exit 1
+    fi
+
+    focus_one_kitty
+
+    $XDOTOOL mousemove --window "$wid" 20 20 mousedown 1 \
+             mousemove --window "$wid" 60 30 \
+             mousemove --window "$wid" 480 70 mouseup 1
+
+    # Instrument check, deliberately distinct from a verdict about the keymap.
+    if ! wait_for 50 "$KITTY @ --to $sock get-text --extent selection \
+        | tr -d '[:space:]' | grep -q SELECTME"; then
+      echo "FAIL: the drag selected nothing, so this run measured the drag" \
+           "and not the binding -- the keymap verdict is UNKNOWN, not bad" >&2
+      exit 1
+    fi
+    echo "selection confirmed in the pane"
+
+    $XDOTOOL key ctrl+c
+    # A consumed key produces no observable event, so there is nothing to poll
+    # for here; this waits long enough that a SIGINT would have landed. The
+    # press-2 assertion below is the one that polls.
+    wait_for 10 false || true
+    after1=$(cat "$res")
+    if [ "$after1" != "INTERRUPTS=0" ]; then
+      echo "FAIL: ctrl+c WITH a selection interrupted ($after1); the copy" \
+           "half of the chain is not consuming the key" >&2
+      exit 1
+    fi
+
+    $XDOTOOL key ctrl+c
+    if ! wait_for 100 "grep -qx INTERRUPTS=1 $res"; then
+      echo "FAIL: the second ctrl+c did not interrupt (observed" \
+           "$(cat "$res" 2>/dev/null || echo '<none>')), so a stale selection" \
+           "is swallowing interrupts -- clear_selection is not doing its job" >&2
+      cat "$log" >&2 || true
+      exit 1
+    fi
+    echo "PASS copy consumes ctrl+c, and the next ctrl+c interrupts again"
+  '';
+
+  # Phase A2 — the ctrl+v DECISION, behaviourally. The config assertions in
+  # configParseProbe prove the binding points at a runnable decider; they say
+  # nothing about which way it decides. Without this, an edit to the script's
+  # TARGETS predicate could invert image and text and CI would stay green.
+  #
+  # Drives the decider exactly as kitty does -- `launch --type=background
+  # --allow-remote-control`, so it gets the same per-launch fd channel -- and
+  # observes the result in the pane with a raw-mode reader that has itself
+  # negotiated the kitty keyboard protocol, which is what claude-code does.
+  # A delivered keypress therefore arrives as the bytes \x1b[118;5u and a
+  # paste as the token: one channel, two unambiguous outcomes.
+  #
+  # The observer is NOT `cat -v`, which was the first attempt and failed for
+  # an instructive reason: `cat` leaves the tty in canonical mode, where the
+  # line discipline claims ctrl+V as VLNEXT (literal-next) and consumes it
+  # before any program can see it. The pane showed ^] and no ^V. Measuring a
+  # ctrl+v delivery requires a reader that has taken the terminal out of
+  # canonical mode, which is also the only configuration the real consumer
+  # ever runs in.
+  #
+  # Its own kitty instance on its own socket, started and stopped here, so it
+  # cannot disturb the session save/restore phases that follow (they glob
+  # /tmp/kitty.sock-* and count windows).
+  #
+  # On xclip: an earlier draft of this lane abandoned clipboard automation
+  # because "xclip daemonises waiting forever". That is true when xclip is a
+  # SINK being read back, which is why Phase A uses a file instead. As a
+  # clipboard OWNER the daemonising is the point -- it is what serves the
+  # selection to kitty -- so it is backgrounded here deliberately.
+  pasteObserverPy = pkgs.writeText "vm-kitty-paste-observer.py" ''
+    """Raw-mode reader that records what the pane actually receives.
+
+    Negotiates the kitty keyboard protocol with the disambiguate flag, the
+    way claude-code does, then records every byte for a bounded window. Raw
+    mode is essential and not incidental: in canonical mode the tty line
+    discipline claims ctrl+V as VLNEXT and the keypress never reaches the
+    program at all.
+
+    Writes a READY file once negotiation is CONFIRMED, which the harness waits
+    for before asking for a decision. The socket being open says only that
+    kitty is up, not that this program has started, left canonical mode and
+    had its push processed -- and `send-key` encodes for the window's LIVE
+    keyboard mode, so a push that has not landed yet means kitty emits legacy
+    0x16 and the still-canonical tty eats it as VLNEXT. Measured with a 1.5s
+    startup delay standing in for a loaded runner: waiting only for the socket
+    loses the keypress entirely (observed NOTHING), waiting for READY observes
+    b'\x1b[118;5u'.
+
+    Confirmed, not assumed: after pushing the flag this queries it back with
+    CSI ?u and waits for kitty's reply (measured on 0.49.2: b'\x1b[?1u'), so
+    READY means kitty has processed the push rather than that the write was
+    flushed. The reply is consumed here so it cannot be mistaken for the
+    keypress under test, and if it never arrives READY is never written and
+    the harness fails loudly instead of racing.
+    """
+    import os
+    import select
+    import sys
+    import termios
+    import time
+    import tty
+
+    out = sys.argv[1]
+    ready_path = sys.argv[2]
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    buf = b""
+    # Before READY, so that READY implies the result file exists.
+    with open(out, "w") as f:
+        f.write("NOTHING")
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\x1b[>1u")
+        sys.stdout.write("\x1b[?u")
+        sys.stdout.flush()
+        reply = b""
+        hs_deadline = time.time() + 10.0
+        while time.time() < hs_deadline:
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if not r:
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            reply += chunk
+            if reply.endswith(b"u"):
+                break
+        if reply.endswith(b"u"):
+            with open(ready_path, "w") as f:
+                f.write("READY")
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                continue
+            data = os.read(fd, 4096)
+            if not data:
+                break
+            buf += data
+            with open(out, "w") as f:
+                f.write(repr(buf))
+    finally:
+        sys.stdout.write("\x1b[<u")
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        with open(out, "w") as f:
+            f.write(repr(buf) if buf else "NOTHING")
+  '';
+
+  pasteDecisionTest = pkgs.writeShellScript "vm-kitty-paste-decision" ''
+    set -eu
+    PATH=/run/current-system/sw/bin:$PATH
+    PNG=/tmp/paste-decision.png
+    TOKEN=PASTEDECISIONTOKEN
+    # The raw binary, never a bare `kitty`. On the deployed PATH that name is
+    # the session-restoring wrapper from home/kitty.nix (see configParseProbe
+    # below), and every path through it that opens a terminal ends in
+    # `exec kitty -1`. Under single-instance a second invocation hands its
+    # arguments to the first instance and exits, so --listen-on would never
+    # open a socket and the case would fail as "never opened its socket" --
+    # for reasons depending only on what else happened to be running. The
+    # wrapper does pass `kitty @` through untouched, so those calls were
+    # never at risk, but there is no reason to depend on that here.
+    KITTY=${pkgs.kitty}/bin/kitty
+
+    ${waitForSh}
+
+    # Only ever the clipboard owner this script started. `pkill -f 'xclip
+    # -selection clipboard'` would also reap an owner belonging to the user's
+    # own session -- harmless in a disposable VM, wrong as a habit, and the
+    # pid costs nothing to keep.
+    owner=""
+    stop_owner() {
+      [ -n "$owner" ] || return 0
+      kill "$owner" 2>/dev/null || true
+      wait_for 50 "! kill -0 $owner 2>/dev/null" || true
+      owner=""
+    }
+    trap stop_owner EXIT
+
+    decider=$(command -v kitty-paste-smart || true)
+    if [ -z "$decider" ]; then
+      echo "FAIL: kitty-paste-smart is not on the deployed PATH" >&2
+      exit 1
+    fi
+    echo "decider: $decider"
+
+    # A real 1x1 PNG, so an image clipboard is an image and not a guess.
+    printf '%s' \
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==' \
+      | base64 -d > "$PNG"
+
+    # One kitty per case, each on its own socket with a fresh observer, so a
+    # case cannot read bytes left over from the previous one and none of them
+    # disturb the session phases that follow.
+    probe_case() {
+      # $1 = case name, $2 = clipboard setup command, $3 = condition that
+      # proves the clipboard is really serving what this case needs before a
+      # decision is asked for. Per-case rather than one shared predicate: the
+      # text case checks the served CONTENT, so it cannot pass by agreeing
+      # with the same TARGETS reasoning the decider under test uses.
+      name=$1
+      setup=$2
+      ready=$3
+      sock=unix:/tmp/paste-decision-$name.sock
+      res=/tmp/paste-decision-$name.txt
+      rdy=/tmp/paste-decision-$name.ready
+      log=/tmp/paste-decision-$name.log
+
+      # So a re-run in the same VM cannot read a previous case's result.
+      rm -f "$res" "$rdy"
+
+      stop_owner
+      # Both halves of this line are load-bearing, and neither is obvious.
+      #
+      # The redirect: xclip as a clipboard owner never exits, so if it
+      # inherits a pipe it holds that pipe open forever -- the hang Phase A's
+      # comment above describes, and which this function reproduced when its
+      # result was read through a command substitution. The result therefore
+      # travels by file and the daemon gets no pipe.
+      #
+      # The `&` INSIDE the eval'd string: written `eval "$setup" &` instead,
+      # the `&` backgrounds the eval builtin, so $! is the pid of the subshell
+      # eval forks and xclip is its child. Killing that pid then leaves the
+      # real clipboard owner alive to fight the next case for the selection --
+      # measured, and strictly worse than the `pkill -f` this replaced. With
+      # the `&` inside, eval runs in this shell and $! is the pipeline's last
+      # element, which is xclip itself.
+      eval "$setup >/dev/null 2>&1 &"
+      owner=$!
+      if ! wait_for 100 "$ready"; then
+        echo "FAIL: $name: clipboard never served the case's own payload" >&2
+        return 1
+      fi
+
+      $KITTY -o allow_remote_control=yes --listen-on "$sock" \
+        ${pkgs.python3}/bin/python3 ${pasteObserverPy} "$res" "$rdy" \
+        >"$log" 2>&1 &
+      kpid=$!
+      if ! wait_for 600 "$KITTY @ --to $sock ls"; then
+        echo "FAIL: $name: test kitty never opened its socket" >&2
+        cat "$log" >&2 || true
+        kill $kpid 2>/dev/null || true
+        return 1
+      fi
+      # The socket says kitty is up, NOT that the observer has started, left
+      # canonical mode and had its keyboard-protocol push processed. Asking
+      # for a decision before that loses an image case's keypress to VLNEXT
+      # (measured; see the observer's docstring). This is the handshake
+      # Phase A3 already had and this phase did not.
+      if ! wait_for 300 "grep -qx READY $rdy"; then
+        echo "FAIL: $name: the observer never confirmed the kitty keyboard" \
+             "protocol, so a keypress could not have been observed reliably" >&2
+        cat "$log" >&2 || true
+        kill $kpid 2>/dev/null || true
+        return 1
+      fi
+
+      # >/dev/null: `launch` prints the new window id, and a background launch
+      # has none, so it otherwise prints a bare 0 into the lane's output.
+      $KITTY @ --to "$sock" launch --type=background \
+        --allow-remote-control "$decider" >/dev/null
+
+      # The observer writes NOTHING before it reads anything and overwrites
+      # that with repr(buf) on the first byte, so "no longer NOTHING" is
+      # exactly "something arrived". A timeout here is NOT failed on: the
+      # per-case assertion below can tell "nothing arrived" from "the wrong
+      # thing arrived" and says which, which is the more useful message.
+      #
+      # The `-f` test is not redundant. grep exits 2 on a missing file, and
+      # `!` turns that into success, so without it this wait returns
+      # immediately on the first attempt whenever the file is not there yet
+      # and the case kills kitty before anything could arrive. READY already
+      # implies the file exists; this keeps the predicate true on its own.
+      wait_for 100 "[ -f $res ] && ! grep -qx NOTHING $res" || true
+
+      kill $kpid 2>/dev/null || true
+      wait $kpid 2>/dev/null || true
+    }
+
+    rc=0
+
+    echo "--- image case"
+    probe_case image \
+      "xclip -selection clipboard -t image/png -i $PNG" \
+      "xclip -selection clipboard -t TARGETS -o | grep -qx image/png" || rc=1
+    got=$(cat /tmp/paste-decision-image.txt 2>/dev/null || true)
+    echo "    observed: $got"
+    case $got in
+      *'118;5u'*)
+        echo "PASS image clipboard -> real keypress handed to the application" ;;
+      *"$TOKEN"*)
+        echo "FAIL: image clipboard pasted text instead of handing over the key" >&2
+        rc=1 ;;
+      *)
+        echo "FAIL: image clipboard delivered neither the key nor a paste" >&2
+        rc=1 ;;
+    esac
+
+    echo "--- text case"
+    probe_case text \
+      "printf '%s' $TOKEN | xclip -selection clipboard -i" \
+      "xclip -selection clipboard -o | grep -qx $TOKEN" || rc=1
+    got=$(cat /tmp/paste-decision-text.txt 2>/dev/null || true)
+    echo "    observed: $got"
+    case $got in
+      *"$TOKEN"*)
+        echo "PASS text clipboard -> pasted the text" ;;
+      *'118;5u'*)
+        echo "FAIL: text clipboard handed over the key instead of pasting" >&2
+        rc=1 ;;
+      *)
+        echo "FAIL: text clipboard delivered neither a paste nor the key" >&2
+        rc=1 ;;
+    esac
+
+    exit $rc
+  '';
+
   # Config-parse probe, run through `kitty +runpy` so the check uses
   # kitty's OWN loader (and therefore the deployed kitty version's
   # notion of every option's type) rather than a reimplementation.
   #
-  # MUST call the raw kitty binary. `/etc/profiles/per-user/jonathan/
-  # bin/kitty` is the session-restoring bash wrapper from home/kitty.nix;
-  # handed `+runpy` it does not pass the argument through — it proceeds to open a terminal and
-  # blocks until the 3600s test timeout.
+  # MUST call the raw kitty binary, as pasteDecisionTest above also does.
+  # `/etc/profiles/per-user/jonathan/bin/kitty` is the session-restoring bash
+  # wrapper from home/kitty.nix; handed `+runpy` it does not pass the argument
+  # through — it proceeds to open a terminal and blocks until the 3600s test
+  # timeout.
   configParseProbe = pkgs.writeShellScript "vm-kitty-config-parse-probe" ''
     set -euo pipefail
     # Bounded so a future hang fails the lane in a minute with a clear
@@ -109,6 +693,9 @@ let
     from kitty.config import load_config
     from kitty.options.utils import parse_shortcut
     from kitty.keys import get_shortcut
+    from kitty.boss import Boss
+    from kitty.tabs import Tab
+    from kitty.window import Window
     from kitty.fast_data_types import (
         KeyEvent,
         GLFW_MOD_CONTROL,
@@ -251,6 +838,138 @@ let
             "exact ctrl+shift+' first"
         )
 
+    # Resolved into actions, not compared as a definition string: kitty
+    # accepts an unknown action name without complaining. The line parses,
+    # `bad` stays empty, and only at dispatch does getattr come up empty
+    # and the key get swallowed -- a typo inside the ctrl+c chain would
+    # cost the interrupt with nothing anywhere reporting it.
+    CTRL_C_CHAIN = (
+        "copy_or_noop",
+        "pass_selection_to_program",
+        "clear_selection",
+    )
+    CTRL_V_CHAIN = ("launch",)
+
+    resolved = {}
+    for spec in ("ctrl+c", "ctrl+shift+c", "ctrl+v"):
+        defs = keymap.get(parse_shortcut(spec))
+        if not defs:
+            errors.append(f"{spec}: NOT BOUND")
+            continue
+        try:
+            acts = opts.alias_map.resolve_aliases(defs[-1].definition, "map")
+        except Exception as exc:
+            # A bare unknown action name gets through kitty's own loader --
+            # `bad` stays empty and it prints that the config parses clean --
+            # and raises only here, when something actually resolves it.
+            # Caught rather than left to propagate: the lane fails either
+            # way, but a traceback does not say which key lost its binding.
+            errors.append(
+                f"{spec}: definition {defs[-1].definition!r} does not "
+                f"resolve ({exc}), so the key is silently swallowed"
+            )
+            continue
+        resolved[spec] = acts
+        for a in acts:
+            live = False
+            if hasattr(Boss, a.func):
+                live = True
+            if hasattr(Tab, a.func):
+                live = True
+            if hasattr(Window, a.func):
+                live = True
+            if not live:
+                errors.append(
+                    f"{spec}: no such action as {a.func!r}, so the key is "
+                    "silently swallowed -- the config parses clean and "
+                    "kitty reports nothing"
+                )
+
+    funcs = {}
+    for spec in resolved:
+        chain = []
+        for a in resolved[spec]:
+            chain.append(a.func)
+        funcs[spec] = tuple(chain)
+
+    if "ctrl+c" in funcs and funcs["ctrl+c"] != CTRL_C_CHAIN:
+        errors.append(
+            f"ctrl+c resolves to {funcs['ctrl+c']}, want {CTRL_C_CHAIN} -- "
+            "without copy_or_noop first the key never reaches the "
+            "application and nothing interrupts, and without "
+            "clear_selection a stale selection swallows every further "
+            "interrupt"
+        )
+    if "ctrl+v" in funcs and funcs["ctrl+v"] != CTRL_V_CHAIN:
+        errors.append(
+            f"ctrl+v resolves to {funcs['ctrl+v']}, want {CTRL_V_CHAIN} -- "
+            "paste_from_clipboard alone reads text/plain only, so an "
+            "image-only clipboard pastes nothing and the application never "
+            "sees the key either"
+        )
+
+    # The launch has to carry both flags and point at something runnable.
+    # None of this is cosmetic: a launch whose target is missing or merely
+    # not executable swallows the keypress and reports NOTHING anywhere --
+    # measured, by shipping exactly that mistake into this harness. And
+    # without --allow-remote-control the script gets no KITTY_LISTEN_ON, so
+    # it cannot reach the kitty that launched it and the paste silently
+    # does nothing.
+    v_args = []
+    for a in resolved.get("ctrl+v") or ():
+        if a.func == "launch":
+            v_args = list(a.args)
+    if "ctrl+v" in funcs:
+        if "--type=background" not in v_args:
+            errors.append(
+                f"ctrl+v launch lacks --type=background: {v_args!r} -- any "
+                "other type opens a window on every paste"
+            )
+        if "--allow-remote-control" not in v_args:
+            errors.append(
+                f"ctrl+v launch lacks --allow-remote-control: {v_args!r} -- "
+                "without it the script has no channel back to its own kitty "
+                "and every paste is a silent no-op"
+            )
+        prog = v_args[-1] if v_args else ""
+        if not prog.startswith("/"):
+            errors.append(
+                f"ctrl+v launch target {prog!r} is not an absolute path"
+            )
+        elif not os.path.exists(prog):
+            errors.append(
+                f"ctrl+v launch target {prog} does not exist, so the key is "
+                "swallowed with no error anywhere"
+            )
+        elif not os.access(prog, os.X_OK):
+            errors.append(
+                f"ctrl+v launch target {prog} is not executable, so the key "
+                "is swallowed with no error anywhere"
+            )
+
+    # Same pipeline on both keys, asserted by comparing them rather than
+    # by restating it: ctrl+c must put the unwrapped text on the clipboard,
+    # not the raw selection copy_or_noop leaves there first.
+    cc_args = None
+    for a in resolved.get("ctrl+c") or ():
+        if a.func == "pass_selection_to_program":
+            cc_args = a.args
+    cs_args = None
+    for a in resolved.get("ctrl+shift+c") or ():
+        if a.func == "pass_selection_to_program":
+            cs_args = a.args
+    if cs_args is None:
+        errors.append(
+            "ctrl+shift+c no longer runs pass_selection_to_program, so the "
+            "unwrap filter is gone"
+        )
+    elif cc_args != cs_args:
+        errors.append(
+            f"ctrl+c pipes the selection through {cc_args!r} but "
+            f"ctrl+shift+c uses {cs_args!r} -- the two copy keys would put "
+            "different text on the clipboard"
+        )
+
     if errors:
         for e in errors:
             print("FAIL: " + e, file=sys.stderr)
@@ -258,9 +977,11 @@ let
     print(
         "keymap correct: kitty_mod+arrows move pane focus, ctrl+tab and "
         "ctrl+shift+tab still switch tabs, plain ctrl+arrows free for the "
-        "shell, font-zoom steps disabled, reset still reachable, and both "
+        "shell, font-zoom steps disabled, reset still reachable, both "
         "ctrl+< and ctrl+* vsplit -- the latter checked by dispatching a "
-        "real ctrl+shift+' keypress"
+        "real ctrl+shift+' keypress -- and ctrl+c / ctrl+v copy and paste "
+        "through dispatchable actions, ctrl+c keeping its interrupt and "
+        "ctrl+v launching an executable decider that can reach its own kitty"
     )
   '';
 
@@ -412,6 +1133,35 @@ in
     workstation.succeed(
         "su jonathan -c 'DISPLAY=:0 ${testCopyPipeline}'"
     )
+
+    # === ctrl+v decision (Phase A2 — which way the decider decides) ===
+    # The config probe proves ctrl+v launches a runnable decider. This proves
+    # it decides correctly: an image clipboard must hand the real keypress to
+    # the application (only the application can paste an image — claude-code's
+    # chat:imagePaste reads the clipboard itself), and a text clipboard must
+    # paste the text. Inverting those two would leave the config probe green.
+    print("[paste-decision]\n" + workstation.succeed(
+        "su jonathan -c 'DISPLAY=:0 ${pasteDecisionTest}'"
+    ))
+
+    # === ctrl+c interrupt (Phase A3 — the key still reaches the program) ===
+    # Claiming ctrl+c for copy is the riskiest half of this binding: a
+    # terminal that silently stops interrupting is worse than one that misses
+    # an image paste. The chain comparison in the config probe cannot see
+    # this, because whether the interrupt survives depends on copy_or_noop's
+    # return value and kitty's passthrough protocol, not on the config.
+    print("[interrupt]\n" + workstation.succeed(
+        "su jonathan -c 'DISPLAY=:0 ${interruptTest}'"
+    ))
+
+    # === ctrl+c after a copy (Phase A4 — clear_selection earns its place) ===
+    # The other half of the same guarantee: a selection makes ctrl+c copy, and
+    # the NEXT ctrl+c must interrupt again. Without clear_selection the second
+    # press is swallowed too (measured on the host as the control), and stays
+    # swallowed until something else clears the selection.
+    print("[selection-interrupt]\n" + workstation.succeed(
+        "su jonathan -c 'DISPLAY=:0 ${selectionTest}'"
+    ))
 
     # Helper: glob discovers the live socket regardless of kitty's PID.
     sock_cmd = (
