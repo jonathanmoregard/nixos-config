@@ -425,20 +425,13 @@ def cmd_report(args) -> int:
             live = load_live(args.live)
             declared = load_declared(args.declared)
         except SettingsUnparseable as exc:
-            # NOT "already reported above, or will be next activation". The
-            # marker is written by `record`, which only runs at activation,
-            # and this reporter is the only thing that runs between deploys
-            # (hourly, from home/drift-analyzer.nix). A file broken after the
-            # last deploy therefore has no marker, and trusting one printed
-            # zero findings while being unable to read the file at all --
-            # the one output shape that reads as "nothing to see here".
-            #
-            # Deduplicated against the marker rather than emitted
-            # unconditionally: when activation DID see it, the marker and
-            # this failed read are two sightings of one broken file, and a
-            # doubled heading would read as two separate problems. Reporting
-            # stays read-only -- recording state is `record`'s job, and the
-            # hourly probe writing activation markers would invert that.
+            # The marker above is written only at activation, and this
+            # reporter is what runs in the hours between, so a file broken
+            # since the last deploy has no marker to be reported from -- and
+            # an unreadable settings file that yields no finding reads as a
+            # clean report. Emitted here, but deliberately not recorded:
+            # writing activation state from the hourly probe would invert
+            # whose job that is.
             if not unparseable:
                 findings.append(finding(
                     "VSCodium settings file does not parse",

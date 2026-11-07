@@ -310,9 +310,9 @@ check("20 ignored leaf stays ignored when nested", n == 0, text)
 
 # 21. a file broken AFTER the last activation has no marker to carry the
 #     news, and the hourly report is the only thing that runs between
-#     deploys. Catching the parse failure and trusting the marker printed
-#     ZERO findings while being unable to read the file at all -- the one
-#     output shape that reads as "nothing to see here". Found in review.
+#     deploys. A reporter that leans on the marker yields ZERO findings
+#     while unable to read the file at all -- the one output shape that
+#     reads as "nothing to see here".
 root = setup('{{{ not json', {"editor.formatOnSave": True})
 n, text = report_text(root)
 check("21 report alone still flags the broken file",
