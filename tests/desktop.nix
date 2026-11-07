@@ -378,8 +378,11 @@ in
         workstation.sleep(5)
         live = live_probe()
     print(f"[diag] live cinnamon-rescue probe: {live} (0 alive, 1 hung, 2 absent)")
-    assert live in (0, 2), \
-        f"probe reported hung (rc={live}) in a session that is not wedged"
+    # == 0, not "in (0, 2)": accepting "absent" let this pass in a session
+    # where Cinnamon never claimed the bus name, which is the one state that
+    # makes every real-probe assertion below vacuous.
+    assert live == 0, \
+        f"the real probe did not read a healthy session as alive (rc={live})"
 
     # Fail-safe: an unowned org.Cinnamon means Cinnamon is not running at all
     # (greeter, non-Cinnamon session). Never "recover" it there.
@@ -743,6 +746,20 @@ in
         assert raw, "nothing owns org.Cinnamon, so there is no live session to wedge"
         return int(raw)
 
+    # cinnamon-session owns org.gnome.SessionManager. Its presence as a process
+    # is not checkable here: comm is capped at 15 characters, so `pgrep -x
+    # cinnamon-session` never matches, and `pgrep -f` matches the su shell
+    # carrying the pattern, which would pass with the session already dead.
+    def session_manager_pid():
+        return workstation.succeed(
+            f"su - jonathan -c '{rescue_env}; "
+            "gdbus call --session --dest org.freedesktop.DBus "
+            "--object-path /org/freedesktop/DBus --method "
+            "org.freedesktop.DBus.GetConnectionUnixProcessID "
+            "org.gnome.SessionManager' "
+            "| sed -n 's/.*uint32 \\([0-9]*\\).*/\\1/p'"
+        ).strip()
+
     # The diagnostic probe above tolerates "absent" (Cinnamon may not have
     # claimed the name yet). This block cannot: without a live Cinnamon there
     # is nothing to wedge and every assertion below would pass vacuously.
@@ -750,7 +767,12 @@ in
         f"su - jonathan -c '{rescue_env}; cinnamon-rescue probe'", timeout=120
     )
     wedged_pid = cinnamon_owner_pid()
-    print(f"[diag] live Cinnamon before the wedge: pid {wedged_pid}")
+    session_pid = session_manager_pid()
+    assert session_pid, "nothing owns org.gnome.SessionManager"
+    print(
+        f"[diag] live Cinnamon before the wedge: pid {wedged_pid}, "
+        f"cinnamon-session pid {session_pid}"
+    )
 
     # Eval runs the script on Cinnamon's main loop, so an endless loop there
     # is the real fault rather than a simulation of it. The reply never
@@ -798,6 +820,45 @@ in
     recovered_pid = cinnamon_owner_pid()
     assert recovered_pid != wedged_pid, \
         f"org.Cinnamon is still owned by the wedged pid {wedged_pid}"
+
+    # The session itself has to survive the rescue. cinnamon-launcher declares
+    # X-GNOME-Provides=panel;windowmanager; with X-GNOME-AutoRestart=false, so
+    # if ending Cinnamon took cinnamon-session down with it the rescue would
+    # have cost the whole session rather than saved it.
+    session_after = session_manager_pid()
+    assert session_after == session_pid, (
+        "cinnamon-session did not survive the rescue: org.gnome.SessionManager "
+        f"was owned by pid {session_pid} before it, now "
+        f"{session_after or 'nothing'}"
+    )
+    assert "true" in workstation.succeed(
+        f"su - jonathan -c '{rescue_env}; "
+        "gdbus call --session --timeout 5 --dest org.gnome.SessionManager "
+        "--object-path /org/gnome/SessionManager --method "
+        "org.gnome.SessionManager.IsSessionRunning'"
+    ), "cinnamon-session kept the bus name but stopped answering"
+
+    # The launcher reads a signal death as a crash and takes its fallback
+    # branch unconditionally: fork, metacity --replace, then confirm_restart()
+    # puts up a keep-above "Cinnamon just crashed" dialog. Recorded rather than
+    # asserted absent: the dialog cannot be avoided by a kill-based rescue on
+    # 6.6.9, because the launcher only treats a signal death as its own when
+    # self.killed is set, and that happens only in its memory monitor. Counting
+    # the helpers it starts alongside would prove nothing either -- they are
+    # hardcoded /usr/lib* polkit paths plus nm-applet, none in this closure.
+    print("[diag] launcher took its crash-fallback branch: " + workstation.succeed(
+        "journalctl -b 0 --no-pager | grep -c 'os.execvp(FALLBACK_COMMAND' || true"
+    ).strip())
+    # rc 1 with no ids is a real absence; any other failure is the instrument,
+    # which must not be able to read as "no dialog".
+    rc_dialog, dialog = workstation.execute(
+        "su jonathan -c 'DISPLAY=:0 "
+        "${pkgs.xdotool}/bin/xdotool search --name Cinnamon.just.crashed' 2>&1"
+    )
+    print(f"[diag] crash dialog search rc={rc_dialog} windows={dialog.split()!r}")
+    print("[diag] metacity on PATH in this closure: " + workstation.succeed(
+        "command -v metacity >/dev/null && echo yes || echo no"
+    ).strip())
     assert workstation.execute(
         f"su - jonathan -c '{rescue_env}; cinnamon-rescue probe'"
     )[0] == 0, "the replacement does not answer its own main loop"

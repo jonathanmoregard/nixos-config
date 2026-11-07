@@ -28,9 +28,10 @@ let
   killGraceSecs = 10;
   # How many times the watchdog will start a Cinnamon into a session whose
   # name is unowned after it ended one itself, before concluding the session
-  # is gone. Without a bound, a logged-out session with linger enabled keeps
-  # a timer and a runtime dir, and would retry a start with no display for
-  # as long as the machine stays up.
+  # is gone. The timer being PartOf graphical-session.target is the primary
+  # defence against retrying into a logged-out session; this bound is what
+  # holds if the timer outlives the session anyway, which linger makes
+  # possible.
   absentStartLimit = 3;
   # Every deadline below is a floor, not a ceiling: each probe is TWO gdbus
   # calls (GetNameOwner then the property read), so a wait can overshoot its
@@ -46,17 +47,24 @@ let
 
   # @unit@ is substituted per attempt: a recovered Cinnamon keeps running as
   # this unit, so a fixed name would collide on the second hang of a session.
-  # /run/current-system/sw/bin, not a store path, because --replace has to
-  # match the Cinnamon the live session is running.
+  #
+  # @cinnamon@ is substituted with /proc/<wedged pid>/exe, which is the only
+  # path guaranteed to be the binary the session is actually running.
+  # /run/current-system/sw/bin/cinnamon is the NEWEST Cinnamon, which after a
+  # nixos-rebuild switch without a re-login is a different store path from the
+  # running one -- and a Cinnamon version bump is exactly when that differs.
+  # This path is the fallback for when /proc/<pid>/exe cannot be read.
   restartCmd = lib.concatStringsSep " " [
     "${pkgs.systemd}/bin/systemd-run"
     "--user"
     "--quiet"
     "--collect"
     "--unit=@unit@"
-    "/run/current-system/sw/bin/cinnamon"
+    "@cinnamon@"
     "--replace"
   ];
+
+  fallbackCinnamon = "/run/current-system/sw/bin/cinnamon";
 
   cinnamonRescue = pkgs.writers.writePython3Bin "cinnamon-rescue"
     { flakeIgnore = [ "E501" ]; }
@@ -80,6 +88,7 @@ let
       GDBUS = os.environ.get("CINNAMON_RESCUE_GDBUS", "${pkgs.glib}/bin/gdbus")
       JOURNALCTL = os.environ.get("CINNAMON_RESCUE_JOURNALCTL", "${pkgs.systemd}/bin/journalctl")
       RESTART_CMD = os.environ.get("CINNAMON_RESCUE_RESTART_CMD", "${restartCmd}")
+      FALLBACK_CINNAMON = os.environ.get("CINNAMON_RESCUE_FALLBACK_BIN", "${fallbackCinnamon}")
       REPORT_DIR = os.environ.get("CINNAMON_RESCUE_STATE_DIR", "${reportDir}")
       THRESHOLD = int(os.environ.get("CINNAMON_RESCUE_THRESHOLD", "${toString threshold}"))
       COOLDOWN = int(os.environ.get("CINNAMON_RESCUE_COOLDOWN_SECS", "${toString cooldownSecs}"))
@@ -277,10 +286,24 @@ let
               signal.signal(signal.SIGALRM, previous)
 
 
-      def restart():
+      def session_cinnamon(pid):
+          """The binary the session is running, by preference over the newest
+          one on the system."""
+          if pid is not None:
+              try:
+                  exe = os.readlink("/proc/%d/exe" % pid)
+                  if exe and not exe.endswith(" (deleted)"):
+                      return exe
+              except OSError:
+                  pass
+          return FALLBACK_CINNAMON
+
+
+      def restart(pid=None):
           """Launch the replacement. Returns (launched, transient unit or None)."""
           unit = "cinnamon-rescue-replace-%d" % time.time()
           cmd = RESTART_CMD.replace("@unit@", unit)
+          cmd = cmd.replace("@cinnamon@", session_cinnamon(pid))
           # systemd-run does not forward this process's environment to the
           # transient unit, so DISPLAY has to be handed over explicitly.
           display = os.environ.get("DISPLAY") or ":0"
@@ -423,7 +446,7 @@ let
           ident = _proc_starttime(pid) if pid is not None else None
           report = capture(pid, fails)
           print("cinnamon-rescue: hung after %d failed probes; report %s" % (fails, report))
-          launched, unit = restart()
+          launched, unit = restart(pid)
           # Written before the outcome is known: a recovery that stalls must
           # still open the cooldown, or the timer retries escalation forever.
           _write_int("last-restart", int(time.time()))
@@ -456,7 +479,10 @@ let
           # built for the case where someone else holds the selection.
           print("cinnamon-rescue: starting a window manager for the stranded session",
                 file=sys.stderr)
-          launched, retry_unit = restart()
+          # The wedged process is gone by now, so /proc/<pid>/exe is too and
+          # this falls back to the system path -- which is correct here: with
+          # no session Cinnamon left to match, the newest one is the right one.
+          launched, retry_unit = restart(pid)
           # A cold start is a whole Cinnamon coming up, not a replacement
           # that only had to stop blocking, so it gets the longer deadline.
           if launched and _await_takeover(COLD_START_DEADLINE):
@@ -554,12 +580,22 @@ in
   };
 
   systemd.user.timers.cinnamon-watchdog = {
-    Unit.Description = "Poll Cinnamon's main loop for responsiveness";
+    # Bound to the graphical session, not timers.target: this user has linger
+    # enabled, so a timers.target timer keeps firing after logout with the
+    # runtime dir still in place, and the watchdog would try to recover a
+    # session that is not there. Verified active in a live Cinnamon session
+    # (systemctl --user is-active graphical-session.target) and asserted below
+    # by the lane, which would fail if the timer never started.
+    Unit = {
+      Description = "Poll Cinnamon's main loop for responsiveness";
+      PartOf = [ "graphical-session.target" ];
+      After = [ "graphical-session.target" ];
+    };
     Timer = {
-      OnBootSec = "2min";
+      OnActiveSec = "2min";
       OnUnitActiveSec = "${toString intervalSecs}s";
       AccuracySec = "5s";
     };
-    Install.WantedBy = [ "timers.target" ];
+    Install.WantedBy = [ "graphical-session.target" ];
   };
 }
