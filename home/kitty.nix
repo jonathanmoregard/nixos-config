@@ -4342,6 +4342,46 @@ finally:
   # transform). Heuristic-only by necessity: when the source TUI emits
   # real `\n` for display wraps, kitty has no per-line "continued" flag
   # to recover from.
+  # ctrl+v chooses between pasting text itself and handing the key to the
+  # application, because only the application can paste an image.
+  # claude-code binds ctrl+v to `chat:imagePaste`, which reads the clipboard
+  # ITSELF and acts only if an image comes back (`if (ct) C(ct.base64, ...)`
+  # in the 2.1.319 binary) — the keypress is only a trigger, no image bytes
+  # travel through the terminal. kitty's own paste reads text/plain only, so
+  # claiming the chord unconditionally makes an image-only clipboard paste
+  # nothing at all, with no error anywhere.
+  #
+  # The channel back to kitty is the per-launch socket pair that
+  # `launch --allow-remote-control` creates (KITTY_LISTEN_ON=fd:N,
+  # boss.py:3226-3230), NOT a /tmp/kitty.sock-* glob — see find_socket()
+  # above on why that glob is exactly how a process reaches the user's live
+  # session instead of its own. An fd can only reach the instance that
+  # launched this script, and `send-key` with no --match goes to that
+  # instance's active window, i.e. the window the key was pressed in.
+  # Measured: a background launch inherits NO KITTY_* variables, so there is
+  # nothing else to address the window with.
+  kittyPasteSmart = pkgs.writeShellApplication {
+    name = "kitty-paste-smart";
+    runtimeInputs = [ pkgs.xclip pkgs.coreutils ];
+    text = ''
+      # `|| true` because xclip exits non-zero on an empty clipboard, which
+      # is not an error here: no targets means no image, means paste.
+      targets=$(timeout 2 xclip -selection clipboard -t TARGETS -o 2>/dev/null || true)
+
+      # An image wins only when the clipboard offers no text alternative.
+      # A screenshot carries image/* alone, so the case this exists for is
+      # covered. A clipboard carrying both (an image copied from a browser,
+      # which also offers its URL) pastes the text, deliberately: a wrong
+      # text paste is visible and undoable, a swallowed keypress is neither.
+      if printf '%s\n' "$targets" | grep -q '^image/' \
+         && ! printf '%s\n' "$targets" | grep -qE '^(text/plain|UTF8_STRING|STRING|TEXT)'; then
+        exec ${pkgs.kitty}/bin/kitty @ send-key ctrl+v
+      fi
+
+      exec ${pkgs.kitty}/bin/kitty @ action paste_from_clipboard
+    '';
+  };
+
   kittyCopyUnwrap = pkgs.writers.writePython3Bin "kitty-copy-unwrap" {} ''
     import sys
 
@@ -4982,6 +5022,7 @@ in
     kittySessionCommit
     kittySessionSave
     kittyCopyUnwrap
+    kittyPasteSmart
     claudeKittyPaneRecord
     kittyPaneRegistryWrite
     kittyPanesReflow
@@ -5205,10 +5246,20 @@ in
     # the payload in the buffer without auto-executing, so the
     # safety story is already covered by the shell side.
     paste_actions quote-urls-at-prompt,confirm
-    # Shadows claude-code's own ctrl+v (chat:imagePaste) — kitty claims the
-    # chord before the TUI sees it. Rebind that action in
-    # ~/.claude/keybindings.json to keep image paste reachable.
-    map ctrl+v paste_from_clipboard
+    # Not `paste_from_clipboard` directly: that claims the chord for text
+    # and an image-only clipboard then pastes nothing, silently, because
+    # kitty's paste reads text/plain only. kitty-paste-smart pastes text
+    # when there is text and otherwise hands the real keypress to the
+    # application, which is the only thing that can paste an image —
+    # claude-code's chat:imagePaste reads the clipboard itself. See the
+    # script for why its channel is a per-launch fd and not a socket glob.
+    #
+    # --allow-remote-control is what creates that channel; without it the
+    # script has no way to reach the kitty that launched it. A launch whose
+    # target is missing or non-executable swallows the key with no error at
+    # all (measured) — tests/kitty.nix asserts the target is executable for
+    # exactly that reason.
+    map ctrl+v launch --type=background --allow-remote-control ${kittyPasteSmart}/bin/kitty-paste-smart
   '';
 
   # Periodic snapshot — survives crashes, kernel panics, power loss.

@@ -264,7 +264,7 @@ let
         "pass_selection_to_program",
         "clear_selection",
     )
-    CTRL_V_CHAIN = ("paste_from_clipboard",)
+    CTRL_V_CHAIN = ("launch",)
 
     resolved = {}
     for spec in ("ctrl+c", "ctrl+shift+c", "ctrl+v"):
@@ -272,7 +272,19 @@ let
         if not defs:
             errors.append(f"{spec}: NOT BOUND")
             continue
-        acts = opts.alias_map.resolve_aliases(defs[-1].definition, "map")
+        try:
+            acts = opts.alias_map.resolve_aliases(defs[-1].definition, "map")
+        except Exception as exc:
+            # A bare unknown action name gets through kitty's own loader --
+            # `bad` stays empty and it prints that the config parses clean --
+            # and raises only here, when something actually resolves it.
+            # Caught rather than left to propagate: the lane fails either
+            # way, but a traceback does not say which key lost its binding.
+            errors.append(
+                f"{spec}: definition {defs[-1].definition!r} does not "
+                f"resolve ({exc}), so the key is silently swallowed"
+            )
+            continue
         resolved[spec] = acts
         for a in acts:
             live = False
@@ -306,8 +318,50 @@ let
         )
     if "ctrl+v" in funcs and funcs["ctrl+v"] != CTRL_V_CHAIN:
         errors.append(
-            f"ctrl+v resolves to {funcs['ctrl+v']}, want {CTRL_V_CHAIN}"
+            f"ctrl+v resolves to {funcs['ctrl+v']}, want {CTRL_V_CHAIN} -- "
+            "paste_from_clipboard alone reads text/plain only, so an "
+            "image-only clipboard pastes nothing and the application never "
+            "sees the key either"
         )
+
+    # The launch has to carry both flags and point at something runnable.
+    # None of this is cosmetic: a launch whose target is missing or merely
+    # not executable swallows the keypress and reports NOTHING anywhere --
+    # measured, by shipping exactly that mistake into this harness. And
+    # without --allow-remote-control the script gets no KITTY_LISTEN_ON, so
+    # it cannot reach the kitty that launched it and the paste silently
+    # does nothing.
+    v_args = []
+    for a in resolved.get("ctrl+v") or ():
+        if a.func == "launch":
+            v_args = list(a.args)
+    if "ctrl+v" in funcs:
+        if "--type=background" not in v_args:
+            errors.append(
+                f"ctrl+v launch lacks --type=background: {v_args!r} -- any "
+                "other type opens a window on every paste"
+            )
+        if "--allow-remote-control" not in v_args:
+            errors.append(
+                f"ctrl+v launch lacks --allow-remote-control: {v_args!r} -- "
+                "without it the script has no channel back to its own kitty "
+                "and every paste is a silent no-op"
+            )
+        prog = v_args[-1] if v_args else ""
+        if not prog.startswith("/"):
+            errors.append(
+                f"ctrl+v launch target {prog!r} is not an absolute path"
+            )
+        elif not os.path.exists(prog):
+            errors.append(
+                f"ctrl+v launch target {prog} does not exist, so the key is "
+                "swallowed with no error anywhere"
+            )
+        elif not os.access(prog, os.X_OK):
+            errors.append(
+                f"ctrl+v launch target {prog} is not executable, so the key "
+                "is swallowed with no error anywhere"
+            )
 
     # Same pipeline on both keys, asserted by comparing them rather than
     # by restating it: ctrl+c must put the unwrapped text on the clipboard,
@@ -342,7 +396,8 @@ let
         "shell, font-zoom steps disabled, reset still reachable, both "
         "ctrl+< and ctrl+* vsplit -- the latter checked by dispatching a "
         "real ctrl+shift+' keypress -- and ctrl+c / ctrl+v copy and paste "
-        "through dispatchable actions, ctrl+c keeping its interrupt"
+        "through dispatchable actions, ctrl+c keeping its interrupt and "
+        "ctrl+v launching an executable decider that can reach its own kitty"
     )
   '';
 
