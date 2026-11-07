@@ -1421,7 +1421,34 @@ in
         # (home/claude-egress-slice.nix), not drift.
         "mkdir -p $root/home/.local/share/claude/versions; "
         "printf \"#!/bin/sh\\n\" > $root/home/.local/share/claude/versions/9.9.9; "
-        "ln -s $root/home/.local/share/claude/versions/9.9.9 $root/home/.local/bin/claude'"
+        "ln -s $root/home/.local/share/claude/versions/9.9.9 $root/home/.local/bin/claude; "
+        # Codium Claude config directory (home/claude-codium-config.nix): the
+        # writable declared surface whose live layer nothing else reports on.
+        # Deliberately built at the probe's DEFAULT paths — $XDG_STATE_HOME/
+        # claude-codium and $HOME/.claude/skills, both of which already point
+        # into this fixture — rather than behind NIXOS_DRIFT_CODIUM_* env
+        # overrides, so the path construction is exercised too and not just
+        # the override plumbing.
+        "c=$root/state/claude-codium; mkdir -p $c/skills; "
+        "mkdir -p $root/home/.claude/skills/inherited-demo; "
+        "mkdir -p $root/home/.claude/skills/shadowed-demo; "
+        "mkdir -p $root/own-repo/my-skill; "
+        # MANAGED, must stay silent: a declared Codium skill is a store
+        # symlink, and an inherited one points into ~/.claude/skills.
+        "ln -s ${../home/claude-codium/skills}/declared-demo $c/skills/declared-link; "
+        "ln -s $root/home/.claude/skills/inherited-demo $c/skills/inherited-link; "
+        # DRIFT: written in place, and the promotion queue this probe exists
+        # to surface.
+        "mkdir -p $c/skills/handwritten; "
+        # DRIFT: a symlink into one of the user's own repos — route 2 from the
+        # skills README, managed by nobody.
+        "ln -s $root/own-repo/my-skill $c/skills/own-repo-link; "
+        # DRIFT *and* SHADOWING: a real directory beats the shared skill of
+        # the same name, silently, because activation leaves it alone.
+        "mkdir -p $c/skills/shadowed-demo; "
+        # Prose layer starts byte-identical to the seed, which IS the empty
+        # state and must not be reported.
+        "install -m 0644 ${../home/claude-codium/local-seed.md} $c/local.md'"
     )
     drift_env = (
         f"HOME={drift_fixture}/home "
@@ -1468,6 +1495,75 @@ in
     local_bin = drift_section("Entries outside /nix/store in ~/.local/bin")
     assert "claude" not in local_bin, (
         f"Claude Code native installer reported as drift:\n{drift_report}"
+    )
+
+    # Codium skills live layer. The promotion queue is the point: a skill
+    # written straight into that directory works immediately and survives
+    # every deploy, so nothing distinguishes it from reviewed config until a
+    # fresh install drops it.
+    codium_live = drift_section("Codium-only skills live but not declared")
+    for entry in ["handwritten", "own-repo-link", "shadowed-demo"]:
+        assert entry in codium_live, (
+            f"undeclared Codium skill {entry!r} not reported. A skill in that "
+            "directory is permanent in practice and unreviewed, and this "
+            f"probe is the only thing that says so:\n{drift_report}"
+        )
+    # The managed shapes must stay silent, or the report is noise every hour
+    # and gets ignored — which costs the findings above, not just these.
+    for managed in ["declared-link", "inherited-link"]:
+        assert managed not in codium_live, (
+            f"managed Codium skill link {managed!r} reported as drift. A "
+            "store symlink is a declared skill and a link into "
+            f"~/.claude/skills is an inherited one:\n{drift_report}"
+        )
+    # Shadowing is the skills-side equivalent of a declared settings key
+    # being overridden, and it is reported separately because the fix is
+    # different: rename or drop the live copy, not promote it.
+    codium_shadow = drift_section(
+        "Codium skills shadowing a shared skill of the same name"
+    )
+    assert "shadowed-demo" in codium_shadow, (
+        "a live Codium skill silently shadowing a shared skill of the same "
+        f"name was not reported:\n{drift_report}"
+    )
+    for unshadowed in ["handwritten", "own-repo-link"]:
+        assert unshadowed not in codium_shadow, (
+            f"{unshadowed!r} reported as shadowing, but no shared skill of "
+            f"that name exists:\n{drift_report}"
+        )
+    # A local.md still byte-identical to the seed is the EMPTY state. This is
+    # the no-false-positive arm: it would otherwise fire on every host from
+    # the first deploy onwards, which is how an hourly report gets muted.
+    assert "Codium session notes live but not declared" not in drift_report, (
+        "local.md matching the seed byte-for-byte was reported as drift. "
+        "That fires on every freshly deployed host and trains the reader to "
+        f"ignore the whole report:\n{drift_report}"
+    )
+    # …and the other arm, which is what makes the one above mean something:
+    # write a note into local.md and it IS reported. Without this pair, a
+    # probe that never fires and a probe that always fires both look green.
+    workstation.succeed(
+        "su - jonathan -c 'printf \"\\nSomething learned mid-session.\\n\" "
+        f">> {drift_fixture}/state/claude-codium/local.md'"
+    )
+    workstation.succeed(
+        "su - jonathan -c '" + drift_env + drift_runner + "'"
+    )
+    codium_notes_report = workstation.succeed(
+        f"cat {drift_fixture}/data/nixos-drift-analyzer/latest.md"
+    )
+    assert "Codium session notes live but not declared" in codium_notes_report, (
+        "a note written into local.md was not reported. That file is the "
+        "prose half of the same layer — writable, needing no PR — so without "
+        "this the notes accumulate unreviewed and are lost on a reinstall:\n"
+        + codium_notes_report
+    )
+    # Restore the empty state, so the blocks below start from a fixture whose
+    # Codium layer differs from the seed in no way they did not ask for.
+    workstation.succeed(
+        "install -o jonathan -g users -m 0644 "
+        f"${../home/claude-codium/local-seed.md} "
+        f"{drift_fixture}/state/claude-codium/local.md"
     )
     drift_success = f"{drift_fixture}/state/nixos-drift-analyzer/last-success"
     workstation.succeed(f"test -s {drift_success}")

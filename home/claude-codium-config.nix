@@ -77,6 +77,12 @@ let
 
   codiumClaudeMd = ./claude-codium/CLAUDE.md;
 
+  # A real file rather than an inline writeText because home/drift-analyzer.nix
+  # compares local.md against it to decide whether there are notes worth
+  # promoting. Two copies of this text would make an edit here read as drift
+  # on every host until the analyzer's copy caught up.
+  codiumLocalSeed = ./claude-codium/local-seed.md;
+
   # Entries linked straight back at ~/.claude, with the reason each one has to
   # be. `settings.json` carries permissions and every hook; `.credentials.json`
   # is the OAuth material; `agents` holds the pinned role agents the global
@@ -165,18 +171,7 @@ in
       # it. It exists at all because CLAUDE.md imports it and a missing import
       # target is not worth finding out about mid-session.
       if [ ! -e "$codium/local.md" ]; then
-        $DRY_RUN_CMD install -m 0644 ${
-          pkgs.writeText "claude-codium-local-seed.md" ''
-            # Codium notes, mutable layer
-
-            Writable, needs no worktree and no PR. Imported by the declared
-            CLAUDE.md next to it. Survives reboot and deploy; lost on a fresh
-            install until promoted into `home/claude-codium/CLAUDE.md` in
-            nixos-config.
-
-            Nothing recorded yet.
-          ''
-        } "$codium/local.md"
+        $DRY_RUN_CMD install -m 0644 ${codiumLocalSeed} "$codium/local.md"
       fi
 
       # skills/ is assembled, not replaced. Only DANGLING symlinks are swept:
