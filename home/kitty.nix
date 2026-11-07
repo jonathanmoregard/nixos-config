@@ -4324,24 +4324,6 @@ finally:
         main()
   '';
 
-  # ctrl+shift+c copy filter: unwrap TUI hanging-indent line wraps so a
-  # single shell command that the source app (claude-code, less, man,
-  # any wide-text TUI) hard-wrapped for display copies back to its
-  # original single line.
-  #
-  # Algorithm: stdin → stdout. A "block" is one non-indented line
-  # followed by 1+ lines all starting with the SAME K>0 leading
-  # spaces. Continuation lines have their K spaces stripped, all lines
-  # rstrip'd, block joined with single spaces (matches the implicit
-  # word-boundary space at terminal wrap points). Lines outside any
-  # block pass through verbatim.
-  #
-  # Trade-off: a uniformly K-indented multi-line shell body (for/do/done,
-  # if/then/fi with consistent indent) ALSO collapses. The escape hatch
-  # is ctrl+shift+alt+c (`copy_to_clipboard`, kitty built-in, no
-  # transform). Heuristic-only by necessity: when the source TUI emits
-  # real `\n` for display wraps, kitty has no per-line "continued" flag
-  # to recover from.
   # ctrl+v chooses between pasting text itself and handing the key to the
   # application, because only the application can paste an image.
   # claude-code binds ctrl+v to `chat:imagePaste`, which reads the clipboard
@@ -4352,12 +4334,12 @@ finally:
   # nothing at all, with no error anywhere.
   #
   # The channel back to kitty is the per-launch socket pair that
-  # `launch --allow-remote-control` creates (KITTY_LISTEN_ON=fd:N,
-  # boss.py:3226-3230), NOT a /tmp/kitty.sock-* glob — see find_socket()
-  # above on why that glob is exactly how a process reaches the user's live
-  # session instead of its own. An fd can only reach the instance that
-  # launched this script, and `send-key` with no --match goes to that
-  # instance's active window, i.e. the window the key was pressed in.
+  # `launch --allow-remote-control` creates (KITTY_LISTEN_ON=fd:N, set by
+  # kitty's own Boss.run_background_process), NOT a /tmp/kitty.sock-* glob —
+  # see find_socket() above on why that glob is exactly how a process reaches
+  # the user's live session instead of its own. An fd can only reach the
+  # instance that launched this script, and `send-key` with no --match goes
+  # to that instance's active window, i.e. the window the key was pressed in.
   # Measured: a background launch inherits NO KITTY_* variables, so there is
   # nothing else to address the window with.
   kittyPasteSmart = pkgs.writeShellApplication {
@@ -4382,16 +4364,24 @@ finally:
       # covered; so is Chrome's "Copy image", which offers image/png and
       # text/html but no text/plain and therefore still counts as an image.
       # A clipboard genuinely offering both (measured with CopyQ: image/png
-      # AND text/plain at once) pastes the text, deliberately -- a wrong
-      # text paste is visible and undoable, a swallowed keypress is neither.
+      # AND text/plain at once) pastes the text.
       #
-      # Consequence worth knowing in a NON-claude pane: with an image on the
-      # clipboard this now delivers a real ctrl+v to the program, so zsh
-      # runs quoted-insert and takes the NEXT keystroke literally -- a
-      # following ctrl+c inserts a literal ^C instead of interrupting.
-      # Previously the key was swallowed there. Accepted: the alternative is
-      # keeping the swallow, and the shell's own binding is not kitty's to
-      # suppress.
+      # The tie-break costs something either way, so neither side gets
+      # called free: text-first loses the image in a claude pane, and
+      # image-first sends a real ctrl+v to zsh in a shell pane, where
+      # quoted-insert then takes the NEXT keystroke literally (a following
+      # ctrl+c inserts a literal ^C instead of interrupting). Text-first
+      # because a clipboard offering both is rare while a shell pane is
+      # where most ctrl+v presses land. Deciding per pane is possible --
+      # `kitty @ ls --match state:focused` over this same fd channel reports
+      # foreground_processes -- and is deliberately not done for one rare
+      # case. That quoted-insert cost is unavoidable for the image-ONLY
+      # case, which is the case this binding exists for; previously the key
+      # was swallowed there instead, and the shell's own binding is not
+      # kitty's to suppress.
+      #
+      # The text alternatives are matched with no end anchor on purpose:
+      # `text/plain;charset=utf-8` is a text alternative too.
       if printf '%s\n' "$targets" | grep -q '^image/' \
          && ! printf '%s\n' "$targets" | grep -qE '^(text/plain|UTF8_STRING|STRING|TEXT)'; then
         exec ${pkgs.kitty}/bin/kitty @ send-key ctrl+v
@@ -4401,6 +4391,24 @@ finally:
     '';
   };
 
+  # ctrl+shift+c copy filter: unwrap TUI hanging-indent line wraps so a
+  # single shell command that the source app (claude-code, less, man,
+  # any wide-text TUI) hard-wrapped for display copies back to its
+  # original single line.
+  #
+  # Algorithm: stdin → stdout. A "block" is one non-indented line
+  # followed by 1+ lines all starting with the SAME K>0 leading
+  # spaces. Continuation lines have their K spaces stripped, all lines
+  # rstrip'd, block joined with single spaces (matches the implicit
+  # word-boundary space at terminal wrap points). Lines outside any
+  # block pass through verbatim.
+  #
+  # Trade-off: a uniformly K-indented multi-line shell body (for/do/done,
+  # if/then/fi with consistent indent) ALSO collapses. The escape hatch
+  # is ctrl+shift+alt+c (`copy_to_clipboard`, kitty built-in, no
+  # transform). Heuristic-only by necessity: when the source TUI emits
+  # real `\n` for display wraps, kitty has no per-line "continued" flag
+  # to recover from.
   kittyCopyUnwrap = pkgs.writers.writePython3Bin "kitty-copy-unwrap" {} ''
     import sys
 
@@ -5241,11 +5249,24 @@ in
     # OSC 52 fails under pass_selection_to_program — see comment near
     # `pkgs.xclip` above).
     map ctrl+shift+c pass_selection_to_program sh -c 'printf %s "$0" | kitty-copy-unwrap | xclip -selection clipboard -in'
-    # Same copy on ctrl+c. With nothing selected copy_or_noop reports the
-    # key unhandled, so the real keypress goes to the application and ctrl+c
-    # still interrupts. With a selection it copies the raw text and the
-    # unwrap pipeline runs second, overwriting it; clear_selection then
-    # stops a stale selection from swallowing the next interrupt.
+    # Same copy on ctrl+c. With nothing selected copy_or_noop returns True,
+    # which kitty's dispatch protocol reads as "unhandled" (dispatch_action:
+    # `if passthrough is not True: return True`), so the rest of the combine
+    # chain does not run, the real keypress goes to the application, and
+    # ctrl+c still interrupts. With a selection it copies the raw text and
+    # returns False, which drains the chain: the unwrap pipeline runs second
+    # and overwrites it, then clear_selection stops a stale selection from
+    # swallowing the next interrupt.
+    #
+    # So a copy that the filter rewrites performs TWO clipboard ownership
+    # changes, raw then unwrapped, and the raw text is briefly what a paste
+    # would get. A clipboard manager sees both: no dedup option is declared
+    # for CopyQ (nothing in ~/.config/copyq/copyq.conf), so expect a raw
+    # entry in its history beside the unwrapped one whenever the two differ.
+    # When the filter changes nothing the two writes are byte-identical.
+    # copy_or_noop is nonetheless the right action here -- it is the only one
+    # whose return value lets the interrupt through -- and the raw write is
+    # its side effect, not something this binding can suppress.
     map ctrl+c combine : copy_or_noop : pass_selection_to_program sh -c 'printf %s "$0" | kitty-copy-unwrap | xclip -selection clipboard -in' : clear_selection
     # Escape hatch: kitty's built-in copy_to_clipboard, no transform.
     # Use for uniformly-indented multi-line shell bodies (for/do/done,
