@@ -424,8 +424,32 @@ def cmd_report(args) -> int:
         try:
             live = load_live(args.live)
             declared = load_declared(args.declared)
-        except SettingsUnparseable:
-            pass  # already reported above, or will be next activation
+        except SettingsUnparseable as exc:
+            # NOT "already reported above, or will be next activation". The
+            # marker is written by `record`, which only runs at activation,
+            # and this reporter is the only thing that runs between deploys
+            # (hourly, from home/drift-analyzer.nix). A file broken after the
+            # last deploy therefore has no marker, and trusting one printed
+            # zero findings while being unable to read the file at all --
+            # the one output shape that reads as "nothing to see here".
+            #
+            # Deduplicated against the marker rather than emitted
+            # unconditionally: when activation DID see it, the marker and
+            # this failed read are two sightings of one broken file, and a
+            # doubled heading would read as two separate problems. Reporting
+            # stays read-only -- recording state is `record`'s job, and the
+            # hourly probe writing activation markers would invert that.
+            if not unparseable:
+                findings.append(finding(
+                    "VSCodium settings file does not parse",
+                    f"path:   {args.live}\n"
+                    f"at:     {now()}\n"
+                    f"reason: {exc}\n\n"
+                    "Seen by the hourly check, not at activation: the file "
+                    "parsed when it was last deployed and does not now. The "
+                    "file was left in place. Fix the syntax; until then no "
+                    "override is recorded and the merge cannot apply.",
+                ))
         except Exception as exc:  # noqa: BLE001
             findings.append(finding(
                 "VSCodium settings could not be compared",
