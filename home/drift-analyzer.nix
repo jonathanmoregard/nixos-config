@@ -1,5 +1,11 @@
 { pkgs, ... }:
 let
+  # Shared with home/claude-codium-config.nix, which installs this same file
+  # as the initial local.md. The probe below decides "has anything been
+  # written here" by comparing against it, so a second copy of the text would
+  # read as drift on every host the moment one copy was edited.
+  codiumLocalSeed = ./claude-codium/local-seed.md;
+
   # Shared with home/vscodium.nix, which runs the same binary's `record`
   # subcommand from its activation entry. One leaf-diff for both halves: a
   # second copy would let this report call a key clean that the activation
@@ -201,6 +207,71 @@ installed: crontab -l"
         fi
       else
         add_finding "NixOS config anchor is unavailable" "$anchor"
+      fi
+
+      # The Codium Claude config directory (home/claude-codium-config.nix) is
+      # a deliberately WRITABLE declared surface, so it drifts in a way the
+      # probes above cannot see: a skill written straight into it works
+      # immediately and survives every deploy, which makes it
+      # indistinguishable from declared config right up until a fresh install
+      # drops it. Nothing else looks in there, so without this a skill sits in
+      # the live layer indefinitely and nobody is reminded it was never
+      # reviewed.
+      #
+      # Managed entries are symlinks, and exactly two targets are managed: the
+      # store (a skill declared in home/claude-codium/skills) and
+      # ~/.claude/skills (one inherited from the shared config). Anything else
+      # — a real directory, or a symlink into one of the user's own repos — is
+      # the promotion queue. The immediate target is checked, not the resolved
+      # one, for the same reason as the systemd/user probe above: an inherited
+      # skill that is itself a store symlink resolves into the store without
+      # being declared HERE.
+      codium_dir="''${NIXOS_DRIFT_CODIUM_DIR:-''${XDG_STATE_HOME:-$HOME/.local/state}/claude-codium}"
+      codium_seed="''${NIXOS_DRIFT_CODIUM_SEED:-${codiumLocalSeed}}"
+      codium_shared="''${NIXOS_DRIFT_CODIUM_SHARED:-$HOME/.claude/skills}"
+      if [ -d "$codium_dir/skills" ]; then
+        : > "$scratch/codium-skills"
+        : > "$scratch/codium-shadow"
+        find "$codium_dir/skills" -mindepth 1 -maxdepth 1 -print0 \
+          | sort -z > "$scratch/codium-entries"
+        while IFS= read -r -d $'\0' entry; do
+          name=''${entry#"$codium_dir"/skills/}
+          target=$(readlink "$entry" 2>/dev/null || true)
+          case "$target" in
+            /nix/store/*) continue ;;
+            "$codium_shared"/*) continue ;;
+          esac
+          printf '%s\n' "$name" >> "$scratch/codium-skills"
+          # A live skill with the same name as a shared one WINS, silently:
+          # activation leaves a real directory alone rather than relinking
+          # over it. That is the skills-side equivalent of a declared
+          # settings key being overridden, and this is the only place it is
+          # ever stated.
+          if [ -e "$codium_shared/$name" ]; then
+            printf '%s\n' "$name" >> "$scratch/codium-shadow"
+          fi
+        done < "$scratch/codium-entries"
+        if [ -s "$scratch/codium-skills" ]; then
+          add_finding \
+            "Codium-only skills live but not declared" \
+            "$(cat "$scratch/codium-skills")"
+        fi
+        if [ -s "$scratch/codium-shadow" ]; then
+          add_finding \
+            "Codium skills shadowing a shared skill of the same name" \
+            "$(cat "$scratch/codium-shadow")"
+        fi
+      fi
+
+      # local.md is the prose half of the same layer: seeded once, the user's
+      # from then on. Compared against the seed rather than checked for
+      # existence, because the seed IS the empty state — byte-identical means
+      # nothing has been written there yet.
+      if [ -f "$codium_dir/local.md" ] && [ -f "$codium_seed" ] \
+        && ! cmp -s "$codium_dir/local.md" "$codium_seed"; then
+        add_finding \
+          "Codium session notes live but not declared" \
+          "$codium_dir/local.md"
       fi
 
       # VSCodium's settings.json is the one declared file on this host that

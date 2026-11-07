@@ -51,7 +51,9 @@
 # is built in since 1.67), code-settings-sync (this file replaces it),
 # indent-rainbow, clangd/clang-format (their paths were a Flatpak prefix and
 # /usr/bin — neither exists here), macros / block-travel / bookmarks bindings
-# (their extensions are not in the nixpkgs set).
+# (their extensions are not in the nixpkgs set), and
+# security.workspace.trust.untrustedFiles = "open" (the trust prompt is a real
+# guard now that agents write into these repos).
 { config, lib, modulesPath, pkgs, ... }:
 let
   jsonFormat = pkgs.formats.json { };
@@ -208,14 +210,14 @@ let
     # the setting that admits it, so a live `true` would hand an
     # editor-started session blanket tool approval and survive every deploy.
     # environmentVariables sets the env of the spawned claude process, which
-    # is how the egress wrapper below could be worked around.
+    # is how the egress wrapper below could be worked around; it is declared
+    # under Claude Code below, where its own value needs explaining.
     #
     # initialPermissionMode itself is left undeclared on purpose: unset means
     # "defer to the CLI's resolved default for the session", and pinning a
     # value here would override that. It is in the drift tool's sensitive
     # prefixes instead, so a live value is reported within the hour.
     "claudeCode.allowDangerouslySkipPermissions" = false;
-    "claudeCode.environmentVariables" = [ ];
 
     # ── Claude Code ─────────────────────────────────────────────────────
     # Launch through the egress wrapper, so an editor-spawned session
@@ -223,6 +225,32 @@ let
     # this the extension spawns the CLI directly and its traffic is
     # invisible to the nftables rule bound to that cgroup.
     "claudeCode.claudeProcessWrapper" = "${claudeEgressLaunch}/bin/claude-egress-launch";
+    # Point editor-started sessions at their own config directory, which is
+    # what gives Codium its own CLAUDE.md and its own skills/ — see
+    # home/claude-codium-config.nix for what that directory contains and what
+    # had to be linked back into it.
+    #
+    # CLAUDE_CONFIG_DIR is special inside this list: the extension copies
+    # every OTHER entry into the spawned process's environment, but pulls this
+    # one out, requires an absolute path, and applies it on its own
+    # (extension.js 2.1.311). An entry here with a relative path is silently
+    # ignored, so the path is built from homeDirectory rather than written
+    # with a `~`.
+    #
+    # Declared, which is what makes it safe to depend on: the activation
+    # merge is `$dynamic * $static`, so a declared key's value wins over
+    # whatever the Settings UI wrote, and the recorder files the discarded
+    # value as an override before the merge runs. jq's `*` replaces an array
+    # wholesale rather than unioning it, so an appended entry goes too.
+    # That matters more for this key than for the rest of them — it is where
+    # an edit could point the editor's Claude at an attacker-chosen config
+    # directory, or inject environment into the process it spawns.
+    "claudeCode.environmentVariables" = [
+      {
+        name = "CLAUDE_CONFIG_DIR";
+        value = "${config.home.homeDirectory}/.local/state/claude-codium";
+      }
+    ];
 
     # ── Rust ────────────────────────────────────────────────────────────
     # Same desktop-menu PATH problem as nix.serverPath below, one layer
@@ -394,6 +422,36 @@ in
   # the deploy, and this path is declared here in full, so there is nothing
   # in it worth preserving that is not already above.
   home.file.${keybindingsPath}.force = true;
+
+  # Exempts the path from the collision check, which covers a stray file or
+  # foreign symlink there. It does not cover a directory: linkGeneration
+  # places the link with `ln -Tsf`, which refuses one.
+  #
+  # Keyed relative, unlike the paths above: the module derives this entry
+  # from its own dataFolderName, and the absolute spelling would be a second,
+  # sourceless entry rather than an override of that one.
+  home.file.".vscode-oss/extensions".force = true;
+
+  # VSCodium creates ~/.vscode-oss/extensions itself on first run, and
+  # mutableExtensionsDir = false puts that path under home-manager, where a
+  # real directory stops the linker. A failed activation on this host latches
+  # the deploy SHA as poisoned and never re-attempts it.
+  #
+  # Moved aside rather than deleted: the declared set is the whole set, so
+  # nothing there is needed, but a sideloaded extension is the user's. Placed
+  # after the write boundary so the rename happens only once activation is
+  # past the checks that can still abort it, and before linkGeneration
+  # because that is what needs the path free.
+  home.activation.vscodiumExtensionsDirMigration =
+    lib.hm.dag.entryBetween [ "linkGeneration" ] [ "writeBoundary" ] ''
+      extDir="$HOME/.vscode-oss/extensions"
+      if [ -d "$extDir" ] && [ ! -L "$extDir" ]; then
+        moved="$extDir.pre-nix-$(date -u +%Y%m%dT%H%M%SZ)"
+        echo "vscodium: $extDir is an unmanaged directory and the declared" \
+             "extension set belongs at that path; moving it to $moved" >&2
+        run mv "$extDir" "$moved"
+      fi
+    '';
 
   # What the hourly probe diffs the live file against. A store symlink, so it
   # is exactly what this file declares and cannot be edited into agreement.
