@@ -3442,9 +3442,32 @@ in
             if agg_notify_count() > baseline:
                 return
             _time.sleep(2)
+        # A marker count alone cannot tell "the notifier never ran" from "it
+        # ran, logged the marker, and this query did not return it" — the
+        # second is what a chatty sibling user unit flooding the shared user
+        # journal produces, and the old wording asserted the first outright,
+        # sending the reader after the wrong bug. The unit's own accounting
+        # discriminates: an empty ExecMainStartTimestamp means it never
+        # executed; a populated one with no marker in its journal means it
+        # ran and answered wrongly.
+        state = workstation.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            "systemctl --user show aggregator-ingest-failure-notify.service "
+            "-p ActiveState -p Result -p NRestarts -p InvocationID "
+            "-p ExecMainStartTimestamp' || true"
+        ).strip()
+        notify_journal = workstation.succeed(
+            "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            "journalctl --user -u aggregator-ingest-failure-notify.service "
+            "-n 50 --no-pager' || true"
+        )
         raise AssertionError(
-            f"aggregator OnFailure notifier never fired for {what}; marker "
-            f"count stuck at {agg_notify_count()} (baseline {baseline})"
+            f"aggregator OnFailure notifier recorded no new marker for {what} "
+            f"within 60s; count {agg_notify_count()} (baseline {baseline}).\n"
+            f"notifier unit state (empty ExecMainStartTimestamp = never ran, "
+            f"populated = it ran and the marker is missing or unreadable):\n"
+            f"{state}\n"
+            f"notifier journal (last 50):\n{notify_journal}"
         )
 
     agg_baseline = agg_notify_count()
