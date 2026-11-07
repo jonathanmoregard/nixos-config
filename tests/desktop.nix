@@ -14,6 +14,10 @@
 #     after three consecutive failures; an unowned bus name never is; the
 #     cooldown both holds and expires; the failure count does not outlive
 #     the boot; `now` recovers on demand.
+#   - cinnamon-rescue escalation: a replacement that never takes over is
+#     reported as a failed recovery rather than a success; the wedged
+#     process is ended SIGTERM-then-SIGKILL to unblock it; a pid that is
+#     not Cinnamon is never signalled; the blocked replacement is stopped.
 #
 # Uses mkFeatureTest with home/_test-desktop.nix — HM closure is
 # jonathan.nix + cinnamon.nix + desktop-apps.nix (no kitty / claude
@@ -75,7 +79,11 @@ let
           *"--object-path /org/Cinnamon "*) : ;;
           *) echo "FAKE: property read on wrong object path: $args" >&2; exit 64 ;;
         esac
-        if [ "$mode" = alive ]; then
+        # A replacement that has taken over makes the property read answer
+        # again, which is how a verified recovery is distinguished from a
+        # launch that blocked in XWindowEvent and never managed anything.
+        if [ "$mode" = alive ] \
+          || { [ -n "''${FAKE_TAKEOVER_MARKER:-}" ] && [ -e "$FAKE_TAKEOVER_MARKER" ]; }; then
           echo "(<'6.6.9'>,)"
         else
           echo "Error: Timeout was reached" >&2
@@ -91,11 +99,52 @@ let
   '';
 
   # Records that a restart was attempted, instead of replacing the window
-  # manager out from under the test session.
+  # manager out from under the test session. FAKE_RESTART_TAKES_OVER=1 models
+  # the replacement actually becoming the window manager; left unset it
+  # models the launch blocking in XWindowEvent, which is what a wedged
+  # Cinnamon does to it.
   fakeRestart = pkgs.writeScriptBin "fake-cinnamon-restart" ''
     #!${pkgs.bash}/bin/bash
     echo restarted >> "$CINNAMON_RESCUE_RESTART_LOG"
+    if [ "''${FAKE_RESTART_TAKES_OVER:-0}" = 1 ]; then
+      : > "$FAKE_TAKEOVER_MARKER"
+    fi
   '';
+
+  # argv[0] has to end in systemd-run for the transient-unit path (the
+  # --setenv insertion and the unit name the cleanup stops) to be taken.
+  fakeSystemdRun = pkgs.writeScriptBin "fake-systemd-run" ''
+    #!${pkgs.bash}/bin/bash
+    echo "$*" >> "$CINNAMON_RESCUE_RESTART_LOG"
+  '';
+
+  fakeSystemctl = pkgs.writeScriptBin "fake-systemctl" ''
+    #!${pkgs.bash}/bin/bash
+    echo "$*" >> "$CINNAMON_RESCUE_SYSTEMCTL_LOG"
+  '';
+
+  # Stands in for a wedged Cinnamon so the escalation has a real process to
+  # end. execv sets argv[0] to the given name, which is what the guard
+  # matches on; mode "trap" ignores SIGTERM, so only SIGKILL can end it.
+  # Prints the victim's pid.
+  fakeVictim = pkgs.writers.writePython3Bin "start-fake-cinnamon"
+    { flakeIgnore = [ "E501" ]; }
+    ''
+      import os
+      import sys
+
+      name, mode = sys.argv[1], sys.argv[2]
+      ignore = "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); " if mode == "trap" else ""
+      body = ignore + "import time; time.sleep(600)"
+
+      pid = os.fork()
+      if pid:
+          print(pid)
+          sys.exit(0)
+      os.setsid()
+      os.closerange(0, 3)
+      os.execv(sys.executable, [name, "-c", body])
+    '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
   name = "vm-desktop";
@@ -202,21 +251,43 @@ in
     rstate = "/tmp/rescue-reports"
     rcount = "/tmp/rescue-counters"
     rlog = "/tmp/rescue-restarts"
+    rsctl = "/tmp/rescue-systemctl"
+    rmark = "/tmp/rescue-took-over"
     fake_pid = 1
 
-    def rescue_run(cmd, mode="alive", threshold=3, cooldown=300):
+    def rescue_run(
+        cmd,
+        mode="alive",
+        threshold=3,
+        cooldown=300,
+        pid=None,
+        takes_over=False,
+        restart_cmd="${fakeRestart}/bin/fake-cinnamon-restart",
+    ):
         return workstation.execute(
             "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u) "
             "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus "
-            f"FAKE_GDBUS_MODE={mode} FAKE_PID={fake_pid} "
+            f"FAKE_GDBUS_MODE={mode} FAKE_PID={fake_pid if pid is None else pid} "
+            f"FAKE_TAKEOVER_MARKER={rmark} "
+            f"FAKE_RESTART_TAKES_OVER={1 if takes_over else 0} "
             f"CINNAMON_RESCUE_GDBUS=${fakeGdbus}/bin/fake-gdbus "
             f"CINNAMON_RESCUE_STATE_DIR={rstate} "
             f"CINNAMON_RESCUE_COUNTER_DIR={rcount} "
             f"CINNAMON_RESCUE_RESTART_LOG={rlog} "
-            f"CINNAMON_RESCUE_RESTART_CMD=${fakeRestart}/bin/fake-cinnamon-restart "
+            f"CINNAMON_RESCUE_SYSTEMCTL_LOG={rsctl} "
+            f"CINNAMON_RESCUE_SYSTEMCTL=${fakeSystemctl}/bin/fake-systemctl "
+            f'CINNAMON_RESCUE_RESTART_CMD="{restart_cmd}" '
             f"CINNAMON_RESCUE_THRESHOLD={threshold} "
-            f"CINNAMON_RESCUE_COOLDOWN_SECS={cooldown}; "
-            f"cinnamon-rescue {cmd}'"
+            f"CINNAMON_RESCUE_COOLDOWN_SECS={cooldown} "
+            # Escalation deadlines shrunk so the lane does not spend a minute
+            # per stalled recovery; the production values are in the module.
+            "CINNAMON_RESCUE_TAKEOVER_DEADLINE_SECS=2 "
+            "CINNAMON_RESCUE_TERM_GRACE_SECS=2 "
+            "CINNAMON_RESCUE_KILL_GRACE_SECS=2; "
+            # 2>&1 because the driver's backdoor shell sends only stdout to
+            # the capture socket, and the failure paths report on stderr --
+            # which is where the journal reads them from for the real unit.
+            f"cinnamon-rescue {cmd} 2>&1'"
         )
 
     def rescue(cmd, mode="alive", **kw):
@@ -229,6 +300,12 @@ in
         assert rc == 0, f"cinnamon-rescue {cmd} (mode={mode}) exited {rc}:\n{out}"
         return out
 
+    def rescue_fails(cmd, mode="alive", **kw):
+        rc, out = rescue_run(cmd, mode, **kw)
+        assert rc != 0, \
+            f"cinnamon-rescue {cmd} (mode={mode}) reported success:\n{out}"
+        return out
+
     def restarts():
         return int(
             workstation.succeed(f"wc -l < {rlog} 2>/dev/null || echo 0").strip()
@@ -236,8 +313,38 @@ in
 
     def reset_rescue():
         workstation.succeed(
-            f"rm -rf {rstate} {rcount} {rlog}; "
-            f"install -o jonathan -m 644 /dev/null {rlog}"
+            f"rm -rf {rstate} {rcount} {rlog} {rsctl} {rmark}; "
+            f"install -o jonathan -m 644 /dev/null {rlog}; "
+            f"install -o jonathan -m 644 /dev/null {rsctl}"
+        )
+
+    # Starts a process that stands in for a wedged Cinnamon, so os.kill has a
+    # real target whose death the test can observe. Waits for argv[0] to carry
+    # the name, which is both what the guard matches on and proof the exec
+    # landed before the escalation reads /proc.
+    def start_victim(name, trapped):
+        pid = int(workstation.succeed(
+            "su - jonathan -c "
+            f"'${fakeVictim}/bin/start-fake-cinnamon {name} "
+            f"{'trap' if trapped else 'plain'}'"
+        ).strip())
+        workstation.wait_until_succeeds(
+            f"tr '\\0' ' ' < /proc/{pid}/cmdline | grep -q '^{name} '",
+            timeout=20,
+        )
+        return pid
+
+    def alive_pid(pid):
+        return workstation.execute(f"test -d /proc/{pid}")[0] == 0
+
+    # A killed orphan can sit as a zombie until init reaps it, and
+    # /proc/<pid> still exists for a zombie, so "gone" has to accept Z.
+    # Times out loudly if the escalation never ended the process.
+    def wait_until_gone(pid):
+        workstation.wait_until_succeeds(
+            f"! test -e /proc/{pid}/status "
+            f"|| grep -qE '^State:[[:space:]]+Z' /proc/{pid}/status",
+            timeout=30,
         )
 
     # The real probe, against the live Cinnamon in this session. The fakes
@@ -289,8 +396,9 @@ in
     # Threshold reached: recover, and leave a report carrying the real pid,
     # the probe actually used, and a real thread state — so a capture that
     # quietly stopped reading /proc fails here instead of passing on labels.
-    rescue_ok("check", mode="hung")
+    out = rescue_ok("check", mode="hung", takes_over=True)
     assert restarts() == 1, "watchdog did not restart Cinnamon at the threshold"
+    assert "took over" in out, f"recovery was not verified, only launched:\n{out}"
     diag = workstation.succeed(f"cat {rstate}/hang-*.txt")
     assert f"pid={fake_pid}" in diag, f"report does not name the pid:\n{diag}"
     assert "Properties.Get" in diag, \
@@ -299,6 +407,7 @@ in
         f"report carries no real thread state for pid {fake_pid}:\n{diag}"
 
     # Cooldown holds inside the window...
+    workstation.succeed(f"rm -f {rmark}")
     for _ in range(3):
         rescue_ok("check", mode="hung")
     assert restarts() == 1, "cooldown did not suppress a second restart"
@@ -309,7 +418,7 @@ in
         f"echo 1 > {rcount}/last-restart; chown jonathan {rcount}/last-restart"
     )
     for _ in range(3):
-        rescue_ok("check", mode="hung")
+        rescue_ok("check", mode="hung", takes_over=True)
     assert restarts() == 2, \
         "an expired cooldown still refused to restart, so it never ends"
 
@@ -336,10 +445,72 @@ in
     # `now` is the manual escape hatch over SSH or Ctrl+Alt+F2: it recovers on
     # demand, with no accumulated failures and no regard for the cooldown.
     reset_rescue()
-    rescue_ok("now", mode="hung")
+    rescue_ok("now", mode="hung", takes_over=True)
     assert restarts() == 1, "`cinnamon-rescue now` did not recover on demand"
     status = rescue_ok("status", mode="alive")
     assert "failures=0/3" in status, f"status does not report the counter:\n{status}"
+
+    # `cinnamon --replace` blocks in XWindowEvent until the outgoing window
+    # manager destroys its selection window (muffin 6.6.3
+    # take_manager_selection: "We sort of block infinitely here"). A wedged
+    # main loop never gets there, so a launch that is merely queued must not
+    # be reported as a recovery, and the hung process has to be ended for the
+    # waiting replacement to proceed. takes_over stays False throughout:
+    # that is what models the blocked replacement.
+    #
+    # A process that ignores SIGTERM proves both rungs of the ladder are
+    # real — it can only die of SIGKILL.
+    reset_rescue()
+    victim = start_victim("cinnamon-kill-victim", trapped=True)
+    out = rescue_fails("now", mode="hung", pid=victim)
+    wait_until_gone(victim)
+    assert "SIGTERM" in out and "SIGKILL" in out, \
+        f"escalation did not climb from SIGTERM to SIGKILL:\n{out}"
+    assert "recovery FAILED" in out, \
+        f"a recovery that never took over was not reported as failed:\n{out}"
+
+    # SIGTERM first, and only as far as it needs to go: a process that honours
+    # it must never be SIGKILLed.
+    reset_rescue()
+    polite = start_victim("cinnamon-term-victim", trapped=False)
+    out = rescue_fails("now", mode="hung", pid=polite)
+    wait_until_gone(polite)
+    assert "has exited" in out, \
+        f"escalation did not notice the process had gone:\n{out}"
+    assert "SIGKILL" not in out, \
+        f"escalated to SIGKILL against a process that honoured SIGTERM:\n{out}"
+
+    # The guard that makes escalation safe. The pid comes from the broker, so
+    # a stale or recycled one must never be signalled — here it is PID 1, and
+    # the VM surviving this assertion is itself the evidence.
+    reset_rescue()
+    out = rescue_fails("now", mode="hung", pid=1)
+    assert "not Cinnamon; not signalling" in out, \
+        f"escalation did not refuse a pid that is not Cinnamon:\n{out}"
+    assert alive_pid(1), "escalation signalled PID 1"
+
+    # A replacement left blocked holds the window manager selection without
+    # managing anything, so it is stopped rather than left for the next
+    # --replace to aim at.
+    reset_rescue()
+    stale = start_victim("cinnamon-stale-victim", trapped=True)
+    rescue_fails(
+        "now", mode="hung", pid=stale,
+        restart_cmd="${fakeSystemdRun}/bin/fake-systemd-run --user --unit=@unit@ cinnamon --replace",
+    )
+    stops = workstation.succeed(f"cat {rsctl}")
+    assert "stop" in stops and "cinnamon-rescue-replace-" in stops, \
+        f"the blocked replacement was not stopped:\n{stops}"
+    launched = workstation.succeed(f"cat {rlog}")
+    assert "--setenv=DISPLAY=" in launched, \
+        f"the transient unit was launched without DISPLAY:\n{launched}"
+    unit = [w for w in launched.split() if w.startswith("--unit=")][0].split("=", 1)[1]
+    assert unit in stops, \
+        f"stopped a different unit than the one launched ({unit}):\n{stops}"
+    # A replacement stuck in XWindowEvent does not answer SIGTERM, so a
+    # blocking stop would spend the unit's whole start timeout waiting.
+    assert "--no-block" in stops, \
+        f"the stop would block on the stuck replacement:\n{stops}"
 
     # Runs last: it takes ~40 s, and the X-bell check above samples server
     # state at one instant, so running this first shifted that sample past
@@ -458,5 +629,85 @@ in
     assert out.strip() == "rc=0", f"mark printed or failed: {out!r}"
     out = as_j("echo not-json | agent-activity mark; echo rc=$?")
     assert out.strip() == "rc=0", f"mark on garbage printed or failed: {out!r}"
+
+    # The live fault, end to end, with no fakes anywhere in the path: wedge
+    # the real Cinnamon's main loop the way the 2026-11-07 hang did, then
+    # recover it with the real `cinnamon --replace`.
+    #
+    # This is the assertion the fakes cannot make. muffin blocks in
+    # XWindowEvent until the outgoing window manager destroys its selection
+    # window, and a main loop spinning in JS never will -- it will not even
+    # act on SIGTERM, because GLib's handler defers to that same loop. So
+    # the handover completes only because the escalation reaches SIGKILL.
+    #
+    # Runs last: it ends the session's window manager, which nothing after
+    # it could rely on.
+    rescue_env = (
+        "export XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus"
+    )
+
+    def cinnamon_owner_pid():
+        return int(workstation.succeed(
+            f"su - jonathan -c '{rescue_env}; "
+            "gdbus call --session --dest org.freedesktop.DBus "
+            "--object-path /org/freedesktop/DBus --method "
+            "org.freedesktop.DBus.GetConnectionUnixProcessID org.Cinnamon' "
+            "| sed -n 's/.*uint32 \\([0-9]*\\).*/\\1/p'"
+        ).strip())
+
+    wedged_pid = cinnamon_owner_pid()
+    print(f"[diag] live Cinnamon before the wedge: pid {wedged_pid}")
+
+    # Eval runs the script on Cinnamon's main loop, so an endless loop there
+    # is the real fault rather than a simulation of it. The reply never
+    # comes, so the client is given a short --timeout and abandoned; the loop
+    # it started keeps spinning inside Cinnamon regardless.
+    rc_eval, eval_out = workstation.execute(
+        f"su - jonathan -c '{rescue_env}; "
+        "timeout 30 gdbus call --session --timeout 3 --dest org.Cinnamon "
+        "--object-path /org/Cinnamon --method org.Cinnamon.Eval "
+        "\"while(true){}\" 2>&1'",
+        timeout=120,
+    )
+    print(f"[diag] Eval rc={rc_eval} out={eval_out.strip()!r}")
+
+    # The probe must see the real wedge, not just the fake one.
+    probes = []
+    for _ in range(10):
+        probes.append(workstation.execute(
+            f"su - jonathan -c '{rescue_env}; cinnamon-rescue probe'"
+        )[0])
+        if probes[-1] == 1:
+            break
+    print(f"[diag] probe after the wedge: {probes}")
+    assert 1 in probes, (
+        "Eval did not wedge the live main loop, so the recovery below would "
+        f"prove nothing: Eval rc={rc_eval} out={eval_out.strip()!r}, "
+        f"probes={probes}"
+    )
+
+    # KILL_GRACE is stretched because Cinnamon's own start-up has to fit in
+    # it on an emulated GPU; the deadline being configuration is the point,
+    # the escalation reaching SIGKILL is what is under test.
+    rc, out = workstation.execute(
+        f"su - jonathan -c '{rescue_env} "
+        f"CINNAMON_RESCUE_STATE_DIR={rstate} CINNAMON_RESCUE_COUNTER_DIR={rcount} "
+        "CINNAMON_RESCUE_KILL_GRACE_SECS=120; cinnamon-rescue now 2>&1'",
+        timeout=600,
+    )
+    print(f"[diag] live recovery rc={rc}:\n{out}")
+    assert rc == 0, f"live recovery of a genuinely wedged Cinnamon failed:\n{out}"
+    assert "SIGKILL" in out, \
+        f"the handover completed without the escalation, so --replace did not block:\n{out}"
+    assert "took over" in out, f"recovery was not verified:\n{out}"
+
+    recovered_pid = cinnamon_owner_pid()
+    assert recovered_pid != wedged_pid, \
+        f"org.Cinnamon is still owned by the wedged pid {wedged_pid}"
+    assert workstation.execute(
+        f"su - jonathan -c '{rescue_env}; cinnamon-rescue probe'"
+    )[0] == 0, "the replacement does not answer its own main loop"
+    print(f"[diag] live Cinnamon recovered: pid {wedged_pid} -> {recovered_pid}")
   '';
 }

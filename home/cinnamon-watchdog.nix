@@ -5,6 +5,14 @@
 # mouse while nothing is clickable and no notification can render. Recovery
 # therefore cannot ask the user anything; it has to act on its own.
 #
+# The replacement cannot be launched and trusted. `cinnamon --replace` blocks
+# in XWindowEvent until the outgoing window manager's selection window is
+# destroyed (muffin 6.6.3, take_manager_selection, whose own comment reads
+# "We sort of block infinitely here which is probably lame"). A wedged main
+# loop never processes the SelectionClear that would make it exit, so the
+# replacement waits forever on precisely the fault it was launched to repair.
+# Recovery is therefore verified, and escalates when takeover stalls.
+#
 # Asserted by tests/desktop.nix (vm-desktop).
 let
   threshold = 3;
@@ -12,7 +20,12 @@ let
   probeTimeoutSecs = 5;
   intervalSecs = 20;
   captureLimitSecs = 20;
-  startTimeoutSecs = 60;
+  takeoverDeadlineSecs = 15;
+  termGraceSecs = 5;
+  killGraceSecs = 10;
+  # Must exceed capture + launch + takeover wait + both escalation graces,
+  # each of which can overshoot by one probe timeout.
+  startTimeoutSecs = 150;
 
   reportDir = "${config.home.homeDirectory}/.local/state/cinnamon-rescue";
 
@@ -57,6 +70,10 @@ let
       COOLDOWN = int(os.environ.get("CINNAMON_RESCUE_COOLDOWN_SECS", "${toString cooldownSecs}"))
       PROBE_TIMEOUT = int(os.environ.get("CINNAMON_RESCUE_PROBE_TIMEOUT_SECS", "${toString probeTimeoutSecs}"))
       CAPTURE_LIMIT = int(os.environ.get("CINNAMON_RESCUE_CAPTURE_LIMIT_SECS", "${toString captureLimitSecs}"))
+      TAKEOVER_DEADLINE = int(os.environ.get("CINNAMON_RESCUE_TAKEOVER_DEADLINE_SECS", "${toString takeoverDeadlineSecs}"))
+      TERM_GRACE = int(os.environ.get("CINNAMON_RESCUE_TERM_GRACE_SECS", "${toString termGraceSecs}"))
+      KILL_GRACE = int(os.environ.get("CINNAMON_RESCUE_KILL_GRACE_SECS", "${toString killGraceSecs}"))
+      SYSTEMCTL = os.environ.get("CINNAMON_RESCUE_SYSTEMCTL", "${pkgs.systemd}/bin/systemctl")
 
 
       def counter_dir():
@@ -241,29 +258,150 @@ let
 
 
       def restart():
-          cmd = RESTART_CMD.replace("@unit@", "cinnamon-rescue-replace-%d" % time.time())
-          env = dict(os.environ)
+          """Launch the replacement. Returns (launched, transient unit or None)."""
+          unit = "cinnamon-rescue-replace-%d" % time.time()
+          cmd = RESTART_CMD.replace("@unit@", unit)
           # systemd-run does not forward this process's environment to the
           # transient unit, so DISPLAY has to be handed over explicitly.
-          display = env.get("DISPLAY") or ":0"
+          display = os.environ.get("DISPLAY") or ":0"
           argv = shlex.split(cmd)
-          if argv and argv[0].endswith("systemd-run"):
+          transient = bool(argv) and argv[0].endswith("systemd-run")
+          if transient:
               argv.insert(1, "--setenv=DISPLAY=" + display)
+          # systemd-run returns as soon as the job is queued, so rc only says
+          # the replacement was launched -- never that it took over.
           rc, out = _run(argv, 30)
           if rc != 0:
               print("cinnamon-rescue: restart failed rc=%d: %s" % (rc, out.strip()),
                     file=sys.stderr)
+              return False, None
+          return True, (unit if transient else None)
+
+
+      def _await_takeover(deadline):
+          """Poll the main loop until it answers again, or deadline elapses."""
+          end = time.monotonic() + deadline
+          while True:
+              if probe() == ALIVE:
+                  return True
+              if time.monotonic() >= end:
+                  return False
+              time.sleep(1)
+
+
+      def _argv0_names_cinnamon(pid):
+          # The guard that keeps escalation from ever signalling a bystander:
+          # the pid comes from the broker, and a stale or recycled pid must
+          # not be killable. Cinnamon's comm is ".cinnamon-wrapp", so match
+          # argv[0] rather than the thread name.
+          raw = _slurp("/proc/%d/cmdline" % pid, 4096)
+          if not raw or raw.startswith("<unreadable"):
               return False
-          return True
+          argv0 = raw.split("\0")[0]
+          return "cinnamon" in os.path.basename(argv0).lower()
+
+
+      def _proc_starttime(pid):
+          """Field 22 of /proc/<pid>/stat, which tells two pids of the same
+          number apart across recycling."""
+          raw = _slurp("/proc/%d/stat" % pid, 2048)
+          if not raw or raw.startswith("<unreadable") or ")" not in raw:
+              return None
+          # comm can hold spaces and parens, so the fields after the LAST
+          # paren start at stat's field 3; field 22 is index 19 of those.
+          fields = raw.rsplit(")", 1)[-1].split()
+          return fields[19] if len(fields) > 19 else None
+
+
+      def _pid_alive(pid):
+          try:
+              os.kill(pid, 0)
+              return True
+          except ProcessLookupError:
+              return False
+          except OSError:
+              # Exists but is not ours to signal; treat as alive and let the
+              # kill below report the real error.
+              return True
+
+
+      def _escalate(pid, ident):
+          """End the wedged Cinnamon so the waiting replacement can proceed."""
+          if pid is None:
+              print("cinnamon-rescue: no pid to escalate against", file=sys.stderr)
+              return False
+          # Identity, not bus ownership. A stalled --replace has often taken
+          # the name already while the old process goes on blocking it, so
+          # re-reading the owner refuses exactly when escalation is needed;
+          # the start time pins the same process across pid recycling.
+          if ident is None or _proc_starttime(pid) != ident:
+              print("cinnamon-rescue: pid %s is not the process diagnosed as hung; "
+                    "not signalling" % pid, file=sys.stderr)
+              return False
+          if not _argv0_names_cinnamon(pid):
+              print("cinnamon-rescue: pid %s is not Cinnamon; not signalling" % pid,
+                    file=sys.stderr)
+              return False
+          for sig, grace in ((signal.SIGTERM, TERM_GRACE), (signal.SIGKILL, KILL_GRACE)):
+              # SIGKILL is for a process that would not leave, not for one
+              # that already has.
+              if not _pid_alive(pid):
+                  print("cinnamon-rescue: the wedged Cinnamon (pid %s) has exited" % pid)
+                  break
+              try:
+                  os.kill(pid, sig)
+              except OSError as exc:
+                  print("cinnamon-rescue: %s to pid %s failed: %s" % (sig.name, pid, exc),
+                        file=sys.stderr)
+                  return False
+              print("cinnamon-rescue: sent %s to the wedged Cinnamon (pid %s)" % (sig.name, pid))
+              if _await_takeover(grace):
+                  return True
+          return False
+
+
+      def _drop_pending_replacement(unit):
+          # A replacement blocked in XWindowEvent has already taken the window
+          # manager selection without managing anything, so leaving it behind
+          # would aim the next --replace at a process that can never answer.
+          if not unit:
+              return
+          # --no-block: stopping waits for the process to die, and a process
+          # blocked in XWindowEvent does not answer SIGTERM, so a blocking
+          # stop burns the unit's whole start timeout. systemd escalates to
+          # SIGKILL on its own schedule.
+          rc, out = _run([SYSTEMCTL, "--user", "stop", "--no-block", unit], 15)
+          if rc != 0:
+              print("cinnamon-rescue: could not stop %s: %s" % (unit, out.strip()),
+                    file=sys.stderr)
 
 
       def _recover(fails):
-          report = capture(cinnamon_pid(), fails)
+          pid = cinnamon_pid()
+          # Taken before the replacement is launched: this is the process the
+          # probe found wedged, and the only one escalation may signal.
+          ident = _proc_starttime(pid) if pid is not None else None
+          report = capture(pid, fails)
           print("cinnamon-rescue: hung after %d failed probes; report %s" % (fails, report))
-          ok = restart()
+          launched, unit = restart()
+          # Written before the outcome is known: a recovery that stalls must
+          # still open the cooldown, or the timer retries escalation forever.
           _write_int("last-restart", int(time.time()))
           _write_int("failures", 0)
-          return 0 if ok else 1
+          if not launched:
+              return 1
+          if _await_takeover(TAKEOVER_DEADLINE):
+              print("cinnamon-rescue: replacement took over; the session answers again")
+              return 0
+          print("cinnamon-rescue: replacement has not taken over in %ds; escalating"
+                % TAKEOVER_DEADLINE, file=sys.stderr)
+          if _escalate(pid, ident):
+              print("cinnamon-rescue: replacement took over once the old Cinnamon ended")
+              return 0
+          _drop_pending_replacement(unit)
+          print("cinnamon-rescue: recovery FAILED; the session is still wedged",
+                file=sys.stderr)
+          return 1
 
 
       def check():
