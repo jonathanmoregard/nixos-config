@@ -21,15 +21,25 @@ let
   intervalSecs = 20;
   captureLimitSecs = 20;
   takeoverDeadlineSecs = 15;
+  # A replacement only has to stop blocking once the old process is gone
+  # (measured at ~1.5s), but a cold start is a whole Cinnamon coming up.
+  coldStartDeadlineSecs = 60;
   termGraceSecs = 5;
   killGraceSecs = 10;
+  # How many times the watchdog will start a Cinnamon into a session whose
+  # name is unowned after it ended one itself, before concluding the session
+  # is gone. Without a bound, a logged-out session with linger enabled keeps
+  # a timer and a runtime dir, and would retry a start with no display for
+  # as long as the machine stays up.
+  absentStartLimit = 3;
   # Every deadline below is a floor, not a ceiling: each probe is TWO gdbus
   # calls (GetNameOwner then the property read), so a wait can overshoot its
   # deadline by 2*(probeTimeout+5) = 20s before the next check of the clock.
   # Worst case, with every call hanging: pid lookup 10 + capture 20 + launch
-  # 30 + takeover 15+20 + SIGTERM 5+20 + SIGKILL 10+20 + stop 15 + the
-  # last-resort start 30+15+20+15 = 310s. This is the backstop for all of it,
-  # including a capture that SIGALRM cannot interrupt (see capture()).
+  # 30 + takeover 15+20 + SIGTERM 5+20 + SIGKILL 10+20 + the recovered-check
+  # probe 20 + stop 15 + the last-resort start (30 + 60+20 + 20 + 15) = 330s.
+  # This is the backstop for all of it, including a capture that SIGALRM
+  # cannot interrupt (see capture()).
   startTimeoutSecs = 420;
 
   reportDir = "${config.home.homeDirectory}/.local/state/cinnamon-rescue";
@@ -76,6 +86,8 @@ let
       PROBE_TIMEOUT = int(os.environ.get("CINNAMON_RESCUE_PROBE_TIMEOUT_SECS", "${toString probeTimeoutSecs}"))
       CAPTURE_LIMIT = int(os.environ.get("CINNAMON_RESCUE_CAPTURE_LIMIT_SECS", "${toString captureLimitSecs}"))
       TAKEOVER_DEADLINE = int(os.environ.get("CINNAMON_RESCUE_TAKEOVER_DEADLINE_SECS", "${toString takeoverDeadlineSecs}"))
+      COLD_START_DEADLINE = int(os.environ.get("CINNAMON_RESCUE_COLD_START_DEADLINE_SECS", "${toString coldStartDeadlineSecs}"))
+      ABSENT_START_LIMIT = int(os.environ.get("CINNAMON_RESCUE_ABSENT_START_LIMIT", "${toString absentStartLimit}"))
       TERM_GRACE = int(os.environ.get("CINNAMON_RESCUE_TERM_GRACE_SECS", "${toString termGraceSecs}"))
       KILL_GRACE = int(os.environ.get("CINNAMON_RESCUE_KILL_GRACE_SECS", "${toString killGraceSecs}"))
       SYSTEMCTL = os.environ.get("CINNAMON_RESCUE_SYSTEMCTL", "${pkgs.systemd}/bin/systemctl")
@@ -390,6 +402,20 @@ let
                     file=sys.stderr)
 
 
+      def _drop_unless_recovered(unit):
+          """Stop a replacement that is still not working. Returns False when
+          it turned out to be working and was therefore left alone."""
+          # A handover can land just after the last grace expired. Stopping
+          # the unit then would kill the Cinnamon that had just rescued the
+          # session -- the rescue destroying its own result.
+          if probe() == ALIVE:
+              print("cinnamon-rescue: the replacement took over after the deadlines; "
+                    "keeping it")
+              return False
+          _drop_pending_replacement(unit)
+          return True
+
+
       def _recover(fails):
           pid = cinnamon_pid()
           # Taken before the replacement is launched: this is the process the
@@ -404,27 +430,40 @@ let
           _write_int("failures", 0)
           if not launched:
               return 1
-          if _await_takeover(TAKEOVER_DEADLINE):
+          # No pid means nothing owned the name, so this is a cold start
+          # rather than a replacement waiting on a wedged process, and a
+          # whole Cinnamon coming up needs the longer deadline.
+          deadline = TAKEOVER_DEADLINE if pid is not None else COLD_START_DEADLINE
+          if _await_takeover(deadline):
               print("cinnamon-rescue: replacement took over; the session answers again")
               return 0
           print("cinnamon-rescue: replacement has not taken over in %ds; escalating"
-                % TAKEOVER_DEADLINE, file=sys.stderr)
+                % deadline, file=sys.stderr)
           if _escalate(pid, ident):
               print("cinnamon-rescue: replacement took over once the old Cinnamon ended")
               return 0
-          _drop_pending_replacement(unit)
+          if not _drop_unless_recovered(unit):
+              return 0
           # Ending the old Cinnamon and then dropping its replacement leaves
           # nobody owning the name, which is a session with no window manager
           # at all -- worse than the hang it replaced. One bounded start
           # attempt beats stranding it there.
-          if not name_owned():
-              print("cinnamon-rescue: nothing owns %s; starting a window manager"
-                    % BUS_NAME, file=sys.stderr)
-              launched, retry_unit = restart()
-              if launched and _await_takeover(TAKEOVER_DEADLINE):
-                  print("cinnamon-rescue: a fresh Cinnamon took over")
-                  return 0
-              _drop_pending_replacement(retry_unit)
+          #
+          # Not gated on name_owned(): the stop above is --no-block, so a name
+          # the dropped replacement claimed can still read as owned for a
+          # moment, which would skip this start exactly when nothing is going
+          # to own it. The session is known not to answer, and --replace is
+          # built for the case where someone else holds the selection.
+          print("cinnamon-rescue: starting a window manager for the stranded session",
+                file=sys.stderr)
+          launched, retry_unit = restart()
+          # A cold start is a whole Cinnamon coming up, not a replacement
+          # that only had to stop blocking, so it gets the longer deadline.
+          if launched and _await_takeover(COLD_START_DEADLINE):
+              print("cinnamon-rescue: a fresh Cinnamon took over")
+              return 0
+          if launched and not _drop_unless_recovered(retry_unit):
+              return 0
           print("cinnamon-rescue: recovery FAILED; the session is still wedged",
                 file=sys.stderr)
           return 1
@@ -440,6 +479,7 @@ let
           if state == ALIVE:
               _write_int("failures", 0)
               _write_int("ended-cinnamon", 0)
+              _write_int("absent-starts", 0)
               return 0
           if state == ABSENT:
               # Normally a greeter or a non-Cinnamon session, where starting a
@@ -449,10 +489,21 @@ let
               if not _read_int("ended-cinnamon"):
                   _write_int("failures", 0)
                   return 0
+              attempts = _read_int("absent-starts")
+              if attempts >= ABSENT_START_LIMIT:
+                  # The session is gone rather than broken -- a logout, most
+                  # likely, which leaves this timer running under linger.
+                  # Stop treating it as ours to repair.
+                  print("cinnamon-rescue: no Cinnamon after %d starts; treating the "
+                        "session as ended" % attempts)
+                  _write_int("ended-cinnamon", 0)
+                  _write_int("failures", 0)
+                  return 0
               if _cooldown_open():
                   print("cinnamon-rescue: no Cinnamon since our own restart, but the "
                         "%ds cooldown is still open" % COOLDOWN)
                   return 0
+              _write_int("absent-starts", attempts + 1)
               print("cinnamon-rescue: no Cinnamon since our own restart; starting one",
                     file=sys.stderr)
               return _recover(_read_int("failures"))

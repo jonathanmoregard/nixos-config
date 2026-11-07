@@ -287,6 +287,7 @@ in
             # Escalation deadlines shrunk so the lane does not spend a minute
             # per stalled recovery; the production values are in the module.
             "CINNAMON_RESCUE_TAKEOVER_DEADLINE_SECS=2 "
+            "CINNAMON_RESCUE_COLD_START_DEADLINE_SECS=2 "
             "CINNAMON_RESCUE_TERM_GRACE_SECS=2 "
             "CINNAMON_RESCUE_KILL_GRACE_SECS=2; "
             # 2>&1 because the driver's backdoor shell sends only stdout to
@@ -547,6 +548,32 @@ in
     assert restarts() == 0, \
         "watchdog started a window manager in a session that has no Cinnamon"
 
+    # And the stranded-session retries are bounded. Linger keeps this timer
+    # and its runtime dir alive after a logout, so an unbounded retry would
+    # start a Cinnamon with no display every cooldown for as long as the
+    # machine stays up. After the limit it concludes the session is gone.
+    reset_rescue()
+    doomed = start_victim("cinnamon-doomed-victim", trapped=True)
+    rescue_fails("now", mode="hung", pid=doomed)
+    wait_until_gone(doomed)
+    # Each of the first three attempts legitimately exits non-zero: it starts
+    # a Cinnamon that cannot take over in this fake session.
+    for _ in range(4):
+        workstation.succeed(
+            f"echo 1 > {rcount}/last-restart; chown jonathan {rcount}/last-restart"
+        )
+        rc, out = rescue_run("check", mode="unowned")
+    assert "treating the session as ended" in out, \
+        f"stranded-session starts are unbounded:\n{out}"
+    assert rc == 0, f"giving the session up was reported as a failure:\n{out}"
+    before = restarts()
+    workstation.succeed(
+        f"echo 1 > {rcount}/last-restart; chown jonathan {rcount}/last-restart"
+    )
+    rescue_ok("check", mode="unowned")
+    assert restarts() == before, \
+        "watchdog kept starting Cinnamon after giving the session up"
+
     # A replacement left blocked holds the window manager selection without
     # managing anything, so it is stopped rather than left for the next
     # --replace to aim at.
@@ -706,14 +733,22 @@ in
     )
 
     def cinnamon_owner_pid():
-        return int(workstation.succeed(
+        raw = workstation.succeed(
             f"su - jonathan -c '{rescue_env}; "
             "gdbus call --session --dest org.freedesktop.DBus "
             "--object-path /org/freedesktop/DBus --method "
             "org.freedesktop.DBus.GetConnectionUnixProcessID org.Cinnamon' "
             "| sed -n 's/.*uint32 \\([0-9]*\\).*/\\1/p'"
-        ).strip())
+        ).strip()
+        assert raw, "nothing owns org.Cinnamon, so there is no live session to wedge"
+        return int(raw)
 
+    # The diagnostic probe above tolerates "absent" (Cinnamon may not have
+    # claimed the name yet). This block cannot: without a live Cinnamon there
+    # is nothing to wedge and every assertion below would pass vacuously.
+    workstation.wait_until_succeeds(
+        f"su - jonathan -c '{rescue_env}; cinnamon-rescue probe'", timeout=120
+    )
     wedged_pid = cinnamon_owner_pid()
     print(f"[diag] live Cinnamon before the wedge: pid {wedged_pid}")
 
