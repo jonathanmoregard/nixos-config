@@ -23,9 +23,14 @@ let
   takeoverDeadlineSecs = 15;
   termGraceSecs = 5;
   killGraceSecs = 10;
-  # Must exceed capture + launch + takeover wait + both escalation graces,
-  # each of which can overshoot by one probe timeout.
-  startTimeoutSecs = 150;
+  # Every deadline below is a floor, not a ceiling: each probe is TWO gdbus
+  # calls (GetNameOwner then the property read), so a wait can overshoot its
+  # deadline by 2*(probeTimeout+5) = 20s before the next check of the clock.
+  # Worst case, with every call hanging: pid lookup 10 + capture 20 + launch
+  # 30 + takeover 15+20 + SIGTERM 5+20 + SIGKILL 10+20 + stop 15 + the
+  # last-resort start 30+15+20+15 = 310s. This is the backstop for all of it,
+  # including a capture that SIGALRM cannot interrupt (see capture()).
+  startTimeoutSecs = 420;
 
   reportDir = "${config.home.homeDirectory}/.local/state/cinnamon-rescue";
 
@@ -236,9 +241,12 @@ let
 
       def capture(pid, fails):
           """Write a hang report, returning its path or a reason it is absent."""
-          # /proc reads on a task wedged in-kernel can block on its mmap lock,
-          # which would eat the unit's start timeout and cost this tick's
-          # recovery. The report is worth less than the recovery.
+          # Bounds the Python-level work and the file write. It cannot
+          # interrupt a /proc read that is blocked in an uninterruptible
+          # kernel wait (a task wedged on its mmap lock) -- the handler does
+          # not run until the syscall returns, so TimeoutStartSec on the unit
+          # is the real backstop for that case. The report is worth less than
+          # the recovery either way.
           previous = signal.signal(signal.SIGALRM, _on_alarm)
           signal.alarm(CAPTURE_LIMIT)
           try:
@@ -334,26 +342,32 @@ let
           # the name already while the old process goes on blocking it, so
           # re-reading the owner refuses exactly when escalation is needed;
           # the start time pins the same process across pid recycling.
-          if ident is None or _proc_starttime(pid) != ident:
-              print("cinnamon-rescue: pid %s is not the process diagnosed as hung; "
-                    "not signalling" % pid, file=sys.stderr)
-              return False
-          if not _argv0_names_cinnamon(pid):
-              print("cinnamon-rescue: pid %s is not Cinnamon; not signalling" % pid,
-                    file=sys.stderr)
-              return False
           for sig, grace in ((signal.SIGTERM, TERM_GRACE), (signal.SIGKILL, KILL_GRACE)):
               # SIGKILL is for a process that would not leave, not for one
               # that already has.
               if not _pid_alive(pid):
                   print("cinnamon-rescue: the wedged Cinnamon (pid %s) has exited" % pid)
                   break
+              # Re-checked before every signal, not once up front: tens of
+              # seconds of grace pass in between, and a pid that was reaped
+              # and reissued in that window must not be signalled.
+              if ident is None or _proc_starttime(pid) != ident:
+                  print("cinnamon-rescue: pid %s is not the process diagnosed as hung; "
+                        "not signalling" % pid, file=sys.stderr)
+                  return False
+              if not _argv0_names_cinnamon(pid):
+                  print("cinnamon-rescue: pid %s is not Cinnamon; not signalling" % pid,
+                        file=sys.stderr)
+                  return False
               try:
                   os.kill(pid, sig)
               except OSError as exc:
                   print("cinnamon-rescue: %s to pid %s failed: %s" % (sig.name, pid, exc),
                         file=sys.stderr)
                   return False
+              # Recorded as soon as a signal lands: from here on an unowned
+              # bus name is our doing, not an absent Cinnamon.
+              _write_int("ended-cinnamon", 1)
               print("cinnamon-rescue: sent %s to the wedged Cinnamon (pid %s)" % (sig.name, pid))
               if _await_takeover(grace):
                   return True
@@ -399,23 +413,55 @@ let
               print("cinnamon-rescue: replacement took over once the old Cinnamon ended")
               return 0
           _drop_pending_replacement(unit)
+          # Ending the old Cinnamon and then dropping its replacement leaves
+          # nobody owning the name, which is a session with no window manager
+          # at all -- worse than the hang it replaced. One bounded start
+          # attempt beats stranding it there.
+          if not name_owned():
+              print("cinnamon-rescue: nothing owns %s; starting a window manager"
+                    % BUS_NAME, file=sys.stderr)
+              launched, retry_unit = restart()
+              if launched and _await_takeover(TAKEOVER_DEADLINE):
+                  print("cinnamon-rescue: a fresh Cinnamon took over")
+                  return 0
+              _drop_pending_replacement(retry_unit)
           print("cinnamon-rescue: recovery FAILED; the session is still wedged",
                 file=sys.stderr)
           return 1
 
 
+      def _cooldown_open():
+          last = _read_int("last-restart")
+          return bool(last) and int(time.time()) - last < COOLDOWN
+
+
       def check():
           state = probe()
-          if state != HUNG:
+          if state == ALIVE:
               _write_int("failures", 0)
+              _write_int("ended-cinnamon", 0)
               return 0
+          if state == ABSENT:
+              # Normally a greeter or a non-Cinnamon session, where starting a
+              # window manager would be wrong. But when we ended Cinnamon
+              # ourselves and nothing replaced it, reading "absent" as healthy
+              # would leave the session without a window manager for good.
+              if not _read_int("ended-cinnamon"):
+                  _write_int("failures", 0)
+                  return 0
+              if _cooldown_open():
+                  print("cinnamon-rescue: no Cinnamon since our own restart, but the "
+                        "%ds cooldown is still open" % COOLDOWN)
+                  return 0
+              print("cinnamon-rescue: no Cinnamon since our own restart; starting one",
+                    file=sys.stderr)
+              return _recover(_read_int("failures"))
           fails = _read_int("failures") + 1
           _write_int("failures", fails)
           if fails < THRESHOLD:
               print("cinnamon-rescue: unresponsive (%d/%d)" % (fails, THRESHOLD))
               return 0
-          last = _read_int("last-restart")
-          if last and int(time.time()) - last < COOLDOWN:
+          if _cooldown_open():
               print("cinnamon-rescue: hung, but %ds cooldown is still open; not restarting"
                     % COOLDOWN)
               return 0

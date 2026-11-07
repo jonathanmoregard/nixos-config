@@ -56,15 +56,21 @@ let
     #!${pkgs.bash}/bin/bash
     mode="''${FAKE_GDBUS_MODE:-alive}"
     args="$*"
+    # A started replacement owns the name, so "unowned" has to be able to
+    # become owned -- otherwise a started window manager could never be
+    # observed to take over and that assertion could not pass honestly.
+    took_over() {
+      [ -n "''${FAKE_TAKEOVER_MARKER:-}" ] && [ -e "$FAKE_TAKEOVER_MARKER" ]
+    }
     case "$args" in
       *"org.freedesktop.DBus.GetNameOwner org.Cinnamon"*)
-        if [ "$mode" = unowned ]; then
+        if [ "$mode" = unowned ] && ! took_over; then
           echo "Error: org.Cinnamon has no owner" >&2
           exit 1
         fi
         echo "(':1.42',)" ;;
       *"org.freedesktop.DBus.GetConnectionUnixProcessID org.Cinnamon"*)
-        if [ "$mode" = unowned ]; then
+        if [ "$mode" = unowned ] && ! took_over; then
           echo "Error: org.Cinnamon has no owner" >&2
           exit 1
         fi
@@ -82,8 +88,7 @@ let
         # A replacement that has taken over makes the property read answer
         # again, which is how a verified recovery is distinguished from a
         # launch that blocked in XWindowEvent and never managed anything.
-        if [ "$mode" = alive ] \
-          || { [ -n "''${FAKE_TAKEOVER_MARKER:-}" ] && [ -e "$FAKE_TAKEOVER_MARKER" ]; }; then
+        if [ "$mode" = alive ] || took_over; then
           echo "(<'6.6.9'>,)"
         else
           echo "Error: Timeout was reached" >&2
@@ -489,6 +494,59 @@ in
         f"escalation did not refuse a pid that is not Cinnamon:\n{out}"
     assert alive_pid(1), "escalation signalled PID 1"
 
+    # A pid whose process has gone is reported as exited and the ladder stops
+    # there, rather than escalating at a number the kernel is free to hand to
+    # somebody else.
+    #
+    # The start-time half of the identity guard is NOT covered here. It only
+    # bites when a pid is reaped and reissued between the diagnosis and a
+    # signal, and staging that needs CAP_SYS_ADMIN to write ns_last_pid from
+    # inside the rescue's own timing window. It is defence in depth whose
+    # removal this lane would not catch.
+    reset_rescue()
+    ghost = start_victim("cinnamon-ghost-victim", trapped=False)
+    workstation.succeed(f"kill -9 {ghost}")
+    wait_until_gone(ghost)
+    out = rescue_fails("now", mode="hung", pid=ghost)
+    assert "has exited" in out, f"a dead pid was not reported as exited:\n{out}"
+    assert "sent SIG" not in out, \
+        f"signalled a pid whose process had already gone:\n{out}"
+
+    # No pid at all from the broker: escalation has nothing to act on and
+    # says so, instead of signalling something it guessed at.
+    reset_rescue()
+    out = rescue_fails("now", mode="unowned")
+    assert "no pid to escalate against" in out, \
+        f"escalation did not refuse an absent pid:\n{out}"
+
+    # Ending Cinnamon and then dropping its replacement leaves nothing owning
+    # the bus name. Read as "no Cinnamon here" that would strand the session
+    # with no window manager and never retry, so it has to start one.
+    reset_rescue()
+    stranded = start_victim("cinnamon-stranded-victim", trapped=True)
+    rescue_fails("now", mode="hung", pid=stranded)
+    wait_until_gone(stranded)
+    # The cooldown the failed attempt opened would otherwise mask this; the
+    # block below proves it is the cooldown and not indifference.
+    out = rescue_ok("check", mode="unowned", takes_over=True)
+    assert "cooldown is still open" in out, \
+        f"a stranded session ignored the cooldown:\n{out}"
+    workstation.succeed(
+        f"echo 1 > {rcount}/last-restart; chown jonathan {rcount}/last-restart"
+    )
+    out = rescue_ok("check", mode="unowned", takes_over=True)
+    assert "starting one" in out, \
+        f"an unowned bus name after our own kill was read as healthy:\n{out}"
+    assert restarts() >= 2, \
+        f"no window manager was started for the stranded session:\n{out}"
+
+    # ...but an unowned name on its own is still a greeter, not a fault.
+    reset_rescue()
+    for _ in range(3):
+        rescue_ok("check", mode="unowned")
+    assert restarts() == 0, \
+        "watchdog started a window manager in a session that has no Cinnamon"
+
     # A replacement left blocked holds the window manager selection without
     # managing anything, so it is stopped rather than left for the next
     # --replace to aim at.
@@ -687,13 +745,13 @@ in
         f"probes={probes}"
     )
 
-    # KILL_GRACE is stretched because Cinnamon's own start-up has to fit in
-    # it on an emulated GPU; the deadline being configuration is the point,
-    # the escalation reaching SIGKILL is what is under test.
+    # No deadline overrides: this runs the production takeover deadline and
+    # both escalation graces, so the shipped numbers are the ones proven to
+    # fit a real handover rather than numbers no test ever exercised.
     rc, out = workstation.execute(
         f"su - jonathan -c '{rescue_env} "
-        f"CINNAMON_RESCUE_STATE_DIR={rstate} CINNAMON_RESCUE_COUNTER_DIR={rcount} "
-        "CINNAMON_RESCUE_KILL_GRACE_SECS=120; cinnamon-rescue now 2>&1'",
+        f"CINNAMON_RESCUE_STATE_DIR={rstate} CINNAMON_RESCUE_COUNTER_DIR={rcount}; "
+        "cinnamon-rescue now 2>&1'",
         timeout=600,
     )
     print(f"[diag] live recovery rc={rc}:\n{out}")
