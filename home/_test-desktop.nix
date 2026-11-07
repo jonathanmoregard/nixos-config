@@ -13,6 +13,7 @@
     ./_test-base.nix
     ./jonathan.nix
     ./cinnamon.nix
+    ./cinnamon-watchdog.nix
     ./lid-guard.nix
     ./desktop-apps.nix
   ];

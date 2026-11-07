@@ -667,6 +667,7 @@ in
   imports = [
     ./jonathan.nix
     ./cinnamon.nix
+    ./cinnamon-watchdog.nix
     ./lid-guard.nix
     ./desktop-apps.nix
     ./calibre-plugins.nix

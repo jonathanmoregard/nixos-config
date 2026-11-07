@@ -31,6 +31,45 @@ let
     sleep "$2"
     true
   '';
+
+  # Stands in for gdbus so cinnamon-rescue's branching can be driven without
+  # wedging a real Cinnamon. $FAKE_GDBUS_MODE picks the shape:
+  #   alive   — name owned, Peer.Ping replies
+  #   hung    — name owned, Ping exits non-zero (what a blocked main loop
+  #             looks like to gdbus once --timeout expires)
+  #   unowned — org.Cinnamon has no owner at all (Cinnamon not running)
+  fakeGdbus = pkgs.writeScriptBin "fake-gdbus" ''
+    #!${pkgs.bash}/bin/bash
+    mode="''${FAKE_GDBUS_MODE:-alive}"
+    case "$*" in
+      *GetNameOwner*|*GetConnectionUnixProcessID*)
+        if [ "$mode" = unowned ]; then
+          echo "Error: org.Cinnamon has no owner" >&2
+          exit 1
+        fi
+        case "$*" in
+          *GetNameOwner*) echo "(':1.42',)" ;;
+          # PID 1 always exists, so the /proc capture has a real target to
+          # read (and to fall back on where a field is unreadable).
+          *)              echo "(uint32 1,)" ;;
+        esac ;;
+      *Peer.Ping*)
+        if [ "$mode" = alive ]; then
+          echo "()"
+        else
+          echo "Error: Timeout was reached" >&2
+          exit 1
+        fi ;;
+      *) exit 1 ;;
+    esac
+  '';
+
+  # Records that a restart was attempted, instead of replacing the window
+  # manager out from under the test session.
+  fakeRestart = pkgs.writeScriptBin "fake-cinnamon-restart" ''
+    #!${pkgs.bash}/bin/bash
+    echo restarted >> "$CINNAMON_RESCUE_RESTART_LOG"
+  '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
   name = "vm-desktop";
@@ -126,6 +165,111 @@ in
         "xrdb -query | grep -qx 'Xcursor.theme:\tBibata-Modern-Classic'",
         timeout=120,
     )
+
+    # cinnamon-rescue (home/cinnamon-watchdog.nix): recovers a hung Cinnamon
+    # without the hard reboot a wedged window manager otherwise forces.
+    # Cinnamon's main loop is what dispatches clicks, so when it blocks the
+    # cursor still tracks the mouse (X is fine) but nothing is clickable.
+    # That cost two hard power-offs (2026-10-29, 2026-11-07), each leaving an
+    # unclean btrfs. Liveness is a D-Bus Peer.Ping to org.Cinnamon: it is
+    # answered from the main loop, so a blocked loop fails the ping while the
+    # bus name stays owned — which is exactly the state worth acting on.
+    rstate = "/tmp/rescue-state"
+    rlog = "/tmp/rescue-restarts"
+
+    def rescue(cmd, mode="alive"):
+        return workstation.execute(
+            "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus "
+            f"FAKE_GDBUS_MODE={mode} "
+            f"CINNAMON_RESCUE_GDBUS=${fakeGdbus}/bin/fake-gdbus "
+            f"CINNAMON_RESCUE_STATE_DIR={rstate} "
+            f"CINNAMON_RESCUE_RESTART_LOG={rlog} "
+            f"CINNAMON_RESCUE_RESTART_CMD=${fakeRestart}/bin/fake-cinnamon-restart "
+            "CINNAMON_RESCUE_THRESHOLD=3 CINNAMON_RESCUE_COOLDOWN_SECS=300; "
+            f"cinnamon-rescue {cmd}'"
+        )[0]
+
+    def restarts():
+        return int(
+            workstation.succeed(f"wc -l < {rlog} 2>/dev/null || echo 0").strip()
+        )
+
+    def reset_rescue():
+        workstation.succeed(
+            f"rm -rf {rstate} {rlog}; install -o jonathan -m 644 /dev/null {rlog}"
+        )
+
+    # The real probe, against the live Cinnamon in this session. The fakes
+    # below prove the branching; this proves the probe itself is pointed at
+    # something that answers.
+    workstation.succeed(
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "systemctl --user is-active cinnamon-watchdog.timer'"
+    )
+    # Cinnamon's shell does not reliably claim org.Cinnamon in a headless
+    # VM (no GL), so asserting ALIVE here would be flaky. Assert the
+    # discriminating property instead: in a session that is NOT wedged,
+    # probe must never report "hung" — which is the misreport that would
+    # make the watchdog replace a healthy window manager. The live ALIVE
+    # case is covered by the host smoke, where Cinnamon demonstrably
+    # answers the ping.
+    def live_probe():
+        return workstation.execute(
+            "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus; "
+            "cinnamon-rescue probe'"
+        )[0]
+
+    live = live_probe()
+    for _ in range(12):
+        if live == 0:
+            break
+        workstation.sleep(5)
+        live = live_probe()
+    print(f"[diag] live cinnamon-rescue probe: {live} (0 alive, 1 hung, 2 absent)")
+    assert live in (0, 2), \
+        f"probe reported hung (rc={live}) in a session that is not wedged"
+
+    # Fail-safe: an unowned org.Cinnamon means Cinnamon is not running at all
+    # (greeter, non-Cinnamon session). Never "recover" it there.
+    reset_rescue()
+    rc = rescue("probe", mode="unowned")
+    assert rc == 2, f"probe on an unowned bus name: rc={rc}, want 2 (not running)"
+    for _ in range(5):
+        rescue("check", mode="unowned")
+    assert restarts() == 0, \
+        "watchdog restarted Cinnamon while its bus name was unowned"
+
+    # Hung: name owned, main loop silent. Must not fire below the threshold.
+    reset_rescue()
+    rc = rescue("probe", mode="hung")
+    assert rc == 1, f"probe on a blocked main loop: rc={rc}, want 1 (hung)"
+    rescue("check", mode="hung")
+    rescue("check", mode="hung")
+    assert restarts() == 0, "watchdog fired before 3 consecutive failed pings"
+
+    # Third consecutive failure: recover, and leave the diagnostics behind —
+    # the hang left no trace either time, which is why it was never explained.
+    rescue("check", mode="hung")
+    assert restarts() == 1, "watchdog did not restart Cinnamon at the threshold"
+    diag = workstation.succeed(f"cat {rstate}/hang-*.txt")
+    for want in ("cinnamon-rescue", "pid=", "wchan", "threads"):
+        assert want in diag, f"diagnostics file missing {want!r}:\n{diag}"
+
+    # Cooldown: a Cinnamon that keeps wedging must not become a restart loop.
+    for _ in range(3):
+        rescue("check", mode="hung")
+    assert restarts() == 1, "cooldown did not suppress a second restart"
+
+    # A reply resets the count, so isolated blips never add up to a restart.
+    reset_rescue()
+    rescue("check", mode="hung")
+    rescue("check", mode="hung")
+    rescue("check", mode="alive")
+    rescue("check", mode="hung")
+    rescue("check", mode="hung")
+    assert restarts() == 0, "a successful ping did not reset the failure counter"
 
     # Runs last: it takes ~40 s, and the X-bell check above samples server
     # state at one instant, so running this first shifted that sample past
