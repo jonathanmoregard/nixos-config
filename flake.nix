@@ -28,6 +28,20 @@
     prose-decorate.url = "github:jonathanmoregard/prose-decorate";
     prose-decorate.inputs.nixpkgs.follows = "nixpkgs";
 
+    # Voquill voice-typing, built by its own flake.
+    #
+    # Deliberately NOT `inputs.nixpkgs.follows = "nixpkgs"`. Voquill's binary
+    # and the libraries it loads must come from ONE nixpkgs. The previous setup
+    # built it in Voquill's devShell (its own, older pin) and then injected this
+    # flake's newer libs via LD_LIBRARY_PATH; when the two pins drifted apart
+    # the app died with `GLIBC_2.43 not found` against its pinned glibc, and a
+    # nix GC then removed that glibc entirely (exit 127, ~19k restart loop).
+    # Letting Voquill keep its own pin makes the package self-consistent: its
+    # RPATHs resolve inside its own closure and no ambient library path is
+    # involved. The cost is a second nixpkgs in the closure, so Voquill's
+    # webkitgtk only advances when its flake.lock is bumped.
+    voquill.url = "github:jonathanmoregard/voquill";
+
     # Anthropic ships an official Linux app since 2026-06-30, but not
     # via nixpkgs. `aaddrick/claude-desktop-debian` repackages the
     # upstream Linux app as `.deb`/`.rpm`/AppImage plus a Nix flake
@@ -164,7 +178,7 @@
   };
 
   outputs = flakeInputs@{ self, nixpkgs, home-manager, agenix, agenix-rekey, microvm,
-              tts-tool, substack-url-tool, prose-decorate, claude-desktop,
+              tts-tool, substack-url-tool, prose-decorate, claude-desktop, voquill,
               codex-cli-nix,
               aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
               ... }:
@@ -232,6 +246,7 @@
         })
         claude-desktop.overlays.default
         (final: prev: {
+          voquill = voquill.packages.${linuxSystem}.default;
           tts-tool = tts-tool.packages.${linuxSystem}.default;
           substack-url-tool = substack-url-tool.packages.${linuxSystem}.default;
           prose-decorate = prose-decorate.packages.${linuxSystem}.default;
@@ -455,11 +470,37 @@
         rust-analyzer-devshell = import ./tests/rust-analyzer-devshell.nix {
           pkgs = pkgsLinux;
           raDevshell = import ./home/rust-analyzer-devshell.nix { pkgs = pkgsLinux; };
-          # Drift gate: the settings.json the primary host really deploys,
+          # Drift gate: the server path the primary host really declares,
           # read for the server path the editor will spawn.
-          deployedSettings = primaryConfig
-            .home-manager.users.jonathan
-            .home.file.".config/VSCodium/User/settings.json".source;
+          #
+          # Read from the OPTION, not from a deployed settings.json in the
+          # store. Since home/vscodium.nix moved to `mutableUserSettings`
+          # there is no single deployed settings.json to read: the live file
+          # is assembled at activation from this declared set plus whatever
+          # the user has added through the Settings UI. The declared set is
+          # the half this check is about, and reading the option keeps the
+          # gate independent of how that set happens to be exported to disk.
+          deployedSettings =
+            pkgsLinux.writeText "deployed-vscodium-settings.json"
+              (builtins.toJSON (
+                primaryConfig
+                  .home-manager.users.jonathan
+                  .programs.vscodium.profiles.default.userSettings
+              ));
+        };
+        # Not a VM lane: behavioural harness for the VSCodium settings drift
+        # recorder/reporter (home/vscodium-drift-tool.nix) — what the merge
+        # preserves, what it reverts, that the live file is never moved or
+        # rewritten, and that a live-only security key escalates apart from
+        # the cosmetic promotion queue. Boots nothing; seconds.
+        #
+        # The vm-base lane drives the same tool through a real home-manager
+        # activation; this drives the cases that lane cannot reach cheaply.
+        vscodium-drift-tool = import ./tests/vscodium-drift-tool.nix {
+          pkgs = pkgsLinux;
+          # The derivation both call sites import, so the `python3 -I`
+          # wrapper and the json5 in its closure are under test too.
+          driftTool = import ./home/vscodium-drift-tool.nix { pkgs = pkgsLinux; };
         };
         # Not a VM lane: eval-time guard that no age.secret re-declares a
         # credential whose real home is elsewhere (see the test's header for
