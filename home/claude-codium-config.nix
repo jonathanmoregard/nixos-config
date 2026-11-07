@@ -53,9 +53,9 @@
 # them is only durability: declared here is reviewed and survives a
 # reinstall, written live is immediate and survives everything short of one.
 #
-# Nothing reports on the live layer yet. `nixos-drift-analyzer` does not look
-# at this directory, so a skill left sitting in it is invisible until someone
-# goes and reads it. Worth wiring up; out of scope here.
+# `nixos-drift-analyzer` reports the live layer (home/drift-analyzer.nix), so
+# a skill or a note left here surfaces as a promotion queue rather than
+# becoming permanent by going unnoticed.
 { config, pkgs, lib, ... }:
 
 let

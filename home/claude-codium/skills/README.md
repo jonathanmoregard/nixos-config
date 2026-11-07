@@ -27,9 +27,16 @@ Two routes, and the difference is the point:
    symlinks whose target has gone, which is how a skill deleted upstream
    stops resolving without taking hand-made links with it.
 
-Route 2 is the mutable layer. Nothing reports on it yet — the drift analyzer
-does not look in that directory — so a skill left there is permanent in
-practice and unreviewed. Promote by moving the directory here.
+Route 2 is the mutable layer, and it is the expected one: a session that wants
+a skill writes it there on the spot. `nixos-drift-analyzer` then reports it
+under *Codium-only skills live but not declared*, which is the promotion
+queue — nothing left there is silent. Promote by moving the directory here.
+
+The analyzer reports a second case separately, *Codium skills shadowing a
+shared skill of the same name*, which is the one not to promote: a real
+directory in the live layer beats the inherited skill of that name, because
+activation leaves it alone rather than relinking over it, so the shared skill
+becomes unreachable from editor sessions. Rename or drop the live copy.
 
 A skill scoped to the editor should be one that makes no sense in a terminal —
 something about the diff view, the panel, the file tree, or the

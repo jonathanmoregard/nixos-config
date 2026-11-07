@@ -25,30 +25,64 @@ replaces them; this file adds what is only true inside the editor.
   a long foreground command blocks a panel the user is watching rather than a
   terminal they can leave.
 
-## Iterating on this setup
+## Changing this setup from inside a session
 
-`skills/` in this config directory is assembled at activation: one symlink per
-skill from `~/.claude/skills`, plus the Codium-only skills declared in
-nixos-config under `home/claude-codium/skills`. A skill you write in there
-yourself is left alone — both a real directory and a symlink into one of the
-user's own repos — so it survives reboot and deploy, and is lost on a fresh
-install until it is promoted into `home/claude-codium/skills` in nixos-config.
-The only thing activation removes is a symlink whose target has gone.
+Two things in this directory are writable on purpose, and writing them is part
+of the ordinary flow rather than a config change to be reviewed first:
+
+| To add | Write | Shape |
+|---|---|---|
+| A skill that only makes sense in the editor | `~/.local/state/claude-codium/skills/<name>/SKILL.md` | `name` + `description` frontmatter, then the body |
+| A note, preference or correction worth keeping | `~/.local/state/claude-codium/local.md` | append it |
+
+That directory is `$CLAUDE_CONFIG_DIR` for this session. Both take effect for
+the next session in this editor, and both survive reboot and deploy.
+
+The global rule imported below — every edit to skills, CLAUDE.md, hooks or
+settings goes through a `~/worktrees/claude-<slug>` worktree and a PR, with
+agent e2e first — governs `~/.claude`, which is a read-only projection of
+`claude-config` read live by every session on the machine. This directory is
+neither read-only nor shared. Writing here needs no worktree, no PR and no
+e2e: do it in the session the need comes up, without asking.
+
+Three things are still off-limits:
+
+- `CLAUDE.md` in this directory is a store symlink, so it is read-only. Prose
+  goes in `local.md`.
+- `settings.json` is a symlink to the live one, so permissions and the security
+  hooks are identical here. Nothing about this directory is a way around them.
+- A skill useful in a terminal too belongs in `claude-config`'s
+  `runtime/skills`, through its own PR flow. Scope one here only when it is
+  about the diff view, the panel, the file tree, or the accept/reject edit
+  flow.
+
+## What happens to it afterwards
+
+`skills/` is assembled at activation: one symlink per skill from
+`~/.claude/skills`, plus the Codium-only skills declared in nixos-config under
+`home/claude-codium/skills`. Anything else there is left alone — a real
+directory you wrote, or a symlink into one of the user's own repos. The only
+thing activation removes is a symlink whose target has gone.
+
+`nixos-drift-analyzer` reports what gets left here, so none of it goes
+unnoticed:
+
+- *Codium-only skills live but not declared* — the promotion queue. Move the
+  directory into `home/claude-codium/skills` in nixos-config once it has
+  proven itself.
+- *Codium skills shadowing a shared skill of the same name* — a real directory
+  beats the inherited skill of that name, so the shared one is unreachable
+  from editor sessions. Rename or drop the live copy; do not promote it.
+- *Codium session notes live but not declared* — `local.md` has notes past its
+  seed. Promote the durable ones into this file.
+
+So the arrangement is: write it live and use it immediately, get reported, get
+promoted into declared config when it has earned it. Declared is reviewed and
+survives a reinstall; live is immediate and survives everything short of one.
 
 Note that `projects/` here is this directory's own, so an editor session does
 not share transcripts or a `--resume` list with a terminal one. The MCP
 servers and `.claude.json` ARE shared.
-
-`local.md`, imported at the end of this file, is the same deal for prose: it
-is writable, it needs no worktree and no PR, and it is the right place to put
-something learned mid-session. Promote the parts that prove durable into this
-file, which IS declared.
-
-That split is deliberate: declared is reviewed and survives a reinstall,
-written-live is immediate and survives everything short of one. Nothing
-reports on the live half yet — `nixos-drift-analyzer` does not look in this
-directory — so a skill or a note left here is invisible until someone reads
-it. Promote the things worth keeping rather than relying on being reminded.
 
 @/home/jonathan/.claude/CLAUDE.md
 
