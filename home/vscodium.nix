@@ -398,6 +398,20 @@ in
         zhuangtongfa.material-theme
         vscode-icons-team.vscode-icons
         esbenp.prettier-vscode
+        # Caddyfile syntax: a grammar, brace/comment rules and a bundled
+        # language server (directive and global-option diagnostics) for the
+        # `Caddyfile` filename and *.caddyfile — an otherwise-plaintext
+        # buffer. In the nixpkgs set, so the header's claim that a rebuild
+        # reproduces the editor still holds.
+        #
+        # Its formatter is the one part that needs more than the extension:
+        # it spawns `caddy fmt -` from $PATH (or `caddyfile.executable`, when
+        # that is set to an absolute path), and caddy is not declared on this
+        # host. With editor.formatOnSave on, saving such a buffer therefore
+        # shows "Caddy was not found in your $PATH" and leaves the text
+        # alone. Declaring caddy is a separate decision, not a dependency of
+        # the highlighting this extension is here for.
+        matthewpi.caddyfile-support
         # PR review inside the editor: inline diff against the base, the PR
         # description as a tab, and review comments on a selection. Needs an
         # editor >= 1.129 (overlays/vscodium.nix bumps it there).
