@@ -299,11 +299,11 @@ let
           return FALLBACK_CINNAMON
 
 
-      def restart(pid=None):
+      def restart(exe):
           """Launch the replacement. Returns (launched, transient unit or None)."""
           unit = "cinnamon-rescue-replace-%d" % time.time()
           cmd = RESTART_CMD.replace("@unit@", unit)
-          cmd = cmd.replace("@cinnamon@", session_cinnamon(pid))
+          cmd = cmd.replace("@cinnamon@", exe)
           # systemd-run does not forward this process's environment to the
           # transient unit, so DISPLAY has to be handed over explicitly.
           display = os.environ.get("DISPLAY") or ":0"
@@ -444,9 +444,14 @@ let
           # Taken before the replacement is launched: this is the process the
           # probe found wedged, and the only one escalation may signal.
           ident = _proc_starttime(pid) if pid is not None else None
+          # Read once, here, for every launch below: the stranded start runs
+          # after escalation ended this pid, where /proc/<pid>/exe is gone --
+          # or, once the kernel has reissued the number, belongs to an
+          # unrelated process that must never be handed to --replace.
+          exe = session_cinnamon(pid)
           report = capture(pid, fails)
           print("cinnamon-rescue: hung after %d failed probes; report %s" % (fails, report))
-          launched, unit = restart(pid)
+          launched, unit = restart(exe)
           # Written before the outcome is known: a recovery that stalls must
           # still open the cooldown, or the timer retries escalation forever.
           _write_int("last-restart", int(time.time()))
@@ -479,10 +484,7 @@ let
           # built for the case where someone else holds the selection.
           print("cinnamon-rescue: starting a window manager for the stranded session",
                 file=sys.stderr)
-          # The wedged process is gone by now, so /proc/<pid>/exe is too and
-          # this falls back to the system path -- which is correct here: with
-          # no session Cinnamon left to match, the newest one is the right one.
-          launched, retry_unit = restart(pid)
+          launched, retry_unit = restart(exe)
           # A cold start is a whole Cinnamon coming up, not a replacement
           # that only had to stop blocking, so it gets the longer deadline.
           if launched and _await_takeover(COLD_START_DEADLINE):

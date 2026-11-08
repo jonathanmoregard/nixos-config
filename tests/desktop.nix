@@ -582,9 +582,10 @@ in
     # --replace to aim at.
     reset_rescue()
     stale = start_victim("cinnamon-stale-victim", trapped=True)
+    stale_exe = workstation.succeed(f"readlink /proc/{stale}/exe").strip()
     rescue_fails(
         "now", mode="hung", pid=stale,
-        restart_cmd="${fakeSystemdRun}/bin/fake-systemd-run --user --unit=@unit@ cinnamon --replace",
+        restart_cmd="${fakeSystemdRun}/bin/fake-systemd-run --user --unit=@unit@ @cinnamon@ --replace",
     )
     stops = workstation.succeed(f"cat {rsctl}")
     assert "stop" in stops and "cinnamon-rescue-replace-" in stops, \
@@ -599,6 +600,17 @@ in
     # blocking stop would spend the unit's whole start timeout waiting.
     assert "--no-block" in stops, \
         f"the stop would block on the stuck replacement:\n{stops}"
+    # Every launch has to name the binary the wedged session was running,
+    # including the stranded start -- which runs after escalation ended that
+    # pid, so reading /proc for it there falls back to the newest system
+    # Cinnamon, or, once the kernel has reissued the number, hands --replace
+    # some unrelated process's binary.
+    launches = [ln for ln in launched.splitlines() if ln.strip()]
+    assert len(launches) == 2, \
+        f"expected a replacement and a stranded start, got {len(launches)}:\n{launched}"
+    for line in launches:
+        assert stale_exe in line, \
+            f"a launch did not name the wedged session's binary {stale_exe}:\n{line}"
 
     # Runs last: it takes ~40 s, and the X-bell check above samples server
     # state at one instant, so running this first shifted that sample past
@@ -843,9 +855,13 @@ in
     # puts up a keep-above "Cinnamon just crashed" dialog. Recorded rather than
     # asserted absent: the dialog cannot be avoided by a kill-based rescue on
     # 6.6.9, because the launcher only treats a signal death as its own when
-    # self.killed is set, and that happens only in its memory monitor. Counting
-    # the helpers it starts alongside would prove nothing either -- they are
-    # hardcoded /usr/lib* polkit paths plus nm-applet, none in this closure.
+    # self.killed is set, and that happens only in its memory monitor.
+    #
+    # Counted from the forked child's traceback rather than the launcher's own
+    # prints: the launcher block-buffers stdout and flushes it only when it
+    # exits, so its "Launching for fallback session: nm-applet" reaches the
+    # journal minutes late. That buffering, not a missing helper, is why an
+    # earlier version of this diagnostic read 0 with the branch taken.
     print("[diag] launcher took its crash-fallback branch: " + workstation.succeed(
         "journalctl -b 0 --no-pager | grep -c 'os.execvp(FALLBACK_COMMAND' || true"
     ).strip())
@@ -863,5 +879,51 @@ in
         f"su - jonathan -c '{rescue_env}; cinnamon-rescue probe'"
     )[0] == 0, "the replacement does not answer its own main loop"
     print(f"[diag] live Cinnamon recovered: pid {wedged_pid} -> {recovered_pid}")
+
+    # Answering that dialog. Its No button and its window close reach the same
+    # branch -- Gtk.main_quit(), launcher line 199, the only alternative to
+    # YES -- so WM_DELETE_WINDOW is the No click without depending on focus or
+    # on button coordinates GTK does not expose to X. The launcher provides
+    # panel;windowmanager with X-GNOME-AutoRestart=false, so what happens to
+    # the session when it quits decides whether the rescue saved the session
+    # or only postponed losing it to the user's next click.
+    def launcher_pids():
+        rc, out = workstation.execute("pgrep -f 'cinnamon-launche[r]' 2>&1")
+        return sorted(out.split()) if rc == 0 else []
+
+    launcher_before = launcher_pids()
+    assert launcher_before, \
+        "no cinnamon-launcher is running, so nothing here would answer the dialog"
+    assert rc_dialog == 0 and dialog.split(), \
+        "no dialog window to answer, so everything below would pass vacuously"
+    workstation.succeed(
+        "su jonathan -c 'DISPLAY=:0 "
+        "${pkgs.xdotool}/bin/xdotool search --name Cinnamon.just.crashed "
+        "windowquit' 2>&1"
+    )
+    for _ in range(40):
+        if not launcher_pids():
+            break
+        workstation.sleep(0.5)
+    launcher_after = launcher_pids()
+    print(f"[diag] launcher pids after answering No: {launcher_before} -> {launcher_after}")
+    assert not launcher_after, (
+        "answering the dialog did not end the launcher, so the checks below "
+        f"prove nothing about that click: {launcher_before} -> {launcher_after}"
+    )
+    session_final = session_manager_pid()
+    assert session_final == session_pid, (
+        "the session died when the launcher quit, so the rescue only postpones "
+        f"the loss: org.gnome.SessionManager was pid {session_pid}, now "
+        f"{session_final or 'nothing'}"
+    )
+    assert "true" in workstation.succeed(
+        f"su - jonathan -c '{rescue_env}; "
+        "gdbus call --session --timeout 5 --dest org.gnome.SessionManager "
+        "--object-path /org/gnome/SessionManager --method "
+        "org.gnome.SessionManager.IsSessionRunning'"
+    ), "the session kept the bus name but stopped answering once the launcher quit"
+    assert cinnamon_owner_pid() == recovered_pid, \
+        "the rescued Cinnamon did not survive the launcher quitting"
   '';
 }
