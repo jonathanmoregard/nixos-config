@@ -10,6 +10,8 @@
 #   - lid-guard: lid-close action is suspend by default, "nothing" while
 #     agent hooks report work in flight (turn, subagent, young background
 #     Bash), back to suspend on Stop / dead agent / SessionEnd.
+#   - tooltip markup: the string CopyQ publishes for an empty clipboard
+#     renders without Pango rejecting it, while real markup still renders.
 #
 # Uses mkFeatureTest with home/_test-desktop.nix — HM closure is
 # jonathan.nix + cinnamon.nix + desktop-apps.nix (no kitty / claude
@@ -30,6 +32,42 @@ let
     agent-activity mark < "$1"
     sleep "$2"
     true
+  '';
+
+  # Drives the real Tooltip.set_markup path inside the running Cinnamon,
+  # first with the string CopyQ actually publishes when the clipboard is
+  # empty, then with valid markup. Kept in a file because the JS needs
+  # double quotes and the testScript already nests two levels of shell
+  # quoting; the newline is built at runtime because a literal one inside
+  # the JS string would be an uncatchable syntax error.
+  tooltipMarkupProbe = pkgs.writeText "tooltip-markup-probe.js" ''
+    var log = [];
+    try {
+        var NL = String.fromCharCode(10);
+        var button = new imports.gi.St.Button();
+        var tip = new imports.ui.tooltips.Tooltip(button, "");
+        tip.set_markup("CopyQ" + NL + "<EMPTY>");
+        log.push("hostile_text=" +
+                 tip._tooltip.clutter_text.get_text().split(NL).join("~"));
+        tip.set_markup("<b>bold</b>");
+        log.push("valid_text=" + tip._tooltip.clutter_text.get_text());
+        // Positive control, and it runs LAST on purpose. These two lines are
+        // the unpatched set_markup body verbatim, so they reach Pango without
+        // the validation and must produce exactly one warning. Without it,
+        // "no new warnings" would also pass when the warning never reaches
+        // the journal at all -- and the rendered text cannot tell the two
+        // apart, because Clutter keeps the literal string either way.
+        // Being last means journald has necessarily flushed the lines above
+        // it by the time this one is visible.
+        tip._tooltip.set_text("CopyQ" + NL + "<EMPTY>");
+        tip._tooltip.clutter_text.set_use_markup(true);
+        log.push("control=fired");
+        tip._tooltip.destroy();
+        button.destroy();
+    } catch (e) {
+        log.push("ERR: " + e);
+    }
+    log.join(" | ");
   '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
@@ -244,5 +282,60 @@ in
     assert out.strip() == "rc=0", f"mark printed or failed: {out!r}"
     out = as_j("echo not-json | agent-activity mark; echo rc=$?")
     assert out.strip() == "rc=0", f"mark on garbage printed or failed: {out!r}"
+
+    # Tooltip text is untrusted: CopyQ publishes the clipboard on line 2 of
+    # its tray tooltip, so an empty clipboard ("<EMPTY>") or a copied '&'
+    # reaches Pango as invalid markup. Clutter keeps the literal text either
+    # way, so what it renders cannot tell a fixed Cinnamon from a broken one
+    # — the absence of the warning is the only observable difference, and it
+    # is also the damage (92 of them in the host journal over five weeks).
+    # The valid-markup case is asserted alongside so that a "fix" which
+    # escapes unconditionally, throwing away real formatting, fails too.
+    def markup_failures():
+        return int(workstation.succeed(
+            "journalctl -b 0 --no-pager | "
+            "grep -c 'Failed to set the markup' || true"
+        ).strip() or "0")
+
+    workstation.wait_until_succeeds(
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus; "
+        "gdbus call --session --dest org.freedesktop.DBus "
+        "--object-path /org/freedesktop/DBus "
+        "--method org.freedesktop.DBus.GetNameOwner org.Cinnamon'",
+        timeout=180,
+    )
+    before = markup_failures()
+    rendered = as_j(
+        "gdbus call --session --dest org.Cinnamon "
+        "--object-path /org/Cinnamon --method org.Cinnamon.Eval "
+        "\"$(cat ${tooltipMarkupProbe})\""
+    )
+    print("[diag] tooltip markup probe: " + rendered.strip())
+    assert "ERR:" not in rendered, \
+        f"tooltip probe threw inside Cinnamon:\n{rendered}"
+    assert "hostile_text=CopyQ~<EMPTY>" in rendered, \
+        f"CopyQ's tooltip text was not preserved verbatim:\n{rendered}"
+    assert "valid_text=bold" in rendered, \
+        f"valid markup no longer renders (over-escaped?):\n{rendered}"
+    assert "control=fired" in rendered, \
+        f"the positive control did not run, so the count below proves nothing:\n{rendered}"
+
+    # Wait for the control's warning rather than reading the count straight
+    # away: this is what distinguishes "the fix worked" from "the warning had
+    # not been flushed yet", and it waits out the flush in the same step.
+    workstation.wait_until_succeeds(
+        f"test $(journalctl -b 0 --no-pager | grep -c 'Failed to set the markup') "
+        f"-ge {before + 1}",
+        timeout=60,
+    )
+    after = markup_failures()
+    # Exactly one: the control's. The two set_markup calls above it must have
+    # added none.
+    assert after == before + 1, (
+        "Pango rejected CopyQ's tooltip text through the patched path: "
+        f"{after - before - 1} warning(s) beyond the positive control's "
+        f"(before={before} after={after}, expected {before + 1})"
+    )
   '';
 }

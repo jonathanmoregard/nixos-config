@@ -233,6 +233,11 @@
         # `pkgs.vscodium` newer than nixpkgs: the GitHub PR review extension
         # needs an editor >= 1.129. See overlays/vscodium.nix.
         (import ./overlays/vscodium.nix)
+        # `cinnamon-common` validates tooltip markup before enabling it:
+        # CopyQ puts the clipboard on line 2 of its tray tooltip, so any
+        # copied '&' or '<' reached Pango unescaped. See
+        # overlays/cinnamon-tooltip-markup.nix.
+        (import ./overlays/cinnamon-tooltip-markup.nix)
         # Native Codex CLI package with prebuilt store paths from the
         # codex-cli Cachix cache.
         codex-cli-nix.overlays.default
