@@ -615,6 +615,31 @@ in
     assert restarts() == before, \
         "watchdog kept starting Cinnamon after giving the session up"
 
+    # A rescued Cinnamon has nothing supervising it. cinnamon-launcher reads
+    # our kill as a crash, and both answers to the dialog it then puts up end
+    # the launcher, so when that Cinnamon later crashes outright no fallback
+    # is left -- and reading the unowned name as "no Cinnamon here" would
+    # leave the session without a window manager for the rest of it.
+    reset_rescue()
+    rescue_ok("check", mode="hung", threshold=1, takes_over=True)
+    # The healthy tick is the whole point of this block: it clears the record
+    # of our own kill, which is what made a crash afterwards read as a session
+    # that never had a Cinnamon at all.
+    rescue_ok("check", mode="alive")
+    assert workstation.succeed(f"cat {rcount}/ended-cinnamon").strip() == "0", (
+        "the healthy tick left the record of our own kill in place, so the "
+        "crash below would be covered by that record and prove nothing"
+    )
+    # The crash: the Cinnamon we started stops owning the name.
+    workstation.succeed(f"rm -f {rmark}")
+    before = restarts()
+    workstation.succeed(
+        f"echo 1 > {rcount}/last-restart; chown jonathan {rcount}/last-restart"
+    )
+    out = rescue_ok("check", mode="unowned", takes_over=True)
+    assert restarts() > before, \
+        f"a crash after a rescue left the session with no window manager:\n{out}"
+
     # A replacement left blocked holds the window manager selection without
     # managing anything, so it is stopped rather than left for the next
     # --replace to aim at.
@@ -1018,5 +1043,65 @@ in
     ), "the session kept the bus name but stopped answering once the launcher quit"
     assert cinnamon_owner_pid() == recovered_pid, \
         "the rescued Cinnamon did not survive the launcher quitting"
+
+    # The gap the rescue itself opens, live. With the launcher gone, nothing
+    # supervises the Cinnamon the rescue left running: a crash from here on is
+    # the watchdog's to catch or nobody's. The healthy tick first, because it
+    # is what makes the next part a crash rather than the aftermath of our own
+    # kill -- it clears the record escalation wrote.
+    rescue_counters = (
+        f"CINNAMON_RESCUE_STATE_DIR={rstate} CINNAMON_RESCUE_COUNTER_DIR={rcount}"
+    )
+    workstation.succeed(
+        f"su - jonathan -c '{rescue_env} {rescue_counters}; cinnamon-rescue check 2>&1'"
+    )
+    assert workstation.succeed(f"cat {rcount}/ended-cinnamon").strip() == "0", (
+        "the healthy tick left the record of our own kill in place, so the "
+        "crash below would be covered by that record and prove nothing"
+    )
+    workstation.succeed(f"kill -KILL {recovered_pid}")
+
+    # 2 is ABSENT: the session now has no window manager at all, which is the
+    # state the launcher used to cover. Polled by exit code rather than with
+    # wait_until_succeeds, because the driver runs each command under `set -e`,
+    # where a probe exiting non-zero ends the shell before any test of $?.
+    def probe_state():
+        return workstation.execute(
+            f"su - jonathan -c '{rescue_env}; cinnamon-rescue probe'"
+        )[0]
+
+    state = probe_state()
+    for _ in range(30):
+        if state == 2:
+            break
+        workstation.sleep(1)
+        state = probe_state()
+    assert state == 2, (
+        "the killed Cinnamon still owns org.Cinnamon, so what follows would "
+        f"not be the absent-name case this covers: probe={state}"
+    )
+    # Only the cooldown is overridden. The production 300s would idle the lane
+    # for five minutes here; the fake-driven block above is where the cooldown
+    # behaviour itself is asserted. Everything else, the cold-start deadline
+    # included, runs at the shipped numbers.
+    t0 = int(workstation.succeed("date +%s").strip())
+    rc_crash, crash_out = workstation.execute(
+        f"su - jonathan -c '{rescue_env} {rescue_counters} "
+        "CINNAMON_RESCUE_COOLDOWN_SECS=0; cinnamon-rescue check 2>&1'",
+        timeout=600,
+    )
+    t1 = int(workstation.succeed("date +%s").strip())
+    print(f"[diag] crash after the rescue: rc={rc_crash} in ~{t1 - t0}s\n{crash_out}")
+    assert "starting one" in crash_out, (
+        "a crash after the rescue was read as a session that has no Cinnamon, "
+        f"so nothing started a window manager:\n{crash_out}"
+    )
+    assert rc_crash == 0, f"the crash after the rescue was not recovered:\n{crash_out}"
+    crash_pid = cinnamon_owner_pid()
+    assert crash_pid != recovered_pid, \
+        f"org.Cinnamon is still owned by the crashed pid {recovered_pid}"
+    assert probe_state() == 0, \
+        "the Cinnamon started after the crash does not answer its main loop"
+    print(f"[diag] crash recovered: pid {recovered_pid} -> {crash_pid}")
   '';
 }

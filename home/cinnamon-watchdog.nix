@@ -27,8 +27,8 @@ let
   termGraceSecs = 5;
   killGraceSecs = 10;
   # How many times the watchdog will start a Cinnamon into a session whose
-  # name is unowned after it ended one itself, before concluding the session
-  # is gone. The timer being PartOf graphical-session.target is the primary
+  # name is unowned after it ended or started one itself, before concluding
+  # the session is gone. The timer being PartOf graphical-session.target is the primary
   # defence against retrying into a logged-out session; this bound is what
   # holds if the timer outlives the session anyway, which linger makes
   # possible.
@@ -439,6 +439,17 @@ let
           return True
 
 
+      def _recovered():
+          """A Cinnamon we started is the session's window manager now."""
+          # cinnamon-launcher is not behind this one. It reads our kill as a
+          # crash, and both answers to the dialog that follows end it: No
+          # calls Gtk.main_quit, Yes execs a replacement launcher over it. So
+          # the fallback that used to restart a crashed Cinnamon is gone, and
+          # from here an unowned name is a crash only this can recover.
+          _write_int("ours", 1)
+          return 0
+
+
       def _recover(fails):
           pid = cinnamon_pid()
           # Taken before the replacement is launched: this is the process the
@@ -464,14 +475,14 @@ let
           deadline = TAKEOVER_DEADLINE if pid is not None else COLD_START_DEADLINE
           if _await_takeover(deadline):
               print("cinnamon-rescue: replacement took over; the session answers again")
-              return 0
+              return _recovered()
           print("cinnamon-rescue: replacement has not taken over in %ds; escalating"
                 % deadline, file=sys.stderr)
           if _escalate(pid, ident):
               print("cinnamon-rescue: replacement took over once the old Cinnamon ended")
-              return 0
+              return _recovered()
           if not _drop_unless_recovered(unit):
-              return 0
+              return _recovered()
           # Ending the old Cinnamon and then dropping its replacement leaves
           # nobody owning the name, which is a session with no window manager
           # at all -- worse than the hang it replaced. One bounded start
@@ -489,9 +500,9 @@ let
           # that only had to stop blocking, so it gets the longer deadline.
           if launched and _await_takeover(COLD_START_DEADLINE):
               print("cinnamon-rescue: a fresh Cinnamon took over")
-              return 0
+              return _recovered()
           if launched and not _drop_unless_recovered(retry_unit):
-              return 0
+              return _recovered()
           print("cinnamon-rescue: recovery FAILED; the session is still wedged",
                 file=sys.stderr)
           return 1
@@ -508,13 +519,18 @@ let
               _write_int("failures", 0)
               _write_int("ended-cinnamon", 0)
               _write_int("absent-starts", 0)
+              # "ours" is deliberately not cleared here. It records that the
+              # session's window manager is one we started and has no
+              # launcher behind it, which a healthy tick does not change.
               return 0
           if state == ABSENT:
               # Normally a greeter or a non-Cinnamon session, where starting a
-              # window manager would be wrong. But when we ended Cinnamon
-              # ourselves and nothing replaced it, reading "absent" as healthy
-              # would leave the session without a window manager for good.
-              if not _read_int("ended-cinnamon"):
+              # window manager would be wrong. Two cases are ours, and reading
+              # either as healthy would leave the session without a window
+              # manager for good: we ended Cinnamon and nothing replaced it,
+              # or the Cinnamon that has just stopped owning the name is one
+              # we started, whose crash no launcher is left to catch.
+              if not (_read_int("ended-cinnamon") or _read_int("ours")):
                   _write_int("failures", 0)
                   return 0
               attempts = _read_int("absent-starts")
@@ -525,6 +541,7 @@ let
                   print("cinnamon-rescue: no Cinnamon after %d starts; treating the "
                         "session as ended" % attempts)
                   _write_int("ended-cinnamon", 0)
+                  _write_int("ours", 0)
                   _write_int("failures", 0)
                   return 0
               if _cooldown_open():
