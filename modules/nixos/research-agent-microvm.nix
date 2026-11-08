@@ -64,7 +64,14 @@ in
         # the OOM incident that motivated the swap+zram PR (#152) was
         # exactly this class of oversubscription. Still well clear of the
         # 2048 DSDT-corruption boundary noted above.
-        mem = 4096;
+        #
+        # 4224 (was 4096), 2026-10-04: research-agent now runs 2 concurrent
+        # slots with a 1536 MiB per-call memguard cap, and its sizing
+        # invariant `slots * cap + guest_base <= mem` needs
+        # 2 * 1536 + ~1100 = 4172 MiB (research-agent scripts/lib/memguard.sh,
+        # tests/test_memguard.py). 6 slots x 1536 MiB had broken it, so the
+        # per-call cap could not stop VM-wide reclaim. Not near 2048.
+        mem = 4224;
 
         shares = [
           {
