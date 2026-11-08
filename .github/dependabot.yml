@@ -1,0 +1,30 @@
+version: 2
+
+# One weekly pull request across every ecosystem and directory below, majors
+# included, so each repo gets at most one routine Dependabot PR per week. A
+# multi-ecosystem group bundles majors whatever per-entry `groups` say, so
+# entries define none.
+multi-ecosystem-groups:
+  weekly-dependencies:
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:17"
+      timezone: "Europe/Stockholm"
+
+updates:
+  - package-ecosystem: "nix"
+    directory: "/"
+    patterns: ["*"]
+    multi-ecosystem-group: "weekly-dependencies"
+    rebase-strategy: "disabled"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    patterns: ["*"]
+    multi-ecosystem-group: "weekly-dependencies"
+    rebase-strategy: "disabled"
+    cooldown:
+      default-days: 7
