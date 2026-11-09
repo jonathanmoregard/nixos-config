@@ -830,11 +830,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1794174731,
-        "narHash": "sha256-5CZaSKhNVHq2v8uZkjIRA141w9keOJabZWdmGfU6fhM=",
+        "lastModified": 1794229920,
+        "narHash": "sha256-OsGeEbGlK8fDRCxBEIManurYCCzl1JK0lNUAZq5xzJc=",
         "owner": "jonathanmoregard",
         "repo": "voquill",
-        "rev": "9a2c8de373658e1fe552bcfa0653b60765246cda",
+        "rev": "e52f121d37259ceb1d0becd8e0b99aff03734ddb",
         "type": "github"
       },
       "original": {
