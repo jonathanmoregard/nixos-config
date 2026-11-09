@@ -2,57 +2,6 @@
 # User services ported from ~/.config/systemd/user/ + migrated from autostart.
 # - Router services: originals under ~/.local/share/router-agent (uv-managed venv).
 # - Voquill: migrated from ~/.config/autostart/ to a proper systemd user service.
-let
-  # Voquill is built outside Nix (in ~/Repos/voquill via its devShell flake),
-  # so the resulting binary links against unqualified SONAMEs (libwebkit2gtk,
-  # libxdo, libpulse, etc.). On NixOS those libs aren't in /usr/lib, so we
-  # have to inject the Nix-store paths via LD_LIBRARY_PATH at launch time.
-  # Keep this list in sync with apps/desktop/flake.nix `runtimeLibs`.
-  voquillRuntimeLibs = with pkgs; [
-    webkitgtk_4_1
-    gtk3
-    gtk-layer-shell
-    libayatana-appindicator  # tray-icon dlopens libayatana-appindicator3.so.1
-    glib
-    libsoup_3
-    librsvg
-    gdk-pixbuf
-    cairo
-    pango
-    atk
-    harfbuzz
-    openssl
-    alsa-lib
-    libpulseaudio
-    xdotool
-    libx11
-    libxtst
-    libxi
-    libxrandr
-    libxcursor
-    libxcb
-    libxkbcommon
-    wayland
-    vulkan-loader
-    libGL
-  ];
-
-  # Built with tauri.local.conf.json overlay so the binary uses the
-  # `com.voquill.desktop.local` identifier and reads the user's existing
-  # data directory at ~/.config/com.voquill.desktop.local.
-  voquillBinary = "/home/jonathan/Repos/voquill/apps/desktop/src-tauri/target/release/Voquill (local)";
-  voquillWrapper = pkgs.writeShellApplication {
-    name = "voquill-launch";
-    runtimeInputs = [ pkgs.xdotool ];
-    text = ''
-      export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath voquillRuntimeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-      # webkit2gtk DMA-BUF renderer can crash on some drivers; force the
-      # legacy compositing renderer for stability inside Tauri.
-      export WEBKIT_DISABLE_DMABUF_RENDERER=1
-      exec "${voquillBinary}" "$@"
-    '';
-  };
-in
 {
   # Router services: ExecStart was hardcoded to /home/jonathan/.local/bin/uv,
   # which existed on the prior Mint host (pip-installed) but not on NixOS.
@@ -127,17 +76,29 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # Voquill voice-typing app. Locally-built release binary at
-  # ~/Repos/voquill/apps/desktop/src-tauri/target/release/Voquill, launched
-  # through `voquillWrapper` so it gets the Nix-store LD_LIBRARY_PATH it
-  # cannot resolve on its own (no /usr/lib on NixOS).
+  # Voquill voice-typing app, built by its own flake (`pkgs.voquill`, wired up
+  # in flake.nix). What changed is not that LD_LIBRARY_PATH went away — the
+  # package's own wrapper still prefixes one, for the libs it dlopens — but
+  # that every entry on it now comes from voquill's OWN closure instead of
+  # this flake's nixpkgs. That is the whole fix: one nixpkgs per process, so
+  # this flake's pin moving can no longer strand the binary, and the closure
+  # is GC-rooted so nothing it needs can be swept.
+  #
+  # The package keeps the `com.voquill.desktop.local` identifier, so it reads
+  # the existing data directory at ~/.config/com.voquill.desktop.local.
+  #
+  # Known, upstream: that wrapper exports LD_LIBRARY_PATH to CHILDREN too, so
+  # anything voquill spawns (xdg-open -> browser, pactl, gdbus) sees voquill's
+  # libs ahead of its own RUNPATH. Belongs in voquill's derivation, not here.
+  home.packages = [ pkgs.voquill ];
+
   # Start-menu entry for Voquill. Placed at ~/.local/share/applications by
   # home-manager so Cinnamon's menu picks it up without imperative edits.
   xdg.desktopEntries.voquill = {
     name = "Voquill";
     comment = "AI voice dictation";
-    exec = "${voquillWrapper}/bin/voquill-launch";
-    icon = "/home/jonathan/Repos/voquill/apps/desktop/src-tauri/icons/128x128.png";
+    exec = "${pkgs.voquill}/bin/voquill";
+    icon = "voquill";
     terminal = false;
     type = "Application";
     categories = [ "Utility" "AudioVideo" ];
@@ -151,7 +112,7 @@ in
     };
     Service = {
       Type = "simple";
-      ExecStart = "${voquillWrapper}/bin/voquill-launch --voquill-autostart-hidden";
+      ExecStart = "${pkgs.voquill}/bin/voquill --voquill-autostart-hidden";
       Restart = "on-failure";
       RestartSec = 5;
       # Dictation is interactive: five shares to a default sibling's one

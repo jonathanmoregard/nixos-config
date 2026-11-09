@@ -608,7 +608,8 @@
         "pyproject-nix": "pyproject-nix_2",
         "substack-url-tool": "substack-url-tool",
         "tts-tool": "tts-tool",
-        "uv2nix": "uv2nix_4"
+        "uv2nix": "uv2nix_4",
+        "voquill": "voquill"
       }
     },
     "spectrum": {
@@ -819,6 +820,26 @@
       "original": {
         "owner": "pyproject-nix",
         "repo": "uv2nix",
+        "type": "github"
+      }
+    },
+    "voquill": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1794229920,
+        "narHash": "sha256-OsGeEbGlK8fDRCxBEIManurYCCzl1JK0lNUAZq5xzJc=",
+        "owner": "jonathanmoregard",
+        "repo": "voquill",
+        "rev": "e52f121d37259ceb1d0becd8e0b99aff03734ddb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jonathanmoregard",
+        "repo": "voquill",
         "type": "github"
       }
     }
