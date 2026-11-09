@@ -28,19 +28,31 @@
     prose-decorate.url = "github:jonathanmoregard/prose-decorate";
     prose-decorate.inputs.nixpkgs.follows = "nixpkgs";
 
-    # Voquill voice-typing, built by its own flake.
+    # Voquill voice-typing, built by its own flake, on THIS flake's nixpkgs.
     #
-    # Deliberately NOT `inputs.nixpkgs.follows = "nixpkgs"`. Voquill's binary
-    # and the libraries it loads must come from ONE nixpkgs. The previous setup
-    # built it in Voquill's devShell (its own, older pin) and then injected this
-    # flake's newer libs via LD_LIBRARY_PATH; when the two pins drifted apart
-    # the app died with `GLIBC_2.43 not found` against its pinned glibc, and a
-    # nix GC then removed that glibc entirely (exit 127, ~19k restart loop).
-    # Letting Voquill keep its own pin makes the package self-consistent: its
-    # RPATHs resolve inside its own closure and no ambient library path is
-    # involved. The cost is a second nixpkgs in the closure, so Voquill's
-    # webkitgtk only advances when its flake.lock is bumped.
+    # Voquill's binary and the libraries it loads must come from ONE nixpkgs —
+    # the previous setup built it in Voquill's devShell (its own, older pin) and
+    # injected this flake's newer libs via LD_LIBRARY_PATH; when the two pins
+    # drifted the app died with `GLIBC_2.43 not found`, and a nix GC then
+    # removed that glibc entirely (exit 127, ~19k restart loop).
+    #
+    # That "one nixpkgs" must be THIS one, not Voquill's. A self-consistent
+    # closure is necessary but not sufficient: the GPU driver is not in any
+    # closure. `/run/opengl-driver` is system-global, built from the nixpkgs
+    # below, and GLVND loads its mesa EGL vendor into the app's process at
+    # runtime. On Voquill's own (older) pin that load silently finds no usable
+    # vendor — EGL client extension string comes back empty, eglInitialize
+    # fails, and WebKit treats a missing EGL display as fatal:
+    #   Could not create default EGL display: EGL_BAD_PARAMETER. Aborting...
+    # The WebKitWebProcess aborts ~3s after start, so the window renders grey
+    # and the React frontend never mounts — which also means it never calls
+    # `start_key_listener`, so the hotkey is dead and the pill never appears.
+    # Measured on tuxedo 2026-11-08: host glibc+GLVND -> EGL ok; Voquill's
+    # pinned glibc or GLVND, either one alone -> eglInitialize fails.
+    #
+    # So any app that touches GL/EGL/Vulkan builds on the host's nixpkgs.
     voquill.url = "github:jonathanmoregard/voquill";
+    voquill.inputs.nixpkgs.follows = "nixpkgs";
 
     # Anthropic ships an official Linux app since 2026-06-30, but not
     # via nixpkgs. `aaddrick/claude-desktop-debian` repackages the
