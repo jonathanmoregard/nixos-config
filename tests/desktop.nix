@@ -130,6 +130,38 @@ let
     echo "$*" >> "$CINNAMON_RESCUE_SYSTEMCTL_LOG"
   '';
 
+  # Stands in for gdbus so desktop-freeze-sample can be observed against a
+  # screensaver name that nobody owns. It records every call and then fails
+  # the way the real bus fails GetNameOwner for an unowned name.
+  #
+  # Failing *everything* is deliberate: the test's claim is that exactly one
+  # call is made, so a second call would be logged whatever its result.
+  # org.cinnamon.ScreenSaver is D-Bus-activatable on this host
+  # (org.cinnamon.ScreenSaver.service ships in the system's dbus-1/services),
+  # which means a plain method call on the unowned name makes the bus START
+  # cinnamon-screensaver -- a locker, holding the input grab, spawned into
+  # the session the sampler is only supposed to be watching.
+  freezeGdbusLogger = pkgs.writeScriptBin "freeze-gdbus-logger" ''
+    #!${pkgs.bash}/bin/bash
+    echo "$*" >> "$FREEZE_GDBUS_LOG"
+    exit 1
+  '';
+
+  # Stands in for xprop returning a WM_CLASS that is not UTF-8. X STRING
+  # properties are Latin-1, so this is ordinary, not exotic: 0xE4 is an
+  # a-umlaut in Latin-1 and an invalid continuation byte in UTF-8. Strict
+  # decoding of it raises UnicodeDecodeError, which is neither OSError nor
+  # TimeoutExpired, so it escapes the sampler's probe wrapper and loses the
+  # whole tick for as long as that window holds focus.
+  freezeXpropLatin1 = pkgs.writeScriptBin "freeze-xprop-latin1" ''
+    #!${pkgs.bash}/bin/bash
+    if [[ "$*" == *_NET_ACTIVE_WINDOW* ]]; then
+      echo '_NET_ACTIVE_WINDOW(WINDOW): window id # 0x3400007'
+    else
+      printf 'WM_CLASS(STRING) = "caf\344", "Caf\344Window"\n'
+    fi
+  '';
+
   # Stands in for a wedged Cinnamon so the escalation has a real process to
   # end. execv sets argv[0] to the given name, which is what the guard
   # matches on; mode "trap" ignores SIGTERM, so only SIGKILL can end it.
@@ -1103,5 +1135,285 @@ in
     assert probe_state() == 0, \
         "the Cinnamon started after the crash does not answer its main loop"
     print(f"[diag] crash recovered: pid {recovered_pid} -> {crash_pid}")
+
+    # desktop-freeze-sample (home/desktop-freeze-forensics.nix): record the
+    # desktop state that the 2026-11-09 freeze had no record of. This is a
+    # read-only sampler, so the assertions are about the three ways it could
+    # be useless: wrong fields, no durable write, or blocking on the very
+    # wedge it is sampling.
+    sample_env = (
+        "export XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus DISPLAY=:0;"
+    )
+
+    workstation.succeed(
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "systemctl --user is-active desktop-freeze-forensics.timer'"
+    )
+
+    # Every field the log is read for must be present. A silently dropped
+    # key turns a freeze post-mortem back into a guess, which is the failure
+    # this module exists to prevent.
+    expected_keys = [
+        "t", "mono", "idle_ms", "ss_active", "focus", "backlight", "conn",
+        "xorg", "cinnamon", "locker", "pamhelper", "load",
+        "psi_cpu", "psi_io", "psi_mem",
+    ]
+    line = workstation.succeed(
+        f"su - jonathan -c '{sample_env} desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] live sample: {line}")
+    fields = dict(
+        pair.split("=", 1) for pair in line.split(" ") if "=" in pair
+    )
+    missing = [k for k in expected_keys if k not in fields]
+    assert not missing, f"sample is missing fields {missing}:\n{line}"
+    assert len(fields) == len(expected_keys), \
+        f"sample has unexpected fields {sorted(set(fields) - set(expected_keys))}"
+
+    # The X probe must actually reach this session's X server. "?" or
+    # "timeout" here would mean the sampler ships blind to the one field
+    # that separates "input stopped arriving" from "the user walked away".
+    assert fields["idle_ms"].isdigit(), \
+        f"idle_ms did not come from a reachable X server: {fields['idle_ms']}"
+    # Xorg and Cinnamon are both running in this session, so "absent" would
+    # mean the /proc matcher does not match the processes it names.
+    for key in ("xorg", "cinnamon"):
+        assert fields[key] != "absent", \
+            f"{key} read as absent in a live graphical session:\n{line}"
+        parts = fields[key].split(":")
+        assert len(parts) == 3 and parts[0].isdigit() and parts[2].isdigit(), \
+            f"{key} is not pid:state:cpu — {fields[key]}"
+
+    # Not just "some pid": the pid of the actual Cinnamon shell, checked
+    # against the bus owner of org.Cinnamon as an independent oracle.
+    #
+    # Shape alone is too weak to be worth asserting. `=cinnamon` is an exact
+    # argv[0] match precisely because a substring match reports
+    # `cinnamon-session-binary` instead -- also a plausible-looking
+    # pid:state:cpu, also not "absent", and useless for telling whether the
+    # Cinnamon that froze was alive. Comparing against the name owner is
+    # what makes a regression to substring matching fail here.
+    owner = cinnamon_owner_pid()
+    assert fields["cinnamon"].split(":")[0] == str(owner), \
+        (f"sampler reported cinnamon={fields['cinnamon']} but org.Cinnamon is "
+         f"owned by pid {owner}; the /proc matcher is naming the wrong process")
+
+    # /sys parsing, against a fixture rather than the builder's hardware:
+    # the test VM has no backlight, so the real tree cannot show that a
+    # powered-off panel or a disconnected connector is reported correctly.
+    workstation.succeed(
+        "mkdir -p /tmp/sysfix/sys/class/backlight/fake_bl0 "
+        "/tmp/sysfix/sys/class/drm/card1-eDP-1 "
+        "/tmp/sysfix/sys/class/drm/card1-DP-2 "
+        "/tmp/sysfix/sys/class/drm/card1-HDMI-A-1"
+    )
+    workstation.succeed(
+        "echo 96 > /tmp/sysfix/sys/class/backlight/fake_bl0/brightness; "
+        "echo 255 > /tmp/sysfix/sys/class/backlight/fake_bl0/max_brightness; "
+        "echo 4 > /tmp/sysfix/sys/class/backlight/fake_bl0/bl_power; "
+        "echo enabled > /tmp/sysfix/sys/class/drm/card1-eDP-1/enabled; "
+        "echo connected > /tmp/sysfix/sys/class/drm/card1-eDP-1/status; "
+        "echo Off > /tmp/sysfix/sys/class/drm/card1-eDP-1/dpms; "
+        "echo enabled > /tmp/sysfix/sys/class/drm/card1-DP-2/enabled; "
+        "echo disconnected > /tmp/sysfix/sys/class/drm/card1-DP-2/status; "
+        "echo On > /tmp/sysfix/sys/class/drm/card1-DP-2/dpms; "
+        # Not enabled, so it must not appear at all: a log line listing every
+        # connector the chip has is noise that hides the two that matter.
+        "echo disabled > /tmp/sysfix/sys/class/drm/card1-HDMI-A-1/enabled; "
+        "echo connected > /tmp/sysfix/sys/class/drm/card1-HDMI-A-1/status; "
+        "chmod -R a+rX /tmp/sysfix"
+    )
+    fixture = workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_SYS_ROOT=/tmp/sysfix "
+        "desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] fixture sample: {fixture}")
+    ffields = dict(
+        pair.split("=", 1) for pair in fixture.split(" ") if "=" in pair
+    )
+    assert ffields["backlight"] == "fake_bl0:96/255:power4", \
+        f"backlight not parsed (power4 = panel off): {ffields['backlight']}"
+    assert ffields["conn"] == "DP-2:disconnected:On,eDP-1:connected:Off", \
+        f"connectors not parsed, or a disabled one leaked in: {ffields['conn']}"
+
+    # A tick must land on disk durably. The sampler fsyncs every line
+    # because a freeze that ends in a held power button loses whatever is
+    # still in the page cache -- and that is exactly the final minutes.
+    #
+    # Pointed at its own directory, NOT the production log: the timer
+    # asserted active above fires every 20s, so counting lines in the real
+    # log would race it and flake.
+    sdir = "/tmp/fz-state"
+    log = f"{sdir}/samples.log"
+    tick = f"su - jonathan -c '{sample_env} FREEZE_STATE_DIR={sdir} desktop-freeze-sample tick'"
+    workstation.succeed(tick)
+    first = int(workstation.succeed(f"wc -l < {log}").strip())
+    assert first == 1, f"one tick wrote {first} lines"
+    workstation.succeed(tick)
+    assert int(workstation.succeed(f"wc -l < {log}").strip()) == 2, \
+        "a second tick did not append"
+
+    # Rotation, so the log can never be the reason a disk fills.
+    workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_STATE_DIR={sdir} "
+        "FREEZE_MAX_BYTES=1 desktop-freeze-sample tick'"
+    )
+    workstation.succeed(f"test -f {log}.1")
+    assert int(workstation.succeed(f"wc -l < {log}").strip()) == 1, \
+        "rotation did not start a fresh log"
+    assert int(workstation.succeed(f"wc -l < {log}.1").strip()) == 2, \
+        "rotation lost the previous lines"
+
+    # The production path must still be the one the unit writes, which the
+    # dedicated directory above deliberately does not prove.
+    workstation.succeed(
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "systemctl --user start desktop-freeze-forensics.service'"
+    )
+    unit_line = workstation.succeed(
+        "tail -n 1 /home/jonathan/.local/state/desktop-freeze/samples.log"
+    ).strip()
+    print(f"[diag] line written by the unit: {unit_line}")
+    ufields = dict(
+        pair.split("=", 1) for pair in unit_line.split(" ") if "=" in pair
+    )
+    # The unit's own Environment must reach X, not just the sampler when run
+    # by hand with sample_env. `test -s` alone could not tell the difference:
+    # it passes on lines the timer wrote minutes earlier, so dropping DISPLAY
+    # from the unit -- every tick then recording idle_ms=rc1 -- would still
+    # have passed it.
+    assert ufields["idle_ms"].isdigit(), \
+        (f"the unit's own environment did not reach X: idle_ms="
+         f"{ufields['idle_ms']}; DISPLAY/DBUS_SESSION_BUS_ADDRESS in the "
+         f"service are wrong")
+
+    # The scenario this module is for: X is wedged. Every X and DBus call is
+    # bounded, so a tick must still finish, still write, and record the
+    # timeout as the datum it is. A sampler that blocks here records nothing
+    # about the only event worth recording.
+    workstation.succeed(
+        "printf '#!/bin/sh\\nsleep 300\\n' > /tmp/hang; chmod a+rx /tmp/hang"
+    )
+    t0 = int(workstation.succeed("date +%s").strip())
+    hung = workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_XPRINTIDLE=/tmp/hang "
+        "FREEZE_XPROP=/tmp/hang FREEZE_GDBUS=/tmp/hang "
+        "desktop-freeze-sample show'",
+        timeout=120,
+    ).strip()
+    t1 = int(workstation.succeed("date +%s").strip())
+    print(f"[diag] wedged-X sample in ~{t1 - t0}s: {hung}")
+    hfields = dict(
+        pair.split("=", 1) for pair in hung.split(" ") if "=" in pair
+    )
+    for key in ("idle_ms", "focus"):
+        assert hfields[key] == "timeout", \
+            f"{key} did not record a hung X call as a timeout: {hfields[key]}"
+    # ss_active is "owner_timeout", not "timeout": the first gdbus call a
+    # tick makes is GetNameOwner on the bus itself, so a hung gdbus is
+    # caught there. The distinction is the point -- a bus that does not
+    # answer must never be flattened into "the screensaver wasn't running".
+    assert hfields["ss_active"] == "owner_timeout", \
+        (f"a hung bus must be reported as owner_timeout, not "
+         f"{hfields['ss_active']}")
+    # The /proc and /sys fields do not touch X, so they must still be real:
+    # a wedged X server is when load and process state matter most.
+    assert hfields["cinnamon"] != "absent", \
+        "a hung X call also lost the /proc fields, which do not depend on X"
+    assert t1 - t0 < 60, \
+        f"a tick with three hung X calls took {t1 - t0}s; it must stay bounded"
+
+    # The sampler must OBSERVE the desktop, never act on it.
+    #
+    # org.cinnamon.ScreenSaver is D-Bus-activatable on this host, so a plain
+    # method call on the name while it is unowned makes the bus start
+    # cinnamon-screensaver. A tick doing that every 20s would spawn a locker
+    # -- which takes the input grab -- into the session it is only supposed
+    # to be a witness to: a sampler manufacturing the class of fault it
+    # exists to diagnose. Same reason this module takes no X grab.
+    #
+    # So the first call of a tick must be GetNameOwner, a method on the bus
+    # itself, and nothing may address the activatable name until an owner is
+    # known. The stub fails every call and logs it, so a second call shows up
+    # here whatever it returned.
+    gdbus_log = "/tmp/fz-gdbus-calls"
+    workstation.succeed(f"rm -f {gdbus_log}; install -m 666 /dev/null {gdbus_log}")
+    unowned = workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_GDBUS_LOG={gdbus_log} "
+        f"FREEZE_GDBUS=${freezeGdbusLogger}/bin/freeze-gdbus-logger "
+        "desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] unowned-screensaver sample: {unowned}")
+    nfields = dict(
+        pair.split("=", 1) for pair in unowned.split(" ") if "=" in pair
+    )
+    assert nfields["ss_active"] == "unowned", \
+        f"an unowned screensaver name must read as unowned: {nfields['ss_active']}"
+    calls = workstation.succeed(f"cat {gdbus_log}").strip().splitlines()
+    print(f"[diag] gdbus calls one tick made: {calls}")
+    assert len(calls) == 1, \
+        f"a tick made {len(calls)} gdbus calls, expected exactly 1:\n{calls}"
+    assert "GetNameOwner" in calls[0], \
+        f"a tick's only gdbus call must be GetNameOwner, got: {calls[0]}"
+    assert "--dest org.cinnamon.ScreenSaver" not in calls[0], \
+        (f"the sampler addressed the D-Bus-activatable screensaver name "
+         f"directly, which starts a locker in the observed session: {calls[0]}")
+
+    # The /proc walk is the one step whose duration the sampler cannot bound
+    # from the inside: reading /proc/<pid>/cmdline takes the target's
+    # mmap_lock, and that wait is not reliably interruptible. A freeze is
+    # exactly when some process is wedged, so this is the step that would
+    # block during the event being recorded -- and blocking past
+    # TimeoutStartSec means systemd kills the tick before it writes anything.
+    #
+    # Budget 0 forces that path: the four /proc fields degrade to "timeout"
+    # and every field that does not depend on the walk is still collected and
+    # still written. Losing four process fields is a bad trade; losing the
+    # whole sample at the one moment it mattered is the failure this module
+    # exists to prevent.
+    starved = workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_PROC_BUDGET_SECS=0 "
+        "desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] abandoned /proc walk: {starved}")
+    pfields = dict(
+        pair.split("=", 1) for pair in starved.split(" ") if "=" in pair
+    )
+    for key in ("xorg", "cinnamon", "locker", "pamhelper"):
+        assert pfields[key] == "timeout", \
+            f"{key} did not degrade to timeout when the walk was abandoned: {pfields[key]}"
+    assert pfields["idle_ms"].isdigit(), \
+        "abandoning the /proc walk also lost idle_ms, the field that matters most"
+    assert pfields["conn"] != "none", \
+        "abandoning the /proc walk also lost the display state"
+
+    # A WM_CLASS that is not UTF-8 must not cost the tick. X STRING
+    # properties are Latin-1, so this is an ordinary window, not a crafted
+    # one; strict decoding raises UnicodeDecodeError, which is neither
+    # OSError nor TimeoutExpired and so escapes the probe wrapper entirely.
+    # Before the sampler decoded with errors="replace", every tick taken
+    # while such a window held focus wrote nothing at all.
+    latin = workstation.succeed(
+        f"su - jonathan -c '{sample_env} "
+        f"FREEZE_XPROP=${freezeXpropLatin1}/bin/freeze-xprop-latin1 "
+        "desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] latin-1 WM_CLASS sample: {latin}")
+    lfields = dict(
+        pair.split("=", 1) for pair in latin.split(" ") if "=" in pair
+    )
+    assert lfields["idle_ms"].isdigit(), \
+        f"a non-UTF-8 WM_CLASS cost the whole tick:\n{latin}"
+    assert lfields["focus"].startswith("Caf"), \
+        f"the focused window's class was not recovered: {lfields['focus']}"
+
+    # A sampler that fails its unit on an unwritable state dir turns a
+    # diagnostic into an outage of its own.
+    workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_STATE_DIR=/proc/nope "
+        "desktop-freeze-sample tick'"
+    )
+    print("[diag] desktop-freeze-sample assertions passed")
   '';
 }
