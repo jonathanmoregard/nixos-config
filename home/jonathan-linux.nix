@@ -668,6 +668,7 @@ in
     ./jonathan.nix
     ./cinnamon.nix
     ./cinnamon-watchdog.nix
+    ./desktop-freeze-forensics.nix
     ./lid-guard.nix
     ./desktop-apps.nix
     ./calibre-plugins.nix
