@@ -30,8 +30,12 @@
 #     START that service. Asking "is the screensaver active" the naive way
 #     therefore spawns a screensaver -- and a locker takes the input grab.
 #     Ownership is checked first, via a method on the bus itself, which
-#     activates nothing. Reviewed and fixed before this ever shipped; the
-#     log would have been recording a locker it had started itself.
+#     activates nothing; and the follow-up call is addressed to the UNIQUE
+#     name that check returned, never to the well-known one, because a
+#     well-known name can fall unowned between the two calls and activate a
+#     replacement anyway. A unique name is never activatable, so the bus can
+#     only answer or say it has gone. Reviewed and fixed before this ever
+#     shipped; the log would have been recording a locker it started itself.
 #
 #   * Any recovery action. The fault is not identified yet, so there is
 #     nothing to recover from and no safe trigger to hang it on. Recovery of
@@ -91,7 +95,15 @@ let
 
 
       def _run(argv, timeout=None):
-          """(ok, text). Never raises: a failed probe is a field value."""
+          """(ok, text, stderr). Never raises: a failed probe is a field value.
+
+          stderr is returned, not discarded, because for D-Bus it carries the
+          only thing that distinguishes "nobody owns this name" from "the bus
+          did not answer at all" -- both of which are a plain exit 1. Dropping
+          it made a dead session bus indistinguishable from an absent
+          screensaver, which is a wrong answer in the exact circumstance this
+          log exists for.
+          """
           try:
               p = subprocess.run(
                   argv, capture_output=True, text=True,
@@ -105,12 +117,13 @@ let
                   timeout=timeout or CALL_TIMEOUT,
               )
           except subprocess.TimeoutExpired:
-              return False, "timeout"
+              return False, "timeout", ""
           except OSError as exc:
-              return False, "error:%s" % type(exc).__name__
+              return False, "error:%s" % type(exc).__name__, ""
+          err = (p.stderr or "").strip()
           if p.returncode != 0:
-              return False, "rc%d" % p.returncode
-          return True, (p.stdout or "").strip()
+              return False, "rc%d" % p.returncode, err
+          return True, (p.stdout or "").strip(), err
 
 
       def _read(path, limit=256):
@@ -130,6 +143,22 @@ let
           return value or "?"
 
 
+      def _dbus_err(stderr):
+          """Short D-Bus error name from gdbus stderr, or "" if there is none.
+
+          gdbus prints `Error: GDBus.Error:org.freedesktop.DBus.Error.<Name>:
+          <text>` for a bus-level refusal, and something with no error name at
+          all ("Error connecting: Could not connect: ...") when it cannot
+          reach the bus. Both exit 1, so the presence of a name is itself the
+          signal: a name means the bus answered and refused, no name means the
+          bus was not reachable.
+          """
+          m = re.search(r"GDBus\.Error:(?:[\w.]*\.)?(\w+)", stderr or "")
+          if m:
+              return m.group(1)
+          return "busfail" if stderr else ""
+
+
       def idle_ms():
           # The single most useful field, and the one nothing else records:
           # the X idle counter resets on any input event, so a value near
@@ -137,7 +166,7 @@ let
           # accepting input" from "the user had walked away", which is
           # precisely the ambiguity that made the 2026-11-09 freeze
           # undiagnosable after the fact.
-          ok, out = _run([XPRINTIDLE])
+          ok, out, _ = _run([XPRINTIDLE])
           if not ok:
               return out
           return out if out.isdigit() else "?"
@@ -161,7 +190,7 @@ let
           # running, so it activates nothing. "unowned" is also a better
           # datum than a spawned locker's "0": it says the screensaver was
           # not running at all.
-          ok, out = _run([
+          ok, out, err = _run([
               GDBUS, "call", "--session", "--timeout", str(CALL_TIMEOUT),
               "--dest", "org.freedesktop.DBus",
               "--object-path", "/org/freedesktop/DBus",
@@ -169,19 +198,36 @@ let
               "org.cinnamon.ScreenSaver",
           ])
           if not ok:
-              # Only a clean refusal means nobody owns the name. A timeout
-              # or a spawn failure means the BUS did not answer, which is a
-              # far more interesting state during a freeze and must not be
-              # flattened into "the screensaver wasn't running".
-              return "owner_%s" % out if out.startswith(("timeout", "error")) else "unowned"
-          ok, out = _run([
+              return "unowned" if _dbus_err(err) == "NameHasNoOwner" else (
+                  "owner_%s" % (_dbus_err(err) or out))
+          # The unique name (":1.53"), not the well-known one, is the
+          # destination of the second call. Checking ownership and then
+          # addressing org.cinnamon.ScreenSaver anyway would leave the
+          # activation race wide open: if the owner exits between the two
+          # calls, the well-known name is unowned again by the time the
+          # second call lands, and the bus starts a replacement -- the exact
+          # thing the ownership check was added to prevent.
+          #
+          # A unique name is never activatable. Addressing it means the bus
+          # can only answer or report that it has gone, never spawn. gdbus
+          # has no --no-auto-start, so this is also the only way to express
+          # "ask, but never start" with this tool.
+          m = re.search(r"'(:[0-9.]+)'", out)
+          if not m:
+              return "owner_unparsed"
+          ok, out, err = _run([
               GDBUS, "call", "--session", "--timeout", str(CALL_TIMEOUT),
-              "--dest", "org.cinnamon.ScreenSaver",
+              "--dest", m.group(1),
               "--object-path", "/org/cinnamon/ScreenSaver",
               "--method", "org.cinnamon.ScreenSaver.GetActive",
           ])
           if not ok:
-              return out
+              # The owner existed a moment ago and does not now. That is the
+              # race, recorded as a datum instead of papered over by having
+              # started something.
+              if _dbus_err(err) in ("NameHasNoOwner", "ServiceUnknown"):
+                  return "vanished"
+              return "active_%s" % _dbus_err(err) if _dbus_err(err) else out
           return "1" if "true" in out else "0"
 
 
@@ -219,7 +265,7 @@ let
 
       def active_window():
           """WM_CLASS of the focused window, or why it could not be read."""
-          ok, out = _run([XPROP, "-root", "_NET_ACTIVE_WINDOW"])
+          ok, out, _ = _run([XPROP, "-root", "_NET_ACTIVE_WINDOW"])
           if not ok:
               return out
           m = re.search(r"(0x[0-9a-fA-F]+)", out)
@@ -228,7 +274,7 @@ let
           wid = m.group(1)
           if int(wid, 16) == 0:
               return "none"
-          ok, out = _run([XPROP, "-id", wid, "WM_CLASS"])
+          ok, out, _ = _run([XPROP, "-id", wid, "WM_CLASS"])
           if not ok:
               return out
           names = re.findall(r'"([^"]*)"', out)

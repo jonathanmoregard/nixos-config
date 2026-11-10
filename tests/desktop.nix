@@ -141,9 +141,31 @@ let
   # which means a plain method call on the unowned name makes the bus START
   # cinnamon-screensaver -- a locker, holding the input grab, spawned into
   # the session the sampler is only supposed to be watching.
+  #
+  # The stderr matters: a bare exit 1 is how gdbus reports a bus it could not
+  # reach, while an unowned name carries the NameHasNoOwner error name. The
+  # sampler distinguishes the two, so this stub has to speak the real dialect
+  # or it would be asserting against a fiction.
   freezeGdbusLogger = pkgs.writeScriptBin "freeze-gdbus-logger" ''
     #!${pkgs.bash}/bin/bash
     echo "$*" >> "$FREEZE_GDBUS_LOG"
+    echo "Error: GDBus.Error:org.freedesktop.DBus.Error.NameHasNoOwner: The name does not have an owner" >&2
+    exit 1
+  '';
+
+  # Stands in for gdbus during the activation RACE: GetNameOwner succeeds and
+  # hands back a unique name, then that owner is gone by the time the second
+  # call lands. This is the window in which addressing the well-known name
+  # would make the bus activate a replacement, so the stub's job is to record
+  # which name the sampler actually addressed second.
+  freezeGdbusRace = pkgs.writeScriptBin "freeze-gdbus-race" ''
+    #!${pkgs.bash}/bin/bash
+    echo "$*" >> "$FREEZE_GDBUS_LOG"
+    if [[ "$*" == *GetNameOwner* ]]; then
+      echo "(':1.99',)"
+      exit 0
+    fi
+    echo "Error: GDBus.Error:org.freedesktop.DBus.Error.NameHasNoOwner: The name does not have an owner" >&2
     exit 1
   '';
 
@@ -1359,6 +1381,67 @@ in
     assert "--dest org.cinnamon.ScreenSaver" not in calls[0], \
         (f"the sampler addressed the D-Bus-activatable screensaver name "
          f"directly, which starts a locker in the observed session: {calls[0]}")
+
+    # The RACE the ownership check alone does not close: the name is owned
+    # when GetNameOwner runs and unowned by the time the second call lands.
+    # Checking ownership and then addressing org.cinnamon.ScreenSaver anyway
+    # would let the bus activate a replacement in that window -- the same
+    # locker, just harder to reproduce.
+    #
+    # The fix is to address the UNIQUE name GetNameOwner returned, which is
+    # never activatable, so this asserts on the destination of the second
+    # call and not merely on its result. The outcome is recorded as
+    # "vanished": an observation, rather than something the sampler caused.
+    workstation.succeed(f"rm -f {gdbus_log}; install -m 666 /dev/null {gdbus_log}")
+    raced = workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_GDBUS_LOG={gdbus_log} "
+        f"FREEZE_GDBUS=${freezeGdbusRace}/bin/freeze-gdbus-race "
+        "desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] owner-vanished-mid-probe sample: {raced}")
+    rfields = dict(
+        pair.split("=", 1) for pair in raced.split(" ") if "=" in pair
+    )
+    assert rfields["ss_active"] == "vanished", \
+        (f"an owner that disappeared between the two calls must read as "
+         f"vanished, not {rfields['ss_active']}")
+    rcalls = workstation.succeed(f"cat {gdbus_log}").strip().splitlines()
+    print(f"[diag] gdbus calls during the race: {rcalls}")
+    assert len(rcalls) == 2, \
+        f"expected GetNameOwner then GetActive, got {len(rcalls)}:\n{rcalls}"
+    assert "--dest :1.99" in rcalls[1], \
+        (f"the second call must be addressed to the unique name returned by "
+         f"GetNameOwner, got: {rcalls[1]}")
+    for call in rcalls:
+        assert "--dest org.cinnamon.ScreenSaver" not in call, \
+            (f"the sampler addressed the activatable well-known name during "
+             f"the race window, which is exactly when the bus would start a "
+             f"replacement locker: {call}")
+
+    # A bus that cannot be reached must NOT read as "the screensaver wasn't
+    # running". Both are a plain exit 1 from gdbus and differ only in stderr,
+    # so this uses the REAL gdbus against a nonexistent socket -- a stub
+    # could not show that the distinction survives contact with the tool.
+    #
+    # Getting this wrong is a wrong answer in precisely the circumstance the
+    # log exists for: during a freeze, "the session bus stopped answering" is
+    # a finding, and "no screensaver" is a red herring.
+    deadbus = workstation.succeed(
+        "su - jonathan -c 'export DISPLAY=:0 "
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent-bus-sock; "
+        "desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] unreachable-bus sample: {deadbus}")
+    dfields = dict(
+        pair.split("=", 1) for pair in deadbus.split(" ") if "=" in pair
+    )
+    assert dfields["ss_active"] != "unowned", \
+        ("an unreachable session bus was reported as an absent screensaver; "
+         "stderr is the only thing that separates them and it must not be "
+         "discarded")
+    assert dfields["ss_active"].startswith("owner_"), \
+        (f"an unreachable bus must be reported as a bus failure, got "
+         f"{dfields['ss_active']}")
 
     # The /proc walk is the one step whose duration the sampler cannot bound
     # from the inside: reading /proc/<pid>/cmdline takes the target's
