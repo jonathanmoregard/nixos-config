@@ -7504,9 +7504,9 @@ in
     # 2026-11-10 /tmp held 787 GB across 34,067,293 files, with empty
     # directories 41 days old still sitting there and the disk 95% full.
     # Every default age criterion must be older than the cutoff, atime
-    # included, and reading a directory refreshes its atime under relatime —
-    # so systemd-tmpfiles-clean's own nightly opendir() walk kept resetting
-    # the very clock its age check reads.
+    # included, so a directory nothing has written to in weeks still survives
+    # as long as something keeps reading it. (That reader is not the cleaner —
+    # systemd traverses with O_NOATIME. See profiles/base.nix.)
     #
     # btime and ctime cannot be backdated, so a true 10d fixture is
     # impossible here. Arms (a) and (b) prove the mechanism on a 1s age with
@@ -7519,11 +7519,17 @@ in
     workstation.succeed(
         "printf 'q /tmp/agecheck-b 1777 root root bcmBM:1s\\n' > /run/age-b.conf"
     )
+    # Stand in for a reader that touched these directories, by setting atime
+    # far in the future rather than reading them now. A real `ls` would leave
+    # the atime only ~1s fresh, which races the 1s cutoff: any scheduling
+    # delay between the read and the clean would age arm (a) out and fail the
+    # test for a reason that has nothing to do with the criteria. A future
+    # atime cannot go stale, so the arms differ only in `abcmABM` vs `bcmBM`.
+    workstation.succeed(
+        "touch -a -d '+1 hour' /tmp/agecheck-a/d1 /tmp/agecheck-b/d1"
+    )
+    # mtime/ctime must still clear the 1s cutoff for (b) to be reapable.
     workstation.succeed("sleep 2")
-    # The read that a backup, an indexer, or the cleaner itself performs.
-    # relatime does update atime here: the stored atime still equals mtime
-    # from creation, which is one of the conditions relatime updates on.
-    workstation.succeed("ls /tmp/agecheck-a/d1 /tmp/agecheck-b/d1 >/dev/null")
     workstation.succeed(
         "systemd-tmpfiles --clean /run/age-a.conf /run/age-b.conf"
     )
