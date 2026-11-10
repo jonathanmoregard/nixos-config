@@ -113,5 +113,43 @@
     fileSystems = [ "/" ];
   };
 
+  # /tmp aging, with atime removed from the age criteria.
+  #
+  # systemd ships `q /tmp 1777 root root 10d` in tmp.conf. On tuxedo that rule
+  # reaped nothing: on 2026-11-10 /tmp held 787 GB across 34,067,293 files,
+  # with empty directories dating to 2026-09-30 still present. The disk was
+  # 95% full as a direct result.
+  #
+  # Cause: the default age criteria are `abcmABM` — atime, btime, ctime and
+  # mtime for files; Atime, Btime and Mtime for directories — and *every*
+  # criterion must be older than the cutoff before an entry is removed.
+  # Reading a directory updates its atime, and `relatime` (set on / here)
+  # bumps atime whenever the stored value is more than 24h old. So any daily
+  # pass over /tmp keeps every directory's atime fresh, and the 10d atime
+  # condition can never be satisfied. systemd-tmpfiles-clean.service is itself
+  # such a pass: it opendir()s the whole tree nightly. It was refreshing the
+  # atimes its own age check depends on.
+  #
+  # Measured on tuxedo before this change: all 11,899 /tmp/nix-develop-* dirs
+  # had an atime within the last 2 days while their mtimes spread across
+  # September, October and November, and the cleaner said so itself at debug
+  # level — `Directory "/tmp/nix-develop-104998-2679922558": access time
+  # Mon 2026-11-09 21:21:48 is too new.` (mtime and ctime: 2026-09-30), with
+  # that timestamp falling inside the 21:18:53–21:25:32 cleaner run window.
+  #
+  # `bcmBM` keeps every default criterion except atime, so aging follows when
+  # a file was last *written*, not last looked at. This file renders into
+  # /etc/tmpfiles.d/00-nixos.conf, which sorts before tmp.conf, so this entry
+  # wins and tmp.conf's /tmp line is ignored as a duplicate — the same
+  # precedence the research-agent rules in profiles/workstation rely on.
+  # /var/tmp is a separate path and keeps its upstream 30d rule untouched.
+  #
+  # Asserted behaviourally by checks.x86_64-linux.vm-base: a directory whose
+  # mtime is aged past the cutoff but whose atime was just refreshed by a read
+  # must still be reaped. That assertion fails against the upstream `abcmABM`.
+  systemd.tmpfiles.rules = [
+    "q /tmp 1777 root root bcmBM:10d"
+  ];
+
   system.stateVersion = "25.11";
 }

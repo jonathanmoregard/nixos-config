@@ -7497,5 +7497,53 @@ in
     workstation.succeed(
         "su jonathan -c 'printf \\n >> /home/jonathan/.claude/settings.json'"
     )
+
+    # M. /tmp ages by write time, not by read time (profiles/base.nix).
+    #
+    # Upstream's `q /tmp 1777 root root 10d` reaped nothing on tuxedo: on
+    # 2026-11-10 /tmp held 787 GB across 34,067,293 files, with empty
+    # directories 41 days old still sitting there and the disk 95% full.
+    # Every default age criterion must be older than the cutoff, atime
+    # included, and reading a directory refreshes its atime under relatime —
+    # so systemd-tmpfiles-clean's own nightly opendir() walk kept resetting
+    # the very clock its age check reads.
+    #
+    # btime and ctime cannot be backdated, so a true 10d fixture is
+    # impossible here. Arms (a) and (b) prove the mechanism on a 1s age with
+    # the two criteria sets side by side; arm (c) pins what the live /tmp
+    # entry actually parses to.
+    workstation.succeed("mkdir -p /tmp/agecheck-a/d1 /tmp/agecheck-b/d1")
+    workstation.succeed(
+        "printf 'q /tmp/agecheck-a 1777 root root 1s\\n' > /run/age-a.conf"
+    )
+    workstation.succeed(
+        "printf 'q /tmp/agecheck-b 1777 root root bcmBM:1s\\n' > /run/age-b.conf"
+    )
+    workstation.succeed("sleep 2")
+    # The read that a backup, an indexer, or the cleaner itself performs.
+    # relatime does update atime here: the stored atime still equals mtime
+    # from creation, which is one of the conditions relatime updates on.
+    workstation.succeed("ls /tmp/agecheck-a/d1 /tmp/agecheck-b/d1 >/dev/null")
+    workstation.succeed(
+        "systemd-tmpfiles --clean /run/age-a.conf /run/age-b.conf"
+    )
+    # (a) With atime among the criteria the fresh read wins and nothing ages
+    #     out, however old the directory's mtime is. This arm is what makes
+    #     the fix falsifiable — if it ever starts failing, the premise moved
+    #     and (b) proves nothing.
+    workstation.succeed("test -d /tmp/agecheck-a/d1")
+    # (b) With atime dropped, the same directory is reaped despite the read.
+    workstation.fail("test -d /tmp/agecheck-b/d1")
+
+    # (c) The live /tmp entry carries the atime-free criteria. Read back from
+    #     the cleaner's own parse rather than from the Nix string, so this
+    #     cannot pass by restating the declaration. `.` matches the quote
+    #     character systemd prints around the path.
+    age_by = workstation.succeed(
+        "SYSTEMD_LOG_LEVEL=debug systemd-tmpfiles --clean --dry-run "
+        "--prefix=/tmp 2>&1 "
+        "| grep -E 'Cleanup threshold for directory ./tmp. is'"
+    )
+    assert "age-by: bcmBM" in age_by, age_by
   '';
 }
