@@ -363,6 +363,7 @@
         vm-android-dev  = mkLane ./tests/android-dev.nix;
         vm-claude-egress = mkLane ./tests/claude-egress.nix;
         vm-nix-gc       = mkLane ./tests/nix-gc.nix;
+        vm-claude-settings-sync = mkLane ./tests/claude-settings-sync.nix;
         vm-security-batch = mkLane ./tests/security-batch.nix;
         vm-sandbox-seccomp = mkLane ./tests/sandbox-seccomp.nix;
         # In ci.yml's vm-minimal matrix. Gates credential handling and the
