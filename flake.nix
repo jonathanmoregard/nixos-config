@@ -169,19 +169,22 @@
     # new. Referencing either from nixosConfigurations would make the host
     # depend on a test pin. Verify with: the tuxedo toplevel drvPath is
     # identical with and without `--override-input research-agent-new`.
-    # old: research-agent main before the switch (#40 merged), immutable.
-    # new: the egress-broker branch head (research-agent#41); bump to the
-    # merge commit in nixos-B. Revs in the URL, like aggregator-src above:
-    # `nix flake update` on a fully pinned ref changes nothing.
+    # old: research-agent main HEAD, i.e. what the hosts run and what
+    # code^-1 rolls back to. It decays whenever main moves: re-pin to main
+    # HEAD and re-run the lane before the merge it gates (§12.6 step 0).
+    # new: the egress-broker branch head (research-agent#41), the exact
+    # merge candidate at that same run; bump to the merge commit in
+    # nixos-B. Revs in the URL, like aggregator-src above: `nix flake
+    # update` on a fully pinned ref changes nothing.
     # Unmerged local run:
     #   nix build "path:$PWD#checks.x86_64-linux.vm-egress-switchover" -L \
     #     --override-input research-agent-new path:<research-agent checkout>
     research-agent-old = {
-      url = "github:jonathanmoregard/research-agent/e92646e6687db5cda547e6ee99a95d2066c1e421";
+      url = "github:jonathanmoregard/research-agent/2cdb1889a19a3c652e1cf10d7e1894b91d6ee118";
       flake = false;
     };
     research-agent-new = {
-      url = "github:jonathanmoregard/research-agent/6afe86f2dd2489b24951d986454add63ef391c0d";
+      url = "github:jonathanmoregard/research-agent/a18528ada13233c51afa3e195910946fd519d3bb";
       flake = false;
     };
   };

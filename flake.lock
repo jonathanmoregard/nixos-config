@@ -596,34 +596,34 @@
     "research-agent-new": {
       "flake": false,
       "locked": {
-        "lastModified": 1793751518,
-        "narHash": "sha256-K2PyenhW4MA3G5eXrgf6Zyz/Xb/3lHkVYa4/J4+UOxQ=",
+        "lastModified": 1793872304,
+        "narHash": "sha256-xCZmSUMMk3Gueojd5WbirPMfzYqvGo0QnWczju7YCp4=",
         "owner": "jonathanmoregard",
         "repo": "research-agent",
-        "rev": "6afe86f2dd2489b24951d986454add63ef391c0d",
+        "rev": "a18528ada13233c51afa3e195910946fd519d3bb",
         "type": "github"
       },
       "original": {
         "owner": "jonathanmoregard",
         "repo": "research-agent",
-        "rev": "6afe86f2dd2489b24951d986454add63ef391c0d",
+        "rev": "a18528ada13233c51afa3e195910946fd519d3bb",
         "type": "github"
       }
     },
     "research-agent-old": {
       "flake": false,
       "locked": {
-        "lastModified": 1791098200,
-        "narHash": "sha256-QHTVjHws3iD5a//jCYN3NpXkiEaNmbw9vqAJC8v/2wU=",
+        "lastModified": 1793044951,
+        "narHash": "sha256-h0R1D3nmgpUKmUXNagCOfsIStnjgFgMgc44cWGYzn8I=",
         "owner": "jonathanmoregard",
         "repo": "research-agent",
-        "rev": "e92646e6687db5cda547e6ee99a95d2066c1e421",
+        "rev": "2cdb1889a19a3c652e1cf10d7e1894b91d6ee118",
         "type": "github"
       },
       "original": {
         "owner": "jonathanmoregard",
         "repo": "research-agent",
-        "rev": "e92646e6687db5cda547e6ee99a95d2066c1e421",
+        "rev": "2cdb1889a19a3c652e1cf10d7e1894b91d6ee118",
         "type": "github"
       }
     },

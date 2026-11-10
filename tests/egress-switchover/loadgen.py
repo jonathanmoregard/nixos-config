@@ -70,14 +70,14 @@ def main() -> None:
     except ImportError:
         artifact_gate = None
     unavailable = getattr(server, "_BrokerUnavailable", None)
-    # Old code only (research-agent-old, the pre-broker main: no
+    # Old code only (research-agent-old, main HEAD before the switch: no
     # `_BrokerUnavailable`): warm the static-secret cache single-threaded.
     # Its `_secrets()` snapshots SECRETS_CACHE and then skips every name
     # cached after the snapshot, so two concurrent FIRST calls race and the
     # loser ships a run with no provider keys (b5: exa "EXA_API_KEY not
-    # set"). Fixed in research-agent 35895c6; the old pin is immutable, so
-    # the lane cannot see past it otherwise. New code is NOT warmed: a
-    # relapse of the race there must fail the step it happens in.
+    # set"). Fixed in research-agent 35895c6, on the egress branch only
+    # (main 2cdb188 still has the race). New code is NOT warmed: a relapse
+    # of the race there must fail the step it happens in.
     if unavailable is None and hasattr(server, "_secrets"):
         server._secrets()
 
@@ -86,6 +86,7 @@ def main() -> None:
     counter = itertools.count()
     inflight = [0]
     inflight_path = Path(f"/var/log/switchover/{args.name}.inflight")
+    # TEMPORARY, remove when research-agent#52 (slot admission order) lands.
     # Request priority. `_vm_lock` polls non-blocking flocks with a backoff
     # that grows to 5 s, so the longest waiter sleeps longest, and a worker
     # that just released a slot re-enters at 0.5 s and takes it back. With
@@ -149,6 +150,11 @@ def main() -> None:
             rec["rc"] = rc
             body = report.read_text(encoding="utf-8", errors="replace") if report.exists() else ""
             if "\nDONE" not in body:
+                # Free text on purpose: the closed-vocabulary rule governs
+                # the product's guard, and this is a test harness writing to
+                # a test log, against fake upstreams and test keys, never read
+                # by an agent. Do NOT point loadgen at real providers: this
+                # tail and `diag_out` below would then carry real error text.
                 # Diagnostics for a report that did not arrive: what the
                 # host saw, a re-read after the share's attribute timeout,
                 # and the tail of the dial's output (run-agent's stderr).
@@ -193,6 +199,12 @@ def main() -> None:
 
     def worker(i: int) -> None:
         while True:
+            # `hold.*`: TEMPORARY, remove with the request hold (#52). The
+            # glob is UNSCOPED on purpose: any MCP's hold or driven request
+            # idles EVERY MCP's workers, so the steps that use one (T3, T5b,
+            # W3, T6c, T2c, T2d, every req) run without background load and
+            # measure no zero-downtime under load. The day #52 lands, scope
+            # it to this MCP (`hold.{args.name}.*`) or drop it.
             if (CTL / f"{args.name}.pause").exists() or any(logd.glob("hold.*")):
                 time.sleep(0.5)
                 continue

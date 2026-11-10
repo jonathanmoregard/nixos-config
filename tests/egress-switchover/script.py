@@ -73,6 +73,10 @@ def wait_ok(step, n, mcp=None, mode=None, timeout=900):
         if len(rs) >= n:
             return rs
         check_no_failures(f"{step} (waiting for {n} ok calls)")
+        # Precondition of this 120 s fast-fail: no concurrent step may hold
+        # every worker idle for >120 s while a wait_ok(mcp=...) runs (a
+        # request's or a pause's hold.* file does exactly that), or this
+        # misreads a legitimate wait as "nothing attempted".
         if mcp and time.time() - t_start > 120:
             # Fail fast on the harness case: the MCP started no call at all,
             # and has none in flight. Waiting for a slot or for a dial counts
@@ -125,6 +129,7 @@ def wait_req(name, timeout=900):
 
 
 def pause(mcp):
+    # The hold.pause.* file: TEMPORARY, remove when research-agent#52 lands.
     # While `mcp` drains, hold EVERY MCP's workers (loadgen honours
     # /var/log/switchover/hold.*): a call of `mcp` still waiting for a slot
     # is otherwise starved by the other MCP's workers, which re-enter
@@ -458,17 +463,38 @@ with subtest("T6a: B^-1 first: back into expand"):
 
 with subtest("T6b: then code^-1: revert pushed and pulled"):
     n_scraper = released("scraper")
-    host.succeed("runuser -u jonathan -- lane-git revert && runuser -u jonathan -- lane-git pull")
     set_step("T6b")
+    # §12.4's backwards mixing, driven: a broker-token run deliberately in
+    # flight, its session open, when code^-1 lands and stops the broker.
+    req("new-mcp", "t6b-long", {"v": "long", "long_s": 60, "canary": False, "envcheck": False, "nonce": "t6b"})
+    host.wait_until_succeeds("test -s /var/log/switchover/req.t6b-long.rid", timeout=60)
+    lrid = host.succeed("cat /var/log/switchover/req.t6b-long.rid").strip()
+    host.wait_until_succeeds(
+        f"journalctl -u research-broker.service -o cat | grep -q 'run={lrid} POST /v1/scraper/session/open 200'",
+        timeout=300)
+    host.succeed("runuser -u jonathan -- lane-git revert && runuser -u jonathan -- lane-git pull")
     host.succeed(f"test ! -e {CO}/broker/server.py")
     host.wait_until_succeeds(
         "! systemctl is-active --quiet research-broker.socket"
         " && ! systemctl is-active --quiet research-broker-admin.socket"
         " && ! systemctl is-active --quiet research-broker.service", timeout=300)
+    r = wait_req("t6b-long")
+    assert r["ok"] and r["mode"] == "broker", f"T6b: the broker run in flight across code^-1 failed: {r}"
     rs = wait_ok("T6b", 3, mcp="new-mcp", mode="legacy")
     say(f"T6b dial line: {dial_line(rs[0]['id'])!r}")
     assert "mode=legacy" in dial_line(rs[0]["id"]) and "era=legacy-ok" in dial_line(rs[0]["id"])
     check_no_failures("T6b")
+    # G3's positive control for its log half: T3's rc=0 proved only the
+    # marker half (server.log had no mode=legacy line yet). Here every live
+    # MCP is new code with a marker and server.log now holds legacy dials,
+    # so G3 must fail, and for that reason alone.
+    hours = (now() - MARK["log"] - 5) / 3600
+    rc, out = host.execute(f"runuser -u jonathan -- env XDG_RUNTIME_DIR=/run/user/{UID} "
+                           f"research-mcp-protocheck --window-hours {hours:.4f}")
+    say(f"G3 at T6b (legacy dials in server.log, every MCP marked): rc={rc}\n{out}")
+    assert rc == 1 and "mode=legacy dial inside the window" in out, "T6b: G3 must fail on the legacy dials"
+    assert "no protocol marker" not in out and "not the whole" not in out, \
+        f"T6b: G3 failed for a reason other than the legacy dials: {out}"
     # G2^-1: the keyless MCP, spawned under broker-only, fails closed at
     # code^-1 even in the right order (downtime, not a leak) ...
     req("g2inv-mcp", "xfail-g2inv-t6b", {"v": "exa", "canary": False, "envcheck": False, "nonce": "t6bk"})
@@ -564,8 +590,12 @@ with subtest("T6c: back to base (nixos-A reverted), drained by hand first (§12.
 with subtest("T2c: new code on a base (pre-nixos-A) host: mode=legacy reason=no-broker"):
     set_step("T2c")
     host.succeed("runuser -u jonathan -- lane-git reapply && runuser -u jonathan -- lane-git pull")
-    # A fresh pre-A host has never had the admin socket; a reboot clears /run.
-    host.succeed("rm -f /run/research-broker/admin.sock")
+    # The post-A^-1 host as it really is: the admin socket FILE outlives its
+    # unit (RemoveOnStop=no, /run kept until reboot), so new code must not
+    # read the corpse as a broker (a18528a: connect, never stat). An earlier
+    # version removed it here, as on a fresh host, and hid exactly that.
+    host.succeed("test -S /run/research-broker/admin.sock")
+    host.fail("systemctl is-active --quiet research-broker-admin.socket")
     # b12 T2c: new-mcp2 had 0 ok calls in 900 s while ~560 legacy runs went
     # through, the shape of the slot-lock starvation of b8 T2b and b10 T3
     # (a fresh MCP's pollers back off to 5 s in `_vm_lock`; new-mcp's two
@@ -581,6 +611,8 @@ with subtest("T2c: new code on a base (pre-nixos-A) host: mode=legacy reason=no-
         by[k] = by.get(k, 0) + 1
     say(f"T2c contention, 60 s with new-mcp running: new-mcp2 progress {progress('new-mcp2')} "
         f"in flight {inflight_of('new-mcp2')}; T2c calls by (mcp, mode, ok): {sorted(by.items(), key=str)}")
+    # The probe above stays for good (the only measurement of admission
+    # order); this pause is TEMPORARY, remove when research-agent#52 lands.
     pause("new-mcp")
     rs = wait_ok("T2c", 3, mcp="new-mcp2", mode="legacy")
     line = dial_line(rs[0]["id"])

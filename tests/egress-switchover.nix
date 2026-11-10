@@ -351,7 +351,6 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "vm-egress-switchover";
-  skipTypeCheck = true;
 
   nodes.upstream = { pkgs, ... }: {
     imports = [ noUserNic ];
