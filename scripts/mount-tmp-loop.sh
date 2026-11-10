@@ -20,20 +20,37 @@
 # TMPDIR=/mnt/tmp` on the build steps so user tooling agrees with the
 # bind mount.
 #
-# Idempotent: returns early if /tmp is already a mountpoint.
+# Idempotent: returns early if /tmp already shares the /mnt filesystem.
 
 set -euo pipefail
 
-if mountpoint -q /tmp 2>/dev/null; then
-  echo "/tmp is already a mountpoint; nothing to do"
+# Create /mnt/tmp before any early return: the build steps export
+# TMPDIR=/mnt/tmp unconditionally, and nix mkdtemp's under $TMPDIR while
+# fetching flake inputs, so a missing directory here fails every attempt of
+# the retry loop within seconds.
+sudo mkdir -p /mnt/tmp
+sudo chmod 1777 /mnt/tmp
+
+# When /mnt IS the root filesystem (some runner image rollouts collapse it
+# onto /dev/root), binding /tmp onto it moves QEMU's qcow2 files onto the
+# very disk this redirection exists to protect. Leave /tmp alone there.
+if [ "$(stat -c %d /mnt)" = "$(stat -c %d /)" ]; then
+  echo "::warning::/mnt shares the root filesystem on this runner; leaving /tmp in place rather than adding root-disk pressure"
+  df -h / /tmp
+  exit 0
+fi
+
+# Compare filesystems, not mountpoint-ness. Some runner images ship /tmp as
+# a ~7.7G tmpfs, and a bare `mountpoint -q /tmp` treats that as already
+# done — silently leaving multi-GB VM disks on a RAM-backed filesystem.
+if [ "$(stat -c %d /tmp)" = "$(stat -c %d /mnt/tmp)" ]; then
+  echo "/tmp already shares the /mnt filesystem; nothing to do"
   exit 0
 fi
 
 # Preserve anything the runner has already written to /tmp during setup
 # (action-runner bootstrap, checkout temp dirs). Copy across, swap, then
 # point /tmp at the new location.
-sudo mkdir -p /mnt/tmp
-sudo chmod 1777 /mnt/tmp
 if [ -n "$(sudo ls -A /tmp 2>/dev/null)" ]; then
   sudo cp -a /tmp/. /mnt/tmp/ 2>/dev/null || true
 fi

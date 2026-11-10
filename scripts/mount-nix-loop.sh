@@ -17,42 +17,93 @@ if mountpoint -q /nix 2>/dev/null; then
   exit 0
 fi
 
-# Sparse file via truncate, not fallocate. `fallocate -l 60G` reserves
-# the full 60GB on /mnt's underlying filesystem upfront — fine on
-# ubuntu-latest images where /mnt = /dev/sdb1 with ~70GB free, but
-# some image rollouts have collapsed /mnt onto /dev/root, leaving
-# only ~47GB free after free-root-disk.sh. fallocate then ENOSPCs
-# and the job dies in step 6 (observed on runs 26387387551 attempt 3
-# and 26397985441 attempt 1 during the PR #101 stability loop).
-# truncate creates a sparse image: only filesystem metadata is
-# materialised, actual disk consumed grows as paths are written. The
-# cap is enforced by underlying /mnt free space at runtime —
-# graceful ENOSPC mid-build instead of cold ENOSPC at job start.
-# Works identically on both image variants.
+# Sparse file via truncate, not fallocate: `fallocate -l 60G` reserves the
+# whole image upfront and cold-ENOSPCs at job start on images with a smaller
+# /mnt. truncate materialises only metadata and grows as paths are written.
 #
-# Size the cap from actual free space rather than hardcoding it. A flat
-# 60G was the binding limit, not the disk: on PR #407 (voquill joins the
-# host closure, so CI compiles a Tauri app plus whisper.cpp twice) the
-# image grew to its full 60G and 288 `No space left on device` lines
-# killed `build tuxedo toplevel` and four VM lanes — while the runner
-# still had 29G free (root went 57G -> 116G of 145G, i.e. 57G baseline
-# + the 59G image). Spending that idle headroom costs nothing, because
-# the file is sparse.
+# Two failure modes bound the size, from opposite directions:
 #
-# `max(60G, avail - reserve)` so this can only ever help: the runner
-# image whose /mnt collapsed onto /dev/root with ~47G free keeps the
-# historical 60G ceiling (unreachable there anyway — the disk binds
-# first), while a 145G root variant gets ~78G of real room. The reserve
-# is for build temp dirs, which land outside the image on the same
-# filesystem: ci.yml sets TMPDIR=/mnt/tmp, and /tmp is bind-mounted onto
-# /mnt, so an unreserved cap would just move the ENOSPC into cargo's
-# and cmake's scratch space instead.
-reserve_k=$((10 * 1024 * 1024))                 # 10 GiB for /mnt/tmp
-floor_k=$((60 * 1024 * 1024))                   # never below the old cap
+#   Too small — a flat 60G was the binding limit, not the disk. On PR #407
+#   (voquill joins the host closure, so CI compiles a Tauri app plus
+#   whisper.cpp twice) the image grew to its full 60G and 288 `No space left
+#   on device` lines killed `build tuxedo toplevel` and four VM lanes, while
+#   the runner still had 29G free. Spending idle headroom costs nothing,
+#   because the file is sparse.
+#
+#   Over-committed — some runner image rollouts collapse /mnt onto /dev/root.
+#   There an image larger than its own backing filesystem does not ENOSPC
+#   inside the loopback; it exhausts ROOT. The first casualty is the runner's
+#   own worker process writing _diag: it dies without logging, so the build
+#   step's retry loop never reaches attempt 2 and even the `always()` disk
+#   report never runs. The job then reports a failure with no error message
+#   anywhere in it.
+#
+# So size from free space, and apply the historical 60G floor only where
+# over-committing stays contained — a real /mnt disk, where overrunning the
+# image gives ENOSPC inside the loopback and nix reports it like any other
+# build failure. On the collapsed shape the image never exceeds what the
+# filesystem can spare.
+# The reserve differs by shape. On a real /mnt disk only the build temp dirs
+# share the filesystem — ci.yml sets TMPDIR=/mnt/tmp and /tmp is bind-mounted
+# onto /mnt, so an unreserved cap would just move the ENOSPC into cargo's and
+# cmake's scratch space. On the collapsed shape the runner's own agent and its
+# _diag writes live there too, so hold back more.
+RESERVE_SEPARATE_K=$((10 * 1024 * 1024))
+RESERVE_COLLAPSED_K=$((12 * 1024 * 1024))
+BASELINE_K=$((60 * 1024 * 1024))  # the historical cap, kept as a minimum
+ADVISORY_K=$((20 * 1024 * 1024))  # warn below this, but do not refuse: a capped
+                                  # image can only ENOSPC inside the loopback,
+                                  # so trying and failing legibly beats refusing
+                                  # a build that would have fitted
+
+sudo mkdir -p /mnt
+
+# Classify with the same tool that measures, and treat an unreadable answer as
+# collapsed: "separate" is the guess that over-commits. `stat -c %d` is not
+# usable here — btrfs subvolumes report distinct st_dev on one filesystem, and
+# a failed stat compares unequal, both of which read as "separate".
+mnt_src=$(df --output=source /mnt 2>/dev/null | tail -1 | tr -d ' ' || true)
+root_src=$(df --output=source / 2>/dev/null | tail -1 | tr -d ' ' || true)
+if [ -n "$mnt_src" ] && [ -n "$root_src" ] && [ "$mnt_src" != "$root_src" ]; then
+  shape=separate
+  reserve_k=$RESERVE_SEPARATE_K
+else
+  shape=collapsed
+  reserve_k=$RESERVE_COLLAPSED_K
+  if [ -z "$mnt_src" ] || [ -z "$root_src" ]; then
+    echo "::warning::could not identify the filesystem backing /mnt; assuming it shares the root filesystem"
+  fi
+fi
+
 avail_k=$(df --output=avail -k /mnt | tail -1 | tr -d ' ')
+case "$avail_k" in
+  '' | *[!0-9]*)
+    echo "::error::could not read available space on the filesystem backing /mnt (got '${avail_k}')"
+    df -h / /mnt
+    exit 1
+    ;;
+esac
+
 size_k=$((avail_k - reserve_k))
-[ "$size_k" -lt "$floor_k" ] && size_k="$floor_k"
-echo "/mnt avail ${avail_k}K; sizing /nix image at ${size_k}K"
+if [ "$size_k" -le 0 ]; then
+  echo "::error::/mnt has only $((avail_k / 1024 / 1024))G available, below the $((reserve_k / 1024 / 1024))G reserved for the runner and build temp dirs; no room for a /nix image at all"
+  df -h / /mnt
+  exit 1
+fi
+
+if [ "$shape" = separate ]; then
+  if [ "$size_k" -lt "$BASELINE_K" ]; then
+    size_k=$BASELINE_K
+  fi
+else
+  echo "::warning::/mnt shares the root filesystem on this runner; /nix image held to $((size_k / 1024 / 1024))G ($((avail_k / 1024 / 1024))G avail, $((reserve_k / 1024 / 1024))G reserved) so it cannot exhaust root"
+fi
+
+if [ "$size_k" -lt "$ADVISORY_K" ]; then
+  echo "::warning::/nix image is only $((size_k / 1024 / 1024))G; recent closures have needed more, so expect ENOSPC inside the loopback"
+fi
+
+echo "/mnt avail ${avail_k}K; sizing /nix image at ${size_k}K (${shape} /mnt)"
 sudo truncate -s "${size_k}K" /mnt/nix.img
 sudo mkfs.ext4 -F -E lazy_itable_init=1,lazy_journal_init=1 /mnt/nix.img
 sudo mkdir -p /nix
