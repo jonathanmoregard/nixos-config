@@ -29,13 +29,13 @@
 #     activatable, so a method call on one while it is unowned makes the bus
 #     START that service. Asking "is the screensaver active" the naive way
 #     therefore spawns a screensaver -- and a locker takes the input grab.
-#     Ownership is checked first, via a method on the bus itself, which
-#     activates nothing; and the follow-up call is addressed to the UNIQUE
-#     name that check returned, never to the well-known one, because a
-#     well-known name can fall unowned between the two calls and activate a
-#     replacement anyway. A unique name is never activatable, so the bus can
-#     only answer or say it has gone. Reviewed and fixed before this ever
-#     shipped; the log would have been recording a locker it started itself.
+#     The screensaver probe says `--auto-start=no` to the bus, which is that
+#     refusal stated once. Measured rather than assumed: against an
+#     activatable name on a scratch session bus, a plain `gdbus call` logged
+#     "Activating service name=..." and the service really started, while
+#     this call returned "does not exist" and started nothing. Caught in
+#     review before it ever shipped; the log would otherwise have been
+#     recording a locker it had started itself.
 #
 #   * Any recovery action. The fault is not identified yet, so there is
 #     nothing to recover from and no safe trigger to hang it on. Recovery of
@@ -50,7 +50,8 @@ let
   # scenario: a sampler that blocks on the fault it is sampling records
   # nothing. A timeout is itself a datum and is logged as one.
   callTimeoutSecs = 4;
-  # Backstop for the whole tick: 9 bounded calls plus file IO. Generous
+  # Backstop for the whole tick: the bounded /proc walk, at most 5 bounded
+  # subprocess calls (xprintidle, 2 gdbus, 2 xprop) plus file IO. Generous
   # enough that a slow-but-working desktop is never cut off, short enough
   # that ticks cannot pile up at a 20s interval.
   tickTimeoutSecs = 60;
@@ -77,13 +78,19 @@ let
       import threading
       import time
 
-      GDBUS = os.environ.get("FREEZE_GDBUS", "${pkgs.glib}/bin/gdbus")
+      BUSCTL = os.environ.get("FREEZE_BUSCTL", "${pkgs.systemd}/bin/busctl")
       XPRINTIDLE = os.environ.get("FREEZE_XPRINTIDLE", "${pkgs.xprintidle}/bin/xprintidle")
       XPROP = os.environ.get("FREEZE_XPROP", "${pkgs.xprop}/bin/xprop")
       STATE_DIR = os.environ.get("FREEZE_STATE_DIR", "${stateDir}")
       CALL_TIMEOUT = int(os.environ.get("FREEZE_CALL_TIMEOUT_SECS", "${toString callTimeoutSecs}"))
       MAX_BYTES = int(os.environ.get("FREEZE_MAX_BYTES", "${toString maxBytes}"))
       PROC_BUDGET = int(os.environ.get("FREEZE_PROC_BUDGET_SECS", "${toString procBudgetSecs}"))
+      # busctl's own --timeout must expire BEFORE the subprocess timeout that
+      # wraps it, or the two race: whichever fires first decides whether the
+      # tick learns "the peer accepted the call and never answered" (busctl
+      # wins and says so) or merely "the process was killed" (subprocess
+      # wins, stderr empty, the distinction lost). Strictly smaller, floor 1.
+      CALL_TIMEOUT_INNER = max(1, CALL_TIMEOUT - 1)
       # Overridable so the test can point every /sys read at a fixture tree
       # instead of the builder's real hardware, which has no backlight and
       # whose DRM connectors say nothing about this code being right.
@@ -143,20 +150,79 @@ let
           return value or "?"
 
 
-      def _dbus_err(stderr):
-          """Short D-Bus error name from gdbus stderr, or "" if there is none.
+      def _bus_failure(out, stderr):
+          """Label a failed busctl call. Never invents a substantive answer.
 
-          gdbus prints `Error: GDBus.Error:org.freedesktop.DBus.Error.<Name>:
-          <text>` for a bus-level refusal, and something with no error name at
-          all ("Error connecting: Could not connect: ...") when it cannot
-          reach the bus. Both exit 1, so the presence of a name is itself the
-          signal: a name means the bus answered and refused, no name means the
-          bus was not reachable.
+          These must stay apart, because during a freeze they point at
+          different culprits: nobody is running the screensaver; the
+          screensaver is running but has stopped answering; the session bus
+          itself is gone; the bus answered and refused.
+
+          Every string below was observed from busctl, not guessed. Three
+          details that are easy to get wrong and were only found by looking:
+
+          1. THE TWO BUS IMPLEMENTATIONS WORD "UNOWNED" DIFFERENTLY, and
+             this host runs the one whose wording is less obvious:
+
+               dbus-broker  Call failed: Destination does not exist
+               dbus-daemon  Call failed: Name "org.x" does not exist
+
+             dbus-broker is what runs here (systemd user session, see the
+             `dbusd` matcher). dbus-daemon is what `dbus-run-session` gives
+             a scratch experiment -- so a string captured that way is NOT
+             the string production emits, and matching only it silently
+             reclassifies every real unowned screensaver. Both are listed.
+
+          2. QUOTING IS NOT UNIFORM, and some near-misses also contain the
+             words "does not exist":
+
+               wrong path  Call failed: Object does not exist at path "/x"
+               no method   Call failed: No such method "Foo"
+
+             Those two come from a LIVE, OWNED peer and carry CURLY quotes
+             (systemd composes them; the unowned texts above come from the
+             bus and are ASCII). So an unanchored `does not exist` test
+             files a working screensaver as "no screensaver running". Each
+             accepted phrase is therefore written out in full, and anything
+             unrecognised falls through to `callerr` rather than being
+             guessed at.
+
+          3. ORDER MATTERS. "Failed to connect ...: Connection timed out" is
+             a dead bus, not a slow screensaver, so the connect test runs
+             before the timeout test.
+
+          There is no structured alternative to this prose: `--json=short`
+          was tried and leaves stderr exactly as above, so busctl's `call`
+          verb never exposes the D-Bus error name.
+
+          `out` carries the probe-level outcome instead ("timeout" when our
+          own subprocess kill beat busctl, "error:<Type>" when it could not
+          be launched at all).
           """
-          m = re.search(r"GDBus\.Error:(?:[\w.]*\.)?(\w+)", stderr or "")
-          if m:
-              return m.group(1)
-          return "busfail" if stderr else ""
+          stderr = stderr or ""
+          if out == "timeout" or out.startswith("error:"):
+              return out
+          if re.search(r"Failed to connect", stderr):
+              return "busfail"
+          if re.search(r'Destination does not exist'        # dbus-broker
+                       r'|Name "[^"]*" does not exist',     # dbus-daemon
+                       stderr):
+              return "unowned"
+          # Measured, not assumed: SIGSTOPping the bus daemon and leaving a
+          # live peer unresponsive BOTH yield "Connection timed out", so
+          # this one label genuinely cannot say which stalled. The two-call
+          # design it replaced could, and that is a real loss. The `dbusd`
+          # field narrows it from the same line without another bus call,
+          # but only as evidence, not as proof -- see PROC_MATCHERS.
+          if re.search(r"[Tt]imed out|[Tt]imeout", stderr):
+              return "notimely"
+          # The bus answered and refused: wrong object path, unknown method,
+          # wrong signature, AccessDenied. That is a fault in this probe or
+          # a changed screensaver API -- emphatically NOT "the session bus
+          # is gone", which is what this used to be filed as.
+          if stderr:
+              return "callerr"
+          return "unparsed"
 
 
       def idle_ms():
@@ -173,68 +239,72 @@ let
 
 
       def screensaver_active():
-          # Ask the bus who owns the name BEFORE calling a method on it.
-          #
-          # This is not defensive habit, it is the difference between
-          # observing and interfering. The host ships
-          # org.cinnamon.ScreenSaver.service in
-          # /run/current-system/sw/share/dbus-1/services/, so the name is
-          # D-Bus-activatable: a plain method call on an unowned name makes
-          # the bus START cinnamon-screensaver. A sampler that does that
-          # every 20s would spawn a locker -- and a locker takes the input
-          # grab -- into the session it is supposed to be a passive witness
-          # to. That is the same class of self-inflicted fault as taking an
-          # X grab, which this module refuses to do for the same reason.
-          #
-          # GetNameOwner is a method on the bus itself, which is always
-          # running, so it activates nothing. "unowned" is also a better
-          # datum than a spawned locker's "0": it says the screensaver was
-          # not running at all.
+          """Is the screen locked? Asked in a way that cannot start a locker.
+
+          The host ships org.cinnamon.ScreenSaver.service in
+          /run/current-system/sw/share/dbus-1/services/, so the name is
+          D-Bus-activatable: a plain method call on it while it is unowned
+          makes the bus START cinnamon-screensaver. A sampler doing that
+          every 20s would spawn a locker -- and a locker takes the input
+          grab -- into the session it is supposed to be a passive witness to.
+          Same class of self-inflicted fault as taking an X grab, which this
+          module refuses for the same reason.
+
+          `--auto-start=no` is that refusal, stated once to the bus. It was
+          measured, not assumed: against an activatable name on a scratch
+          session bus, a plain `gdbus call` logged "Activating service
+          name=..." and the service really started, while this call returned
+          "does not exist" and started nothing.
+
+          This replaced a hand-rolled two-step -- GetNameOwner, then address
+          the unique name it returned -- which was correct but larger, and
+          which needed a third state ("vanished") purely to describe the
+          owner disappearing between its two calls. One call has no gap
+          between calls, so that state stopped existing rather than being
+          handled.
+          """
           ok, out, err = _run([
-              GDBUS, "call", "--session", "--timeout", str(CALL_TIMEOUT),
-              "--dest", "org.freedesktop.DBus",
-              "--object-path", "/org/freedesktop/DBus",
-              "--method", "org.freedesktop.DBus.GetNameOwner",
-              "org.cinnamon.ScreenSaver",
+              BUSCTL, "--user", "call", "--auto-start=no",
+              "--timeout=%d" % CALL_TIMEOUT_INNER,
+              "org.cinnamon.ScreenSaver", "/org/cinnamon/ScreenSaver",
+              "org.cinnamon.ScreenSaver", "GetActive",
           ])
           if not ok:
-              return "unowned" if _dbus_err(err) == "NameHasNoOwner" else (
-                  "owner_%s" % (_dbus_err(err) or out))
-          # The unique name (":1.53"), not the well-known one, is the
-          # destination of the second call. Checking ownership and then
-          # addressing org.cinnamon.ScreenSaver anyway would leave the
-          # activation race wide open: if the owner exits between the two
-          # calls, the well-known name is unowned again by the time the
-          # second call lands, and the bus starts a replacement -- the exact
-          # thing the ownership check was added to prevent.
-          #
-          # A unique name is never activatable. Addressing it means the bus
-          # can only answer or report that it has gone, never spawn. gdbus
-          # has no --no-auto-start, so this is also the only way to express
-          # "ask, but never start" with this tool.
-          m = re.search(r"'(:[0-9.]+)'", out)
-          if not m:
-              return "owner_unparsed"
-          ok, out, err = _run([
-              GDBUS, "call", "--session", "--timeout", str(CALL_TIMEOUT),
-              "--dest", m.group(1),
-              "--object-path", "/org/cinnamon/ScreenSaver",
-              "--method", "org.cinnamon.ScreenSaver.GetActive",
-          ])
-          if not ok:
-              # The owner existed a moment ago and does not now. That is the
-              # race, recorded as a datum instead of papered over by having
-              # started something.
-              if _dbus_err(err) in ("NameHasNoOwner", "ServiceUnknown"):
-                  return "vanished"
-              return "active_%s" % _dbus_err(err) if _dbus_err(err) else out
-          return "1" if "true" in out else "0"
+              return _bus_failure(out, err)
+          # Match the reply shape rather than looking for "true" anywhere in
+          # it. A substring test turned every unexpected reply -- empty
+          # output, a changed signature, a future formatting change -- into
+          # "0", which does not mean "could not tell", it means "the
+          # screensaver was running and the screen was NOT locked". That is a
+          # claim about the desktop manufactured out of a parse failure, and
+          # the most misleading thing this log could say about a freeze.
+          if re.fullmatch(r"b\s+true", out):
+              return "1"
+          if re.fullmatch(r"b\s+false", out):
+              return "0"
+          return "active_unparsed"
+
+
+      def _sys_class(subdir):
+          """(entries, present) for a /sys class directory.
+
+          `present` separates "the kernel exposes this class and it is empty"
+          from "this path is not readable at all". Both used to collapse into
+          "none", which reads as a substantive observation -- no backlight, no
+          enabled connector -- when it may only mean the sampler was looking
+          somewhere that does not exist. On a machine whose symptom is a dark
+          screen, "no enabled connector" is close to a diagnosis, so it must
+          never be something a bad path can fabricate.
+          """
+          root = _sys("/sys/class/" + subdir)
+          return sorted(glob.glob(os.path.join(root, "*"))), os.path.isdir(root)
 
 
       def backlight():
           """<name>:<brightness>/<max>:power<bl_power> for each backlight."""
           out = []
-          for d in sorted(glob.glob(_sys("/sys/class/backlight/*"))):
+          devices, present = _sys_class("backlight")
+          for d in devices:
               # bl_power is the field that answers "was the panel actually
               # lit": 0 is on, 4 is off. Brightness alone does not, because a
               # dimmed-but-on panel and a powered-off one can report the same
@@ -245,13 +315,18 @@ let
                   _read(os.path.join(d, "max_brightness")) or "?",
                   _read(os.path.join(d, "bl_power")) or "?",
               ))
-          return ",".join(out) if out else "none"
+          if out:
+              return ",".join(out)
+          return "none" if present else "unreadable"
 
 
       def connectors():
           """<name>:<status>:<dpms> for every enabled DRM connector."""
           out = []
-          for d in sorted(glob.glob(_sys("/sys/class/drm/card*-*"))):
+          devices, present = _sys_class("drm")
+          for d in devices:
+              if not re.match(r"card\d+-", os.path.basename(d)):
+                  continue
               if (_read(os.path.join(d, "enabled")) or "") != "enabled":
                   continue
               name = os.path.basename(d).split("-", 1)[-1]
@@ -260,7 +335,9 @@ let
                   _read(os.path.join(d, "status")) or "?",
                   _read(os.path.join(d, "dpms")) or "?",
               ))
-          return ",".join(out) if out else "none"
+          if out:
+              return ",".join(out)
+          return "none" if present else "unreadable"
 
 
       def active_window():
@@ -308,6 +385,24 @@ let
           # A pam helper still alive across several ticks is an unlock
           # conversation that never finished.
           ("pamhelper", ("cinnamon-screensaver-pam-helper",)),
+          # The session bus daemon, carried to help disambiguate
+          # ss_active=notimely: busctl reports a stalled BUS and a stalled
+          # PEER with the same "Connection timed out", so the label alone
+          # cannot say which. This costs no extra bus call, since the /proc
+          # walk already runs.
+          #
+          # READ IT AS A HINT, NOT AS PROOF. Several brokers usually exist
+          # (system bus, user bus, any nested session) and _fmt_hits reports
+          # the highest pid, which is not necessarily the one this probe
+          # talks to -- that heuristic is tuned for spotting a stalled
+          # `cinnamon --replace`, not for picking a bus. The `+N` suffix is
+          # the tell that others were seen. So D or T here alongside
+          # notimely is good evidence the bus stalled; S here does not by
+          # itself clear the bus.
+          #
+          # dbus-broker, not dbus-daemon: that is what this host runs, and
+          # the difference matters elsewhere too (see _bus_failure).
+          ("dbusd", ("=dbus-broker",)),
       )
 
 
@@ -398,7 +493,19 @@ let
                   )
 
           th = threading.Thread(target=target, daemon=True)
-          th.start()
+          try:
+              th.start()
+          except Exception as exc:  # noqa: BLE001 - fields, not a crash
+              # Thread exhaustion (RLIMIT_NPROC, a runaway spawner) is
+              # itself a freeze symptom, so this is the one moment the rest
+              # of the line matters most. Before this, the failure escaped
+              # to main() and cost ALL of it: the whole sample collapsed to
+              # "sampler=failed:RuntimeError" -- no idle_ms, no ss_active,
+              # no PSI -- for the event the log exists to explain.
+              return dict(
+                  (name, "error:%s" % type(exc).__name__)
+                  for name, _ in PROC_MATCHERS
+              )
           th.join(PROC_BUDGET)
           return box.get("r") or dict((name, "timeout") for name, _ in PROC_MATCHERS)
 
@@ -432,6 +539,7 @@ let
               ("cinnamon", procs["cinnamon"]),
               ("locker", procs["locker"]),
               ("pamhelper", procs["pamhelper"]),
+              ("dbusd", procs["dbusd"]),
               ("load", (_read("/proc/loadavg", 128) or "?").split(" ")[0]),
               ("psi_cpu", pressure("cpu")),
               ("psi_io", pressure("io")),
@@ -468,19 +576,45 @@ let
 
       def main(argv):
           cmd = argv[1] if len(argv) > 1 else "tick"
-          line = " ".join("%s=%s" % (k, _clean(v)) for k, v in sample())
+          if cmd not in ("tick", "show"):
+              print("usage: desktop-freeze-sample [tick|show]", file=sys.stderr)
+              return 64
+          # Collecting a sample must not be able to fail the tick.
+          #
+          # Every probe below is individually defensive, but the collection
+          # around them was not, and "individually defensive" is exactly the
+          # reasoning that misses the step that has no probe in it. Observed:
+          # under a process-count limit, threading.Thread.start() raises
+          # RuntimeError("can't start new thread"), which escaped sample(),
+          # skipped write() entirely and exited 1 -- a failed unit and no
+          # line, at the moment a line is worth most. Resource exhaustion is
+          # not a hypothetical here: it is a plausible shape for the freeze
+          # this log exists to explain.
+          #
+          # So the sample is best-effort and the line is written regardless.
+          # A line saying only when the tick ran and that it broke is worth
+          # more than a unit failure and silence.
+          try:
+              fields = sample()
+          except Exception as exc:  # noqa: BLE001 - a datum, not a crash
+              fields = [
+                  ("t", time.strftime("%Y-%m-%dT%H:%M:%S%z")),
+                  ("mono", "%.0f" % time.monotonic()),
+                  ("sampler", "failed:%s" % type(exc).__name__),
+              ]
+          line = " ".join("%s=%s" % (k, _clean(v)) for k, v in fields)
           if cmd == "show":
               print(line)
               return 0
-          if cmd != "tick":
-              print("usage: desktop-freeze-sample [tick|show]", file=sys.stderr)
-              return 64
           try:
               write(line)
-          except OSError as exc:
+          except Exception as exc:  # noqa: BLE001 - never fail the unit
               # A sampler that fails the unit on a full disk turns a
-              # diagnostic into an outage of its own.
-              print("desktop-freeze-sample: write failed: %s" % exc, file=sys.stderr)
+              # diagnostic into an outage of its own. Same for any other
+              # write-path surprise: the tick is the thing being observed
+              # least, so it is the thing allowed to fail most quietly.
+              print("desktop-freeze-sample: write failed: %s: %s"
+                    % (type(exc).__name__, exc), file=sys.stderr)
               return 0
           return 0
 
