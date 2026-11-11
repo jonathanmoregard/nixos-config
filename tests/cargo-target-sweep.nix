@@ -28,6 +28,7 @@ pkgs.runCommand "cargo-target-sweep-contract"
     pkgs.diffutils
     pkgs.findutils
     pkgs.gnugrep
+    pkgs.python3
     pkgs.util-linux
   ];
   # Passed as derivation attributes, matching tests/worktree-sweep.nix:
@@ -52,8 +53,8 @@ pkgs.runCommand "cargo-target-sweep-contract"
   # A genuine cargo target dir: built by cargo, so it carries the
   # .fingerprint metadata cargo-sweep needs and the deps/ layout that the
   # age computation has to cope with.
-  mk_real() { # name -> prints the worktree path
-    local wt="$ROOT/$1"
+  mk_real() { # crate-name [dir-name] -> prints the worktree path
+    local wt="$ROOT/''${2:-$1}"
     mkdir -p "$wt/src"
     printf 'pub fn f() -> u32 { 1 }\n' > "$wt/src/lib.rs"
     printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\npath = "src/lib.rs"\n' "$1" > "$wt/Cargo.toml"
@@ -143,6 +144,23 @@ pkgs.runCommand "cargo-target-sweep-contract"
     || { echo "FAIL arm6 fixture: the tree is not actually fresh — nothing was written deep inside it"; exit 1; }
   echo "arm6 fixture: depth-1 reads $(((deep_now - deep_d1) / 86400))d, deepest write $(((deep_now - deep_all) / 86400))d"
 
+  # ------------------------------------------------------ host /proc shape
+  # On a real host most /proc/N/{cwd,fd,maps} belong to other users and are
+  # unreadable (521 of 817 on tuxedo, 2026-11-11). `find` and `gawk` then
+  # exit non-zero EVEN WHEN THEY MATCHED, and a liveness test that reads
+  # their exit status reports every live directory as idle — reproduced on
+  # tuxedo: a shell cd'd into a target dir, an fd held in it and a mapping
+  # out of it all read "not live". The single-uid sandbox has no such
+  # entries, so arms 7-7e passed against that script. A NON-DUMPABLE process
+  # of our own uid gets root-owned /proc entries, which is the host's shape.
+  python3 -c 'import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); time.sleep(600)' &
+  ndpid=$!
+  sleep 1
+  # Open, don't `test -r`: maps is mode 0444 whatever the dumpable flag, and
+  # the ptrace access check that refuses it only happens at open().
+  ! cat "/proc/$ndpid/maps" >/dev/null 2>&1 && ! readlink "/proc/$ndpid/cwd" >/dev/null 2>&1 \
+    || { echo "FATAL host-shape: the non-dumpable neighbour's /proc entries are readable — arms 7-7e would not model the host"; exit 1; }
+
   # ---------------------------------------------------------------- arm 7
   # LIVE. A process holding an fd on a real artifact inside a stale target
   # dir protects the whole directory.
@@ -177,6 +195,27 @@ pkgs.runCommand "cargo-target-sweep-contract"
   sleep 1   # let it map itself in
   grep -qF "$MAPWT/target/debug/sleep" "/proc/$mappid/maps" \
     || { echo "FATAL arm7c: fixture process is not mapped out of the target dir"; exit 1; }
+
+  # ---------------------------------------------------------------- arm 7d
+  # PATTERN CHARACTERS IN THE PATH. A liveness match that treats the
+  # directory as a glob (`find -lname "$dir/*"`) never matches a worktree
+  # named with [ ] * ?, so a shell sitting inside one reads as idle.
+  GLOBWT=$(mk_real globcwd 'glob [1]'); backdate "$GLOBWT/target" 90
+  ( cd "$GLOBWT/target" && exec sleep 300 ) &
+  globpid=$!
+
+  # ---------------------------------------------------------------- arm 7e
+  # SPACES IN A MAPPED PATH. /proc/N/maps is whitespace-separated, so reading
+  # the path as field 6 truncates "map [1]/..." at the space and the mapping
+  # is never matched.
+  SPMAPWT=$(mk_real spacemap 'map [1]')
+  cp "$(command -v sleep)" "$SPMAPWT/target/debug/sleep"
+  backdate "$SPMAPWT/target" 90
+  "$SPMAPWT/target/debug/sleep" 300 &
+  spmappid=$!
+  sleep 1
+  grep -qF "$SPMAPWT/target/debug/sleep" "/proc/$spmappid/maps" \
+    || { echo "FATAL arm7e: fixture process is not mapped out of the target dir"; exit 1; }
 
   # ---------------------------------------------------------------- arm 8
   # ERREXIT. writeShellApplication's preamble sets errexit and the script's
@@ -237,9 +276,8 @@ pkgs.runCommand "cargo-target-sweep-contract"
 
   exec {held}>&-
   exec {livefd}>&-
-  kill "$cwdpid" "$mappid" 2>/dev/null || true
-  wait "$cwdpid" 2>/dev/null || true
-  wait "$mappid" 2>/dev/null || true
+  kill "$cwdpid" "$mappid" "$globpid" "$spmappid" "$ndpid" 2>/dev/null || true
+  for p in "$cwdpid" "$mappid" "$globpid" "$spmappid" "$ndpid"; do wait "$p" 2>/dev/null || true; done
 
   # ----------------------------------------------------------- assertions
 
@@ -319,6 +357,18 @@ pkgs.runCommand "cargo-target-sweep-contract"
     || { echo "FAIL arm7c: deleted a target dir a running process was mapped out of"; exit 1; }
   grep -q "KEEP   $MAPWT/target — LIVE" run.log \
     || { echo "FAIL arm7c: the mapped-file branch of the liveness scan did not fire"; cat run.log; exit 1; }
+
+  # arm 7d: cwd inside a path containing glob characters and a space
+  test -d "$GLOBWT/target" \
+    || { echo "FAIL arm7d: deleted a target dir a process was sitting in (glob chars in path)"; exit 1; }
+  grep -qF "KEEP   $GLOBWT/target — LIVE" run.log \
+    || { echo "FAIL arm7d: liveness treated the path as a pattern"; cat run.log; exit 1; }
+
+  # arm 7e: mapping out of a path containing a space
+  test -d "$SPMAPWT/target" \
+    || { echo "FAIL arm7e: deleted a target dir a process was mapped out of (space in path)"; exit 1; }
+  grep -qF "KEEP   $SPMAPWT/target — LIVE" run.log \
+    || { echo "FAIL arm7e: the maps scan truncated a path at a space"; cat run.log; exit 1; }
 
   # arm 8: an unwalkable subtree makes staleness unprovable, so the tree is
   # kept — not detached on the strength of a walk that could not see the

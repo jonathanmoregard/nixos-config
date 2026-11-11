@@ -175,20 +175,35 @@ pkgs.writeShellApplication {
     # build in the user's worktree) is not seen. The swept trees are the
     # user's own and the unit runs as that user, so this is out of scope
     # rather than handled; it is not a case this sweep can detect.
+    #
+    # THE SIGNAL IS OUTPUT, NEVER EXIT STATUS. On a real host most /proc
+    # entries belong to other users, so `find` and `gawk` exit non-zero on
+    # EACCES even after they matched — and under pipefail that read as "not
+    # live". Reproduced on tuxedo 2026-11-11: a shell cd'd into a target dir,
+    # an fd held in it and a mapping out of it all read idle, and the harness
+    # (single-uid sandbox, no unreadable entries) passed regardless.
+    #
+    # PATHS ARE STRINGS, NEVER PATTERNS. `-lname "$dir/*"` is a glob, so a
+    # worktree named with [ ] * ? never matched; maps' path is read as the
+    # rest of the line after five fields, not as $6, which truncates at a
+    # space.
     is_live() {
-      local dir=$1 lock="$1/$LOCK_NAME"
-      if find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 \
-           \( -lname "$dir" -o -lname "$dir/*" \) ! -lname "$lock" \
-           -print -quit 2>/dev/null | grep -q .; then
-        return 0
-      fi
+      local dir=$1 lock="$1/$LOCK_NAME" hit
+      hit=$(find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%l\n' 2>/dev/null \
+              | awk -v d="$dir" -v lk="$lock" \
+                  '$0 != lk && ($0 == d || index($0, d "/") == 1) { print "hit"; exit }')
+      [ -n "$hit" ] && return 0
       # Mapped files matter on their own: a running rustc maps .rlib/.so
       # straight out of the target dir without holding a conventional fd.
-      if awk -v d="$dir/" -v lk="$lock" \
-           '$6 != lk && index($6, d) == 1 { found = 1; exit } END { exit (found ? 0 : 1) }' \
-           /proc/[0-9]*/maps 2>/dev/null; then
-        return 0
-      fi
+      # gawk treats an unopenable input file as FATAL and never reaches the
+      # files after it (measured: one non-dumpable neighbour sorted first hid
+      # every mapping behind it), so unreadable maps are skipped explicitly.
+      hit=$(awk -v d="$dir/" -v lk="$lock" \
+              'BEGINFILE { if (ERRNO != "") nextfile }
+               { p = $0; if (!sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +/, "", p)) next }
+               p != lk && index(p, d) == 1 { print "hit"; exit }' \
+              /proc/[0-9]*/maps 2>/dev/null)
+      [ -n "$hit" ] && return 0
       return 1
     }
 
