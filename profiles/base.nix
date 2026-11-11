@@ -113,5 +113,49 @@
     fileSystems = [ "/" ];
   };
 
+  # /tmp aging, with atime removed from the age criteria.
+  #
+  # systemd ships `q /tmp 1777 root root 10d` in tmp.conf. On tuxedo that rule
+  # reaped nothing: on 2026-11-10 /tmp held 787 GB across 34,067,293 files,
+  # with empty directories dating to 2026-09-30 still present. The disk was
+  # 95% full as a direct result.
+  #
+  # Cause: the default age criteria are `abcmABM` — atime, btime, ctime and
+  # mtime for files; Atime, Btime and Mtime for directories — and *every*
+  # criterion must be older than the cutoff before an entry is removed. On
+  # tuxedo the atime condition is never satisfied, so nothing in /tmp ages out
+  # however long ago it was last written.
+  #
+  # Measured before this change: all 11,899 /tmp/nix-develop-* dirs had an
+  # atime within the last 2 days while their mtimes spread across September,
+  # October and November, and the cleaner said so itself at debug level —
+  # `Directory "/tmp/nix-develop-104998-2679922558": access time
+  # Mon 2026-11-09 21:21:48 is too new.` (mtime and ctime: 2026-09-30).
+  #
+  # What keeps those atimes fresh is NOT the cleaner. systemd opens
+  # directories O_NOATIME when traversing, and verified on tuxedo: a fixture
+  # with its atime forced to 2020-01-01 was walked and reported on by
+  # `systemd-tmpfiles --clean` and came back still stamped 2020-01-01, so
+  # there is no privilege fallback here. The refresher is ordinary readers of
+  # /tmp — indexers, backups, agent tooling enumerating the tree — combined
+  # with `relatime` on /, which bumps atime once the stored value is over 24h
+  # old. The specific reader is not identified and does not need to be: the
+  # atimes are observably fresh whatever touches them, and excluding atime is
+  # the right policy for /tmp either way.
+  #
+  # `bcmBM` keeps every default criterion except atime, so aging follows when
+  # a file was last *written*, not last looked at. This file renders into
+  # /etc/tmpfiles.d/00-nixos.conf, which sorts before tmp.conf, so this entry
+  # wins and tmp.conf's /tmp line is ignored as a duplicate — the same
+  # precedence the research-agent rules in profiles/workstation rely on.
+  # /var/tmp is a separate path and keeps its upstream 30d rule untouched.
+  #
+  # Asserted behaviourally by checks.x86_64-linux.vm-base: a directory whose
+  # mtime is aged past the cutoff but whose atime was just refreshed by a read
+  # must still be reaped. That assertion fails against the upstream `abcmABM`.
+  systemd.tmpfiles.rules = [
+    "q /tmp 1777 root root bcmBM:10d"
+  ];
+
   system.stateVersion = "25.11";
 }
