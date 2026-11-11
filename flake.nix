@@ -466,6 +466,14 @@
           deployedExecStart = primaryConfig
             .home-manager.users.jonathan
             .systemd.user.services.cargo-target-sweep.Service.ExecStart;
+          # Schedule gate: the harness asserts this sweep and worktree-sweep
+          # do not share a window, since both walk the same trees.
+          deployedTimer = primaryConfig
+            .home-manager.users.jonathan
+            .systemd.user.timers.cargo-target-sweep.Timer;
+          worktreeSweepTimer = primaryConfig
+            .home-manager.users.jonathan
+            .systemd.user.timers.worktree-sweep.Timer;
         };
         # Not a VM lane: runtime-invocation harness for the kitty
         # session save/restore scripts (home/kitty.nix) — single-line

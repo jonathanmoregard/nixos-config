@@ -27,7 +27,8 @@
 # working-tree changes, branches and .git are never touched by anything here.
 #
 # TWO PASSES, both liveness-gated:
-#   A. target dir untouched >= maxAgeDays  -> removed whole, via `cargo clean`
+#   A. target dir untouched >= maxAgeDays  -> detached, then removed via
+#                                             `cargo clean`
 #   B. target dir still active             -> `cargo sweep --time` prunes only
 #                                             the stale artifacts inside it
 # Pass B is what keeps long-lived worktrees from silently re-accumulating;
@@ -36,7 +37,9 @@
 # WHY `cargo clean` AND `cargo sweep`, NOT `rm -rf`. Both are scoped by
 # construction: they can only ever touch the target directory belonging to the
 # manifest they are handed. A stray root or a symlinked path cannot turn
-# either into a recursive delete of something else.
+# either into a recursive delete of something else. That scoping is only as
+# good as the target directory cargo actually resolves, which is why
+# predicate (4) below pins it rather than assuming it.
 #
 # FAIL-CLOSED CONTRACT (asserted by tests/cargo-target-sweep.nix). Every
 # predicate must positively hold or the directory is kept, and the reason is
@@ -44,29 +47,50 @@
 #
 #   1. path matches <root>/*/target and resolves (after symlink resolution)
 #      to a location still inside that root
-#   2. it really is a Cargo target dir — CACHEDIR.TAG present with Cargo's
-#      own signature. This is the single most important gate: it is what
-#      stops a directory merely NAMED `target` from being deleted.
+#   2. it really is a Cargo target dir — CACHEDIR.TAG with Cargo's own
+#      signature, .rustc_info.json, or a profile .fingerprint dir. This is
+#      what stops a directory merely NAMED `target` from being deleted.
 #   3. a Cargo.toml sits beside it, so the scoped tool has a manifest
-#   4. no live process has cwd, an open fd, or a mapped file inside it
+#   4. `cargo metadata` resolves that manifest's target directory to exactly
+#      this path. CARGO_TARGET_DIR is not the only way to redirect it:
+#      CARGO_BUILD_TARGET_DIR and `build.target-dir` in any .cargo/config.toml
+#      on the cwd ancestry (notably ~/.cargo/config.toml, which IS on it when
+#      this runs as a user unit) redirect it too. Measured 2026-11-11: with
+#      CARGO_BUILD_TARGET_DIR set, `cargo metadata` reported the redirected
+#      path — so asking cargo is the check, and unsetting is only the belt.
+#   5. the per-worktree Cargo lock (.klaffat-cargo.lock) can be taken
+#      non-blocking — the same lock ~/Repos/klaffat/scripts/with-cargo-lock
+#      takes, so a lane holding it is never interrupted
+#   6. no live process has cwd, an open fd, or a mapped file inside it
 #      — mapped files matter: a running rustc maps .rlib/.so straight out
 #        of the target dir without holding a conventional fd
-#   5. the per-worktree Cargo lock (.klaffat-cargo.lock) can be taken
-#      non-blocking, and is HELD for the duration of the removal, so a lane
-#      cannot start building into a directory mid-delete
+#      — this check is taken FRESH, per directory, while the lock is held,
+#        and is the last thing before acting. An earlier revision took one
+#        /proc snapshot up front; a `cargo` started by hand after that
+#        snapshot (it takes no klaffat lock) would have been swept
+#        mid-build. One snapshot per candidate costs ~0.1s on a Nice=15
+#        idle-IO daily job and removes the window entirely.
 #
-# Predicates 4 and 5 are what make this safe against the standing constraint
+# Predicates 5 and 6 are what make this safe against the standing constraint
 # that parallel klaffat lanes run constantly: destroying a lane's target dir
-# mid-build loses hours and can corrupt a run reporting into a PR. In
-# practice (4) fires first, because holding a flock requires holding an open
-# fd and that fd is visible in /proc. (5) is not therefore redundant: it is
-# the only thing that closes the window BETWEEN the check and the delete,
-# and it is the same lock scripts/with-cargo-lock takes in the klaffat repo,
-# so a lane starting mid-sweep blocks instead of racing.
+# mid-build loses hours and can corrupt a run reporting into a PR.
 #
-# Age is deliberately NOT read from the target dir's own mtime — see the
-# comment at the age computation. Getting that wrong makes the job silently
-# self-defeating.
+# WHY PASS A DETACHES BEFORE CLEANING. `cargo clean` unlinks everything in the
+# target dir — including the lock file this sweep is holding. Measured
+# 2026-11-11: with the sweep still holding its fd, a competing lane recreated
+# .klaffat-cargo.lock (new inode) and took the flock immediately, i.e. the
+# mutual exclusion is gone the moment the clean starts, exactly while the
+# files are disappearing. So pass A renames `target` to
+# `target.sweeping.<pid>` first — one atomic rename in the parent directory —
+# and cleans the detached path. A lane arriving mid-delete then creates a
+# fresh empty `target/` and builds into it: a cold build, never a build whose
+# files vanish underneath it. A sweep killed between the rename and the clean
+# leaves a detached dir behind, which the next run adopts (see ADOPT below),
+# gated on the recorded pid no longer existing.
+#
+# Age is deliberately NOT read from the target dir's own mtime, nor from its
+# depth-1 entries — see the comment at the age computation. Getting that wrong
+# makes the job delete directories that are being built into right now.
 
 let
   inherit (pkgs) lib;
@@ -79,60 +103,174 @@ pkgs.writeShellApplication {
     cargo-sweep
     coreutils
     findutils
+    gawk
     gnugrep
+    jq
     util-linux
   ];
   text = ''
     set -uo pipefail
+    # writeShellApplication's preamble sets errexit, and `set -uo pipefail`
+    # above does NOT clear it (measured: a bare `false` aborted the script).
+    # A sweep must survive one bad directory: `du` on a tree with an
+    # unreadable subdir, a vanished path, a manifest cargo dislikes. Every
+    # predicate here is tested explicitly and every failure is logged, so
+    # errexit buys nothing and costs the rest of the run.
+    set +e
 
     MAX_AGE_DAYS=${toString maxAgeDays}
     PRUNE_AGE_DAYS=${toString pruneAgeDays}
     DRY_RUN=''${CARGO_TARGET_SWEEP_DRY_RUN:-0}
     ROOTS=(${rootsStr})
 
-    # Cargo refuses to honour a manifest path if this is set, and a stray
-    # value from the environment would redirect every clean below.
-    unset CARGO_TARGET_DIR
+    # Belt for predicate (4)'s braces: these redirect the target dir cargo
+    # resolves, and a stray value from the environment would aim every clean
+    # below somewhere else. The metadata check is what actually enforces it.
+    unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
 
     log() { printf '%s\n' "$*"; }
     keep() { log "KEEP   $2 — $1"; }
+    # Counted so the unit can fail. systemd treats the last command's status
+    # as the service result, and the last command here is a log line, so
+    # without this every failed detach and failed clean would report success
+    # and the host's unit-failure notifier would never fire.
+    failures=0
+    fail() { log "FAIL   $*"; failures=$((failures + 1)); }
 
-    # ---- live-path set: cwd, open fds, and mapped files of every process ----
-    LIVE=$(mktemp) || exit 1
-    trap 'rm -f "$LIVE"' EXIT
-    for p in /proc/[0-9]*; do
-      [ -r "$p" ] || continue
-      readlink "$p/cwd" 2>/dev/null >>"$LIVE" || true
-      if [ -d "$p/fd" ]; then
-        for fd in "$p"/fd/*; do
-          [ -e "$fd" ] || continue
-          readlink "$fd" 2>/dev/null >>"$LIVE" || true
-        done
+    LOCK_NAME=.klaffat-cargo.lock
+    release_lock() {
+      if [ -n "''${lockfd:-}" ]; then
+        exec {lockfd}>&-
+        lockfd=""
       fi
-      if [ -r "$p/maps" ]; then
-        awk '{ if ($6 ~ /^\//) print $6 }' "$p/maps" 2>/dev/null >>"$LIVE" || true
+      return 0
+    }
+
+    # Liveness depends entirely on /proc. If it cannot be read, nothing below
+    # can establish that a directory is idle, and the fail-closed contract
+    # says refuse rather than guess.
+    if [ ! -r /proc/self/maps ] || [ ! -L /proc/self/cwd ]; then
+      log "ABORT  /proc is not readable — cannot verify liveness; refusing to sweep"
+      exit 1
+    fi
+
+    # Fresh liveness scan for ONE directory: cwd, open fds and mapped files of
+    # every process. Returns 0 when something live is inside it.
+    #
+    # Two scans, each ONE process rather than one per pid. The per-pid shape
+    # this replaces spawned readlink for every fd and awk for every process:
+    # measured on tuxedo with 822 processes it cost 7.4s PER DIRECTORY, 11+
+    # minutes across the 91 real target dirs, and — worse than slow — every
+    # one of those seconds sat between the liveness check and the delete it
+    # was meant to guard. The single-process form measures 0.04s and 0.009s,
+    # so the window it leaves is a window in name only.
+    #
+    # The coordination lock file is excluded: holding only that fd is what a
+    # waiting lane looks like, and the flock predicate is what handles it.
+    # Without this exclusion the flock branch could never fire — the holder
+    # would always look LIVE first — and so could never be tested either.
+    #
+    # KNOWN LIMIT: /proc entries belonging to other users are unreadable here
+    # and are silently skipped, so a process running as another user (a root
+    # build in the user's worktree) is not seen. The swept trees are the
+    # user's own and the unit runs as that user, so this is out of scope
+    # rather than handled; it is not a case this sweep can detect.
+    is_live() {
+      local dir=$1 lock="$1/$LOCK_NAME"
+      if find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 \
+           \( -lname "$dir" -o -lname "$dir/*" \) ! -lname "$lock" \
+           -print -quit 2>/dev/null | grep -q .; then
+        return 0
       fi
-    done
-    sort -u -o "$LIVE" "$LIVE"
-    log "cargo-target-sweep: $(wc -l <"$LIVE") live paths; max-age ''${MAX_AGE_DAYS}d; dry-run=$DRY_RUN"
+      # Mapped files matter on their own: a running rustc maps .rlib/.so
+      # straight out of the target dir without holding a conventional fd.
+      if awk -v d="$dir/" -v lk="$lock" \
+           '$6 != lk && index($6, d) == 1 { found = 1; exit } END { exit (found ? 0 : 1) }' \
+           /proc/[0-9]*/maps 2>/dev/null; then
+        return 0
+      fi
+      return 1
+    }
+
+    # Is anything under $1 newer than the staleness cutoff?
+    #
+    # Prints "active", "stale", "empty", or "unreadable". The last is the
+    # point: `find` cannot descend into an unreadable subdirectory, and a
+    # fresh file inside one is therefore invisible — measured, a tree whose
+    # only recent write sat under a mode-000 directory reported NO recent
+    # files and would have been detached and cleaned. An incomplete walk
+    # cannot establish staleness, so it is not allowed to.
+    staleness() {
+      local dir=$1 err hit
+      err=$(mktemp) || { printf 'unreadable\n'; return; }
+      hit=$(find "$dir" -mindepth 1 ! -name "$LOCK_NAME" \
+              -newermt "@$cutoff" -print -quit 2>"$err")
+      if [ -s "$err" ]; then
+        rm -f "$err"
+        printf 'unreadable\n'
+        return
+      fi
+      rm -f "$err"
+      if [ -n "$hit" ]; then
+        printf 'active\n'
+      elif [ -z "$(find "$dir" -mindepth 1 ! -name "$LOCK_NAME" -print -quit 2>/dev/null)" ]; then
+        printf 'empty\n'
+      else
+        printf 'stale\n'
+      fi
+    }
+
+    log "cargo-target-sweep: max-age ''${MAX_AGE_DAYS}d; prune-age ''${PRUNE_AGE_DAYS}d; dry-run=$DRY_RUN"
 
     now=$(date +%s)
-    cleaned=0 pruned=0 kept=0 freed_mb=0
+    cutoff=$(date -d "-''${MAX_AGE_DAYS} days" +%s)
+    cleaned=0 pruned=0 kept=0 adopted=0 freed_mb=0
 
     for root in "''${ROOTS[@]}"; do
       [ -d "$root" ] || continue
       root_real=$(readlink -f "$root") || continue
 
+      # ---- ADOPT: detached dirs left by a sweep that died mid-clean ----
+      # Only when the pid that detached it is gone, so a concurrent run's
+      # work in progress is never stolen.
+      while IFS= read -r orphan; do
+        [ -n "$orphan" ] || continue
+        opid=''${orphan##*.sweeping.}
+        case "$opid" in
+          ''' | *[!0-9]*) continue ;;
+        esac
+        [ -d "/proc/$opid" ] && continue
+        omanifest=$(dirname "$orphan")/Cargo.toml
+        [ -f "$omanifest" ] || continue
+        # A detached dir is unreachable by with-cargo-lock (lanes only ever
+        # resolve `target`), so nothing should be inside it — but the whole
+        # contract here is that a predicate holds positively before anything
+        # is removed, and an orphaned child of the dead sweep is exactly the
+        # case that would not.
+        if is_live "$orphan"; then
+          keep "LIVE — a process is using this detached dir" "$orphan"
+          kept=$((kept + 1)); continue
+        fi
+        if [ "$DRY_RUN" = 1 ]; then
+          log "WOULD-ADOPT $orphan"
+        elif CARGO_TARGET_DIR="$orphan" cargo clean --manifest-path "$omanifest" >/dev/null 2>&1; then
+          log "ADOPT  $orphan (left by dead pid $opid)"
+          adopted=$((adopted + 1))
+        else
+          fail "could not clean detached $orphan — it stays until this succeeds"
+        fi
+      done < <(find "$root" -mindepth 2 -maxdepth 2 -type d -name 'target.sweeping.*' 2>/dev/null)
+
       while IFS= read -r target; do
         [ -n "$target" ] || continue
 
         # (1) shape, and still inside the root after symlink resolution
-        real=$(readlink -f "$target" 2>/dev/null) || { keep "unresolvable" "$target"; kept=$((kept+1)); continue; }
+        real=$(readlink -f "$target" 2>/dev/null) || { keep "unresolvable" "$target"; kept=$((kept + 1)); continue; }
         case "$real" in
           "$root_real"/*/target) : ;;
-          *) keep "outside root after symlink resolution" "$target"; kept=$((kept+1)); continue ;;
+          *) keep "outside root after symlink resolution" "$target"; kept=$((kept + 1)); continue ;;
         esac
-        [ -d "$real" ] || { keep "not a directory" "$target"; kept=$((kept+1)); continue; }
+        [ -d "$real" ] || { keep "not a directory" "$target"; kept=$((kept + 1)); continue; }
 
         # (2) it is genuinely a Cargo target dir, not just named 'target'.
         #
@@ -149,68 +287,157 @@ pkgs.writeShellApplication {
                || [ -d "$real/debug/.fingerprint" ] \
                || [ -d "$real/release/.fingerprint" ]; }; then
           keep "no cargo marker (CACHEDIR.TAG/.rustc_info.json/.fingerprint) — not a cargo target dir" "$target"
-          kept=$((kept+1)); continue
+          kept=$((kept + 1)); continue
         fi
 
         # (3) a manifest to hand the scoped tool
         wt=$(dirname "$real")
         man="$wt/Cargo.toml"
-        [ -f "$man" ] || { keep "no Cargo.toml beside it" "$target"; kept=$((kept+1)); continue; }
+        [ -f "$man" ] || { keep "no Cargo.toml beside it" "$target"; kept=$((kept + 1)); continue; }
 
-        # (4) nothing live inside
-        if grep -qF -- "$real/" "$LIVE"; then
-          keep "LIVE — a process is using it" "$target"; kept=$((kept+1)); continue
+        # Age must come from the newest artifact ANYWHERE in the tree, not
+        # from the directory's own mtime and not from its depth-1 entries.
+        # `cargo check` writes into target/debug/deps/, which bumps deps/ but
+        # leaves debug/ and target/ untouched: measured 2026-11-11, a tree
+        # built seconds ago read as 90 DAYS OLD at depth 1. Reading the
+        # directory's own mtime is just as wrong in the other direction —
+        # creating the lock file below bumps it, so every inspected directory
+        # would look fresh forever. `-newermt ... -print -quit` stops at the
+        # first recent file, so an active tree costs almost nothing; a stale
+        # one is walked fully, which pass A has to do anyway.
+        case "$(staleness "$real")" in
+          unreadable)
+            keep "could not walk the whole tree (unreadable subdirectory) — staleness unprovable" "$target"
+            kept=$((kept + 1)); continue ;;
+          empty)
+            keep "empty target dir — nothing to age" "$target"; kept=$((kept + 1)); continue ;;
+          active) stale=0; age="" ;;
+          *)
+            stale=1
+            mt=$(find "$real" -mindepth 1 ! -name "$LOCK_NAME" -printf '%T@\n' 2>/dev/null \
+                 | sort -n | tail -1 | cut -d. -f1)
+            age=$(((now - ''${mt:-$now}) / 86400)) ;;
+        esac
+
+        # (5) take the per-worktree Cargo lock non-blocking.
+        #
+        # A dry run must leave the filesystem exactly as it found it, so it
+        # never CREATES the lock file: opening it `>>` would create the file
+        # and bump the parent directory's mtime (measured). A lock file that
+        # does not exist cannot be held by anyone — a lane holding it would
+        # have created it — so "absent" is a sound negative in dry run.
+        # The redirection must be scoped to a group: `exec {fd}>>f 2>/dev/null`
+        # is an exec with no command, so BOTH redirections apply to the shell
+        # permanently and every later diagnostic in the run goes to /dev/null
+        # (measured). Inside a group, only the group's stderr is affected.
+        lock="$real/$LOCK_NAME"
+        lockfd=""
+        if [ "$DRY_RUN" = 1 ]; then
+          if [ -e "$lock" ]; then
+            { exec {lockfd}<"$lock"; } 2>/dev/null \
+              || { keep "cannot open cargo lock" "$target"; kept=$((kept + 1)); continue; }
+          fi
+        else
+          { exec {lockfd}>>"$lock"; } 2>/dev/null \
+            || { keep "cannot open cargo lock" "$target"; kept=$((kept + 1)); continue; }
+        fi
+        if [ -n "$lockfd" ] && ! flock -n "$lockfd"; then
+          release_lock
+          keep "cargo lock held by a running lane" "$target"; kept=$((kept + 1)); continue
         fi
 
-        # Age must NOT come from the target dir's own mtime. Taking the lock
-        # below creates .klaffat-cargo.lock inside it, which bumps that
-        # mtime — so a sweep would reset the age of everything it inspected
-        # and never clean anything on any later run. (Same shape as the
-        # atime bug that made systemd-tmpfiles never reap /tmp; see
-        # profiles/base.nix.) Derive age from the newest real build artifact
-        # instead, explicitly excluding our own lock file.
-        mt=$(find "$real" -maxdepth 1 -mindepth 1 \
-               ! -name .klaffat-cargo.lock -printf '%T@\n' 2>/dev/null \
-             | sort -n | tail -1 | cut -d. -f1)
-        if [ -z "''${mt:-}" ]; then
-          keep "empty target dir — nothing to age" "$target"; kept=$((kept+1)); continue
+        # (6) cargo must agree that THIS path is the manifest's target dir.
+        # Asked here, in the same process and cwd that will run the clean, so
+        # the answer is the one that governs it.
+        resolved=$(cargo metadata --no-deps --offline --format-version 1 \
+                     --manifest-path "$man" 2>/dev/null | jq -r '.target_directory // empty')
+        if [ -z "$resolved" ]; then
+          release_lock
+          keep "cargo metadata could not resolve the manifest" "$target"; kept=$((kept + 1)); continue
         fi
-        age=$(( (now - mt) / 86400 ))
-
-        # (5) take the per-worktree Cargo lock non-blocking and HOLD it
-        lock="$real/.klaffat-cargo.lock"
-        exec {lockfd}>>"$lock" 2>/dev/null || { keep "cannot open cargo lock" "$target"; kept=$((kept+1)); continue; }
-        if ! flock -n "$lockfd"; then
-          exec {lockfd}>&-
-          keep "cargo lock held by a running lane" "$target"; kept=$((kept+1)); continue
+        resolved_real=$(readlink -f "$resolved" 2>/dev/null)
+        if [ "$resolved_real" != "$real" ]; then
+          release_lock
+          keep "cargo resolves this manifest's target dir to '$resolved' — refusing to aim a clean elsewhere" "$target"
+          kept=$((kept + 1)); continue
         fi
 
-        if [ "$age" -ge "$MAX_AGE_DAYS" ]; then
+        # Sizing walks the whole tree, so it happens HERE — behind the lock
+        # and in front of nothing that matters. Everything above this point
+        # is slow enough to matter; everything below is the act itself.
+        sz=0
+        if [ "$stale" = 1 ]; then
           sz=$(du -sm "$real" 2>/dev/null | cut -f1); sz=''${sz:-0}
+        fi
+
+        # (7) staleness was decided before the lock was held, and the walks
+        # since then take real time on a 50k-file tree. A lane that built and
+        # exited in that interval would leave the first verdict saying stale
+        # while its fresh artifacts sit on disk. Re-ask under the lock, and
+        # only ever downgrade: a directory may lose its claim to being
+        # cleaned, never acquire one mid-run.
+        case "$(staleness "$real")" in
+          active)
+            if [ "$stale" = 1 ]; then
+              log "RECHECK $target became active while it was being measured — pruning instead"
+            fi
+            stale=0 ;;
+          unreadable)
+            release_lock
+            keep "became unwalkable while it was being measured" "$target"; kept=$((kept + 1)); continue ;;
+          empty)
+            release_lock
+            keep "became empty while it was being measured" "$target"; kept=$((kept + 1)); continue ;;
+          *) : ;;
+        esac
+
+        # (8) nothing live inside. This is the LAST thing before acting, and
+        # the only work between it and the act is the act's own first syscall.
+        if is_live "$real"; then
+          release_lock
+          keep "LIVE — a process is using it" "$target"; kept=$((kept + 1)); continue
+        fi
+
+        if [ "$stale" = 1 ]; then
           if [ "$DRY_RUN" = 1 ]; then
             log "WOULD-CLEAN ''${sz}MB ''${age}d $target"
-          elif cargo clean --manifest-path "$man" >/dev/null 2>&1; then
-            log "CLEAN  ''${sz}MB ''${age}d $target"
-            cleaned=$((cleaned+1)); freed_mb=$((freed_mb+sz))
           else
-            log "FAIL   cargo clean returned non-zero $target"
+            # Detach first: see WHY PASS A DETACHES BEFORE CLEANING above.
+            detached="$real.sweeping.$$"
+            if ! mv "$real" "$detached" 2>/dev/null; then
+              fail "could not detach $target"
+              release_lock
+              kept=$((kept + 1)); continue
+            fi
+            log "DETACH $target -> $detached"
+            # The lock inode moved with the directory and now guards nothing
+            # a lane can reach; a lane arriving from here on makes a fresh
+            # target/ of its own.
+            release_lock
+            if CARGO_TARGET_DIR="$detached" cargo clean --manifest-path "$man" >/dev/null 2>&1; then
+              log "CLEAN  ''${sz}MB ''${age}d $target"
+              cleaned=$((cleaned + 1)); freed_mb=$((freed_mb + sz))
+            else
+              fail "cargo clean returned non-zero for detached $detached — the next run adopts it"
+            fi
           fi
         else
           # still active: prune only the stale artifacts inside it
           if [ "$DRY_RUN" = 1 ]; then
-            log "WOULD-PRUNE ''${age}d $target"
+            log "WOULD-PRUNE $target"
           elif cargo sweep --time "$PRUNE_AGE_DAYS" "$wt" >/dev/null 2>&1; then
-            log "PRUNE  ''${age}d $target"
-            pruned=$((pruned+1))
+            log "PRUNE  $target"
+            pruned=$((pruned + 1))
           else
-            keep "cargo sweep declined" "$target"; kept=$((kept+1))
+            keep "cargo sweep declined" "$target"; kept=$((kept + 1))
           fi
         fi
 
-        exec {lockfd}>&-
+        release_lock
       done < <(find "$root" -mindepth 2 -maxdepth 2 -type d -name target 2>/dev/null)
     done
 
-    log "cargo-target-sweep: cleaned=$cleaned (''${freed_mb}MB) pruned=$pruned kept=$kept"
+    log "cargo-target-sweep: cleaned=$cleaned (''${freed_mb}MB) pruned=$pruned adopted=$adopted kept=$kept failed=$failures"
+    [ "$failures" -eq 0 ]
   '';
 }
