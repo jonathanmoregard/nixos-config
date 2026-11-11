@@ -31,6 +31,22 @@
 
   networking.hostName = "tuxedo";
 
+  # Let TRIM through LUKS. Without it dm-crypt drops every discard
+  # (discard_max_bytes=0 on cryptroot), so weekly fstrim only ever reached
+  # /boot and btrfs could not enable discard=async: the DRAM-less SN7100
+  # saw nearly all 4 TB as live and stalled in garbage collection under
+  # write bursts (100% busy at single-digit MB/s, ~1 GB writeback stuck
+  # for ~18 s, 2026-11-11). Cost: free-block layout is visible on the raw
+  # disk; contents are not.
+  # bypassWorkqueues: standard dm-crypt tuning for fast NVMe — do the
+  # crypto inline instead of queueing every bio through kcryptd /
+  # dmcrypt_write, which showed up in D state during those stalls.
+  # Applied when initrd opens the device, i.e. on the next boot.
+  boot.initrd.luks.devices."cryptroot" = {
+    allowDiscards = true;
+    bypassWorkqueues = true;
+  };
+
   # Flash the Corne (QMK, ATmega32U4) without sudo. The rules tag the
   # bootloader devices `uaccess`, so the seat's logged-in user gets an ACL;
   # no group membership is involved. The flashing toolchain is not installed
