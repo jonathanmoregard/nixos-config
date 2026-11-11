@@ -130,6 +130,75 @@ let
     echo "$*" >> "$CINNAMON_RESCUE_SYSTEMCTL_LOG"
   '';
 
+  # Stands in for busctl, replaying its real strings so the sampler's
+  # failure mapping is asserted against the tool's actual dialect rather
+  # than against a fiction. Every string below was captured from busctl on
+  # a scratch session bus, not invented:
+  #
+  #   unowned    Call failed: Destination does not exist   (dbus-broker)
+  #   unowned2   Call failed: Name "org.x" does not exist  (dbus-daemon)
+  #   notimely   Call failed: Connection timed out         (owned, silent)
+  #   busfail    Failed to connect to user scope bus ...   (no bus at all)
+  #   wrongpath  Call failed: Object does not exist at path "..."
+  #   nomethod   Call failed: No such method "..."
+  #
+  # Those must stay apart: during a freeze they mean nobody is running the
+  # screensaver, the screensaver has stopped answering, the session bus is
+  # gone, and the bus answered and refused -- four different culprits.
+  #
+  # TWO THINGS HERE ARE LOAD-BEARING AND BOTH HAVE ALREADY BITTEN ONCE:
+  #
+  # 1. THE IMPLEMENTATION. This host and this VM run dbus-BROKER, which
+  #    says "Destination does not exist". dbus-DAEMON, which is what a
+  #    scratch `dbus-run-session` gives you, says `Name "..." does not
+  #    exist`. A mapping captured from a scratch bus and anchored on the
+  #    daemon wording passes every hand-run experiment and then fails to
+  #    recognise a single real unowned screensaver. Both are replayed.
+  #
+  # 2. THE QUOTE CHARACTERS, reproduced exactly as busctl emits them: the
+  #    bus's own texts use ASCII quotes, the two systemd composes use CURLY
+  #    ones. wrongpath and nomethod come from a LIVE, OWNED peer yet both
+  #    read like absence, so an unanchored `does not exist` match files a
+  #    working screensaver as "no screensaver running".
+  #
+  # Do not "normalise" or re-wrap these strings.
+  #
+  # Every invocation is logged, so "the sampler makes exactly one call, and
+  # it carries --auto-start=no" is checkable rather than assumed.
+  # $FAKE_BUSCTL picks the behaviour; the default is a plain `b false`.
+  freezeBusctlStub = pkgs.writeScriptBin "freeze-busctl-stub" ''
+    #!${pkgs.bash}/bin/bash
+    echo "$*" >> "$FREEZE_BUSCTL_LOG"
+    case "''${FAKE_BUSCTL:-false}" in
+      unowned)   echo 'Call failed: Destination does not exist' >&2; exit 1 ;;
+      unowned2)  echo 'Call failed: Name "org.cinnamon.ScreenSaver" does not exist' >&2; exit 1 ;;
+      notimely)  echo 'Call failed: Connection timed out' >&2; exit 1 ;;
+      busfail)   echo 'Failed to connect to user scope bus via local transport: No such file or directory' >&2; exit 1 ;;
+      conntmo)   echo 'Failed to connect to user scope bus via local transport: Connection timed out' >&2; exit 1 ;;
+      wrongpath) echo 'Call failed: Object does not exist at path “/org/cinnamon/ScreenSaver”' >&2; exit 1 ;;
+      nomethod)  echo 'Call failed: No such method “GetActive”' >&2; exit 1 ;;
+      silent)    exit 1 ;;
+      odd)       echo 'q 42'; exit 0 ;;
+      true)      echo 'b true'; exit 0 ;;
+      *)         echo 'b false'; exit 0 ;;
+    esac
+  '';
+
+  # Stands in for xprop returning a WM_CLASS that is not UTF-8. X STRING
+  # properties are Latin-1, so this is ordinary, not exotic: 0xE4 is an
+  # a-umlaut in Latin-1 and an invalid continuation byte in UTF-8. Strict
+  # decoding of it raises UnicodeDecodeError, which is neither OSError nor
+  # TimeoutExpired, so it escapes the sampler's probe wrapper and loses the
+  # whole tick for as long as that window holds focus.
+  freezeXpropLatin1 = pkgs.writeScriptBin "freeze-xprop-latin1" ''
+    #!${pkgs.bash}/bin/bash
+    if [[ "$*" == *_NET_ACTIVE_WINDOW* ]]; then
+      echo '_NET_ACTIVE_WINDOW(WINDOW): window id # 0x3400007'
+    else
+      printf 'WM_CLASS(STRING) = "caf\344", "Caf\344Window"\n'
+    fi
+  '';
+
   # Stands in for a wedged Cinnamon so the escalation has a real process to
   # end. execv sets argv[0] to the given name, which is what the guard
   # matches on; mode "trap" ignores SIGTERM, so only SIGKILL can end it.
@@ -1103,5 +1172,576 @@ in
     assert probe_state() == 0, \
         "the Cinnamon started after the crash does not answer its main loop"
     print(f"[diag] crash recovered: pid {recovered_pid} -> {crash_pid}")
+
+    # desktop-freeze-sample (home/desktop-freeze-forensics.nix): record the
+    # desktop state that the 2026-11-09 freeze had no record of. This is a
+    # read-only sampler, so the assertions are about the three ways it could
+    # be useless: wrong fields, no durable write, or blocking on the very
+    # wedge it is sampling.
+    sample_env = (
+        "export XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus DISPLAY=:0;"
+    )
+
+    workstation.succeed(
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "systemctl --user is-active desktop-freeze-forensics.timer'"
+    )
+
+    # The fields fed by the /proc walk, named once. Every assertion about
+    # the walk degrading iterates this, so adding a matcher to the module
+    # without extending its coverage here is not possible by omission.
+    PROC_FIELDS = ("xorg", "cinnamon", "locker", "pamhelper", "dbusd")
+
+    def conn_is_real(value):
+        """Is conn an observation rather than one of its two non-answers?
+
+        Written as a positive shape check because the alternative --
+        `!= "none"` in one place and `not in ("unreadable", "?")` in
+        another -- meant each assertion passed on the value the other was
+        guarding against. Format is <name>:<status>:<dpms>, comma-joined.
+        """
+        if value in ("none", "unreadable", "?"):
+            return False
+        return all(len(part.split(":")) == 3 for part in value.split(","))
+
+    # Every field the log is read for must be present. A silently dropped
+    # key turns a freeze post-mortem back into a guess, which is the failure
+    # this module exists to prevent.
+    expected_keys = [
+        "t", "mono", "idle_ms", "ss_active", "focus", "backlight", "conn",
+        "xorg", "cinnamon", "locker", "pamhelper", "dbusd", "load",
+        "psi_cpu", "psi_io", "psi_mem",
+    ]
+    line = workstation.succeed(
+        f"su - jonathan -c '{sample_env} desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] live sample: {line}")
+    fields = dict(
+        pair.split("=", 1) for pair in line.split(" ") if "=" in pair
+    )
+    missing = [k for k in expected_keys if k not in fields]
+    assert not missing, f"sample is missing fields {missing}:\n{line}"
+    assert len(fields) == len(expected_keys), \
+        f"sample has unexpected fields {sorted(set(fields) - set(expected_keys))}"
+
+    # The X probe must actually reach this session's X server. "?" or
+    # "timeout" here would mean the sampler ships blind to the one field
+    # that separates "input stopped arriving" from "the user walked away".
+    assert fields["idle_ms"].isdigit(), \
+        f"idle_ms did not come from a reachable X server: {fields['idle_ms']}"
+    # Xorg and Cinnamon are both running in this session, so "absent" would
+    # mean the /proc matcher does not match the processes it names.
+    for key in ("xorg", "cinnamon"):
+        assert fields[key] != "absent", \
+            f"{key} read as absent in a live graphical session:\n{line}"
+        parts = fields[key].split(":")
+        assert len(parts) == 3 and parts[0].isdigit() and parts[2].isdigit(), \
+            f"{key} is not pid:state:cpu — {fields[key]}"
+
+    # Not just "some pid": the pid of the actual Cinnamon shell, checked
+    # against the bus owner of org.Cinnamon as an independent oracle.
+    #
+    # Shape alone is too weak to be worth asserting. `=cinnamon` is an exact
+    # argv[0] match precisely because a substring match reports
+    # `cinnamon-session-binary` instead -- also a plausible-looking
+    # pid:state:cpu, also not "absent", and useless for telling whether the
+    # Cinnamon that froze was alive. Comparing against the name owner is
+    # what makes a regression to substring matching fail here.
+    owner = cinnamon_owner_pid()
+    assert fields["cinnamon"].split(":")[0] == str(owner), \
+        (f"sampler reported cinnamon={fields['cinnamon']} but org.Cinnamon is "
+         f"owned by pid {owner}; the /proc matcher is naming the wrong process")
+
+    # /sys parsing, against a fixture rather than the builder's hardware:
+    # the test VM has no backlight, so the real tree cannot show that a
+    # powered-off panel or a disconnected connector is reported correctly.
+    workstation.succeed(
+        "mkdir -p /tmp/sysfix/sys/class/backlight/fake_bl0 "
+        "/tmp/sysfix/sys/class/drm/card1-eDP-1 "
+        "/tmp/sysfix/sys/class/drm/card1-DP-2 "
+        "/tmp/sysfix/sys/class/drm/card1-HDMI-A-1"
+    )
+    workstation.succeed(
+        "echo 96 > /tmp/sysfix/sys/class/backlight/fake_bl0/brightness; "
+        "echo 255 > /tmp/sysfix/sys/class/backlight/fake_bl0/max_brightness; "
+        "echo 4 > /tmp/sysfix/sys/class/backlight/fake_bl0/bl_power; "
+        "echo enabled > /tmp/sysfix/sys/class/drm/card1-eDP-1/enabled; "
+        "echo connected > /tmp/sysfix/sys/class/drm/card1-eDP-1/status; "
+        "echo Off > /tmp/sysfix/sys/class/drm/card1-eDP-1/dpms; "
+        "echo enabled > /tmp/sysfix/sys/class/drm/card1-DP-2/enabled; "
+        "echo disconnected > /tmp/sysfix/sys/class/drm/card1-DP-2/status; "
+        "echo On > /tmp/sysfix/sys/class/drm/card1-DP-2/dpms; "
+        # Not enabled, so it must not appear at all: a log line listing every
+        # connector the chip has is noise that hides the two that matter.
+        "echo disabled > /tmp/sysfix/sys/class/drm/card1-HDMI-A-1/enabled; "
+        "echo connected > /tmp/sysfix/sys/class/drm/card1-HDMI-A-1/status; "
+        "chmod -R a+rX /tmp/sysfix"
+    )
+    fixture = workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_SYS_ROOT=/tmp/sysfix "
+        "desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] fixture sample: {fixture}")
+    ffields = dict(
+        pair.split("=", 1) for pair in fixture.split(" ") if "=" in pair
+    )
+    assert ffields["backlight"] == "fake_bl0:96/255:power4", \
+        f"backlight not parsed (power4 = panel off): {ffields['backlight']}"
+    assert ffields["conn"] == "DP-2:disconnected:On,eDP-1:connected:Off", \
+        f"connectors not parsed, or a disabled one leaked in: {ffields['conn']}"
+
+    # A tick must append its line to the log, and a second tick must not
+    # overwrite the first.
+    #
+    # Scope note, because the comment here used to overstate: this asserts
+    # APPEND, not durability. The sampler fsyncs every line so that a freeze
+    # ending in a held power button does not lose the final minutes in the
+    # page cache, but nothing below would notice if the fsync were deleted --
+    # proving that needs a real power cut, which this lane cannot stage. The
+    # fsync is reviewed, not tested, and this comment no longer claims
+    # otherwise.
+    #
+    # Pointed at its own directory, NOT the production log: the timer
+    # asserted active above fires every 20s, so counting lines in the real
+    # log would race it and flake.
+    sdir = "/tmp/fz-state"
+    log = f"{sdir}/samples.log"
+    tick = f"su - jonathan -c '{sample_env} FREEZE_STATE_DIR={sdir} desktop-freeze-sample tick'"
+    workstation.succeed(tick)
+    first = int(workstation.succeed(f"wc -l < {log}").strip())
+    assert first == 1, f"one tick wrote {first} lines"
+    workstation.succeed(tick)
+    assert int(workstation.succeed(f"wc -l < {log}").strip()) == 2, \
+        "a second tick did not append"
+
+    # Rotation, so the log can never be the reason a disk fills.
+    workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_STATE_DIR={sdir} "
+        "FREEZE_MAX_BYTES=1 desktop-freeze-sample tick'"
+    )
+    workstation.succeed(f"test -f {log}.1")
+    assert int(workstation.succeed(f"wc -l < {log}").strip()) == 1, \
+        "rotation did not start a fresh log"
+    assert int(workstation.succeed(f"wc -l < {log}.1").strip()) == 2, \
+        "rotation lost the previous lines"
+
+    # The production path must still be the one the unit writes, which the
+    # dedicated directory above deliberately does not prove.
+    workstation.succeed(
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "systemctl --user start desktop-freeze-forensics.service'"
+    )
+    unit_line = workstation.succeed(
+        "tail -n 1 /home/jonathan/.local/state/desktop-freeze/samples.log"
+    ).strip()
+    print(f"[diag] line written by the unit: {unit_line}")
+    ufields = dict(
+        pair.split("=", 1) for pair in unit_line.split(" ") if "=" in pair
+    )
+    # The unit's own Environment must reach X, not just the sampler when run
+    # by hand with sample_env. `test -s` alone could not tell the difference:
+    # it passes on lines the timer wrote minutes earlier, so dropping DISPLAY
+    # from the unit -- every tick then recording idle_ms=rc1 -- would still
+    # have passed it.
+    assert ufields["idle_ms"].isdigit(), \
+        (f"the unit's own environment did not reach X: idle_ms="
+         f"{ufields['idle_ms']}; DISPLAY/DBUS_SESSION_BUS_ADDRESS in the "
+         f"service are wrong")
+
+    # The scenario this module is for: X is wedged. Every X and DBus call is
+    # bounded, so a tick must still finish, still write, and record the
+    # timeout as the datum it is. A sampler that blocks here records nothing
+    # about the only event worth recording.
+    workstation.succeed(
+        "printf '#!/bin/sh\\nsleep 300\\n' > /tmp/hang; chmod a+rx /tmp/hang"
+    )
+    # Runs `tick`, not `show`: the claim being tested is that a wedged
+    # desktop still gets a line ON DISK, and `show` only prints to stdout.
+    # Asserting the printed line proved the probes degraded gracefully but
+    # never that the write happened, which is the half that matters when the
+    # machine is about to be power-cycled.
+    hungdir = "/tmp/fz-hung"
+    t0 = int(workstation.succeed("date +%s").strip())
+    workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_XPRINTIDLE=/tmp/hang "
+        f"FREEZE_XPROP=/tmp/hang FREEZE_BUSCTL=/tmp/hang "
+        f"FREEZE_STATE_DIR={hungdir} desktop-freeze-sample tick'",
+        timeout=120,
+    )
+    t1 = int(workstation.succeed("date +%s").strip())
+    hung = workstation.succeed(f"tail -n 1 {hungdir}/samples.log").strip()
+    assert int(workstation.succeed(f"wc -l < {hungdir}/samples.log").strip()) == 1, \
+        "a tick against a wedged desktop did not write exactly one line"
+    print(f"[diag] wedged-X sample in ~{t1 - t0}s: {hung}")
+    hfields = dict(
+        pair.split("=", 1) for pair in hung.split(" ") if "=" in pair
+    )
+    for key in ("idle_ms", "focus"):
+        assert hfields[key] == "timeout", \
+            f"{key} did not record a hung X call as a timeout: {hfields[key]}"
+    # "timeout" here is the probe's own kill: the stub never returns and
+    # never prints, so the subprocess timeout fires and there is no bus
+    # message to classify. That is distinct from "notimely" (busctl itself
+    # reported the peer never answered) and from "unowned". A hung bus must
+    # never be flattened into "the screensaver wasn't running".
+    assert hfields["ss_active"] == "timeout", \
+        (f"a hung bus call must be reported as timeout, not "
+         f"{hfields['ss_active']}")
+    # The /proc and /sys fields do not touch X, so they must still be real:
+    # a wedged X server is when load and process state matter most.
+    #
+    # "real" means the pid:state:cpu shape of a live process, checked against
+    # the org.Cinnamon owner. `!= "absent"` was not that: "timeout" and
+    # "error:ValueError" both pass it, so the assertion would have held while
+    # the /proc fields were as useless as the X ones.
+    cparts = hfields["cinnamon"].split(":")
+    assert len(cparts) == 3 and cparts[0].isdigit() and cparts[2].isdigit(), \
+        (f"a hung X call also lost the /proc fields, which do not depend on "
+         f"X: cinnamon={hfields['cinnamon']}")
+    assert cparts[0] == str(cinnamon_owner_pid()), \
+        (f"/proc fields survived a hung X server but name the wrong process: "
+         f"{hfields['cinnamon']} vs org.Cinnamon owner {cinnamon_owner_pid()}")
+    # Asserted as a POSITIVE shape, not as "not unreadable". The two
+    # non-observations this field can produce are "none" and "unreadable",
+    # and a negative check against either one silently passes on the other
+    # -- so the pair of negatives scattered through this lane each guarded
+    # the half the other let through. conn_is_real is the whole shape:
+    # <name>:<status>:<dpms>, comma-joined.
+    assert conn_is_real(hfields["conn"]), \
+        f"a hung X call also lost the /sys fields: conn={hfields['conn']}"
+    # Bound tied to the sampler's own budget rather than a round number:
+    # 5 bounded calls at CALL_TIMEOUT=4s plus the 15s /proc budget is ~35s
+    # worst case, and the observed run is ~12s. 60s was the unit's
+    # TimeoutStartSec, so the old bound only proved systemd had not killed it.
+    assert t1 - t0 < 40, \
+        f"a tick with three hung X calls took {t1 - t0}s; it must stay bounded"
+
+    # The sampler must OBSERVE the desktop, never act on it.
+    #
+    # org.cinnamon.ScreenSaver is D-Bus-activatable on this host, so a plain
+    # method call on the name while it is unowned makes the bus start
+    # cinnamon-screensaver. A tick doing that every 20s would spawn a locker
+    # -- which takes the input grab -- into the session it is only supposed
+    # to be a witness to: a sampler manufacturing the class of fault it
+    # exists to diagnose. Same reason this module takes no X grab.
+    #
+    # Asserted against the BUS, not against the sampler's argv.
+    #
+    # Checking that the command line contains --auto-start=no only proves a
+    # string is present. What matters is the consequence: after a tick, a
+    # screensaver that was not running is still not running. So this uses
+    # the real busctl against the real session bus and asks the bus
+    # afterwards.
+    #
+    # The activation file has to exist for the test to mean anything -- with
+    # no .service file there is nothing to activate and the check would pass
+    # for the wrong reason -- so its presence is asserted first.
+    workstation.succeed(
+        "test -f /run/current-system/sw/share/dbus-1/services/"
+        "org.cinnamon.ScreenSaver.service"
+    )
+    # The two ownership probes below collapse "the name is unowned" into
+    # the same `unowned` as "busctl could not reach the bus at all", so
+    # this whole block would pass vacuously on a broken bus -- including
+    # the no-activation assertion, which is the one that matters. Prove the
+    # bus answers first, against a name that is ALWAYS owned.
+    workstation.succeed(
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "busctl --user status org.freedesktop.DBus >/dev/null'"
+    )
+    owned_before = workstation.succeed(
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "busctl --user status org.cinnamon.ScreenSaver >/dev/null 2>&1 "
+        "&& echo owned || echo unowned'"
+    ).strip()
+    assert owned_before == "unowned", \
+        ("this VM was expected to have no running screensaver, so that a "
+         "tick's effect on it is observable; something already owns the name")
+    unowned = workstation.succeed(
+        f"su - jonathan -c '{sample_env} desktop-freeze-sample show'"
+    ).strip()
+    owned_after = workstation.succeed(
+        "su - jonathan -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "busctl --user status org.cinnamon.ScreenSaver >/dev/null 2>&1 "
+        "&& echo owned || echo unowned'"
+    ).strip()
+    print(f"[diag] screensaver owner before/after a tick: {owned_before}/{owned_after}")
+    assert owned_after == "unowned", \
+        ("a tick STARTED cinnamon-screensaver -- a locker, holding the input "
+         "grab, spawned into the session the sampler is only supposed to "
+         "witness. This is the fault the probe exists to avoid.")
+    nfields = dict(
+        pair.split("=", 1) for pair in unowned.split(" ") if "=" in pair
+    )
+    print(f"[diag] unowned-screensaver sample: ss_active={nfields['ss_active']}")
+    assert nfields["ss_active"] == "unowned", \
+        f"an unowned screensaver name must read as unowned: {nfields['ss_active']}"
+
+    # And the call itself carries the refusal, so a future edit that drops
+    # the flag fails here rather than silently relying on the VM having no
+    # screensaver to start.
+    busctl_log = "/tmp/fz-busctl-calls"
+    workstation.succeed(f"rm -f {busctl_log}; install -m 666 /dev/null {busctl_log}")
+    workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_BUSCTL_LOG={busctl_log} "
+        f"FREEZE_BUSCTL=${freezeBusctlStub}/bin/freeze-busctl-stub "
+        "desktop-freeze-sample show'"
+    )
+    calls = workstation.succeed(f"cat {busctl_log}").strip().splitlines()
+    print(f"[diag] bus calls one tick made: {calls}")
+    assert len(calls) == 1, \
+        f"a tick made {len(calls)} bus calls, expected exactly 1:\n{calls}"
+    assert "--auto-start=no" in calls[0], \
+        (f"the screensaver probe must refuse activation explicitly, got: "
+         f"{calls[0]}")
+
+    # A bus that cannot be reached must NOT read as "the screensaver wasn't
+    # running". Both are a plain exit 1 from busctl and differ only in stderr,
+    # so this uses the REAL busctl against a nonexistent socket -- the stub
+    # below replays captured strings, which cannot show that the distinction
+    # survives contact with the tool itself.
+    #
+    # Getting this wrong is a wrong answer in precisely the circumstance the
+    # log exists for: during a freeze, "the session bus stopped answering" is
+    # a finding, and "no screensaver" is a red herring.
+    deadbus = workstation.succeed(
+        "su - jonathan -c 'export DISPLAY=:0 "
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent-bus-sock; "
+        "desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] unreachable-bus sample: {deadbus}")
+    dfields = dict(
+        pair.split("=", 1) for pair in deadbus.split(" ") if "=" in pair
+    )
+    assert dfields["ss_active"] != "unowned", \
+        ("an unreachable session bus was reported as an absent screensaver; "
+         "stderr is the only thing that separates them and it must not be "
+         "discarded")
+    # Pinned exactly, not a prefix match: a loose check also admits
+    # active_unparsed (a call that SUCCEEDED and returned something odd) and
+    # whatever label a dropped stderr would produce, so the loose form would
+    # have passed on the very regression it guards.
+    assert dfields["ss_active"] == "busfail", \
+        (f"an unreachable bus must be reported as busfail, got "
+         f"{dfields['ss_active']}")
+
+    # The /proc walk is the one step whose duration the sampler cannot bound
+    # from the inside: reading /proc/<pid>/cmdline takes the target's
+    # mmap_lock, and that wait is not reliably interruptible. A freeze is
+    # exactly when some process is wedged, so this is the step that would
+    # block during the event being recorded -- and blocking past
+    # TimeoutStartSec means systemd kills the tick before it writes anything.
+    #
+    # Budget 0 forces that path: the four /proc fields degrade to "timeout"
+    # and every field that does not depend on the walk is still collected and
+    # still written. Losing four process fields is a bad trade; losing the
+    # whole sample at the one moment it mattered is the failure this module
+    # exists to prevent.
+    starved = workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_PROC_BUDGET_SECS=0 "
+        "desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] abandoned /proc walk: {starved}")
+    pfields = dict(
+        pair.split("=", 1) for pair in starved.split(" ") if "=" in pair
+    )
+    for key in PROC_FIELDS:
+        assert pfields[key] == "timeout", \
+            f"{key} did not degrade to timeout when the walk was abandoned: {pfields[key]}"
+    assert pfields["idle_ms"].isdigit(), \
+        "abandoning the /proc walk also lost idle_ms, the field that matters most"
+    assert conn_is_real(pfields["conn"]), \
+        f"abandoning the /proc walk also lost the display state: conn={pfields['conn']}"
+
+    # Thread exhaustion must cost the FOUR /proc fields, not the line.
+    #
+    # The walk runs on a thread, so the one thing that can fail before the
+    # walk even begins is Thread.start(). RLIMIT_NPROC capped at 1 forces
+    # exactly that. execv, not a subshell: a fork would die before reaching
+    # the sampler, and `ulimit -u` low enough to matter cannot spawn the
+    # process at all -- which is why this path went unnoticed.
+    #
+    # It is not a contrived limit. Thread exhaustion is itself a plausible
+    # freeze symptom (a runaway spawner), so this is the one moment the
+    # rest of the line matters most. Before the fix the RuntimeError
+    # escaped to main() and the entire sample collapsed to
+    # "sampler=failed:RuntimeError" -- no idle_ms, no ss_active, no PSI.
+    workstation.succeed(
+        "install -m 755 /dev/stdin /tmp/nothread.py <<'PYEOF'\n"
+        "import os, resource, sys\n"
+        "resource.setrlimit(resource.RLIMIT_NPROC,\n"
+        "                   (1, resource.getrlimit(resource.RLIMIT_NPROC)[1]))\n"
+        "os.execv(sys.argv[1], [sys.argv[1], 'show'])\n"
+        "PYEOF"
+    )
+    nothread = workstation.succeed(
+        f"su - jonathan -c '{sample_env} "
+        f"${pkgs.python3}/bin/python3 -I /tmp/nothread.py "
+        "$(command -v desktop-freeze-sample)'"
+    ).strip()
+    print(f"[diag] thread-starved sample: {nothread}")
+    tfields = dict(p.split("=", 1) for p in nothread.split(" ") if "=" in p)
+    assert "sampler" not in tfields, \
+        (f"a thread that could not start cost the whole sample; the line "
+         f"must survive with each field real or self-describing:\n{nothread}")
+    for key in PROC_FIELDS:
+        assert tfields[key].startswith("error:"), \
+            f"{key} should name the thread failure, got {tfields[key]}"
+
+    # RLIMIT_NPROC=1 blocks fork as well as thread creation, so every probe
+    # that shells out (idle_ms, ss_active, focus) genuinely CANNOT be read
+    # here. That is not a defect and the assertions must not demand
+    # otherwise -- an earlier version of this test required idle_ms to be a
+    # number and failed on the module for obeying physics.
+    #
+    # What it must do is say so per field instead of inventing a value:
+    # "error:BlockingIOError" is a datum, "0" would be a lie about the
+    # user's idleness.
+    for key in ("idle_ms", "ss_active", "focus"):
+        assert tfields[key].startswith("error:"), \
+            (f"{key} must name its failure under process exhaustion, not "
+             f"fabricate a reading: {tfields[key]}")
+
+    # The fields that need neither a thread nor a fork -- plain file reads
+    # -- must still be real, or the line is worthless in the exact
+    # circumstance (a runaway spawner) that produced it.
+    assert conn_is_real(tfields["conn"]), \
+        f"thread exhaustion lost the display state: conn={tfields['conn']}"
+    assert tfields["psi_cpu"].replace(".", "", 1).isdigit(), \
+        f"thread exhaustion lost PSI: psi_cpu={tfields['psi_cpu']}"
+    assert tfields["load"].replace(".", "", 1).isdigit(), \
+        f"thread exhaustion lost load: load={tfields['load']}"
+
+    # A WM_CLASS that is not UTF-8 must not cost the tick. X STRING
+    # properties are Latin-1, so this is an ordinary window, not a crafted
+    # one; strict decoding raises UnicodeDecodeError, which is neither
+    # OSError nor TimeoutExpired and so escapes the probe wrapper entirely.
+    # Before the sampler decoded with errors="replace", every tick taken
+    # while such a window held focus wrote nothing at all.
+    latin = workstation.succeed(
+        f"su - jonathan -c '{sample_env} "
+        f"FREEZE_XPROP=${freezeXpropLatin1}/bin/freeze-xprop-latin1 "
+        "desktop-freeze-sample show'"
+    ).strip()
+    print(f"[diag] latin-1 WM_CLASS sample: {latin}")
+    lfields = dict(
+        pair.split("=", 1) for pair in latin.split(" ") if "=" in pair
+    )
+    assert lfields["idle_ms"].isdigit(), \
+        f"a non-UTF-8 WM_CLASS cost the whole tick:\n{latin}"
+    assert lfields["focus"].startswith("Caf"), \
+        f"the focused window's class was not recovered: {lfields['focus']}"
+
+    # A sampler that fails its unit on an unwritable state dir turns a
+    # diagnostic into an outage of its own.
+    workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_STATE_DIR=/proc/nope "
+        "desktop-freeze-sample tick'"
+    )
+    # Every reply shape the probe can meet, mapped to its field value.
+    #
+    # The VM has no screensaver, so without a stub the lane never gets past
+    # "unowned": the GetActive object path, its method name and the reply
+    # parse go unexercised, and ss_active=1 -- the value that says "the
+    # screen was locked" -- is never once produced by the code under test.
+    #
+    # The failure strings are busctl's own, captured from it on a scratch
+    # session bus. They must map to DIFFERENT values: during a freeze
+    # "nobody is running the screensaver", "the screensaver stopped
+    # answering", "the session bus is gone" and "the bus answered and
+    # refused" point at different culprits.
+    #
+    # wrongpath and nomethod are the ones with teeth. Both come back from a
+    # LIVE, OWNED screensaver, and both contain the substring "does not
+    # exist" or otherwise look like absence. An earlier version of the
+    # mapping matched `does not exist` unanchored and filed wrongpath as
+    # `unowned` -- the log would have said "no screensaver was running"
+    # about a screensaver that was running and answering.
+    for mode, expect in (
+        ("true", "1"),
+        ("false", "0"),
+        # Both implementations' wording for the same condition. The second
+        # is not hypothetical portability work: it is the string every
+        # scratch-bus experiment produces, so leaving it out invites the
+        # next person to "verify" against it and conclude the first is
+        # wrong.
+        ("unowned", "unowned"),
+        ("unowned2", "unowned"),
+        ("notimely", "notimely"),
+        ("busfail", "busfail"),
+        # A connect failure that happens to time out is a DEAD BUS, not a
+        # slow screensaver; it must not be drawn off by the timeout arm.
+        ("conntmo", "busfail"),
+        ("wrongpath", "callerr"),
+        ("nomethod", "callerr"),
+        ("silent", "unparsed"),
+        ("odd", "active_unparsed"),
+    ):
+        workstation.succeed(f"rm -f {busctl_log}; install -m 666 /dev/null {busctl_log}")
+        got = workstation.succeed(
+            f"su - jonathan -c '{sample_env} FREEZE_BUSCTL_LOG={busctl_log} "
+            f"FAKE_BUSCTL={mode} "
+            f"FREEZE_BUSCTL=${freezeBusctlStub}/bin/freeze-busctl-stub "
+            "desktop-freeze-sample show'"
+        ).strip()
+        gf = dict(p.split("=", 1) for p in got.split(" ") if "=" in p)
+        print(f"[diag] screensaver reply {mode!r} -> ss_active={gf['ss_active']}")
+        assert gf["ss_active"] == expect, \
+            f"busctl {mode} must read as {expect}, got {gf['ss_active']}"
+        acalls = workstation.succeed(f"cat {busctl_log}").strip().splitlines()
+        assert len(acalls) == 1, \
+            f"{mode}: expected exactly one bus call, got {acalls}"
+        assert "org.cinnamon.ScreenSaver GetActive" in acalls[0] \
+            and "/org/cinnamon/ScreenSaver" in acalls[0], \
+            f"GetActive object path or method name is wrong: {acalls[0]}"
+
+    # An unreadable /sys must not read like a dark machine. "none" is a
+    # finding -- no enabled connector, no backlight -- and a wrong path must
+    # never be able to fabricate it.
+    unread = workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_SYS_ROOT=/nonexistent "
+        "desktop-freeze-sample show'"
+    ).strip()
+    ufields2 = dict(p.split("=", 1) for p in unread.split(" ") if "=" in p)
+    print(f"[diag] unreadable /sys: backlight={ufields2['backlight']} conn={ufields2['conn']}")
+    for key in ("backlight", "conn"):
+        assert ufields2[key] == "unreadable", \
+            (f"an unreadable /sys reported {key}={ufields2[key]}, which is "
+             f"indistinguishable from a real observation")
+
+    # Collecting a sample must never fail the unit, and must never cost the
+    # line. This drives the WRITE path (tick, not show) under a process cap,
+    # so it covers what the show-based thread-starvation case above cannot:
+    # that the degraded line actually reaches the log on disk.
+    #
+    # This assertion used to require "sampler=failed:" in the line, and that
+    # was a real bug in the test, not just a weak check: it pinned the
+    # whole-sample collapse as the CORRECT outcome. A later fix that made
+    # the sampler degrade field-by-field instead would have been reported as
+    # a regression by its own lane. The contract in the comment above was
+    # always the real one; the assertion simply did not say it.
+    faildir = "/tmp/fz-threadfail"
+    workstation.succeed(
+        f"su - jonathan -c '{sample_env} FREEZE_STATE_DIR={faildir} "
+        "bash -c \"ulimit -u 25; exec desktop-freeze-sample tick\"'"
+    )
+    failed = workstation.succeed(f"tail -n 1 {faildir}/samples.log").strip()
+    print(f"[diag] tick under a process cap: {failed}")
+    ffields = dict(p.split("=", 1) for p in failed.split(" ") if "=" in p)
+    assert "sampler" not in ffields, \
+        (f"a tick under a process cap collapsed to a whole-sample failure "
+         f"instead of degrading the affected fields: {failed}")
+    for key in expected_keys:
+        assert key in ffields, \
+            f"the written line dropped {key} under a process cap: {failed}"
+    # The file-read fields need neither a fork nor a thread, so they are the
+    # ones that must survive to make the record worth having.
+    assert conn_is_real(ffields["conn"]), \
+        f"the written line lost the display state: conn={ffields['conn']}"
+    assert ffields["psi_cpu"].replace(".", "", 1).isdigit(), \
+        f"the written line lost PSI: psi_cpu={ffields['psi_cpu']}"
+
+    print("[diag] desktop-freeze-sample assertions passed")
   '';
 }
