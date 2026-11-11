@@ -686,6 +686,7 @@ in
     ./ai-router.nix
     ./session-reflect-backfill.nix
     ./worktree-sweep.nix
+    ./cargo-target-sweep.nix
     ./router-services.nix
     ./claude-services.nix
     ./ai-client-config-sync.nix
