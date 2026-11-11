@@ -28,7 +28,9 @@ pkgs.runCommand "cargo-target-sweep-contract"
     pkgs.diffutils
     pkgs.findutils
     pkgs.gnugrep
+    pkgs.inotify-tools
     pkgs.python3
+    pkgs.systemd
     pkgs.util-linux
   ];
   # Passed as derivation attributes, matching tests/worktree-sweep.nix:
@@ -247,8 +249,79 @@ pkgs.runCommand "cargo-target-sweep-contract"
   test ! -d "/proc/$DEADPID" || { echo "FATAL: fixture pid $DEADPID exists"; exit 1; }
   ORPHAN=$(mk_real orphan)
   mv "$ORPHAN/target" "$ORPHAN/target.sweeping.$DEADPID"
+  # A RUNNING sweep's detached dir. The pid must look like a sweep, because
+  # a live pid alone is not proof — see 9b.
+  # (Not `exec -a … sleep`: coreutils' sleep dispatches on argv[0] — see 7c.)
+  python3 -c 'import time; time.sleep(300)' cargo-target-sweep &
+  sweeppid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    grep -qa cargo-target-sweep "/proc/$sweeppid/cmdline" 2>/dev/null && break; sleep 0.1
+  done
+  grep -qa cargo-target-sweep "/proc/$sweeppid/cmdline" \
+    || { echo "FATAL arm9: the stand-in sweep process does not carry the sweep's name"; exit 1; }
   INUSE=$(mk_real inuse)
-  mv "$INUSE/target" "$INUSE/target.sweeping.$$"
+  mv "$INUSE/target" "$INUSE/target.sweeping.$sweeppid"
+
+  # 9b PID REUSE. The dead sweep's pid now belongs to an unrelated live
+  # process. Gating on "/proc/<pid> exists" alone kept such a dir forever,
+  # silently — multiple GB nobody would ever see.
+  REUSED=$(mk_real reused)
+  mv "$REUSED/target" "$REUSED/target.sweeping.$cwdpid"
+
+  # 9c an unrecognised suffix is kept, and SAYS so
+  NONNUM=$(mk_real nonnum)
+  mv "$NONNUM/target" "$NONNUM/target.sweeping.abc"
+
+  # 9d a dead sweep's detached dir that a process is nonetheless inside
+  ORPHLIVE=$(mk_real orphlive)
+  mv "$ORPHLIVE/target" "$ORPHLIVE/target.sweeping.$DEADPID"
+  ( cd "$ORPHLIVE/target.sweeping.$DEADPID" && exec sleep 300 ) &
+  orphlivepid=$!
+
+  # 9e a dead sweep's detached dir with no manifest to clean it through
+  mkdir -p "$ROOT/orphnoman/target.sweeping.$DEADPID"
+  printf 'x\n' > "$ROOT/orphnoman/target.sweeping.$DEADPID/junk"
+
+  # 9f a dead sweep's detached dir whose lock file a lane holds open — the
+  # lane that opened it in the detach window and is blocked in flock(). It
+  # holds no other fd, no cwd and no mapping, so only the waiter check sees it.
+  ORPHWAIT=$(mk_real orphwait)
+  : > "$ORPHWAIT/target/.klaffat-cargo.lock"
+  mv "$ORPHWAIT/target" "$ORPHWAIT/target.sweeping.$DEADPID"
+  sleep 300 3>>"$ORPHWAIT/target.sweeping.$DEADPID/.klaffat-cargo.lock" &
+  orphwaitpid=$!
+
+  # ---------------------------------------------------------------- arm 14
+  # A LANE WAITING ON THE LOCK. with-cargo-lock opens .klaffat-cargo.lock and
+  # then blocks in flock(LOCK_EX). While the sweep holds the flock, such a
+  # lane holds nothing but that fd — invisible to the liveness scan, which
+  # excludes the lock path. Detaching would hand it the flock on the detached
+  # inode while a second lane takes a fresh lock on the new target/.
+  WAITWT=$(mk_real waiter)
+  : > "$WAITWT/target/.klaffat-cargo.lock"
+  backdate "$WAITWT/target" 90
+  sleep 300 3>>"$WAITWT/target/.klaffat-cargo.lock" &
+  waitpid=$!
+
+  # ---------------------------------------------------------------- arm 16
+  # A worktree that is a SYMLINK to a tree outside the root. Whatever it
+  # resolves to is not ours: it must never be detached, cleaned or pruned.
+  LINKSRC=$(mk_real linksrc)
+  mkdir -p "$TMPDIR/outside-root"
+  mv "$LINKSRC" "$TMPDIR/outside-root/linksrc"
+  ln -s "$TMPDIR/outside-root/linksrc" "$ROOT/linked"
+  backdate "$TMPDIR/outside-root/linksrc/target" 90
+
+  # ---------------------------------------------------------------- arm 17
+  # RECHECK DOWNGRADE. Staleness is decided before the lock and asked again
+  # under it. A tree written to in between must be pruned, never cleaned.
+  # The writer fires on the sweep's own creation of the lock file — the
+  # first create in that directory — and the recheck sits behind
+  # `cargo metadata` and `du`, so the write lands well before it.
+  RECHK=$(mk_real recheck); backdate "$RECHK/target" 90
+  ( inotifywait -qq -e create "$RECHK/target" \
+      && printf 'fresh\n' > "$RECHK/target/debug/written-mid-sweep" ) &
+  rechkpid=$!
 
   # ------------------------------------------------------------ dry run
   # A dry run must reach the same verdicts while leaving the filesystem
@@ -269,6 +342,15 @@ pkgs.runCommand "cargo-target-sweep-contract"
     || { echo "FAIL dry-run: did not plan to clean the stale target"; exit 1; }
   grep -q 'WOULD-ADOPT.*orphan' dry.log \
     || { echo "FAIL dry-run: did not plan to adopt the detached dir"; exit 1; }
+  # ...and the KEEP verdicts are the dry run's whole point: a dry run that
+  # plans to clean a locked or live directory is a lie about the real one.
+  for d in "$LOCKED" "$LIVEWT" "$CWDWT" "$MAPWT" "$GLOBWT" "$SPMAPWT" "$WAITWT" "$UNREAD"; do
+    grep -qF "KEEP   $d/target — " dry.log \
+      || { echo "FAIL dry-run: did not keep $d/target"; exit 1; }
+    if grep -E '^WOULD-CLEAN' dry.log | grep -qF " $d/target"; then
+      echo "FAIL dry-run: planned to clean $d/target"; exit 1
+    fi
+  done
 
   # ------------------------------------------------------------ real run
   cargo-target-sweep > run.log 2>&1 || true
@@ -276,8 +358,10 @@ pkgs.runCommand "cargo-target-sweep-contract"
 
   exec {held}>&-
   exec {livefd}>&-
-  kill "$cwdpid" "$mappid" "$globpid" "$spmappid" "$ndpid" 2>/dev/null || true
-  for p in "$cwdpid" "$mappid" "$globpid" "$spmappid" "$ndpid"; do wait "$p" 2>/dev/null || true; done
+  livepids="$cwdpid $mappid $globpid $spmappid $ndpid $sweeppid $orphlivepid $orphwaitpid $waitpid $rechkpid"
+  # shellcheck disable=SC2086
+  kill $livepids 2>/dev/null || true
+  for p in $livepids; do wait "$p" 2>/dev/null || true; done
 
   # ----------------------------------------------------------- assertions
 
@@ -390,8 +474,59 @@ pkgs.runCommand "cargo-target-sweep-contract"
     || { echo "FAIL arm9: a detached dir from a dead sweep was not adopted"; exit 1; }
   grep -q "ADOPT .*$ORPHAN/target.sweeping.$DEADPID" run.log \
     || { echo "FAIL arm9: adoption not logged"; exit 1; }
-  test -d "$INUSE/target.sweeping.$$" \
+  test -d "$INUSE/target.sweeping.$sweeppid" \
     || { echo "FAIL arm9: stole a detached dir belonging to a LIVE sweep"; exit 1; }
+  grep -qF "KEEP   $INUSE/target.sweeping.$sweeppid — detached by a sweep that is still running" run.log \
+    || { echo "FAIL arm9: keeping a running sweep's detached dir was not logged"; exit 1; }
+
+  # arm 9b: a reused pid is not a running sweep
+  test ! -e "$REUSED/target.sweeping.$cwdpid" \
+    || { echo "FAIL arm9b: a dead sweep's detached dir was kept because its pid was reused"; cat run.log; exit 1; }
+  grep -qF "ADOPT  $REUSED/target.sweeping.$cwdpid" run.log \
+    || { echo "FAIL arm9b: adoption past a reused pid was not logged"; exit 1; }
+
+  # arm 9c / 9e: every skipped detached dir is logged with its reason
+  test -d "$NONNUM/target.sweeping.abc" \
+    || { echo "FAIL arm9c: removed a detached dir whose suffix is not a pid"; exit 1; }
+  grep -qF "KEEP   $NONNUM/target.sweeping.abc — unrecognised detached-dir suffix" run.log \
+    || { echo "FAIL arm9c: an unrecognised detached dir was skipped silently"; cat run.log; exit 1; }
+  test -d "$ROOT/orphnoman/target.sweeping.$DEADPID" \
+    || { echo "FAIL arm9e: removed a detached dir with no manifest"; exit 1; }
+  grep -qF "KEEP   $ROOT/orphnoman/target.sweeping.$DEADPID — no Cargo.toml beside it" run.log \
+    || { echo "FAIL arm9e: a manifest-less detached dir was skipped silently"; cat run.log; exit 1; }
+
+  # arm 9d: liveness gates adoption too
+  test -d "$ORPHLIVE/target.sweeping.$DEADPID" \
+    || { echo "FAIL arm9d: adopted a detached dir a process was sitting in"; exit 1; }
+  grep -qF "KEEP   $ORPHLIVE/target.sweeping.$DEADPID — LIVE" run.log \
+    || { echo "FAIL arm9d: live detached dir not kept for the documented reason"; cat run.log; exit 1; }
+
+  # arm 9f: a lane waiting on a detached dir's lock gates adoption too
+  test -d "$ORPHWAIT/target.sweeping.$DEADPID" \
+    || { echo "FAIL arm9f: adopted a detached dir whose lock a lane was waiting on"; exit 1; }
+  grep -qF "KEEP   $ORPHWAIT/target.sweeping.$DEADPID — LIVE" run.log \
+    || { echo "FAIL arm9f: waiting lane on a detached dir not detected"; cat run.log; exit 1; }
+
+  # arm 14: a lane blocked on the lock is a lane
+  test -d "$WAITWT/target" \
+    || { echo "FAIL arm14: detached a target dir a lane was waiting to build in"; exit 1; }
+  grep -qF "KEEP   $WAITWT/target — a lane is waiting on its cargo lock" run.log \
+    || { echo "FAIL arm14: a waiting lane was not detected"; cat run.log; exit 1; }
+
+  # arm 16: a symlinked worktree outside the root is never touched
+  test -f "$TMPDIR/outside-root/linksrc/target/.rustc_info.json" \
+    || { echo "FAIL arm16: swept a target dir outside the root through a symlinked worktree"; exit 1; }
+  if grep -E '^(DETACH|CLEAN|PRUNE)' run.log | grep -qF "$ROOT/linked/"; then
+    echo "FAIL arm16: acted on a symlinked worktree"; exit 1
+  fi
+
+  # arm 17: written between the first verdict and the recheck -> pruned
+  test -f "$RECHK/target/debug/written-mid-sweep" \
+    || { echo "FAIL arm17: the mid-sweep write never happened, or was swept — this arm proves nothing"; cat run.log; exit 1; }
+  grep -qF "RECHECK $RECHK/target became active while it was being measured" run.log \
+    || { echo "FAIL arm17: the recheck did not downgrade a tree written to mid-sweep"; cat run.log; exit 1; }
+  grep -qE "^(DETACH|CLEAN) .*$RECHK/target" run.log \
+    && { echo "FAIL arm17: cleaned a tree written to mid-sweep"; exit 1; }
 
   # --------------------------------------------------------------- arm 10
   # AGE REGRESSION. Taking the Cargo lock CREATES .klaffat-cargo.lock inside
@@ -509,6 +644,30 @@ pkgs.runCommand "cargo-target-sweep-contract"
   test "$okrc" -eq 0 \
     || { echo "FAIL arm13: a run with no failures exited $okrc"; cat okrun.log; exit 1; }
 
+  # --------------------------------------------------------------- arm 15
+  # PRUNE FAILURE IS A FAILURE. cargo-sweep 0.8 exits 0 when it cannot
+  # remove files, printing only "[WARN] Failed to remove" (measured on
+  # tuxedo 2026-11-11). Logged as PRUNE, pass B could fail on every
+  # directory, every day, with the unit green.
+  PFAIL=$(mk_real prunefail)
+  printf 'stale artifact\n' > "$PFAIL/target/debug/deps/libstaleart-0000000000000000.rlib"
+  touch -d "90 days ago" "$PFAIL/target/debug/deps/libstaleart-0000000000000000.rlib"
+  chmod 555 "$PFAIL/target/debug/deps"
+  set +e
+  cargo-target-sweep > prunefail.log 2>&1
+  pfrc=$?
+  set -e
+  chmod 755 "$PFAIL/target/debug/deps"
+  echo "--- prune-failure run (rc=$pfrc) ---"; cat prunefail.log
+  test -f "$PFAIL/target/debug/deps/libstaleart-0000000000000000.rlib" \
+    || { echo "FAIL arm15: the fixture's artifact was removed — the arm proves nothing"; exit 1; }
+  grep -qF "PRUNE  $PFAIL/target" prunefail.log \
+    && { echo "FAIL arm15: logged PRUNE although cargo sweep could not remove anything"; exit 1; }
+  grep -qF "FAIL   cargo sweep could not remove artifacts in $PFAIL/target" prunefail.log \
+    || { echo "FAIL arm15: a failed prune was not reported as a failure"; exit 1; }
+  test "$pfrc" -ne 0 \
+    || { echo "FAIL arm15: a run whose prune failed still exited 0"; exit 1; }
+
   # ------------------------------------------------------- drift gate
   # The deployed user unit must exec exactly the derivation tested above,
   # or this harness proves nothing about what actually runs.
@@ -523,10 +682,26 @@ pkgs.runCommand "cargo-target-sweep-contract"
   # than both at midnight. A comment claiming an offset is worthless if the
   # units do not actually have one — the previous revision's comment said
   # "offset from worktree-sweep's window" while both read OnCalendar=daily.
-  if [ "$OnCalendar" = "$wtOnCalendar" ]; then
-    echo "FAIL schedule: cargo-target-sweep and worktree-sweep share OnCalendar='$OnCalendar'"
-    exit 1
-  fi
+  # String inequality is not the property: 'daily' and '*-*-* 00:00:00'
+  # differ as strings and fire at the same instant. Compare the WINDOWS —
+  # first elapse plus randomized delay — as systemd itself computes them.
+  tod() { # OnCalendar -> seconds after midnight of its next elapse
+    systemd-analyze calendar --iterations=1 "$1" \
+      | awk '/Next elapse:/ { split($5, t, ":"); print t[1] * 3600 + t[2] * 60 + t[3]; exit }'
+  }
+  span() { # timespan -> whole seconds
+    systemd-analyze timespan "$1" | awk 'NF == 2 && $2 ~ /^[0-9]+$/ { print int($2 / 1000000); exit }'
+  }
+  a=$(tod "$OnCalendar"); da=$(span "$RandomizedDelaySec")
+  b=$(tod "$wtOnCalendar"); db=$(span "$wtRandomizedDelaySec")
+  test -n "$a" && test -n "$da" && test -n "$b" && test -n "$db" \
+    || { echo "FAIL schedule: could not compute the timer windows (a=$a da=$da b=$b db=$db)"; exit 1; }
+  for shift in -86400 0 86400; do
+    if [ "$a" -le $((b + shift + db)) ] && [ $((b + shift)) -le $((a + da)) ]; then
+      echo "FAIL schedule: cargo-target-sweep [$a, +$da s] overlaps worktree-sweep [$b, +$db s]"
+      exit 1
+    fi
+  done
   echo "schedule: cargo-target-sweep '$OnCalendar' +$RandomizedDelaySec; worktree-sweep '$wtOnCalendar' +$wtRandomizedDelaySec"
 
   echo "all cargo-target-sweep contract arms passed"

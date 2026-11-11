@@ -60,7 +60,9 @@
 #      path — so asking cargo is the check, and unsetting is only the belt.
 #   5. the per-worktree Cargo lock (.klaffat-cargo.lock) can be taken
 #      non-blocking — the same lock ~/Repos/klaffat/scripts/with-cargo-lock
-#      takes, so a lane holding it is never interrupted
+#      takes, so a lane holding it is never interrupted — and, once taken,
+#      no OTHER process holds the lock file open: with-cargo-lock opens it
+#      and then blocks in flock(), so an open fd on it is a waiting lane
 #   6. no live process has cwd, an open fd, or a mapped file inside it
 #      — mapped files matter: a running rustc maps .rlib/.so straight out
 #        of the target dir without holding a conventional fd
@@ -68,8 +70,13 @@
 #        and is the last thing before acting. An earlier revision took one
 #        /proc snapshot up front; a `cargo` started by hand after that
 #        snapshot (it takes no klaffat lock) would have been swept
-#        mid-build. One snapshot per candidate costs ~0.1s on a Nice=15
-#        idle-IO daily job and removes the window entirely.
+#        mid-build. One snapshot per candidate costs ~0.05s.
+#      — it cannot close the window on its own: a `cargo` that starts
+#        between the check and the rename keeps its files through the
+#        rename. So the check is asked AGAIN on the detached path, where
+#        anything that opened files before the rename is still visible and
+#        nothing new can arrive (a newcomer resolves `target`, which is now
+#        a fresh directory). A hit there moves the directory back.
 #
 # Predicates 5 and 6 are what make this safe against the standing constraint
 # that parallel klaffat lanes run constantly: destroying a lane's target dir
@@ -207,6 +214,27 @@ pkgs.writeShellApplication {
       return 1
     }
 
+    # Does any process OTHER than this sweep hold the lock file $1 open?
+    # Called only with the flock in our hands, so such a process is a lane
+    # blocked in flock(LOCK_EX): with-cargo-lock opens the file and then
+    # waits. is_live() excludes the lock path, so it cannot see one.
+    #
+    # The scan runs in a subshell that first closes its inherited copy of
+    # the lock fd, so neither it nor find/awk shows up as a holder; the main
+    # shell's own fd is excluded by pid. Signal is output, as in is_live().
+    lock_waiters() {
+      local lock=$1 hit
+      [ -e "$lock" ] || return 1
+      hit=$(
+        if [ -n "''${lockfd:-}" ]; then exec {lockfd}>&-; fi
+        find /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%h %l\n' 2>/dev/null \
+          | awk -v lk="$lock" -v me="/proc/$$/fd" '
+              { sp = index($0, " ") }
+              substr($0, sp + 1) == lk && substr($0, 1, sp - 1) != me { print "hit"; exit }'
+      )
+      [ -n "$hit" ]
+    }
+
     # Is anything under $1 newer than the staleness cutoff?
     #
     # Prints "active", "stale", "empty", or "unreadable". The last is the
@@ -248,21 +276,39 @@ pkgs.writeShellApplication {
       # ---- ADOPT: detached dirs left by a sweep that died mid-clean ----
       # Only when the pid that detached it is gone, so a concurrent run's
       # work in progress is never stolen.
+      #
+      # Every skip is logged and counted: a detached dir is typically many
+      # GB, and one skipped silently is one nobody ever finds.
       while IFS= read -r orphan; do
         [ -n "$orphan" ] || continue
         opid=''${orphan##*.sweeping.}
         case "$opid" in
-          ''' | *[!0-9]*) continue ;;
+          ''' | *[!0-9]*)
+            keep "unrecognised detached-dir suffix — not this sweep's naming" "$orphan"
+            kept=$((kept + 1)); continue ;;
         esac
-        [ -d "/proc/$opid" ] && continue
+        # A live pid is not proof of a live sweep: pids are reused. Only a
+        # process that IS a cargo-target-sweep owns the dir. An unreadable
+        # cmdline proves nothing either way, so it keeps (fail closed).
+        if [ -d "/proc/$opid" ]; then
+          if ! ocmd=$(tr '\0' ' ' < "/proc/$opid/cmdline" 2>/dev/null) \
+             || [[ "$ocmd" == *cargo-target-sweep* ]]; then
+            keep "detached by a sweep that is still running (pid $opid)" "$orphan"
+            kept=$((kept + 1)); continue
+          fi
+          log "REUSED pid $opid is alive but is not a sweep — treating $orphan as orphaned"
+        fi
         omanifest=$(dirname "$orphan")/Cargo.toml
-        [ -f "$omanifest" ] || continue
+        if [ ! -f "$omanifest" ]; then
+          keep "no Cargo.toml beside it — nothing to clean it through" "$orphan"
+          kept=$((kept + 1)); continue
+        fi
         # A detached dir is unreachable by with-cargo-lock (lanes only ever
         # resolve `target`), so nothing should be inside it — but the whole
         # contract here is that a predicate holds positively before anything
         # is removed, and an orphaned child of the dead sweep is exactly the
         # case that would not.
-        if is_live "$orphan"; then
+        if is_live "$orphan" || lock_waiters "$orphan/$LOCK_NAME"; then
           keep "LIVE — a process is using this detached dir" "$orphan"
           kept=$((kept + 1)); continue
         fi
@@ -406,8 +452,14 @@ pkgs.writeShellApplication {
           *) : ;;
         esac
 
-        # (8) nothing live inside. This is the LAST thing before acting, and
-        # the only work between it and the act is the act's own first syscall.
+        # (8) no lane waiting on the lock, and nothing live inside. is_live
+        # is the LAST thing before acting — the waiter scan goes first, so
+        # the only work between is_live and the act is the act's own first
+        # syscall. Every scan placed in that gap widens it.
+        if [ -n "$lockfd" ] && lock_waiters "$lock"; then
+          release_lock
+          keep "a lane is waiting on its cargo lock" "$target"; kept=$((kept + 1)); continue
+        fi
         if is_live "$real"; then
           release_lock
           keep "LIVE — a process is using it" "$target"; kept=$((kept + 1)); continue
@@ -425,6 +477,35 @@ pkgs.writeShellApplication {
               kept=$((kept + 1)); continue
             fi
             log "DETACH $target -> $detached"
+            # (9) Ask again, on the detached path. Anything that opened
+            # files in target/ between (8) and the rename moved with it and
+            # is visible here; anything arriving from now on resolves
+            # `target` to a fresh directory and cannot reach this one. A lane
+            # that opened the lock in that window holds the detached inode.
+            #
+            # Move back BEFORE releasing the lock. Released first, a waiter
+            # woken on the detached inode can run cargo, which recreates
+            # target/ by path; the move-back then fails and that lane's
+            # flock guards a directory no other lane can reach.
+            #
+            # KNOWN LIMIT: with-cargo-lock resolves target/ and then opens the
+            # lock file. A rename landing exactly between the two makes that
+            # open fail with ENOENT and the lane exits at startup with "could
+            # not open Cargo lock". It fails safe — before building anything,
+            # loudly — and cannot be closed from this side.
+            if is_live "$detached" || lock_waiters "$detached/$LOCK_NAME"; then
+              if [ -e "$real" ]; then
+                release_lock
+                keep "LIVE after detach and target/ was recreated meanwhile — left at $detached; a later run adopts it once idle" "$target"
+              elif mverr=$(mv -T "$detached" "$real" 2>&1); then
+                release_lock
+                keep "LIVE after detach — something started using it in the window; moved back" "$target"
+              else
+                release_lock
+                fail "LIVE after detach and could not move $detached back to $target: $mverr"
+              fi
+              kept=$((kept + 1)); continue
+            fi
             # The lock inode moved with the directory and now guards nothing
             # a lane can reach; a lane arriving from here on makes a fresh
             # target/ of its own.
@@ -440,11 +521,22 @@ pkgs.writeShellApplication {
           # still active: prune only the stale artifacts inside it
           if [ "$DRY_RUN" = 1 ]; then
             log "WOULD-PRUNE $target"
-          elif cargo sweep --time "$PRUNE_AGE_DAYS" "$wt" >/dev/null 2>&1; then
-            log "PRUNE  $target"
-            pruned=$((pruned + 1))
           else
-            keep "cargo sweep declined" "$target"; kept=$((kept + 1))
+            # cargo-sweep 0.8 exits 0 when it fails: "[WARN] Failed to remove"
+            # for an undeletable artifact, "[ERROR] Failed to clean" for an
+            # unreadable tree (both measured 2026-11-11), so the exit status
+            # alone would report a prune that removed nothing. Any [ERROR]
+            # line or any "Failed to" line is a failure; other [WARN]s are not.
+            if sweep_out=$(cargo sweep --time "$PRUNE_AGE_DAYS" "$wt" 2>&1); then
+              if grep -qE '^\[ERROR\]|Failed to' <<<"$sweep_out"; then
+                fail "cargo sweep could not remove artifacts in $target: $(grep -m1 -E '^\[ERROR\]|Failed to' <<<"$sweep_out")"
+              else
+                log "PRUNE  $target"
+                pruned=$((pruned + 1))
+              fi
+            else
+              fail "cargo sweep exited non-zero for $target: $(tail -n1 <<<"$sweep_out")"
+            fi
           fi
         fi
 
