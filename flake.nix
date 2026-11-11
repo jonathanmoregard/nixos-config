@@ -452,6 +452,29 @@
             .home-manager.users.jonathan
             .systemd.user.services.worktree-sweep.Service.ExecStart;
         };
+        # Not a VM lane: fail-closed contract harness for the stale Cargo
+        # target sweeper (home/cargo-target-sweep-script.nix). Builds
+        # fixture target dirs — genuine, fresh, lock-held, manifest-less,
+        # and a decoy merely named `target` — and asserts every keep/delete
+        # predicate. Destructive automation ships only behind this.
+        # Cheap runCommand; seconds.
+        cargo-target-sweep = import ./tests/cargo-target-sweep.nix {
+          pkgs = pkgsLinux;
+          sweepScript = import ./home/cargo-target-sweep-script.nix { pkgs = pkgsLinux; };
+          # Drift gate: the harness asserts the deployed user unit execs
+          # exactly the derivation under test.
+          deployedExecStart = primaryConfig
+            .home-manager.users.jonathan
+            .systemd.user.services.cargo-target-sweep.Service.ExecStart;
+          # Schedule gate: the harness asserts this sweep and worktree-sweep
+          # do not share a window, since both walk the same trees.
+          deployedTimer = primaryConfig
+            .home-manager.users.jonathan
+            .systemd.user.timers.cargo-target-sweep.Timer;
+          worktreeSweepTimer = primaryConfig
+            .home-manager.users.jonathan
+            .systemd.user.timers.worktree-sweep.Timer;
+        };
         # Not a VM lane: runtime-invocation harness for the kitty
         # session save/restore scripts (home/kitty.nix) — single-line
         # session stub, pane-0 notice delivery, grid dispatch against
