@@ -669,6 +669,7 @@ in
     ./cinnamon.nix
     ./cinnamon-watchdog.nix
     ./lid-guard.nix
+    ./notification-log.nix
     ./desktop-apps.nix
     ./calibre-plugins.nix
     ./ghostty.nix
