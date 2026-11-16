@@ -30,6 +30,72 @@
 # Run: nix build .#checks.x86_64-linux.vm-desktop -L
 { pkgs, inputs }:
 let
+  inherit (pkgs) lib;
+
+  # notification-log fixtures. One `busctl --user monitor --json=short` line
+  # per message, shaped as captured on tuxedo for a real
+  # `notify-send -a probe-app -u critical ...` (2026-11-11):
+  #   {"type":"method_call",...,"sender":":1.11458","destination":":1.58",
+  #    "interface":"org.freedesktop.Notifications","member":"Notify",
+  #    "payload":{"type":"susssasa{sv}i","data":["probe-app",0,"","probe summary",
+  #    "probe body\nline2",[],{"urgency":{"type":"y","data":2},...},-1]}}
+  nlMsg = { member ? "Notify", data }: builtins.toJSON {
+    type = "method_call";
+    sender = ":1.900";
+    destination = ":1.58";
+    path = "/org/freedesktop/Notifications";
+    interface = "org.freedesktop.Notifications";
+    inherit member;
+    payload = { type = "susssasa{sv}i"; inherit data; };
+  };
+  nlNotify = summary: body: hints:
+    nlMsg { data = [ "adv-app" 0 "" summary body [ ] hints (-1) ]; };
+  nlLow = { urgency = { type = "y"; data = 0; }; };
+
+  # Garbage first, then the five records that must survive in this order.
+  nlAdversarial = pkgs.writeText "nl-adversarial.jsonl" (lib.concatMapStrings (l: l + "\n") [
+    ""
+    "not json at all"
+    "{}"
+    "null"
+    "[1,2]"
+    ''{"type":"method_call","payload":''
+    (nlMsg { member = "CloseNotification"; data = [ 5 ]; })
+    (nlMsg { data = [ "short" 0 "" ]; })
+    (nlNotify "adv-plain" "plain" nlLow)
+    (nlNotify "adv-nohints" "no hints" { })
+    (nlNotify "adv-badurgency" "urgency is a string" { urgency = { type = "s"; data = "high"; }; })
+    (nlNotify "adv-unicode" "line1\nlïne2 ✓ 日本" nlLow)
+    (nlNotify "adv-long" (lib.concatStrings (lib.replicate 100000 "x")) nlLow)
+    # Terminal control (OSC title, clear screen, BEL) plus U+2028, which a
+    # raw-UTF-8 log line would split at.
+    (nlNotify "adv-ctl" (builtins.fromJSON ''"a\u2028b\u001b]0;PWNED\u0007c\u001b[2Jd\u009be"'') nlLow)
+    # A lone surrogate escape: valid JSON, no valid UTF-8.
+    ''{"member":"Notify","interface":"org.freedesktop.Notifications","payload":{"data":["adv-app",0,"","adv-surrogate","x\ud800y",[],{},-1]}}''
+    (nlMsg { data = [ (lib.concatStrings (lib.replicate 100000 "a")) 0 "" "adv-longapp" "b" [ ] { } (-1) ]; })
+    (nlNotify (lib.concatStrings (lib.replicate 5000 "s")) "long summary" nlLow)
+  ]);
+
+  # Age alone, below the entry cap: the old entry must go, the rest stay.
+  nlAgeSeed = pkgs.writeText "nl-age-seed.jsonl" (lib.concatMapStrings (l: l + "\n") (
+    [ (builtins.toJSON { ts = "2000-01-01T00:00:00+00:00"; app = "old"; summary = "nl-age-ancient"; body = ""; urgency = null; sender = ":1.1"; }) ]
+    ++ lib.genList (i: builtins.toJSON {
+      ts = "2090-01-01T00:00:00+00:00"; app = "seq"; summary = "nl-age-${toString i}";
+      body = ""; urgency = 1; sender = ":1.1";
+    }) 3
+  ));
+
+  # A 30-day-old entry, then 5100 entries: trimming must drop the old one and
+  # keep only the newest 5000 (nl-seq-100 .. nl-seq-5099). The recent ones are
+  # dated far ahead because a pure fixture cannot know the VM's clock.
+  nlTrimSeed = pkgs.writeText "nl-trim-seed.jsonl" (lib.concatMapStrings (l: l + "\n") (
+    [ (builtins.toJSON { ts = "2000-01-01T00:00:00+00:00"; app = "old"; summary = "nl-ancient"; body = ""; urgency = null; sender = ":1.1"; }) ]
+    ++ lib.genList (i: builtins.toJSON {
+      ts = "2090-01-01T00:00:00+00:00"; app = "seq"; summary = "nl-seq-${toString i}";
+      body = ""; urgency = 1; sender = ":1.1";
+    }) 5100
+  ));
+
   # Stands in for a Claude Code process: comm is "claude" (the basename
   # execve saw), it feeds a hook payload file to `agent-activity mark` the
   # way the settings.json hook does, then stays alive for $2 seconds. The
@@ -283,6 +349,201 @@ in
         "xrdb -query | grep -qx 'Xcursor.theme:\tBibata-Modern-Classic'",
         timeout=120,
     )
+
+    # notification-log (home/notification-log.nix): every Notify call on the
+    # session bus is appended to ~/.local/state/notification-log/
+    # notifications.jsonl and shown by `notifications`, while Cinnamon keeps
+    # delivering it. Runs before the cinnamon-rescue block, which ends the
+    # session's notification daemon.
+    import json as nl_json
+    from datetime import datetime, timedelta, timezone
+
+    nl_env = (
+        "export XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus"
+    )
+    nl_dir = "/home/jonathan/.local/state/notification-log"
+    nl_file = f"{nl_dir}/notifications.jsonl"
+
+    def nl_as_j(cmd, **kw):
+        return workstation.execute(f"su - jonathan -c '{nl_env}; {cmd}' 2>&1", **kw)
+
+    workstation.wait_until_succeeds(
+        f"su - jonathan -c '{nl_env}; systemctl --user is-active notification-log.service'",
+        timeout=60,
+    )
+    # Delivery needs a daemon, and Cinnamon only claims the name once its
+    # session is up; a capture proven against an unowned name proves nothing
+    # about leaving delivery alone.
+    workstation.wait_until_succeeds(
+        f"su - jonathan -c '{nl_env}; gdbus call --session --dest org.freedesktop.DBus "
+        "--object-path /org/freedesktop/DBus --method org.freedesktop.DBus.NameHasOwner "
+        "org.freedesktop.Notifications' | grep -q true",
+        timeout=120,
+    )
+
+    # The monitor attaches a moment after the unit goes active, so resend
+    # until one lands. notify-send exits 0 only when the daemon replied with
+    # an id, so every attempt also proves delivery still works.
+    nl_captured = False
+    for _ in range(15):
+        rc, out = nl_as_j("${pkgs.libnotify}/bin/notify-send -u critical e2e-summary e2e-body")
+        assert rc == 0, f"notify-send failed, so delivery is broken: rc={rc} {out!r}"
+        if workstation.execute(
+            f"test -s {nl_file} && grep -q e2e-summary {nl_file}"
+        )[0] == 0:
+            nl_captured = True
+            break
+        workstation.sleep(1)
+    print("[diag] notification log:\n" + workstation.execute(f"tail -n 5 {nl_file} 2>&1")[1])
+    print("[diag] notification-log journal:\n" + workstation.execute(
+        "journalctl --no-pager -n 20 _SYSTEMD_USER_UNIT=notification-log.service 2>&1"
+    )[1])
+    assert nl_captured, "a real notify-send never reached the notification log"
+
+    rec = nl_json.loads(workstation.succeed(
+        f"grep e2e-summary {nl_file} | tail -n 1"
+    ))
+    print(f"[diag] captured record: {rec!r}")
+    assert rec["app"] == "notify-send", rec
+    assert rec["summary"] == "e2e-summary" and rec["body"] == "e2e-body", rec
+    assert rec["urgency"] == 2, f"-u critical must log urgency 2: {rec!r}"
+    assert rec["sender"].startswith(":"), f"sender is not a unique bus name: {rec!r}"
+    nl_ts = datetime.fromisoformat(rec["ts"])
+    assert nl_ts.utcoffset() == timedelta(0), f"ts is not UTC: {rec['ts']!r}"
+    nl_vm_now = datetime.fromtimestamp(
+        int(workstation.succeed("date +%s").strip()), timezone.utc
+    )
+    assert abs((nl_vm_now - nl_ts).total_seconds()) < 600, \
+        f"ts {rec['ts']} is not the capture time (VM now {nl_vm_now})"
+
+    # Bodies may be private.
+    assert workstation.succeed(f"stat -c %a {nl_dir}").strip() == "700"
+    assert workstation.succeed(f"stat -c %a {nl_file}").strip() == "600"
+
+    # One line per notification in the unit's journal.
+    workstation.wait_until_succeeds(
+        "journalctl --no-pager _SYSTEMD_USER_UNIT=notification-log.service "
+        "| grep -q e2e-summary",
+        timeout=30,
+    )
+    # ...and that line names the app and summary only, never the body.
+    workstation.fail(
+        "journalctl --no-pager _SYSTEMD_USER_UNIT=notification-log.service "
+        "| grep -q e2e-body"
+    )
+
+    # Monitor only: the daemon that owns the name is not in our unit.
+    owner = workstation.succeed(
+        f"su - jonathan -c '{nl_env}; gdbus call --session --dest org.freedesktop.DBus "
+        "--object-path /org/freedesktop/DBus --method "
+        "org.freedesktop.DBus.GetConnectionUnixProcessID org.freedesktop.Notifications' "
+        "| sed -n 's/.*uint32 \\([0-9]*\\).*/\\1/p'"
+    ).strip()
+    assert owner, "nothing owns org.freedesktop.Notifications"
+    assert "notification-log" not in workstation.succeed(f"cat /proc/{owner}/cgroup"), \
+        "notification-log claimed org.freedesktop.Notifications"
+
+    # The CLI, as a user would run it.
+    rc, out = nl_as_j("notifications")
+    print(f"[diag] notifications rc={rc}:\n{out}")
+    assert rc == 0, out
+    assert "e2e-summary" in out and "e2e-body" in out, out
+    assert not out.lstrip().startswith("{"), f"default output is raw JSON:\n{out}"
+
+    rc, out = nl_as_j("notifications --json -n 1")
+    assert rc == 0, out
+    nl_lines = out.strip().splitlines()
+    assert len(nl_lines) == 1, f"-n 1 printed {len(nl_lines)} lines:\n{out}"
+    assert set(nl_json.loads(nl_lines[0])) >= {"ts", "app", "summary", "body", "urgency", "sender"}
+
+    rc, out = nl_as_j("notifications --since \"1 hour ago\"")
+    assert rc == 0 and "e2e-summary" in out, f"--since 1 hour ago lost it:\n{out}"
+    rc, out = nl_as_j("notifications --json --since 2089-01-01")
+    assert rc == 0 and "e2e-summary" not in out, f"--since in the future kept it:\n{out}"
+
+    # An empty log must say so AND say whether capture is running, so "no
+    # notifications" can never read as "capture is down", or the reverse.
+    workstation.succeed("install -d -o jonathan -m 700 /tmp/nl-empty")
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-empty notifications")
+    print(f"[diag] empty log, service up: rc={rc}\n{out}")
+    assert rc == 0 and "No notifications" in out and "notification-log: active" in out, out
+    workstation.succeed(f"su - jonathan -c '{nl_env}; systemctl --user stop notification-log.service'")
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-empty notifications")
+    print(f"[diag] empty log, service down: rc={rc}\n{out}")
+    assert rc == 0 and "notification-log: active" not in out and "NOT running" in out, out
+    workstation.succeed(f"su - jonathan -c '{nl_env}; systemctl --user start notification-log.service'")
+
+    # The parser against garbage: nothing malformed is logged, nothing
+    # malformed stops it, every well-formed Notify survives intact.
+    workstation.succeed("install -d -o jonathan -m 700 /tmp/nl-adv")
+    rc, out = nl_as_j(
+        "XDG_STATE_HOME=/tmp/nl-adv notification-log-capture --stdin < ${nlAdversarial}"
+    )
+    print(f"[diag] adversarial run rc={rc}:\n{out[:2000]}")
+    assert rc == 0, f"capture died on adversarial input:\n{out[:2000]}"
+    adv = [nl_json.loads(line) for line in workstation.succeed(
+        "cat /tmp/nl-adv/notification-log/notifications.jsonl"
+    ).splitlines()]
+    assert [r["summary"][:20] for r in adv] == [
+        "adv-plain", "adv-nohints", "adv-badurgency", "adv-unicode", "adv-long",
+        "adv-ctl", "adv-surrogate", "adv-longapp", "s" * 20,
+    ], [r["summary"][:20] for r in adv]
+    assert [r["urgency"] for r in adv] == [0, None, None, 0, 0, 0, None, None, 0], \
+        [r["urgency"] for r in adv]
+    assert adv[3]["body"] == "line1\nlïne2 ✓ 日本", repr(adv[3]["body"])
+    assert adv[4]["body"] == "x" * 4096, f"a 100k body was stored at {len(adv[4]['body'])} chars"
+    assert adv[5]["body"] == "a\u2028b\x1b]0;PWNED\x07c\x1b[2Jd\x9be", repr(adv[5]["body"])
+    assert adv[6]["body"] == "x?y", repr(adv[6]["body"])
+    assert adv[7]["app"] == "a" * 256, f"a 100k app name was stored at {len(adv[7]['app'])} chars"
+    assert adv[8]["summary"] == "s" * 1024, f"a 5000-char summary was stored at {len(adv[8]['summary'])} chars"
+    assert "adv-plain" in out, "no journal line was printed for a capture"
+    assert "PWNED" not in out and "long summary" not in out, \
+        f"a body reached the capture's journal output:\n{out[:2000]}"
+
+    # The CLI shows every one of them, and no notification text can drive
+    # the terminal.
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-adv notifications -n 0")
+    print(f"[diag] adversarial CLI rc={rc}:\n{out[:2000]!r}")
+    assert rc == 0, out[:2000]
+    assert "adv-ctl" in out and "adv-surrogate" in out, out[:2000]
+    assert not any(c in out for c in "\x1b\x07\x9b"), \
+        f"control characters reached the terminal:\n{out[:2000]!r}"
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-adv notifications --json -n 0")
+    assert rc == 0, out[:2000]
+    assert len([nl_json.loads(line) for line in out.splitlines()]) == len(adv), \
+        f"--json lost records:\n{out[:2000]!r}"
+    assert not any(c in out for c in "\x1b\x07\x9b\u2028"), \
+        f"--json printed raw control characters:\n{out[:2000]!r}"
+
+    # Age, below the entry cap: the CLI hides the old entry even before any
+    # trim, and the trim then removes it from disk.
+    workstation.succeed(
+        "install -d -o jonathan -m 700 /tmp/nl-age /tmp/nl-age/notification-log && "
+        "install -o jonathan -m 600 ${nlAgeSeed} /tmp/nl-age/notification-log/notifications.jsonl"
+    )
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-age notifications -n 0")
+    assert rc == 0 and "nl-age-ancient" not in out and "nl-age-2" in out, out
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-age notification-log-capture --stdin < /dev/null")
+    assert rc == 0, out
+    aged = [nl_json.loads(line)["summary"] for line in workstation.succeed(
+        "cat /tmp/nl-age/notification-log/notifications.jsonl"
+    ).splitlines()]
+    assert aged == ["nl-age-0", "nl-age-1", "nl-age-2"], aged
+
+    # Bounded: the oldest entries and anything over 30 days old are trimmed.
+    workstation.succeed(
+        "install -d -o jonathan -m 700 /tmp/nl-trim /tmp/nl-trim/notification-log && "
+        "install -o jonathan -m 600 ${nlTrimSeed} /tmp/nl-trim/notification-log/notifications.jsonl"
+    )
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-trim notification-log-capture --stdin < /dev/null")
+    assert rc == 0, out
+    trimmed = workstation.succeed("cat /tmp/nl-trim/notification-log/notifications.jsonl")
+    trimmed_summaries = [nl_json.loads(line)["summary"] for line in trimmed.splitlines()]
+    assert len(trimmed_summaries) == 5000, f"kept {len(trimmed_summaries)} lines"
+    assert "nl-ancient" not in trimmed_summaries, "a 30-day-old entry survived the trim"
+    assert trimmed_summaries[0] == "nl-seq-100" and trimmed_summaries[-1] == "nl-seq-5099", \
+        f"trim kept the wrong end: {trimmed_summaries[0]} .. {trimmed_summaries[-1]}"
 
     # cinnamon-rescue (home/cinnamon-watchdog.nix): recover a wedged Cinnamon
     # main loop without a reboot.
