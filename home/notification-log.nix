@@ -21,6 +21,7 @@ let
   # A body is stored up to this many characters; the rest is cut.
   maxBodyChars = 4096;
   maxSummaryChars = 1024;
+  maxAppChars = 256;
   # Trim on start, then after this many appends or once a day, whichever
   # comes first, so the file never grows far past maxEntries.
   trimEveryAppends = 500;
@@ -30,7 +31,9 @@ let
 
   common = ''
     import os
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
+
+    RETENTION = timedelta(days=${toString retentionDays})
 
 
     def log_path():
@@ -62,14 +65,13 @@ let
       import subprocess
       import sys
       import time
-      from datetime import timedelta
 
       ${common}
 
       MAX_ENTRIES = ${toString maxEntries}
-      RETENTION = timedelta(days=${toString retentionDays})
       MAX_BODY = ${toString maxBodyChars}
       MAX_SUMMARY = ${toString maxSummaryChars}
+      MAX_APP = ${toString maxAppChars}
       TRIM_EVERY_APPENDS = ${toString trimEveryAppends}
       TRIM_EVERY_SECS = ${toString trimEverySecs}
       BUSCTL = [
@@ -82,6 +84,13 @@ let
           d = os.path.dirname(path)
           os.makedirs(d, mode=0o700, exist_ok=True)
           os.chmod(d, 0o700)
+
+
+      def clean(s, n):
+          """s cut to n characters, with lone surrogates (which no UTF-8
+          writer accepts) replaced so neither the log nor the journal line
+          can fail on them."""
+          return s[:n].encode("utf-8", "replace").decode("utf-8")
 
 
       def record_from(line, now):
@@ -113,11 +122,11 @@ let
           sender = msg.get("sender")
           return {
               "ts": now.isoformat(timespec="seconds"),
-              "app": app,
-              "summary": summary[:MAX_SUMMARY],
-              "body": body[:MAX_BODY],
+              "app": clean(app, MAX_APP),
+              "summary": clean(summary, MAX_SUMMARY),
+              "body": clean(body, MAX_BODY),
               "urgency": urgency,
-              "sender": sender if isinstance(sender, str) else None,
+              "sender": clean(sender, MAX_APP) if isinstance(sender, str) else None,
           }
 
 
@@ -125,7 +134,10 @@ let
           fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
           try:
               os.fchmod(fd, 0o600)
-              os.write(fd, (json.dumps(rec, ensure_ascii=False) + "\n").encode())
+              # ASCII-only, so a U+2028 or U+0085 in a body stays an escape
+              # instead of a raw character that splitlines() reads as a line
+              # break, which would split the record into unparsable halves.
+              os.write(fd, (json.dumps(rec) + "\n").encode())
           finally:
               os.close(fd)
 
@@ -216,10 +228,21 @@ let
       import json
       import subprocess
       import sys
+      import unicodedata
 
       ${common}
 
       URGENCY = {0: "low", 1: "normal", 2: "critical"}
+
+
+      def safe(s):
+          """s with control characters and lone surrogates shown as U+FFFD.
+          Any app can send a notification, so its text must not be able to
+          drive the terminal (escape sequences, title changes, clears)."""
+          return "".join(
+              "�" if c != "\t" and unicodedata.category(c) in ("Cc", "Cs") else c
+              for c in str(s)
+          )
 
 
       def service_state():
@@ -247,13 +270,17 @@ let
                   lines = f.read().splitlines()
           except FileNotFoundError:
               return []
+          cutoff = datetime.now(timezone.utc) - RETENTION
           out = []
           for line in lines:
               try:
                   rec = json.loads(line)
               except ValueError:
                   continue
-              if isinstance(rec, dict) and parse_ts(rec.get("ts")) is not None:
+              ts = parse_ts(rec.get("ts")) if isinstance(rec, dict) else None
+              # The capture trims only on start and on appends, so apply the
+              # retention window here too.
+              if ts is not None and ts >= cutoff:
                   out.append(rec)
           return out
 
@@ -262,11 +289,11 @@ let
           ts = parse_ts(rec["ts"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
           urg = URGENCY.get(rec.get("urgency"))
           tag = f"  [{urg}]" if urg and urg != "normal" else ""
-          app = rec.get("app") or ""
-          summary = rec.get("summary") or ""
+          app = safe(rec.get("app") or "")
+          summary = safe(rec.get("summary") or "")
           print(f"{ts}  {app}{tag}  {summary}")
-          for line in str(rec.get("body", "")).splitlines():
-              print(f"    {line}")
+          for line in str(rec.get("body") or "").splitlines():
+              print(f"    {safe(line)}")
 
 
       def main():
@@ -288,11 +315,17 @@ let
               recs = recs[-a.n:]
 
           state = service_state()
-          down = None if state == "active" else \
-              f"notification-log: NOT running ({state}); new notifications are not being logged"
+          if state == "active":
+              down = None
+          elif state == "unknown":
+              # systemctl could not reach the user manager (no user bus in
+              # this environment), which says nothing about the service.
+              down = "notification-log: capture state unknown (systemctl --user unavailable here)"
+          else:
+              down = f"notification-log: NOT running ({state}); new notifications are not being logged"
           if a.json:
               for r in recs:
-                  print(json.dumps(r, ensure_ascii=False))
+                  print(json.dumps(r))
               if down:
                   print(down, file=sys.stderr)
               return 0

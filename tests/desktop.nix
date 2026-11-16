@@ -67,7 +67,23 @@ let
     (nlNotify "adv-badurgency" "urgency is a string" { urgency = { type = "s"; data = "high"; }; })
     (nlNotify "adv-unicode" "line1\nlïne2 ✓ 日本" nlLow)
     (nlNotify "adv-long" (lib.concatStrings (lib.replicate 100000 "x")) nlLow)
+    # Terminal control (OSC title, clear screen, BEL) plus U+2028, which a
+    # raw-UTF-8 log line would split at.
+    (nlNotify "adv-ctl" (builtins.fromJSON ''"a\u2028b\u001b]0;PWNED\u0007c\u001b[2Jd\u009be"'') nlLow)
+    # A lone surrogate escape: valid JSON, no valid UTF-8.
+    ''{"member":"Notify","interface":"org.freedesktop.Notifications","payload":{"data":["adv-app",0,"","adv-surrogate","x\ud800y",[],{},-1]}}''
+    (nlMsg { data = [ (lib.concatStrings (lib.replicate 100000 "a")) 0 "" "adv-longapp" "b" [ ] { } (-1) ]; })
+    (nlNotify (lib.concatStrings (lib.replicate 5000 "s")) "long summary" nlLow)
   ]);
+
+  # Age alone, below the entry cap: the old entry must go, the rest stay.
+  nlAgeSeed = pkgs.writeText "nl-age-seed.jsonl" (lib.concatMapStrings (l: l + "\n") (
+    [ (builtins.toJSON { ts = "2000-01-01T00:00:00+00:00"; app = "old"; summary = "nl-age-ancient"; body = ""; urgency = null; sender = ":1.1"; }) ]
+    ++ lib.genList (i: builtins.toJSON {
+      ts = "2090-01-01T00:00:00+00:00"; app = "seq"; summary = "nl-age-${toString i}";
+      body = ""; urgency = 1; sender = ":1.1";
+    }) 3
+  ));
 
   # A 30-day-old entry, then 5100 entries: trimming must drop the old one and
   # keep only the newest 5000 (nl-seq-100 .. nl-seq-5099). The recent ones are
@@ -411,6 +427,11 @@ in
         "| grep -q e2e-summary",
         timeout=30,
     )
+    # ...and that line names the app and summary only, never the body.
+    workstation.fail(
+        "journalctl --no-pager _SYSTEMD_USER_UNIT=notification-log.service "
+        "| grep -q e2e-body"
+    )
 
     # Monitor only: the daemon that owns the name is not in our unit.
     owner = workstation.succeed(
@@ -464,14 +485,51 @@ in
     adv = [nl_json.loads(line) for line in workstation.succeed(
         "cat /tmp/nl-adv/notification-log/notifications.jsonl"
     ).splitlines()]
-    assert [r["summary"] for r in adv] == [
-        "adv-plain", "adv-nohints", "adv-badurgency", "adv-unicode", "adv-long"
-    ], [r["summary"] for r in adv]
-    assert [r["urgency"] for r in adv] == [0, None, None, 0, 0], [r["urgency"] for r in adv]
+    assert [r["summary"][:20] for r in adv] == [
+        "adv-plain", "adv-nohints", "adv-badurgency", "adv-unicode", "adv-long",
+        "adv-ctl", "adv-surrogate", "adv-longapp", "s" * 20,
+    ], [r["summary"][:20] for r in adv]
+    assert [r["urgency"] for r in adv] == [0, None, None, 0, 0, 0, None, None, 0], \
+        [r["urgency"] for r in adv]
     assert adv[3]["body"] == "line1\nlïne2 ✓ 日本", repr(adv[3]["body"])
-    assert adv[4]["body"].startswith("xxxx") and len(adv[4]["body"]) < 10000, \
-        f"a 100k body was stored at {len(adv[4]['body'])} chars"
+    assert adv[4]["body"] == "x" * 4096, f"a 100k body was stored at {len(adv[4]['body'])} chars"
+    assert adv[5]["body"] == "a\u2028b\x1b]0;PWNED\x07c\x1b[2Jd\x9be", repr(adv[5]["body"])
+    assert adv[6]["body"] == "x?y", repr(adv[6]["body"])
+    assert adv[7]["app"] == "a" * 256, f"a 100k app name was stored at {len(adv[7]['app'])} chars"
+    assert adv[8]["summary"] == "s" * 1024, f"a 5000-char summary was stored at {len(adv[8]['summary'])} chars"
     assert "adv-plain" in out, "no journal line was printed for a capture"
+    assert "PWNED" not in out and "long summary" not in out, \
+        f"a body reached the capture's journal output:\n{out[:2000]}"
+
+    # The CLI shows every one of them, and no notification text can drive
+    # the terminal.
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-adv notifications -n 0")
+    print(f"[diag] adversarial CLI rc={rc}:\n{out[:2000]!r}")
+    assert rc == 0, out[:2000]
+    assert "adv-ctl" in out and "adv-surrogate" in out, out[:2000]
+    assert not any(c in out for c in "\x1b\x07\x9b"), \
+        f"control characters reached the terminal:\n{out[:2000]!r}"
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-adv notifications --json -n 0")
+    assert rc == 0, out[:2000]
+    assert len([nl_json.loads(line) for line in out.splitlines()]) == len(adv), \
+        f"--json lost records:\n{out[:2000]!r}"
+    assert not any(c in out for c in "\x1b\x07\x9b\u2028"), \
+        f"--json printed raw control characters:\n{out[:2000]!r}"
+
+    # Age, below the entry cap: the CLI hides the old entry even before any
+    # trim, and the trim then removes it from disk.
+    workstation.succeed(
+        "install -d -o jonathan -m 700 /tmp/nl-age /tmp/nl-age/notification-log && "
+        "install -o jonathan -m 600 ${nlAgeSeed} /tmp/nl-age/notification-log/notifications.jsonl"
+    )
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-age notifications -n 0")
+    assert rc == 0 and "nl-age-ancient" not in out and "nl-age-2" in out, out
+    rc, out = nl_as_j("XDG_STATE_HOME=/tmp/nl-age notification-log-capture --stdin < /dev/null")
+    assert rc == 0, out
+    aged = [nl_json.loads(line)["summary"] for line in workstation.succeed(
+        "cat /tmp/nl-age/notification-log/notifications.jsonl"
+    ).splitlines()]
+    assert aged == ["nl-age-0", "nl-age-1", "nl-age-2"], aged
 
     # Bounded: the oldest entries and anything over 30 days old are trimmed.
     workstation.succeed(
