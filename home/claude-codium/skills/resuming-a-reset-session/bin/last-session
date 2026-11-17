@@ -73,13 +73,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--turns", type=int, default=12)
     parser.add_argument("-d", "--dir", default=os.getcwd())
-    parser.add_argument("--session", default=os.environ.get("CLAUDE_SESSION_ID", ""))
+    parser.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     args = parser.parse_args()
 
     # Editor and terminal sessions keep separate projects/ dirs, so a reset
     # editor session resuming terminal work (or the reverse) must see both.
     roots = [os.environ.get("CLAUDE_CONFIG_DIR"), os.path.expanduser("~/.claude")]
-    slug = str(pathlib.Path(args.dir).resolve()).replace("/", "-")
+    # Claude names project dirs by replacing every non-alphanumeric character.
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(pathlib.Path(args.dir).resolve()))
     searched = []
     files: list[pathlib.Path] = []
     for root in dict.fromkeys(r for r in roots if r):
