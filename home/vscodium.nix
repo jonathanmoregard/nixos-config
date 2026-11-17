@@ -225,6 +225,8 @@ let
     # this the extension spawns the CLI directly and its traffic is
     # invisible to the nftables rule bound to that cgroup.
     "claudeCode.claudeProcessWrapper" = "${claudeEgressLaunch}/bin/claude-egress-launch";
+    "claudeCode.preferredLocation" = "sidebar";
+    "chat.fontSize" = 16;
     # Point editor-started sessions at their own config directory, which is
     # what gives Codium its own CLAUDE.md and its own skills/ — see
     # home/claude-codium-config.nix for what that directory contains and what
@@ -261,6 +263,8 @@ let
     # pkg-config and OPENSSL_* all along. The wrapper enters the workspace's
     # devShell first and execs the pinned server inside it.
     "rust-analyzer.server.path" = "${rustAnalyzerDevshell}/bin/rust-analyzer-devshell";
+    "rust-analyzer.inlayHints.chainingHints.enable" = false;
+    "rust-analyzer.inlayHints.typeHints.enable" = false;
 
     # ── Nix ─────────────────────────────────────────────────────────────
     # nix-ide shells out to the language server by name, and a VSCodium
