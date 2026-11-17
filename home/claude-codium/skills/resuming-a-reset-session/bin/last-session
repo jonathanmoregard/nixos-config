@@ -60,6 +60,10 @@ def turns(path: pathlib.Path) -> list[tuple[str, str, str]]:
             role = role_of(entry)
             if role not in {"user", "assistant"}:
                 continue
+            # Skill bodies, compact summaries and subagent turns are written
+            # by the harness, not said by the user.
+            if entry.get("isMeta") or entry.get("isCompactSummary") or entry.get("isSidechain"):
+                continue
             body = STRIP.sub("", text_of(entry)).strip()
             if not body or NOISE.search(body):
                 continue
@@ -78,7 +82,11 @@ def main() -> int:
 
     # Editor and terminal sessions keep separate projects/ dirs, so a reset
     # editor session resuming terminal work (or the reverse) must see both.
-    roots = [os.environ.get("CLAUDE_CONFIG_DIR"), os.path.expanduser("~/.claude")]
+    roots = [
+        os.environ.get("CLAUDE_CONFIG_DIR"),
+        os.path.expanduser("~/.local/state/claude-codium"),
+        os.path.expanduser("~/.claude"),
+    ]
     # Claude names project dirs by replacing every non-alphanumeric character.
     slug = re.sub(r"[^A-Za-z0-9]", "-", str(pathlib.Path(args.dir).resolve()))
     searched = []
@@ -94,19 +102,23 @@ def main() -> int:
                 if not (args.session and args.session in p.stem)
             ]
 
-    if not files:
-        print("no other session transcript for this directory; looked in:",
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    # A headless run or a just-opened session leaves a transcript with no real
+    # turns; the reset session is the newest one that has some.
+    newest, collected = next(
+        ((p, t) for p in files if (t := turns(p))), (None, [])
+    )
+    if newest is None:
+        print("no other session transcript with turns for this directory; looked in:",
               file=sys.stderr)
         for path in searched:
             print(f"  {path}", file=sys.stderr)
         return 1
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
-    newest = files[0]
-    collected = turns(newest)
+    shown = collected[len(collected) - min(max(args.turns, 0), len(collected)) :]
     print(f"# {newest}")
-    print(f"# {len(collected)} turns; showing last {min(args.turns, len(collected))}\n")
-    for role, stamp, body in collected[-args.turns :]:
+    print(f"# {len(collected)} turns; showing last {len(shown)}\n")
+    for role, stamp, body in shown:
         print(f"## {role.upper()}  {stamp}")
         print(body)
         print()
