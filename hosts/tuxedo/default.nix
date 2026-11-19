@@ -2,7 +2,7 @@
 # successor. Everything hardware-neutral lives in profiles/workstation/;
 # this file keeps only what is tied to this laptop's hardware and identity.
 # Disk layout mirrors dellan: LUKS2 `cryptroot` + btrfs @ @home @nix @log.
-{ ... }:
+{ pkgs, ... }:
 {
   imports = [
     ./hardware-configuration.nix
@@ -49,9 +49,15 @@
 
   # Flash the Corne (QMK, ATmega32U4) without sudo. The rules tag the
   # bootloader devices `uaccess`, so the seat's logged-in user gets an ACL;
-  # no group membership is involved. The flashing toolchain is not installed
-  # here on purpose: it comes from qmk_firmware's own shell.nix.
+  # no group membership is involved. The toolchain is declared here because
+  # upstream qmk_firmware dropped its shell.nix; the flashing-corne skill
+  # calls qmk (compile) and avrdude (caterina flash) from PATH. nixpkgs' qmk
+  # does not put avrdude on PATH, hence both.
   hardware.keyboard.qmk.enable = true;
+  environment.systemPackages = [
+    pkgs.qmk
+    pkgs.avrdude
+  ];
   # secrets/github-app-key.age is encrypted to this host's key only.
   services.githubAppBroker.enable = true;
   # claude-code-dev-box (public: `gh api /apps/claude-code-dev-box`).
