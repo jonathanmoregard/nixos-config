@@ -669,6 +669,7 @@ in
     ./cinnamon.nix
     ./cinnamon-watchdog.nix
     ./lid-guard.nix
+    ./corne-miss-beep.nix
     ./notification-log.nix
     ./desktop-apps.nix
     ./calibre-plugins.nix

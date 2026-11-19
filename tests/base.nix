@@ -2564,6 +2564,37 @@ in
 
     workstation.succeed("modprobe -r dummy_hcd")
 
+    # corne-miss-beep (home/corne-miss-beep.nix): with no Corne attached the
+    # user service waits and rescans instead of crash-looping, and the
+    # listener plays its sound for a miss report ('Q' 'M' 0x01) and for
+    # nothing else. A FIFO stands in for the hidraw node and `touch` for the
+    # player, via the listener's CORNE_MISS_BEEP_* seams.
+    workstation.wait_for_unit("corne-miss-beep.service", "jonathan")
+    workstation.wait_until_succeeds(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "journalctl --user -u corne-miss-beep.service --no-pager' "
+        "| grep -q 'no Corne raw HID interface; waiting'",
+        timeout=60,
+    )
+    cmb = "/tmp/cmb"
+    workstation.succeed(f"su jonathan -c 'mkdir -p {cmb} && mkfifo {cmb}/fifo'")
+    workstation.succeed(
+        f"su - jonathan -c 'CORNE_MISS_BEEP_DEVICE={cmb}/fifo "
+        f"CORNE_MISS_BEEP_PLAYER=\"touch {cmb}/beeped\" "
+        f"setsid -f timeout 60 corne-miss-beep >{cmb}/log 2>&1'"
+    )
+
+    def cmb_send(payload):
+        # Opening the FIFO for write blocks until the listener has it open.
+        workstation.succeed(f"su jonathan -c \"printf '{payload}' > {cmb}/fifo\"", timeout=10)
+
+    cmb_send("XX\\001junk")
+    workstation.sleep(1)
+    workstation.fail(f"test -e {cmb}/beeped")
+    cmb_send("QM\\001")
+    workstation.wait_until_succeeds(f"test -e {cmb}/beeped", timeout=10)
+    print("[diag] corne-miss-beep log:\n" + workstation.succeed(f"cat {cmb}/log"))
+
     # claude-agent-N users (modules/nixos/claude-agent-users.nix) must be
     # hidden from the LightDM greeter. slick-greeter builds its user list
     # from AccountsService, which drops accounts whose SystemAccount
