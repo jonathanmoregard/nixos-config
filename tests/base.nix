@@ -2576,11 +2576,23 @@ in
         "| grep -q 'no Corne raw HID interface; waiting'",
         timeout=60,
     )
+    # Still the same process after several 3 s rescans: no crash/restart loop.
+    workstation.sleep(10)
+    restarts = workstation.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user show -P NRestarts corne-miss-beep.service'"
+    ).strip()
+    assert restarts == "0", f"corne-miss-beep restarted {restarts} times while waiting"
+    workstation.succeed(
+        "su - jonathan -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+        "systemctl --user is-active corne-miss-beep.service'"
+    )
     cmb = "/tmp/cmb"
     workstation.succeed(f"su jonathan -c 'mkdir -p {cmb} && mkfifo {cmb}/fifo'")
     workstation.succeed(
         f"su - jonathan -c 'CORNE_MISS_BEEP_DEVICE={cmb}/fifo "
         f"CORNE_MISS_BEEP_PLAYER=\"touch {cmb}/beeped\" "
+        f"CORNE_STATS_FILE={cmb}/stats.tsv "
         f"setsid -f timeout 60 corne-miss-beep >{cmb}/log 2>&1'"
     )
 
@@ -2588,11 +2600,24 @@ in
         # Opening the FIFO for write blocks until the listener has it open.
         workstation.succeed(f"su jonathan -c \"printf '{payload}' > {cmb}/fifo\"", timeout=10)
 
-    cmb_send("XX\\001junk")
-    workstation.sleep(1)
-    workstation.fail(f"test -e {cmb}/beeped")
+    # Near misses: wrong prefix, wrong message type, marker not at offset 0.
+    for payload in ["XX\\001junk", "QM\\002", "XQM\\001"]:
+        cmb_send(payload)
+        workstation.sleep(1)
+        workstation.fail(f"test -e {cmb}/beeped")
     cmb_send("QM\\001")
     workstation.wait_until_succeeds(f"test -e {cmb}/beeped", timeout=10)
+
+    # Typing counts ('Q' 'S', keystrokes 48, backspaces 2, misses 1, uint16 LE)
+    # land in the stats file, and corne-accuracy turns them into 95.8 %.
+    cmb_send("QS\\060\\000\\002\\000\\001\\000")
+    workstation.wait_until_succeeds(
+        f"grep -qP '^\\d{{4}}-\\d\\d-\\d\\dT[\\d:]+\\t48\\t2\\t1$' {cmb}/stats.tsv", timeout=10
+    )
+    summary = workstation.succeed(
+        f"su - jonathan -c 'CORNE_STATS_FILE={cmb}/stats.tsv corne-accuracy'"
+    )
+    assert "today" in summary and "95.8% accuracy" in summary and "2.1 missed" in summary, summary
     print("[diag] corne-miss-beep log:\n" + workstation.succeed(f"cat {cmb}/log"))
 
     # claude-agent-N users (modules/nixos/claude-agent-users.nix) must be

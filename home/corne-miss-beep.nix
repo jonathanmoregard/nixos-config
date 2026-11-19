@@ -8,6 +8,11 @@
 # Corne's raw HID interface (usage page 0xFF60) and plays a short, quiet tone
 # per report, so the hint is heard without looking at the keyboard.
 #
+# The keymap also reports typing counts ('Q' 'S', then keystrokes, backspaces
+# and misses as little-endian uint16 since the previous report; never which
+# keys). The listener appends them to $XDG_STATE_HOME/corne-stats/stats.tsv and
+# `corne-accuracy` summarises accuracy (1 - backspaces/keystrokes) per day.
+#
 # Access: hardware.keyboard.qmk.enable (hosts/tuxedo) installs the QMK udev
 # rules, which tag the Corne's hidraw nodes `uaccess`. With no Corne plugged
 # in the service just rescans every few seconds.
@@ -45,16 +50,22 @@ let
       import shlex
       import subprocess
       import sys
+      import threading
       import time
 
-      VID_PID = "00004653:00000001"  # foostan Corne (crkbd rev1)
+      VID_PID = b"00004653:00000001"  # foostan Corne (crkbd rev1)
       RAW_USAGE_PAGE = bytes([0x06, 0x60, 0xFF])  # QMK raw HID usage page 0xFF60
       MISS = b"QM\x01"
+      STATS = b"QS"
       MIN_GAP = 0.08  # seconds; a burst of misses gives one beep per gap
       RESCAN = 3
 
-      # Test seams: a fixed device path (e.g. a FIFO) and a player command.
+      # Test seams: a fixed device path (e.g. a FIFO), a player command and
+      # the stats file.
       DEVICE = os.environ.get("CORNE_MISS_BEEP_DEVICE")
+      STATS_FILE = os.environ.get("CORNE_STATS_FILE") or os.path.join(
+          os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+          "corne-stats", "stats.tsv")
       PLAYER = shlex.split(os.environ.get(
           "CORNE_MISS_BEEP_PLAYER",
           "${pkgs.pipewire}/bin/pw-play --volume 0.5 ${beepSound}",
@@ -70,7 +81,7 @@ let
               return DEVICE if os.path.exists(DEVICE) else None
           for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
               try:
-                  with open(f"{node}/device/uevent") as f:
+                  with open(f"{node}/device/uevent", "rb") as f:
                       if VID_PID not in f.read().upper():
                           continue
                   with open(f"{node}/device/report_descriptor", "rb") as f:
@@ -82,6 +93,28 @@ let
           return None
 
 
+      def play():
+          try:
+              r = subprocess.run(PLAYER, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
+          except (OSError, subprocess.TimeoutExpired) as e:
+              log(f"player failed: {e}")
+              return
+          if r.returncode != 0:
+              err = r.stderr.decode(errors="replace").strip()[:200]
+              log(f"player exited {r.returncode}: {err}")
+
+
+      def record_stats(data):
+          keys, bsp, miss = (int.from_bytes(data[i:i + 2], "little") for i in (2, 4, 6))
+          row = f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\t{keys}\t{bsp}\t{miss}\n"
+          try:
+              os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
+              with open(STATS_FILE, "a") as f:
+                  f.write(row)
+          except OSError as e:
+              log(f"stats write failed: {e}")
+
+
       def listen(path):
           last = 0.0
           fd = os.open(path, os.O_RDONLY)
@@ -91,22 +124,25 @@ let
                   data = os.read(fd, 64)
                   if not data:  # FIFO writer closed
                       return
-                  if MISS not in data[:4]:
+                  # The raw HID interface has no report IDs, so a report
+                  # arrives as-is and the marker sits at offset 0.
+                  if data.startswith(STATS) and len(data) >= 8:
+                      record_stats(data)
+                      continue
+                  if not data.startswith(MISS):
                       continue
                   now = time.monotonic()
                   if now - last < MIN_GAP:
                       continue
                   last = now
-                  try:
-                      subprocess.Popen(PLAYER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                  except OSError as e:
-                      log(f"player failed: {e}")
+                  threading.Thread(target=play, daemon=True).start()
           finally:
               os.close(fd)
 
 
       def main():
           waiting = False
+          last_error = None
           while True:
               path = find_device()
               if path is None:
@@ -118,16 +154,78 @@ let
               waiting = False
               try:
                   listen(path)
+                  last_error = None
               except OSError as e:
-                  log(f"{path}: {e}")
-                  time.sleep(1)
+                  # Log a persistent failure (e.g. EACCES while the seat has no
+                  # ACL) once, not on every retry.
+                  error = f"{path}: {e}"
+                  if error != last_error:
+                      log(error)
+                      last_error = error
+                  time.sleep(RESCAN)
 
 
       main()
     '';
+
+  corneAccuracy = pkgs.writers.writePython3Bin "corne-accuracy"
+    { flakeIgnore = [ "E501" ]; }
+    ''
+      """Typing accuracy from the Corne's counts: today, the last 7 days, all time."""
+      import collections
+      import datetime
+      import os
+      import sys
+
+      path = os.environ.get("CORNE_STATS_FILE") or os.path.join(
+          os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+          "corne-stats", "stats.tsv")
+      days = collections.defaultdict(lambda: [0, 0, 0])
+      try:
+          with open(path) as f:
+              for line in f:
+                  parts = line.rstrip("\n").split("\t")
+                  if len(parts) != 4:
+                      continue
+                  try:
+                      counts = [int(x) for x in parts[1:]]
+                  except ValueError:
+                      continue
+                  day = days[parts[0][:10]]
+                  for i in range(3):
+                      day[i] += counts[i]
+      except FileNotFoundError:
+          sys.exit(f"no stats yet ({path}); type on the Corne with corne-miss-beep running")
+
+
+      def line(label, keys, bsp, miss):
+          if keys == 0:
+              return f"{label:<12} no typing"
+          acc = 100 * max(0, keys - bsp) / keys
+          return f"{label:<12} {acc:5.1f}% accuracy  {keys:>7} keys  {bsp:>6} backspaces  {100 * miss / keys:4.1f} missed shortcuts/100 keys"
+
+
+      def total(dates):
+          t = [0, 0, 0]
+          for d in dates:
+              for i in range(3):
+                  t[i] += days[d][i]
+          return t
+
+
+      today = datetime.date.today()
+      week = [(today - datetime.timedelta(n)).isoformat() for n in range(7)]
+      print(line("today", *days[today.isoformat()]))
+      print(line("last 7 days", *total(d for d in week if d in days)))
+      print(line("all time", *total(list(days))))
+      print()
+      for d in sorted((d for d in week if d in days), reverse=True):
+          print(line(d, *days[d]))
+      print("\naccuracy = 1 - backspaces/keystrokes (Ctrl+Backspace counts once)")
+    '';
 in
 {
-  home.packages = [ corneMissBeep ];
+  home.packages = [ corneMissBeep corneAccuracy ];
 
   systemd.user.services.corne-miss-beep = {
     Unit = {
