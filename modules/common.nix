@@ -58,6 +58,7 @@
     dnsutils       # provides dig / nslookup / host
     mtr            # traceroute + ping combined
     socat          # bidirectional data relay
+    passt          # pasta — user-mode network namespace for the Claude `confined` jail
     netcat         # nc
 
     # --- archive ---
