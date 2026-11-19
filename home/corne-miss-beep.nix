@@ -67,10 +67,8 @@ let
           os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
           "corne-stats", "stats.tsv")
       STATS_FILE = os.path.abspath(STATS_FILE)
-      PLAYER = shlex.split(os.environ.get(
-          "CORNE_MISS_BEEP_PLAYER",
-          "${pkgs.pipewire}/bin/pw-play --volume 0.5 ${beepSound}",
-      ))
+      DEFAULT_PLAYER = "${pkgs.pipewire}/bin/pw-play --volume 0.5 ${beepSound}"
+      PLAYER = shlex.split(os.environ.get("CORNE_MISS_BEEP_PLAYER") or DEFAULT_PLAYER)
 
 
       def log(msg):
@@ -191,9 +189,9 @@ let
       import os
       import sys
 
-      path = os.environ.get("CORNE_STATS_FILE") or os.path.join(
+      path = os.path.abspath(os.environ.get("CORNE_STATS_FILE") or os.path.join(
           os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
-          "corne-stats", "stats.tsv")
+          "corne-stats", "stats.tsv"))
       days = collections.defaultdict(lambda: [0, 0, 0])
       try:
           with open(path) as f:

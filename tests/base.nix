@@ -2623,10 +2623,23 @@ in
     rows = workstation.succeed(f"wc -l < {cmb}/stats.tsv").strip()
     for payload in ["XQS\\060\\000\\002\\000\\001\\000", "QS\\060\\000\\002"]:
         cmb_send(payload)
-    workstation.sleep(1)
+        workstation.sleep(1)  # one report per read, as from the device
     assert workstation.succeed(f"wc -l < {cmb}/stats.tsv").strip() == rows, \
         workstation.succeed(f"cat {cmb}/stats.tsv")
     print("[diag] corne-miss-beep log:\n" + workstation.succeed(f"cat {cmb}/log"))
+
+    # A persistently failing player is logged once, not once per miss.
+    workstation.succeed(f"su jonathan -c 'mkfifo {cmb}/fifo2'")
+    workstation.succeed(
+        f"su - jonathan -c 'CORNE_MISS_BEEP_DEVICE={cmb}/fifo2 "
+        f"CORNE_MISS_BEEP_PLAYER=false CORNE_STATS_FILE={cmb}/stats2.tsv "
+        f"setsid -f timeout 60 corne-miss-beep >{cmb}/log2 2>&1'"
+    )
+    for _ in range(3):
+        workstation.succeed(f"su jonathan -c \"printf 'QM\\001' > {cmb}/fifo2\"", timeout=10)
+        workstation.sleep(1)
+    failures = workstation.succeed(f"grep -c 'player exited 1' {cmb}/log2").strip()
+    assert failures == "1", workstation.succeed(f"cat {cmb}/log2")
 
     # claude-agent-N users (modules/nixos/claude-agent-users.nix) must be
     # hidden from the LightDM greeter. slick-greeter builds its user list
