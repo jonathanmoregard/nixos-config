@@ -2607,6 +2607,7 @@ in
         workstation.fail(f"test -e {cmb}/beeped")
     cmb_send("QM\\001")
     workstation.wait_until_succeeds(f"test -e {cmb}/beeped", timeout=10)
+    workstation.succeed(f"rm {cmb}/beeped")  # stats reports below must not beep
 
     # Typing counts ('Q' 'S', keystrokes 48, backspaces 2, misses 1, uint16 LE)
     # land in the stats file, and corne-accuracy turns them into 95.8 %.
@@ -2626,6 +2627,7 @@ in
         workstation.sleep(1)  # one report per read, as from the device
     assert workstation.succeed(f"wc -l < {cmb}/stats.tsv").strip() == rows, \
         workstation.succeed(f"cat {cmb}/stats.tsv")
+    workstation.fail(f"test -e {cmb}/beeped")
     print("[diag] corne-miss-beep log:\n" + workstation.succeed(f"cat {cmb}/log"))
 
     # A persistently failing player is logged once, not once per miss.

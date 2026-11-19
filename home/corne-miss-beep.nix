@@ -48,6 +48,7 @@ let
       import glob
       import os
       import shlex
+      import stat
       import subprocess
       import sys
       import threading
@@ -59,6 +60,8 @@ let
       STATS = b"QS"
       MIN_GAP = 0.08  # seconds; a burst of misses gives one beep per gap
       RESCAN = 3
+      EOF_PAUSE = 0.5  # seconds before reopening after end-of-file
+      _announced = None  # path last logged as "listening on"
 
       # Test seams: a fixed device path (e.g. a FIFO), a player command and
       # the stats file.
@@ -67,12 +70,25 @@ let
           os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
           "corne-stats", "stats.tsv")
       STATS_FILE = os.path.abspath(STATS_FILE)
-      DEFAULT_PLAYER = "${pkgs.pipewire}/bin/pw-play --volume 0.5 ${beepSound}"
-      PLAYER = shlex.split(os.environ.get("CORNE_MISS_BEEP_PLAYER") or DEFAULT_PLAYER)
+      DEFAULT_PLAYER = ["${pkgs.pipewire}/bin/pw-play", "--volume", "0.5", "${beepSound}"]
 
 
       def log(msg):
           print(f"corne-miss-beep: {msg}", file=sys.stderr, flush=True)
+
+
+      def player_command():
+          # Unset, blank or unparsable -> the default player.
+          raw = os.environ.get("CORNE_MISS_BEEP_PLAYER", "")
+          try:
+              cmd = shlex.split(raw)
+          except ValueError as e:
+              log(f"ignoring CORNE_MISS_BEEP_PLAYER ({e})")
+              cmd = []
+          return cmd or DEFAULT_PLAYER
+
+
+      PLAYER = player_command()
 
 
       # A persistent failure (no ACL, pipewire down, disk full) is logged once
@@ -92,7 +108,15 @@ let
 
       def find_device():
           if DEVICE:
-              return DEVICE if os.path.exists(DEVICE) else None
+              # A FIFO or a device node; a regular file would replay forever.
+              try:
+                  mode = os.stat(DEVICE).st_mode
+              except OSError:
+                  return None
+              if stat.S_ISFIFO(mode) or stat.S_ISCHR(mode):
+                  return DEVICE
+              failed("device", f"{DEVICE}: not a FIFO or device")
+              return None
           for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
               try:
                   with open(f"{node}/device/uevent", "rb") as f:
@@ -134,14 +158,17 @@ let
 
       def listen(path):
           last = 0.0
+          global _announced
           fd = os.open(path, os.O_RDONLY)
-          succeeded("device")
-          log(f"listening on {path}")
+          if _announced != path:
+              log(f"listening on {path}")
+              _announced = path
           try:
               while True:
                   data = os.read(fd, 64)
-                  if not data:  # FIFO writer closed
+                  if not data:  # FIFO writer closed (or /dev/null)
                       return
+                  succeeded("device")  # a read worked: re-arm device errors
                   # The raw HID interface has no report IDs, so a report
                   # arrives as-is and the marker sits at offset 0.
                   if data.startswith(STATS) and len(data) >= 8:
@@ -171,8 +198,13 @@ let
               waiting = False
               try:
                   listen(path)
+                  # End of file. Pause only after closing: a writer that opens
+                  # while we still hold the FIFO would have its data dropped.
+                  time.sleep(EOF_PAUSE)
               except OSError as e:
-                  # Unplug (EIO) or no ACL (EACCES); a successful open re-arms it.
+                  # Unplug (EIO) or no ACL (EACCES); a successful read re-arms it.
+                  global _announced
+                  _announced = None
                   failed("device", f"{path}: {e}")
                   time.sleep(RESCAN)
 
@@ -194,7 +226,7 @@ let
           "corne-stats", "stats.tsv"))
       days = collections.defaultdict(lambda: [0, 0, 0])
       try:
-          with open(path) as f:
+          with open(path, errors="replace") as f:
               for line in f:
                   parts = line.rstrip("\n").split("\t")
                   if len(parts) != 4:
@@ -208,6 +240,8 @@ let
                       day[i] += counts[i]
       except FileNotFoundError:
           sys.exit(f"no stats yet ({path}); type on the Corne with corne-miss-beep running")
+      except OSError as e:
+          sys.exit(f"cannot read {path}: {e}")
 
 
       def line(label, keys, bsp, miss):
