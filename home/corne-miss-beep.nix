@@ -53,7 +53,7 @@ let
       import threading
       import time
 
-      VID_PID = b"00004653:00000001"  # foostan Corne (crkbd rev1)
+      HID_ID = b"HID_ID=0003:00004653:00000001"  # USB, foostan Corne (crkbd rev1)
       RAW_USAGE_PAGE = bytes([0x06, 0x60, 0xFF])  # QMK raw HID usage page 0xFF60
       MISS = b"QM\x01"
       STATS = b"QS"
@@ -66,6 +66,7 @@ let
       STATS_FILE = os.environ.get("CORNE_STATS_FILE") or os.path.join(
           os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
           "corne-stats", "stats.tsv")
+      STATS_FILE = os.path.abspath(STATS_FILE)
       PLAYER = shlex.split(os.environ.get(
           "CORNE_MISS_BEEP_PLAYER",
           "${pkgs.pipewire}/bin/pw-play --volume 0.5 ${beepSound}",
@@ -76,13 +77,28 @@ let
           print(f"corne-miss-beep: {msg}", file=sys.stderr, flush=True)
 
 
+      # A persistent failure (no ACL, pipewire down, disk full) is logged once
+      # per distinct message; success on that channel re-arms it.
+      _last_failure = {}
+
+
+      def failed(channel, msg):
+          if _last_failure.get(channel) != msg:
+              log(msg)
+              _last_failure[channel] = msg
+
+
+      def succeeded(channel):
+          _last_failure.pop(channel, None)
+
+
       def find_device():
           if DEVICE:
               return DEVICE if os.path.exists(DEVICE) else None
           for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
               try:
                   with open(f"{node}/device/uevent", "rb") as f:
-                      if VID_PID not in f.read().upper():
+                      if HID_ID not in f.read().upper().splitlines():
                           continue
                   with open(f"{node}/device/report_descriptor", "rb") as f:
                       if not f.read().startswith(RAW_USAGE_PAGE):
@@ -97,11 +113,13 @@ let
           try:
               r = subprocess.run(PLAYER, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
           except (OSError, subprocess.TimeoutExpired) as e:
-              log(f"player failed: {e}")
+              failed("player", f"player failed: {e}")
               return
           if r.returncode != 0:
               err = r.stderr.decode(errors="replace").strip()[:200]
-              log(f"player exited {r.returncode}: {err}")
+              failed("player", f"player exited {r.returncode}: {err}")
+          else:
+              succeeded("player")
 
 
       def record_stats(data):
@@ -111,13 +129,15 @@ let
               os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
               with open(STATS_FILE, "a") as f:
                   f.write(row)
+              succeeded("stats")
           except OSError as e:
-              log(f"stats write failed: {e}")
+              failed("stats", f"stats write failed: {e}")
 
 
       def listen(path):
           last = 0.0
           fd = os.open(path, os.O_RDONLY)
+          succeeded("device")
           log(f"listening on {path}")
           try:
               while True:
@@ -142,7 +162,6 @@ let
 
       def main():
           waiting = False
-          last_error = None
           while True:
               path = find_device()
               if path is None:
@@ -154,14 +173,9 @@ let
               waiting = False
               try:
                   listen(path)
-                  last_error = None
               except OSError as e:
-                  # Log a persistent failure (e.g. EACCES while the seat has no
-                  # ACL) once, not on every retry.
-                  error = f"{path}: {e}"
-                  if error != last_error:
-                      log(error)
-                      last_error = error
+                  # Unplug (EIO) or no ACL (EACCES); a successful open re-arms it.
+                  failed("device", f"{path}: {e}")
                   time.sleep(RESCAN)
 
 

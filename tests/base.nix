@@ -2601,7 +2601,7 @@ in
         workstation.succeed(f"su jonathan -c \"printf '{payload}' > {cmb}/fifo\"", timeout=10)
 
     # Near misses: wrong prefix, wrong message type, marker not at offset 0.
-    for payload in ["XX\\001junk", "QM\\002", "XQM\\001"]:
+    for payload in ["XM\\001", "QM\\002", "XQM\\001"]:
         cmb_send(payload)
         workstation.sleep(1)
         workstation.fail(f"test -e {cmb}/beeped")
@@ -2617,7 +2617,15 @@ in
     summary = workstation.succeed(
         f"su - jonathan -c 'CORNE_STATS_FILE={cmb}/stats.tsv corne-accuracy'"
     )
-    assert "today" in summary and "95.8% accuracy" in summary and "2.1 missed" in summary, summary
+    today = next(l for l in summary.splitlines() if l.startswith("today "))
+    assert "95.8% accuracy" in today and " 48 keys" in today and "2.1 missed" in today, summary
+    # Not a stats report: marker not at offset 0, or too short to carry counts.
+    rows = workstation.succeed(f"wc -l < {cmb}/stats.tsv").strip()
+    for payload in ["XQS\\060\\000\\002\\000\\001\\000", "QS\\060\\000\\002"]:
+        cmb_send(payload)
+    workstation.sleep(1)
+    assert workstation.succeed(f"wc -l < {cmb}/stats.tsv").strip() == rows, \
+        workstation.succeed(f"cat {cmb}/stats.tsv")
     print("[diag] corne-miss-beep log:\n" + workstation.succeed(f"cat {cmb}/log"))
 
     # claude-agent-N users (modules/nixos/claude-agent-users.nix) must be
