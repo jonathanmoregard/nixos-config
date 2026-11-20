@@ -68,18 +68,21 @@ in
 {
   sandbox-runtime = prev.sandbox-runtime.overrideAttrs (old: {
     # srt covers a protected file that does not exist yet with /dev/null bound
-    # onto a regular file bubblewrap makes on the host. bubblewrap binds nodev,
+    # onto an empty file bubblewrap makes on the host. bubblewrap binds nodev,
     # so the device cannot be opened and nix fails every flake build in a git
-    # repo without .gitmodules ("is locked: Permission denied"); and git lists
-    # the mount point by its host entry type, so ~19 absent names show up as
-    # untracked. The patch binds an empty read-only file instead, onto a unix
-    # socket srt makes as the mount point, which git skips (measured; an empty
-    # directory breaks nix's .gitmodules parser, a regular file shows in git).
+    # repo without .gitmodules ("is locked: Permission denied"). The patch
+    # binds an empty read-only file instead.
+    #
+    # The host keeps seeing bubblewrap's empty file while the command runs,
+    # and after an srt that was killed: git lists it as untracked. Every other
+    # mount point is worse for the owner's nix there (measured: a directory
+    # fails its .gitmodules parser, a socket fails it with ENXIO), and leaving
+    # the name absent lets the command create it.
     postInstall = (old.postInstall or "") + ''
       pkg=$out/lib/node_modules/@anthropic-ai/sandbox-runtime
       install -Dm755 ${applySeccomp}/bin/apply-seccomp $pkg/vendor/seccomp/x64/apply-seccomp
       install -Dm444 /dev/null $pkg/empty-placeholder
-      patch -p1 -d $pkg < ${./sandbox-runtime-socket-placeholder.patch}
+      patch -p1 -d $pkg < ${./sandbox-runtime-empty-placeholder.patch}
       substituteInPlace $pkg/dist/sandbox/linux-sandbox-utils.js \
         --replace-fail @emptyPlaceholder@ $pkg/empty-placeholder
     '';

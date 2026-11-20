@@ -1,0 +1,11 @@
+--- a/dist/sandbox/linux-sandbox-utils.js
++++ b/dist/sandbox/linux-sandbox-utils.js
+@@ -2339,7 +2339,7 @@
+                 case MountPointKind.Directory:
+                     return (emptySource ?? (emptySource = ensureEmptyMountSourceDir()));
+                 case MountPointKind.File:
+-                    return '/dev/null';
++                    return '@emptyPlaceholder@';
+                 case MountPointKind.Unmakeable:
+                     // Never mounted: unmakeableDenyDests keeps it out of what is emitted.
+                     return '/dev/null';

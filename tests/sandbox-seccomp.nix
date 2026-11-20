@@ -83,6 +83,36 @@ let
       allowAllUnixSockets = false;
     };
   });
+
+  # PLACEHOLDER arms: how srt holds a protected file that does not exist yet
+  # (.gitmodules in a flake repo without submodules). allowAllUnixSockets
+  # keeps apply-seccomp, and the nested user namespace this VM refuses, out
+  # of the way, so the command really runs.
+  shortRepo = "/home/jonathan/flake";
+  # .gitmodules there is past the 108-byte limit of a unix socket path.
+  longRepo = "/home/jonathan/${pkgs.lib.strings.replicate 100 "l"}/flake";
+  placeholderSettings = repo: pkgs.writeText "srt-placeholder.json" (builtins.toJSON {
+    filesystem = {
+      denyRead = [ ];
+      allowWrite = [ repo probeCache ];
+      denyWrite = [ ];
+    };
+    network = {
+      allowedDomains = [ ];
+      deniedDomains = [ ];
+      allowAllUnixSockets = true;
+    };
+  });
+  # nix's fetcher cache, writable as the jobs broker gives a job its own.
+  probeCache = "/home/jonathan/.cache/srt-probe";
+  placeholderProbe = pkgs.writeShellScript "placeholder-probe" ''
+    export XDG_CACHE_HOME=${probeCache}
+    printf 'read=%s\n' "$(wc -c < .gitmodules)"
+    if ( : > .gitmodules ) 2>/dev/null; then echo create=allowed; else echo create=blocked; fi
+    if out=$(nix flake metadata --no-write-lock-file . 2>&1); then echo nix=ok; else echo "nix=failed $out"; fi
+    echo READY
+    while [ ! -e "$1" ]; do sleep 0.2; done
+  '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkMinimalTest {
   name = "vm-sandbox-seccomp";
@@ -97,10 +127,15 @@ in
         pkgs.python3
         pkgs.bubblewrap
         pkgs.socat
+        pkgs.git
+        pkgs.ripgrep
       ];
+      nix.settings.experimental-features = [ "nix-command" "flakes" ];
     }
   ];
   testScript = ''
+    import shlex
+
     workstation.wait_for_unit("multi-user.target")
 
     # The helper has to be at exactly this path. srt probes it and nothing
@@ -151,5 +186,65 @@ in
     assert "Found apply-seccomp binary: ${applySeccomp}" in log, log
     assert "Applying seccomp filter for Unix socket blocking" in log, log
     assert "unix socket blocking disabled" not in log, log
+
+    # --- PLACEHOLDER: an absent protected file reads empty and stays absent
+    def as_jonathan(cmd):
+        return workstation.succeed(f"su jonathan -c {shlex.quote(cmd)}")
+
+    def host_nix(repo):
+        as_jonathan(f"cd {repo} && nix flake metadata --no-write-lock-file . >/dev/null")
+
+    def start(name, srt, repo, settings):
+        as_jonathan(
+            f"cd {repo} && setsid {srt} -s {settings} -- ${placeholderProbe} "
+            f"/home/jonathan/{name}.release >/home/jonathan/{name}.log 2>&1 </dev/null "
+            f"& echo $! >/home/jonathan/{name}.pid")
+        workstation.wait_until_succeeds(f"grep -q READY /home/jonathan/{name}.log", timeout=180)
+        return workstation.succeed(f"cat /home/jonathan/{name}.log")
+
+    def finish(name):
+        as_jonathan(f"touch /home/jonathan/{name}.release")
+        workstation.wait_until_fails(f"kill -0 $(cat /home/jonathan/{name}.pid)", timeout=60)
+
+    as_jonathan("mkdir -p ${probeCache}")
+    for repo in ("${shortRepo}", "${longRepo}"):
+        as_jonathan(
+            f"mkdir -p {repo} && cd {repo} && git init -q"
+            " && echo '{ outputs = _: { }; }' > flake.nix && git add flake.nix"
+            " && git -c user.name=t -c user.email=t@t.invalid commit -qm init")
+
+    # Negative control: nixpkgs' srt binds /dev/null on a nodev mount, which
+    # nix cannot open inside, so the arms below can tell the fix from no fix.
+    log = start("upstream", "${unpatched}/bin/srt", "${shortRepo}",
+                "${placeholderSettings shortRepo}")
+    finish("upstream")
+    assert "nix=failed" in log and "parsing .gitmodules" in log, log
+
+    for name, repo, settings in (
+        ("short", "${shortRepo}", "${placeholderSettings shortRepo}"),
+        ("long", "${longRepo}", "${placeholderSettings longRepo}"),
+    ):
+        log = start(name, "${pkgs.sandbox-runtime}/bin/srt", repo, settings)
+        assert "read=0" in log, log
+        assert "create=blocked" in log, log
+        assert "nix=ok" in log, log
+        # The owner's nix in the same repo while the sandbox holds it.
+        host_nix(repo)
+        finish(name)
+        workstation.succeed(f"test ! -e {repo}/.gitmodules")
+        assert as_jonathan(f"git -C {repo} status --porcelain") == "", name
+
+    # srt killed before its cleanup runs: whatever it leaves must not break
+    # the owner's nix there, now or under the next sandbox.
+    start("killed", "${pkgs.sandbox-runtime}/bin/srt", "${shortRepo}",
+          "${placeholderSettings shortRepo}")
+    workstation.succeed("kill -KILL $(cat /home/jonathan/killed.pid)")
+    finish("killed")
+    host_nix("${shortRepo}")
+    log = start("after-kill", "${pkgs.sandbox-runtime}/bin/srt", "${shortRepo}",
+                "${placeholderSettings shortRepo}")
+    assert "read=0" in log and "create=blocked" in log and "nix=ok" in log, log
+    host_nix("${shortRepo}")
+    finish("after-kill")
   '';
 }
