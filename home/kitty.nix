@@ -5084,6 +5084,10 @@ in
     allow_remote_control yes
     listen_on unix:/tmp/kitty.sock
 
+    # Middle mouse is held to dictate (Voquill); releasing it must not paste
+    # the primary selection. Shift+middle still pastes it.
+    mouse_map middle release ungrabbed discard_event
+
     # Splits layout enables hsplit/vsplit launch locations
     enabled_layouts splits,stack
 

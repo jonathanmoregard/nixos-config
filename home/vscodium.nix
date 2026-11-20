@@ -80,6 +80,8 @@ let
     "editor.cursorBlinking" = "smooth";
     # Keep a peek window open until dismissed instead of on first navigation.
     "editor.stablePeek" = true;
+    # Middle mouse is held to dictate (Voquill); no primary-selection paste.
+    "editor.selectionClipboard" = false;
     # Markup and prose get formatted on demand, not on every save.
     "[html]" = {
       "editor.formatOnSave" = false;
