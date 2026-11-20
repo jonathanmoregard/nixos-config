@@ -80,14 +80,14 @@ let
 
   # Meetily only lists Whisper files named in its built-in catalog
   # (src-tauri/src/config.rs, WHISPER_MODEL_CATALOG) and checks each is
-  # >= 90% of the catalog size and a valid GGML file. KBLab's whisper.cpp
-  # builds of kb-whisper are drop-in GGML files of the same architecture,
-  # so they are saved under catalog names; pick that name in Meetily's
-  # model list. Swedish WER (KBLab/Klang benchmarks): kb-whisper-large ~3.5%
+  # >= 90% of the catalog size and starts with a GGML magic. KBLab publishes
+  # whisper.cpp GGML builds of kb-whisper (same Whisper architectures), so
+  # they are saved under catalog names; pick that name in Meetily's model
+  # list. The helper checks both conditions before installing a download. Swedish WER (KBLab/Klang benchmarks): kb-whisper-large ~3.5%
   # vs OpenAI large-v3 ~7.2% vs Parakeet v3 (Meetily's default) ~17.7%.
   meetily-kb-whisper = prev.writeShellApplication {
     name = "meetily-kb-whisper";
-    runtimeInputs = with prev; [ curl coreutils ];
+    runtimeInputs = with prev; [ curl coreutils util-linux ];
     text = ''
       usage() {
         cat <<'EOF'
@@ -122,29 +122,64 @@ let
         esac
       done
 
+      # min_mb = 90% of the catalog size_mb, the floor Meetily accepts.
       case "$variant" in
-        large)     repo=kb-whisper-large;  file=ggml-model.bin;      target=ggml-large-v3.bin; ui=large-v3 ;;
-        large-q5)  repo=kb-whisper-large;  file=ggml-model-q5_0.bin; target=ggml-large-v3-q5_0.bin; ui=large-v3-q5_0 ;;
-        medium-q5) repo=kb-whisper-medium; file=ggml-model-q5_0.bin; target=ggml-medium-q5_0.bin; ui=medium-q5_0 ;;
+        large)     repo=kb-whisper-large;  file=ggml-model.bin;      target=ggml-large-v3.bin;      ui=large-v3;      min_mb=2656 ;;
+        large-q5)  repo=kb-whisper-large;  file=ggml-model-q5_0.bin; target=ggml-large-v3-q5_0.bin; ui=large-v3-q5_0; min_mb=928 ;;
+        medium-q5) repo=kb-whisper-medium; file=ggml-model-q5_0.bin; target=ggml-medium-q5_0.bin;   ui=medium-q5_0;   min_mb=463 ;;
         "") usage >&2; exit 2 ;;
         *) echo "meetily-kb-whisper: unknown variant: $variant" >&2; usage >&2; exit 2 ;;
       esac
 
       models_dir="''${MEETILY_MODELS_DIR:-''${XDG_DATA_HOME:-$HOME/.local/share}/com.meetily.ai/models}"
       dest="$models_dir/$target"
+      mkdir -p "$models_dir"
+
+      # One download per target at a time: a second run fails fast instead of
+      # racing the first one into the same file.
+      exec 9>"$dest.lock"
+      if ! flock --nonblock 9; then
+        echo "meetily-kb-whisper: another download of $target is running" >&2
+        exit 1
+      fi
+
+      # Holding the lock means no other run is downloading this target, so any
+      # temp file for it is debris from a run that was killed (SIGKILL, power
+      # loss) before its EXIT trap could clean up.
+      for stale in "$dest".*.part "$dest.part"; do
+        [[ -e "$stale" ]] && rm -f -- "$stale"
+      done
+
       if [[ -e "$dest" && "$force" -ne 1 ]]; then
         echo "meetily-kb-whisper: $dest already exists (use --force to replace it)" >&2
         exit 1
       fi
 
+      # Fresh temp file per run, no resume: a leftover partial file from an
+      # older upstream revision can never be spliced into the new one.
+      tmp="$(mktemp "$dest.XXXXXX.part")"
+      trap 'rm -f "$tmp"' EXIT
+
       url="https://huggingface.co/KBLab/$repo/resolve/main/$file"
-      mkdir -p "$models_dir"
-      part="$dest.part"
       echo "Downloading $url"
       echo "  -> $dest"
-      # --continue-at - resumes an interrupted download of the same .part file.
-      curl --fail --location --continue-at - --output "$part" "$url"
-      mv -f "$part" "$dest"
+      curl --fail --location --output "$tmp" "$url"
+
+      # Install only what Meetily would accept: a GGML/GGUF header and at
+      # least the catalog's minimum size.
+      magic="$(head -c 4 "$tmp")"
+      case "$magic" in
+        ggml|lmgg|ggmf|fmgg|GGUF|FUGU) ;;
+        *) echo "meetily-kb-whisper: download is not a GGML model (header: $(head -c 16 "$tmp" | tr -cd '[:print:]'))" >&2
+           exit 1 ;;
+      esac
+      size_mb=$(( $(stat -c %s "$tmp") / 1048576 ))
+      if (( size_mb < min_mb )); then
+        echo "meetily-kb-whisper: download is ''${size_mb} MB, expected at least ''${min_mb} MB" >&2
+        exit 1
+      fi
+
+      mv -f "$tmp" "$dest"
       printf '%s\n' "KBLab/$repo $file" > "$dest.source"
       echo "Done. In Meetily, choose the Whisper model \"$ui\" (now kb-whisper)."
       echo "Restart Meetily if it was open."
