@@ -1,0 +1,99 @@
+# Merges claude-config's runtime/mcp-servers.json into the mcpServers of
+# ~/.claude.json on each deploy tick, so a server merged upstream goes live
+# without a hand step. Additive by design — see scripts/claude-mcp-import.py.
+#
+# A system unit run as the user, triggered by claude-runtime-deploy.service
+# succeeding, for the same reasons as claude-settings-sync.nix.
+{ config, lib, pkgs, ... }:
+let
+  user = "jonathan";
+  group = "users";
+  home = "/home/${user}";
+
+  served = "/var/lib/claude-runtime/checkout/runtime/mcp-servers.json";
+  live = "${home}/.claude.json";
+  marker = "${home}/.claude/.projection-enabled";
+
+  failuresDir = "/var/lib/unit-failures";
+  record = "${failuresDir}/claude-mcp-import.json";
+
+  import' = pkgs.runCommand "claude-mcp-import" {
+    nativeBuildInputs = [ pkgs.python3 ];
+  } ''
+    install -Dm755 ${../../scripts/claude-mcp-import.py} $out/bin/claude-mcp-import
+    substituteInPlace $out/bin/claude-mcp-import \
+      --replace-fail '#!/usr/bin/env python3' '#!${pkgs.python3}/bin/python3'
+    PYTHONDONTWRITEBYTECODE=1 CLAUDE_MCP_IMPORT_SRC=$out/bin/claude-mcp-import \
+      python3 -W error::ResourceWarning ${../../tests/claude-mcp-import/test_import.py} -v
+  '';
+
+  failureNotify = pkgs.writeShellApplication {
+    name = "claude-mcp-import-failure-notify";
+    runtimeInputs = [ pkgs.jq pkgs.coreutils ];
+    text = ''
+      result="''${MONITOR_SERVICE_RESULT:-unknown}"
+      status="''${MONITOR_EXIT_STATUS:-unknown}"
+      echo "claude-mcp-import FAILED (result=$result status=$status): merged claude-config MCP servers are not reaching ${live}; inspect: journalctl -u claude-mcp-import.service -n 50"
+      mkdir -p -- ${failuresDir}
+      chmod 0755 -- ${failuresDir}
+      tmp=$(mktemp ${failuresDir}/.claude-mcp-import.XXXXXX)
+      jq -n \
+        --arg unit claude-mcp-import.service \
+        --arg result "$result" \
+        --arg status "$status" \
+        --arg invocation "''${MONITOR_INVOCATION_ID:-}" \
+        --arg failed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg summary "Merged claude-config mcp-servers.json changes are not reaching ~/.claude.json; new MCP servers are not live." \
+        --arg inspect "journalctl -u claude-mcp-import.service -n 50" \
+        '{unit: $unit, result: $result, exit_status: $status, invocation_id: $invocation, failed_at: $failed_at, summary: $summary, inspect: $inspect}' \
+        > "$tmp"
+      chmod 0644 -- "$tmp"
+      mv -f -- "$tmp" ${record}
+      echo "claude-mcp-import-failure-notify: recorded ${record}"
+    '';
+  };
+
+  clearRecord = pkgs.writeShellScript "claude-mcp-import-clear" ''
+    if [ "''${SERVICE_RESULT:-}" = success ]; then
+      ${pkgs.coreutils}/bin/rm -f -- ${record}
+    fi
+  '';
+in
+{
+  systemd.services.claude-mcp-import = {
+    description = "Merge the served claude-config mcp-servers.json into ~/.claude.json";
+    after = [ "claude-runtime-deploy.service" ];
+    unitConfig = {
+      OnFailure = "claude-mcp-import-failure-notify.service";
+      StartLimitIntervalSec = 0;
+    };
+    serviceConfig = {
+      Type = "oneshot";
+      User = user;
+      Group = group;
+      ExecStart = lib.escapeShellArgs [
+        "${import'}/bin/claude-mcp-import"
+        "--served" served
+        "--live" live
+        "--marker" marker
+      ];
+      ExecStopPost = "+${clearRecord}";
+      Nice = 10;
+      TimeoutStartSec = 90;
+      NoNewPrivileges = true;
+      PrivateNetwork = true;
+      PrivateTmp = true;
+      ProtectSystem = "full";
+    };
+  };
+
+  systemd.services.claude-runtime-deploy.unitConfig.OnSuccess = [ "claude-mcp-import.service" ];
+
+  systemd.services.claude-mcp-import-failure-notify = {
+    description = "Record a failed claude-mcp-import run for the SessionStart report";
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = lib.getExe failureNotify;
+    };
+  };
+}
