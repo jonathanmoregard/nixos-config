@@ -67,9 +67,17 @@ let
 in
 {
   sandbox-runtime = prev.sandbox-runtime.overrideAttrs (old: {
+    # srt covers a protected file that does not exist yet with a bind of
+    # /dev/null, which cannot be opened under its seccomp policy; nix then
+    # fails every flake build in a git repo without .gitmodules ("is locked:
+    # Permission denied"). An empty read-only file blocks the write the same way.
     postInstall = (old.postInstall or "") + ''
-      install -Dm755 ${applySeccomp}/bin/apply-seccomp \
-        $out/lib/node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/x64/apply-seccomp
+      pkg=$out/lib/node_modules/@anthropic-ai/sandbox-runtime
+      install -Dm755 ${applySeccomp}/bin/apply-seccomp $pkg/vendor/seccomp/x64/apply-seccomp
+      install -Dm444 /dev/null $pkg/empty-placeholder
+      sed -i "/case MountPointKind.File:/{n;s|'/dev/null'|'$pkg/empty-placeholder'|}" \
+        $pkg/dist/sandbox/linux-sandbox-utils.js
+      grep -q "'$pkg/empty-placeholder'" $pkg/dist/sandbox/linux-sandbox-utils.js
     '';
   });
 }
