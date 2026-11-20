@@ -1,0 +1,86 @@
+--- a/dist/sandbox/linux-sandbox-utils.js
++++ b/dist/sandbox/linux-sandbox-utils.js
+@@ -4,6 +4,7 @@
+ import { whichSync } from '../utils/which.js';
+ import { randomBytes } from 'node:crypto';
+ import * as fs from 'fs';
++import * as net from 'node:net';
+ import { spawn, spawnSync } from 'node:child_process';
+ import { endianness, tmpdir } from 'node:os';
+ import path, { join } from 'node:path';
+@@ -189,6 +190,32 @@
+     }
+     return targetPath; // Shouldn't reach here if called correctly
+ }
++/**
++ * Host-side mount points this process made as unix sockets, for an absent
++ * file. The empty file bound over one reads as empty inside, as nix's
++ * .gitmodules parser needs, while git, which lists a directory entry by its
++ * type, skips a socket where it would list the regular file bubblewrap makes.
++ * Binding a listening socket is the one synchronous way node makes one.
++ */
++const placeholderSockets = new Map();
++function makeSocketMountPoint(dest) {
++    if (fs.existsSync(dest))
++        return;
++    const server = net.createServer();
++    server.on('error', () => { });
++    try {
++        server.listen(dest);
++        server.unref();
++        if (fs.lstatSync(dest).isSocket()) {
++            placeholderSockets.set(dest, server);
++            return;
++        }
++    }
++    catch {
++        // bubblewrap makes a regular file there instead
++    }
++    server.close();
++}
+ /** What the placeholder for an absent deny path is mounted on. */
+ var MountPointKind;
+ (function (MountPointKind) {
+@@ -942,6 +969,12 @@
+                 fs.unlinkSync(mountPoint);
+                 logForDebugging(`[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`);
+             }
++            else if (stat.isSocket() && placeholderSockets.has(mountPoint)) {
++                fs.unlinkSync(mountPoint);
++                placeholderSockets.get(mountPoint).close();
++                placeholderSockets.delete(mountPoint);
++                logForDebugging(`[Sandbox Linux] Cleaned up bwrap mount point (socket): ${mountPoint}`);
++            }
+             else if (stat.isDirectory()) {
+                 // Empty directory mount points are created for intermediate
+                 // components (Fix 2). Only remove if still empty.
+@@ -2326,6 +2359,8 @@
+                 // cleanupBwrapMountPoints() to remove. An existing file that looks
+                 // like a mount point may be the caller's own, or that of another
+                 // process's sandbox still running, whose deny goes with it.
++                if (kind === MountPointKind.File)
++                    makeSocketMountPoint(dest);
+                 bwrapMountPoints.add(dest);
+                 registerExitCleanupHandler();
+             }
+@@ -2339,7 +2374,7 @@
+                 case MountPointKind.Directory:
+                     return (emptySource ?? (emptySource = ensureEmptyMountSourceDir()));
+                 case MountPointKind.File:
+-                    return '/dev/null';
++                    return '@emptyPlaceholder@';
+                 case MountPointKind.Unmakeable:
+                     // Never mounted: unmakeableDenyDests keeps it out of what is emitted.
+                     return '/dev/null';
+@@ -2410,8 +2445,10 @@
+             // Handle non-existent paths by mounting /dev/null to block creation.
+             // Without this, a sandboxed process could mkdir+write a denied path that
+             // doesn't exist yet, bypassing the deny rule entirely.
++            // Another sandbox's socket mount point is covered like an absent path.
+             if (decidedMountPointOver(normalizedPath) !== undefined ||
+-                !fs.existsSync(normalizedPath)) {
++                !fs.existsSync(normalizedPath) ||
++                fs.lstatSync(normalizedPath).isSocket()) {
+                 const placeholder = mountPointFor(normalizedPath);
+                 if (placeholder !== undefined) {
+                     const { dest, kind } = placeholder;
