@@ -24,6 +24,15 @@
   # that expect /lib64/ld-linux-x86-64.so.2 + standard glibc layout.
   programs.nix-ld.enable = true;
 
+  # tiny_power_button turns every ACPI power-button notify into a raw
+  # SIGRTMIN+4 (poweroff) to PID 1, bypassing logind. On 6.18.5x this
+  # InfinityBook's firmware fires such a notify at s2idle entry and on lid
+  # open, so every suspend ended in a poweroff on resume (journal: "Received
+  # SIGRTMIN+4" amid "Freezing user space processes"). The regular `button`
+  # driver still exposes the key as an input device, so logind keeps
+  # handling it per HandlePowerKey.
+  boot.blacklistedKernelModules = [ "tiny_power_button" ];
+
   # Lid close behavior — suspend on battery, ignore on AC (laptop docked)
   services.logind.settings.Login = {
     HandleLidSwitch = "suspend";
