@@ -11,6 +11,7 @@ Exit 0 merged or nothing to do, 75 an input is unusable or the lock is busy.
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -39,8 +40,14 @@ def _parse_object(raw, path):
     def _reject_constant(token):
         raise Unusable(f"{path} contains {token}, which JSON.parse rejects")
 
+    def _finite_float(token):
+        value = float(token)
+        if not math.isfinite(value):
+            raise Unusable(f"{path} contains {token}, which would be written back as Infinity")
+        return value
+
     try:
-        doc = json.loads(text, parse_constant=_reject_constant)
+        doc = json.loads(text, parse_constant=_reject_constant, parse_float=_finite_float)
     except json.JSONDecodeError as exc:
         raise Unusable(f"{path} is not valid JSON ({exc})")
     if not isinstance(doc, dict):
@@ -112,7 +119,9 @@ def _replace(path, doc, mode):
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".claude.json.mcp-import.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(doc, f, indent=2, ensure_ascii=False)
+            # ASCII escapes carry a lone surrogate, which JSON.stringify emits
+            # and UTF-8 cannot encode.
+            json.dump(doc, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, mode)

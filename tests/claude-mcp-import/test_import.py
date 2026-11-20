@@ -136,6 +136,16 @@ class Merge(ImportCase):
         self.run_import()
         self.assertEqual(stat.S_IMODE(os.stat(self.live).st_mode), 0o600)
 
+    def test_lone_surrogate_in_live_file_survives(self):
+        # JSON.stringify writes a lone surrogate as an escape; JSON.parse reads it back.
+        live = copy.deepcopy(LIVE)
+        live["projects"]["/home/jonathan"]["lastPrompt"] = "cut emoji \ud83d"
+        self.write(self.live, render(live))
+        proc = self.run_import()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.raw(self.live).decode("utf-8")
+        self.assertEqual(self.read_live()["projects"], live["projects"])
+
     def test_second_run_is_a_no_op(self):
         self.run_import()
         ino = os.stat(self.live).st_ino
@@ -176,6 +186,11 @@ class Refusals(ImportCase):
 
     def test_served_nan(self):
         self.write(self.served, '{"github": {"timeout": NaN}}\n')
+        self.assert_unchanged_after(75)
+
+    def test_served_number_out_of_range(self):
+        # JSON.parse reads 1e400 as Infinity; Python would write it back as `Infinity`.
+        self.write(self.served, '{"github": {"timeout": 1e400}}\n')
         self.assert_unchanged_after(75)
 
     def test_live_unparseable(self):
