@@ -222,6 +222,9 @@
       config.android_sdk.accept_license = true;
       overlays = [
         (import ./overlays/beeper.nix)
+        # `pkgs.meetily` + `pkgs.meetily-kb-whisper` — local meeting
+        # transcription (Meetily Community 0.5.0 .deb). See overlays/meetily.nix.
+        (import ./overlays/meetily.nix)
         (import ./overlays/auphonic-cli.nix)
         (import ./overlays/signal-expiry.nix)
         (import ./overlays/sandbox-runtime.nix)
@@ -746,6 +749,8 @@
     # smoke-tested via checks.x86_64-linux.add-secret-smoke.
     packages.${linuxSystem} = {
       update-beeper = pkgsLinux.beeper-update;
+      meetily = pkgsLinux.meetily;
+      meetily-kb-whisper = pkgsLinux.meetily-kb-whisper;
       check-signal-expiry = pkgsLinux.signal-expiry-check;
       add-secret = import ./home/add-secret.nix { pkgs = pkgsLinux; };
       # `nix run .#security-static [-- --self-test]` — fast offline security

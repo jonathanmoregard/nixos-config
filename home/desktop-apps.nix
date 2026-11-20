@@ -14,6 +14,8 @@
     qbittorrent
     keepassxc
     zoom-us
+    meetily            # local meeting transcription; overlays/meetily.nix
+    meetily-kb-whisper # fetch KBLab Swedish Whisper models for Meetily
     zenity
     dropbox
     thunderbird
