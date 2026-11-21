@@ -22,8 +22,13 @@
 let
   # Captured here: inside the guest module below, `config` is the guest's.
   hostJonathanUid = config.users.users.jonathan.uid;
+  researchAgentSrc = pkgs.research-agent-mcp.src;
 in
 {
+  # microvm.nix restarts the VM only when the guest toplevel changes,
+  # which a share-source bump does not.
+  systemd.services."microvm@research-agent".restartTriggers = [ researchAgentSrc ];
+
   microvm.vms.research-agent = {
     # Fully-declarative VM (`config` set inline below). The host's
     # `microvm.nixosModules.host` already injects the guest microvm
@@ -68,7 +73,12 @@ in
 
         shares = [
           {
-            source = "/home/jonathan/Repos/research-agent";
+            # The source the host research-agent-mcp server is built
+            # from, so host and guest code never skew. microvm.nix keys
+            # a host tmpfiles rule by each share source, and an attribute
+            # name cannot carry store context; the restart trigger below
+            # keeps the path in the host closure.
+            source = builtins.unsafeDiscardStringContext "${researchAgentSrc}";
             mountPoint = "/workspace";
             tag = "workspace";
             proto = "virtiofs";

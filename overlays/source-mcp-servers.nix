@@ -56,7 +56,10 @@ let
   };
 in
 {
-  research-agent-mcp = final.callPackage ./research-agent-mcp.nix { venv = researchAgentVenv; };
+  research-agent-mcp = final.callPackage ./research-agent-mcp.nix {
+    venv = researchAgentVenv;
+    src = research-agent-src;
+  };
 
   # Tools are fixed here so the registered argv is the bare store path.
   # load_dotenv(override=False) keeps uv --env-file's precedence: a variable

@@ -1,4 +1,4 @@
-{ pkgs, venv }:
+{ pkgs, venv, src }:
 # research-agent-mcp wrapper.
 #
 # Claude Code spawns `research-agent-mcp` as a stdio MCP subprocess
@@ -186,7 +186,7 @@ let
 in
     pkgs.writeShellApplication {
       name = "research-agent-mcp";
-      passthru = { inherit venv; };
+      passthru = { inherit venv src; };
       # tesseract: the post-run artifact gate OCRs browser screenshots
       # (mcp_server/artifact_gate.py) before they reach reports/.
       runtimeInputs = [ pkgs.tesseract ];

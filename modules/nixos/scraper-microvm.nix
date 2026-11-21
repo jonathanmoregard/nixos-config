@@ -34,6 +34,7 @@
 let
   # Captured here: inside the guest module below, `config` is the guest's.
   hostJonathanUid = config.users.users.jonathan.uid;
+  researchAgentSrc = pkgs.research-agent-mcp.src;
 in
 {
   # Per-boot bearer token. Random, never persisted across reboots. The
@@ -75,6 +76,8 @@ in
     '';
   };
 
+  systemd.services."microvm@scraper".restartTriggers = [ researchAgentSrc ];
+
   microvm.vms.scraper = {
     config = { config, pkgs, ... }: {
       imports = [ ./scraper-egress.nix ];
@@ -99,7 +102,8 @@ in
             # default is readOnly=false — the flag MUST be set
             # explicitly. (Verified via:
             # `nix eval .#nixosConfigurations.dellan.config.microvm.vms.scraper.config.config.microvm.shares`.)
-            source = "/home/jonathan/Repos/research-agent";
+            # Context dropped and restart wired as in research-agent-microvm.nix.
+            source = builtins.unsafeDiscardStringContext "${researchAgentSrc}";
             mountPoint = "/workspace";
             tag = "workspace";
             proto = "virtiofs";
