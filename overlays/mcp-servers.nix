@@ -28,6 +28,7 @@ in
   mcp-server-reddit = linkBin "mcp-server-reddit" "0.2.1" (mkEnv "reddit") "mcp-server-reddit";
 
   ha-mcp-unwrapped = linkBin "ha-mcp" "8.6.0" (mkEnv "ha-mcp") "ha-mcp";
+  ha-mcp = final.callPackage ./ha-mcp.nix { };
 
   # Only the dependencies are pinned here. server.py itself stays in
   # claude-config, whose review and deploy path owns the served checkout.

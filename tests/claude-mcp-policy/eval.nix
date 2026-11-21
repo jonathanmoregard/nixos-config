@@ -23,7 +23,7 @@ let
     connectorUrls = [ "https://mcp.example.invalid" ];
   }).config;
   policy = builtins.fromJSON good.claude.mcp.policyJSON;
-  servers = (builtins.fromJSON good.claude.mcp.serversJSON).mcpServers;
+  servers = builtins.fromJSON good.claude.mcp.serversJSON;
   commands = map (e: e.serverCommand) (lib.filter (e: e ? serverCommand) policy.allowedMcpServers);
   urls = map (e: e.serverUrl) (lib.filter (e: e ? serverUrl) policy.allowedMcpServers);
 

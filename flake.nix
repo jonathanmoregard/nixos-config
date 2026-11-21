@@ -413,6 +413,12 @@
             `hashedPasswordFile` — do not put a plaintext default back in profiles/base.nix.
           ''
             (pkgsLinux.runCommand "dellan-initial-password-null" { } "touch $out");
+        # Not a VM lane: modules/nixos/claude-mcp-policy.nix's eval checks, and
+        # the importer run on the primary host's generated list. Seconds.
+        claude-mcp-policy = import ./tests/claude-mcp-policy {
+          pkgs = pkgsLinux;
+          hostConfig = primaryConfig;
+        };
         # Not a VM lane: runtime-invocation harness for the feature-vm
         # launcher (locked-by-default sandbox invariants). Seconds.
         feature-vm-ctl = import ./tests/feature-vm-ctl.nix { pkgs = pkgsLinux; };

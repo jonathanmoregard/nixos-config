@@ -83,7 +83,7 @@ in
 
   config = lib.mkIf cfg.enable {
     claude.mcp.policyJSON = builtins.toJSON policy;
-    claude.mcp.serversJSON = builtins.toJSON { mcpServers = lib.mapAttrs (_: entry) cfg.servers; };
+    claude.mcp.serversJSON = builtins.toJSON (lib.mapAttrs (_: entry) cfg.servers);
 
     assertions = [
       {
