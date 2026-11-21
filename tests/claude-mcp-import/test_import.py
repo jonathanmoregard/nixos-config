@@ -122,6 +122,32 @@ class Authoritative(ImportCase):
             self.assertEqual(got[key], LIVE[key])
         self.assertEqual(list(got), list(LIVE))
 
+    def test_per_project_mcp_state_untouched(self):
+        live = copy.deepcopy(LIVE)
+        live["projects"]["/home/jonathan"].update({
+            "mcpServers": {"proj-only": HAND_ADDED},
+            "enabledMcpjsonServers": ["proj-only"],
+            "disabledMcpjsonServers": ["github"],
+            "mcpContextUris": ["x"],
+        })
+        self.write(self.live, render(live))
+        self.import_ok()
+        got = self.read_live()
+        self.assertEqual(got["projects"], live["projects"])
+        self.assertEqual({k: v for k, v in got.items() if k != "mcpServers"},
+                         {k: v for k, v in live.items() if k != "mcpServers"})
+
+    def test_own_leftover_temp_files_removed_unrelated_kept(self):
+        leftover = os.path.join(self.dir, ".claude.json.mcp-import.abc123")
+        unrelated = [os.path.join(self.dir, n) for n in
+                     (".claude.json.tmp", ".claude.json.mcp-importer.x", "claude.json.mcp-import.x")]
+        for path in [leftover, *unrelated]:
+            self.write(path, "stale")
+        self.import_ok()
+        self.assertFalse(os.path.exists(leftover))
+        for path in unrelated:
+            self.assertTrue(os.path.exists(path), path)
+
     def test_live_without_mcp_servers_gains_them(self):
         live = copy.deepcopy(LIVE)
         del live["mcpServers"]
