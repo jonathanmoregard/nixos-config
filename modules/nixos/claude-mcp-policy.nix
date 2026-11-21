@@ -36,7 +36,6 @@ let
     allowedMcpServers =
       lib.mapAttrsToList (_: s: { serverCommand = argvOf s; }) stdio
       ++ map (c: { serverCommand = c; }) cfg.extraAllowedCommands
-      ++ lib.mapAttrsToList (_: u: { serverCommand = u.argv; }) cfg.unreviewedAllowedCommands
       ++ lib.mapAttrsToList (_: s: { serverUrl = s.url; }) remote
       ++ map (u: { serverUrl = u; }) cfg.connectorUrls;
   };
@@ -82,17 +81,6 @@ in
       default = [ ];
       description = "Commands allowed but not registered in ~/.claude.json, e.g. the agent-e2e stub dispatcher.";
     };
-    # The visible escape hatch from the trusted-prefix rule; every entry must carry an issue.
-    unreviewedAllowedCommands = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.submodule {
-        options = {
-          argv = lib.mkOption { type = lib.types.listOf lib.types.str; };
-          reason = lib.mkOption { type = lib.types.str; };
-          issue = lib.mkOption { type = lib.types.str; };
-        };
-      });
-      default = { };
-    };
     connectorUrls = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -119,13 +107,7 @@ in
         assertion = lib.all (s: !(lib.hasInfix "\${" (toString (argvOf s)))) (lib.attrValues stdio);
         message = "claude.mcp: no \${VAR} in commands; the policy matches literal argv";
       }
-    ] ++ lib.mapAttrsToList (name: u: {
-      assertion = lib.trim u.reason != ""
-        && builtins.match "https://github\\.com/[^/]+/[^/]+/issues/[0-9]+" u.issue != null
-        && u.argv != [ ]
-        && !(lib.any (lib.hasInfix "\${") u.argv);
-      message = "claude.mcp.unreviewedAllowedCommands.${name}: needs a non-empty argv without \${, a reason, and a https://github.com/<owner>/<repo>/issues/<n> issue";
-    }) cfg.unreviewedAllowedCommands;
+    ];
 
     environment.etc."claude-code/managed-settings.d/50-mcp.json" = {
       text = cfg.policyJSON;

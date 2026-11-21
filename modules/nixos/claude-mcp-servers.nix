@@ -10,15 +10,6 @@ let
     args = [ "${runtime}/mcps/${dir}/server.py" ];
     inherit timeout;
   };
-  routerAgent = "/home/jonathan/Repos/router-agent";
-  routerProxy = mode: [
-    "uv" "run" "--directory" routerAgent "router-proxy"
-    "--mode" mode
-    "--paths" "/home/jonathan/.config/router/paths.yaml"
-    "--policy" "${routerAgent}/config/policy.yaml"
-    "--children" "${routerAgent}/config/children.yaml"
-  ];
-  routerIssue = "https://github.com/jonathanmoregard/nixos-config/issues/430";
 in
 {
   imports = [ ./claude-mcp-policy.nix ];
@@ -52,19 +43,6 @@ in
     extraAllowedCommands = [
       [ python3 "${runtime}/scripts/dev-mcp/dispatch.py" ]
     ];
-
-    unreviewedAllowedCommands = {
-      router-proxy-interactive = {
-        argv = routerProxy "interactive";
-        reason = "router-proxy from ~/Repos/router-agent's project .mcp.json, for interactive sessions in that repo. Runs uv from a writable checkout of a private repo, which cannot be a public flake input.";
-        issue = routerIssue;
-      };
-      router-proxy-autonomous = {
-        argv = routerProxy "autonomous";
-        reason = "router-proxy for router-worker.service: launch.sh passes --strict-mcp-config --mcp-config with the profile .mcp.json in ~/.local/share/router-agent, whose uv --directory points at ~/Repos/router-agent, not the worker clone. Private source repo, so unpackaged.";
-        issue = routerIssue;
-      };
-    };
 
     connectorUrls = [
       "https://api.anthropic.com/v1/pages/mcp"
