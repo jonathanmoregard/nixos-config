@@ -12,6 +12,10 @@ let
   };
   failing = cfg: lib.filter (a: !a.assertion) cfg.assertions;
 
+  homeArgv = [ "uv" "run" "--directory" "/home/jonathan/Repos/x" "x-server" "--config" "/home/jonathan/x.yaml" ];
+  issue = "https://github.com/jonathanmoregard/nixos-config/issues/430";
+  exception = { argv = homeArgv; reason = "private source repo"; inherit issue; };
+
   good = (eval {
     enable = true;
     servers = {
@@ -21,6 +25,7 @@ let
     };
     extraAllowedCommands = [ [ "/run/current-system/sw/bin/python3" "/var/lib/claude-runtime/checkout/runtime/scripts/agent-e2e/mcp-stub-dispatch.py" ] ];
     connectorUrls = [ "https://mcp.example.invalid" ];
+    unreviewedAllowedCommands.x = exception;
   }).config;
   policy = builtins.fromJSON good.claude.mcp.policyJSON;
   servers = builtins.fromJSON good.claude.mcp.serversJSON;
@@ -50,6 +55,14 @@ let
     rejectsUntrustedExtra = rejects { extraAllowedCommands = [ [ "/tmp/x" ] ]; };
     rejectsVarExpansion = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "\${HOME}" ]; }; };
     rejectsPlainHttp = rejects { servers.x = { type = "http"; url = "http://example.invalid"; }; };
+    unreviewedRenderedExactly = lib.count (e: e == { serverCommand = homeArgv; }) policy.allowedMcpServers == 1
+      && !(lib.hasInfix "private source repo" good.claude.mcp.policyJSON);
+    rejectsUnreviewedEmptyReason = rejects { unreviewedAllowedCommands.x = exception // { reason = " "; }; };
+    rejectsUnreviewedNonGithubIssue = rejects { unreviewedAllowedCommands.x = exception // { issue = "https://example.invalid/o/r/issues/1"; }; };
+    rejectsUnreviewedPullUrl = rejects { unreviewedAllowedCommands.x = exception // { issue = "https://github.com/o/r/pull/1"; }; };
+    rejectsUnreviewedEmptyArgv = rejects { unreviewedAllowedCommands.x = exception // { argv = [ ]; }; };
+    rejectsUnreviewedVarExpansion = rejects { unreviewedAllowedCommands.x = exception // { argv = homeArgv ++ [ "\${HOME}" ]; }; };
+    rejectsUnreviewedArgvAsExtra = rejects { extraAllowedCommands = [ homeArgv ]; };
   };
   failed = lib.attrNames (lib.filterAttrs (_: v: !v) checks);
 in
