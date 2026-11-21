@@ -43,6 +43,10 @@ let
     rejectsBareCommand = rejects { servers.x.command = "ha-mcp"; };
     rejectsHomePath = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "/home/jonathan/.claude/mcps/x.py" ]; }; };
     rejectsTildePath = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "~/x" ]; }; };
+    rejectsEqualsPath = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--config=/home/jonathan/x" ]; }; };
+    rejectsDotDotArg = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "/nix/store/../home/jonathan/x.py" ]; }; };
+    rejectsDotDotCommand = rejects { servers.x.command = "/nix/store/../home/jonathan/x"; };
+    rejectsDotDotAfterEquals = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--config=../x" ]; }; };
     rejectsUntrustedExtra = rejects { extraAllowedCommands = [ [ "/tmp/x" ] ]; };
     rejectsVarExpansion = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "\${HOME}" ]; }; };
     rejectsPlainHttp = rejects { servers.x = { type = "http"; url = "http://example.invalid"; }; };

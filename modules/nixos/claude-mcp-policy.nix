@@ -4,6 +4,8 @@
 # importer copies into ~/.claude.json. Drift and review control, not an agent
 # boundary: an unsandboxed agent running as the user can still run a binary
 # itself or start claude without this policy (design: Fable, 2026-11-21).
+# A server that is missing must be added to claude.mcp (servers or
+# extraAllowedCommands); unlisted servers are skipped silently.
 { config, lib, ... }:
 let
   cfg = config.claude.mcp;
@@ -16,7 +18,14 @@ let
     "/var/lib/claude-runtime/checkout/"
   ];
   looksLikePath = s: lib.hasPrefix "/" s || lib.hasPrefix "~" s || lib.hasPrefix "." s;
-  trusted = s: lib.any (p: lib.hasPrefix p s) trustedPrefixes;
+  trusted = s: lib.any (p: lib.hasPrefix p s) trustedPrefixes && !hasDotDot s;
+  hasDotDot = s: lib.elem ".." (lib.splitString "/" s);
+  # A flag such as --config=/home/x carries its path after the first "=".
+  afterEquals = s: lib.concatStringsSep "=" (lib.drop 1 (lib.splitString "=" s));
+  badElement = e:
+    (looksLikePath e && !trusted e)
+    || hasDotDot e
+    || (lib.hasInfix "=" e && (let v = afterEquals e; in (looksLikePath v && !trusted v) || hasDotDot v));
 
   stdio = lib.filterAttrs (_: s: s.type == "stdio") cfg.servers;
   remote = lib.filterAttrs (_: s: s.type != "stdio") cfg.servers;
@@ -38,9 +47,9 @@ let
       { inherit (s) type url; };
 
   badElements = lib.concatLists (lib.mapAttrsToList
-    (name: s: map (e: "${name}: ${e}") (lib.filter (e: looksLikePath e && !trusted e) (argvOf s)))
+    (name: s: map (e: "${name}: ${e}") (lib.filter badElement (argvOf s)))
     stdio
-    ++ map (c: map (e: "extraAllowedCommands: ${e}") (lib.filter (e: looksLikePath e && !trusted e) c))
+    ++ map (c: map (e: "extraAllowedCommands: ${e}") (lib.filter badElement c))
       cfg.extraAllowedCommands);
   untrustedCommands = lib.concatLists (lib.mapAttrsToList
     (name: s: lib.optional (!trusted s.command) "${name}: ${s.command}") stdio

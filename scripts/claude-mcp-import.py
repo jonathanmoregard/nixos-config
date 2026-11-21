@@ -105,9 +105,20 @@ class _ConfigLock:
         os.rmdir(self.path)
 
 
+TEMP_PREFIX = ".claude.json.mcp-import."
+
+
+def _remove_leftovers(directory):
+    # A killed run leaves its temp file, a full copy of ~/.claude.json.
+    for name in os.listdir(directory):
+        if name.startswith(TEMP_PREFIX):
+            os.unlink(os.path.join(directory, name))
+
+
 def _replace(path, doc, mode):
     directory = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".claude.json.mcp-import.")
+    _remove_leftovers(directory)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=TEMP_PREFIX)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             # ASCII escapes carry a lone surrogate, which JSON.stringify emits
