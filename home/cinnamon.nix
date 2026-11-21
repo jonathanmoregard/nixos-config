@@ -186,6 +186,11 @@ in
       toolkit-accessibility = false;
       clock-use-24h = true;
       font-name = "Ubuntu 10";
+      # Middle mouse is held to dictate (Voquill). The X11 primary-selection
+      # paste would otherwise fire into whatever is under the pointer.
+      # Cinnamon's XSettings exports this key (not org/gnome's) as
+      # Gtk/EnablePrimaryPaste, which GTK apps and Chrome obey.
+      gtk-enable-primary-paste = false;
     };
 
     "org/cinnamon/sounds" = {
@@ -329,9 +334,6 @@ in
       monospace-font-name = "DejaVu Sans Mono 10";
       document-font-name = "Sans 10";
       color-scheme = "prefer-dark";
-      # Middle mouse is held to dictate (Voquill). The X11 primary-selection
-      # paste would otherwise fire into whatever is under the pointer.
-      gtk-enable-primary-paste = false;
     };
 
     # xdg-desktop-portal-xapp answers org.freedesktop.appearance color-scheme
