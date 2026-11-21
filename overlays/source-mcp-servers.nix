@@ -58,7 +58,10 @@ in
 {
   research-agent-mcp = final.callPackage ./research-agent-mcp.nix {
     venv = researchAgentVenv;
-    src = research-agent-src;
+    # The microvm shares drop this path's context. Under lazy trees
+    # (Determinate Nix) a flake input's path without context is an unrealised
+    # placeholder; a derivation's output path is real under any evaluator.
+    src = prev.runCommand "research-agent-src" { } "cp -r ${research-agent-src} $out";
   };
 
   # Tools are fixed here so the registered argv is the bare store path.
