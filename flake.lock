@@ -220,6 +220,23 @@
         "type": "github"
       }
     },
+    "gdocs-review-mcp-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1788019594,
+        "narHash": "sha256-gW5yPbkO8TYgZoba4Bh+F8Cbi9DxsGavSBayPjkaQiE=",
+        "owner": "jonathanmoregard",
+        "repo": "google_workspace_mcp",
+        "rev": "2d6136bef5c4fe693f8469cf9839b6892f1d8d38",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jonathanmoregard",
+        "repo": "google_workspace_mcp",
+        "rev": "2d6136bef5c4fe693f8469cf9839b6892f1d8d38",
+        "type": "github"
+      }
+    },
     "gitignore": {
       "inputs": {
         "nixpkgs": [
@@ -593,6 +610,23 @@
         "type": "github"
       }
     },
+    "research-agent-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793044951,
+        "narHash": "sha256-h0R1D3nmgpUKmUXNagCOfsIStnjgFgMgc44cWGYzn8I=",
+        "owner": "jonathanmoregard",
+        "repo": "research-agent",
+        "rev": "2cdb1889a19a3c652e1cf10d7e1894b91d6ee118",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jonathanmoregard",
+        "repo": "research-agent",
+        "rev": "2cdb1889a19a3c652e1cf10d7e1894b91d6ee118",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "agenix": "agenix",
@@ -600,12 +634,14 @@
         "aggregator-src": "aggregator-src",
         "claude-desktop": "claude-desktop",
         "codex-cli-nix": "codex-cli-nix",
+        "gdocs-review-mcp-src": "gdocs-review-mcp-src",
         "home-manager": "home-manager_2",
         "microvm": "microvm",
         "nixpkgs": "nixpkgs_2",
         "prose-decorate": "prose-decorate",
         "pyproject-build-systems": "pyproject-build-systems_2",
         "pyproject-nix": "pyproject-nix_2",
+        "research-agent-src": "research-agent-src",
         "substack-url-tool": "substack-url-tool",
         "tts-tool": "tts-tool",
         "uv2nix": "uv2nix_4",
