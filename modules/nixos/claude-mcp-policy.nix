@@ -4,31 +4,25 @@
 # importer copies into ~/.claude.json. Drift and review control, not an agent
 # boundary: an unsandboxed agent running as the user can still run a binary
 # itself or start claude without this policy (design: Fable, 2026-11-21).
+# Rule: every argv element after the command is an absolute trusted-prefix path
+# without "..", or appears verbatim in that entry's literalArgs. Env is not
+# compared by the managed allowlist, so it is out of scope.
+# Reviewers: don't report new argv forms; report only a concrete input that
+# satisfies this rule and still loads untrusted code (e.g. a trusted-prefix path
+# the agent can write).
 # A server that is missing must be added to claude.mcp (servers or
 # extraAllowedCommands); unlisted servers are skipped silently.
 { config, lib, ... }:
 let
   cfg = config.claude.mcp;
 
-  # Root-owned prefixes only: every argv element of an allowed command must
-  # resolve under one of these, so the policy names code a PR reviewed.
   trustedPrefixes = [
     "/nix/store/"
     "/run/current-system/sw/bin/"
     "/var/lib/claude-runtime/checkout/"
   ];
-  # A bare script name has no "/" but still runs from the session's cwd.
-  scriptExtensions = [ ".py" ".sh" ".js" ".mjs" ".cjs" ".ts" ".rb" ".pl" ];
-  looksLikePath = s: lib.hasInfix "/" s || lib.hasPrefix "~" s || lib.hasPrefix "." s
-    || lib.any (x: lib.hasSuffix x s) scriptExtensions;
-  trusted = s: lib.any (p: lib.hasPrefix p s) trustedPrefixes && !hasDotDot s;
   hasDotDot = s: lib.elem ".." (lib.splitString "/" s);
-  badValue = s: hasDotDot s || (looksLikePath s && !trusted s);
-  # A flag such as --config=/nix/store/x carries its path after the first "=".
-  flagKey = s: builtins.head (lib.splitString "=" s);
-  afterEquals = s: lib.concatStringsSep "=" (lib.drop 1 (lib.splitString "=" s));
-  badElement = e:
-    if lib.hasInfix "=" e && !looksLikePath (flagKey e) then badValue (afterEquals e) else badValue e;
+  trusted = s: lib.any (p: lib.hasPrefix p s) trustedPrefixes && !hasDotDot s;
 
   stdio = lib.filterAttrs (_: s: s.type == "stdio") cfg.servers;
   remote = lib.filterAttrs (_: s: s.type != "stdio") cfg.servers;
@@ -49,10 +43,10 @@ let
     else
       { inherit (s) type url; };
 
-  badElements = lib.concatLists (lib.mapAttrsToList
-    (name: s: map (e: "${name}: ${e}") (lib.filter badElement (argvOf s)))
+  badArgs = lib.concatLists (lib.mapAttrsToList
+    (name: s: map (e: "${name}: ${e}") (lib.filter (e: !(trusted e || lib.elem e s.literalArgs)) s.args))
     stdio
-    ++ map (c: map (e: "extraAllowedCommands: ${e}") (lib.filter badElement c))
+    ++ map (c: map (e: "extraAllowedCommands: ${e}") (lib.filter (e: !trusted e) (lib.drop 1 c)))
       cfg.extraAllowedCommands);
   untrustedCommands = lib.concatLists (lib.mapAttrsToList
     (name: s: lib.optional (!trusted s.command) "${name}: ${s.command}") stdio
@@ -64,6 +58,11 @@ let
       type = lib.mkOption { type = lib.types.enum [ "stdio" "http" "sse" ]; default = "stdio"; };
       command = lib.mkOption { type = lib.types.str; default = ""; };
       args = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
+      literalArgs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Arguments allowed verbatim although they are not trusted-prefix paths, e.g. a flag or subcommand.";
+      };
       # Copied into ~/.claude.json only; the policy does not compare env and
       # the files under /etc are world-readable, so never put a secret here.
       env = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
@@ -99,8 +98,12 @@ in
 
     assertions = [
       {
-        assertion = untrustedCommands == [ ] && badElements == [ ];
-        message = "claude.mcp: every command and path argument must be absolute under ${toString trustedPrefixes}; offending: ${toString (untrustedCommands ++ badElements)}";
+        assertion = untrustedCommands == [ ];
+        message = "claude.mcp: every command must be absolute under ${toString trustedPrefixes}; offending: ${toString untrustedCommands}";
+      }
+      {
+        assertion = badArgs == [ ];
+        message = "claude.mcp: every argument must be an absolute path under ${toString trustedPrefixes} or listed in literalArgs; offending: ${toString badArgs}";
       }
       {
         assertion = lib.all (s: s.url != "" && lib.hasPrefix "https://" s.url) (lib.attrValues remote);

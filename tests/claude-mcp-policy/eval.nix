@@ -16,7 +16,7 @@ let
     enable = true;
     servers = {
       broker = { command = "/run/current-system/sw/bin/python3"; args = [ "/var/lib/claude-runtime/checkout/runtime/mcps/git-broker/server.py" ]; timeout = 5; };
-      pkg = { command = "/nix/store/00000000000000000000000000000000-x/bin/x"; args = [ "--flag" "value" ]; env.A = "1"; };
+      pkg = { command = "/nix/store/00000000000000000000000000000000-x/bin/x"; args = [ "--flag" "value" ]; literalArgs = [ "--flag" "value" ]; env.A = "1"; };
       web = { type = "http"; url = "https://example.invalid/mcp"; };
     };
     extraAllowedCommands = [ [ "/run/current-system/sw/bin/python3" "/var/lib/claude-runtime/checkout/runtime/scripts/agent-e2e/mcp-stub-dispatch.py" ] ];
@@ -27,7 +27,12 @@ let
   commands = map (e: e.serverCommand) (lib.filter (e: e ? serverCommand) policy.allowedMcpServers);
   urls = map (e: e.serverUrl) (lib.filter (e: e ? serverUrl) policy.allowedMcpServers);
 
-  rejects = mcp: failing (eval ({ enable = true; } // mcp)).config != [ ];
+  rejectsWith = fragment: mcp: lib.any (a: lib.hasInfix fragment a.message) (failing (eval ({ enable = true; } // mcp)).config);
+  rejectsCommand = rejectsWith "every command must be";
+  rejectsArg = rejectsWith "every argument must be";
+  py = "/run/current-system/sw/bin/python3";
+  x = "/nix/store/0-x/bin/x";
+  withArgs = command: args: { servers.x = { inherit command args; }; };
 
   checks = {
     noAssertionFails = failing good == [ ];
@@ -35,27 +40,37 @@ let
     noServerName = lib.all (e: lib.attrNames e == [ "serverCommand" ] || lib.attrNames e == [ "serverUrl" ]) policy.allowedMcpServers;
     everyStdioArgvAllowed = lib.all (s: lib.elem ([ s.command ] ++ s.args) commands)
       (lib.filter (s: s.type == "stdio") (lib.attrValues servers));
-    dispatcherAllowedNotRegistered = lib.elem [ "/run/current-system/sw/bin/python3" "/var/lib/claude-runtime/checkout/runtime/scripts/agent-e2e/mcp-stub-dispatch.py" ] commands
+    dispatcherAllowedNotRegistered = lib.elem [ py "/var/lib/claude-runtime/checkout/runtime/scripts/agent-e2e/mcp-stub-dispatch.py" ] commands
       && lib.length (lib.attrNames servers) == 3;
     urlsAllowed = lib.elem "https://example.invalid/mcp" urls && lib.elem "https://mcp.example.invalid" urls;
     envKeptInServerList = servers.pkg.env == { A = "1"; } && !(lib.hasInfix "\"env\"" good.claude.mcp.policyJSON);
+    literalArgsNotInServerList = !(servers.pkg ? literalArgs);
     etcFilesWorldReadable = good.environment.etc."claude-code/managed-settings.d/50-mcp.json".mode == "0644";
-    rejectsBareCommand = rejects { servers.x.command = "ha-mcp"; };
-    rejectsHomePath = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "/home/jonathan/.claude/mcps/x.py" ]; }; };
-    rejectsTildePath = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "~/x" ]; }; };
-    rejectsEqualsPath = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--config=/home/jonathan/x" ]; }; };
-    rejectsDotDotArg = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "/nix/store/../home/jonathan/x.py" ]; }; };
-    rejectsDotDotCommand = rejects { servers.x.command = "/nix/store/../home/jonathan/x"; };
-    rejectsDotDotAfterEquals = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--config=../x" ]; }; };
-    rejectsRelativeScriptPath = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "mcps/x/server.py" ]; }; };
-    rejectsBareScriptName = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "x.py" ]; }; };
-    rejectsBareScriptAfterEquals = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--script=x.sh" ]; }; };
-    rejectsAttachedFlagPath = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "-I/home/jonathan/x" ]; }; };
-    rejectsDotDotValue = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--dir=.." ]; }; };
-    allowsTrustedAfterEquals = !(rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--config=/nix/store/0-c/config.json" "stdio" ]; }; });
-    rejectsUntrustedExtra =rejects { extraAllowedCommands = [ [ "/tmp/x" ] ]; };
-    rejectsVarExpansion = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "\${HOME}" ]; }; };
-    rejectsPlainHttp = rejects { servers.x = { type = "http"; url = "http://example.invalid"; }; };
+    rejectsBareCommand = rejectsCommand { servers.x.command = "ha-mcp"; };
+    rejectsDotDotCommand = rejectsCommand { servers.x.command = "/nix/store/../home/jonathan/x"; };
+    rejectsUntrustedExtra = rejectsCommand { extraAllowedCommands = [ [ "/tmp/x" ] ]; };
+    rejectsHomePath = rejectsArg (withArgs py [ "/home/jonathan/.claude/mcps/x.py" ]);
+    rejectsTildePath = rejectsArg (withArgs x [ "~/x" ]);
+    rejectsEqualsPath = rejectsArg (withArgs x [ "--config=/home/jonathan/x" ]);
+    rejectsTrustedEqualsPath = rejectsArg (withArgs x [ "--config=/nix/store/0-c/config.json" ]);
+    rejectsDotDotArg = rejectsArg (withArgs py [ "/nix/store/../home/jonathan/x.py" ]);
+    rejectsDotDotAfterEquals = rejectsArg (withArgs x [ "--config=../x" ]);
+    rejectsRelativeScriptPath = rejectsArg (withArgs py [ "mcps/x/server.py" ]);
+    rejectsBareScriptName = rejectsArg (withArgs py [ "x.py" ]);
+    rejectsBareScriptAfterEquals = rejectsArg (withArgs x [ "--script=x.sh" ]);
+    rejectsAttachedFlagPath = rejectsArg (withArgs py [ "-I/home/jonathan/x" ]);
+    rejectsDotDotValue = rejectsArg (withArgs x [ "--dir=.." ]);
+    rejectsModuleFlag = rejectsArg (withArgs py [ "-m" "pkg" ]);
+    rejectsBareServer = rejectsArg (withArgs x [ "server" ]);
+    rejectsBareConfigFile = rejectsArg (withArgs x [ "config.json" ]);
+    rejectsConfigEqualsToml = rejectsArg (withArgs x [ "--config=c.toml" ]);
+    rejectsUntrustedExtraArg = rejectsArg { extraAllowedCommands = [ [ py "-m" ] ]; };
+    allowsListedLiteralArgs = !(rejectsArg { servers.x = { command = py; args = [ "-m" "pkg" ]; literalArgs = [ "-m" "pkg" ]; }; });
+    rejectsPartlyListedLiteralArgs = rejectsArg { servers.x = { command = py; args = [ "-m" "pkg" ]; literalArgs = [ "-m" ]; }; };
+    literalArgsArePerEntry = rejectsArg { servers.x = { command = py; args = [ "-m" ]; }; servers.y = { command = py; literalArgs = [ "-m" ]; }; };
+    allowsTrustedPathArgs = !(rejectsArg (withArgs x [ "/nix/store/0-c/config.json" "/var/lib/claude-runtime/checkout/runtime/x" ]));
+    rejectsVarExpansion = rejectsWith "no \${VAR}" { servers.x = { command = x; args = [ "\${HOME}" ]; literalArgs = [ "\${HOME}" ]; }; };
+    rejectsPlainHttp = rejectsWith "https://" { servers.x = { type = "http"; url = "http://example.invalid"; }; };
   };
   failed = lib.attrNames (lib.filterAttrs (_: v: !v) checks);
 in
