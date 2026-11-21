@@ -373,6 +373,26 @@ in
     };
   };
 
+  # gtk-enable-primary-paste above never reaches apps: Cinnamon's XSettings
+  # does not export it (linuxmint/cinnamon#13523), so Chrome and GTK still
+  # paste PRIMARY on middle-click. xmousepasteblock empties PRIMARY and the
+  # cut buffer on every middle press instead. It only listens (XI2 raw
+  # events, no grab), so Voquill's XRecord hold-to-dictate still sees the
+  # button.
+  systemd.user.services.xmousepasteblock = {
+    Unit = {
+      Description = "Empty the X PRIMARY selection on middle-click";
+      After = [ "graphical-session.target" ];
+      PartOf = [ "graphical-session.target" ];
+    };
+    Service = {
+      ExecStart = lib.getExe pkgs.xmousepasteblock;
+      Restart = "on-failure";
+      RestartSec = 5;
+    };
+    Install.WantedBy = [ "graphical-session.target" ];
+  };
+
   # XDG MIME defaults (matches Mint)
   xdg.mimeApps = {
     enable = true;

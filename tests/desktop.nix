@@ -7,6 +7,8 @@
 #     clipboard")
 #   - xdg-mime resolves magnet/.torrent/video types to their handlers
 #   - the X11 bell is actually silent after display-setup-script runs
+#   - a middle click empties PRIMARY (xmousepasteblock), while a passive
+#     XRecord listener (Voquill's hold-to-dictate) still sees the button
 #   - lid-guard: lid-close action is suspend by default, "nothing" while
 #     agent hooks report work in flight (turn, subagent, young background
 #     Bash), back to suspend on Stop / dead agent / SessionEnd.
@@ -254,6 +256,55 @@ let
     }
     log.join(" | ");
   '';
+
+  # A passive XRecord listener, the mechanism Voquill's hold-to-dictate uses
+  # to see the middle button without grabbing it. Prints "ready" once the
+  # server confirms recording, then each button-2 press/release, and exits
+  # after the first release.
+  xrecordProbe = pkgs.writers.writePython3 "vm-desktop-xrecord-probe" {
+    libraries = [ pkgs.python3Packages.xlib ];
+  } ''
+    from Xlib import X, display
+    from Xlib.ext import record
+    from Xlib.protocol import rq
+
+    control = display.Display()
+    recorder = display.Display()
+    context = recorder.record_create_context(0, [record.AllClients], [{
+        "core_requests": (0, 0),
+        "core_replies": (0, 0),
+        "ext_requests": (0, 0, 0, 0),
+        "ext_replies": (0, 0, 0, 0),
+        "delivered_events": (0, 0),
+        "device_events": (X.ButtonPress, X.ButtonRelease),
+        "errors": (0, 0),
+        "client_started": False,
+        "client_died": False,
+    }])
+
+
+    def on_reply(reply):
+        if reply.category == record.StartOfData:
+            print("ready", flush=True)
+            return
+        if reply.category != record.FromServer or reply.client_swapped:
+            return
+        data = reply.data
+        while data:
+            event, data = rq.EventField(None).parse_binary_value(
+                data, recorder.display, None, None)
+            if event.detail != 2:
+                continue
+            if event.type == X.ButtonPress:
+                print("press", flush=True)
+            else:
+                print("release", flush=True)
+                control.record_disable_context(context)
+                control.flush()
+
+
+    recorder.record_enable_context(context, on_reply)
+  '';
 in
 (import ./lib/common.nix { inherit pkgs inputs; }).mkFeatureTest {
   name = "vm-desktop";
@@ -349,6 +400,34 @@ in
         "xrdb -query | grep -qx 'Xcursor.theme:\tBibata-Modern-Classic'",
         timeout=120,
     )
+
+    # Middle-click paste blocker (home/cinnamon.nix): a middle press empties
+    # PRIMARY, so Chrome and GTK apps have nothing to paste, while a passive
+    # XRecord listener (Voquill's hold-to-dictate) still sees the button.
+    xenv = "env DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 "
+    read_primary = xenv + "${pkgs.xclip}/bin/xclip -selection primary -o 2>/dev/null"
+    workstation.succeed(
+        xenv + "sh -c 'printf primary-secret | "
+        "${pkgs.xclip}/bin/xclip -selection primary -i' >/dev/null 2>&1"
+    )
+    assert workstation.succeed(read_primary) == "primary-secret", \
+        "precondition: xclip did not take PRIMARY"
+    workstation.succeed(
+        xenv + "timeout 120 ${xrecordProbe} >/tmp/xrecord.log 2>&1 &"
+    )
+    workstation.wait_until_succeeds("grep -qx ready /tmp/xrecord.log", timeout=30)
+    # Retried: the blocker selects its XI2 events a moment after the unit
+    # starts, and nothing else ever empties PRIMARY.
+    workstation.wait_until_succeeds(
+        xenv + "${pkgs.xdotool}/bin/xdotool click 2 && "
+        "test -z \"$(" + read_primary + ")\"",
+        timeout=60,
+    )
+    workstation.wait_until_succeeds("grep -qx release /tmp/xrecord.log", timeout=30)
+    recorded = workstation.succeed("cat /tmp/xrecord.log").split()
+    print(f"[diag] xrecord saw: {recorded}")
+    assert recorded[:3] == ["ready", "press", "release"], \
+        f"XRecord did not see the middle press and release: {recorded}"
 
     # notification-log (home/notification-log.nix): every Notify call on the
     # session bus is appended to ~/.local/state/notification-log/
