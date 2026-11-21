@@ -1,6 +1,6 @@
 # Pure evaluation of modules/nixos/claude-mcp-policy.nix: the generated policy
 # parses, names no server by serverName, allows every registered server's exact
-# argv, and the module refuses a command outside the root-owned prefixes.
+# argv, and the module refuses a command outside the prefixes the agent cannot write.
 { lib }:
 let
   stubOptions = {
@@ -30,6 +30,7 @@ let
   rejectsWith = fragment: mcp: lib.any (a: lib.hasInfix fragment a.message) (failing (eval ({ enable = true; } // mcp)).config);
   rejectsCommand = rejectsWith "every command must be";
   rejectsArg = rejectsWith "every argument must be";
+  rejectsUrl = rejectsWith "every URL must be";
   py = "/run/current-system/sw/bin/python3";
   x = "/nix/store/0-x/bin/x";
   withArgs = command: args: { servers.x = { inherit command args; }; };
@@ -45,7 +46,8 @@ let
     urlsAllowed = lib.elem "https://example.invalid/mcp" urls && lib.elem "https://mcp.example.invalid" urls;
     envKeptInServerList = servers.pkg.env == { A = "1"; } && !(lib.hasInfix "\"env\"" good.claude.mcp.policyJSON);
     literalArgsNotInServerList = !(servers.pkg ? literalArgs);
-    etcFilesWorldReadable = good.environment.etc."claude-code/managed-settings.d/50-mcp.json".mode == "0644";
+    etcFilesWorldReadable = lib.all (f: good.environment.etc.${f}.mode == "0644")
+      [ "claude-code/managed-settings.d/50-mcp.json" "claude-code/mcp-servers.json" ];
     rejectsBareCommand = rejectsCommand { servers.x.command = "ha-mcp"; };
     rejectsDotDotCommand = rejectsCommand { servers.x.command = "/nix/store/../home/jonathan/x"; };
     rejectsUntrustedExtra = rejectsCommand { extraAllowedCommands = [ [ "/tmp/x" ] ]; };
@@ -70,7 +72,10 @@ let
     literalArgsArePerEntry = rejectsArg { servers.x = { command = py; args = [ "-m" ]; }; servers.y = { command = py; literalArgs = [ "-m" ]; }; };
     allowsTrustedPathArgs = !(rejectsArg (withArgs x [ "/nix/store/0-c/config.json" "/var/lib/claude-runtime/checkout/runtime/x" ]));
     rejectsVarExpansion = rejectsWith "no \${VAR}" { servers.x = { command = x; args = [ "\${HOME}" ]; literalArgs = [ "\${HOME}" ]; }; };
-    rejectsPlainHttp = rejectsWith "https://" { servers.x = { type = "http"; url = "http://example.invalid"; }; };
+    rejectsPlainHttp = rejectsUrl { servers.x = { type = "http"; url = "http://example.invalid"; }; };
+    rejectsPlainHttpConnector = rejectsUrl { connectorUrls = [ "http://x" ]; };
+    rejectsWildcardConnector = rejectsUrl { connectorUrls = [ "https://*" ]; };
+    rejectsWildcardServerUrl = rejectsUrl { servers.x = { type = "http"; url = "https://*.example.com/mcp"; }; };
   };
   failed = lib.attrNames (lib.filterAttrs (_: v: !v) checks);
 in

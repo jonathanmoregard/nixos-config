@@ -26,6 +26,7 @@ let
 
   stdio = lib.filterAttrs (_: s: s.type == "stdio") cfg.servers;
   remote = lib.filterAttrs (_: s: s.type != "stdio") cfg.servers;
+  allUrls = map (s: s.url) (lib.attrValues remote) ++ cfg.connectorUrls;
   argvOf = s: [ s.command ] ++ s.args;
 
   policy = {
@@ -106,8 +107,8 @@ in
         message = "claude.mcp: every argument must be an absolute path under ${toString trustedPrefixes} or listed in literalArgs; offending: ${toString badArgs}";
       }
       {
-        assertion = lib.all (s: s.url != "" && lib.hasPrefix "https://" s.url) (lib.attrValues remote);
-        message = "claude.mcp: remote servers need an https:// url";
+        assertion = lib.all (u: lib.hasPrefix "https://" u && !(lib.hasInfix "*" u)) allUrls;
+        message = "claude.mcp: every URL must be https:// without \"*\" (serverUrl treats it as a wildcard); offending: ${toString (lib.filter (u: !(lib.hasPrefix "https://" u && !(lib.hasInfix "*" u))) allUrls)}";
       }
       {
         assertion = lib.all (s: !(lib.hasInfix "\${" (toString (argvOf s)))) (lib.attrValues stdio);
