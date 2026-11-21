@@ -27,6 +27,7 @@
     # Merges that clone's settings.json into the live ~/.claude/settings.json,
     # the one entry the mounts cannot serve as a link.
     ../../modules/nixos/claude-settings-sync.nix
+    ../../modules/nixos/claude-mcp-import.nix
   ];
 
   networking.hostName = "tuxedo";

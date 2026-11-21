@@ -680,7 +680,6 @@ in
     ./git-hooks.nix
     ./cache-publisher-enqueue.nix
     ./autodoro.nix
-    ./claude-mcp-sync.nix
     ./dcg.nix
     ./drift-analyzer.nix
     ./nixos-config-fetch.nix

@@ -9,10 +9,8 @@
 # What we check:
 #   - pre-push hook present, executable, in the global hooks dir
 #     (matching core.hooksPath set in home/jonathan.nix)
-#   - shared hook composed by home/git-hooks.nix carries dispatches
-#     for BOTH consumers currently registered:
-#       - autodoro-reload (from home/autodoro.nix)
-#       - claude-mcp-sync (from home/claude-mcp-sync.nix)
+#   - shared hook composed by home/git-hooks.nix carries the
+#     autodoro-reload dispatch (from home/autodoro.nix)
 #   - hook exits 0 unconditionally so a per-dispatch error never
 #     blocks the push itself
 #   - hook body is syntactically valid bash
@@ -28,9 +26,7 @@
     hook = "/home/jonathan/.config/git/hooks/pre-push"
     workstation.succeed(f"test -x {hook}")
 
-    # Both registered dispatches must appear by name in a comment.
     workstation.succeed(f"grep -q '^# autodoro-reload$' {hook}")
-    workstation.succeed(f"grep -q '^# claude-mcp-sync$' {hook}")
 
     # Unconditional exit 0 so any dispatch failure never blocks the push.
     workstation.succeed(f"grep -q '^exit 0$' {hook}")
