@@ -1,18 +1,17 @@
-# Merges claude-config's runtime/mcp-servers.json into the mcpServers of
-# ~/.claude.json on each deploy tick, so a server merged upstream goes live
-# without a hand step. Additive by design — see scripts/claude-mcp-import.py.
-#
-# A system unit run as the user, triggered by claude-runtime-deploy.service
-# succeeding, for the same reasons as claude-settings-sync.nix.
+# Makes the mcpServers of ~/.claude.json exactly the list in
+# /etc/claude-code/mcp-servers.json, the one the managed policy enforces — see
+# scripts/claude-mcp-import.py. The list changes on rebuild, so a rebuild reruns it.
 { config, lib, pkgs, ... }:
 let
   user = "jonathan";
   group = "users";
   home = "/home/${user}";
 
-  served = "/var/lib/claude-runtime/checkout/runtime/mcp-servers.json";
+  served = "/etc/claude-code/mcp-servers.json";
   live = "${home}/.claude.json";
   marker = "${home}/.claude/.projection-enabled";
+
+  hasList = config.environment.etc ? "claude-code/mcp-servers.json";
 
   failuresDir = "/var/lib/unit-failures";
   record = "${failuresDir}/claude-mcp-import.json";
@@ -33,7 +32,7 @@ let
     text = ''
       result="''${MONITOR_SERVICE_RESULT:-unknown}"
       status="''${MONITOR_EXIT_STATUS:-unknown}"
-      echo "claude-mcp-import FAILED (result=$result status=$status): merged claude-config MCP servers are not reaching ${live}; inspect: journalctl -u claude-mcp-import.service -n 50"
+      echo "claude-mcp-import FAILED (result=$result status=$status): the managed MCP server list is not reaching ${live}; inspect: journalctl -u claude-mcp-import.service -n 50"
       mkdir -p -- ${failuresDir}
       chmod 0755 -- ${failuresDir}
       tmp=$(mktemp ${failuresDir}/.claude-mcp-import.XXXXXX)
@@ -43,7 +42,7 @@ let
         --arg status "$status" \
         --arg invocation "''${MONITOR_INVOCATION_ID:-}" \
         --arg failed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --arg summary "Merged claude-config mcp-servers.json changes are not reaching ~/.claude.json; new MCP servers are not live." \
+        --arg summary "Managed mcp-servers.json changes are not reaching ~/.claude.json; the live MCP server list is stale." \
         --arg inspect "journalctl -u claude-mcp-import.service -n 50" \
         '{unit: $unit, result: $result, exit_status: $status, invocation_id: $invocation, failed_at: $failed_at, summary: $summary, inspect: $inspect}' \
         > "$tmp"
@@ -61,8 +60,10 @@ let
 in
 {
   systemd.services.claude-mcp-import = {
-    description = "Merge the served claude-config mcp-servers.json into ~/.claude.json";
+    description = "Mirror the managed mcp-servers.json into ~/.claude.json";
     after = [ "claude-runtime-deploy.service" ];
+    wantedBy = lib.optional hasList "multi-user.target";
+    restartTriggers = lib.optional hasList config.environment.etc."claude-code/mcp-servers.json".source;
     unitConfig = {
       OnFailure = "claude-mcp-import-failure-notify.service";
       StartLimitIntervalSec = 0;
