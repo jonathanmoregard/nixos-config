@@ -405,29 +405,40 @@ in
     # PRIMARY, so Chrome and GTK apps have nothing to paste, while a passive
     # XRecord listener (Voquill's hold-to-dictate) still sees the button.
     xenv = "env DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 "
-    read_primary = xenv + "${pkgs.xclip}/bin/xclip -selection primary -o 2>/dev/null"
-    workstation.succeed(
-        xenv + "sh -c 'printf primary-secret | "
-        "${pkgs.xclip}/bin/xclip -selection primary -i' >/dev/null 2>&1"
+    middle_click = xenv + "${pkgs.xdotool}/bin/xdotool click 2"
+    primary_empty = (
+        "test -z \"$(" + xenv
+        + "${pkgs.xclip}/bin/xclip -selection primary -o 2>/dev/null)\""
     )
-    assert workstation.succeed(read_primary) == "primary-secret", \
-        "precondition: xclip did not take PRIMARY"
+
+    def own_primary():
+        workstation.succeed(
+            xenv + "sh -c 'printf primary-secret | "
+            "${pkgs.xclip}/bin/xclip -selection primary -i' >/dev/null 2>&1"
+        )
+        workstation.fail(primary_empty)
+
+    # Readiness barrier: the blocker selects its XI2 events a moment after
+    # the unit starts, and nothing else ever empties PRIMARY.
+    own_primary()
+    workstation.wait_until_succeeds(
+        middle_click + " && " + primary_empty, timeout=60
+    )
+
+    # One click, with the blocker known to be listening: it must both empty
+    # PRIMARY and reach the passive listener.
+    own_primary()
     workstation.succeed(
         xenv + "timeout 120 ${xrecordProbe} >/tmp/xrecord.log 2>&1 &"
     )
     workstation.wait_until_succeeds("grep -qx ready /tmp/xrecord.log", timeout=30)
-    # Retried: the blocker selects its XI2 events a moment after the unit
-    # starts, and nothing else ever empties PRIMARY.
-    workstation.wait_until_succeeds(
-        xenv + "${pkgs.xdotool}/bin/xdotool click 2 && "
-        "test -z \"$(" + read_primary + ")\"",
-        timeout=60,
-    )
+    workstation.succeed(middle_click)
+    workstation.wait_until_succeeds(primary_empty, timeout=10)
     workstation.wait_until_succeeds("grep -qx release /tmp/xrecord.log", timeout=30)
     recorded = workstation.succeed("cat /tmp/xrecord.log").split()
     print(f"[diag] xrecord saw: {recorded}")
-    assert recorded[:3] == ["ready", "press", "release"], \
-        f"XRecord did not see the middle press and release: {recorded}"
+    assert recorded == ["ready", "press", "release"], \
+        f"XRecord did not see exactly one middle press and release: {recorded}"
 
     # notification-log (home/notification-log.nix): every Notify call on the
     # session bus is appended to ~/.local/state/notification-log/

@@ -5085,7 +5085,9 @@ in
     listen_on unix:/tmp/kitty.sock
 
     # Middle mouse is held to dictate (Voquill); releasing it must not paste
-    # the primary selection. Shift+middle still pastes it.
+    # the primary selection. Shift+middle has nothing to paste either:
+    # xmousepasteblock (home/cinnamon.nix) empties PRIMARY on every middle
+    # press.
     mouse_map middle release ungrabbed discard_event
 
     # Splits layout enables hsplit/vsplit launch locations
