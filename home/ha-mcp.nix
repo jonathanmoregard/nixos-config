@@ -7,13 +7,9 @@
 # automations, helpers, scenes, backups.
 #
 # Upstream: github.com/homeassistant-ai/ha-mcp (PyPI `ha-mcp`, MIT).
-# Not in nixpkgs, so it runs through uvx, pinned two ways:
-#   - the package itself to an exact version;
-#   - every transitive dependency by `--exclude-newer`, so a dependency
-#     released after the pin date can never be resolved in.
-# That is determinism, not integrity: there are no artifact hashes, so
-# it trusts PyPI over TLS, and a yank can still shift the resolved set.
-# Bump both together, after reading the upstream changelog.
+# Not in nixpkgs; pkgs.ha-mcp-unwrapped (overlays/mcp-servers.nix) builds
+# it from the hash-locked pkgs/mcp-servers/ha-mcp/uv.lock. Bump the pin
+# and its exclude-newer there together, after reading the changelog.
 #
 # Credential: a long-lived access token of a dedicated HA admin user
 # (`claude`), so it can be revoked in HA without touching anyone's
@@ -25,15 +21,12 @@
 # backups go through its `ha_manage_backup` tool; deleting one is off
 # by default and an agent cannot switch that on.
 let
-  version = "8.6.0";
-  excludeNewer = "2026-10-01T00:00:00Z";
   tokenFile = "/run/agenix/home-assistant-mcp-token";
 in
 {
   home.packages = [
     (pkgs.writeShellApplication {
       name = "ha-mcp";
-      runtimeInputs = [ pkgs.uv ];
       text = ''
         if [[ ! -r ${tokenFile} || ! -s ${tokenFile} ]]; then
           echo "ha-mcp: ${tokenFile} is missing or empty; create the agenix secret home-assistant-mcp-token" >&2
@@ -55,11 +48,7 @@ in
         export HA_MCP_DISABLE_UPDATE_CHECK=1 FASTMCP_CHECK_FOR_UPDATES=off
         # HA is upgraded through the smarthome repo, never from HA itself.
         export DISABLED_TOOLS=ha_manage_updates
-        # Use the Nix interpreter; never let uv download a CPython.
-        export UV_PYTHON_DOWNLOADS=never
-        exec uvx --python ${pkgs.python313}/bin/python3.13 \
-          --exclude-newer ${excludeNewer} \
-          ha-mcp==${version} "$@"
+        exec ${pkgs.ha-mcp-unwrapped}/bin/ha-mcp "$@"
       '';
     })
   ];

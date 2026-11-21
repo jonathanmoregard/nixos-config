@@ -261,6 +261,10 @@
           inherit pyproject-nix uv2nix pyproject-build-systems;
           src = aggregator-src;
         })
+        # PyPI-only MCP servers, hash-locked from pkgs/mcp-servers/<name>/uv.lock.
+        (import ./overlays/mcp-servers.nix {
+          inherit pyproject-nix uv2nix pyproject-build-systems;
+        })
         claude-desktop.overlays.default
         (final: prev: {
           voquill = voquill.packages.${linuxSystem}.default;
@@ -749,6 +753,7 @@
       update-beeper = pkgsLinux.beeper-update;
       check-signal-expiry = pkgsLinux.signal-expiry-check;
       add-secret = import ./home/add-secret.nix { pkgs = pkgsLinux; };
+      inherit (pkgsLinux) mcp-server-reddit ha-mcp-unwrapped github-mux;
       # `nix run .#security-static [-- --self-test]` — fast offline security
       # scanners, pinned via flake.lock. CI job `security-static`.
       security-static = pkgsLinux.writeShellApplication {
