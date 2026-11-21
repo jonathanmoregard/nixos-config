@@ -86,7 +86,9 @@ def _current(doc):
 def _merged(doc, servers):
     current = _current(doc)
     merged = _merge(current, servers)
-    return None if merged == current else merged
+    # Compared as JSON text: Python's == holds for true == 1 == 1.0.
+    same = json.dumps(merged, sort_keys=True) == json.dumps(current, sort_keys=True)
+    return None if same else merged
 
 
 class _ConfigLock:

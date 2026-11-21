@@ -91,7 +91,7 @@ in
                 "mcpServers": {"github": github_live, "scratch": SCRATCH}}
     as_jonathan("mkdir -p ~/.claude && touch ~/.claude/.projection-enabled")
     as_jonathan(f"cat > {live} <<'EOF'\n{json.dumps(live_doc, indent=2)}\nEOF")
-    as_jonathan(f"chmod 600 {live}")
+    as_jonathan(f"chmod 640 {live}")
 
     # ── A broker merged upstream goes live on the next tick ──
     publish(json.dumps({"github": GITHUB, "agent_e2e_broker": BROKER}, indent=2), "add broker")
@@ -103,7 +103,7 @@ in
     assert got["mcpServers"]["github"]["env"] == {"GITHUB_TOKEN": "live-only"}, got
     assert got["numStartups"] == 7 and got["projects"] == {"/home/jonathan": {}}, got
     owner = workstation.succeed(f"stat -c '%U:%G %a' {live}").strip()
-    assert owner == "jonathan:users 600", owner
+    assert owner == "jonathan:users 640", owner
     workstation.fail(f"test -e {live}.lock")
     workstation.fail(f"test -e {record}")
 

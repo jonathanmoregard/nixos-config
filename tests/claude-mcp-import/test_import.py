@@ -140,9 +140,22 @@ class Merge(ImportCase):
         self.assertEqual(self.read_live()["mcpServers"], SERVED)
 
     def test_mode_preserved(self):
-        os.chmod(self.live, 0o600)
+        # Not 0600: mkstemp's own mode would pass without the chmod.
+        os.chmod(self.live, 0o640)
         self.import_ok()
-        self.assertEqual(stat.S_IMODE(os.stat(self.live).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self.live).st_mode), 0o640)
+
+    def test_tracked_number_replaces_an_equal_comparing_live_boolean(self):
+        live = copy.deepcopy(LIVE)
+        live["mcpServers"] = copy.deepcopy(SERVED)
+        live["mcpServers"]["github"]["trust"] = True
+        self.write(self.live, render(live))
+        served = copy.deepcopy(SERVED)
+        served["github"]["trust"] = 1
+        self.write(self.served, render(served))
+        proc = self.run_import()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIs(type(self.read_live()["mcpServers"]["github"]["trust"]), int)
 
     def test_lone_surrogate_in_live_file_survives(self):
         # JSON.stringify writes a lone surrogate as an escape; JSON.parse reads it back.

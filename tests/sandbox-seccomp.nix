@@ -231,6 +231,7 @@ in
         assert "write=ok" in log, log
         assert "nix=ok" in log, log
         # The owner's nix in the same repo while the sandbox holds it.
+        workstation.succeed(f"test -f {repo}/.gitmodules && test ! -s {repo}/.gitmodules")
         host_nix(repo)
         finish(name)
         workstation.succeed(f"test ! -e {repo}/.gitmodules")
@@ -242,6 +243,7 @@ in
           "${placeholderSettings shortRepo}")
     workstation.succeed("kill -KILL $(cat /home/jonathan/killed.pid)")
     finish("killed")
+    workstation.succeed("f=${shortRepo}/.gitmodules; test ! -e $f || { test -f $f && test ! -s $f; }")
     host_nix("${shortRepo}")
     log = start("after-kill", "${pkgs.sandbox-runtime}/bin/srt", "${shortRepo}",
                 "${placeholderSettings shortRepo}")
