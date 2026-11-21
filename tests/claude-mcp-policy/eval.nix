@@ -47,7 +47,13 @@ let
     rejectsDotDotArg = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "/nix/store/../home/jonathan/x.py" ]; }; };
     rejectsDotDotCommand = rejects { servers.x.command = "/nix/store/../home/jonathan/x"; };
     rejectsDotDotAfterEquals = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--config=../x" ]; }; };
-    rejectsUntrustedExtra = rejects { extraAllowedCommands = [ [ "/tmp/x" ] ]; };
+    rejectsRelativeScriptPath = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "mcps/x/server.py" ]; }; };
+    rejectsBareScriptName = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "x.py" ]; }; };
+    rejectsBareScriptAfterEquals = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--script=x.sh" ]; }; };
+    rejectsAttachedFlagPath = rejects { servers.x = { command = "/run/current-system/sw/bin/python3"; args = [ "-I/home/jonathan/x" ]; }; };
+    rejectsDotDotValue = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--dir=.." ]; }; };
+    allowsTrustedAfterEquals = !(rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "--config=/nix/store/0-c/config.json" "stdio" ]; }; });
+    rejectsUntrustedExtra =rejects { extraAllowedCommands = [ [ "/tmp/x" ] ]; };
     rejectsVarExpansion = rejects { servers.x = { command = "/nix/store/0-x/bin/x"; args = [ "\${HOME}" ]; }; };
     rejectsPlainHttp = rejects { servers.x = { type = "http"; url = "http://example.invalid"; }; };
   };

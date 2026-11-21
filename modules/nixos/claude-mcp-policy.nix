@@ -17,15 +17,18 @@ let
     "/run/current-system/sw/bin/"
     "/var/lib/claude-runtime/checkout/"
   ];
-  looksLikePath = s: lib.hasPrefix "/" s || lib.hasPrefix "~" s || lib.hasPrefix "." s;
+  # A bare script name has no "/" but still runs from the session's cwd.
+  scriptExtensions = [ ".py" ".sh" ".js" ".mjs" ".cjs" ".ts" ".rb" ".pl" ];
+  looksLikePath = s: lib.hasInfix "/" s || lib.hasPrefix "~" s || lib.hasPrefix "." s
+    || lib.any (x: lib.hasSuffix x s) scriptExtensions;
   trusted = s: lib.any (p: lib.hasPrefix p s) trustedPrefixes && !hasDotDot s;
   hasDotDot = s: lib.elem ".." (lib.splitString "/" s);
-  # A flag such as --config=/home/x carries its path after the first "=".
+  badValue = s: hasDotDot s || (looksLikePath s && !trusted s);
+  # A flag such as --config=/nix/store/x carries its path after the first "=".
+  flagKey = s: builtins.head (lib.splitString "=" s);
   afterEquals = s: lib.concatStringsSep "=" (lib.drop 1 (lib.splitString "=" s));
   badElement = e:
-    (looksLikePath e && !trusted e)
-    || hasDotDot e
-    || (lib.hasInfix "=" e && (let v = afterEquals e; in (looksLikePath v && !trusted v) || hasDotDot v));
+    if lib.hasInfix "=" e && !looksLikePath (flagKey e) then badValue (afterEquals e) else badValue e;
 
   stdio = lib.filterAttrs (_: s: s.type == "stdio") cfg.servers;
   remote = lib.filterAttrs (_: s: s.type != "stdio") cfg.servers;

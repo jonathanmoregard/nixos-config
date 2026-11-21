@@ -816,12 +816,11 @@ in
     # installer's idempotency check recognises it as already present.
     30 17 * * * $HOME/.claude/permission-ledger/run-evaluate.sh >> $HOME/.claude/logs/permission-ledger.log 2>&1 # permission-ledger-evaluate
     # Keep the research-agent working copy current. That checkout IS
-    # production twice over: research-agent-mcp runs it directly
-    # (`uv run --project ~/Repos/research-agent`), and the research
-    # microvm bind-mounts the same directory read-only at /workspace, so
-    # the jailed agent reads run-agent.sh, the shims and its CLAUDE.md
-    # fresh from it on every call. An unpulled merge therefore ships
-    # stale code to every newly spawned server and every research call.
+    # production: research-agent-mcp itself runs a Nix-packaged copy, but
+    # the research microvm bind-mounts this directory read-only at
+    # /workspace, so the jailed agent reads run-agent.sh, the shims and its
+    # CLAUDE.md fresh from it on every call. An unpulled merge therefore
+    # ships stale code to every research call.
     # 2026-07-29..31: a merged model-fallback fix (PR #19) sat unpulled
     # for three days while every research call failed 429 — MCP
     # processes churned constantly, the checkout never moved, and two

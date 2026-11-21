@@ -34,9 +34,8 @@
 # server's `_ssh_settings()` reads it lazily at call time so we just
 # export it here.
 #
-# Wrapper name `research-agent-mcp` matches the ~/.claude.json command
-# string so the config doesn't need to change. The wrapped binary lives
-# inside the project venv at a different absolute path, so no PATH loop.
+# ~/.claude.json and the managed MCP policy name this wrapper by its store
+# path (modules/nixos/claude-mcp-servers.nix), not by a PATH lookup.
 let
   # Lakera Guard tuned-policy pointer, single-sourced in home/lakera.nix.
   lakera = import ../home/lakera.nix;

@@ -121,5 +121,15 @@ in
     assert tick() == "success"
     workstation.fail(f"test -e {record}")
     assert read_live()["mcpServers"]["jobs_broker"] == repaired
+
+    # ── A record write that fails (jq killed by SIGXFSZ) leaves no temp file ──
+    notify = workstation.succeed(
+        "systemctl show -P ExecStart claude-mcp-import-failure-notify.service "
+        "| grep -o 'path=[^ ]*' | cut -d= -f2").strip()
+    workstation.fail(f"bash -c 'ulimit -f 0; exec {notify}'")
+    left = workstation.succeed(
+        "find /var/lib/unit-failures -name '.claude-mcp-import.*'").strip()
+    assert left == "", left
+    workstation.fail(f"test -e {record}")
   '';
 }

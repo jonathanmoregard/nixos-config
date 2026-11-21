@@ -36,6 +36,7 @@ let
       mkdir -p -- ${failuresDir}
       chmod 0755 -- ${failuresDir}
       tmp=$(mktemp ${failuresDir}/.claude-mcp-import.XXXXXX)
+      trap 'rm -f -- "$tmp"' EXIT
       jq -n \
         --arg unit claude-mcp-import.service \
         --arg result "$result" \
