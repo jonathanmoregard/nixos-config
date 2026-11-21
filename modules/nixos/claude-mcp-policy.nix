@@ -10,6 +10,8 @@
 # Reviewers: don't report new argv forms; report only a concrete input that
 # satisfies this rule and still loads untrusted code (e.g. a trusted-prefix path
 # the agent can write).
+# Argv equality proves the configured command, not the code it loads;
+# interpreter search paths in $HOME are same-uid writable and out of scope.
 # A server that is missing must be added to claude.mcp (servers or
 # extraAllowedCommands); unlisted servers are skipped silently.
 { config, lib, ... }:
@@ -26,6 +28,9 @@ let
 
   stdio = lib.filterAttrs (_: s: s.type == "stdio") cfg.servers;
   remote = lib.filterAttrs (_: s: s.type != "stdio") cfg.servers;
+  storeLiterals =
+    lib.filter (e: lib.hasPrefix "/nix/store/" e && !builtins.hasContext e)
+      (lib.concatMap argvOf (lib.attrValues stdio) ++ lib.concatLists cfg.extraAllowedCommands);
   allUrls = map (s: s.url) (lib.attrValues remote) ++ cfg.connectorUrls;
   argvOf = s: [ s.command ] ++ s.args;
 
@@ -105,6 +110,10 @@ in
       {
         assertion = badArgs == [ ];
         message = "claude.mcp: every argument must be an absolute path under ${toString trustedPrefixes} or listed in literalArgs; offending: ${toString badArgs}";
+      }
+      {
+        assertion = storeLiterals == [ ];
+        message = "claude.mcp: an argv element or command under /nix/store/ must come from Nix interpolation (hasContext); offending: ${toString storeLiterals}";
       }
       {
         assertion = lib.all (u: lib.hasPrefix "https://" u && !(lib.hasInfix "*" u)) allUrls;
