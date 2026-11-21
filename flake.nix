@@ -169,6 +169,17 @@
       flake = false;
     };
 
+    # Source-only MCP servers built by overlays/source-mcp-servers.nix. Same
+    # bump rule as aggregator-src: edit the rev, then `nix flake lock`.
+    research-agent-src = {
+      url = "github:jonathanmoregard/research-agent/2cdb1889a19a3c652e1cf10d7e1894b91d6ee118";
+      flake = false;
+    };
+    gdocs-review-mcp-src = {
+      url = "github:jonathanmoregard/google_workspace_mcp/2d6136bef5c4fe693f8469cf9839b6892f1d8d38";
+      flake = false;
+    };
+
     pyproject-nix.url = "github:pyproject-nix/pyproject.nix";
     pyproject-nix.inputs.nixpkgs.follows = "nixpkgs";
     uv2nix.url = "github:pyproject-nix/uv2nix";
@@ -193,6 +204,7 @@
               tts-tool, substack-url-tool, prose-decorate, claude-desktop, voquill,
               codex-cli-nix,
               aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
+              research-agent-src, gdocs-review-mcp-src,
               ... }:
   let
     linuxSystem = "x86_64-linux";
@@ -261,6 +273,7 @@
           inherit pyproject-nix uv2nix pyproject-build-systems;
           src = aggregator-src;
         })
+        (import ./overlays/source-mcp-servers.nix { inherit pyproject-nix uv2nix pyproject-build-systems research-agent-src gdocs-review-mcp-src; })
         claude-desktop.overlays.default
         (final: prev: {
           voquill = voquill.packages.${linuxSystem}.default;
