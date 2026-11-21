@@ -109,6 +109,7 @@ let
     export XDG_CACHE_HOME=${probeCache}
     printf 'read=%s\n' "$(wc -c < .gitmodules)"
     if ( : > .gitmodules ) 2>/dev/null; then echo create=allowed; else echo create=blocked; fi
+    if ( echo x > srt-probe-write ) 2>/dev/null && rm srt-probe-write; then echo write=ok; else echo write=failed; fi
     if out=$(nix flake metadata --no-write-lock-file . 2>&1); then echo nix=ok; else echo "nix=failed $out"; fi
     echo READY
     while [ ! -e "$1" ]; do sleep 0.2; done
@@ -227,6 +228,7 @@ in
         log = start(name, "${pkgs.sandbox-runtime}/bin/srt", repo, settings)
         assert "read=0" in log, log
         assert "create=blocked" in log, log
+        assert "write=ok" in log, log
         assert "nix=ok" in log, log
         # The owner's nix in the same repo while the sandbox holds it.
         host_nix(repo)
@@ -243,7 +245,7 @@ in
     host_nix("${shortRepo}")
     log = start("after-kill", "${pkgs.sandbox-runtime}/bin/srt", "${shortRepo}",
                 "${placeholderSettings shortRepo}")
-    assert "read=0" in log and "create=blocked" in log and "nix=ok" in log, log
+    assert "read=0" in log and "create=blocked" in log and "write=ok" in log and "nix=ok" in log, log
     host_nix("${shortRepo}")
     finish("after-kill")
   '';

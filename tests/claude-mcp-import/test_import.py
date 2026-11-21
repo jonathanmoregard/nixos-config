@@ -149,8 +149,7 @@ class Merge(ImportCase):
         live = copy.deepcopy(LIVE)
         live["projects"]["/home/jonathan"]["lastPrompt"] = "cut emoji \ud83d"
         self.write(self.live, render(live))
-        proc = self.run_import()
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.import_ok()
         self.raw(self.live).decode("utf-8")
         self.assertEqual(self.read_live()["projects"], live["projects"])
 
@@ -214,8 +213,7 @@ class Refusals(ImportCase):
 
 class Locking(ImportCase):
     def test_lock_released_after_write(self):
-        proc = self.run_import()
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.import_ok()
         self.assertFalse(os.path.exists(self.lock))
 
     def test_lock_held_past_timeout_refuses(self):
@@ -230,7 +228,8 @@ class Locking(ImportCase):
 
         def holder():
             time.sleep(1)
-            self.write(self.live, render(concurrent))
+            self.write(self.live + ".tmp", render(concurrent))
+            os.replace(self.live + ".tmp", self.live)
             os.rmdir(self.lock)
 
         t = threading.Thread(target=holder)

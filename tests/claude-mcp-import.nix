@@ -119,9 +119,11 @@ in
     assert "is not valid JSON" in log, log
 
     # ── Repaired upstream: the next tick succeeds and clears the record ──
-    publish(json.dumps({"github": GITHUB, "agent_e2e_broker": BROKER}, indent=2), "repair")
+    repaired = {"type": "stdio", "command": "jobs-broker", "args": [], "env": {}}
+    publish(json.dumps({"github": GITHUB, "agent_e2e_broker": BROKER,
+                        "jobs_broker": repaired}, indent=2), "repair")
     assert tick() == "success"
     workstation.fail(f"test -e {record}")
-    assert read_live()["mcpServers"]["agent_e2e_broker"] == BROKER
+    assert read_live()["mcpServers"]["jobs_broker"] == repaired
   '';
 }
