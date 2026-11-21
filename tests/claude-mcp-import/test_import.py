@@ -73,6 +73,14 @@ class ImportCase(unittest.TestCase):
             capture_output=True, text=True, timeout=60,
         )
 
+    def import_ok(self):
+        before = os.stat(self.live).st_ino
+        proc = self.run_import()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotEqual(os.stat(self.live).st_ino, before)
+        self.assertEqual(self.read_live()["mcpServers"]["agent_e2e_broker"], BROKER)
+        return proc
+
     def assert_unchanged_after(self, code, *extra):
         before = self.raw(self.live)
         proc = self.run_import(*extra)
@@ -88,14 +96,14 @@ class Merge(ImportCase):
         self.assertEqual(self.read_live()["mcpServers"]["agent_e2e_broker"], BROKER)
 
     def test_live_only_server_survives(self):
-        self.run_import()
+        self.import_ok()
         self.assertEqual(self.read_live()["mcpServers"]["scratch"], HAND_ADDED)
 
     def test_live_env_key_absent_from_tracked_survives(self):
         live = copy.deepcopy(LIVE)
         live["mcpServers"]["github"]["env"] = {"GITHUB_TOKEN": "live-secret"}
         self.write(self.live, render(live))
-        self.run_import()
+        self.import_ok()
         self.assertEqual(self.read_live()["mcpServers"]["github"]["env"],
                          {"GITHUB_TOKEN": "live-secret"})
 
@@ -103,7 +111,7 @@ class Merge(ImportCase):
         served = copy.deepcopy(SERVED)
         del served["research-agent"]["env"]
         self.write(self.served, render(served))
-        self.run_import()
+        self.import_ok()
         self.assertEqual(self.read_live()["mcpServers"]["research-agent"]["env"],
                          RESEARCH["env"])
 
@@ -112,13 +120,13 @@ class Merge(ImportCase):
         served["github"]["args"] = ["stdio", "--read-only"]
         served["research-agent"]["env"]["RESEARCH_AGENT_TIMEOUT"] = "1200"
         self.write(self.served, render(served))
-        self.run_import()
+        self.import_ok()
         servers = self.read_live()["mcpServers"]
         self.assertEqual(servers["github"]["args"], ["stdio", "--read-only"])
         self.assertEqual(servers["research-agent"]["env"]["RESEARCH_AGENT_TIMEOUT"], "1200")
 
     def test_rest_of_live_file_untouched(self):
-        self.run_import()
+        self.import_ok()
         got = self.read_live()
         for key in ("numStartups", "oauthAccount", "projects"):
             self.assertEqual(got[key], LIVE[key])
@@ -128,12 +136,12 @@ class Merge(ImportCase):
         live = copy.deepcopy(LIVE)
         del live["mcpServers"]
         self.write(self.live, render(live))
-        self.run_import()
+        self.import_ok()
         self.assertEqual(self.read_live()["mcpServers"], SERVED)
 
     def test_mode_preserved(self):
         os.chmod(self.live, 0o600)
-        self.run_import()
+        self.import_ok()
         self.assertEqual(stat.S_IMODE(os.stat(self.live).st_mode), 0o600)
 
     def test_lone_surrogate_in_live_file_survives(self):
@@ -147,7 +155,7 @@ class Merge(ImportCase):
         self.assertEqual(self.read_live()["projects"], live["projects"])
 
     def test_second_run_is_a_no_op(self):
-        self.run_import()
+        self.import_ok()
         ino = os.stat(self.live).st_ino
         proc = self.assert_unchanged_after(0)
         self.assertEqual(os.stat(self.live).st_ino, ino)
@@ -195,6 +203,12 @@ class Refusals(ImportCase):
 
     def test_live_unparseable(self):
         self.write(self.live, "{ half-written")
+        self.assert_unchanged_after(75)
+
+    def test_live_mcp_servers_not_an_object(self):
+        live = copy.deepcopy(LIVE)
+        live["mcpServers"] = [1]
+        self.write(self.live, render(live))
         self.assert_unchanged_after(75)
 
 

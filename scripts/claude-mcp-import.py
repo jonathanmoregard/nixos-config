@@ -77,8 +77,10 @@ def _merge(live, tracked):
 
 
 def _current(doc):
-    current = doc.get("mcpServers")
-    return current if isinstance(current, dict) else {}
+    current = doc.get("mcpServers", {})
+    if not isinstance(current, dict):
+        raise Unusable("live mcpServers is not a JSON object")
+    return current
 
 
 def _merged(doc, servers):
