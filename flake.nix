@@ -179,6 +179,12 @@
       url = "github:jonathanmoregard/google_workspace_mcp/2d6136bef5c4fe693f8469cf9839b6892f1d8d38";
       flake = false;
     };
+    # github-mux's server.py and its PEP 723 lock. The served checkout keeps
+    # deploying the rest of claude-config; this rev only decides github-mux.
+    claude-config-src = {
+      url = "github:jonathanmoregard/claude-config/df5692f750c4c1b1e4c44bf64800e02379bb3179";
+      flake = false;
+    };
 
     pyproject-nix.url = "github:pyproject-nix/pyproject.nix";
     pyproject-nix.inputs.nixpkgs.follows = "nixpkgs";
@@ -204,7 +210,7 @@
               tts-tool, substack-url-tool, prose-decorate, claude-desktop, voquill,
               codex-cli-nix,
               aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
-              research-agent-src, gdocs-review-mcp-src,
+              research-agent-src, gdocs-review-mcp-src, claude-config-src,
               ... }:
   let
     linuxSystem = "x86_64-linux";
@@ -278,7 +284,8 @@
           inherit pyproject-nix uv2nix pyproject-build-systems;
         })
         (import ./overlays/source-mcp-servers.nix {
-          inherit pyproject-nix uv2nix pyproject-build-systems research-agent-src gdocs-review-mcp-src;
+          inherit pyproject-nix uv2nix pyproject-build-systems research-agent-src gdocs-review-mcp-src
+            claude-config-src;
         })
         claude-desktop.overlays.default
         (final: prev: {

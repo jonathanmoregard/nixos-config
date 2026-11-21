@@ -2,7 +2,8 @@
 # built from pinned source inputs with uv2nix from each repo's own uv.lock.
 # Rationale (uv2nix, wheels, bump procedure): overlays/aggregator.nix.
 # Interpreters follow each repo's .python-version, which is what uv ran.
-{ pyproject-nix, uv2nix, pyproject-build-systems, research-agent-src, gdocs-review-mcp-src }:
+{ pyproject-nix, uv2nix, pyproject-build-systems, research-agent-src, gdocs-review-mcp-src
+, claude-config-src }:
 final: prev:
 let
   inherit (prev) lib;
@@ -38,6 +39,21 @@ let
     src = gdocs-review-mcp-src;
     python = prev.python311;
   };
+
+  githubMuxDir = "${claude-config-src}/runtime/mcps/github-mux";
+  # uv2nix only names a script it gets as a path value; a flake input is a
+  # store-path string, readable in pure eval because it is a locked input.
+  githubMuxScript = uv2nix.lib.scripts.loadScript {
+    script = /. + builtins.unsafeDiscardStringContext "${githubMuxDir}/server.py";
+  };
+  githubMuxVenv = githubMuxScript.mkVirtualEnv {
+    pythonSet =
+      (prev.callPackage pyproject-nix.build.packages { python = prev.python313; })
+        .overrideScope (lib.composeManyExtensions [
+          pyproject-build-systems.overlays.default
+          (githubMuxScript.mkOverlay { sourcePreference = "wheel"; })
+        ]);
+  };
 in
 {
   research-agent-mcp = final.callPackage ./research-agent-mcp.nix { venv = researchAgentVenv; };
@@ -71,4 +87,16 @@ in
     derivationArgs.passthru.venv = gdocsVenv;
     meta.mainProgram = "gdocs-review-mcp";
   };
+
+  # config.json comes from the same rev: it names the child binary and the
+  # excluded tools, and its schema is server.py's.
+  github-mux =
+    prev.runCommand "github-mux"
+      {
+        nativeBuildInputs = [ prev.makeWrapper ];
+        passthru.venv = githubMuxVenv;
+      } ''
+      makeWrapper ${githubMuxVenv}/bin/python $out/bin/github-mux \
+        --add-flags "${githubMuxDir}/server.py --config ${githubMuxDir}/config.json"
+    '';
 }

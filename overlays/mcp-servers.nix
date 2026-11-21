@@ -29,17 +29,4 @@ in
 
   ha-mcp-unwrapped = linkBin "ha-mcp" "8.6.0" (mkEnv "ha-mcp") "ha-mcp";
   ha-mcp = final.callPackage ./ha-mcp.nix { };
-
-  # Only the dependencies are pinned here. server.py itself stays in
-  # claude-config, whose review and deploy path owns the served checkout.
-  github-mux =
-    let venv = mkEnv "github-mux"; in
-    prev.runCommand "github-mux"
-      {
-        nativeBuildInputs = [ prev.makeWrapper ];
-        passthru = { inherit venv; };
-      } ''
-      makeWrapper ${venv}/bin/python $out/bin/github-mux \
-        --add-flags /var/lib/claude-runtime/checkout/runtime/mcps/github-mux/server.py
-    '';
 }

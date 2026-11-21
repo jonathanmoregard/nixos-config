@@ -64,6 +64,23 @@
         "type": "github"
       }
     },
+    "claude-config-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1795170343,
+        "narHash": "sha256-+YkiygwIfht5SnwyIIRZ2S4pCGh+tRGJcQIjfYnXtsM=",
+        "owner": "jonathanmoregard",
+        "repo": "claude-config",
+        "rev": "df5692f750c4c1b1e4c44bf64800e02379bb3179",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jonathanmoregard",
+        "repo": "claude-config",
+        "rev": "df5692f750c4c1b1e4c44bf64800e02379bb3179",
+        "type": "github"
+      }
+    },
     "claude-desktop": {
       "inputs": {
         "flake-parts": "flake-parts_2",
@@ -632,6 +649,7 @@
         "agenix": "agenix",
         "agenix-rekey": "agenix-rekey",
         "aggregator-src": "aggregator-src",
+        "claude-config-src": "claude-config-src",
         "claude-desktop": "claude-desktop",
         "codex-cli-nix": "codex-cli-nix",
         "gdocs-review-mcp-src": "gdocs-review-mcp-src",

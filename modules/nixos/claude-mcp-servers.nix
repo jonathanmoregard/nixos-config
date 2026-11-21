@@ -27,7 +27,6 @@ in
       aggregator.command = "${pkgs.aggregator}/bin/aggregator-mcp";
       github = {
         command = "${pkgs.github-mux}/bin/github-mux";
-        args = [ "--config" "${runtime}/mcps/github-mux/config.json" ];
         timeout = 600000;
       };
       reddit.command = "${pkgs.mcp-server-reddit}/bin/mcp-server-reddit";
