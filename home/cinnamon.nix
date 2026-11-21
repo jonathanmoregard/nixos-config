@@ -94,7 +94,7 @@ in
   '';
 
   # Voquill autostart intentionally NOT declared here: it is launched by
-  # systemd.user.services.voquill (home/router-services.nix), which execs
+  # systemd.user.services.voquill (home/voquill.nix), which execs
   # `pkgs.voquill` directly. A previous cinnamon autostart entry here pointed at
   # a stale locally-built binary and raced with the systemd unit on every login
   # (proposals/2026-05-05-voquill-autostart-race.md).

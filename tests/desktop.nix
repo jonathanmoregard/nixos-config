@@ -23,7 +23,7 @@
 #
 # Uses mkFeatureTest with home/_test-desktop.nix — HM closure is
 # jonathan.nix + cinnamon.nix + desktop-apps.nix (no kitty / claude
-# /autodoro / router-services / etc). extraModules pull in the system
+# /autodoro / voquill / etc). extraModules pull in the system
 # Cinnamon module + lightdm + autoLogin so dconf is populated when the
 # Cinnamon session comes up, plus jq for the testScript's grep paths.
 #
@@ -275,7 +275,7 @@ in
     workstation.wait_for_unit("default.target", "jonathan")
 
     # Voquill must NOT have a cinnamon autostart entry — it is launched by
-    # systemd.user.services.voquill (home/router-services.nix); a duplicate
+    # systemd.user.services.voquill (home/voquill.nix); a duplicate
     # autostart entry raced with the systemd unit on every login
     # (proposals/2026-05-05-voquill-autostart-race.md).
     workstation.succeed(

@@ -14,7 +14,7 @@
 # which is the F2 case a wrapper package would have lost.
 #
 # Everything else jonathan-linux.nix pulls in (cinnamon, desktop-apps,
-# autodoro, router-services, the MCP wrappers, the crontab) is excluded,
+# autodoro, voquill, the MCP wrappers, the crontab) is excluded,
 # so this lane's drvPath is invariant to edits in those files.
 { ... }:
 {

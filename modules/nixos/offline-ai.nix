@@ -181,8 +181,6 @@ let
   ];
   evictUser = [
     "aggregator-ingest.timer"
-    "router-ingestor-scan.timer"
-    "router-ingestor.service"
     "voquill.service"
     # local-stt.nix: the router first, then the three models behind it (~3 GB).
     "local-stt.service"
@@ -190,14 +188,11 @@ let
     "local-stt-general-short.service"
     "local-stt-swedish.service"
   ];
-  # The services above (not the timers: their services carry the condition)
-  # plus the scan the router timer fires. All home-manager units, so the
-  # condition goes in as a drop-in beside each unit file; a drop-in appends
-  # to any ConditionPathExists= the unit already has.
+  # The services above (not the timers: their services carry the condition).
+  # All home-manager units, so the condition goes in as a drop-in beside each
+  # unit file; a drop-in appends to any ConditionPathExists= the unit already has.
   gatedUserServices = [
     "aggregator-ingest.service"
-    "router-ingestor.service"
-    "router-ingestor-scan.service"
     "voquill.service"
     "local-stt.service"
     "local-stt-general.service"

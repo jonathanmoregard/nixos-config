@@ -7,7 +7,7 @@
 # the cinnamon-rescue watchdog (home/cinnamon-watchdog.nix) and the
 # notification-log capture unit + CLI (home/notification-log.nix).
 #
-# Excludes kitty, ghostty, autodoro, drift-analyzer, router-services,
+# Excludes kitty, ghostty, autodoro, drift-analyzer, voquill,
 # claude-services, research-agent-mcp.
 { ... }:
 {

@@ -688,7 +688,7 @@ in
     ./session-reflect-backfill.nix
     ./worktree-sweep.nix
     ./cargo-target-sweep.nix
-    ./router-services.nix
+    ./voquill.nix
     ./claude-services.nix
     ./ai-client-config-sync.nix
     ./research-agent-mcp.nix
@@ -858,29 +858,6 @@ in
     fi
   '';
 
-  # router-agent expects ~/.config/router/paths.yaml. Project is cloned
-  # by cloneRepos activation but its config dir lives outside the repo.
-  # Content migrated 1:1 from the prior Mint install (mint-backup-2026-05-05).
-  # Contains no secrets — just Dropbox roots and local-state directory
-  # paths.
-  home.file.".config/router/paths.yaml".text = ''
-    version: 1
-
-    # Dropbox roots — sync target for ingestion and exocortex artifacts.
-    # Change ~/Dropbox to wherever your Dropbox folder lives.
-    dropbox_root: ~/Dropbox
-    inlet_transcripts: ''${dropbox_root}/1. Exocortex/_Inlet/Android/Transcripts
-    exocortex_root: ''${dropbox_root}/1. Exocortex
-
-    # Local-disk roots (per-machine, never in Dropbox).
-    state_root: ~/.local/state/router
-    inbox_root: ''${state_root}/inbox
-    processed_root: ''${state_root}/processed
-    queue_root: ''${state_root}/queue
-    audit_root: ''${state_root}/audit
-    ingestor_ledger: ''${state_root}/ingestor-ledger.db
-  '';
-
   # Clone user repos into ~/Repos on first activation.
   #
   # Strategy: try SSH first (works for both public + private once the host's
@@ -921,14 +898,6 @@ in
         || true
       fi
     }
-
-    # router-agent lives outside ~/Repos because router-services.nix
-    # configures the systemd units' WorkingDirectory to
-    # %h/.local/share/router-agent (uv-managed venv lands alongside).
-    # uv will bootstrap the venv on first `uv run`; if resolution fails
-    # the unit goes into Restart=on-failure (journal-visible, not
-    # silent).
-    clone_if_missing router-agent "$HOME/.local/share/router-agent"
 
     clone_if_missing autodoro "$HOME/Repos/autodoro"
     clone_if_missing intender "$HOME/Repos/intender"
