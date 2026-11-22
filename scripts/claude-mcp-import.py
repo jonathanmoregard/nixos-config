@@ -108,16 +108,15 @@ class _ConfigLock:
 TEMP_PREFIX = ".claude.json.mcp-import."
 
 
-def _remove_leftovers(directory):
+def _leftovers(path):
     # A killed run leaves its temp file, a full copy of ~/.claude.json.
-    for name in os.listdir(directory):
-        if name.startswith(TEMP_PREFIX):
-            os.unlink(os.path.join(directory, name))
+    directory = os.path.dirname(path) or "."
+    return [os.path.join(directory, n) for n in os.listdir(directory)
+            if n.startswith(TEMP_PREFIX)]
 
 
 def _replace(path, doc, mode):
     directory = os.path.dirname(path) or "."
-    _remove_leftovers(directory)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=TEMP_PREFIX)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -145,11 +144,13 @@ def _import(args):
     if raw is None:
         print(f"claude-mcp-import: no {args.live} yet; nothing to do")
         return 0
-    if not _changed(_parse_object(raw, args.live), servers):
+    if not _changed(_parse_object(raw, args.live), servers) and not _leftovers(args.live):
         print("claude-mcp-import: nothing to change")
         return 0
 
     with _ConfigLock(args.live, args.lock_timeout):
+        for leftover in _leftovers(args.live):
+            os.unlink(leftover)
         raw = _read(args.live)
         if raw is None:
             raise Unusable(f"{args.live} vanished under the lock")

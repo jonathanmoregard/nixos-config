@@ -205,6 +205,19 @@ class Authoritative(ImportCase):
         self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
         self.assertIn("nothing to change", proc.stdout)
 
+    def test_leftover_removed_when_list_already_matches(self):
+        live = copy.deepcopy(LIVE)
+        live["mcpServers"] = copy.deepcopy(SERVED)
+        self.write(self.live, render(live))
+        leftover = os.path.join(self.dir, ".claude.json.mcp-import.abc123")
+        self.write(leftover, "stale")
+        ino = os.stat(self.live).st_ino
+        proc = self.assert_unchanged_after(0)
+        self.assertFalse(os.path.exists(leftover))
+        self.assertEqual(os.stat(self.live).st_ino, ino)
+        self.assertFalse(os.path.exists(self.lock))
+        self.assertIn("nothing to change", proc.stdout)
+
 
 class NothingToDo(ImportCase):
     def test_no_marker(self):
