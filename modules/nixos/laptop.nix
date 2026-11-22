@@ -47,6 +47,31 @@
     alsa.enable = true;
     alsa.support32Bit = true;
     pulse.enable = true;
+    # "Echo-cancelled mic": the default mic minus what the speakers play
+    # (WebRTC AEC), so a recorder such as Meetily does not capture a call's
+    # far side twice when it plays on speakers. monitor.mode takes the echo
+    # reference from the default sink's monitor, so playback needs no routing
+    # through a virtual sink. Passive capture: the real mic only opens while
+    # something records from this source. Not made the default source.
+    extraConfig.pipewire."60-echo-cancel" = {
+      "context.modules" = [
+        {
+          name = "libpipewire-module-echo-cancel";
+          args = {
+            "library.name" = "aec/libspa-aec-webrtc";
+            "monitor.mode" = true;
+            "capture.props" = {
+              "node.name" = "echo-cancel-capture";
+              "node.passive" = true;
+            };
+            "source.props" = {
+              "node.name" = "echo-cancel-source";
+              "node.description" = "Echo-cancelled mic";
+            };
+          };
+        }
+      ];
+    };
   };
   security.rtkit.enable = true;
 
