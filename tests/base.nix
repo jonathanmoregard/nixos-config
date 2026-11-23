@@ -4235,9 +4235,11 @@ in
         "systemctl --user start aggregator-ingest.timer'"
     )
 
-    # ai-client-config-codex-sync — pull the latest migration code before
-    # rendering Claude config into Codex. Exercise the real systemd unit
-    # against a local Git adapter: no network, no test-only service path.
+    # ai-client-config-codex-sync — pull the latest renderer from
+    # claude-config before rendering Claude config into Codex. Exercise the
+    # real systemd unit against a local Git adapter shaped like claude-config
+    # (default branch master, renderer under codex/scripts/): no network, no
+    # test-only service path.
     fixture = "/home/jonathan/.local/state/ai-client-config-sync/fixture"
     output = "/home/jonathan/.codex/claude-setup-mirror/test-output"
     network_output = "/home/jonathan/.codex/claude-setup-mirror/network-output"
@@ -4247,7 +4249,7 @@ in
     claude_state_output = "/home/jonathan/.codex/claude-setup-mirror/claude-state-output"
     failure = "/home/jonathan/.local/state/ai-client-config-sync/last-failure"
     workstation.succeed(
-        f"install -d -o jonathan -g users {fixture} {fixture}/scripts && "
+        f"install -d -o jonathan -g users {fixture} {fixture}/codex/scripts && "
         "install -d -o jonathan -g users /home/jonathan/.codex/claude-setup-mirror && "
         "install -d -o jonathan -g users /home/jonathan/.codex/sessions && "
         "install -d -o jonathan -g users /home/jonathan/.codex/skills/.system/builtin && "
@@ -4318,16 +4320,16 @@ in
         "printf '# local rules\\n' > /home/jonathan/.codex/rules/default.rules && "
         "printf '{}\\n' > /home/jonathan/.agents/plugins/marketplace.json && "
         "chown -R jonathan:users /home/jonathan/.codex /home/jonathan/.agents/plugins && "
-        f"su - jonathan -c 'git init -b main {fixture} && "
+        f"su - jonathan -c 'git init -b master {fixture} && "
         f"git -C {fixture} config user.name vm-test && "
         f"git -C {fixture} config user.email vm-test@example.invalid'"
     )
 
     def commit_renderer(version, body):
         workstation.succeed(
-            f"printf '%s\\n' {body} > {fixture}/scripts/sync_codex.py && "
-            f"chown jonathan:users {fixture}/scripts/sync_codex.py && "
-            f"su - jonathan -c 'git -C {fixture} add scripts/sync_codex.py && "
+            f"printf '%s\\n' {body} > {fixture}/codex/scripts/sync_codex.py && "
+            f"chown jonathan:users {fixture}/codex/scripts/sync_codex.py && "
+            f"su - jonathan -c 'git -C {fixture} add codex/scripts/sync_codex.py && "
             f"git -C {fixture} commit -m {version}'"
         )
 
@@ -4381,7 +4383,6 @@ in
         user_systemctl
         + " set-environment "
         + f"AI_CLIENT_CONFIG_REMOTE=file://{fixture} "
-        + "AI_CLIENT_CONFIG_REF=main "
         + "AI_CLIENT_CONFIG_ALLOW_FILE_REMOTE=1 "
         + "AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS=10 "
         + f"AI_CLIENT_CONFIG_NETWORK_OUTPUT={network_output} "
@@ -4444,6 +4445,16 @@ in
             workstation.succeed(f"stat -c %i {output_root}").strip(),
             workstation.succeed(f"stat -c %i {pin}").strip(),
         )
+    # Mirror semantics: hand-made content where the mirror renders a file is
+    # blasted. A non-empty directory at ~/.codex/AGENTS.md must not make every
+    # hourly publish fail with rsync "cannot delete non-empty directory".
+    workstation.succeed(
+        "rm -f /home/jonathan/.codex/AGENTS.md && "
+        "install -d -o jonathan -g users /home/jonathan/.codex/AGENTS.md/hand-made && "
+        "printf 'blocker\\n' > /home/jonathan/.codex/AGENTS.md/hand-made/file && "
+        # install -d leaves the intermediate AGENTS.md directory root-owned.
+        "chown -R jonathan:users /home/jonathan/.codex/AGENTS.md"
+    )
     workstation.succeed(
         "install -d -o jonathan -g users /home/jonathan/.codex/skills/skills/skills/obsolete && "
         "printf 'nested cruft\\n' > /home/jonathan/.codex/skills/skills/skills/obsolete/SKILL.md && "
@@ -4518,6 +4529,8 @@ in
     assert workstation.succeed(f"cat {bus_output}").strip() == "hidden"
     assert workstation.succeed(f"cat {proc_output}").strip() == "hidden"
     workstation.fail("test -e /home/jonathan/.codex/unmanaged-proof")
+    workstation.succeed("test -f /home/jonathan/.codex/AGENTS.md")
+    assert workstation.succeed("cat /home/jonathan/.codex/AGENTS.md").strip() == "stable"
     expected_commit = workstation.succeed(
         f"su - jonathan -c 'git -C {fixture} rev-parse --verify HEAD'"
     ).strip()
@@ -4525,7 +4538,7 @@ in
         "cat /home/jonathan/.local/state/ai-client-config-sync/last-success"
     )
     assert f"commit={expected_commit}" in success_text, success_text
-    assert "ref=main" in success_text, success_text
+    assert "ref=master" in success_text, success_text
 
     # Renderer failure must surface its exact stage/status while preserving
     # the last successful output. OnFailure may alert, but recovery data is
@@ -4595,10 +4608,73 @@ in
         f"{sync_script_text}"
     )
 
+    # Codex `--profile <name>` layers ~/.codex/<name>.config.toml over the
+    # mirrored config.toml. Those files sit outside the mirror, so the sync
+    # stages them as check input only: a loosening one blocks the whole
+    # publish, a harmless one passes, and neither is ever written or pruned.
+    # The stand-in renders first and then floors the staged profiles, the
+    # order and selection (glob + is_file) of claude-config's check.
+    profile = "/home/jonathan/.codex/p.config.toml"
+    profiles_seen = "/home/jonathan/.codex/claude-setup-mirror/profiles-seen"
+    commit_renderer(
+        "profiles",
+        "'import os, tomllib' 'from pathlib import Path' "
+        "'codex = Path.home() / \".codex\"' "
+        "'(codex / \"claude-setup-mirror\").mkdir(parents=True, exist_ok=True)' "
+        "'(codex / \"AGENTS.md\").write_text(\"profiles\\n\")' "
+        "'Path(os.environ[\"AI_CLIENT_CONFIG_TEST_OUTPUT\"]).write_text(\"profiles\\n\")' "
+        "'seen = [p.name for p in sorted(codex.glob(\"*.config.toml\")) if p.is_file()]' "
+        "'(codex / \"claude-setup-mirror\" / \"profiles-seen\").write_text(\"\".join(n + \"\\n\" for n in seen))' "
+        "'loose = [n for n in seen if tomllib.loads((codex / n).read_text()).get(\"approval_policy\", \"never\") != \"never\"]' "
+        "'raise SystemExit(1 if loose else 0)'",
+    )
+    workstation.succeed(
+        user_systemctl
+        + " set-environment AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS=10'"
+    )
+
+    def profile_fingerprint():
+        return workstation.succeed(
+            f"stat -c '%F %i %Y %s' {profile} && cat {profile}"
+        )
+
+    workstation.succeed(
+        f"printf '%s\\n' 'approval_policy = \"on-request\"' > {profile} && "
+        f"chown jonathan:users {profile} && touch -d @1700000000 {profile}"
+    )
+    loosening_before = profile_fingerprint()
+    workstation.succeed(
+        user_systemctl + " reset-failed ai-client-config-codex-sync.service'"
+    )
+    workstation.fail(user_systemctl + " start ai-client-config-codex-sync.service'")
+    failure_lines = workstation.succeed(f"cat {failure}").splitlines()
+    assert "stage=render" in failure_lines, failure_lines
+    assert "status=1" in failure_lines, failure_lines
+    # Nothing from the failed run reached the live home.
+    assert workstation.succeed(f"cat {output}").strip() == "v2"
+    assert workstation.succeed("cat /home/jonathan/.codex/AGENTS.md").strip() == "stable"
+    workstation.fail(f"test -e {profiles_seen}")
+    assert profile_fingerprint() == loosening_before
+
+    workstation.succeed(
+        f"printf '%s\\n' 'model = \"x\"' > {profile} && "
+        f"chown jonathan:users {profile} && touch -d @1700000000 {profile}"
+    )
+    harmless_before = profile_fingerprint()
+    workstation.succeed(
+        user_systemctl + " reset-failed ai-client-config-codex-sync.service'"
+    )
+    workstation.succeed(user_systemctl + " start ai-client-config-codex-sync.service'")
+    assert workstation.succeed(f"cat {output}").strip() == "profiles"
+    # The harmless pass is not vacuous: the check saw the live profile.
+    assert workstation.succeed(f"cat {profiles_seen}").split() == ["p.config.toml"]
+    assert profile_fingerprint() == harmless_before
+    workstation.succeed(f"rm -f {profile}")
+
     # A malformed upstream revision must fail before execution and identify
     # the missing contract explicitly.
     workstation.succeed(
-        f"su - jonathan -c 'git -C {fixture} rm scripts/sync_codex.py && "
+        f"su - jonathan -c 'git -C {fixture} rm codex/scripts/sync_codex.py && "
         f"git -C {fixture} commit -m missing-renderer'"
     )
     workstation.succeed(
