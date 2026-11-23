@@ -47,7 +47,7 @@ let
       --inh-caps=-all \
       --ambient-caps=-all \
       --no-new-privs \
-      ${pkgs.python3}/bin/python3 -B scripts/sync_codex.py
+      ${pkgs.python3}/bin/python3 -B codex/scripts/sync_codex.py
   '';
 
   syncScript = pkgs.writeShellApplication {
@@ -61,8 +61,10 @@ let
       pkgs.util-linux
     ];
     text = ''
-      remote="''${AI_CLIENT_CONFIG_REMOTE-https://github.com/jonathanmoregard/ai-client-config.git}"
-      ref="''${AI_CLIENT_CONFIG_REF-main}"
+      # The renderer lives in claude-config under codex/ (its own repo root:
+      # client-support.toml, clients/, imports/ all resolve beside it).
+      remote="''${AI_CLIENT_CONFIG_REMOTE-https://github.com/jonathanmoregard/claude-config.git}"
+      ref="''${AI_CLIENT_CONFIG_REF-master}"
       render_timeout="''${AI_CLIENT_CONFIG_SYNC_TIMEOUT_SECONDS-600}"
       state_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/ai-client-config-sync"
       failure_file="$state_dir/last-failure"
@@ -110,7 +112,11 @@ let
         # Copy payloads before the entry points that reference them, including
         # on first installation. Then update those entry points and prune.
         # Keep private directory permissions and file executable bits.
-        rsync -rltE --checksum --omit-dir-times \
+        # The mirror owns every managed path: --force lets this pass replace a
+        # non-empty directory standing where a file belongs (the second pass
+        # already can, since --delete-after is active there). Without it each
+        # run fails with "cannot delete non-empty directory".
+        rsync -rltE --checksum --omit-dir-times --force \
           --exclude="/.codex/config.toml" \
           --exclude="/.codex/hooks.json" \
           --exclude="/.agents/plugins/marketplace.json" \
@@ -229,10 +235,10 @@ let
       fi
 
       commit=$(git -C "$run_dir/repo" rev-parse --verify HEAD)
-      renderer="$run_dir/repo/scripts/sync_codex.py"
+      renderer="$run_dir/repo/codex/scripts/sync_codex.py"
       if [ ! -f "$renderer" ]; then
         stage="validate-source"
-        echo "ai-client-config sync: scripts/sync_codex.py missing at $commit" >&2
+        echo "ai-client-config sync: codex/scripts/sync_codex.py missing at $commit" >&2
         exit 66
       fi
 
@@ -400,6 +406,28 @@ let
         "$staged_home/.codex" \
         "$staged_home/.agents/plugins" \
         "$staged_home/plugins/claude-mirror"
+      # `codex --profile <name>` layers ~/.codex/<name>.config.toml over
+      # config.toml. Profiles are outside the mirror, but the check floors
+      # them, so stage every one it would read (same glob; symlinks followed,
+      # like Path.is_file) as check input only. managed_paths never names
+      # them: publish neither writes nor prunes them. A profile that does not
+      # resolve in this namespace may still resolve for Codex: fail closed.
+      if [ -d "$HOME/.codex" ]; then
+        profile_listing="$run_dir/profile-listing"
+        if ! find -P "$HOME/.codex" -mindepth 1 -maxdepth 1 \
+          -name '*.config.toml' -print0 > "$profile_listing"; then
+          echo "ai-client-config sync: cannot enumerate Codex profiles" >&2
+          exit 66
+        fi
+        while IFS= read -r -d "" profile_path; do
+          if [ -L "$profile_path" ] && [ ! -e "$profile_path" ]; then
+            echo "ai-client-config sync: unresolved Codex profile ''${profile_path##*/}" >&2
+            exit 66
+          fi
+          [ -f "$profile_path" ] || continue
+          cp -L -- "$profile_path" "$staged_home/.codex/''${profile_path##*/}"
+        done < "$profile_listing"
+      fi
       if [ -f "$source_home/.claude.json" ]; then
         cp -a --no-preserve=ownership -- \
           "$source_home/.claude.json" "$staged_home/.claude.json"
