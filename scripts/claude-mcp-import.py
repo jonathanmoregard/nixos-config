@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Merge the served claude-config mcp-servers.json into ~/.claude.json.
+"""Make ~/.claude.json's mcpServers exactly the served mcp-servers.json.
 
-Additive: a tracked server is added or updated by name, recursively, so the
-tracked file wins on every value it states. Live-only servers, and live-only
-keys inside a tracked server (an `env` secret added by hand), are kept.
-Removing a server from the tracked file therefore does not remove it live.
+Authoritative: the machine-wide managed policy decides which servers may start,
+so this only mirrors that list. A server absent from it, and any key inside a
+listed server that the list does not state, is dropped. Nothing else in
+~/.claude.json is touched.
 
-Exit 0 merged or nothing to do, 75 an input is unusable or the lock is busy.
+Exit 0 done or nothing to do, 75 an input is unusable or the lock is busy.
 """
 
 import argparse
@@ -66,16 +66,6 @@ def _load_served(path):
     return servers
 
 
-def _merge(live, tracked):
-    out = dict(live)
-    for key, value in tracked.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
 def _current(doc):
     current = doc.get("mcpServers", {})
     if not isinstance(current, dict):
@@ -83,12 +73,9 @@ def _current(doc):
     return current
 
 
-def _merged(doc, servers):
-    current = _current(doc)
-    merged = _merge(current, servers)
+def _changed(doc, servers):
     # Compared as JSON text: Python's == holds for true == 1 == 1.0.
-    same = json.dumps(merged, sort_keys=True) == json.dumps(current, sort_keys=True)
-    return None if same else merged
+    return json.dumps(servers, sort_keys=True) != json.dumps(_current(doc), sort_keys=True)
 
 
 class _ConfigLock:
@@ -118,9 +105,19 @@ class _ConfigLock:
         os.rmdir(self.path)
 
 
+TEMP_PREFIX = ".claude.json.mcp-import."
+
+
+def _leftovers(path):
+    # A killed run leaves its temp file, a full copy of ~/.claude.json.
+    directory = os.path.dirname(path) or "."
+    return [os.path.join(directory, n) for n in os.listdir(directory)
+            if n.startswith(TEMP_PREFIX)]
+
+
 def _replace(path, doc, mode):
     directory = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".claude.json.mcp-import.")
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=TEMP_PREFIX)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             # ASCII escapes carry a lone surrogate, which JSON.stringify emits
@@ -147,29 +144,32 @@ def _import(args):
     if raw is None:
         print(f"claude-mcp-import: no {args.live} yet; nothing to do")
         return 0
-    if _merged(_parse_object(raw, args.live), servers) is None:
+    if not _changed(_parse_object(raw, args.live), servers) and not _leftovers(args.live):
         print("claude-mcp-import: nothing to change")
         return 0
 
     with _ConfigLock(args.live, args.lock_timeout):
+        for leftover in _leftovers(args.live):
+            os.unlink(leftover)
         raw = _read(args.live)
         if raw is None:
             raise Unusable(f"{args.live} vanished under the lock")
         doc = _parse_object(raw, args.live)
-        merged = _merged(doc, servers)
-        if merged is None:
+        if not _changed(doc, servers):
             print("claude-mcp-import: nothing to change")
             return 0
-        added = sorted(set(merged) - set(_current(doc)))
-        doc["mcpServers"] = merged
+        added = sorted(set(servers) - set(_current(doc)))
+        removed = sorted(set(_current(doc)) - set(servers))
+        doc["mcpServers"] = servers
         _replace(args.live, doc, os.stat(args.live).st_mode & 0o7777)
-    print(f"claude-mcp-import: updated {args.live}; added: {', '.join(added) or 'none'}")
+    print(f"claude-mcp-import: updated {args.live}; "
+          f"added: {', '.join(added) or 'none'}; removed: {', '.join(removed) or 'none'}")
     return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--served", required=True, help="mcp-servers.json in the deploy clone")
+    parser.add_argument("--served", required=True, help="the managed mcp-servers.json")
     parser.add_argument("--live", required=True, help="the live ~/.claude.json")
     parser.add_argument("--marker", required=True,
                         help="the projection cutover marker; absent means nothing to do")
