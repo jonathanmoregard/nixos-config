@@ -89,48 +89,64 @@ class ImportCase(unittest.TestCase):
         return proc
 
 
-class Merge(ImportCase):
-    def test_tracked_server_missing_live_is_added(self):
+class Authoritative(ImportCase):
+    def test_listed_server_missing_live_is_added(self):
         proc = self.run_import()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.read_live()["mcpServers"]["agent_e2e_broker"], BROKER)
 
-    def test_live_only_server_survives(self):
+    def test_live_only_server_is_removed(self):
         self.import_ok()
-        self.assertEqual(self.read_live()["mcpServers"]["scratch"], HAND_ADDED)
+        self.assertNotIn("scratch", self.read_live()["mcpServers"])
 
-    def test_live_env_key_absent_from_tracked_survives(self):
+    def test_live_only_key_inside_a_listed_server_is_removed(self):
         live = copy.deepcopy(LIVE)
-        live["mcpServers"]["github"]["env"] = {"GITHUB_TOKEN": "live-secret"}
+        live["mcpServers"]["github"]["env"] = {"GITHUB_TOKEN": "planted"}
+        live["mcpServers"]["github"]["headersHelper"] = "/tmp/planted"
         self.write(self.live, render(live))
         self.import_ok()
-        self.assertEqual(self.read_live()["mcpServers"]["github"]["env"],
-                         {"GITHUB_TOKEN": "live-secret"})
+        self.assertEqual(self.read_live()["mcpServers"]["github"], GITHUB)
 
-    def test_live_env_survives_tracked_entry_without_env_key(self):
+    def test_mcp_servers_equals_served_exactly(self):
         served = copy.deepcopy(SERVED)
+        served["github"]["args"] = ["stdio", "--read-only"]
         del served["research-agent"]["env"]
         self.write(self.served, render(served))
         self.import_ok()
-        self.assertEqual(self.read_live()["mcpServers"]["research-agent"]["env"],
-                         RESEARCH["env"])
+        self.assertEqual(self.read_live()["mcpServers"], served)
 
-    def test_tracked_values_win_on_conflict(self):
-        served = copy.deepcopy(SERVED)
-        served["github"]["args"] = ["stdio", "--read-only"]
-        served["research-agent"]["env"]["RESEARCH_AGENT_TIMEOUT"] = "1200"
-        self.write(self.served, render(served))
-        self.import_ok()
-        servers = self.read_live()["mcpServers"]
-        self.assertEqual(servers["github"]["args"], ["stdio", "--read-only"])
-        self.assertEqual(servers["research-agent"]["env"]["RESEARCH_AGENT_TIMEOUT"], "1200")
-
-    def test_rest_of_live_file_untouched(self):
+    def test_other_top_level_keys_and_projects_untouched(self):
         self.import_ok()
         got = self.read_live()
         for key in ("numStartups", "oauthAccount", "projects"):
             self.assertEqual(got[key], LIVE[key])
         self.assertEqual(list(got), list(LIVE))
+
+    def test_per_project_mcp_state_untouched(self):
+        live = copy.deepcopy(LIVE)
+        live["projects"]["/home/jonathan"].update({
+            "mcpServers": {"proj-only": HAND_ADDED},
+            "enabledMcpjsonServers": ["proj-only"],
+            "disabledMcpjsonServers": ["github"],
+            "mcpContextUris": ["x"],
+        })
+        self.write(self.live, render(live))
+        self.import_ok()
+        got = self.read_live()
+        self.assertEqual(got["projects"], live["projects"])
+        self.assertEqual({k: v for k, v in got.items() if k != "mcpServers"},
+                         {k: v for k, v in live.items() if k != "mcpServers"})
+
+    def test_own_leftover_temp_files_removed_unrelated_kept(self):
+        leftover = os.path.join(self.dir, ".claude.json.mcp-import.abc123")
+        unrelated = [os.path.join(self.dir, n) for n in
+                     (".claude.json.tmp", ".claude.json.mcp-importer.x", "claude.json.mcp-import.x")]
+        for path in [leftover, *unrelated]:
+            self.write(path, "stale")
+        self.import_ok()
+        self.assertFalse(os.path.exists(leftover))
+        for path in unrelated:
+            self.assertTrue(os.path.exists(path), path)
 
     def test_live_without_mcp_servers_gains_them(self):
         live = copy.deepcopy(LIVE)
@@ -139,13 +155,19 @@ class Merge(ImportCase):
         self.import_ok()
         self.assertEqual(self.read_live()["mcpServers"], SERVED)
 
+    def test_empty_served_list_clears_live_servers(self):
+        self.write(self.served, "{}\n")
+        proc = self.run_import()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.read_live()["mcpServers"], {})
+
     def test_mode_preserved(self):
         # Not 0600: mkstemp's own mode would pass without the chmod.
         os.chmod(self.live, 0o640)
         self.import_ok()
         self.assertEqual(stat.S_IMODE(os.stat(self.live).st_mode), 0o640)
 
-    def test_tracked_number_replaces_an_equal_comparing_live_boolean(self):
+    def test_served_number_replaces_an_equal_comparing_live_boolean(self):
         live = copy.deepcopy(LIVE)
         live["mcpServers"] = copy.deepcopy(SERVED)
         live["mcpServers"]["github"]["trust"] = True
@@ -171,6 +193,29 @@ class Merge(ImportCase):
         ino = os.stat(self.live).st_ino
         proc = self.assert_unchanged_after(0)
         self.assertEqual(os.stat(self.live).st_ino, ino)
+        self.assertIn("nothing to change", proc.stdout)
+
+    def test_already_matching_file_is_not_rewritten(self):
+        live = copy.deepcopy(LIVE)
+        live["mcpServers"] = copy.deepcopy(SERVED)
+        self.write(self.live, render(live))
+        before = os.stat(self.live)
+        proc = self.assert_unchanged_after(0)
+        after = os.stat(self.live)
+        self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+        self.assertIn("nothing to change", proc.stdout)
+
+    def test_leftover_removed_when_list_already_matches(self):
+        live = copy.deepcopy(LIVE)
+        live["mcpServers"] = copy.deepcopy(SERVED)
+        self.write(self.live, render(live))
+        leftover = os.path.join(self.dir, ".claude.json.mcp-import.abc123")
+        self.write(leftover, "stale")
+        ino = os.stat(self.live).st_ino
+        proc = self.assert_unchanged_after(0)
+        self.assertFalse(os.path.exists(leftover))
+        self.assertEqual(os.stat(self.live).st_ino, ino)
+        self.assertFalse(os.path.exists(self.lock))
         self.assertIn("nothing to change", proc.stdout)
 
 
@@ -234,7 +279,7 @@ class Locking(ImportCase):
         self.assert_unchanged_after(75, "--lock-timeout", "1")
         self.assertTrue(os.path.isdir(self.lock), "a lock it does not own was removed")
 
-    def test_waits_for_lock_then_merges_the_file_written_under_it(self):
+    def test_waits_for_lock_then_applies_to_the_file_written_under_it(self):
         os.mkdir(self.lock)
         concurrent = copy.deepcopy(LIVE)
         concurrent["numStartups"] = 413

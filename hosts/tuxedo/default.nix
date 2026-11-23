@@ -28,6 +28,7 @@
     # the one entry the mounts cannot serve as a link.
     ../../modules/nixos/claude-settings-sync.nix
     ../../modules/nixos/claude-mcp-import.nix
+    ../../modules/nixos/claude-mcp-servers.nix
   ];
 
   networking.hostName = "tuxedo";

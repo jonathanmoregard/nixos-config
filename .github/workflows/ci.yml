@@ -446,6 +446,24 @@ jobs:
           set -euo pipefail
           nix build .#nixosConfigurations.tuxedo.config.system.build.toplevel \
             --no-link --print-build-logs --keep-going
+      # Cachix evicts least-recently-used paths once the account is at its
+      # storage limit. Main CI substitutes only each lane's finished output,
+      # so the system closure under it goes unfetched and is evicted within
+      # days; the next PR touching a lane then rebuilds it from source
+      # (2026-11-22: ~1800 derivations, 48 min, the runner lost
+      # communication). A pin protects a path's runtime closure from that
+      # GC. Push first: the action's own push runs only in its post step.
+      - name: Pin the main system closure in cachix
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          out=$(nix path-info .#nixosConfigurations.tuxedo.config.system.build.toplevel)
+          if cachix push jonathanmoregard "$out" && \
+             cachix pin jonathanmoregard tuxedo-main "$out" --keep-revisions 2; then
+            echo "pinned $out"
+          else
+            echo "::warning::cachix pin of $out failed; PR VM lanes may rebuild evicted paths from source"
+          fi
       - name: Disk after (post-build)
         if: always() && needs.preflight.outputs.risk != 'TRIVIAL'
         run: df -h / /mnt /tmp 2>/dev/null || df -h /

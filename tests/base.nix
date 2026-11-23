@@ -116,7 +116,7 @@ let
   '';
 
   # Dependency-free stand-in for mcp_server.server. The production wrapper
-  # runs this through its real uv -> bootstrap path, so the probe observes the
+  # runs this through its real bootstrap path, so the probe observes the
   # actual argv, stdio, environment and /proc policy without contacting any
   # provider or copying the wrapper's implementation into the test.
   researchAgentMcpProbePy = pkgs.writeText "vm-base-research-agent-mcp-probe.py" ''
@@ -489,9 +489,9 @@ in
 
     # research-agent-mcp must make the final Python process non-dumpable
     # before it reads any of its twelve agenix secrets. That turns the
-    # process's /proc files into root-owned, same-UID-unreadable files. uv is
-    # intentionally still dumpable, but it must never receive a secret in its
-    # environment. The local probe project keeps this an offline process test.
+    # process's /proc files into root-owned, same-UID-unreadable files. Its
+    # parent must never receive a secret in its environment. PYTHONPATH puts
+    # the probe ahead of the packaged mcp_server, keeping this offline.
     workstation.succeed(
         "cp -r ${researchAgentMcpProbeProject}/. /home/jonathan/Repos/research-agent/ && "
         "chown -R jonathan:users /home/jonathan/Repos/research-agent"
@@ -499,14 +499,18 @@ in
     research_mcp_path = workstation.succeed(
         "su - jonathan -c 'command -v research-agent-mcp'"
     ).strip()
-    # The VM has no network and no warm uv cache, so uv would try to download
-    # a managed CPython. Point it at the system interpreter instead; the
-    # wrapper -> uv -> bootstrap chain under test is otherwise unchanged.
+    # The server must come from the store, not `uv run` over a writable tree.
+    research_mcp_exec = [
+        ln.strip()
+        for ln in workstation.succeed(f"cat {research_mcp_path}").splitlines()
+        if ln.strip().startswith("exec ")
+    ]
+    assert len(research_mcp_exec) == 1 and research_mcp_exec[0].startswith(
+        "exec /nix/store/"
+    ), research_mcp_exec
     mcp_env = (
         "env HOME=/home/jonathan "
         "PYTHONPATH=/home/jonathan/Repos/research-agent "
-        "UV_PYTHON_DOWNLOADS=never "
-        "UV_PYTHON=${pkgs.python3}/bin/python3 "
     )
     secret_values = {
         "anthropic-api-key": "vm-base-anthropic",
@@ -570,7 +574,7 @@ in
     workstation.wait_until_succeeds(
         "test -s /tmp/research-agent-mcp-probe.pids", timeout=30
     )
-    server_pid, uv_pid, child_pid = workstation.succeed(
+    server_pid, parent_pid, child_pid = workstation.succeed(
         "cat /tmp/research-agent-mcp-probe.pids"
     ).split()
     probe_out = workstation.succeed(
@@ -588,21 +592,21 @@ in
     assert server_environ_owner == "root root", server_environ_owner
 
     rc, _ = workstation.execute(
-        f"runuser -u jonathan -- cat /proc/{uv_pid}/environ >/dev/null 2>&1"
+        f"runuser -u jonathan -- cat /proc/{parent_pid}/environ >/dev/null 2>&1"
     )
-    uv_environ_owner = workstation.succeed(
-        f"stat -c '%U %G' /proc/{uv_pid}/environ"
+    parent_environ_owner = workstation.succeed(
+        f"stat -c '%U %G' /proc/{parent_pid}/environ"
     ).strip()
     if rc == 0:
         workstation.succeed(
-            f"! tr '\\0' '\\n' < /proc/{uv_pid}/environ | "
+            f"! tr '\\0' '\\n' < /proc/{parent_pid}/environ | "
             "grep -Eq '^(ANTHROPIC_API_KEY|OPENAI_API_KEY|LAKERA_API_KEY|"
             "EXA_API_KEY|TAVILY_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|"
             "EUIPO_CLIENT_ID|EUIPO_CLIENT_SECRET|EBAY_CLIENT_ID|"
             "EBAY_CLIENT_SECRET|TRADERA_APP_ID|TRADERA_APP_KEY)='"
         )
     else:
-        assert uv_environ_owner == "root root", uv_environ_owner
+        assert parent_environ_owner == "root root", parent_environ_owner
 
     # execve resets dumpability in descendants, so bootstrap also strips all
     # twelve secret variables from every Python subprocess environment. The
@@ -626,7 +630,7 @@ in
         if line.endswith("research-agent-mcp-bootstrap.py")
     )
     workstation.succeed(
-        f"kill {child_pid} {server_pid} {uv_pid} {wrapper_pid} 2>/dev/null || true"
+        f"kill {child_pid} {server_pid} {wrapper_pid} 2>/dev/null || true"
     )
 
     # A seccomp denial makes prctl(2) fail. The bootstrap must report that

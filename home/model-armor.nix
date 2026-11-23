@@ -11,7 +11,7 @@
 # they live here as plain nix strings.
 #
 # Imported by every wrapper that spawns the scanner:
-#   - home/research-agent-mcp.nix   (research-agent-mcp)
+#   - overlays/research-agent-mcp.nix   (research-agent-mcp)
 # Change an id HERE and every call site follows.
 {
   project = "jm-pi-scanner";

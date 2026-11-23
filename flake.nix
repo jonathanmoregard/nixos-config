@@ -169,6 +169,23 @@
       flake = false;
     };
 
+    # Source-only MCP servers built by overlays/source-mcp-servers.nix. Same
+    # bump rule as aggregator-src: edit the rev, then `nix flake lock`.
+    research-agent-src = {
+      url = "github:jonathanmoregard/research-agent/2cdb1889a19a3c652e1cf10d7e1894b91d6ee118";
+      flake = false;
+    };
+    gdocs-review-mcp-src = {
+      url = "github:jonathanmoregard/google_workspace_mcp/2d6136bef5c4fe693f8469cf9839b6892f1d8d38";
+      flake = false;
+    };
+    # github-mux's server.py and its PEP 723 lock. The served checkout keeps
+    # deploying the rest of claude-config; this rev only decides github-mux.
+    claude-config-src = {
+      url = "github:jonathanmoregard/claude-config/df5692f750c4c1b1e4c44bf64800e02379bb3179";
+      flake = false;
+    };
+
     pyproject-nix.url = "github:pyproject-nix/pyproject.nix";
     pyproject-nix.inputs.nixpkgs.follows = "nixpkgs";
     uv2nix.url = "github:pyproject-nix/uv2nix";
@@ -193,6 +210,7 @@
               tts-tool, substack-url-tool, prose-decorate, claude-desktop, voquill,
               codex-cli-nix,
               aggregator-src, pyproject-nix, uv2nix, pyproject-build-systems,
+              research-agent-src, gdocs-review-mcp-src, claude-config-src,
               ... }:
   let
     linuxSystem = "x86_64-linux";
@@ -260,6 +278,14 @@
         (import ./overlays/aggregator.nix {
           inherit pyproject-nix uv2nix pyproject-build-systems;
           src = aggregator-src;
+        })
+        # PyPI-only MCP servers, hash-locked from pkgs/mcp-servers/<name>/uv.lock.
+        (import ./overlays/mcp-servers.nix {
+          inherit pyproject-nix uv2nix pyproject-build-systems;
+        })
+        (import ./overlays/source-mcp-servers.nix {
+          inherit pyproject-nix uv2nix pyproject-build-systems research-agent-src gdocs-review-mcp-src
+            claude-config-src;
         })
         claude-desktop.overlays.default
         (final: prev: {
@@ -394,6 +420,12 @@
             `hashedPasswordFile` — do not put a plaintext default back in profiles/base.nix.
           ''
             (pkgsLinux.runCommand "dellan-initial-password-null" { } "touch $out");
+        # Not a VM lane: modules/nixos/claude-mcp-policy.nix's eval checks, and
+        # the importer run on the primary host's generated list. Seconds.
+        claude-mcp-policy = import ./tests/claude-mcp-policy {
+          pkgs = pkgsLinux;
+          hostConfig = primaryConfig;
+        };
         # Not a VM lane: runtime-invocation harness for the feature-vm
         # launcher (locked-by-default sandbox invariants). Seconds.
         feature-vm-ctl = import ./tests/feature-vm-ctl.nix { pkgs = pkgsLinux; };
@@ -749,6 +781,7 @@
       update-beeper = pkgsLinux.beeper-update;
       check-signal-expiry = pkgsLinux.signal-expiry-check;
       add-secret = import ./home/add-secret.nix { pkgs = pkgsLinux; };
+      inherit (pkgsLinux) mcp-server-reddit ha-mcp-unwrapped github-mux;
       # `nix run .#security-static [-- --self-test]` — fast offline security
       # scanners, pinned via flake.lock. CI job `security-static`.
       security-static = pkgsLinux.writeShellApplication {

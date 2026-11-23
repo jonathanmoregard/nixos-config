@@ -11,7 +11,7 @@
 # LAKERA_API_KEY does that), so it lives here as a plain nix string.
 #
 # Imported by every wrapper that spawns the scanner:
-#   - home/research-agent-mcp.nix   (research-agent-mcp)
+#   - overlays/research-agent-mcp.nix   (research-agent-mcp)
 # Change the id HERE and every call site follows.
 {
   lakeraProjectId = "project-5833252261";

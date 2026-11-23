@@ -815,21 +815,17 @@ in
     # created (verified accepted by cron), tag comment included so the
     # installer's idempotency check recognises it as already present.
     30 17 * * * $HOME/.claude/permission-ledger/run-evaluate.sh >> $HOME/.claude/logs/permission-ledger.log 2>&1 # permission-ledger-evaluate
-    # Keep the research-agent working copy current. That checkout IS
-    # production twice over: research-agent-mcp runs it directly
-    # (`uv run --project ~/Repos/research-agent`), and the research
-    # microvm bind-mounts the same directory read-only at /workspace, so
-    # the jailed agent reads run-agent.sh, the shims and its CLAUDE.md
-    # fresh from it on every call. An unpulled merge therefore ships
-    # stale code to every newly spawned server and every research call.
-    # 2026-07-29..31: a merged model-fallback fix (PR #19) sat unpulled
-    # for three days while every research call failed 429 — MCP
-    # processes churned constantly, the checkout never moved, and two
-    # agent sessions misread it as "the research backend is down".
+    # Keep the research-agent working copy current for the feature VM,
+    # which bind-mounts this checkout. Production does NOT read it: the
+    # research microvm mounts the pinned research-agent-src store path at
+    # /workspace, the same source research-agent-mcp is built from. To ship
+    # a merged guest fix to production, bump research-agent-src
+    # (nix flake update research-agent-src), commit the lock, and rebuild;
+    # pulling this checkout changes nothing there.
     # Pull rather than fetch (unlike the bare repo above, this one has a
     # working tree that must actually advance); --ff-only so a dirty or
     # diverged tree fails loudly into the log instead of fabricating a
-    # merge commit on a live production path.
+    # merge commit in the feature VM's source.
     */30 * * * * git -C /home/jonathan/Repos/research-agent pull --ff-only >> /home/jonathan/.claude/logs/research-agent-pull.log 2>&1
   '';
 

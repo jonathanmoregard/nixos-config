@@ -180,6 +180,41 @@ pkgs.testers.runNixOSTest {
         "/var/lib/microvms/research-agent/current/bin/microvm-run"
     )
 
+    # Both guests' /workspace is the source the host server is built from,
+    # read off the virtiofsd launcher the runner execs. The share drops the
+    # path's store context, so assert it is still in the system closure (a
+    # test VM sees the whole build-host store, so `test -f` cannot tell).
+    def workspace_source(vm):
+        conf = workstation.succeed(
+            f"grep -o -- '--configuration [^ ]*' /var/lib/microvms/{vm}/current/bin/virtiofsd-run"
+        ).split()[1]
+        launcher = workstation.succeed(
+            f"grep -A1 '^\\[program:virtiofsd-workspace\\]' {conf} | sed -n 's/^command=//p'"
+        ).strip()
+        return workstation.succeed(
+            f"sed -n 's/.*--shared-dir=\\([^ ]*\\).*/\\1/p' {launcher}"
+        ).strip()
+
+    pinned = "${pkgs.research-agent-mcp.src}"
+    for vm, needed in (("research-agent", ["scripts/run-agent.sh", "scripts/lib/memguard.sh",
+                                          "agent/CLAUDE.md", "agent/.mcp.json"]),
+                       ("scraper", ["scraper/server.py"])):
+        if vm == "scraper":
+            workstation.succeed("systemctl start install-microvm-scraper.service")
+        src = workspace_source(vm)
+        print(f"[diag] {vm} /workspace source: {src}")
+        assert src == pinned, f"{vm}: /workspace served from {src!r}, expected pinned {pinned!r}"
+        workstation.succeed(f"nix-store -q --requisites /run/current-system | grep -qFx {src}")
+        for f in needed:
+            workstation.succeed(f"test -f {src}/{f}")
+        # microvm.nix triggers a restart on the guest toplevel only, which a
+        # share-source bump leaves unchanged; the deploy must still restart
+        # the VM or it keeps serving the old tree.
+        triggers = workstation.succeed(
+            f"cat $(systemctl cat microvm@{vm}.service | sed -n 's/^X-Restart-Triggers=//p')"
+        )
+        assert pinned in triggers, f"{vm}: a source bump would not restart the VM; triggers: {triggers!r}"
+
     # Persisted vm-ssh state dir must be in place before the VM boots.
     # The host module's systemd.tmpfiles.rules are the load-bearing piece.
     workstation.succeed("test -d /var/lib/research-agent/vm-ssh")
