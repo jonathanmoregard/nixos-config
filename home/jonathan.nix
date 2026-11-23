@@ -3,6 +3,49 @@ let
   # gh + git-over-HTTPS authenticate as the GitHub App, never as the founder.
   ghHost = import ./gh-host-token.nix { inherit pkgs; };
   githubAppMcp = import ./github-app-mcp.nix { inherit pkgs; };
+  globalGitIgnore = ''
+    **/.claude/settings.local.json
+
+    # Environment files (negations must follow the glob that catches them)
+    .env
+    .env.*
+    !.env.example
+    !.env.sample
+    !.env.template
+
+    # Keys and certificates
+    *.pem
+    *.key
+    *.p12
+    *.pfx
+    *.jks
+
+    # Credential stores
+    .git-credentials
+    .netrc
+    .authinfo
+    .pypirc
+    credentials.json
+    service-account*.json
+
+    # Terraform state (contains resolved secret values in plaintext)
+    *.tfstate
+    *.tfstate.backup
+  '';
+  # Placeholders Claude Code's Bash sandbox mounts (/dev/null devices) at the
+  # session repo root for protected paths that do not exist (measured on
+  # 2.1.330; upstream anthropics/claude-code#81602). "!/x/" re-includes x
+  # when it is a real directory, so a new file under a real .claude/skills
+  # or .vscode still shows. A new untracked regular file x (a first
+  # .mcp.json, say) is hidden too, as is a symlink to a directory.
+  sandboxPlaceholders = [
+    ".bash_profile" ".bashrc" ".gitconfig" ".gitmodules" ".idea" ".mcp.json"
+    ".profile" ".ripgreprc" ".vscode" ".zprofile" ".zshrc"
+    ".claude/agents" ".claude/commands" ".claude/hooks" ".claude/launch.json"
+    ".claude/loop.md" ".claude/output-styles" ".claude/routines"
+    ".claude/scheduled_tasks.json" ".claude/settings.json"
+    ".claude/settings.local.json" ".claude/skills" ".claude/workflows"
+  ];
 in
 {
   home.username = "jonathan";
@@ -168,35 +211,13 @@ in
   # Deliberately NOT ignored: .npmrc — pnpm workspaces legitimately
   # commit one, and silently dropping it from `git add -A` would be a
   # confusing failure. The gitleaks hook covers the `_authToken=` case.
-  home.file.".config/git/ignore".text = ''
-    **/.claude/settings.local.json
+  home.file.".config/git/ignore".text = globalGitIgnore;
 
-    # Environment files (negations must follow the glob that catches them)
-    .env
-    .env.*
-    !.env.example
-    !.env.sample
-    !.env.template
-
-    # Keys and certificates
-    *.pem
-    *.key
-    *.p12
-    *.pfx
-    *.jks
-
-    # Credential stores
-    .git-credentials
-    .netrc
-    .authinfo
-    .pypirc
-    credentials.json
-    service-account*.json
-
-    # Terraform state (contains resolved secret values in plaintext)
-    *.tfstate
-    *.tfstate.backup
-  '';
+  # Claude's sandboxed Bash points core.excludesFile here (claude-config
+  # settings env); host git keeps the file above. core.excludesFile
+  # replaces the global ignore, so this one carries it too.
+  home.file.".config/git/ignore-claude-sandbox".text = globalGitIgnore
+    + pkgs.lib.concatMapStrings (p: "/${p}\n!/${p}/\n") sandboxPlaceholders;
 
   # Husky pre-commit hook helper — loads nvm so node-based hooks find the
   # right binary regardless of which shell the commit was made from.
