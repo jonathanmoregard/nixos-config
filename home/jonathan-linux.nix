@@ -746,7 +746,11 @@ in
     */30 * * * * ${wellbeingPython}/bin/python3 /home/jonathan/.claude/wellbeing/sunset-walk-tracker.py >> /home/jonathan/.claude/logs/sunset-walk-tracker.log 2>&1
     # Upstream drift of vendored forks becomes a pending proposal; never merged unattended.
     30 10 * * 1 ${pkgs.python3}/bin/python3 /home/jonathan/.claude/scripts/upstream-drift.py >> /home/jonathan/.claude/logs/upstream-drift.log 2>&1
-    11 16 * * * /home/jonathan/Repos/aggregator/sync-agent.sh >> /home/jonathan/Repos/aggregator/sync.log 2>&1
+    # aggregator auto-commit + push: REMOVED 2026-11-23, for the same reason
+    # as the ~/.claude one below. aggregator work reaches main through
+    # worktrees and PRs, so its main checkout has nothing to sync; the job had
+    # not run since August (its log symlink pointed into the old ~/.claude
+    # tasks dir), and nothing was lost.
     # ~/.claude auto-commit + push: REMOVED 2026-08-31, deliberately.
     #
     # It ran `47 13 * * * ~/.claude/sync-agent.sh`, spawning an agent to
