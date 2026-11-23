@@ -386,6 +386,19 @@ let
       fi
       chmod -R u+w -- "$source_home"
 
+      # One publisher at a time on the live home. A direct
+      # codex/scripts/sync_codex.py run locks ~/.codex too (sync_codex.LOCKS),
+      # the one object both sides see as the same inode: "$HOME" here is a
+      # directory on the ProtectHome tmpfs, while ~/.codex is bound in from
+      # the live home. Held from the backup through the publish and any
+      # restore in finish (the fd stays open until the script exits).
+      stage="lock"
+      exec {codex_lock}<"$HOME/.codex"
+      if ! flock --wait 300 "$codex_lock"; then
+        echo "ai-client-config sync: another sync holds a lock on $HOME/.codex" >&2
+        exit 75
+      fi
+
       stage="snapshot"
       mkdir -p "$run_dir/backup"
       staged_home="$run_dir/staged-home"
