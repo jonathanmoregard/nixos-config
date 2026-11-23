@@ -35,8 +35,9 @@ let
   # Placeholders Claude Code's Bash sandbox mounts (/dev/null devices) at the
   # session repo root for protected paths that do not exist (measured on
   # 2.1.330; upstream anthropics/claude-code#81602). "!/x/" re-includes x
-  # when it is a real directory, so only the non-directory placeholder is
-  # ignored and a new file under a real .claude/skills or .vscode still shows.
+  # when it is a real directory, so a new file under a real .claude/skills
+  # or .vscode still shows. A new untracked regular file x (a first
+  # .mcp.json, say) is hidden too, as is a symlink to a directory.
   sandboxPlaceholders = [
     ".bash_profile" ".bashrc" ".gitconfig" ".gitmodules" ".idea" ".mcp.json"
     ".profile" ".ripgreprc" ".vscode" ".zprofile" ".zshrc"
