@@ -238,6 +238,7 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   # Caller names another language: no re-routing even if detection would.
   res=$(ask SV-hej en)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "language=en re-routed: $res"
+  [ "$(tail -1 "$log.general" | jq -r '.language')" = en ] || fail "language=en not passed on: $(tail -1 "$log.general")"
 
   # Clip length picks the model: a short clip (most dictation) goes to the
   # short-window turbo server, whose 15-second encoder window halves the
@@ -396,11 +397,15 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
 
   # Swedish model down: Swedish audio still answered, by the general model.
   kill "$swedish"; wait "$swedish" 2>/dev/null || true
+  # Turbo already heard Swedish: its text is the answer, not asked for twice.
+  before=$(asked_count general)
   res=$(ask SV-hej)
   [ "$(jq -r '.[0]' <<< "$res")" = 200 ] || fail "Swedish with its model down: $res"
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "fallback text: $res"
+  [ "$(asked_count general)" = $((before + 1)) ] || fail "Swedish turbo text redone with the Swedish model down"
   res=$(ask EN-anything sv)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "language=sv with its model down: $res"
+  [ "$(tail -1 "$log.general" | jq -r '.language')" = sv ] || fail "language=sv with its model down not told sv: $(tail -1 "$log.general")"
   # Swedish chosen but turbo wrote it out as Portuguese: turbo again, told Swedish.
   res=$(ask PTSV-hej)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it as sv" ] || fail "misheard Swedish with its model down: $res"
