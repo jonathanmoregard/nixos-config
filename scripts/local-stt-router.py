@@ -326,6 +326,7 @@ def route(audio, language, prompt):
               file=sys.stderr, flush=True)
     if text is None:
         text = transcribe(GENERAL, audio, "sv", prompt)[0]
+        note = f"{clip}, 30 s window"
     return text, "turbo (Swedish model unavailable)", note
 
 
