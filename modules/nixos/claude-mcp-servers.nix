@@ -38,6 +38,9 @@ in
       klaffat-app-runner = served "klaffat-app-runner" 1900000;
       agent_e2e_broker = served "agent-e2e-broker" 3900000;
       jobs_broker = served "jobs-broker" 600000;
+      # The ARTL advisor hands in its verdict through this server's
+      # schema-checked submit_verdict tool; the PR-open gate records only that.
+      artl_verdict = served "artl-verdict" 60000;
     };
 
     extraAllowedCommands = [
