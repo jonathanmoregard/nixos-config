@@ -23,7 +23,8 @@ Korean, Norwegian (0.63, Swedish 0.28) and Icelandic (0.99, Swedish not even
 a candidate). Each listed language may name look-alikes after colons, whose
 probability counts toward it, so a Nordic guess is a vote for Swedish.
 Narrowed, the clip's language is the listed one with the most probability
-(the first listed when whisper names none of them); if turbo had transcribed
+(the first listed when none of whisper's candidates is listed; a reply with
+no candidates at all keeps turbo's text); if turbo had transcribed
 it as another language, it transcribes it again in the chosen one.
 
 If kb-whisper is down, the Swedish request is answered with turbo's text
@@ -279,19 +280,20 @@ def choose_language(probabilities):
     return next(language for score, language in scores if score == best)
 
 
-def general(audio, seconds, language, prompt):
-    """Turbo's (text, probabilities, window note): the short-window server for a
-    short clip, the full-window one otherwise or when that one fails."""
+def general(audio, seconds, language, prompt, short=True):
+    """Turbo's (text, probabilities, window note, whether the short window
+    answered): the short-window server for a short clip unless `short` is
+    False, the full-window one otherwise or when that one fails."""
     clip = f"{seconds:.1f} s clip" if seconds is not None else "length unknown"
-    if seconds is not None and seconds <= SHORT_SECONDS:
+    if short and seconds is not None and seconds <= SHORT_SECONDS:
         try:
             text, probabilities = transcribe(GENERAL_SHORT, audio, language, prompt, timeout=SHORT_TIMEOUT)
-            return text, probabilities, f"{clip}, 15 s window"
+            return text, probabilities, f"{clip}, 15 s window", True
         except BackendError as e:
             print(f"local-stt: short-window model unavailable or slow, using the full window: {e}",
                   file=sys.stderr, flush=True)
     text, probabilities = transcribe(GENERAL, audio, language, prompt)
-    return text, probabilities, f"{clip}, 30 s window"
+    return text, probabilities, f"{clip}, 30 s window", False
 
 
 def route(audio, language, prompt):
@@ -301,15 +303,17 @@ def route(audio, language, prompt):
     note = f"{clip}, 30 s window"
     text = None
     if language != "sv":
-        text, probabilities, note = general(audio, seconds, language or "auto", prompt)
+        text, probabilities, note, short = general(audio, seconds, language or "auto", prompt)
         if language:
             return text, "turbo", note
         chosen = choose_language(probabilities)
         if chosen != "sv":
             heard = most_probable(probabilities)
             if chosen is not None and chosen != heard:
-                # Turbo wrote out a language nobody here speaks: again, in the chosen one.
-                text, _, note = general(audio, seconds, chosen, prompt)
+                # Turbo wrote out a language nobody here speaks: again, in the
+                # chosen one, on the server that just answered (a short-window
+                # server that failed would be waited out a second time).
+                text, _, note, _ = general(audio, seconds, chosen, prompt, short=short)
                 note += f", heard as {heard}, redone as {chosen}"
             return text, "turbo", note
         if most_probable(probabilities) != "sv":

@@ -373,6 +373,14 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   res=$(ask EN-hello "" "" 3)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "short clip with the short-window model wedged: $res"
   [ $((SECONDS - started)) -lt 15 ] || fail "a wedged short-window model held a short clip for $((SECONDS - started)) s"
+  # A misheard clip redone as English waits out the wedged server once, not
+  # twice: the redo goes straight to the full-window model.
+  started_ms=$(date +%s%3N)
+  res=$(ask PTEN-hello "" "" 3)
+  elapsed=$(( $(date +%s%3N) - started_ms ))
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "misheard English with the short-window model wedged: $res"
+  [ "$(tail -1 "$log.general" | jq -r '.language')" = en ] || fail "misheard English not redone as English: $(tail -1 "$log.general")"
+  [ "$elapsed" -lt 3500 ] || fail "a misheard clip waited out the wedged short-window model twice (''${elapsed} ms, timeout 2 s)"
 
   # Short-window model down: short clips still answered, by the full-window one.
   kill "$short"; wait "$short" 2>/dev/null || true
@@ -386,6 +394,10 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "fallback text: $res"
   res=$(ask EN-anything sv)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "language=sv with its model down: $res"
+  # Swedish chosen but turbo wrote it out as Portuguese: turbo again, told Swedish.
+  res=$(ask PTSV-hej)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "misheard Swedish with its model down: $res"
+  [ "$(tail -1 "$log.general" | jq -r '.language')" = sv ] || fail "misheard Swedish with its model down not redone as Swedish: $(tail -1 "$log.general")"
 
   # General model down: an error the caller can see.
   kill "$general"; wait "$general" 2>/dev/null || true
