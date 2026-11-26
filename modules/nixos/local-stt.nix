@@ -150,6 +150,11 @@ in
       LOCAL_STT_SHORT_SECONDS = toString shortSeconds;
       LOCAL_STT_SHORT_TIMEOUT = toString shortTimeoutSeconds;
       LOCAL_STT_SWEDISH = "http://127.0.0.1:${toString swedishPort}";
+      # Only Swedish and English are spoken here. Detection over all of
+      # whisper's languages misreads short clips: 2026-11-26, Meetily's
+      # 2-6 s chunks of Swedish came back as Portuguese, Korean, Norwegian
+      # and Icelandic, so a Nordic guess counts as Swedish.
+      LOCAL_STT_LANGUAGES = "sv:no:nn:da:is:fo,en";
       # The record-start boost's two side channels: power-profiles-daemon's
       # client (the daemon itself is the desktop's), and the hint file the
       # governor reads, the one path for both so they cannot drift.

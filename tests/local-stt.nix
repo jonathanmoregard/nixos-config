@@ -21,6 +21,14 @@
 #     hang or an empty 200;
 #   - the detected language is the most probable candidate, wherever it
 #     sits in whisper-server's list;
+#   - with LOCAL_STT_LANGUAGES=sv:no:is,en (Swedish, two look-alikes,
+#     English), only Swedish or English is chosen: a clip
+#     whisper hears as Portuguese but finds Swedish likelier than English goes
+#     to the Swedish model; one it finds English likelier is transcribed again
+#     by turbo as English; one naming neither goes to the first listed,
+#     Swedish; one heard as Icelandic (a look-alike listed for Swedish)
+#     goes to the Swedish model even with English likelier than Swedish
+#     itself. Unset, any detected language stands;
 #   - text whisper-server split mid-word across segments comes back whole;
 #   - the model list and a request without audio are answered like the
 #     OpenAI API would;
@@ -60,8 +68,20 @@ let
             if asked["language"] not in ("auto", ""):
                 lang = asked["language"]
             # Like whisper-server: several candidates, the detected one not first.
-            reply = {"language_probabilities": {"no": 0.001, "en": 0.004, lang: 0.99},
+            probabilities = {"no": 0.001, "en": 0.004, lang: 0.99}
+            # A short clip misheard as Portuguese: Swedish (PTSV) or English
+            # (PTEN) second, or neither among the candidates (PTXX).
+            if asked["language"] in ("auto", ""):
+                probabilities = {"PTSV": {"en": 0.05, "pt": 0.6, "sv": 0.3},
+                                 "PTEN": {"sv": 0.05, "pt": 0.6, "en": 0.3},
+                                 "PTXX": {"ko": 0.3, "pt": 0.6},
+                                 "ISEN": {"is": 0.9, "en": 0.02}}.get(audio[:4], probabilities)
+            reply = {"language_probabilities": probabilities,
                      "segments": [{"text": " " + name + " hear"}, {"text": "d it"}]}
+            # A misheard clip's text names the language it was asked for, so
+            # a redone answer differs from the first pass's.
+            if audio[:2] in ("PT", "IS"):
+                reply["segments"].append({"text": " as " + (asked["language"] or "auto")})
             data = json.dumps(reply).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(data)))
@@ -156,6 +176,7 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   export LOCAL_STT_SWEDISH=http://127.0.0.1:18764
   export LOCAL_STT_GENERAL_SHORT=http://127.0.0.1:18762
   export LOCAL_STT_SHORT_TIMEOUT=2
+  export LOCAL_STT_LANGUAGES=sv:no:is,en
   # The record-start boost's two side channels: a fake powerprofilesctl that
   # records how it was called and then runs the held command like the real
   # one, and a hint file in a directory that does not exist yet.
@@ -217,6 +238,7 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   # Caller names another language: no re-routing even if detection would.
   res=$(ask SV-hej en)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "language=en re-routed: $res"
+  [ "$(tail -1 "$log.general" | jq -r '.language')" = en ] || fail "language=en not passed on: $(tail -1 "$log.general")"
 
   # Clip length picks the model: a short clip (most dictation) goes to the
   # short-window turbo server, whose 15-second encoder window halves the
@@ -237,6 +259,21 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   [ "$(jq -r '.[1].text' <<< "$res")" = "swedish heard it" ] || fail "short Swedish: $res"
   [ "$(tail -1 "$log.short" | jq -r '.audio')" = SV-hej ] || fail "a short Swedish clip was not detected by the short-window model: $(tail -1 "$log.short")"
   [ "$(asked_count general)" = "$before" ] || fail "a short Swedish clip also went through the full-window general model"
+
+  # Narrowed to Swedish and English (LOCAL_STT_LANGUAGES=sv:no:is,en): a clip
+  # misheard as Portuguese, Swedish likelier than English: the Swedish model.
+  res=$(ask PTSV-hej "" "" 3)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "swedish heard it as sv" ] || fail "misheard Swedish: $res"
+  # English likelier: turbo again, told English.
+  res=$(ask PTEN-hello "" "" 3)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "short heard it as en" ] || fail "misheard English: $res"
+  [ "$(tail -1 "$log.short" | jq -r '.language')" = en ] || fail "misheard English not redone as English: $(tail -1 "$log.short")"
+  # Neither among the candidates: the first listed, Swedish.
+  res=$(ask PTXX-x "" "" 3)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "swedish heard it as sv" ] || fail "no listed language: $res"
+  # Heard as Icelandic, a look-alike of Swedish: Swedish, not English.
+  res=$(ask ISEN-nu "" "" 3)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "swedish heard it as sv" ] || fail "Icelandic look-alike: $res"
 
   # API surface.
   [ "$(ask models | jq -r '.data[0].id')" = local-stt ] || fail "model list"
@@ -317,7 +354,7 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   kill "$router3"
   # No powerprofilesctl (the lane VM, any machine without power-profiles-daemon):
   # prepare still answers 204 and leaves the hint; the journal says so once.
-  LOCAL_STT_PORT=18766 LOCAL_STT_POWERPROFILESCTL=$PWD/no-such-powerprofilesctl \
+  LOCAL_STT_PORT=18766 LOCAL_STT_LANGUAGES= LOCAL_STT_POWERPROFILESCTL=$PWD/no-such-powerprofilesctl \
     LOCAL_STT_THROTTLE_HINT=$PWD/hint2 ${routerCommand} > $PWD/router2.log 2>&1 &
   router2=$!
   wait_port 18766
@@ -326,6 +363,13 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   [ -f $PWD/hint2 ] || fail "prepare without powerprofilesctl left no hint"
   LOCAL_STT_TEST_PORT=18766 ask prepare /v1/prepare > /dev/null
   [ "$(grep -c 'no powerprofilesctl' $PWD/router2.log)" = 1 ] || fail "a missing powerprofilesctl must be logged once: $(cat $PWD/router2.log)"
+  # LOCAL_STT_LANGUAGES unset: whatever turbo detected stands, not redone.
+  before=$(asked_count short)
+  before_general=$(asked_count general)
+  res=$(LOCAL_STT_TEST_PORT=18766 ask PTEN-hello "" "" 3)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "short heard it as auto" ] || fail "unrestricted, Portuguese: $res"
+  [ "$(asked_count short)" = $((before + 1)) ] || fail "unrestricted, a detected language was redone"
+  [ "$(asked_count general)" = "$before_general" ] || fail "unrestricted, a detected language was redone on the full-window model"
   kill "$router2"
 
   # Short-window model wedged (accepts, never answers): the clip is not held
@@ -337,6 +381,14 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
   res=$(ask EN-hello "" "" 3)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "short clip with the short-window model wedged: $res"
   [ $((SECONDS - started)) -lt 15 ] || fail "a wedged short-window model held a short clip for $((SECONDS - started)) s"
+  # A misheard clip redone as English waits out the wedged server once, not
+  # twice: the redo goes straight to the full-window model.
+  started_ms=$(date +%s%3N)
+  res=$(ask PTEN-hello "" "" 3)
+  elapsed=$(( $(date +%s%3N) - started_ms ))
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it as en" ] || fail "misheard English with the short-window model wedged: $res"
+  [ "$(tail -1 "$log.general" | jq -r '.language')" = en ] || fail "misheard English not redone as English: $(tail -1 "$log.general")"
+  [ "$elapsed" -lt 3500 ] || fail "a misheard clip waited out the wedged short-window model twice (''${elapsed} ms, timeout 2 s)"
 
   # Short-window model down: short clips still answered, by the full-window one.
   kill "$short"; wait "$short" 2>/dev/null || true
@@ -345,11 +397,19 @@ pkgs.runCommand "local-stt-check" { nativeBuildInputs = [ pkgs.python3 pkgs.jq ]
 
   # Swedish model down: Swedish audio still answered, by the general model.
   kill "$swedish"; wait "$swedish" 2>/dev/null || true
+  # Turbo already heard Swedish: its text is the answer, not asked for twice.
+  before=$(asked_count general)
   res=$(ask SV-hej)
   [ "$(jq -r '.[0]' <<< "$res")" = 200 ] || fail "Swedish with its model down: $res"
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "fallback text: $res"
+  [ "$(asked_count general)" = $((before + 1)) ] || fail "Swedish turbo text redone with the Swedish model down"
   res=$(ask EN-anything sv)
   [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it" ] || fail "language=sv with its model down: $res"
+  [ "$(tail -1 "$log.general" | jq -r '.language')" = sv ] || fail "language=sv with its model down not told sv: $(tail -1 "$log.general")"
+  # Swedish chosen but turbo wrote it out as Portuguese: turbo again, told Swedish.
+  res=$(ask PTSV-hej)
+  [ "$(jq -r '.[1].text' <<< "$res")" = "general heard it as sv" ] || fail "misheard Swedish with its model down: $res"
+  [ "$(tail -1 "$log.general" | jq -r '.language')" = sv ] || fail "misheard Swedish with its model down not redone as Swedish: $(tail -1 "$log.general")"
 
   # General model down: an error the caller can see.
   kill "$general"; wait "$general" 2>/dev/null || true

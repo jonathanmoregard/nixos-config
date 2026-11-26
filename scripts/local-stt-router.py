@@ -15,6 +15,18 @@ heard Swedish, the same audio is transcribed again by kb-whisper and that
 text is returned. A caller that names the language skips detection: "sv"
 goes straight to kb-whisper, anything else to turbo.
 
+Detection can be narrowed to the languages actually spoken here
+(LOCAL_STT_LANGUAGES, e.g. "sv:no:nn:da:is:fo,en"). On a clip of a few
+seconds whisper's guess over all of its languages is unreliable: on
+2026-11-26, Meetily's 2-6 s chunks of Swedish speech came back as Portuguese,
+Korean, Norwegian (0.63, Swedish 0.28) and Icelandic (0.99, Swedish not even
+a candidate). Each listed language may name look-alikes after colons, whose
+probability counts toward it, so a Nordic guess is a vote for Swedish.
+Narrowed, the clip's language is the listed one with the most probability
+(the first listed when none of whisper's candidates is listed; a reply with
+no candidates at all keeps turbo's text); if turbo had transcribed
+it as another language, it transcribes it again in the chosen one.
+
 If kb-whisper is down, the Swedish request is answered with turbo's text
 rather than failing; if turbo is down, the request fails with 502.
 
@@ -56,6 +68,9 @@ Settings come from the environment (the systemd unit sets them):
   LOCAL_STT_GENERAL_SHORT  base URL of the turbo whisper-server with the
                            15-second window (default: LOCAL_STT_GENERAL)
   LOCAL_STT_SWEDISH        base URL of the kb-whisper whisper-server
+  LOCAL_STT_LANGUAGES      comma-separated languages detection may choose
+                           from, most likely first, each optionally followed
+                           by :look-alike codes (default: any)
   LOCAL_STT_SHORT_SECONDS  clips up to this length (s) go to the short-window
                            server (14)
   LOCAL_STT_SHORT_TIMEOUT  seconds to wait for the short-window server before
@@ -84,6 +99,11 @@ PORT = int(os.environ.get("LOCAL_STT_PORT", "8766"))
 GENERAL = os.environ.get("LOCAL_STT_GENERAL", "http://127.0.0.1:8763")
 GENERAL_SHORT = os.environ.get("LOCAL_STT_GENERAL_SHORT") or GENERAL
 SWEDISH = os.environ.get("LOCAL_STT_SWEDISH", "http://127.0.0.1:8764")
+# [(language, (it and its look-alikes))], most likely first.
+LANGUAGES = [(codes[0], tuple(codes))
+             for codes in ([c.strip().lower() for c in entry.split(":") if c.strip()]
+                           for entry in os.environ.get("LOCAL_STT_LANGUAGES", "").split(","))
+             if codes]
 TIMEOUT = 600
 MODEL_ID = "local-stt"
 SHORT_SECONDS = float(os.environ.get("LOCAL_STT_SHORT_SECONDS", "14"))
@@ -213,7 +233,7 @@ def wav_seconds(audio):
 
 
 def transcribe(base, audio, language, prompt, timeout=TIMEOUT):
-    """Run one whisper-server; returns (text, detected language code or None)."""
+    """Run one whisper-server; returns (text, {language code: probability})."""
     boundary = uuid.uuid4().hex
     parts = [("response_format", "verbose_json"), ("temperature", "0"), ("language", language)]
     if prompt:
@@ -241,34 +261,63 @@ def transcribe(base, audio, language, prompt, timeout=TIMEOUT):
         text = "".join(s.get("text", "") for s in segments)
     else:
         text = result.get("text", "").replace("\n", "")
-    # With detection on, whisper-server lists the candidate languages in no
-    # particular order; the detected one is the most probable.
-    probabilities = result.get("language_probabilities") or {}
-    detected = max(probabilities, key=probabilities.get) if probabilities else None
-    return text.strip(), detected
+    return text.strip(), result.get("language_probabilities") or {}
+
+
+def most_probable(probabilities):
+    """The language turbo transcribed in: with detection on, whisper-server
+    lists the candidates in no particular order, and uses the most probable."""
+    return max(probabilities, key=probabilities.get) if probabilities else None
+
+
+def choose_language(probabilities):
+    """The clip's language among LANGUAGES (any language when that is empty)."""
+    if not probabilities or not LANGUAGES:
+        return most_probable(probabilities)
+    scores = [(sum(probabilities.get(code, 0) for code in codes), language) for language, codes in LANGUAGES]
+    best = max(score for score, _ in scores)
+    # Ties, including none of them a candidate, go to the first listed.
+    return next(language for score, language in scores if score == best)
+
+
+def general(audio, seconds, language, prompt, short=True):
+    """Turbo's (text, probabilities, window note, whether the short window
+    answered): the short-window server for a short clip unless `short` is
+    False, the full-window one otherwise or when that one fails."""
+    clip = f"{seconds:.1f} s clip" if seconds is not None else "length unknown"
+    if short and seconds is not None and seconds <= SHORT_SECONDS:
+        try:
+            text, probabilities = transcribe(GENERAL_SHORT, audio, language, prompt, timeout=SHORT_TIMEOUT)
+            return text, probabilities, f"{clip}, 15 s window", True
+        except BackendError as e:
+            print(f"local-stt: short-window model unavailable or slow, using the full window: {e}",
+                  file=sys.stderr, flush=True)
+    text, probabilities = transcribe(GENERAL, audio, language, prompt)
+    return text, probabilities, f"{clip}, 30 s window", False
 
 
 def route(audio, language, prompt):
     """The text for one request, which model produced it, and a note on the clip and window."""
     seconds = wav_seconds(audio)
-    short = seconds is not None and seconds <= SHORT_SECONDS
     clip = f"{seconds:.1f} s clip" if seconds is not None else "length unknown"
     note = f"{clip}, 30 s window"
     text = None
     if language != "sv":
-        detected = None
-        if short:
-            try:
-                text, detected = transcribe(GENERAL_SHORT, audio, language or "auto", prompt,
-                                            timeout=SHORT_TIMEOUT)
-                note = f"{clip}, 15 s window"
-            except BackendError as e:
-                print(f"local-stt: short-window model unavailable or slow, using the full window: {e}",
-                      file=sys.stderr, flush=True)
-        if text is None:
-            text, detected = transcribe(GENERAL, audio, language or "auto", prompt)
-        if language or detected != "sv":
+        text, probabilities, note, short = general(audio, seconds, language or "auto", prompt)
+        if language:
             return text, "turbo", note
+        chosen = choose_language(probabilities)
+        if chosen != "sv":
+            heard = most_probable(probabilities)
+            if chosen is not None and chosen != heard:
+                # Turbo wrote out a language nobody here speaks: again, in the
+                # chosen one, on the server that just answered (a short-window
+                # server that failed would be waited out a second time).
+                text, _, note, _ = general(audio, seconds, chosen, prompt, short=short)
+                note += f", heard as {heard}, redone as {chosen}"
+            return text, "turbo", note
+        if most_probable(probabilities) != "sv":
+            text = None  # turbo's text is in another language; no use as the fallback
     # Swedish accuracy first: kb-whisper always gets the full window.
     try:
         return transcribe(SWEDISH, audio, "sv", prompt)[0], "kb-whisper", f"{clip}, 30 s window"
@@ -277,6 +326,7 @@ def route(audio, language, prompt):
               file=sys.stderr, flush=True)
     if text is None:
         text = transcribe(GENERAL, audio, "sv", prompt)[0]
+        note = f"{clip}, 30 s window"
     return text, "turbo (Swedish model unavailable)", note
 
 
